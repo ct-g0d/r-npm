@@ -1839,9 +1839,29 @@ pub struct InstallOptions {
     pub vulnerability_constraints: std::collections::HashMap<String, Vec<rnpm_core::semver::Range>>,
     /// Whether to create binary shims in `.bin` directories (default: true).
     pub bin_links: bool,
+    /// Recursion guard: list of canonical git dependency paths already being prepared.
+    pub git_no_prepare: Vec<String>,
+    /// Recursion guard: current depth of git dependency preparation.
+    pub git_prepare_depth: usize,
 }
 
 impl InstallOptions {
+    /// Converts these install options to git materialization options.
+    pub fn git_materialize_options(&self) -> crate::git::GitMaterializeOptions {
+        crate::git::GitMaterializeOptions {
+            ignore_scripts: self.ignore_scripts,
+            foreground_scripts: self.foreground_scripts,
+            registry_url: self.registry_url.clone(),
+            cache_dir: self.cache_dir.clone(),
+            offline: self.offline,
+            prefer_offline: self.prefer_offline,
+            prefer_online: self.prefer_online,
+            strict_sandbox: self.strict_sandbox,
+            git_no_prepare: self.git_no_prepare.clone(),
+            git_prepare_depth: self.git_prepare_depth,
+        }
+    }
+
     /// Evaluates if package-lock reading and writing is enabled.
     pub fn package_lock_enabled(&self) -> bool {
         self.package_lock && !self.no_package_lock
@@ -1945,6 +1965,8 @@ impl Default for InstallOptions {
             unlocked_packages: std::collections::HashSet::new(),
             vulnerability_constraints: std::collections::HashMap::new(),
             bin_links: true,
+            git_no_prepare: Vec::new(),
+            git_prepare_depth: 0,
         }
     }
 }
@@ -4468,12 +4490,13 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                         .checkout_git_dependency(&target, self.options.offline)
                         .await?;
 
-                    crate::git::materialize_git_dependency(
+                    let mat_opts = self.options.git_materialize_options();
+                    crate::git::materialize_git_dependency_with_options(
                         &checkout_dir,
                         &dest_dir,
-                        self.options.ignore_scripts,
-                        self.options.foreground_scripts,
-                    )?;
+                        &mat_opts,
+                    )
+                    .await?;
                     packages_installed += 1;
                     cache_hits += 1;
 
@@ -6374,12 +6397,13 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
 
                 let t_mat = std::time::Instant::now();
                 let _mat_span = tracing::info_span!("materialize", package = %pkg_key).entered();
-                crate::git::materialize_git_dependency(
+                let mat_opts = self.options.git_materialize_options();
+                crate::git::materialize_git_dependency_with_options(
                     &checkout_dir,
                     &full_target,
-                    self.options.ignore_scripts,
-                    self.options.foreground_scripts,
-                )?;
+                    &mat_opts,
+                )
+                .await?;
                 drop(_mat_span);
                 collector.record_phase(Phase::Materialize, t_mat.elapsed());
 

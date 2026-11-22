@@ -1,7 +1,30 @@
 use std::path::Path;
 use tempfile::tempdir;
 
+use flate2::write::GzEncoder;
+use flate2::Compression;
+use tar::{Builder, Header};
+
 use rnpm_install::{InstallOptions, Installer};
+
+fn build_mock_tarball(files: &[(&str, &[u8])]) -> Vec<u8> {
+    let mut gz = GzEncoder::new(Vec::new(), Compression::default());
+    {
+        let mut builder = Builder::new(&mut gz);
+        for &(rel_path, content) in files {
+            let full_path = format!("package/{rel_path}");
+            let mut header = Header::new_gnu();
+            header.set_size(content.len() as u64);
+            header.set_mode(0o755);
+            header.set_cksum();
+            builder
+                .append_data(&mut header, full_path, content)
+                .unwrap();
+        }
+        builder.finish().unwrap();
+    }
+    gz.finish().unwrap()
+}
 
 fn run_git(dir: &Path, args: &[&str]) {
     let _ = std::fs::write(dir.join(".empty_gitconfig"), "");
@@ -290,7 +313,6 @@ async fn test_git_prepare_then_pack_build_flow() {
     // Verify NO .git file or directory or .rnpm_checkout_done leaks
     assert_no_git_leaks(&installed_pkg);
 }
-
 /// Test 3: Same git dependency with `--ignore-scripts`:
 /// Verify `prepare` does NOT run.
 #[tokio::test]
@@ -377,6 +399,208 @@ async fn test_git_prepare_ignored_with_ignore_scripts() {
 
     // src/unpacked.ts must NOT exist (filtered out by files: ['dist'])
     assert!(!installed_pkg.join("src").exists());
+
+    // Verify NO .git file or directory or .rnpm_checkout_done leaks
+    assert_no_git_leaks(&installed_pkg);
+}
+
+/// Test A: Git dep has a devDependency (served from local file: dep)
+/// providing a .bin build tool (`my-builder`), and `"scripts": { "prepare": "my-builder" }`
+/// generates `dist/out.js` + `"files": ["dist"]` -> verify `node_modules/<pkg>/dist/out.js` is built and installed!
+#[tokio::test]
+async fn test_git_prepare_with_dev_dependency_bin_tool() {
+    let tmp = tempdir().unwrap();
+
+    let builder_json = serde_json::json!({
+        "name": "my-builder",
+        "version": "1.0.0",
+        "bin": {
+            "my-builder": "bin.js"
+        }
+    });
+    let builder_script = r#"#!/usr/bin/env node
+const fs = require('fs');
+fs.mkdirSync('dist', { recursive: true });
+fs.writeFileSync('dist/out.js', 'module.exports = "built by my-builder";\n');
+"#;
+
+    let builder_tarball_bytes = build_mock_tarball(&[
+        ("package.json", builder_json.to_string().as_bytes()),
+        ("bin.js", builder_script.as_bytes()),
+    ]);
+    let builder_tarball_path = tmp.path().join("my-builder-1.0.0.tgz");
+    std::fs::write(&builder_tarball_path, &builder_tarball_bytes).unwrap();
+
+    let builder_file_url = format!(
+        "file:{}",
+        builder_tarball_path.to_string_lossy().replace('\\', "/")
+    );
+
+    // Create Git repository for the git dependency
+    let repo_dir = tmp.path().join("git-pkg-repo");
+    std::fs::create_dir_all(&repo_dir).unwrap();
+    run_git(&repo_dir, &["init"]);
+    run_git(&repo_dir, &["config", "user.name", "Tester"]);
+    run_git(&repo_dir, &["config", "user.email", "test@example.com"]);
+
+    let git_pkg_json = serde_json::json!({
+        "name": "pkg-git-builder",
+        "version": "1.0.0",
+        "main": "dist/out.js",
+        "scripts": {
+            "prepare": "my-builder"
+        },
+        "devDependencies": {
+            "my-builder": builder_file_url
+        },
+        "files": [
+            "dist"
+        ]
+    });
+    std::fs::write(repo_dir.join("package.json"), git_pkg_json.to_string()).unwrap();
+
+    let src_dir = repo_dir.join("src");
+    std::fs::create_dir_all(&src_dir).unwrap();
+    std::fs::write(
+        src_dir.join("dev-source.ts"),
+        "export const devOnly = true;\n",
+    )
+    .unwrap();
+
+    run_git(&repo_dir, &["add", "."]);
+    run_git(&repo_dir, &["commit", "-m", "init git repo with devDependency builder"]);
+
+    let git_url = format!(
+        "git+file://{}",
+        repo_dir.to_string_lossy().replace('\\', "/")
+    );
+
+    // Consumer project installing the git dependency
+    let proj_dir = tmp.path().join("consumer-proj");
+    let cache_dir = tmp.path().join("cache");
+    std::fs::create_dir_all(&proj_dir).unwrap();
+    std::fs::create_dir_all(&cache_dir).unwrap();
+
+    let consumer_json = serde_json::json!({
+        "name": "consumer-app-a",
+        "version": "1.0.0",
+        "dependencies": {
+            "pkg-git-builder": git_url
+        }
+    });
+    std::fs::write(proj_dir.join("package.json"), consumer_json.to_string()).unwrap();
+
+    let mut installer = Installer::new(InstallOptions {
+        project_dir: proj_dir.clone(),
+        cache_dir: Some(cache_dir),
+        ..Default::default()
+    })
+    .unwrap();
+
+    let summary = installer.install().await.expect("Install failed");
+    assert_eq!(summary.packages_installed, 1);
+
+    let installed_pkg = proj_dir.join("node_modules").join("pkg-git-builder");
+    let out_file = installed_pkg.join("dist").join("out.js");
+    assert!(
+        out_file.exists(),
+        "Expected node_modules/pkg-git-builder/dist/out.js to be built and installed via my-builder"
+    );
+    let out_content = std::fs::read_to_string(&out_file).unwrap();
+    assert!(
+        out_content.contains("built by my-builder"),
+        "Content mismatch in out.js: {out_content}"
+    );
+
+    // package.json must exist
+    assert!(installed_pkg.join("package.json").exists());
+
+    // Staging node_modules must NOT leak into installed package
+    assert!(
+        !installed_pkg.join("node_modules").exists(),
+        "Staging node_modules leaked into installed node_modules/pkg-git-builder"
+    );
+
+    // Filtered src files must NOT exist
+    assert!(!installed_pkg.join("src").exists());
+
+    // Verify NO .git file or directory or .rnpm_checkout_done leaks
+    assert_no_git_leaks(&installed_pkg);
+}
+
+/// Test B: Git dep has `"prepack"` + `"prepare"` creating `dist/out.js` AND `"postpack"` deleting `dist/`
+/// -> verify `node_modules/<pkg>/dist/out.js` IS present in the installed package (proving packing happened BEFORE `postpack`!)!
+#[tokio::test]
+async fn test_git_prepare_pack_lifecycle_order_postpack_after_collection() {
+    let tmp = tempdir().unwrap();
+    let repo_dir = tmp.path().join("git-pkg-lifecycle-repo");
+    std::fs::create_dir_all(&repo_dir).unwrap();
+    run_git(&repo_dir, &["init"]);
+    run_git(&repo_dir, &["config", "user.name", "Tester"]);
+    run_git(&repo_dir, &["config", "user.email", "test@example.com"]);
+
+    let git_pkg_json = serde_json::json!({
+        "name": "pkg-git-lifecycle-order",
+        "version": "1.0.0",
+        "main": "dist/out.js",
+        "scripts": {
+            "prepack": "node -e \"const fs = require('fs'); fs.mkdirSync('dist', {recursive: true}); fs.writeFileSync('dist/pre.txt', 'prepack ran');\"",
+            "prepare": "node -e \"const fs = require('fs'); fs.mkdirSync('dist', {recursive: true}); fs.writeFileSync('dist/out.js', 'module.exports = 12345;');\"",
+            "postpack": "node -e \"const fs = require('fs'); fs.rmSync('dist', {recursive: true, force: true});\""
+        },
+        "files": [
+            "dist"
+        ]
+    });
+    std::fs::write(repo_dir.join("package.json"), git_pkg_json.to_string()).unwrap();
+
+    run_git(&repo_dir, &["add", "."]);
+    run_git(&repo_dir, &["commit", "-m", "init git repo with prepack/prepare/postpack"]);
+
+    let git_url = format!(
+        "git+file://{}",
+        repo_dir.to_string_lossy().replace('\\', "/")
+    );
+
+    // Consumer project installing the git dependency
+    let proj_dir = tmp.path().join("consumer-proj-b");
+    let cache_dir = tmp.path().join("cache-b");
+    std::fs::create_dir_all(&proj_dir).unwrap();
+    std::fs::create_dir_all(&cache_dir).unwrap();
+
+    let consumer_json = serde_json::json!({
+        "name": "consumer-app-b",
+        "version": "1.0.0",
+        "dependencies": {
+            "pkg-git-lifecycle-order": git_url
+        }
+    });
+    std::fs::write(proj_dir.join("package.json"), consumer_json.to_string()).unwrap();
+
+    let mut installer = Installer::new(InstallOptions {
+        project_dir: proj_dir.clone(),
+        cache_dir: Some(cache_dir),
+        ..Default::default()
+    })
+    .unwrap();
+
+    let summary = installer.install().await.expect("Install failed");
+    assert_eq!(summary.packages_installed, 1);
+
+    let installed_pkg = proj_dir.join("node_modules").join("pkg-git-lifecycle-order");
+    let out_file = installed_pkg.join("dist").join("out.js");
+    assert!(
+        out_file.exists(),
+        "Expected dist/out.js to be present in installed package! If postpack ran before packing, this file would have been deleted."
+    );
+    let out_content = std::fs::read_to_string(&out_file).unwrap();
+    assert!(
+        out_content.contains("module.exports = 12345;"),
+        "Content mismatch in out.js: {out_content}"
+    );
+
+    // package.json must exist
+    assert!(installed_pkg.join("package.json").exists());
 
     // Verify NO .git file or directory or .rnpm_checkout_done leaks
     assert_no_git_leaks(&installed_pkg);

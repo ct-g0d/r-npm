@@ -837,6 +837,12 @@ fn copy_pack_files_to_dest(source_dir: &Path, manifest: &Manifest, dst: &Path) -
                     .file_name()
                     .and_then(|n| n.to_str())
                     == Some(".rnpm_checkout_done")
+                || rel == ".git"
+                || rel.starts_with(".git/")
+                || rel.starts_with(".git\\")
+                || rel == "node_modules"
+                || rel.starts_with("node_modules/")
+                || rel.starts_with("node_modules\\")
             {
                 continue;
             }
@@ -855,30 +861,86 @@ fn copy_pack_files_to_dest(source_dir: &Path, manifest: &Manifest, dst: &Path) -
         return Ok(());
     }
 
-    copy_dir_all_raw(source_dir, dst)
+    copy_dir_all_raw_pack(source_dir, dst)
+}
+
+/// Raw recursive directory copy for packing fallback that strictly skips:
+/// `.git`, `.rnpm_checkout_done`, and `node_modules`.
+pub fn copy_dir_all_raw_pack(src: &Path, dst: &Path) -> Result<()> {
+    std::fs::create_dir_all(dst)
+        .with_context(|| format!("Failed to create directory '{}'", dst.display()))?;
+
+    for entry in std::fs::read_dir(src)
+        .with_context(|| format!("Failed to read directory '{}'", src.display()))?
+    {
+        let entry = entry?;
+        let file_name = entry.file_name();
+        let name_str = file_name.to_string_lossy();
+        if name_str == ".git" || name_str == ".rnpm_checkout_done" || name_str == "node_modules" {
+            continue;
+        }
+        let ty = entry.file_type()?;
+        let from = entry.path();
+        let to = dst.join(&file_name);
+        if ty.is_dir() {
+            copy_dir_all_raw_pack(&from, &to)?;
+        } else if ty.is_symlink() {
+            #[cfg(unix)]
+            {
+                let link_target = std::fs::read_link(&from)?;
+                let _ = std::os::unix::fs::symlink(&link_target, &to);
+            }
+            #[cfg(windows)]
+            {
+                let _ = std::fs::copy(&from, &to);
+            }
+        } else {
+            std::fs::copy(&from, &to).with_context(|| {
+                format!("Failed to copy '{}' -> '{}'", from.display(), to.display())
+            })?;
+        }
+    }
+    Ok(())
+}
+
+/// Options for materializing git dependencies into node_modules.
+#[derive(Debug, Clone, Default)]
+pub struct GitMaterializeOptions {
+    pub ignore_scripts: bool,
+    pub foreground_scripts: bool,
+    pub registry_url: Option<String>,
+    pub cache_dir: Option<PathBuf>,
+    pub offline: bool,
+    pub prefer_offline: bool,
+    pub prefer_online: bool,
+    pub strict_sandbox: bool,
+    pub git_no_prepare: Vec<String>,
+    pub git_prepare_depth: usize,
 }
 
 /// Materializes a git dependency into the destination folder in node_modules,
 /// executing the `prepare`-then-`pack` build flow matching npm pacote:
 /// 1. Check `package.json` in the checked-out git dependency.
 /// 2. If the git package defines `prepare` (or `prepack`/`postpack`) AND `ignore_scripts` is false:
-///    - Run lifecycle scripts in a staging copy of the checkout directory.
-///    - Set `_RNPM_NO_PREPARE_` to prevent infinite recursion across git dependencies.
-/// 3. Pack/filter using npm's pack file-inclusion rules (`package.json` `files`, `main`, `bin`,
-///    `.npmignore` / `.gitignore`, strictly excluding `.git`, `.rnpm_checkout_done`, `.npmrc`).
-/// 4. Materialize only the packed files into `dst`.
-pub fn materialize_git_dependency(
+///    - Check recursion depth and visited guards to prevent cyclic/infinite loops.
+///    - If `dependencies` or `devDependencies` are declared, install them into the staging directory's
+///      `node_modules` using the configured cache/registry/offline settings.
+///    - Run `prepack` (if present) and `prepare` (if present) with `PATH` including `<staging>/node_modules/.bin`.
+///    - Collect/pack package files (respecting `files`, `.npmignore`, strictly excluding `.git`,
+///      `.rnpm_checkout_done`, and `node_modules`) into `dst`.
+///    - Run `postpack` (if present) after collection/packing.
+/// 3. If no prepare scripts or ignore_scripts is true, directly collect/pack files to `dst`.
+pub async fn materialize_git_dependency_with_options(
     src: &Path,
     dst: &Path,
-    ignore_scripts: bool,
-    foreground_scripts: bool,
+    options: &GitMaterializeOptions,
 ) -> Result<()> {
     std::fs::create_dir_all(dst)
         .with_context(|| format!("Failed to create directory '{}'", dst.display()))?;
 
     let manifest_path = src.join("package.json");
     if !manifest_path.is_file() {
-        return copy_dir_all_raw(src, dst);
+        return copy_dir_all_raw_pack(src, dst);
     }
 
     let manifest = Manifest::from_file(&manifest_path).with_context(|| {
@@ -890,13 +952,35 @@ pub fn materialize_git_dependency(
         || manifest.scripts.contains_key("prepack")
         || manifest.scripts.contains_key("postpack");
 
-    if has_prepare && !ignore_scripts {
+    if has_prepare && !options.ignore_scripts {
         let no_prepare_env = std::env::var("_RNPM_NO_PREPARE_").unwrap_or_default();
         let canonical_src = src.canonicalize().unwrap_or_else(|_| src.to_path_buf());
         let src_key = canonical_src.to_string_lossy().to_string();
 
-        if no_prepare_env.split('\n').any(|s| s == src_key) {
-            debug!("Skipping prepare for git dependency '{}', already seen in _RNPM_NO_PREPARE_", src_key);
+        // Recursion depth guard to prevent runaway git dependency chains
+        const MAX_GIT_PREPARE_DEPTH: usize = 10;
+        let env_depth: usize = std::env::var("_RNPM_PREPARE_DEPTH_")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        let current_depth = std::cmp::max(options.git_prepare_depth, env_depth);
+
+        if current_depth >= MAX_GIT_PREPARE_DEPTH {
+            warn!(
+                "Max git dependency prepare recursion depth ({}) reached, skipping prepare for '{}'",
+                current_depth, src_key
+            );
+            return copy_pack_files_to_dest(src, &manifest, dst);
+        }
+
+        // Visited set guard to prevent cyclic git dependency loops
+        if options.git_no_prepare.iter().any(|s| s == &src_key)
+            || no_prepare_env.split('\n').any(|s| s == src_key)
+        {
+            debug!(
+                "Skipping prepare for git dependency '{}', already seen in no_prepare",
+                src_key
+            );
             return copy_pack_files_to_dest(src, &manifest, dst);
         }
 
@@ -906,7 +990,7 @@ pub fn materialize_git_dependency(
             .tempdir_in(staging_parent)
             .or_else(|_| tempfile::tempdir())?;
 
-        copy_dir_all_raw(src, staging_dir.path())?;
+        copy_dir_all_raw_pack(src, staging_dir.path())?;
 
         let new_no_prepare = if no_prepare_env.is_empty() {
             src_key.clone()
@@ -914,18 +998,102 @@ pub fn materialize_git_dependency(
             format!("{no_prepare_env}\n{src_key}")
         };
 
-        for &hook in &["prepack", "prepare", "postpack"] {
-            if let Some(cmd) = manifest.scripts.get(hook) {
+        let mut next_no_prepare = options.git_no_prepare.clone();
+        if !next_no_prepare.iter().any(|s| s == &src_key) {
+            next_no_prepare.push(src_key.clone());
+        }
+
+        let staging_manifest_path = staging_dir.path().join("package.json");
+        let staging_manifest = if staging_manifest_path.is_file() {
+            Manifest::from_file(&staging_manifest_path).unwrap_or_else(|_| manifest.clone())
+        } else {
+            manifest.clone()
+        };
+
+        // 1. Install preparation dependencies in staging if declared
+        let has_deps = !staging_manifest.dependencies.is_empty()
+            || !staging_manifest.dev_dependencies.is_empty();
+
+        if has_deps {
+            debug!(
+                "Installing build dependencies in staging directory '{}' for git dependency '{}'",
+                staging_dir.path().display(),
+                src_key
+            );
+
+            let staging_options = crate::InstallOptions {
+                project_dir: staging_dir.path().to_path_buf(),
+                cache_dir: options.cache_dir.clone(),
+                registry_url: options.registry_url.clone(),
+                offline: options.offline,
+                prefer_offline: options.prefer_offline,
+                prefer_online: options.prefer_online,
+                strict_sandbox: options.strict_sandbox,
+                foreground_scripts: options.foreground_scripts,
+                ignore_scripts: options.ignore_scripts,
+                bin_links: true,
+                no_package_lock: true,
+                package_lock: false,
+                audit: false,
+                fund: false,
+                silent: true,
+                git_no_prepare: next_no_prepare.clone(),
+                git_prepare_depth: current_depth + 1,
+                ..Default::default()
+            };
+
+            let mut installer = crate::Installer::new(staging_options)?;
+            let install_fut: std::pin::Pin<
+                Box<dyn std::future::Future<Output = Result<crate::InstallSummary>>>,
+            > = Box::pin(installer.install());
+            install_fut.await.with_context(|| {
+                format!(
+                    "Failed to install build dependencies in staging directory for git dependency '{}'",
+                    src_key
+                )
+            })?;
+        }
+
+        // Construct PATH with <staging>/node_modules/.bin at front
+        let staging_bin = staging_dir.path().join("node_modules").join(".bin");
+        let inherited_path = std::env::var_os("PATH")
+            .or_else(|| std::env::var_os("Path"))
+            .unwrap_or_default();
+        let mut paths = vec![staging_bin];
+        paths.extend(std::env::split_paths(&inherited_path));
+        let staging_path_env = std::env::join_paths(paths)
+            .ok()
+            .map(|p| p.to_string_lossy().to_string());
+
+        // 2. Run prepack (if present) and prepare (if present) BEFORE collecting/packing files
+        for &hook in &["prepack", "prepare"] {
+            let current_manifest = if staging_manifest_path.is_file() {
+                Manifest::from_file(&staging_manifest_path)
+                    .unwrap_or_else(|_| staging_manifest.clone())
+            } else {
+                staging_manifest.clone()
+            };
+
+            if let Some(cmd) = current_manifest.scripts.get(hook) {
                 let mut ctx = rnpm_lifecycle::LifecycleContext::new(
                     staging_dir.path(),
                     staging_dir.path(),
-                    manifest.name.as_deref().unwrap_or("git-pkg"),
+                    current_manifest.name.as_deref().unwrap_or("git-pkg"),
                     hook,
                     cmd,
                 );
-                ctx.package_version = manifest.version.clone();
-                ctx.foreground_scripts = foreground_scripts;
+                ctx.package_version = current_manifest.version.clone();
+                ctx.foreground_scripts = options.foreground_scripts;
                 ctx.extra_env.insert("_RNPM_NO_PREPARE_".to_string(), new_no_prepare.clone());
+                ctx.extra_env.insert(
+                    "_RNPM_PREPARE_DEPTH_".to_string(),
+                    (current_depth + 1).to_string(),
+                );
+                if let Some(ref path_val) = staging_path_env {
+                    ctx.extra_env.insert("PATH".to_string(), path_val.clone());
+                    #[cfg(windows)]
+                    ctx.extra_env.insert("Path".to_string(), path_val.clone());
+                }
 
                 let status = rnpm_lifecycle::execute_lifecycle_script(&ctx).with_context(|| {
                     format!("Failed to execute '{}' script for git dependency '{}'", hook, src_key)
@@ -941,22 +1109,85 @@ pub fn materialize_git_dependency(
             }
         }
 
-        let staging_manifest_path = staging_dir.path().join("package.json");
+        // 3. Read effective manifest after prepack and prepare
         let effective_manifest = if staging_manifest_path.is_file() {
-            Manifest::from_file(&staging_manifest_path).unwrap_or(manifest)
+            Manifest::from_file(&staging_manifest_path)
+                .unwrap_or_else(|_| staging_manifest.clone())
         } else {
-            manifest
+            staging_manifest
         };
 
+        // 4. Collect/pack the package files into dst BEFORE running postpack
         copy_pack_files_to_dest(staging_dir.path(), &effective_manifest, dst)?;
+
+        // 5. Run postpack (if present) AFTER collection/packing
+        if let Some(cmd) = effective_manifest.scripts.get("postpack") {
+            let mut ctx = rnpm_lifecycle::LifecycleContext::new(
+                staging_dir.path(),
+                staging_dir.path(),
+                effective_manifest.name.as_deref().unwrap_or("git-pkg"),
+                "postpack",
+                cmd,
+            );
+            ctx.package_version = effective_manifest.version.clone();
+            ctx.foreground_scripts = options.foreground_scripts;
+            ctx.extra_env.insert("_RNPM_NO_PREPARE_".to_string(), new_no_prepare.clone());
+            ctx.extra_env.insert(
+                "_RNPM_PREPARE_DEPTH_".to_string(),
+                (current_depth + 1).to_string(),
+            );
+            if let Some(ref path_val) = staging_path_env {
+                ctx.extra_env.insert("PATH".to_string(), path_val.clone());
+                #[cfg(windows)]
+                ctx.extra_env.insert("Path".to_string(), path_val.clone());
+            }
+
+            let status = rnpm_lifecycle::execute_lifecycle_script(&ctx).with_context(|| {
+                format!("Failed to execute 'postpack' script for git dependency '{}'", src_key)
+            })?;
+
+            if !status.success() {
+                return Err(anyhow!(
+                    "Git dependency preparation failed: script 'postpack' exited with code {:?}",
+                    status.code()
+                ));
+            }
+        }
+
         return Ok(());
     }
 
     copy_pack_files_to_dest(src, &manifest, dst)
 }
 
+pub async fn materialize_git_dependency(
+    src: &Path,
+    dst: &Path,
+    ignore_scripts: bool,
+    foreground_scripts: bool,
+) -> Result<()> {
+    materialize_git_dependency_with_options(
+        src,
+        dst,
+        &GitMaterializeOptions {
+            ignore_scripts,
+            foreground_scripts,
+            ..Default::default()
+        },
+    )
+    .await
+}
+
 pub fn copy_dir_all(src: &Path, dst: &Path) -> Result<()> {
-    materialize_git_dependency(src, dst, false, false)
+    let manifest_path = src.join("package.json");
+    if !manifest_path.is_file() {
+        return copy_dir_all_raw_pack(src, dst);
+    }
+    if let Ok(manifest) = Manifest::from_file(&manifest_path) {
+        copy_pack_files_to_dest(src, &manifest, dst)
+    } else {
+        copy_dir_all_raw_pack(src, dst)
+    }
 }
 
 /// Safely removes a directory tree, clearing Windows read-only flags and handling long paths if necessary.
