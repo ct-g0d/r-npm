@@ -4,12 +4,13 @@ use std::collections::HashMap;
 
 use rnpm_registry::metadata::AbbreviatedPackageMetadata;
 use rnpm_registry::provenance::{
-    assemble_sigstore_bundle, format_registry_signature_payload, normalize_repository_url,
-    sign_dsse_envelope, AttestationItem, AttestationResponse, EphemeralSigner, InTotoStatement,
-    InTotoSubject, LogId, ProvenancePolicy, ProvenanceVerifier, PublicKeyHint, SigstoreBundle,
-    SlsaBuilder, SlsaConfigSource, SlsaInvocation, SlsaPredicate, TlogEntry,
-    VerificationMaterial, NPM_REGISTRY_KEYID, REKOR_DEFAULT_LOG_ID,
-    TEST_MOCK_CA_PRIV_PKCS8_B64, TEST_MOCK_REKOR_PRIV_PKCS8_B64,
+    assemble_sigstore_bundle, decode_base64, format_registry_signature_payload,
+    normalize_repository_url, sign_dsse_envelope, AttestationItem, AttestationResponse,
+    EphemeralSigner, InTotoStatement, InTotoSubject, LogId, ProvenancePolicy, ProvenanceVerifier,
+    PublicKeyHint, SigstoreBundle, SlsaBuilder, SlsaConfigSource, SlsaInvocation, SlsaPredicate,
+    TlogEntry, VerificationMaterial, FULCIO_INTERMEDIATE_CA_2_DER_B64, FULCIO_ROOT_CA_1_DER_B64,
+    FULCIO_ROOT_CA_2_DER_B64, NPM_REGISTRY_KEYID, REKOR_DEFAULT_LOG_ID,
+    REKOR_DEFAULT_PUBKEY_SPKI_B64, TEST_MOCK_CA_PRIV_PKCS8_B64, TEST_MOCK_REKOR_PRIV_PKCS8_B64,
 };
 use rnpm_registry::RegistryError;
 
@@ -819,4 +820,36 @@ fn test_keyed_publish_attestation_verified_against_registry_keys() {
         .expect("Verification with registry key should succeed");
 
     assert_eq!(verified.package_name, "@scoped/keyed-pkg");
+}
+
+#[test]
+fn test_embedded_sigstore_public_good_rekor_and_fulcio_roots() {
+    // Verify Rekor default key SPKI hashes to REKOR_DEFAULT_LOG_ID
+    let rekor_spki = decode_base64(REKOR_DEFAULT_PUBKEY_SPKI_B64).expect("valid base64 Rekor SPKI");
+    let rekor_log_id = HEXLOWER.encode(&Sha256::digest(&rekor_spki));
+    assert_eq!(
+        rekor_log_id, REKOR_DEFAULT_LOG_ID,
+        "Rekor default public key must hash to official logID"
+    );
+
+    // Verify P-256 SPKI parsing with ring
+    let (_, _, pk_bytes) = rnpm_registry::asn1::parse_spki(&rekor_spki).expect("parse Rekor SPKI");
+    assert_eq!(pk_bytes.len(), 65, "P-256 uncompressed public key is 65 bytes");
+
+    // Verify Fulcio root certificates parse as valid X.509
+    let c1 = decode_base64(FULCIO_ROOT_CA_1_DER_B64).expect("valid Fulcio Root 1");
+    let parsed1 = rnpm_registry::asn1::parse_x509_certificate(&c1).expect("parse Fulcio Root 1");
+    assert!(parsed1.not_before < parsed1.not_after, "Fulcio Root 1 validity window");
+    assert!(!parsed1.spki_bytes.is_empty(), "Fulcio Root 1 SPKI");
+
+    let c2 = decode_base64(FULCIO_ROOT_CA_2_DER_B64).expect("valid Fulcio Root 2");
+    let parsed2 = rnpm_registry::asn1::parse_x509_certificate(&c2).expect("parse Fulcio Root 2");
+    assert!(parsed2.not_before < parsed2.not_after, "Fulcio Root 2 validity window");
+    assert!(!parsed2.spki_bytes.is_empty(), "Fulcio Root 2 SPKI");
+
+    let ci2 = decode_base64(FULCIO_INTERMEDIATE_CA_2_DER_B64).expect("valid Fulcio Intermediate 2");
+    let parsed_i2 =
+        rnpm_registry::asn1::parse_x509_certificate(&ci2).expect("parse Fulcio Intermediate 2");
+    assert!(parsed_i2.not_before < parsed_i2.not_after, "Fulcio Intermediate 2 validity window");
+    assert!(!parsed_i2.spki_bytes.is_empty(), "Fulcio Intermediate 2 SPKI");
 }

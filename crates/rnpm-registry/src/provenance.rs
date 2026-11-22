@@ -13,7 +13,7 @@ pub const NPM_REGISTRY_KEYID: &str = "SHA256:jl3bwswu80PjjokCgh0o2w5c2U4LhQAE57g
 
 /// The well-known default Rekor public key SPKI base64 string from Sigstore TUF roots (P-256).
 pub const REKOR_DEFAULT_PUBKEY_SPKI_B64: &str =
-    "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE2G2Y+2tabdTV5BcGIBIx0a9fAFwrkBbmLSGtks4L3qX6yYY0zufBnhC8Ur/iy55GhWP/9A/bY2LhC30M9+RYtw==";
+    "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE2G2Y+2tabdTV5BcGiBIx0a9fAFwrkBbmLSGtks4L3qX6yYY0zufBnhC8Ur/iy55GhWP/9A/bY2LhC30M9+RYtw==";
 
 /// Rekor log2025-1 Ed25519 public key SPKI base64 string from Sigstore TUF roots.
 pub const REKOR_2025_PUBKEY_SPKI_B64: &str =
