@@ -15,9 +15,10 @@ pub mod sandbox;
 
 pub use error::LifecycleError;
 pub use node_gyp::{
-    bootstrap_node_gyp, ensure_node_gyp, find_cache_dir, find_node_gyp, find_registry,
-    is_offline_mode, node_gyp_bin_dir, package_dir_in_node_modules, pick_matching_version,
-    unpack_tarball, validate_package_name, verify_tarball_integrity, StagingGuard,
+    bootstrap_node_gyp, count_node_modules_depth, ensure_node_gyp, find_cache_dir, find_node_gyp,
+    find_registry, install_production_dependencies, is_ancestor_satisfied, is_offline_mode,
+    node_gyp_bin_dir, package_dir_in_node_modules, pick_matching_version, unpack_tarball,
+    validate_package_name, verify_tarball_integrity, MAX_NESTING_DEPTH, StagingGuard,
 };
 pub use policy::{SandboxLevel, ScriptSandboxPolicy};
 pub use sandbox::{check_dangerous_command_patterns, CommandPatternAnalyzer};

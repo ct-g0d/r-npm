@@ -443,8 +443,122 @@ pub async fn download_and_unpack_node_gyp(registry: &str, staging_dir: &Path) ->
     Ok(())
 }
 
+pub const MAX_NESTING_DEPTH: usize = 16;
+
+/// Counts the number of `node_modules` path segments in `path` relative to `staging_dir`.
+pub fn count_node_modules_depth(path: &Path, staging_dir: &Path) -> usize {
+    let rel = path.strip_prefix(staging_dir).unwrap_or(path);
+    rel.components()
+        .filter(|c| c.as_os_str() == "node_modules")
+        .count()
+}
+
+fn get_installed_pkg_info(package_dir: &Path) -> (Option<String>, Option<String>) {
+    let pkg_json = package_dir.join("package.json");
+    if let Ok(content) = std::fs::read_to_string(&pkg_json) {
+        if let Ok(val) = serde_json::from_str::<serde_json::Value>(&content) {
+            let name = val.get("name").and_then(|v| v.as_str()).map(|s| s.to_string());
+            let ver = val.get("version").and_then(|v| v.as_str()).map(|s| s.to_string());
+            return (name, ver);
+        }
+    }
+    (None, None)
+}
+
+fn directory_matches_pkg_name(dir: &Path, pkg_name: &str) -> bool {
+    if let Some((scope, name)) = pkg_name.split_once('/') {
+        let dir_name = dir.file_name().and_then(|s| s.to_str()).unwrap_or("");
+        let parent_name = dir.parent().and_then(|p| p.file_name()).and_then(|s| s.to_str()).unwrap_or("");
+        dir_name == name && parent_name == scope
+    } else {
+        dir.file_name().and_then(|s| s.to_str()).unwrap_or("") == pkg_name
+    }
+}
+
+/// Checks whether a dependency `(job_name, job_spec)` is already satisfied in the ancestor
+/// directory chain from `parent_dir` upward to `staging_dir`, matching Node.js resolution order.
+pub fn is_ancestor_satisfied(
+    job_name: &str,
+    job_spec: &str,
+    parent_dir: &Path,
+    staging_dir: &Path,
+) -> anyhow::Result<bool> {
+    let mut curr = Some(parent_dir);
+
+    while let Some(dir) = curr {
+        if !dir.starts_with(staging_dir) {
+            break;
+        }
+
+        let is_nm_folder = dir.file_name().and_then(|s| s.to_str()) == Some("node_modules");
+        let is_scope_folder = dir
+            .file_name()
+            .and_then(|s| s.to_str())
+            .is_some_and(|s| s.starts_with('@'));
+
+        if is_nm_folder || is_scope_folder {
+            if dir == staging_dir {
+                break;
+            }
+            curr = dir.parent();
+            continue;
+        }
+
+        // 1. Direct self/mutual cycle check:
+        // If an ancestor directory itself IS `<name>` with a version satisfying `job.spec`, STOP!
+        if dir != staging_dir {
+            let (pkg_name_opt, pkg_ver_opt) = get_installed_pkg_info(dir);
+            let ver_opt = pkg_ver_opt.or_else(|| get_installed_version(dir));
+            let name_matches = pkg_name_opt.as_deref() == Some(job_name)
+                || directory_matches_pkg_name(dir, job_name);
+            if name_matches {
+                if let Some(ref v) = ver_opt {
+                    if version_matches_spec(v, job_spec) {
+                        debug!(
+                            "Dependency '{}@{}' satisfied by ancestor package directory {}",
+                            job_name, v, dir.display()
+                        );
+                        return Ok(true);
+                    }
+                }
+            }
+        }
+
+        // 2. Ancestor's node_modules resolution check:
+        // If ANY ancestor's `node_modules/<name>` exists and its installed version satisfies `job.spec`, STOP!
+        let nm_dir = dir.join("node_modules");
+        if nm_dir.is_dir() {
+            if let Ok(cand) = package_dir_in_node_modules(&nm_dir, job_name) {
+                if cand.exists() {
+                    if let Some(ref v) = get_installed_version(&cand) {
+                        if version_matches_spec(v, job_spec) {
+                            debug!(
+                                "Dependency '{}@{}' already satisfied at ancestor {}",
+                                job_name, v, cand.display()
+                            );
+                            return Ok(true);
+                        }
+                    }
+                    // In Node module resolution, an existing cand in a closer node_modules
+                    // shadows all higher ancestors. If it does not satisfy job_spec,
+                    // higher ancestors cannot satisfy this require call.
+                    break;
+                }
+            }
+        }
+
+        if dir == staging_dir {
+            break;
+        }
+
+        curr = dir.parent();
+    }
+
+    Ok(false)
+}
+
 /// Recursively / transitively resolves and installs production dependencies into `staging_dir/node_modules`.
-async fn install_production_dependencies(
+pub async fn install_production_dependencies(
     client: &reqwest::Client,
     registry: &str,
     staging_dir: &Path,
@@ -469,32 +583,37 @@ async fn install_production_dependencies(
     let mut installed_packages: std::collections::HashSet<(PathBuf, String)> = std::collections::HashSet::new();
 
     while let Some(job) = queue.pop_front() {
+        // Walk all ancestor directories from job.parent_dir upward up to staging_dir.
+        // If already satisfied -> STOP!
+        if is_ancestor_satisfied(&job.name, &job.spec, &job.parent_dir, staging_dir)? {
+            debug!(
+                "Dependency '{}@{}' already satisfied in ancestor chain; skipping install",
+                job.name, job.spec
+            );
+            continue;
+        }
+
         let top_nm = staging_dir.join("node_modules");
         let top_target = package_dir_in_node_modules(&top_nm, &job.name)?;
 
         let target_dir = if top_target.exists() {
-            let installed_ver = get_installed_version(&top_target);
-            if let Some(ref v) = installed_ver {
-                if version_matches_spec(v, &job.spec) {
-                    debug!("Dependency '{}@{}' already satisfied at {}", job.name, v, top_target.display());
-                    continue;
-                }
-            }
             // Version conflict at top level! Install nested in <job.parent_dir>/node_modules/<job.name>
             let nested_nm = job.parent_dir.join("node_modules");
-            let nested_target = package_dir_in_node_modules(&nested_nm, &job.name)?;
-            if nested_target.exists() {
-                let nested_ver = get_installed_version(&nested_target);
-                if let Some(ref v) = nested_ver {
-                    if version_matches_spec(v, &job.spec) {
-                        continue;
-                    }
-                }
-            }
-            nested_target
+            package_dir_in_node_modules(&nested_nm, &job.name)?
         } else {
             top_target
         };
+
+        let depth = count_node_modules_depth(&target_dir, staging_dir);
+        if depth > MAX_NESTING_DEPTH {
+            anyhow::bail!(
+                "Exceeded maximum dependency nesting depth of {} (target: '{}') while resolving '{}@{}'",
+                MAX_NESTING_DEPTH,
+                target_dir.display(),
+                job.name,
+                job.spec
+            );
+        }
 
         let key = (target_dir.clone(), job.spec.clone());
         if installed_packages.contains(&key) {
@@ -515,6 +634,14 @@ async fn install_production_dependencies(
                 .ok_or_else(|| anyhow::anyhow!("No matching version found for dependency '{}' satisfying '{}'", job.name, job.spec))?
         } else if packument.get("dist").is_some() {
             let v = packument.get("version").and_then(|v| v.as_str()).unwrap_or("0.0.0");
+            if !version_matches_spec(v, &job.spec) {
+                anyhow::bail!(
+                    "Single-version response for dependency '{}' has version '{}', which does not satisfy '{}'",
+                    job.name,
+                    v,
+                    job.spec
+                );
+            }
             (v, &packument)
         } else {
             anyhow::bail!("Invalid packument format for '{}'", job.name);
