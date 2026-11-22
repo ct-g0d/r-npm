@@ -2130,6 +2130,230 @@ async fn test_ci_drift_detection_dev_dependencies_mutated() {
 }
 
 #[tokio::test]
+async fn test_ci_omit_dev_drift_detection_dev_dependencies_mutated() {
+    let tmp = tempdir().unwrap();
+    let project_dir = tmp.path();
+
+    // 1. Initial package.json with devDependencies
+    let mut manifest = Manifest::default();
+    manifest.name = Some("dev-drift-app".to_string());
+    manifest.version = Some("1.0.0".to_string());
+    manifest
+        .dev_dependencies
+        .insert("dev-tool".to_string(), "^1.0.0".to_string());
+    manifest
+        .save_to_file(project_dir.join("package.json"))
+        .unwrap();
+
+    // 2. Matching lockfile
+    let mut lockfile = LockfileV3::new("dev-drift-app", Some("1.0.0".to_string()));
+    let mut dev_deps = BTreeMap::new();
+    dev_deps.insert("dev-tool".to_string(), "^1.0.0".to_string());
+    lockfile.root_package_mut().unwrap().dev_dependencies = Some(dev_deps);
+    lockfile.insert_package(
+        "node_modules/dev-tool",
+        LockfilePackage {
+            version: Some("1.0.0".to_string()),
+            resolved: Some("https://registry.npmjs.org/dev-tool/-/dev-tool-1.0.0.tgz".to_string()),
+            integrity: Some("sha512-validhash".to_string()),
+            dev: Some(true),
+            ..Default::default()
+        },
+    );
+    lockfile
+        .save_to_file(&project_dir.join("package-lock.json"))
+        .unwrap();
+
+    // 3. Mutate devDependencies in package.json to ^2.0.0
+    manifest
+        .dev_dependencies
+        .insert("dev-tool".to_string(), "^2.0.0".to_string());
+    manifest
+        .save_to_file(project_dir.join("package.json"))
+        .unwrap();
+
+    let mut installer = Installer::new(InstallOptions {
+        project_dir: project_dir.to_path_buf(),
+        offline: true,
+        omit_dev: true,
+        ..Default::default()
+    })
+    .unwrap();
+
+    let res = installer.run_ci().await;
+    assert!(
+        res.is_err(),
+        "run_ci with omit_dev must fail when devDependencies mutated in package.json"
+    );
+    let err_msg = res.unwrap_err().to_string();
+    assert!(
+        err_msg.contains("ELOCKFILE_DRIFT"),
+        "Error must contain ELOCKFILE_DRIFT: {err_msg}"
+    );
+    assert!(
+        err_msg.contains("EUSAGE"),
+        "Error must contain EUSAGE: {err_msg}"
+    );
+    assert!(
+        err_msg.contains("dev-tool"),
+        "Error must mention drifted package: {err_msg}"
+    );
+}
+
+#[tokio::test]
+async fn test_ci_omit_dev_drift_detection_dev_dependencies_added() {
+    let tmp = tempdir().unwrap();
+    let project_dir = tmp.path();
+
+    // 1. Initial package.json and lockfile without devDependencies
+    let mut manifest = Manifest::default();
+    manifest.name = Some("dev-add-app".to_string());
+    manifest.version = Some("1.0.0".to_string());
+    manifest
+        .dependencies
+        .insert("prod-pkg".to_string(), "^1.0.0".to_string());
+    manifest
+        .save_to_file(project_dir.join("package.json"))
+        .unwrap();
+
+    let mut lockfile = LockfileV3::new("dev-add-app", Some("1.0.0".to_string()));
+    let mut deps = BTreeMap::new();
+    deps.insert("prod-pkg".to_string(), "^1.0.0".to_string());
+    lockfile.root_package_mut().unwrap().dependencies = Some(deps);
+    lockfile.insert_package(
+        "node_modules/prod-pkg",
+        LockfilePackage {
+            version: Some("1.0.0".to_string()),
+            resolved: Some("https://registry.npmjs.org/prod-pkg/-/prod-pkg-1.0.0.tgz".to_string()),
+            integrity: Some("sha512-validhash".to_string()),
+            ..Default::default()
+        },
+    );
+    lockfile
+        .save_to_file(&project_dir.join("package-lock.json"))
+        .unwrap();
+
+    // 2. Add a new devDependency to package.json without updating lockfile
+    manifest
+        .dev_dependencies
+        .insert("new-dev-tool".to_string(), "^1.0.0".to_string());
+    manifest
+        .save_to_file(project_dir.join("package.json"))
+        .unwrap();
+
+    let mut installer = Installer::new(InstallOptions {
+        project_dir: project_dir.to_path_buf(),
+        offline: true,
+        omit_dev: true,
+        ..Default::default()
+    })
+    .unwrap();
+
+    let res = installer.run_ci().await;
+    assert!(
+        res.is_err(),
+        "run_ci with omit_dev must fail when devDependencies added to package.json without updating lockfile"
+    );
+    let err_msg = res.unwrap_err().to_string();
+    assert!(
+        err_msg.contains("ELOCKFILE_DRIFT"),
+        "Error must contain ELOCKFILE_DRIFT: {err_msg}"
+    );
+    assert!(
+        err_msg.contains("EUSAGE"),
+        "Error must contain EUSAGE: {err_msg}"
+    );
+    assert!(
+        err_msg.contains("new-dev-tool"),
+        "Error must mention drifted package: {err_msg}"
+    );
+}
+
+#[tokio::test]
+async fn test_ci_omit_dev_succeeds_and_omits_dev_when_in_sync() {
+    let tmp = tempdir().unwrap();
+    let project_dir = tmp.path();
+
+    let prod_tar = make_tarball("prod-pkg", "1.0.0", &[]);
+    let prod_integrity = Integrity::from_bytes(&prod_tar, Algorithm::Sha512).to_string();
+    let dev_tar = make_tarball("dev-pkg", "1.0.0", &[]);
+    let dev_integrity = Integrity::from_bytes(&dev_tar, Algorithm::Sha512).to_string();
+
+    let pkgs_dir = project_dir.join("pkgs");
+    fs::create_dir_all(&pkgs_dir).unwrap();
+    fs::write(pkgs_dir.join("prod-pkg-1.0.0.tgz"), &prod_tar).unwrap();
+    fs::write(pkgs_dir.join("dev-pkg-1.0.0.tgz"), &dev_tar).unwrap();
+
+    let mut lockfile = LockfileV3::new("sync-omit-app", Some("1.0.0".to_string()));
+    let mut deps = BTreeMap::new();
+    deps.insert(
+        "prod-pkg".to_string(),
+        "file:./pkgs/prod-pkg-1.0.0.tgz".to_string(),
+    );
+    let mut dev_deps = BTreeMap::new();
+    dev_deps.insert(
+        "dev-pkg".to_string(),
+        "file:./pkgs/dev-pkg-1.0.0.tgz".to_string(),
+    );
+    lockfile.root_package_mut().unwrap().dependencies = Some(deps.clone());
+    lockfile.root_package_mut().unwrap().dev_dependencies = Some(dev_deps.clone());
+    lockfile.insert_package(
+        "node_modules/prod-pkg",
+        LockfilePackage {
+            version: Some("1.0.0".to_string()),
+            resolved: Some("file:./pkgs/prod-pkg-1.0.0.tgz".to_string()),
+            integrity: Some(prod_integrity),
+            ..Default::default()
+        },
+    );
+    lockfile.insert_package(
+        "node_modules/dev-pkg",
+        LockfilePackage {
+            version: Some("1.0.0".to_string()),
+            resolved: Some("file:./pkgs/dev-pkg-1.0.0.tgz".to_string()),
+            integrity: Some(dev_integrity),
+            dev: Some(true),
+            ..Default::default()
+        },
+    );
+    lockfile
+        .save_to_file(&project_dir.join("package-lock.json"))
+        .unwrap();
+
+    let mut manifest = Manifest::default();
+    manifest.name = Some("sync-omit-app".to_string());
+    manifest.version = Some("1.0.0".to_string());
+    manifest.dependencies = deps;
+    manifest.dev_dependencies = dev_deps;
+    manifest
+        .save_to_file(project_dir.join("package.json"))
+        .unwrap();
+
+    let mut installer = Installer::new(InstallOptions {
+        project_dir: project_dir.to_path_buf(),
+        offline: true,
+        omit_dev: true,
+        ..Default::default()
+    })
+    .unwrap();
+
+    let res = installer.run_ci().await;
+    assert!(
+        res.is_ok(),
+        "ci --omit=dev must succeed when lockfile is in sync: {:?}",
+        res.err()
+    );
+    assert!(
+        project_dir.join("node_modules/prod-pkg/package.json").is_file(),
+        "Production dependency must be installed in node_modules"
+    );
+    assert!(
+        !project_dir.join("node_modules/dev-pkg").exists(),
+        "Dev dependency must be omitted from node_modules when omit_dev is true"
+    );
+}
+
+#[tokio::test]
 async fn test_ci_drift_detection_dependency_deleted_from_manifest() {
     let tmp = tempdir().unwrap();
     let project_dir = tmp.path();

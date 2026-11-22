@@ -5460,31 +5460,29 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
         // 2. Dev dependencies drift check
         let lock_dev_deps = root_pkg.dev_dependencies.as_ref().unwrap_or(&empty_deps);
 
-        if !self.options.omit_dev {
-            for (dep_name, dep_spec) in &manifest.dev_dependencies {
-                if let Some(lock_spec) = lock_dev_deps.get(dep_name) {
-                    if lock_spec != dep_spec {
-                        let satisfies = if let Some(pkg) =
-                            lockfile.packages.get(&format!("node_modules/{dep_name}"))
-                        {
-                            LockfileV3::package_satisfies_spec(dep_name, pkg, dep_spec)
-                        } else {
-                            false
-                        };
-                        if !satisfies {
-                            return Err(anyhow!(
-                                "rnpm ERR! code ELOCKFILE_DRIFT: package.json devDependency {}@{} does not match lockfile spec {} (EUSAGE)",
-                                dep_name, dep_spec, lock_spec
-                            ));
-                        }
+        for (dep_name, dep_spec) in &manifest.dev_dependencies {
+            if let Some(lock_spec) = lock_dev_deps.get(dep_name) {
+                if lock_spec != dep_spec {
+                    let satisfies = if let Some(pkg) =
+                        lockfile.packages.get(&format!("node_modules/{dep_name}"))
+                    {
+                        LockfileV3::package_satisfies_spec(dep_name, pkg, dep_spec)
+                    } else {
+                        false
+                    };
+                    if !satisfies {
+                        return Err(anyhow!(
+                            "rnpm ERR! code ELOCKFILE_DRIFT: package.json devDependency {}@{} does not match lockfile spec {} (EUSAGE)",
+                            dep_name, dep_spec, lock_spec
+                        ));
                     }
-                } else {
-                    return Err(anyhow!(
-                        "rnpm ERR! code ELOCKFILE_DRIFT: package.json devDependency {} missing from {} (EUSAGE)",
-                        dep_name,
-                        lockfile_name
-                    ));
                 }
+            } else {
+                return Err(anyhow!(
+                    "rnpm ERR! code ELOCKFILE_DRIFT: package.json devDependency {} missing from {} (EUSAGE)",
+                    dep_name,
+                    lockfile_name
+                ));
             }
         }
 
@@ -5523,7 +5521,7 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
         }
 
         // 4. Comprehensive lockfile validation via matches_manifest_for_ci
-        if !lockfile.matches_manifest_for_ci(&manifest, !self.options.omit_dev) {
+        if !lockfile.matches_manifest_for_ci(&manifest, true) {
             return Err(anyhow!(
                 "rnpm ERR! code ELOCKFILE_DRIFT: package.json and {} are out of sync. Please run `rnpm install` to update your lockfile. (EUSAGE)",
                 lockfile_name

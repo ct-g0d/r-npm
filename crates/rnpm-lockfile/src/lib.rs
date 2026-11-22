@@ -436,6 +436,66 @@ mod tests {
     }
 
     #[test]
+    fn test_matches_manifest_for_ci_validates_dev_dependencies() {
+        use rnpm_core::Manifest;
+
+        let mut lockfile = LockfileV3::new("ci-app", Some("1.0.0".to_string()));
+        let mut deps = BTreeMap::new();
+        deps.insert("chalk".to_string(), "^5.0.0".to_string());
+        let mut dev_deps = BTreeMap::new();
+        dev_deps.insert("typescript".to_string(), "^5.0.0".to_string());
+
+        if let Some(root) = lockfile.root_package_mut() {
+            root.dependencies = Some(deps.clone());
+            root.dev_dependencies = Some(dev_deps.clone());
+        }
+
+        lockfile.insert_package(
+            "node_modules/chalk",
+            LockfilePackage {
+                version: Some("5.3.0".to_string()),
+                ..Default::default()
+            },
+        );
+        lockfile.insert_package(
+            "node_modules/typescript",
+            LockfilePackage {
+                version: Some("5.4.2".to_string()),
+                dev: Some(true),
+                ..Default::default()
+            },
+        );
+
+        let mut manifest = Manifest::default();
+        manifest.name = Some("ci-app".to_string());
+        manifest.version = Some("1.0.0".to_string());
+        manifest.dependencies = deps;
+        manifest.dev_dependencies = dev_deps;
+
+        // In CI, when in sync, matches_manifest_for_ci validates dev dependencies
+        assert!(lockfile.matches_manifest_for_ci(&manifest, true));
+
+        // When devDependency is mutated in package.json, CI validation fails
+        let mut dev_mutated = manifest.clone();
+        dev_mutated
+            .dev_dependencies
+            .insert("typescript".to_string(), "^6.0.0".to_string());
+        assert!(!lockfile.matches_manifest_for_ci(&dev_mutated, true));
+
+        // When a new devDependency is added to package.json, CI validation fails
+        let mut dev_added = manifest.clone();
+        dev_added
+            .dev_dependencies
+            .insert("eslint".to_string(), "^9.0.0".to_string());
+        assert!(!lockfile.matches_manifest_for_ci(&dev_added, true));
+
+        // When devDependency is deleted from package.json, CI allows extra lockfile deps
+        let mut dev_deleted = manifest.clone();
+        dev_deleted.dev_dependencies.remove("typescript");
+        assert!(lockfile.matches_manifest_for_ci(&dev_deleted, true));
+    }
+
+    #[test]
     fn hidden_lockfile_preserves_indent_and_newlines() {
         let tmp = tempfile::tempdir().unwrap();
         let project = tmp.path();
