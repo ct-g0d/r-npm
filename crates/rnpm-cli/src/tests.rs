@@ -146,6 +146,8 @@ async fn test_cli_update_command_integration() {
             json: false,
             no_audit: false,
             no_fund: false,
+            no_bin_links: false,
+            bin_links: None,
         },
     };
 
@@ -1386,6 +1388,8 @@ async fn test_cli_unsupported_protocol_fixture_install_fails_cleanly() {
             wait_for_trash: false,
             detached_trash: true,
             json: false,
+            no_bin_links: false,
+            bin_links: None,
         },
     };
 

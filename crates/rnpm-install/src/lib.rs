@@ -51,7 +51,8 @@ pub mod fast_path;
 mod legacy_lock;
 pub use legacy_lock::detect_lockfile_version;
 pub use fast_path::{
-    compute_project_fingerprint, validate_hidden_lockfile, validate_hidden_lockfile_simple,
+    compute_input_fingerprint, compute_project_fingerprint, validate_hidden_lockfile,
+    validate_hidden_lockfile_simple,
 };
 
 pub mod timing;
@@ -1750,6 +1751,8 @@ pub struct InstallOptions {
     pub unlocked_packages: std::collections::HashSet<String>,
     /// Vulnerability constraints to avoid when selecting versions during audit fix.
     pub vulnerability_constraints: std::collections::HashMap<String, Vec<rnpm_core::semver::Range>>,
+    /// Whether to create binary shims in `.bin` directories (default: true).
+    pub bin_links: bool,
 }
 
 impl InstallOptions {
@@ -1854,6 +1857,7 @@ impl Default for InstallOptions {
             wait_for_trash: false,
             unlocked_packages: std::collections::HashSet::new(),
             vulnerability_constraints: std::collections::HashMap::new(),
+            bin_links: true,
         }
     }
 }
@@ -3913,7 +3917,9 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
             (nm, bin, base)
         };
         std::fs::create_dir_all(&node_modules_dir).context("Failed to create node_modules")?;
-        std::fs::create_dir_all(&root_bin_dir).context("Failed to create bin dir")?;
+        if self.options.bin_links {
+            std::fs::create_dir_all(&root_bin_dir).context("Failed to create bin dir")?;
+        }
 
         // Milestone M3: Diff ideal tree against actual tree (node_modules/.package-lock.json)
         // A linked tree's hidden lockfile describes the isolated store, not
@@ -4105,7 +4111,7 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                     Some(rnpm_lockfile::PackageBin::Map(map)) => !map.is_empty(),
                     None => false,
                 };
-                if has_bin {
+                if self.options.bin_links && has_bin {
                     let bin_dir =
                         find_enclosing_bin_dir(&dest_dir, &root_bin_dir, &node_modules_dir);
                     dirs_to_precreate.push(bin_dir);
@@ -5177,97 +5183,105 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
 
         // Link all package bins across the tree in shallowest-first order with first-writer-wins
         // per .bin directory in this run, overwriting shims and cleaning up stale ones.
-        let mut tree_packages: Vec<String> = graph
-            .nodes
-            .keys()
-            .filter(|loc| {
-                if loc.is_empty() {
-                    return false;
-                }
-                if self.options.omit_dev && graph.nodes.get(*loc).is_some_and(|n| n.flags.dev) {
-                    return false;
-                }
-                if self.options.omit_optional
-                    && graph.nodes.get(*loc).is_some_and(|n| n.flags.optional)
-                {
-                    return false;
-                }
-                if self.options.omit_peer && graph.nodes.get(*loc).is_some_and(|n| n.flags.peer) {
-                    return false;
-                }
-                if let Some(node) = graph.nodes.get(*loc) {
-                    let is_optional = node.flags.optional || node.flags.dev_optional;
-                    if is_optional {
-                        let host_platform = self.options.platform();
-                        let is_compat = rnpm_solver::is_platform_compatible(
-                            &host_platform,
-                            node.os.as_deref(),
-                            node.cpu.as_deref(),
-                            node.libc.as_deref(),
-                        );
-                        if !is_compat {
-                            return false;
+        if self.options.bin_links {
+            let mut tree_packages: Vec<String> = graph
+                .nodes
+                .keys()
+                .filter(|loc| {
+                    if loc.is_empty() {
+                        return false;
+                    }
+                    if self.options.omit_dev && graph.nodes.get(*loc).is_some_and(|n| n.flags.dev) {
+                        return false;
+                    }
+                    if self.options.omit_optional
+                        && graph.nodes.get(*loc).is_some_and(|n| n.flags.optional)
+                    {
+                        return false;
+                    }
+                    if self.options.omit_peer && graph.nodes.get(*loc).is_some_and(|n| n.flags.peer) {
+                        return false;
+                    }
+                    if let Some(node) = graph.nodes.get(*loc) {
+                        let is_optional = node.flags.optional || node.flags.dev_optional;
+                        if is_optional {
+                            let host_platform = self.options.platform();
+                            let is_compat = rnpm_solver::is_platform_compatible(
+                                &host_platform,
+                                node.os.as_deref(),
+                                node.cpu.as_deref(),
+                                node.libc.as_deref(),
+                            );
+                            if !is_compat {
+                                return false;
+                            }
                         }
                     }
-                }
-                if workspace_members.iter().any(|m| &m.relative_path == *loc) {
-                    return false;
-                }
-                true
-            })
-            .cloned()
-            .collect();
+                    if workspace_members.iter().any(|m| &m.relative_path == *loc) {
+                        return false;
+                    }
+                    true
+                })
+                .cloned()
+                .collect();
 
-        let mut known_bins = HashMap::new();
-        for (loc, node) in &graph.nodes {
-            if let Some(ref bin) = node.bin {
-                let entries = extract_bin_entries_from_lockfile(&node.name, bin);
+            let mut known_bins = HashMap::new();
+            for (loc, node) in &graph.nodes {
+                if let Some(ref bin) = node.bin {
+                    let entries = extract_bin_entries_from_lockfile(&node.name, bin);
+                    if !entries.is_empty() {
+                        known_bins.insert(loc.clone(), entries);
+                    }
+                }
+            }
+            // Bundled children are discovered from their owner's tarball after
+            // solving. Their bins belong to the physical tree too.
+            for (loc, package) in &lockfile.packages {
+                if package.in_bundle != Some(true)
+                    || (self.options.omit_dev && package.dev == Some(true))
+                    || (self.options.omit_optional && package.optional == Some(true))
+                    || (self.options.omit_peer && package.peer == Some(true))
+                {
+                    continue;
+                }
+                let Some(bin) = &package.bin else { continue };
+                if !loc_base_dir.join(loc).is_dir() {
+                    continue;
+                }
+                let name = package.name.as_deref().unwrap_or_else(|| {
+                    loc.rsplit_once("/node_modules/")
+                        .map_or(loc.as_str(), |(_, name)| name)
+                });
+                let entries = extract_bin_entries_from_lockfile(name, bin);
                 if !entries.is_empty() {
+                    tree_packages.push(loc.clone());
                     known_bins.insert(loc.clone(), entries);
                 }
             }
-        }
-        // Bundled children are discovered from their owner's tarball after
-        // solving. Their bins belong to the physical tree too.
-        for (loc, package) in &lockfile.packages {
-            if package.in_bundle != Some(true)
-                || (self.options.omit_dev && package.dev == Some(true))
-                || (self.options.omit_optional && package.optional == Some(true))
-                || (self.options.omit_peer && package.peer == Some(true))
-            {
-                continue;
+            for member in &workspace_members {
+                let entries = member.manifest.bin_entries();
+                if !entries.is_empty() {
+                    known_bins.insert(format!("node_modules/{}", member.name), entries.clone());
+                    known_bins.insert(member.relative_path.clone(), entries);
+                }
             }
-            let Some(bin) = &package.bin else { continue };
-            if !loc_base_dir.join(loc).is_dir() {
-                continue;
-            }
-            let name = package.name.as_deref().unwrap_or_else(|| {
-                loc.rsplit_once("/node_modules/")
-                    .map_or(loc.as_str(), |(_, name)| name)
-            });
-            let entries = extract_bin_entries_from_lockfile(name, bin);
-            if !entries.is_empty() {
-                tree_packages.push(loc.clone());
-                known_bins.insert(loc.clone(), entries);
-            }
-        }
-        for member in &workspace_members {
-            let entries = member.manifest.bin_entries();
-            if !entries.is_empty() {
-                known_bins.insert(format!("node_modules/{}", member.name), entries.clone());
-                known_bins.insert(member.relative_path.clone(), entries);
-            }
-        }
 
-        link_tree_bins(
-            tree_packages,
-            Some(&known_bins),
-            &loc_base_dir,
-            &root_bin_dir,
-            &node_modules_dir,
-            false,
-            Some(&collector),
-        );
+            link_tree_bins(
+                tree_packages,
+                Some(&known_bins),
+                &loc_base_dir,
+                &root_bin_dir,
+                &node_modules_dir,
+                false,
+                Some(&collector),
+            );
+        } else {
+            remove_all_bin_dirs(&node_modules_dir);
+            for member in &workspace_members {
+                let ws_nm = loc_base_dir.join(&member.relative_path).join("node_modules");
+                remove_all_bin_dirs(&ws_nm);
+            }
+        }
 
         // npm reify builds dependencies before saving, then install runs root hooks.
         let lifecycle_opts = if !self.options.ignore_scripts {
@@ -5766,7 +5780,9 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
             fast_trash_wipe_dir(&node_modules_dir)?;
         }
         std::fs::create_dir_all(&node_modules_dir)?;
-        std::fs::create_dir_all(&bin_dir)?;
+        if self.options.bin_links {
+            std::fs::create_dir_all(&bin_dir)?;
+        }
 
         // Pre-create all package parent directories and bin directories in one breadth-first pass
         {
@@ -5814,7 +5830,7 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                     Some(rnpm_lockfile::PackageBin::Map(map)) => !map.is_empty(),
                     None => false,
                 };
-                if has_bin {
+                if self.options.bin_links && has_bin {
                     let pkg_bin_dir =
                         find_enclosing_bin_dir(&target_path, &bin_dir, &node_modules_dir);
                     dirs_to_precreate.push(pkg_bin_dir);
@@ -6994,17 +7010,25 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                                 },
                             )?;
                         }
-                        let t_bins = std::time::Instant::now();
-                        link_tree_bins(
-                            ci_tree_packages,
-                            Some(&known_bins),
-                            loc_base_ref,
-                            bin_dir_ref,
-                            nm_dir_ref,
-                            true,
-                            None,
-                        );
-                        collector.record_phase(Phase::Bins, t_bins.elapsed());
+                        if self.options.bin_links {
+                            let t_bins = std::time::Instant::now();
+                            link_tree_bins(
+                                ci_tree_packages,
+                                Some(&known_bins),
+                                loc_base_ref,
+                                bin_dir_ref,
+                                nm_dir_ref,
+                                true,
+                                None,
+                            );
+                            collector.record_phase(Phase::Bins, t_bins.elapsed());
+                        } else {
+                            remove_all_bin_dirs(nm_dir_ref);
+                            for member in &workspace_members {
+                                let ws_nm = loc_base_ref.join(&member.relative_path).join("node_modules");
+                                remove_all_bin_dirs(&ws_nm);
+                            }
+                        }
                         if save_hidden_needed {
                             let t_lock = std::time::Instant::now();
                             let _ = without_omitted(&self.options, lockfile_ref)
@@ -7440,21 +7464,29 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
 
             let known_bins = crate::fast_path::build_known_bins_map(&lockfile);
 
-            let t_bin_link = std::time::Instant::now();
-            link_tree_bins(
-                ci_tree_packages,
-                Some(&known_bins),
-                &loc_base_dir,
-                &bin_dir,
-                &node_modules_dir,
-                true,
-                Some(&collector),
-            );
-            if std::env::var_os("RNPM_TIMING_DEBUG").is_some() {
-                eprintln!(
-                    "[TIMING_PROFILE] bin link finished: {:.1} ms",
-                    t_bin_link.elapsed().as_secs_f64() * 1000.0
+            if self.options.bin_links {
+                let t_bin_link = std::time::Instant::now();
+                link_tree_bins(
+                    ci_tree_packages,
+                    Some(&known_bins),
+                    &loc_base_dir,
+                    &bin_dir,
+                    &node_modules_dir,
+                    true,
+                    Some(&collector),
                 );
+                if std::env::var_os("RNPM_TIMING_DEBUG").is_some() {
+                    eprintln!(
+                        "[TIMING_PROFILE] bin link finished: {:.1} ms",
+                        t_bin_link.elapsed().as_secs_f64() * 1000.0
+                    );
+                }
+            } else {
+                remove_all_bin_dirs(&node_modules_dir);
+                for member in &workspace_members {
+                    let ws_nm = loc_base_dir.join(&member.relative_path).join("node_modules");
+                    remove_all_bin_dirs(&ws_nm);
+                }
             }
         }
         // As with install, complete dependency builds and save the actual tree
@@ -8668,13 +8700,15 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
 
         if pkg_manifest_path.exists() {
             if let Ok(pkg_manifest) = Manifest::from_file(&pkg_manifest_path) {
-                let pkg_bin_dir = find_enclosing_bin_dir(&dest_dir, bin_dir, node_modules_dir);
-                let _ = std::fs::create_dir_all(&pkg_bin_dir);
-                for (bin_name, script_rel) in pkg_manifest.bin_entries() {
-                    let target_rel = compute_bin_target_rel(&dest_dir, &pkg_bin_dir, &script_rel);
-                    let script_path = dest_dir.join(&script_rel);
-                    let _ = normalize_shebang(&script_path);
-                    let _ = create_shims(&pkg_bin_dir, &bin_name, &target_rel);
+                if self.options.bin_links {
+                    let pkg_bin_dir = find_enclosing_bin_dir(&dest_dir, bin_dir, node_modules_dir);
+                    let _ = std::fs::create_dir_all(&pkg_bin_dir);
+                    for (bin_name, script_rel) in pkg_manifest.bin_entries() {
+                        let target_rel = compute_bin_target_rel(&dest_dir, &pkg_bin_dir, &script_rel);
+                        let script_path = dest_dir.join(&script_rel);
+                        let _ = normalize_shebang(&script_path);
+                        let _ = create_shims(&pkg_bin_dir, &bin_name, &target_rel);
+                    }
                 }
 
                 let is_git = node.resolved_url.starts_with("git+")

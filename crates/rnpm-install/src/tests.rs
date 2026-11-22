@@ -5172,3 +5172,306 @@ async fn test_install_npmrc_lockfile_version_override() {
     let json: serde_json::Value = serde_json::from_str(&content).unwrap();
     assert_eq!(json["lockfileVersion"], 2, "npmrc lockfile-version = 2 must produce v2 lockfile");
 }
+
+fn create_test_bin_tarball(pkg_name: &str, version: &str, bin_name: &str) -> Vec<u8> {
+    use flate2::Compression;
+    use std::io::Cursor;
+    use tar::{Builder, Header};
+
+    let manifest_json = serde_json::json!({
+        "name": pkg_name,
+        "version": version,
+        "bin": {
+            bin_name: "./bin/cli.js"
+        }
+    });
+    let manifest_bytes = serde_json::to_vec_pretty(&manifest_json).unwrap();
+    let bin_content = b"#!/usr/bin/env node\nconsole.log('hello');\n";
+
+    let mut gz = GzEncoder::new(Vec::new(), Compression::default());
+    {
+        let mut builder = Builder::new(&mut gz);
+
+        let mut header = Header::new_gnu();
+        header.set_size(manifest_bytes.len() as u64);
+        header.set_mode(0o644);
+        let path = "package/package.json";
+        header.as_mut_bytes()[..path.len()].copy_from_slice(path.as_bytes());
+        header.set_cksum();
+        builder
+            .append(&header, Cursor::new(manifest_bytes))
+            .unwrap();
+
+        let mut bin_header = Header::new_gnu();
+        bin_header.set_size(bin_content.len() as u64);
+        bin_header.set_mode(0o755);
+        let bin_path = "package/bin/cli.js";
+        bin_header.as_mut_bytes()[..bin_path.len()].copy_from_slice(bin_path.as_bytes());
+        bin_header.set_cksum();
+        builder
+            .append(&bin_header, Cursor::new(bin_content))
+            .unwrap();
+
+        builder.finish().unwrap();
+    }
+    gz.finish().unwrap()
+}
+
+#[tokio::test]
+async fn test_no_bin_links_hoisted_and_fast_path_toggle() {
+    let tmp = tempdir().unwrap();
+    let root = tmp.path().join("project");
+    fs::create_dir_all(&root).unwrap();
+
+    let pkg_a_dir = tmp.path().join("pkg-a");
+    fs::create_dir_all(pkg_a_dir.join("bin")).unwrap();
+    fs::write(
+        pkg_a_dir.join("package.json"),
+        serde_json::json!({
+            "name": "pkg-a",
+            "version": "1.0.0",
+            "bin": {
+                "my-cli": "./bin/cli.js"
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+    fs::write(
+        pkg_a_dir.join("bin/cli.js"),
+        "#!/usr/bin/env node\nconsole.log('hello');\n",
+    )
+    .unwrap();
+
+    let pkg_a_uri = format!("file:{}", pkg_a_dir.display().to_string().replace('\\', "/"));
+    fs::write(
+        root.join("package.json"),
+        serde_json::json!({
+            "name": "my-app",
+            "version": "1.0.0",
+            "dependencies": {
+                "pkg-a": pkg_a_uri
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    // 1. Initial install with bin_links: false
+    let options_no_bin = InstallOptions {
+        project_dir: root.clone(),
+        bin_links: false,
+        ..Default::default()
+    };
+    let mut installer1 = Installer::new(options_no_bin).unwrap();
+    installer1.install().await.unwrap();
+
+    let bin_dir = root.join("node_modules/.bin");
+    let file_count_1 = if bin_dir.exists() {
+        fs::read_dir(&bin_dir).unwrap().count()
+    } else {
+        0
+    };
+    assert_eq!(
+        file_count_1, 0,
+        "bin_links=false must create 0 files in node_modules/.bin"
+    );
+
+    // 2. Switch back to bin_links: true without stale fast-path hit
+    let options_with_bin = InstallOptions {
+        project_dir: root.clone(),
+        bin_links: true,
+        ..Default::default()
+    };
+    let mut installer2 = Installer::new(options_with_bin).unwrap();
+    installer2.install().await.unwrap();
+
+    assert!(
+        bin_dir.exists(),
+        "node_modules/.bin must exist after switching to bin_links=true"
+    );
+    let file_count_2 = fs::read_dir(&bin_dir).unwrap().count();
+    assert!(
+        file_count_2 > 0,
+        "node_modules/.bin must have shims created when bin_links=true"
+    );
+    #[cfg(windows)]
+    assert!(
+        bin_dir.join("my-cli.cmd").exists(),
+        "my-cli.cmd must exist on Windows"
+    );
+
+    // 3. Switch back to bin_links: false -> stale shims must be removed and 0 files in .bin
+    let options_no_bin_again = InstallOptions {
+        project_dir: root.clone(),
+        bin_links: false,
+        ..Default::default()
+    };
+    let mut installer3 = Installer::new(options_no_bin_again).unwrap();
+    installer3.install().await.unwrap();
+
+    let file_count_3 = if bin_dir.exists() {
+        fs::read_dir(&bin_dir).unwrap().count()
+    } else {
+        0
+    };
+    assert_eq!(
+        file_count_3, 0,
+        "switching from bin_links=true to false must remove stale shims, leaving 0 files in .bin"
+    );
+}
+
+#[tokio::test]
+async fn test_no_bin_links_linked_strategy() {
+    let tmp = tempdir().unwrap();
+    let root = tmp.path().join("project");
+    fs::create_dir_all(&root).unwrap();
+
+    let tarball_bytes = create_test_bin_tarball("pkg-a", "1.0.0", "my-cli");
+    let tgz_path = root.join("pkg-a-1.0.0.tgz");
+    fs::write(&tgz_path, &tarball_bytes).unwrap();
+
+    fs::write(
+        root.join("package.json"),
+        serde_json::json!({
+            "name": "my-app",
+            "version": "1.0.0",
+            "dependencies": {
+                "pkg-a": "file:./pkg-a-1.0.0.tgz"
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    // 1. Linked install with bin_links: false
+    let options_no_bin = InstallOptions {
+        project_dir: root.clone(),
+        bin_links: false,
+        install_strategy: crate::InstallStrategy::Linked,
+        ..Default::default()
+    };
+    let mut installer1 = Installer::new(options_no_bin).unwrap();
+    installer1.install().await.unwrap();
+
+    let bin_dir = root.join("node_modules/.bin");
+    let file_count_1 = if bin_dir.exists() {
+        fs::read_dir(&bin_dir).unwrap().count()
+    } else {
+        0
+    };
+    assert_eq!(
+        file_count_1, 0,
+        "linked install with bin_links=false must create 0 files in node_modules/.bin"
+    );
+
+    // 2. Switch back to bin_links: true
+    let options_with_bin = InstallOptions {
+        project_dir: root.clone(),
+        bin_links: true,
+        install_strategy: crate::InstallStrategy::Linked,
+        ..Default::default()
+    };
+    let mut installer2 = Installer::new(options_with_bin).unwrap();
+    installer2.install().await.unwrap();
+
+    assert!(
+        bin_dir.exists(),
+        "node_modules/.bin must exist after switching to bin_links=true in linked install"
+    );
+    let file_count_2 = fs::read_dir(&bin_dir).unwrap().count();
+    assert!(
+        file_count_2 > 0,
+        "node_modules/.bin must have shims created in linked install"
+    );
+
+    // 3. Switch back to bin_links: false
+    let options_no_bin_again = InstallOptions {
+        project_dir: root.clone(),
+        bin_links: false,
+        install_strategy: crate::InstallStrategy::Linked,
+        ..Default::default()
+    };
+    let mut installer3 = Installer::new(options_no_bin_again).unwrap();
+    installer3.install().await.unwrap();
+
+    let file_count_3 = if bin_dir.exists() {
+        fs::read_dir(&bin_dir).unwrap().count()
+    } else {
+        0
+    };
+    assert_eq!(
+        file_count_3, 0,
+        "switching to bin_links=false in linked install must remove stale shims, leaving 0 files in .bin"
+    );
+}
+
+#[tokio::test]
+async fn test_no_bin_links_ci() {
+    let tmp = tempdir().unwrap();
+    let root = tmp.path().join("project");
+    fs::create_dir_all(&root).unwrap();
+
+    let pkg_a_dir = tmp.path().join("pkg-a");
+    fs::create_dir_all(pkg_a_dir.join("bin")).unwrap();
+    fs::write(
+        pkg_a_dir.join("package.json"),
+        serde_json::json!({
+            "name": "pkg-a",
+            "version": "1.0.0",
+            "bin": {
+                "my-cli": "./bin/cli.js"
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+    fs::write(
+        pkg_a_dir.join("bin/cli.js"),
+        "#!/usr/bin/env node\nconsole.log('hello');\n",
+    )
+    .unwrap();
+
+    let pkg_a_uri = format!("file:{}", pkg_a_dir.display().to_string().replace('\\', "/"));
+    fs::write(
+        root.join("package.json"),
+        serde_json::json!({
+            "name": "my-app",
+            "version": "1.0.0",
+            "dependencies": {
+                "pkg-a": pkg_a_uri
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    // Generate package-lock.json first
+    let mut setup_installer = Installer::new(InstallOptions {
+        project_dir: root.clone(),
+        bin_links: true,
+        ..Default::default()
+    })
+    .unwrap();
+    setup_installer.install().await.unwrap();
+
+    // Now run CI with bin_links: false
+    let mut ci_installer = Installer::new(InstallOptions {
+        project_dir: root.clone(),
+        bin_links: false,
+        ..Default::default()
+    })
+    .unwrap();
+    ci_installer.run_ci().await.unwrap();
+
+    let bin_dir = root.join("node_modules/.bin");
+    let file_count = if bin_dir.exists() {
+        fs::read_dir(&bin_dir).unwrap().count()
+    } else {
+        0
+    };
+    assert_eq!(
+        file_count, 0,
+        "CI with bin_links=false must create 0 files in node_modules/.bin"
+    );
+}

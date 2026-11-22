@@ -232,6 +232,14 @@ pub(crate) enum Commands {
         /// Output JSON summary instead of text
         #[arg(long)]
         json: bool,
+
+        /// Suppress binary shim creation in node_modules/.bin
+        #[arg(long = "no-bin-links")]
+        no_bin_links: bool,
+
+        /// Toggle binary shim creation in node_modules/.bin
+        #[arg(long = "bin-links", num_args = 0..=1, default_missing_value = "true")]
+        bin_links: Option<bool>,
     },
 
     /// Install dependencies directly from package-lock.json (clean slate)
@@ -373,6 +381,14 @@ pub(crate) enum Commands {
         /// Output JSON summary instead of text
         #[arg(long)]
         json: bool,
+
+        /// Suppress binary shim creation in node_modules/.bin
+        #[arg(long = "no-bin-links")]
+        no_bin_links: bool,
+
+        /// Toggle binary shim creation in node_modules/.bin
+        #[arg(long = "bin-links", num_args = 0..=1, default_missing_value = "true")]
+        bin_links: Option<bool>,
     },
 
     /// Run package test script
@@ -626,6 +642,14 @@ pub(crate) enum Commands {
         /// Disable funding messages
         #[arg(long = "no-fund")]
         no_fund: bool,
+
+        /// Suppress binary shim creation in node_modules/.bin
+        #[arg(long = "no-bin-links")]
+        no_bin_links: bool,
+
+        /// Toggle binary shim creation in node_modules/.bin
+        #[arg(long = "bin-links", num_args = 0..=1, default_missing_value = "true")]
+        bin_links: Option<bool>,
     },
 
     /// Perform a security audit of dependency vulnerabilities
@@ -4928,6 +4952,8 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             wait_for_trash,
             detached_trash,
             json,
+            no_bin_links,
+            bin_links,
         } => {
             if json {
                 mark_json_mode();
@@ -4987,6 +5013,11 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
                 false
             } else {
                 fund.unwrap_or_else(|| config.get_bool("fund").unwrap_or(true))
+            };
+            let bin_links_val = if no_bin_links || bin_links == Some(false) {
+                false
+            } else {
+                bin_links.unwrap_or_else(|| config.get_bool("bin-links").unwrap_or(true))
             };
             let mut workspace = workspace;
             let target_dir = if let Some(p) = prefix {
@@ -5100,6 +5131,7 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
                 wait_for_trash,
                 detached_trash,
                 silent,
+                bin_links: bin_links_val,
                 ..Default::default()
             };
 
@@ -5227,6 +5259,8 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             wait_for_trash,
             detached_trash,
             json,
+            no_bin_links,
+            bin_links,
         } => {
             if json {
                 mark_json_mode();
@@ -5287,6 +5321,11 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             } else {
                 fund.unwrap_or_else(|| config.get_bool("fund").unwrap_or(true))
             };
+            let bin_links_val = if no_bin_links || bin_links == Some(false) {
+                false
+            } else {
+                bin_links.unwrap_or_else(|| config.get_bool("bin-links").unwrap_or(true))
+            };
             let options = InstallOptions {
                 project_dir: current_dir.clone(),
                 registry_url: registry.clone(),
@@ -5324,6 +5363,7 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
                 install_strategy: effective_strategy,
                 wait_for_trash,
                 detached_trash,
+                bin_links: bin_links_val,
                 ..Default::default()
             };
 
@@ -5804,6 +5844,8 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             legacy_peer_deps,
             strict_peer_deps,
             json,
+            no_bin_links,
+            bin_links,
             ..
         } => {
             let opts = commands::update::UpdateOptions {
@@ -5818,6 +5860,8 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
                 strict_peer_deps,
                 silent,
                 json,
+                no_bin_links,
+                bin_links,
             };
             commands::update::run(opts, current_dir).await?;
         }

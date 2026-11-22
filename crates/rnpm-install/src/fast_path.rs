@@ -22,6 +22,8 @@ use crate::InstallOptions;
 /// - Lockfile (`package-lock.json` or `npm-shrinkwrap.json`)
 /// - `.npmrc` settings
 /// - Resolution-impacting CLI / install options (install strategy, omit/include, target platform, workspaces)
+pub use compute_project_fingerprint as compute_input_fingerprint;
+
 pub fn compute_project_fingerprint(project_dir: &Path, options: &InstallOptions) -> Result<String> {
     let manifest_path = project_dir.join("package.json");
     if !manifest_path.exists() {
@@ -91,7 +93,7 @@ pub fn compute_project_fingerprint(project_dir: &Path, options: &InstallOptions)
 
     hasher.update(
         format!(
-            "\noptions:install_strategy={:?}:omit_dev={}:omit_opt={}:omit_peer={}:legacy_peer={}:strict_peer={}:global={}:os={:?}:cpu={:?}:libc={:?}:target_os={}:target_cpu={}:target_libc={:?}:lock_ver={}:include={:?}:workspaces={}:workspace_root={}:workspace={:?}\n",
+            "\noptions:install_strategy={:?}:omit_dev={}:omit_opt={}:omit_peer={}:legacy_peer={}:strict_peer={}:global={}:os={:?}:cpu={:?}:libc={:?}:target_os={}:target_cpu={}:target_libc={:?}:lock_ver={}:include={:?}:workspaces={}:workspace_root={}:workspace={:?}:bin_links={}\n",
             options.install_strategy,
             options.omit_dev,
             options.omit_optional,
@@ -110,6 +112,7 @@ pub fn compute_project_fingerprint(project_dir: &Path, options: &InstallOptions)
             options.workspaces,
             options.workspace_root,
             sorted_workspace,
+            options.bin_links,
         )
         .as_bytes(),
     );
@@ -766,6 +769,28 @@ mod tests {
         opts_cpu.cpu = Some("arm64".to_string());
         let cpu_fp = compute_project_fingerprint(tmp.path(), &opts_cpu).unwrap();
         assert_ne!(base_fp, cpu_fp, "target cpu must impact fingerprint");
+    }
+
+    #[test]
+    fn test_compute_project_fingerprint_includes_bin_links() {
+        let tmp = tempdir().unwrap();
+        let pkg_json = tmp.path().join("package.json");
+        std::fs::write(&pkg_json, r#"{"name": "test-pkg", "version": "1.0.0"}"#).unwrap();
+
+        let mut opts_true = InstallOptions::default();
+        opts_true.project_dir = tmp.path().to_path_buf();
+        opts_true.bin_links = true;
+
+        let mut opts_false = opts_true.clone();
+        opts_false.bin_links = false;
+
+        let fp_true = compute_project_fingerprint(tmp.path(), &opts_true).unwrap();
+        let fp_false = compute_project_fingerprint(tmp.path(), &opts_false).unwrap();
+
+        assert_ne!(
+            fp_true, fp_false,
+            "bin_links true vs false must produce different fingerprints"
+        );
     }
 
     #[test]

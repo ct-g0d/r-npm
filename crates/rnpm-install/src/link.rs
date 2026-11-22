@@ -394,6 +394,58 @@ pub(crate) fn clean_empty_bin_dir_at(bin_dir: &Path) {
     }
 }
 
+/// Removes all `.bin` directories and any shims inside them under `node_modules` (including nested `node_modules` and root `.bin`).
+pub(crate) fn remove_all_bin_dirs(root_nm: &Path) {
+    if !root_nm.is_dir() {
+        return;
+    }
+    if root_nm.file_name().map(|n| n == ".bin").unwrap_or(false) {
+        if rnpm_fs::junction::is_junction(root_nm).unwrap_or(false) {
+            let _ = rnpm_fs::junction::remove_junction(root_nm);
+        } else {
+            let _ = remove_dir_all_safe(root_nm);
+        }
+        return;
+    }
+    fn visit(dir: &Path) {
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    let file_name = entry.file_name();
+                    if file_name == ".bin" {
+                        if rnpm_fs::junction::is_junction(&path).unwrap_or(false) {
+                            let _ = rnpm_fs::junction::remove_junction(&path);
+                        } else {
+                            let _ = remove_dir_all_safe(&path);
+                        }
+                    } else if file_name == "node_modules" {
+                        visit(&path);
+                    } else if file_name.to_string_lossy().starts_with('@') {
+                        if let Ok(scoped_entries) = std::fs::read_dir(&path) {
+                            for scoped_entry in scoped_entries.flatten() {
+                                let scoped_pkg_path = scoped_entry.path();
+                                if scoped_pkg_path.is_dir() {
+                                    let nested_nm = scoped_pkg_path.join("node_modules");
+                                    if nested_nm.is_dir() {
+                                        visit(&nested_nm);
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        let nested_nm = path.join("node_modules");
+                        if nested_nm.is_dir() {
+                            visit(&nested_nm);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    visit(root_nm);
+}
+
 pub(crate) fn link_single_pkg_bin(
     target_path: &Path,
     pkg_bin_dir: &Path,
