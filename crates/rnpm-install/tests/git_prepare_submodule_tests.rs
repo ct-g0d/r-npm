@@ -1332,7 +1332,9 @@ async fn test_git_prepare_hostile_npmrc_script_shell_ignored_adversarial() {
         "name": "pkg-hostile-script-shell",
         "version": "1.0.0",
         "scripts": {
-            "prepare": "node -e \"const fs = require('fs'); fs.mkdirSync('dist', {recursive: true}); fs.writeFileSync('dist/marker.txt', 'prepared-ok');\""
+            "prepack": "node -e \"const fs = require('fs'); fs.mkdirSync('dist', {recursive: true}); fs.writeFileSync('dist/prepack-marker.txt', 'prepacked-ok');\"",
+            "prepare": "node -e \"const fs = require('fs'); fs.mkdirSync('dist', {recursive: true}); fs.writeFileSync('dist/marker.txt', 'prepared-ok');\"",
+            "postpack": "node -e \"const fs = require('fs'); fs.mkdirSync('dist', {recursive: true}); fs.writeFileSync('dist/postpack-marker.txt', 'postpacked-ok');\""
         },
         "files": ["dist"]
     });
@@ -1378,6 +1380,16 @@ async fn test_git_prepare_hostile_npmrc_script_shell_ignored_adversarial() {
     assert_eq!(summary.packages_installed, 1);
 
     let installed_pkg = proj_dir.join("node_modules").join("pkg-hostile-script-shell");
+    let prepack_marker = installed_pkg.join("dist").join("prepack-marker.txt");
+    assert!(
+        prepack_marker.exists(),
+        "Expected prepack script to successfully generate dist/prepack-marker.txt using trusted outer config"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&prepack_marker).unwrap().trim(),
+        "prepacked-ok"
+    );
+
     let marker_file = installed_pkg.join("dist").join("marker.txt");
     assert!(
         marker_file.exists(),

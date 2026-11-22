@@ -2894,22 +2894,26 @@ impl Installer {
         }
     }
 
-    async fn run_lifecycle_hooks<F, R>(&self, f: F) -> R
-    where
-        F: std::future::Future<Output = R>,
-    {
+    fn get_trusted_lifecycle_config(&self) -> Option<rnpm_config::Config> {
         if self.options.force_non_root_policy || self.options.config_override.is_some() {
-            let trusted_cfg = self.options.config_override.clone().or_else(|| {
+            self.options.config_override.clone().or_else(|| {
                 if self.options.force_non_root_policy {
                     rnpm_config::Config::load(None).ok()
                 } else {
                     None
                 }
-            });
-            rnpm_lifecycle::with_trusted_config(trusted_cfg, f).await
+            })
         } else {
-            f.await
+            None
         }
+    }
+
+    async fn run_lifecycle_hooks<F, R>(&self, f: F) -> R
+    where
+        F: std::future::Future<Output = R>,
+    {
+        let trusted_cfg = self.get_trusted_lifecycle_config();
+        rnpm_lifecycle::with_trusted_config(trusted_cfg, f).await
     }
 
     /// npm's `#inflateAncientLockfile` for a lockfileVersion 1 lock: warn,
@@ -4397,9 +4401,12 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
         }
 
         if self.options.install_strategy == InstallStrategy::Linked {
-            let added = self
-                .reify_isolated(&lockfile, existing_lockfile_for_merge.as_deref())
-                .await?;
+            let trusted_cfg = self.get_trusted_lifecycle_config();
+            let added = rnpm_lifecycle::with_trusted_config(
+                trusted_cfg,
+                self.reify_isolated(&lockfile, existing_lockfile_for_merge.as_deref()),
+            )
+            .await?;
             self.manifest_rollback.clear();
             let lockfile_path = project_lockfile_path(&self.options.project_dir);
             if self.options.package_lock_enabled() && !self.options.no_save && !self.options.is_global {
@@ -4411,7 +4418,8 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                     )
                     .with_context(|| format!("Failed to save {}", lockfile_path.display()))?;
             }
-            self.run_linked_root_hooks(&manifest).await?;
+            self.run_lifecycle_hooks(self.run_linked_root_hooks(&manifest))
+                .await?;
             collector.record_phase(Phase::Plan, plan_start.elapsed());
             return Ok(InstallSummary {
                 reify: None,
@@ -6217,8 +6225,14 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
 
         if self.options.install_strategy == InstallStrategy::Linked {
             // ci loads every node from the lockfile.
-            let added = self.reify_isolated(&lockfile, Some(&lockfile)).await?;
-            self.run_linked_root_hooks(&manifest).await?;
+            let trusted_cfg = self.get_trusted_lifecycle_config();
+            let added = rnpm_lifecycle::with_trusted_config(
+                trusted_cfg,
+                self.reify_isolated(&lockfile, Some(&lockfile)),
+            )
+            .await?;
+            self.run_lifecycle_hooks(self.run_linked_root_hooks(&manifest))
+                .await?;
             return Ok(InstallSummary {
                 reify: None,
                 packages_installed: added,
