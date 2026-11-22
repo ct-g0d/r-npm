@@ -2593,25 +2593,25 @@ fn test_thread5_cli_command_parsing() {
     // 2. link and unlink
     let cli = Cli::try_parse_from(["rnpm", "link"]).unwrap();
     match cli.command {
-        Commands::Link { package } => assert_eq!(package, None),
+        Commands::Link { package, .. } => assert_eq!(package, None),
         _ => panic!("Expected bare Link"),
     }
 
     let cli = Cli::try_parse_from(["rnpm", "link", "my-pkg"]).unwrap();
     match cli.command {
-        Commands::Link { package } => assert_eq!(package, Some("my-pkg".to_string())),
+        Commands::Link { package, .. } => assert_eq!(package, Some("my-pkg".to_string())),
         _ => panic!("Expected Link with package"),
     }
 
     let cli = Cli::try_parse_from(["rnpm", "unlink"]).unwrap();
     match cli.command {
-        Commands::Unlink { package } => assert_eq!(package, None),
+        Commands::Unlink { package, .. } => assert_eq!(package, None),
         _ => panic!("Expected bare Unlink"),
     }
 
     let cli = Cli::try_parse_from(["rnpm", "unlink", "my-pkg"]).unwrap();
     match cli.command {
-        Commands::Unlink { package } => assert_eq!(package, Some("my-pkg".to_string())),
+        Commands::Unlink { package, .. } => assert_eq!(package, Some("my-pkg".to_string())),
         _ => panic!("Expected Unlink with package"),
     }
 

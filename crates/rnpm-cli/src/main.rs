@@ -846,6 +846,18 @@ pub(crate) enum Commands {
         /// Offline mode (only use cache)
         #[arg(long)]
         offline: bool,
+
+        /// Specific workspace(s) to target
+        #[arg(short = 'w', long = "workspace")]
+        workspace: Vec<String>,
+
+        /// Run across all workspaces
+        #[arg(long = "workspaces")]
+        workspaces: bool,
+
+        /// Run against workspace root in addition to specified workspaces
+        #[arg(long = "workspace-root", alias = "include-workspace-root")]
+        workspace_root: bool,
     },
 
     /// Manage the package cache
@@ -1581,12 +1593,52 @@ pub(crate) enum Commands {
     Link {
         /// Package name to link from global prefix into local node_modules
         package: Option<String>,
+
+        /// Specific workspace(s) to target
+        #[arg(short = 'w', long = "workspace")]
+        workspace: Vec<String>,
+
+        /// Run across all workspaces
+        #[arg(long = "workspaces")]
+        workspaces: bool,
+
+        /// Save link to dependencies in package.json
+        #[arg(long = "save")]
+        save: bool,
+
+        /// Save link to devDependencies
+        #[arg(short = 'D', long = "save-dev")]
+        save_dev: bool,
+
+        /// Save link to optionalDependencies
+        #[arg(short = 'O', long = "save-optional")]
+        save_optional: bool,
+
+        /// Save link to peerDependencies
+        #[arg(long = "save-peer")]
+        save_peer: bool,
+
+        /// Save link to prodDependencies
+        #[arg(short = 'P', long = "save-prod")]
+        save_prod: bool,
+
+        /// Do not save link to dependencies
+        #[arg(long = "no-save")]
+        no_save: bool,
     },
 
     /// Unlink a package locally or globally
     Unlink {
         /// Package name to unlink from local node_modules
         package: Option<String>,
+
+        /// Specific workspace(s) to target
+        #[arg(short = 'w', long = "workspace")]
+        workspace: Vec<String>,
+
+        /// Run across all workspaces
+        #[arg(long = "workspaces")]
+        workspaces: bool,
     },
 
     /// Display npm prefix
@@ -2271,7 +2323,7 @@ pub(crate) async fn execute_run(
     }
 }
 
-fn select_workspace_members(
+pub(crate) fn select_workspace_members(
     root: &Path,
     filters: &[String],
     include_root: bool,
@@ -2844,6 +2896,33 @@ fn preprocess_init_args(
             || token.starts_with("--registry=")
             || token.starts_with("--cache=")
         {
+            clap_flags.push(token.clone());
+            i += 1;
+            continue;
+        }
+        if token == "-w" || token == "--workspace" {
+            clap_flags.push(token.clone());
+            if let Some(next) = next_token {
+                if !next.starts_with('-') {
+                    clap_flags.push(next.to_string());
+                    i += 2;
+                    continue;
+                }
+            }
+            i += 1;
+            continue;
+        }
+        if token.starts_with("--workspace=") {
+            clap_flags.push(token.clone());
+            i += 1;
+            continue;
+        }
+        if token == "--workspaces" || token == "-ws" {
+            clap_flags.push(token.clone());
+            i += 1;
+            continue;
+        }
+        if token == "--include-workspace-root" || token == "--workspace-root" {
             clap_flags.push(token.clone());
             i += 1;
             continue;
@@ -5989,6 +6068,9 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             registry,
             cache,
             offline,
+            workspace,
+            workspaces,
+            workspace_root,
         } => {
             let init_args = commands::init::InitCommandArgs {
                 initializer,
@@ -5998,6 +6080,9 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
                 registry,
                 cache,
                 offline,
+                workspace,
+                workspaces,
+                workspace_root,
             };
             commands::init::run(init_args, current_dir).await?;
         }
@@ -7108,11 +7193,41 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
         Commands::Config { action } => {
             commands::config::run(action, current_dir)?;
         }
-        Commands::Link { package } => {
-            commands::link::run_link(package, current_dir)?;
+        Commands::Link {
+            package,
+            workspace,
+            workspaces,
+            save,
+            save_dev,
+            save_optional,
+            save_peer,
+            save_prod,
+            no_save,
+        } => {
+            let link_args = commands::link::LinkCommandArgs {
+                package,
+                workspace,
+                workspaces,
+                save,
+                save_dev,
+                save_optional,
+                save_peer,
+                save_prod,
+                no_save,
+            };
+            commands::link::run_link(link_args, current_dir)?;
         }
-        Commands::Unlink { package } => {
-            commands::link::run_unlink(package, current_dir)?;
+        Commands::Unlink {
+            package,
+            workspace,
+            workspaces,
+        } => {
+            let unlink_args = commands::link::UnlinkCommandArgs {
+                package,
+                workspace,
+                workspaces,
+            };
+            commands::link::run_unlink(unlink_args, current_dir)?;
         }
         Commands::Prefix { global } => {
             if global {
