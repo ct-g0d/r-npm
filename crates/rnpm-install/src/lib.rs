@@ -5170,8 +5170,10 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                         if let Ok(Some(pack)) = self.pack_store.get_package_pack(integrity_str) {
                             for entry in &pack.index.files {
                                 if let Some(ref cas_path) = entry.cas_path {
-                                    let src = loc_base_dir.join(loc).join(&entry.path);
-                                    cas_copy_list.push((src, cas_path.clone()));
+                                    if !cas_path.exists() {
+                                        let src = loc_base_dir.join(loc).join(&entry.path);
+                                        cas_copy_list.push((src, cas_path.clone()));
+                                    }
                                 }
                             }
                         }

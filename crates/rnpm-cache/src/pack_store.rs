@@ -528,44 +528,32 @@ impl PackagePack {
             #[cfg(not(windows))]
             let src_h = None;
 
-            let mut copied = false;
-            if !can_block_clone {
+            if entry.cas_verified {
                 if let Some(ref cas_path) = entry.cas_path {
-                    let cas_valid = entry.cas_verified
-                        && cas_path
-                            .metadata()
-                            .map(|metadata| {
-                                metadata.len() == entry.size
-                                    && entry
-                                        .cas_mtime
-                                        .is_none_or(|m| mtime_to_timestamp(&metadata) == Some(m))
-                            })
-                            .unwrap_or(false);
-                    if cas_valid && rnpm_fs::copy_file_fast(cas_path, &full_path).is_ok() {
-                        copied = true;
-                        rnpm_fs::record_file_created(entry.size);
-                    } else {
-                        // Stale or corrupted CAS entry on disk: rebuild safely via temp file + atomic rename
+                    let is_corrupted = cas_path
+                        .metadata()
+                        .map(|metadata| {
+                            metadata.len() != entry.size
+                                || (entry.cas_mtime.is_some()
+                                    && mtime_to_timestamp(&metadata) != entry.cas_mtime)
+                        })
+                        .unwrap_or(false);
+                    if is_corrupted {
                         let _ = PackStore::write_cas_file_safe(cas_path, slice);
-                        if rnpm_fs::copy_file_fast(cas_path, &full_path).is_ok() {
-                            copied = true;
-                            rnpm_fs::record_file_created(entry.size);
-                        }
                     }
                 }
             }
-            if !copied {
-                clone_or_write_pack_file(
-                    src_h,
-                    &full_path,
-                    slice,
-                    entry.offset,
-                    entry.size,
-                    entry.mode,
-                    prealloc_thresh,
-                )
-                .map_err(CacheError::Io)?;
-            }
+
+            clone_or_write_pack_file(
+                src_h,
+                &full_path,
+                slice,
+                entry.offset,
+                entry.size,
+                entry.mode,
+                prealloc_thresh,
+            )
+            .map_err(CacheError::Io)?;
         }
 
         // 3. Recreate symlinks if any
@@ -852,7 +840,9 @@ impl PackStore {
                         break;
                     }
                     let (src, dst) = &files[idx];
-                    let _ = rnpm_fs::copy_file_fast(src, dst);
+                    if !dst.exists() {
+                        let _ = rnpm_fs::copy_file_fast(src, dst);
+                    }
                 });
             }
         });
@@ -3314,6 +3304,193 @@ mod tests {
         assert_eq!(
             fs::read_to_string(external.join("keep.txt")).unwrap(),
             "keep"
+        );
+    }
+
+    #[test]
+    fn test_ntfs_warm_materialize_skips_cas_disk_indirection_and_double_write() {
+        let dir = tempdir().unwrap();
+        let store = PackStore::new(dir.path()).unwrap();
+        let integrity = "sha512-skipcasdoublewrite12345==";
+
+        let files = [
+            PackInputFile::new("index.js", 0o644, b"console.log('hello world');"),
+            PackInputFile::new(
+                "package.json",
+                0o644,
+                b"{\"name\": \"test-pkg\", \"version\": \"1.0.0\"}",
+            ),
+            PackInputFile::new(
+                "lib/util.js",
+                0o644,
+                b"module.exports = { add: (a, b) => a + b };",
+            ),
+        ];
+
+        // Create pack using deferred CAS mode (simulating cold install where CAS writes are deferred)
+        let index = store.put_package_pack_deferred(integrity, &files).unwrap();
+        assert_eq!(index.files.len(), 3);
+
+        // Verify that store-v1/cas is completely empty (no CAS blobs on disk)
+        let cas_dir = store.cas_dir();
+        let cas_entries: Vec<_> = fs::read_dir(&cas_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .collect();
+        assert!(
+            cas_entries.is_empty(),
+            "CAS directory must be empty initially"
+        );
+
+        // Clear in-memory cache to force loading from disk on warm materialize
+        store.clear_mmap_cache();
+
+        // Warm materialize into target destination
+        let target = tempdir().unwrap();
+        let summary = store
+            .materialize_pack(integrity, target.path(), None)
+            .unwrap();
+
+        assert_eq!(summary.entries_extracted, 3);
+        assert_eq!(
+            fs::read(target.path().join("index.js")).unwrap(),
+            b"console.log('hello world');"
+        );
+        assert_eq!(
+            fs::read(target.path().join("package.json")).unwrap(),
+            b"{\"name\": \"test-pkg\", \"version\": \"1.0.0\"}"
+        );
+        assert_eq!(
+            fs::read(target.path().join("lib/util.js")).unwrap(),
+            b"module.exports = { add: (a, b) => a + b };"
+        );
+
+        // Verify that warm materialize did NOT redundantly create CAS blobs on disk!
+        // Materialization should write directly from the in-memory pack buffer without CAS indirection.
+        let cas_entries_after: Vec<_> = fs::read_dir(&cas_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .collect();
+        assert!(
+            cas_entries_after.is_empty(),
+            "CAS directory must remain empty: warm materialize must NOT double-write into CAS!"
+        );
+    }
+
+    #[test]
+    fn test_warm_materialize_repairs_corrupted_cas_blob_and_materializes_pristine_files() {
+        let dir = tempdir().unwrap();
+        let store = PackStore::new(dir.path()).unwrap();
+        let integrity = "sha512-casrepairmtimeandsize777==";
+
+        let original_data1 = b"export const alpha = 1;";
+        let original_data2 = b"export const beta = 2;";
+        let files = [
+            PackInputFile::new("file1.js", 0o644, original_data1),
+            PackInputFile::new("file2.js", 0o644, original_data2),
+        ];
+
+        // Create pack with CAS files populated
+        let index = store.put_package_pack(integrity, &files).unwrap();
+        let cas_path1 = index.files[0].cas_path.clone().unwrap();
+        let cas_path2 = index.files[1].cas_path.clone().unwrap();
+
+        assert!(cas_path1.is_file());
+        assert!(cas_path2.is_file());
+
+        // Corrupt file1 with size mismatch
+        fs::write(&cas_path1, b"corrupted-size").unwrap();
+
+        // Corrupt file2 with same size but altered content & mtime
+        sleep(Duration::from_millis(25));
+        let mut corrupted_data2 = original_data2.to_vec();
+        corrupted_data2[0] ^= 0x42;
+        fs::write(&cas_path2, &corrupted_data2).unwrap();
+
+        // Clear in-memory mmap cache to simulate warm verification in a fresh process
+        store.clear_mmap_cache();
+
+        let target = tempdir().unwrap();
+        let summary = store
+            .materialize_pack(integrity, target.path(), None)
+            .unwrap();
+
+        assert_eq!(summary.entries_extracted, 2);
+
+        // Verify target files are pristine directly from pack
+        assert_eq!(
+            fs::read(target.path().join("file1.js")).unwrap(),
+            original_data1
+        );
+        assert_eq!(
+            fs::read(target.path().join("file2.js")).unwrap(),
+            original_data2
+        );
+
+        // Verify corrupted CAS blobs on disk were repaired
+        assert_eq!(
+            fs::read(&cas_path1).unwrap(),
+            original_data1,
+            "Corrupted size CAS blob must be repaired"
+        );
+        assert_eq!(
+            fs::read(&cas_path2).unwrap(),
+            original_data2,
+            "Corrupted mtime CAS blob must be repaired"
+        );
+    }
+
+    #[test]
+    fn test_ntfs_materialize_speed_fast_path_vs_cas_indirection() {
+        let dir = tempdir().unwrap();
+        let store = PackStore::new(dir.path()).unwrap();
+        let integrity = "sha512-benchmaterialize999==";
+
+        // Generate 100 files of 4 KiB each
+        let file_data = vec![0xABu8; 4096];
+        let mut files = Vec::new();
+        let mut file_names = Vec::new();
+        for i in 0..100 {
+            file_names.push(format!("sub/file_{i}.dat"));
+        }
+        for name in &file_names {
+            files.push(PackInputFile::new(name, 0o644, &file_data));
+        }
+
+        store.put_package_pack_deferred(integrity, &files).unwrap();
+
+        let target_direct = tempdir().unwrap();
+        let t_start_direct = std::time::Instant::now();
+        let sum_direct = store
+            .materialize_pack(integrity, target_direct.path(), None)
+            .unwrap();
+        let duration_direct = t_start_direct.elapsed();
+        assert_eq!(sum_direct.entries_extracted, 100);
+
+        // For comparison, measure how long writing CAS + CopyFileExW would take for 100 files
+        let cas_sim_dir = tempdir().unwrap();
+        let target_cas = tempdir().unwrap();
+        let t_start_cas = std::time::Instant::now();
+        for name in &file_names {
+            let cas_file = cas_sim_dir.path().join(format!("cas_{name}.tmp"));
+            PackStore::write_cas_file_safe(&cas_file, &file_data).unwrap();
+            let dst = target_cas.path().join(name);
+            if let Some(p) = dst.parent() {
+                let _ = fs::create_dir_all(p);
+            }
+            rnpm_fs::copy_file_fast(&cas_file, &dst).unwrap();
+        }
+        let duration_cas = t_start_cas.elapsed();
+
+        eprintln!(
+            "Benchmark: Direct materialize = {:?}, CAS double-write indirection = {:?}",
+            duration_direct, duration_cas
+        );
+        assert!(
+            duration_direct <= duration_cas,
+            "Direct in-memory materialize ({:?}) should be faster than CAS double-write ({:?})",
+            duration_direct,
+            duration_cas
         );
     }
 }
