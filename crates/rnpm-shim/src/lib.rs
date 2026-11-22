@@ -239,6 +239,8 @@ pub fn normalize_shebang(file_path: &Path) -> std::io::Result<()> {
 
 /// The shebang of `target` as cmd-shim parses it: `None` when the file has
 /// no `#!` line (run directly), else `(env vars, program, trimmed args)`.
+#[cfg(any(not(unix), test))]
+#[allow(dead_code)]
 fn cmd_shim_shebang(target: &Path) -> Option<(String, String, String)> {
     let data = fs::read(target).ok()?;
     let text = String::from_utf8_lossy(&data);
@@ -370,10 +372,83 @@ pub fn generate_direct_shims(target_rel_from_node_modules: &str) -> (String, Str
     (sh, cmd, ps1)
 }
 
+/// Computes the relative POSIX symlink target from a bin directory to the target script.
+/// For a local `.bin` directory, the target is `../<target_rel_from_node_modules>`.
+/// For a global bin directory, the target is `../lib/node_modules/<target_rel_from_node_modules>`.
+pub fn compute_symlink_target(bin_dir: &Path, target_rel_from_node_modules: &str) -> String {
+    let is_dot_bin = bin_dir.file_name().is_some_and(|f| f == ".bin");
+    let normalized = target_rel_from_node_modules.replace('\\', "/");
+    let clean = normalized.strip_prefix("./").unwrap_or(&normalized);
+    if is_dot_bin {
+        format!("../{clean}")
+    } else {
+        format!("../lib/node_modules/{clean}")
+    }
+}
+
+/// Creates bin links/shims in `bin_dir`.
+///
+/// On Unix (`#[cfg(unix)]`): creates a relative POSIX symlink matching npm's `bin-links`:
+/// - `<bin_name>` -> pointing to `../<target_rel_from_node_modules>` (or global target)
+/// removes any stale existing file/symlink first, and sets executable permissions (0755)
+/// on the target script (if it exists). Does NOT write `.cmd` or `.ps1` files on Unix.
+#[cfg(unix)]
+pub fn create_shims(
+    bin_dir: &Path,
+    bin_name: &str,
+    target_rel_from_node_modules: &str,
+) -> Result<()> {
+    fs::create_dir_all(bin_dir)
+        .with_context(|| format!("Failed to create bin dir {}", bin_dir.display()))?;
+
+    let rel_target = compute_symlink_target(bin_dir, target_rel_from_node_modules);
+    let link_path = bin_dir.join(bin_name);
+
+    // Remove any stale existing file/symlink/directory first
+    if let Ok(meta) = fs::symlink_metadata(&link_path) {
+        let res = if meta.is_dir() {
+            fs::remove_dir_all(&link_path)
+        } else {
+            fs::remove_file(&link_path)
+        };
+        if let Err(e) = res {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                return Err(e).with_context(|| {
+                    format!("Failed to remove stale bin link at {}", link_path.display())
+                });
+            }
+        }
+    }
+
+    // Clean up any stale .cmd or .ps1 shims if present
+    let _ = fs::remove_file(bin_dir.join(format!("{bin_name}.cmd")));
+    let _ = fs::remove_file(bin_dir.join(format!("{bin_name}.ps1")));
+
+    std::os::unix::fs::symlink(Path::new(&rel_target), &link_path).with_context(|| {
+        format!(
+            "Failed to create symlink at {} -> {}",
+            link_path.display(),
+            rel_target
+        )
+    })?;
+
+    // chmod 0755 the target script (if it exists)
+    let target_script = bin_dir.join(&rel_target);
+    if let Ok(meta) = fs::metadata(&target_script) {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = meta.permissions();
+        perms.set_mode(0o755);
+        let _ = fs::set_permissions(&target_script, perms);
+    }
+
+    Ok(())
+}
+
 /// Creates all three companion shims in `bin_dir`:
 /// - `<bin_name>` (POSIX shell script)
 /// - `<bin_name>.cmd` (Windows batch)
 /// - `<bin_name>.ps1` (PowerShell)
+#[cfg(not(unix))]
 pub fn create_shims(
     bin_dir: &Path,
     bin_name: &str,
@@ -405,13 +480,6 @@ pub fn create_shims(
         let posix_path = bin_dir.join(bin_name);
         fs::write(&posix_path, sh)
             .with_context(|| format!("Failed to write POSIX shim {}", posix_path.display()))?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perms = fs::metadata(&posix_path)?.permissions();
-            perms.set_mode(0o755);
-            fs::set_permissions(&posix_path, perms)?;
-        }
         let cmd_path = bin_dir.join(format!("{bin_name}.cmd"));
         fs::write(&cmd_path, cmd)
             .with_context(|| format!("Failed to write CMD shim {}", cmd_path.display()))?;
@@ -424,14 +492,6 @@ pub fn create_shims(
         let posix_content = generate_posix_shim(target_rel_from_node_modules);
         fs::write(&posix_path, posix_content)
             .with_context(|| format!("Failed to write POSIX shim {}", posix_path.display()))?;
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perms = fs::metadata(&posix_path)?.permissions();
-            perms.set_mode(0o755);
-            fs::set_permissions(&posix_path, perms)?;
-        }
 
         // 2. Windows cmd wrapper
         let cmd_path = bin_dir.join(format!("{bin_name}.cmd"));
@@ -456,13 +516,6 @@ pub fn create_shims(
         let posix_path = bin_dir.join(bin_name);
         fs::write(&posix_path, content.sh)
             .with_context(|| format!("Failed to write POSIX shim {}", posix_path.display()))?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perms = fs::metadata(&posix_path)?.permissions();
-            perms.set_mode(0o755);
-            fs::set_permissions(&posix_path, perms)?;
-        }
 
         let cmd_path = bin_dir.join(format!("{bin_name}.cmd"));
         fs::write(&cmd_path, content.cmd)

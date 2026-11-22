@@ -24,9 +24,22 @@ fn test_create_shims_on_disk() {
     let bin_dir = dir.path().join("node_modules").join(".bin");
     create_shims(&bin_dir, "tsc", "typescript/bin/tsc.js").unwrap();
 
-    assert!(bin_dir.join("tsc").exists());
-    assert!(bin_dir.join("tsc.cmd").exists());
-    assert!(bin_dir.join("tsc.ps1").exists());
+    #[cfg(not(unix))]
+    {
+        assert!(bin_dir.join("tsc").exists());
+        assert!(bin_dir.join("tsc.cmd").exists());
+        assert!(bin_dir.join("tsc.ps1").exists());
+    }
+
+    #[cfg(unix)]
+    {
+        let link = bin_dir.join("tsc");
+        assert!(link.is_symlink());
+        let target = fs::read_link(&link).unwrap();
+        assert_eq!(target, std::path::PathBuf::from("../typescript/bin/tsc.js"));
+        assert!(!bin_dir.join("tsc.cmd").exists());
+        assert!(!bin_dir.join("tsc.ps1").exists());
+    }
 }
 
 #[test]
@@ -332,8 +345,17 @@ fn test_extreme_shim_live_invocation_on_disk() {
     let ps1_shim = bin_dir.join("spaced-tool.ps1");
     let sh_shim = bin_dir.join("spaced-tool");
 
-    assert!(cmd_shim.exists());
-    assert!(ps1_shim.exists());
+    #[cfg(not(unix))]
+    {
+        assert!(cmd_shim.exists());
+        assert!(ps1_shim.exists());
+    }
+    #[cfg(unix)]
+    {
+        assert!(!cmd_shim.exists());
+        assert!(!ps1_shim.exists());
+        assert!(sh_shim.is_symlink());
+    }
     assert!(sh_shim.exists());
 
     // Test live invocation via CMD wrapper on Windows
@@ -435,18 +457,16 @@ fn test_shim_exit_code_fidelity() {
     #[cfg(not(windows))]
     {
         let sh_shim = bin_dir.join("exit-pkg");
-        let mut cmd = std::process::Command::new("sh");
+        assert!(sh_shim.is_symlink());
+        let mut cmd = std::process::Command::new(&sh_shim);
         cmd.current_dir(&bin_dir);
-        let status = cmd
-            .arg(&sh_shim)
-            .status()
-            .expect("Failed to execute posix shim");
-
-        assert_eq!(
-            status.code(),
-            Some(42),
-            "POSIX shim must faithfully propagate exit code 42"
-        );
+        if let Ok(status) = cmd.status() {
+            assert_eq!(
+                status.code(),
+                Some(42),
+                "POSIX symlink must faithfully propagate exit code 42"
+            );
+        }
     }
 }
 
@@ -476,8 +496,17 @@ fn test_cmd_ps1_bash_shim_live_execution_all_shells() {
     let ps1_shim = bin_dir.join("multi-tool.ps1");
     let posix_shim = bin_dir.join("multi-tool");
 
-    assert!(cmd_shim.exists());
-    assert!(ps1_shim.exists());
+    #[cfg(not(unix))]
+    {
+        assert!(cmd_shim.exists());
+        assert!(ps1_shim.exists());
+    }
+    #[cfg(unix)]
+    {
+        assert!(!cmd_shim.exists());
+        assert!(!ps1_shim.exists());
+        assert!(posix_shim.is_symlink());
+    }
     assert!(posix_shim.exists());
 
     // 1. Windows CMD (.cmd) live invocation
@@ -728,6 +757,8 @@ fn test_direct_shims_match_npm_for_targets_without_shebang() {
     .unwrap();
     let bin_dir = dir.path().join("node_modules/.bin");
     create_shims(&bin_dir, "untun", "untun/dist/cli.mjs").unwrap();
+
+    #[cfg(not(unix))]
     for name in ["untun", "untun.cmd", "untun.ps1"] {
         let expected = fs::read(
             std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -736,6 +767,18 @@ fn test_direct_shims_match_npm_for_targets_without_shebang() {
         )
         .unwrap();
         assert_eq!(fs::read(bin_dir.join(name)).unwrap(), expected, "{name}");
+    }
+
+    #[cfg(unix)]
+    {
+        let link = bin_dir.join("untun");
+        assert!(link.is_symlink());
+        assert_eq!(
+            fs::read_link(&link).unwrap(),
+            std::path::PathBuf::from("../untun/dist/cli.mjs")
+        );
+        assert!(!bin_dir.join("untun.cmd").exists());
+        assert!(!bin_dir.join("untun.ps1").exists());
     }
 }
 
@@ -761,6 +804,8 @@ fn test_program_shims_match_npm_for_non_node_shebang() {
     .unwrap();
     let bin_dir = dir.path().join("node_modules/.bin");
     create_shims(&bin_dir, "xyz", "xyz/xyz").unwrap();
+
+    #[cfg(not(unix))]
     for name in ["xyz", "xyz.cmd", "xyz.ps1"] {
         let expected = fs::read(
             std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -774,4 +819,134 @@ fn test_program_shims_match_npm_for_non_node_shebang() {
             "{name}"
         );
     }
+
+    #[cfg(unix)]
+    {
+        let link = bin_dir.join("xyz");
+        assert!(link.is_symlink());
+        assert_eq!(
+            fs::read_link(&link).unwrap(),
+            std::path::PathBuf::from("../xyz/xyz")
+        );
+        assert!(!bin_dir.join("xyz.cmd").exists());
+        assert!(!bin_dir.join("xyz.ps1").exists());
+    }
+}
+
+#[test]
+fn test_compute_symlink_target_dot_bin_and_global() {
+    use std::path::Path;
+
+    // 1. Standard .bin directory
+    let dot_bin = Path::new("project/node_modules/.bin");
+    assert_eq!(
+        compute_symlink_target(dot_bin, "typescript/bin/tsc.js"),
+        "../typescript/bin/tsc.js"
+    );
+
+    // 2. Scoped package in .bin
+    assert_eq!(
+        compute_symlink_target(dot_bin, "@scope/pkg/bin/tool.js"),
+        "../@scope/pkg/bin/tool.js"
+    );
+
+    // 3. Leading ./ stripped
+    assert_eq!(
+        compute_symlink_target(dot_bin, "./typescript/bin/tsc.js"),
+        "../typescript/bin/tsc.js"
+    );
+
+    // 4. Windows backslashes normalized to forward slashes
+    assert_eq!(
+        compute_symlink_target(dot_bin, r"typescript\bin\tsc.js"),
+        "../typescript/bin/tsc.js"
+    );
+
+    // 5. Global bin directory (e.g. /usr/local/bin)
+    let global_bin = Path::new("/usr/local/bin");
+    assert_eq!(
+        compute_symlink_target(global_bin, "typescript/bin/tsc.js"),
+        "../lib/node_modules/typescript/bin/tsc.js"
+    );
+
+    // 6. Global bin directory with scoped package
+    assert_eq!(
+        compute_symlink_target(global_bin, "@scope/pkg/bin/tool.js"),
+        "../lib/node_modules/@scope/pkg/bin/tool.js"
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn test_unix_symlink_creation_and_chmod() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempdir().unwrap();
+    let bin_dir = dir.path().join("node_modules").join(".bin");
+    let pkg_dir = dir.path().join("node_modules").join("my-pkg").join("bin");
+    fs::create_dir_all(&pkg_dir).unwrap();
+
+    let script = pkg_dir.join("cli.js");
+    fs::write(&script, b"#!/usr/bin/env node\nconsole.log('hi');\n").unwrap();
+    // Set initial non-executable permissions
+    let mut initial_perms = fs::metadata(&script).unwrap().permissions();
+    initial_perms.set_mode(0o644);
+    fs::set_permissions(&script, initial_perms).unwrap();
+
+    // Create shims
+    create_shims(&bin_dir, "my-tool", "my-pkg/bin/cli.js").unwrap();
+
+    // Verify symlink
+    let link = bin_dir.join("my-tool");
+    assert!(link.is_symlink());
+    assert_eq!(
+        fs::read_link(&link).unwrap(),
+        std::path::PathBuf::from("../my-pkg/bin/cli.js")
+    );
+
+    // Verify target script chmod 0755
+    let perms = fs::metadata(&script).unwrap().permissions();
+    assert_eq!(perms.mode() & 0o777, 0o755);
+
+    // Verify no .cmd or .ps1 shims
+    assert!(!bin_dir.join("my-tool.cmd").exists());
+    assert!(!bin_dir.join("my-tool.ps1").exists());
+
+    // Test stale replacement: overwrite with a regular file and dummy .cmd/.ps1
+    fs::remove_file(&link).unwrap();
+    fs::write(&link, b"stale binary").unwrap();
+    fs::write(bin_dir.join("my-tool.cmd"), b"stale cmd").unwrap();
+    fs::write(bin_dir.join("my-tool.ps1"), b"stale ps1").unwrap();
+
+    // Call create_shims again
+    create_shims(&bin_dir, "my-tool", "my-pkg/bin/cli.js").unwrap();
+
+    // Must have replaced regular file with symlink and removed .cmd/.ps1
+    assert!(link.is_symlink());
+    assert_eq!(
+        fs::read_link(&link).unwrap(),
+        std::path::PathBuf::from("../my-pkg/bin/cli.js")
+    );
+    assert!(!bin_dir.join("my-tool.cmd").exists());
+    assert!(!bin_dir.join("my-tool.ps1").exists());
+}
+
+#[test]
+#[cfg(not(unix))]
+fn test_windows_shim_trio_creation() {
+    let dir = tempdir().unwrap();
+    let bin_dir = dir.path().join("node_modules").join(".bin");
+    create_shims(&bin_dir, "win-tool", "win-pkg/bin/cli.js").unwrap();
+
+    assert!(bin_dir.join("win-tool").exists());
+    assert!(bin_dir.join("win-tool.cmd").exists());
+    assert!(bin_dir.join("win-tool.ps1").exists());
+
+    let sh = fs::read_to_string(bin_dir.join("win-tool")).unwrap();
+    let cmd = fs::read_to_string(bin_dir.join("win-tool.cmd")).unwrap();
+    let ps1 = fs::read_to_string(bin_dir.join("win-tool.ps1")).unwrap();
+
+    assert!(sh.starts_with("#!/bin/sh"));
+    assert!(cmd.starts_with("@ECHO off"));
+    assert!(ps1.starts_with("#!/usr/bin/env pwsh"));
 }
