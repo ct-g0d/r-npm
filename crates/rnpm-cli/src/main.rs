@@ -1,6 +1,8 @@
 #![allow(clippy::field_reassign_with_default)]
 #![allow(clippy::too_many_arguments)]
 
+use sha2::Digest;
+
 mod audit;
 mod audit_dry_run;
 mod audit_signatures;
@@ -4151,9 +4153,7 @@ fn ci_provider_name() -> &'static str {
     }
 }
 
-/// libnpmpublish's provenance prerequisites. rnpm cannot sign a Sigstore
-/// bundle, so where npm would generate one rnpm refuses instead of
-/// publishing without the attestation it was asked for.
+/// libnpmpublish's provenance prerequisites.
 fn ensure_provenance_generation() -> anyhow::Result<()> {
     if std::env::var_os("GITHUB_ACTIONS").is_some() {
         if std::env::var_os("ACTIONS_ID_TOKEN_REQUEST_URL").is_none() {
@@ -4163,13 +4163,52 @@ fn ensure_provenance_generation() -> anyhow::Result<()> {
         if std::env::var_os("SIGSTORE_ID_TOKEN").is_none() {
             anyhow::bail!("npm error code EUSAGE\nnpm error Provenance generation in GitLab CI requires \"SIGSTORE_ID_TOKEN\" with \"sigstore\" audience to be present in \"id_tokens\". For more info see:\nnpm error https://docs.gitlab.com/ee/ci/secrets/id_token_authentication.html");
         }
+    } else if std::env::var_os("SIGSTORE_ID_TOKEN").is_some() {
+        // Direct / mock token provided
     } else {
         anyhow::bail!(
             "npm error code EUSAGE\nnpm error Automatic provenance generation not supported for provider: {}",
             ci_provider_name()
         );
     }
-    anyhow::bail!("npm error code EUSAGE\nnpm error rnpm cannot generate Sigstore provenance attestations; publish this version with npm or without --provenance")
+    Ok(())
+}
+
+/// Obtains an OIDC identity token for Sigstore from CI or environment.
+async fn get_sigstore_oidc_token() -> anyhow::Result<String> {
+    if let Ok(token) = std::env::var("SIGSTORE_ID_TOKEN") {
+        if !token.is_empty() {
+            return Ok(token);
+        }
+    }
+    if std::env::var_os("GITHUB_ACTIONS").is_some() {
+        let request_url = std::env::var("ACTIONS_ID_TOKEN_REQUEST_URL")
+            .map_err(|_| anyhow::anyhow!("Missing ACTIONS_ID_TOKEN_REQUEST_URL"))?;
+        let request_token = std::env::var("ACTIONS_ID_TOKEN_REQUEST_TOKEN").unwrap_or_default();
+        let mut url = reqwest::Url::parse(&request_url)?;
+        url.query_pairs_mut().append_pair("audience", "sigstore");
+        let client = reqwest::Client::new();
+        let mut req = client.get(url).header("accept", "application/json");
+        if !request_token.is_empty() {
+            req = req.bearer_auth(request_token);
+        }
+        let resp = req.send().await?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            anyhow::bail!("Failed to obtain GitHub Actions OIDC token ({status}): {text}");
+        }
+        let body: serde_json::Value = resp.json().await?;
+        if let Some(val) = body["value"].as_str() {
+            return Ok(val.to_string());
+        } else {
+            anyhow::bail!("GitHub Actions OIDC response missing 'value' field: {body}");
+        }
+    }
+    if let Ok(token) = std::env::var("SIGSTORE_ID_TOKEN") {
+        return Ok(token);
+    }
+    anyhow::bail!("No OIDC token available for Sigstore provenance generation")
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4446,12 +4485,41 @@ pub(crate) async fn execute_publish(
         );
     }
 
+    let provenance_requested = provenance || config.get_bool("provenance").unwrap_or(false);
+    if provenance_requested {
+        ensure_provenance_generation()?;
+    }
+
+    let mut published_tlog_url: Option<String> = None;
+
     if !dry_run {
         if manifest_json.get("private").is_some_and(|v| v == true) {
             anyhow::bail!("npm error code EPRIVATE\nnpm error This package has been marked as private\nnpm error Remove the 'private' field from the package.json to publish it.");
         }
-        if provenance || config.get_bool("provenance").unwrap_or(false) {
-            ensure_provenance_generation()?;
+        let mut provenance_attestation_val: Option<serde_json::Value> = None;
+        if provenance_requested {
+            let oidc_token = get_sigstore_oidc_token().await?;
+            let sha512_hex = data_encoding::HEXLOWER.encode(&sha2::Sha512::digest(&tarball_bytes));
+            let custom_fulcio = std::env::var("SIGSTORE_FULCIO_URL").ok();
+            let custom_rekor = std::env::var("SIGSTORE_REKOR_URL").ok();
+            let (bundle, tlog_url) = rnpm_registry::generate_sigstore_provenance(
+                &pkg_name,
+                &pkg_version,
+                &sha512_hex,
+                &oidc_token,
+                custom_fulcio.as_deref(),
+                custom_rekor.as_deref(),
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("npm error code EPROVENANCE\nnpm error Failed to generate provenance: {e}"))?;
+
+            published_tlog_url = Some(tlog_url);
+            provenance_attestation_val = Some(serde_json::json!({
+                "bundle": bundle,
+                "provenance": {
+                    "predicateType": "https://slsa.dev/provenance/v1"
+                }
+            }));
         }
         let mut publish_manifest = manifest_json.clone();
         if tarball_spec {
@@ -4520,7 +4588,7 @@ pub(crate) async fn execute_publish(
             manifest: &publish_manifest,
             tarball: tarball_data,
             registry_url: &registry_url,
-            provenance_attestation: None,
+            provenance_attestation: provenance_attestation_val.as_ref(),
         };
         let payload = rnpm_registry::create_publish_payload(&payload_opts);
         let put_url = registry_url
@@ -4596,6 +4664,9 @@ pub(crate) async fn execute_publish(
     }
 
     if !json && !is_silent {
+        if let Some(tlog_url) = published_tlog_url {
+            eprintln!("npm notice publish Provenance statement published to {tlog_url}");
+        }
         if stage {
             let suffix = stage_id
                 .map(|id| format!(" with id {id}"))

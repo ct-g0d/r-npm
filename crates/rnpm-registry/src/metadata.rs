@@ -260,6 +260,8 @@ pub struct DistAttestations {
     pub url: Option<String>,
     #[serde(default)]
     pub provenance: Option<AttestationProvenance>,
+    #[serde(default)]
+    pub bundle: Option<serde_json::Value>,
 }
 
 /// Provenance metadata summary in `dist.attestations.provenance`.

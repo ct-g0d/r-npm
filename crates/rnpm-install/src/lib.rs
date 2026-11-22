@@ -7088,6 +7088,10 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                                     return false;
                                 }
                                 if let Some(info) = lockfile.packages.get(*k) {
+                                    // Omitted packages are not on disk; npm links no bins for them.
+                                    if lockfile_entry_omitted(&self.options, &lockfile, k, info) {
+                                        return false;
+                                    }
                                     if info.link == Some(true) {
                                         return true;
                                     }

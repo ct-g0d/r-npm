@@ -1,14 +1,13 @@
-use data_encoding::{BASE64, HEXLOWER};
+use data_encoding::HEXLOWER;
 use sha2::{Digest, Sha512};
 use std::collections::HashMap;
 
 use rnpm_registry::metadata::AbbreviatedPackageMetadata;
 use rnpm_registry::provenance::{
-    format_registry_signature_payload, normalize_repository_url, AttestationItem,
-    AttestationResponse, DsseEnvelope, DsseSignature, InTotoStatement, InTotoSubject,
-    ProvenancePolicy, ProvenanceVerifier, SigstoreBundle, SlsaBuilder, SlsaConfigSource,
-    SlsaInvocation, SlsaPredicate, TlogEntry, VerificationMaterial, X509Certificate,
-    X509CertificateChain, NPM_REGISTRY_KEYID,
+    assemble_sigstore_bundle, format_registry_signature_payload, normalize_repository_url,
+    sign_dsse_envelope, AttestationItem, AttestationResponse, EphemeralSigner, InTotoStatement,
+    InTotoSubject, ProvenancePolicy, ProvenanceVerifier, SigstoreBundle, SlsaBuilder,
+    SlsaConfigSource, SlsaInvocation, SlsaPredicate, TlogEntry, NPM_REGISTRY_KEYID,
 };
 use rnpm_registry::RegistryError;
 
@@ -52,39 +51,46 @@ fn make_test_bundle(
         },
     };
 
-    let statement_bytes = serde_json::to_vec(&statement).unwrap();
-    let payload_b64 = BASE64.encode(&statement_bytes);
+    let signer = EphemeralSigner::new().unwrap();
+    let envelope = sign_dsse_envelope(&statement, &signer).unwrap();
 
-    SigstoreBundle {
-        media_type: Some("application/vnd.dev.sigstore.bundle+json;version=0.1".into()),
-        verification_material: Some(VerificationMaterial {
-            x509_certificate_chain: Some(X509CertificateChain {
-                certificates: vec![X509Certificate {
-                    raw_bytes: BASE64.encode(b"mock-certificate-bytes"),
-                }],
-            }),
-            certificate: None,
-            tlog_entries: vec![TlogEntry {
-                log_index: 998877,
-                log_id: rnpm_registry::provenance::LogId {
-                    key_id: "test-log-key".into(),
-                },
-                integrated_time: 1700000000,
-                inclusion_promise: None,
-                inclusion_proof: None,
-                canonicalized_body: None,
-            }],
-            timestamp_verification_data: None,
-        }),
-        dsse_envelope: Some(DsseEnvelope {
-            payload_type: "application/vnd.in-toto+json".into(),
-            payload: payload_b64,
-            signatures: vec![DsseSignature {
-                keyid: Some("key-1".into()),
-                sig: BASE64.encode(b"sig-bytes"),
-            }],
-        }),
-    }
+    let now = 1700000000i64;
+    let repo_norm = normalize_repository_url(repo_uri);
+    let fulcio_exts = [
+        (
+            rnpm_registry::asn1::OID_FULCIO_ISSUER,
+            "https://token.actions.githubusercontent.com",
+        ),
+        (
+            rnpm_registry::asn1::OID_FULCIO_GITHUB_WORKFLOW_REPOSITORY,
+            repo_norm.as_str(),
+        ),
+        (rnpm_registry::asn1::OID_FULCIO_RUN_COMMIT_SHA, commit_sha),
+    ];
+
+    let cert_der = rnpm_registry::asn1::create_test_x509_certificate(
+        "test-signer",
+        "sigstore",
+        signer.public_key_uncompressed(),
+        Some("https://github.com/actions/runner"),
+        &fulcio_exts,
+        now - 60,
+        now + 600,
+        &|tbs| signer.sign(tbs).unwrap(),
+    );
+
+    let tlog_entry = TlogEntry {
+        log_index: 998877,
+        log_id: rnpm_registry::provenance::LogId {
+            key_id: "test-log-key".into(),
+        },
+        integrated_time: now,
+        inclusion_promise: None,
+        inclusion_proof: None,
+        canonicalized_body: Some(data_encoding::BASE64.encode(b"canonical-body")),
+    };
+
+    assemble_sigstore_bundle(envelope, &cert_der, tlog_entry)
 }
 
 #[test]

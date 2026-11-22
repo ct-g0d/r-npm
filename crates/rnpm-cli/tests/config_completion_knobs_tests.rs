@@ -146,12 +146,20 @@ fn test_completion_script_generation() {
     let root = dir.path();
 
     // When COMP_CWORD/COMP_LINE/COMP_POINT are not set, output init script
-    let out_default = run_cmd(root, &["completion"], &[]);
+    let out_default = run_cmd(root, &["completion"], &[("MSYSTEM", "MINGW64")]);
     assert!(out_default.status.success());
     let stdout = String::from_utf8_lossy(&out_default.stdout);
     assert!(stdout.contains("###-begin-rnpm-completion-###"));
     assert!(stdout.contains("_rnpm_completion"));
     assert!(stdout.contains("complete -o default -F _rnpm_completion rnpm"));
+
+    #[cfg(windows)]
+    {
+        let out_win = run_cmd(root, &["completion"], &[]);
+        assert!(!out_win.status.success());
+        let stderr = String::from_utf8_lossy(&out_win.stderr);
+        assert!(stderr.contains("npm completion supported only in MINGW / Git bash on Windows"));
+    }
 
     let out_fish = run_cmd(root, &["completion", "fish"], &[]);
     assert!(out_fish.status.success());

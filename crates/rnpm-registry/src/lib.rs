@@ -5,6 +5,7 @@
 //! URL encoding, streaming tarball downloads, and redirect security policies
 //! (preventing auth header leakage across redirects to untrusted hostnames).
 
+pub mod asn1;
 pub mod circuit_breaker;
 pub mod client;
 pub mod error;
@@ -29,11 +30,14 @@ pub use metadata::{
     DistInfo, DistSignature, PackageBin,
 };
 pub use provenance::{
-    format_registry_signature_payload, normalize_repository_url, validate_dist_signatures,
-    verify_provenance, AttestationItem, AttestationResponse, BuildProvenance, DsseEnvelope,
-    DsseSignature, InTotoStatement, InTotoSubject, ProvenancePolicy, ProvenanceVerifier,
-    SigstoreBundle, SlsaPredicate, TransparencyLogMetadata, VerificationMaterial,
-    VerifiedProvenance, NPM_REGISTRY_KEYID,
+    assemble_sigstore_bundle, build_slsa_v1_statement, format_registry_signature_payload,
+    generate_sigstore_provenance, normalize_repository_url, request_fulcio_signing_cert,
+    sign_dsse_envelope, submit_rekor_dsse_entry, validate_dist_signatures, verify_provenance,
+    AttestationItem, AttestationResponse, BuildProvenance, CiEnvironmentInfo, DsseEnvelope,
+    DsseSignature, EphemeralSigner, InTotoStatement, InTotoSubject, ProvenancePolicy,
+    ProvenanceVerifier, SigstoreBundle, SlsaBuilder, SlsaConfigSource, SlsaInvocation,
+    SlsaPredicate, TransparencyLogMetadata, VerificationMaterial, VerifiedProvenance,
+    NPM_REGISTRY_KEYID,
 };
 pub use publish::{
     create_publish_payload, PublishAttachment, PublishPayloadOptions, PublishTarballData,

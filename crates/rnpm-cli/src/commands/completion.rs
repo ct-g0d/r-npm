@@ -105,6 +105,23 @@ pub fn run(args: Vec<String>, current_dir: &Path) -> Result<()> {
             || clean_args.len() > 1);
 
     if !has_env && !has_command_args {
+        #[cfg(windows)]
+        {
+            let msystem = std::env::var("MSYSTEM").unwrap_or_default();
+            let term = std::env::var("TERM").unwrap_or_default();
+            let is_mingw = msystem == "MINGW32" || msystem == "MINGW64";
+            let is_cygwin = term == "cygwin";
+            let requested_shell = clean_args.first().map(|s| s.as_str());
+            if !is_mingw
+                && !is_cygwin
+                && requested_shell != Some("powershell")
+                && requested_shell != Some("fish")
+            {
+                anyhow::bail!(
+                    "npm error code ENOTSUP\nnpm error npm completion supported only in MINGW / Git bash on Windows"
+                );
+            }
+        }
         print_init_script(clean_args.first().map(|s| s.as_str()));
         return Ok(());
     }
