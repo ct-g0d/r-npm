@@ -906,13 +906,22 @@ async fn test_chaos_circuit_breaker_transitions_open_fast_fail_and_half_open_rec
 #[tokio::test]
 async fn test_chaos_request_send_dropped_connection_retries_and_recovers() {
     let server = RawChaosServer::start(|mut stream, attempt, _| async move {
-        let mut buf = [0u8; 2048];
-        let _ = stream.read(&mut buf).await;
-
         if attempt == 0 {
-            // Drop connection immediately during request send
+            // Attempt 0: read initial request and abruptly drop socket to simulate dropped connection
+            let mut buf = [0u8; 1024];
+            let _ = stream.read(&mut buf).await;
             drop(stream);
         } else {
+            // Attempt > 0: consume incoming request completely before responding
+            let mut req_buf = Vec::new();
+            let mut chunk = [0u8; 1024];
+            while !req_buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                match stream.read(&mut chunk).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => req_buf.extend_from_slice(&chunk[..n]),
+                }
+            }
+
             let body = r#"{"name": "dropped-request-pkg", "dist-tags": {"latest": "1.0.0"}, "versions": {"1.0.0": {"name": "dropped-request-pkg", "version": "1.0.0", "dist": {"tarball": "http://127.0.0.1/dropped-request-pkg.tgz", "shasum": "da39a3ee5e6b4b0d3255bfef95601890afd80709"}}}}"#;
             let resp = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
@@ -921,6 +930,8 @@ async fn test_chaos_request_send_dropped_connection_retries_and_recovers() {
             );
             let _ = stream.write_all(resp.as_bytes()).await;
             let _ = stream.flush().await;
+            // Explicit graceful shutdown to prevent abortive TCP RST on Windows
+            let _ = stream.shutdown().await;
         }
     })
     .await;
