@@ -2297,55 +2297,6 @@ fn rename_atomic(from: &Path, to: &Path) -> std::io::Result<()> {
     }
 }
 
-#[cfg(windows)]
-mod windows_rename {
-    use std::io;
-    use std::os::windows::ffi::OsStrExt;
-    use std::path::Path;
-
-    const MOVEFILE_REPLACE_EXISTING: u32 = 0x00000001;
-    const MOVEFILE_WRITE_THROUGH: u32 = 0x00000008;
-
-    #[link(name = "kernel32")]
-    extern "system" {
-        fn MoveFileExW(
-            lpExistingFileName: *const u16,
-            lpNewFileName: *const u16,
-            dwFlags: u32,
-        ) -> i32;
-    }
-
-    pub fn move_file_replace(from: &Path, to: &Path) -> io::Result<()> {
-        let from_wide: Vec<u16> = from.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
-        let to_wide: Vec<u16> = to.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
-
-        let ret = unsafe {
-            MoveFileExW(
-                from_wide.as_ptr(),
-                to_wide.as_ptr(),
-                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
-            )
-        };
-        if ret == 0 {
-            Err(io::Error::last_os_error())
-        } else {
-            Ok(())
-        }
-    }
-}
-
-#[inline]
-fn atomic_replace_file(from: &Path, to: &Path) -> std::io::Result<()> {
-    #[cfg(windows)]
-    {
-        windows_rename::move_file_replace(from, to)
-    }
-    #[cfg(not(windows))]
-    {
-        fs::rename(from, to)
-    }
-}
-
 /// Atomically renames a temporary file into a CAS destination with Windows retry support.
 ///
 /// If `to` already exists and has the expected length, another thread concurrently wrote it;
@@ -2360,7 +2311,7 @@ fn rename_atomic_cas(from: &Path, to: &Path, expected_len: u64) -> std::io::Resu
             return Ok(());
         }
     }
-    if atomic_replace_file(from, to).is_ok() {
+    if fs::rename(from, to).is_ok() {
         return Ok(());
     }
     let mut attempts = 0;
@@ -2376,7 +2327,7 @@ fn rename_atomic_cas(from: &Path, to: &Path, expected_len: u64) -> std::io::Resu
                 return Ok(());
             }
         }
-        match atomic_replace_file(from, to) {
+        match fs::rename(from, to) {
             Ok(()) => return Ok(()),
             Err(e) => {
                 if let Ok(m) = to.metadata() {

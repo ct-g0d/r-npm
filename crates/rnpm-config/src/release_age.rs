@@ -164,10 +164,12 @@ fn parse_brace_range(inner: &str) -> Option<Vec<String>> {
     };
 
     if let (Ok(start), Ok(end)) = (start_str.parse::<i64>(), end_str.parse::<i64>()) {
+        let start = start as i128;
+        let end = end as i128;
         let step = if let Some(st) = step_str {
-            st.parse::<i64>().ok()?.checked_abs().unwrap_or(i64::MAX).max(1)
+            (st.parse::<i64>().ok()? as i128).abs().max(1)
         } else {
-            1
+            1i128
         };
         let pad_len = if (start_str.starts_with('0') && start_str.len() > 1)
             || (start_str.starts_with("-0") && start_str.len() > 2)
@@ -188,10 +190,7 @@ fn parse_brace_range(inner: &str) -> Option<Vec<String>> {
                 } else {
                     res.push(cur.to_string());
                 }
-                cur = cur.saturating_add(step);
-                if cur == i64::MAX {
-                    break;
-                }
+                cur += step;
             }
         } else {
             let mut cur = start;
@@ -201,10 +200,7 @@ fn parse_brace_range(inner: &str) -> Option<Vec<String>> {
                 } else {
                     res.push(cur.to_string());
                 }
-                cur = cur.saturating_sub(step);
-                if cur == i64::MIN {
-                    break;
-                }
+                cur -= step;
             }
         }
         return Some(res);
@@ -467,6 +463,26 @@ mod tests {
         assert_eq!(
             expand_braces("{z..a..-2}"),
             vec!["z", "x", "v", "t", "r", "p", "n", "l", "j", "h", "f", "d", "b"]
+        );
+    }
+
+    #[test]
+    fn test_brace_expansion_i128_extremes_and_overflow() {
+        assert_eq!(
+            expand_braces("{9223372036854775806..9223372036854775807}"),
+            vec!["9223372036854775806", "9223372036854775807"]
+        );
+        assert_eq!(
+            expand_braces("{-9223372036854775808..-9223372036854775807}"),
+            vec!["-9223372036854775808", "-9223372036854775807"]
+        );
+        assert_eq!(
+            expand_braces("{-9223372036854775808..9223372036854775807..-9223372036854775808}"),
+            vec!["-9223372036854775808", "0"]
+        );
+        assert_eq!(
+            expand_braces("{9223372036854775807..9223372036854775806}"),
+            vec!["9223372036854775807", "9223372036854775806"]
         );
     }
 }

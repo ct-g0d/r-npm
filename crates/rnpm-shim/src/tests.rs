@@ -1284,3 +1284,45 @@ fn test_windows_companion_shims_collision_checks() {
     assert!(err2.to_string().contains("EEXIST"), "Expected EEXIST for colliding .ps1 file, got: {err2}");
     assert!(create_shims_with_force(&global_bin2, "custom-tool2", "my-pkg/bin/cli.js", true).is_ok());
 }
+
+#[test]
+fn test_replace_existing_symlink_does_not_overwrite_target() {
+    let dir = tempdir().unwrap();
+    let global_bin = dir.path().join("bin");
+    fs::create_dir_all(&global_bin).unwrap();
+    let target_file = dir.path().join("target.js");
+    let original_content = b"original target file content - must not be overwritten!";
+    fs::write(&target_file, original_content).unwrap();
+
+    let shim_link = global_bin.join("my-tool");
+    #[cfg(unix)]
+    let symlink_res = std::os::unix::fs::symlink(&target_file, &shim_link);
+    #[cfg(windows)]
+    let symlink_res = std::os::windows::fs::symlink_file(&target_file, &shim_link);
+
+    if symlink_res.is_err() {
+        eprintln!("Skipping symlink replace test due to platform privilege constraints");
+        return;
+    }
+
+    assert!(fs::symlink_metadata(&shim_link).unwrap().file_type().is_symlink());
+
+    // Call create_shims_with_force with force=true to replace the existing symlink
+    let res = create_shims_with_force(&global_bin, "my-tool", "my-pkg/bin/cli.js", true);
+    assert!(res.is_ok());
+
+    // Target file content must remain UNCHANGED!
+    let current_target_content = fs::read(&target_file).unwrap();
+    assert_eq!(
+        current_target_content, original_content,
+        "Target file must not be overwritten when replacing a symlink"
+    );
+
+    // On Windows, write_shim_file replaces the symlink with a regular shim file
+    #[cfg(windows)]
+    {
+        let meta = fs::symlink_metadata(&shim_link).unwrap();
+        assert!(!meta.file_type().is_symlink());
+        assert!(meta.is_file());
+    }
+}

@@ -751,7 +751,10 @@ pub fn create_shims_with_force(
 
     let write_shim_file = |path: &Path, data: &[u8]| -> Result<()> {
         if let Ok(meta) = fs::symlink_metadata(path) {
-            if meta.permissions().readonly() {
+            if meta.file_type().is_symlink() {
+                fs::remove_file(path)
+                    .with_context(|| format!("Failed to remove existing symlink {}", path.display()))?;
+            } else if meta.permissions().readonly() {
                 let mut perms = meta.permissions();
                 perms.set_readonly(false);
                 let _ = fs::set_permissions(path, perms);
