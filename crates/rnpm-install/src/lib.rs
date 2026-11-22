@@ -1306,7 +1306,7 @@ impl PackageMetadataProvider for RegistryPackageProvider {
                 || matches!(
                     PackageTarget::parse(range),
                     Ok(PackageTarget::File(_)
-                        | PackageTarget::Git(_)
+                        | PackageTarget::Git { .. }
                         | PackageTarget::Url(_)
                         | PackageTarget::Workspace(_))
                 ));
