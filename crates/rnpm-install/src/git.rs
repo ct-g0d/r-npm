@@ -920,6 +920,7 @@ pub struct GitMaterializeOptions {
     pub force_non_root_policy: bool,
     pub before_cutoff: Option<i64>,
     pub min_release_age_exclude: Vec<String>,
+    pub config_override: Option<rnpm_config::Config>,
 }
 
 /// Materializes a git dependency into the destination folder in node_modules,
@@ -1047,6 +1048,7 @@ pub async fn materialize_git_dependency_with_options(
                 force_non_root_policy: true,
                 before_cutoff: options.before_cutoff,
                 min_release_age_exclude: options.min_release_age_exclude.clone(),
+                config_override: options.config_override.clone(),
                 ..Default::default()
             };
 

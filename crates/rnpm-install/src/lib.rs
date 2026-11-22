@@ -1873,6 +1873,8 @@ pub struct InstallOptions {
     pub before_cutoff: Option<i64>,
     /// Package names / glob patterns exempt from the release-age filter (inherited from outer install).
     pub min_release_age_exclude: Vec<String>,
+    /// Override for resolved config (e.g. inherited from outer install during git dependency prepare).
+    pub config_override: Option<rnpm_config::Config>,
 }
 
 impl InstallOptions {
@@ -1893,6 +1895,7 @@ impl InstallOptions {
             force_non_root_policy: self.force_non_root_policy,
             before_cutoff: self.before_cutoff,
             min_release_age_exclude: self.min_release_age_exclude.clone(),
+            config_override: self.config_override.clone(),
         }
     }
 
@@ -2005,6 +2008,7 @@ impl Default for InstallOptions {
             force_non_root_policy: false,
             before_cutoff: None,
             min_release_age_exclude: Vec::new(),
+            config_override: None,
         }
     }
 }
@@ -2517,7 +2521,14 @@ impl Installer {
             let global_bin = rnpm_config::find_global_bin_dir(root_dir);
             let _ = std::fs::create_dir_all(&global_bin);
         }
-        let config = Config::load(Some(root_dir)).unwrap_or_default();
+        let config = if let Some(ref cfg) = options.config_override {
+            cfg.clone()
+        } else if options.force_non_root_policy {
+            Config::load(None).unwrap_or_default()
+        } else {
+            Config::load(Some(root_dir)).unwrap_or_default()
+        };
+        options.config_override = Some(config.clone());
         if options.lockfile_version.is_none() {
             options.lockfile_version = config
                 .get("lockfile-version")
@@ -2568,6 +2579,7 @@ impl Installer {
         } else {
             config.npmrc.registry.clone()
         };
+        options.registry_url = Some(registry_url.to_string());
 
         let cache_path = options.cache_dir.clone().unwrap_or_else(|| {
             if let Some(user_cache) = config.npmrc.settings.get("cache") {
@@ -2679,8 +2691,11 @@ impl Installer {
             policy::SourcePolicy::from_config(&config)
         };
         options.source_policy_override = Some(source_policy.clone());
-        let script_policy =
-            policy::ScriptPolicy::load(&options.project_dir, &config, options.is_global);
+        let script_policy = policy::ScriptPolicy::load(
+            &options.project_dir,
+            &config,
+            options.is_global || options.force_non_root_policy,
+        );
         if !options.silent {
             for warning in &script_policy.warnings {
                 eprintln!("npm warn install-scripts {warning}");
@@ -3652,8 +3667,16 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
         let metadata_start = std::time::Instant::now();
         let _meta_span = tracing::info_span!("metadata").entered();
 
-        let root_declared = Arc::new(self.collect_root_declared(&manifest, &workspace_members));
-        let root_registry_declared = Arc::new(self.collect_root_registry_declared(&manifest, &workspace_members));
+        let root_declared = Arc::new(if self.options.force_non_root_policy {
+            HashSet::new()
+        } else {
+            self.collect_root_declared(&manifest, &workspace_members)
+        });
+        let root_registry_declared = Arc::new(if self.options.force_non_root_policy {
+            HashSet::new()
+        } else {
+            self.collect_root_registry_declared(&manifest, &workspace_members)
+        });
 
         let is_root_manifest = !self.options.force_non_root_policy;
         let check_manifest_deps = |m: &Manifest| -> Result<()> {

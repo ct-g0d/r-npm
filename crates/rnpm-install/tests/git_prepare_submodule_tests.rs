@@ -1065,3 +1065,251 @@ fs.writeFileSync('dist/built.js', 'module.exports = 999;\n');
 
     assert_no_git_leaks(&installed_pkg);
 }
+
+/// Test F: A hostile Git repository attempts to bypass outer source policies and redirect registries
+/// by committing its own `.npmrc` containing `allow-registry=all`, `registry=<attacker_url>`,
+/// and `dangerously-allow-all-scripts=true`.
+///
+/// When an outer consumer with `allow-registry=root` installs this git dependency:
+/// 1. The staging installer MUST inherit the outer config / source policy.
+/// 2. The staging installer MUST NOT load `.npmrc` from the untrusted git checkout.
+/// 3. Non-root enforcement MUST block the git dependency's registry devDependency with EALLOWREGISTRY.
+/// 4. Zero requests MUST reach the attacker registry.
+#[tokio::test]
+async fn test_git_prepare_hostile_npmrc_in_git_repo_ignored_and_enforced() {
+    let attacker_server = CountingServer::start(|_path, _base_url| {
+        Some((
+            500,
+            vec![("Content-Type", "text/plain".to_string())],
+            b"Attacker received request".to_vec(),
+        ))
+    })
+    .await;
+
+    let tmp = tempdir().unwrap();
+    let repo_dir = tmp.path().join("hostile-git-repo");
+    std::fs::create_dir_all(&repo_dir).unwrap();
+    run_git(&repo_dir, &["init"]);
+    run_git(&repo_dir, &["config", "user.name", "Attacker"]);
+    run_git(&repo_dir, &["config", "user.email", "attacker@example.com"]);
+
+    let git_pkg_json = serde_json::json!({
+        "name": "pkg-hostile-git",
+        "version": "1.0.0",
+        "main": "dist/built.js",
+        "scripts": {
+            "prepare": "my-build-tool"
+        },
+        "devDependencies": {
+            "my-build-tool": "^1.0.0"
+        }
+    });
+    std::fs::write(repo_dir.join("package.json"), git_pkg_json.to_string()).unwrap();
+
+    // Commit hostile .npmrc in git repo
+    let hostile_npmrc = format!(
+        "allow-registry=all\nallow-git=all\nregistry={}\ndangerously-allow-all-scripts=true\nstrict-ssl=false\n",
+        attacker_server.url()
+    );
+    std::fs::write(repo_dir.join(".npmrc"), hostile_npmrc).unwrap();
+
+    run_git(&repo_dir, &["add", "."]);
+    run_git(&repo_dir, &["commit", "-m", "hostile git repo with malicious .npmrc"]);
+
+    let git_url = format!(
+        "git+file://{}",
+        repo_dir.to_string_lossy().replace('\\', "/")
+    );
+
+    let proj_dir = tmp.path().join("safe-consumer-proj");
+    let cache_dir = tmp.path().join("cache-f");
+    std::fs::create_dir_all(&proj_dir).unwrap();
+    std::fs::create_dir_all(&cache_dir).unwrap();
+
+    let consumer_json = serde_json::json!({
+        "name": "safe-consumer-app",
+        "version": "1.0.0",
+        "dependencies": {
+            "pkg-hostile-git": git_url
+        }
+    });
+    std::fs::write(proj_dir.join("package.json"), consumer_json.to_string()).unwrap();
+    // Consumer enforces allow-registry=root, allow-git=root
+    std::fs::write(
+        proj_dir.join(".npmrc"),
+        "allow-registry=root\nallow-git=root\n",
+    )
+    .unwrap();
+
+    let mut installer = Installer::new(InstallOptions {
+        project_dir: proj_dir.clone(),
+        cache_dir: Some(cache_dir),
+        ..Default::default()
+    })
+    .unwrap();
+
+    let result = installer.install().await;
+    assert!(
+        result.is_err(),
+        "Expected install to fail due to non-root registry dependency in git staging"
+    );
+    let err_msg = result.unwrap_err().to_string();
+    assert!(
+        err_msg.contains("EALLOWREGISTRY"),
+        "Expected EALLOWREGISTRY error, got: {err_msg}"
+    );
+
+    // Verify 0 requests reached the attacker registry
+    assert_eq!(
+        attacker_server.request_count().await,
+        0,
+        "Attacker registry should receive 0 requests; git repo .npmrc must be ignored!"
+    );
+}
+
+/// Test G: When outer consumer allows registry=all, but git repo commits an .npmrc pointing `registry`
+/// to an attacker server, the staging preparation must STILL use the outer consumer's legitimate registry
+/// and completely ignore the repo's .npmrc registry override.
+#[tokio::test]
+async fn test_git_prepare_hostile_npmrc_cannot_redirect_registry_url() {
+    let attacker_server = CountingServer::start(|_path, _base_url| {
+        Some((
+            500,
+            vec![("Content-Type", "text/plain".to_string())],
+            b"Attacker received request".to_vec(),
+        ))
+    })
+    .await;
+
+    let builder_json = serde_json::json!({
+        "name": "legit-build-tool",
+        "version": "1.0.0",
+        "bin": {
+            "legit-build-tool": "bin.js"
+        }
+    });
+    let builder_script = r#"#!/usr/bin/env node
+const fs = require('fs');
+fs.mkdirSync('dist', { recursive: true });
+fs.writeFileSync('dist/built.js', 'module.exports = 777;\n');
+"#;
+    let builder_tarball = build_mock_tarball(&[
+        ("package.json", builder_json.to_string().as_bytes()),
+        ("bin.js", builder_script.as_bytes()),
+    ]);
+    let builder_integrity = compute_ssri(&builder_tarball);
+
+    let tarball_clone = builder_tarball.clone();
+    let legitimate_server = CountingServer::start(move |path, base_url| {
+        if path == "/legit-build-tool" {
+            let body = serde_json::json!({
+                "name": "legit-build-tool",
+                "dist-tags": { "latest": "1.0.0" },
+                "versions": {
+                    "1.0.0": {
+                        "name": "legit-build-tool",
+                        "version": "1.0.0",
+                        "bin": {
+                            "legit-build-tool": "bin.js"
+                        },
+                        "dist": {
+                            "tarball": format!("{base_url}/tarballs/legit-build-tool-1.0.0.tgz"),
+                            "integrity": builder_integrity
+                        }
+                    }
+                }
+            })
+            .to_string();
+            Some((
+                200,
+                vec![("Content-Type", "application/json".to_string())],
+                body.into_bytes(),
+            ))
+        } else if path == "/tarballs/legit-build-tool-1.0.0.tgz" {
+            Some((
+                200,
+                vec![("Content-Type", "application/octet-stream".to_string())],
+                tarball_clone.clone(),
+            ))
+        } else {
+            None
+        }
+    })
+    .await;
+
+    let tmp = tempdir().unwrap();
+    let repo_dir = tmp.path().join("git-repo-with-spoofed-npmrc");
+    std::fs::create_dir_all(&repo_dir).unwrap();
+    run_git(&repo_dir, &["init"]);
+    run_git(&repo_dir, &["config", "user.name", "Tester"]);
+    run_git(&repo_dir, &["config", "user.email", "tester@example.com"]);
+
+    let git_pkg_json = serde_json::json!({
+        "name": "pkg-spoofed-npmrc",
+        "version": "1.0.0",
+        "main": "dist/built.js",
+        "scripts": {
+            "prepare": "legit-build-tool"
+        },
+        "devDependencies": {
+            "legit-build-tool": "^1.0.0"
+        },
+        "files": ["dist"]
+    });
+    std::fs::write(repo_dir.join("package.json"), git_pkg_json.to_string()).unwrap();
+
+    // Repo commits .npmrc trying to steal auth or redirect traffic to attacker
+    let hostile_npmrc = format!("registry={}\n", attacker_server.url());
+    std::fs::write(repo_dir.join(".npmrc"), hostile_npmrc).unwrap();
+
+    run_git(&repo_dir, &["add", "."]);
+    run_git(&repo_dir, &["commit", "-m", "repo with malicious .npmrc pointing to attacker"]);
+
+    let git_url = format!(
+        "git+file://{}",
+        repo_dir.to_string_lossy().replace('\\', "/")
+    );
+
+    let proj_dir = tmp.path().join("consumer-g");
+    let cache_dir = tmp.path().join("cache-g");
+    std::fs::create_dir_all(&proj_dir).unwrap();
+    std::fs::create_dir_all(&cache_dir).unwrap();
+
+    let consumer_json = serde_json::json!({
+        "name": "consumer-g",
+        "version": "1.0.0",
+        "dependencies": {
+            "pkg-spoofed-npmrc": git_url
+        }
+    });
+    std::fs::write(proj_dir.join("package.json"), consumer_json.to_string()).unwrap();
+
+    let mut installer = Installer::new(InstallOptions {
+        project_dir: proj_dir.clone(),
+        cache_dir: Some(cache_dir),
+        registry_url: Some(legitimate_server.url()),
+        ..Default::default()
+    })
+    .unwrap();
+
+    let summary = installer
+        .install()
+        .await
+        .expect("Install should succeed using legitimate registry");
+    assert_eq!(summary.packages_installed, 1);
+
+    // Zero requests to attacker, > 0 requests to legitimate registry
+    assert_eq!(
+        attacker_server.request_count().await,
+        0,
+        "Attacker server should receive 0 requests!"
+    );
+    assert!(
+        legitimate_server.request_count().await > 0,
+        "Legitimate registry must serve the build tool"
+    );
+
+    let installed_pkg = proj_dir.join("node_modules").join("pkg-spoofed-npmrc");
+    let built_file = installed_pkg.join("dist").join("built.js");
+    assert!(built_file.exists());
+}
