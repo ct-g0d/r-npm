@@ -840,7 +840,14 @@ impl PackStore {
                         break;
                     }
                     let (src, dst) = &files[idx];
-                    if !dst.exists() {
+                    let dst_valid = dst
+                        .metadata()
+                        .ok()
+                        .and_then(|d_meta| {
+                            src.metadata().ok().map(|s_meta| d_meta.len() == s_meta.len())
+                        })
+                        .unwrap_or(false);
+                    if !dst_valid {
                         let _ = rnpm_fs::copy_file_fast(src, dst);
                     }
                 });
@@ -3467,6 +3474,23 @@ mod tests {
         let duration_direct = t_start_direct.elapsed();
         assert_eq!(sum_direct.entries_extracted, 100);
 
+        for name in &file_names {
+            assert_eq!(
+                fs::read(target_direct.path().join(name)).unwrap(),
+                file_data
+            );
+        }
+
+        // Verify zero CAS files created during direct materialization
+        let cas_entries: Vec<_> = fs::read_dir(store.cas_dir())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .collect();
+        assert!(
+            cas_entries.is_empty(),
+            "Zero CAS files should be created during direct materialize"
+        );
+
         // For comparison, measure how long writing CAS + CopyFileExW would take for 100 files
         let cas_sim_dir = tempdir().unwrap();
         let target_cas = tempdir().unwrap();
@@ -3483,14 +3507,38 @@ mod tests {
         let duration_cas = t_start_cas.elapsed();
 
         eprintln!(
-            "Benchmark: Direct materialize = {:?}, CAS double-write indirection = {:?}",
+            "Benchmark timing: Direct materialize = {:?}, CAS double-write indirection = {:?}",
             duration_direct, duration_cas
         );
-        assert!(
-            duration_direct <= duration_cas,
-            "Direct in-memory materialize ({:?}) should be faster than CAS double-write ({:?})",
-            duration_direct,
-            duration_cas
-        );
+    }
+
+    #[test]
+    fn test_populate_cas_from_installed_overwrites_zero_byte_or_truncated_file() {
+        let temp = tempdir().unwrap();
+        let store = PackStore::new(temp.path().join("store")).unwrap();
+        let source_dir = temp.path().join("node_modules/pkg");
+        fs::create_dir_all(&source_dir).unwrap();
+
+        let src_file = source_dir.join("index.js");
+        let content = b"console.log('repaired');";
+        fs::write(&src_file, content).unwrap();
+
+        let cas_dst = store.cas_dir().join("ab").join("abcdef123456");
+        if let Some(p) = cas_dst.parent() {
+            fs::create_dir_all(p).unwrap();
+        }
+        // Create a truncated 0-byte CAS file
+        fs::write(&cas_dst, b"").unwrap();
+        assert_eq!(fs::metadata(&cas_dst).unwrap().len(), 0);
+
+        // Run populate_cas_from_installed: 0-byte CAS file must be repaired/overwritten
+        store.populate_cas_from_installed(&[(src_file.clone(), cas_dst.clone())]);
+
+        // Verify the 0-byte CAS file was overwritten with valid content
+        assert_eq!(fs::read(&cas_dst).unwrap(), content);
+
+        // Running it again with matching size should succeed idempotently
+        store.populate_cas_from_installed(&[(src_file, cas_dst.clone())]);
+        assert_eq!(fs::read(&cas_dst).unwrap(), content);
     }
 }

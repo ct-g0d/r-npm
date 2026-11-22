@@ -5170,7 +5170,7 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                         if let Ok(Some(pack)) = self.pack_store.get_package_pack(integrity_str) {
                             for entry in &pack.index.files {
                                 if let Some(ref cas_path) = entry.cas_path {
-                                    if !cas_path.exists() {
+                                    if !cas_path.metadata().is_ok_and(|m| m.len() == entry.size) {
                                         let src = loc_base_dir.join(loc).join(&entry.path);
                                         cas_copy_list.push((src, cas_path.clone()));
                                     }
@@ -7426,7 +7426,7 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                     if let Ok(Some(pack)) = self.pack_store.get_package_pack(integrity_str) {
                         for entry in &pack.index.files {
                             if let Some(ref cas_path) = entry.cas_path {
-                                if !cas_path.exists() {
+                                if !cas_path.metadata().is_ok_and(|m| m.len() == entry.size) {
                                     let src = loc_base_dir.join(pkg_key).join(&entry.path);
                                     cas_copy_list.push((src, cas_path.clone()));
                                 }
