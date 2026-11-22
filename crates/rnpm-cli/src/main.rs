@@ -117,6 +117,14 @@ pub(crate) enum Commands {
         #[arg(long = "no-package-lock")]
         no_package_lock: bool,
 
+        /// Format package-lock.json as human readable file
+        #[arg(long = "no-format-package-lock")]
+        no_format_package_lock: bool,
+
+        /// Format package-lock.json as human readable file
+        #[arg(long = "format-package-lock", num_args = 0..=1, default_missing_value = "true")]
+        format_package_lock: Option<bool>,
+
         /// Write package-lock.json using npm's legacy format (1, 2, or 3)
         #[arg(long = "lockfile-version", value_parser = clap::value_parser!(u32).range(1..=3))]
         lockfile_version: Option<u32>,
@@ -285,6 +293,14 @@ pub(crate) enum Commands {
         /// Do not read or write package-lock.json
         #[arg(long = "no-package-lock")]
         no_package_lock: bool,
+
+        /// Format package-lock.json as human readable file
+        #[arg(long = "no-format-package-lock")]
+        no_format_package_lock: bool,
+
+        /// Format package-lock.json as human readable file
+        #[arg(long = "format-package-lock", num_args = 0..=1, default_missing_value = "true")]
+        format_package_lock: Option<bool>,
 
         /// Select package-lock.json serialization format (1, 2, or 3)
         #[arg(long = "lockfile-version", value_parser = clap::value_parser!(u32).range(1..=3))]
@@ -1613,7 +1629,7 @@ pub(crate) enum PkgAction {
     Fix,
 }
 
-#[derive(Subcommand, Debug)]
+#[derive(Subcommand, Debug, Clone)]
 pub(crate) enum CacheAction {
     /// Add the specified package or tarball to the local cache
     Add {
@@ -1648,6 +1664,62 @@ pub(crate) enum CacheAction {
 
     /// Verify the contents of the cache folder, garbage collect unneeded data, and validate integrity
     Verify {
+        /// Custom cache directory path
+        #[arg(long)]
+        cache: Option<PathBuf>,
+    },
+
+    /// Manipulate npx cache
+    Npx {
+        #[command(subcommand)]
+        action: CacheNpxAction,
+
+        /// Custom cache directory path
+        #[arg(long)]
+        cache: Option<PathBuf>,
+
+        /// Force operation without warning
+        #[arg(long, short = 'f')]
+        force: bool,
+
+        /// Simulate operation without modifying filesystem
+        #[arg(long)]
+        dry_run: bool,
+    },
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub(crate) enum CacheNpxAction {
+    /// List entries in the npx cache
+    Ls {
+        /// Custom cache directory path
+        #[arg(long)]
+        cache: Option<PathBuf>,
+    },
+
+    /// Remove entries from the npx cache
+    Rm {
+        /// Entry keys to remove
+        keys: Vec<String>,
+
+        /// Force removal of entire npx cache if no keys specified
+        #[arg(long, short = 'f')]
+        force: bool,
+
+        /// Custom cache directory path
+        #[arg(long)]
+        cache: Option<PathBuf>,
+
+        /// Simulate removal without modifying filesystem
+        #[arg(long)]
+        dry_run: bool,
+    },
+
+    /// Show details of npx cache entries
+    Info {
+        /// Entry keys to inspect
+        keys: Vec<String>,
+
         /// Custom cache directory path
         #[arg(long)]
         cache: Option<PathBuf>,
@@ -3122,7 +3194,7 @@ where
     result
 }
 
-fn parse_package_spec(spec: &str) -> (String, String) {
+pub(crate) fn parse_package_spec(spec: &str) -> (String, String) {
     if let Some(stripped) = spec.strip_prefix('@') {
         if let Some(idx) = stripped.find('@') {
             (
@@ -3176,8 +3248,14 @@ pub(crate) async fn ensure_npx_environment(
         let (name, req) = parse_package_spec(spec);
         deps.insert(name, serde_json::Value::String(req));
     }
-    let manifest =
-        serde_json::json!({ "name": "rnpm-exec-env", "version": "1.0.0", "dependencies": deps });
+    let manifest = serde_json::json!({
+        "name": "rnpm-exec-env",
+        "version": "1.0.0",
+        "dependencies": deps,
+        "_npx": {
+            "packages": specs
+        }
+    });
     let manifest_text = serde_json::to_string_pretty(&manifest)?;
     let installed = env_dir.join("node_modules").is_dir()
         && std::fs::read_to_string(env_dir.join("package.json")).is_ok_and(|t| t == manifest_text);
@@ -3327,7 +3405,10 @@ pub(crate) async fn execute_exec(
                     "name": "rnpm-exec-env",
                     "version": "1.0.0",
                     "dependencies": {
-                        pkg_name.clone(): version_req
+                        pkg_name.clone(): version_req.clone()
+                    },
+                    "_npx": {
+                        "packages": [format!("{pkg_name}@{version_req}")]
                     }
                 });
 
@@ -3410,7 +3491,10 @@ pub(crate) async fn execute_exec(
             let minimal_manifest = serde_json::json!({
                 "name": "rnpm-exec-env",
                 "version": "1.0.0",
-                "dependencies": deps
+                "dependencies": deps,
+                "_npx": {
+                    "packages": package_specs
+                }
             });
 
             std::fs::write(
@@ -4695,7 +4779,12 @@ fn should_cleanup_trash(cmd: &Commands) -> bool {
         | Commands::InstallScripts { .. }
         | Commands::Fix { .. } => true,
         Commands::Cache {
-            action: CacheAction::Clean { .. },
+            action:
+                CacheAction::Clean { .. }
+                | CacheAction::Npx {
+                    action: CacheNpxAction::Rm { .. },
+                    ..
+                },
             ..
         } => true,
         _ => false,
@@ -4819,6 +4908,8 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             prefix,
             include,
             no_package_lock,
+            no_format_package_lock,
+            format_package_lock,
             package_lock,
             lockfile_version,
             dry_run,
@@ -4879,6 +4970,14 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             } else {
                 package_lock.unwrap_or(true)
             };
+            let format_package_lock_val =
+                if no_format_package_lock || format_package_lock == Some(false) {
+                    Some(false)
+                } else if format_package_lock == Some(true) {
+                    Some(true)
+                } else {
+                    config.get_bool("format-package-lock")
+                };
             let audit_val = if no_audit || audit == Some(false) {
                 false
             } else {
@@ -4981,6 +5080,7 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
                 include,
                 package_lock: package_lock_val,
                 no_package_lock,
+                format_package_lock: format_package_lock_val,
                 dry_run,
                 os,
                 cpu,
@@ -5107,6 +5207,8 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             package_lock_only,
             include,
             no_package_lock,
+            no_format_package_lock,
+            format_package_lock,
             package_lock,
             lockfile_version,
             dry_run,
@@ -5167,6 +5269,14 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             } else {
                 package_lock.unwrap_or(true)
             };
+            let format_package_lock_val =
+                if no_format_package_lock || format_package_lock == Some(false) {
+                    Some(false)
+                } else if format_package_lock == Some(true) {
+                    Some(true)
+                } else {
+                    config.get_bool("format-package-lock")
+                };
             let audit_val = if no_audit || audit == Some(false) {
                 false
             } else {
@@ -5195,6 +5305,7 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
                 include,
                 package_lock: package_lock_val,
                 no_package_lock,
+                format_package_lock: format_package_lock_val,
                 dry_run,
                 os,
                 cpu,

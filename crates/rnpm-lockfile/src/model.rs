@@ -1500,6 +1500,82 @@ impl LockfileV3 {
         }
     }
 
+    /// Serialize to compact single-line JSON without indentation or trailing newline.
+    pub fn to_json_string_compact(&self) -> Result<String, LockfileError> {
+        let mut root = serde_json::Map::new();
+        root.insert("name".into(), serde_json::Value::String(self.name.clone()));
+        if let Some(v) = &self.version {
+            root.insert("version".into(), serde_json::Value::String(v.clone()));
+        }
+        root.insert(
+            "lockfileVersion".into(),
+            serde_json::Value::Number(self.lockfile_version.into()),
+        );
+        if let Some(r) = self.requires {
+            root.insert("requires".into(), serde_json::Value::Bool(r));
+        }
+        let mut packages = serde_json::Map::new();
+        for (k, v) in &self.packages {
+            let mut pkg = v.clone();
+            pkg.normalize_flags();
+            let pkg_val = if let Some(ref raw) = pkg.raw_value {
+                raw.clone()
+            } else {
+                serde_json::to_value(&pkg)?
+            };
+            packages.insert(to_posix_path(k), pkg_val);
+        }
+        root.insert("packages".into(), serde_json::Value::Object(packages));
+        let mut out = String::new();
+        stringify_npm_compact(&serde_json::Value::Object(root), &mut out);
+        Ok(out)
+    }
+
+    /// Serialize using npm's requested lockfile format (1, 2, or 3) in compact single-line JSON.
+    pub fn to_json_string_version_compact(&self, version: u32) -> Result<String, LockfileError> {
+        match version {
+            3 => self.to_json_string_compact(),
+            1 | 2 => {
+                let mut root = serde_json::Map::new();
+                root.insert("name".into(), serde_json::Value::String(self.name.clone()));
+                if let Some(v) = &self.version {
+                    root.insert("version".into(), serde_json::Value::String(v.clone()));
+                }
+                root.insert(
+                    "lockfileVersion".into(),
+                    serde_json::Value::Number(version.into()),
+                );
+                root.insert("requires".into(), serde_json::Value::Bool(true));
+
+                let legacy = self.to_legacy_dependencies();
+                if version == 1 {
+                    root.insert("dependencies".into(), legacy);
+                } else {
+                    let packages = self.to_v3_packages_value()?;
+                    root.insert("packages".into(), packages);
+                    root.insert("dependencies".into(), legacy);
+                }
+                let mut out = String::new();
+                stringify_npm_compact(&serde_json::Value::Object(root), &mut out);
+                Ok(out)
+            }
+            other => Err(LockfileError::UnsupportedVersion(other)),
+        }
+    }
+
+    pub fn to_json_string_version_formatted_options(
+        &self,
+        version: u32,
+        format: &rnpm_core::ManifestFormat,
+        format_package_lock: bool,
+    ) -> Result<String, LockfileError> {
+        if format_package_lock {
+            self.to_json_string_version_formatted(version, format)
+        } else {
+            self.to_json_string_version_compact(version)
+        }
+    }
+
     /// Save using npm lockfile-version semantics (1, 2, or 3).
     /// Copy without `resolved` on registry tarballs when
     /// `omit-lockfile-registry-resolved` is set.
@@ -1521,7 +1597,12 @@ impl LockfileV3 {
         std::borrow::Cow::Owned(copy)
     }
 
-    pub fn save_to_file_version(&self, path: &Path, version: u32) -> Result<(), LockfileError> {
+    pub fn save_to_file_version_formatted_option(
+        &self,
+        path: &Path,
+        version: u32,
+        format_package_lock: bool,
+    ) -> Result<(), LockfileError> {
         let this = self.for_writing();
         let content_source: &Self = this.as_ref();
         let parent = path.parent().unwrap_or_else(|| Path::new("."));
@@ -1532,13 +1613,28 @@ impl LockfileV3 {
         };
         let format = project_lockfile_format(root_dir, &[path.to_path_buf()]);
 
-        let content = content_source.to_json_string_version_formatted(version, &format)?;
+        let content = if format_package_lock {
+            content_source.to_json_string_version_formatted(version, &format)?
+        } else {
+            content_source.to_json_string_version_compact(version)?
+        };
 
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
         fs::write(path, content)?;
         Ok(())
+    }
+
+    pub fn save_to_file_version(&self, path: &Path, version: u32) -> Result<(), LockfileError> {
+        let parent = path.parent().unwrap_or_else(|| Path::new("."));
+        let root_dir = if parent.ends_with("node_modules") {
+            parent.parent().unwrap_or(parent)
+        } else {
+            parent
+        };
+        let format_package_lock = is_format_package_lock_enabled(root_dir);
+        self.save_to_file_version_formatted_option(path, version, format_package_lock)
     }
 
     fn to_v3_packages_value(&self) -> Result<serde_json::Value, LockfileError> {
@@ -1863,6 +1959,72 @@ pub fn set_omit_registry_resolved(registries: Option<Vec<String>>) {
     }
 }
 
+static FORMAT_PACKAGE_LOCK: std::sync::RwLock<Option<bool>> = std::sync::RwLock::new(None);
+
+/// Set whether package-lock serialization produces human-readable pretty-printed JSON (true)
+/// or compact single-line JSON (false).
+pub fn set_format_package_lock(format: bool) {
+    if let Ok(mut guard) = FORMAT_PACKAGE_LOCK.write() {
+        *guard = Some(format);
+    }
+}
+
+pub fn reset_format_package_lock() {
+    if let Ok(mut guard) = FORMAT_PACKAGE_LOCK.write() {
+        *guard = None;
+    }
+}
+
+pub fn get_format_package_lock() -> Option<bool> {
+    FORMAT_PACKAGE_LOCK.read().ok().and_then(|g| *g)
+}
+
+fn check_npmrc_file(path: &Path) -> Option<bool> {
+    let content = fs::read_to_string(path).ok()?;
+    for line in content.lines() {
+        let line = line.trim();
+        if line.starts_with('#') || line.starts_with(';') {
+            continue;
+        }
+        if let Some((k, v)) = line.split_once('=') {
+            let key = k.trim().to_ascii_lowercase();
+            if key == "format-package-lock" || key == "format_package_lock" {
+                match v.trim().to_ascii_lowercase().as_str() {
+                    "false" | "0" | "no" | "off" => return Some(false),
+                    "true" | "1" | "yes" | "on" => return Some(true),
+                    _ => {}
+                }
+            }
+        }
+    }
+    None
+}
+
+fn is_format_package_lock_enabled(project_dir: &Path) -> bool {
+    if let Some(explicit) = get_format_package_lock() {
+        return explicit;
+    }
+    for var in &["npm_config_format_package_lock", "NPM_CONFIG_FORMAT_PACKAGE_LOCK"] {
+        if let Ok(val) = std::env::var(var) {
+            match val.trim().to_ascii_lowercase().as_str() {
+                "false" | "0" | "no" | "off" => return false,
+                "true" | "1" | "yes" | "on" => return true,
+                _ => {}
+            }
+        }
+    }
+    if let Some(val) = check_npmrc_file(&project_dir.join(".npmrc")) {
+        return val;
+    }
+    if let Some(user_home) = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME")) {
+        let user_npmrc = Path::new(&user_home).join(".npmrc");
+        if let Some(val) = check_npmrc_file(&user_npmrc) {
+            return val;
+        }
+    }
+    true
+}
+
 pub fn npm_key_compare(a: &str, b: &str) -> std::cmp::Ordering {
     let a_bytes = a.as_bytes();
     let b_bytes = b.as_bytes();
@@ -1961,6 +2123,72 @@ pub(crate) fn stringify_npm_nice_indent(
                     out.push('\n');
                 }
                 indent_spaces(out, indent, indent_level);
+                out.push('}');
+            }
+        }
+    }
+}
+
+pub(crate) fn stringify_npm_compact(val: &serde_json::Value, out: &mut String) {
+    match val {
+        serde_json::Value::Null => out.push_str("null"),
+        serde_json::Value::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
+        serde_json::Value::Number(n) => out.push_str(&n.to_string()),
+        serde_json::Value::String(s) => {
+            out.push_str(&serde_json::to_string(s).unwrap_or_default());
+        }
+        serde_json::Value::Array(arr) => {
+            if arr.is_empty() {
+                out.push_str("[]");
+            } else {
+                out.push('[');
+                for (i, item) in arr.iter().enumerate() {
+                    stringify_npm_compact(item, out);
+                    if i + 1 < arr.len() {
+                        out.push(',');
+                    }
+                }
+                out.push(']');
+            }
+        }
+        serde_json::Value::Object(map) => {
+            if map.is_empty() {
+                out.push_str("{}");
+            } else {
+                out.push('{');
+                let mut entries: Vec<(&String, &serde_json::Value)> = map.iter().collect();
+
+                let is_obj = |v: &serde_json::Value| -> bool { v.is_object() };
+
+                let key_priority =
+                    |k: &str| -> Option<usize> { SW_KEY_ORDER.iter().position(|&p| p == k) };
+
+                entries.sort_by(|(ak, av), (bk, bv)| {
+                    let a_obj = is_obj(av);
+                    let b_obj = is_obj(bv);
+                    if a_obj != b_obj {
+                        if a_obj {
+                            return std::cmp::Ordering::Greater;
+                        } else {
+                            return std::cmp::Ordering::Less;
+                        }
+                    }
+                    match (key_priority(ak), key_priority(bk)) {
+                        (Some(pa), Some(pb)) => pa.cmp(&pb),
+                        (Some(_), None) => std::cmp::Ordering::Less,
+                        (None, Some(_)) => std::cmp::Ordering::Greater,
+                        (None, None) => npm_key_compare(ak, bk),
+                    }
+                });
+
+                for (i, (k, v)) in entries.iter().enumerate() {
+                    out.push_str(&serde_json::to_string(k).unwrap_or_default());
+                    out.push(':');
+                    stringify_npm_compact(v, out);
+                    if i + 1 < entries.len() {
+                        out.push(',');
+                    }
+                }
                 out.push('}');
             }
         }

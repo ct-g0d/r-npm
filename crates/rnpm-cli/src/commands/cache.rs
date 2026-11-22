@@ -9,11 +9,19 @@ pub(crate) async fn run(
 ) -> Result<()> {
     let config = rnpm_config::Config::load(Some(&current_dir)).unwrap_or_default();
     let cache_path = cache_arg
+        .clone()
         .or_else(|| match &action {
             CacheAction::Clean { cache: c, .. } => c.clone(),
             CacheAction::Verify { cache: c } => c.clone(),
             CacheAction::Add { cache: c, .. } => c.clone(),
             CacheAction::Ls { cache: c, .. } => c.clone(),
+            CacheAction::Npx { cache: c, action: npx_action, .. } => {
+                c.clone().or_else(|| match npx_action {
+                    crate::CacheNpxAction::Rm { cache: c, .. } => c.clone(),
+                    crate::CacheNpxAction::Info { cache: c, .. } => c.clone(),
+                    crate::CacheNpxAction::Ls { cache: c, .. } => c.clone(),
+                })
+            }
         })
         .unwrap_or_else(|| {
             if let Some(user_cache) = config.npmrc.settings.get("cache") {
@@ -113,9 +121,219 @@ pub(crate) async fn run(
                 cache_registry_package(&cache, &current_dir, &package).await?;
             }
         }
+        CacheAction::Npx {
+            action: npx_action,
+            cache: c,
+            force,
+            dry_run,
+        } => {
+            let npx_cache_override = c.or(cache_arg);
+            let final_cache = npx_cache_override.unwrap_or(cache_path);
+            run_npx(npx_action, &final_cache, force, dry_run).await?;
+        }
     }
 
     Ok(())
+}
+
+async fn run_npx(
+    action: crate::CacheNpxAction,
+    cache_path: &Path,
+    parent_force: bool,
+    parent_dry_run: bool,
+) -> Result<()> {
+    let npx_cache = match &action {
+        crate::CacheNpxAction::Ls { cache: Some(c) }
+        | crate::CacheNpxAction::Rm { cache: Some(c), .. }
+        | crate::CacheNpxAction::Info { cache: Some(c), .. } => c.join("_npx"),
+        _ => cache_path.join("_npx"),
+    };
+
+    match action {
+        crate::CacheNpxAction::Ls { .. } => {
+            if !npx_cache.exists() {
+                println!("npx cache does not exist");
+                return Ok(());
+            }
+            let mut entries: Vec<(String, PathBuf)> = Vec::new();
+            if let Ok(rd) = std::fs::read_dir(&npx_cache) {
+                for entry in rd.flatten() {
+                    let p = entry.path();
+                    if p.is_dir() {
+                        entries.push((entry.file_name().to_string_lossy().to_string(), p));
+                    }
+                }
+            }
+            entries.sort_by(|a, b| a.0.cmp(&b.0));
+            for (hash, pkg_path) in entries {
+                let pkg_json_path = pkg_path.join("package.json");
+                let pkg_val: Option<serde_json::Value> = std::fs::read_to_string(&pkg_json_path)
+                    .ok()
+                    .and_then(|s| serde_json::from_str(&s).ok());
+                let mut line = format!("{hash}:");
+                if pkg_val.is_none() {
+                    line.push_str(" (empty/invalid)");
+                } else if let Some(npx) = pkg_val.as_ref().and_then(|p| p.get("_npx")).and_then(|v| v.as_object()) {
+                    if let Some(pkgs) = npx.get("packages").and_then(|v| v.as_array()) {
+                        let list: Vec<&str> = pkgs.iter().filter_map(|p| p.as_str()).collect();
+                        line.push(' ');
+                        line.push_str(&list.join(", "));
+                    } else {
+                        line.push_str(" (unknown)");
+                    }
+                } else {
+                    line.push_str(" (unknown)");
+                }
+                println!("{line}");
+            }
+        }
+        crate::CacheNpxAction::Rm {
+            keys,
+            force,
+            dry_run,
+            ..
+        } => {
+            let effective_force = force || parent_force;
+            let effective_dry_run = dry_run || parent_dry_run;
+            if keys.is_empty() {
+                if !effective_force {
+                    anyhow::bail!("npm error code EUSAGE\nnpm error Please use --force to remove entire npx cache");
+                }
+                if npx_cache.exists() && !effective_dry_run {
+                    std::fs::remove_dir_all(&npx_cache)?;
+                }
+                return Ok(());
+            }
+            if !npx_cache.exists() {
+                anyhow::bail!("npm error code EUSAGE\nnpm error Invalid npx key {}", keys[0]);
+            }
+            let mut existing_keys = Vec::new();
+            if let Ok(rd) = std::fs::read_dir(&npx_cache) {
+                for entry in rd.flatten() {
+                    if entry.path().is_dir() {
+                        existing_keys.push(entry.file_name().to_string_lossy().to_string());
+                    }
+                }
+            }
+            for key in &keys {
+                let resolved = resolve_abbrev(&existing_keys, key)
+                    .ok_or_else(|| anyhow::anyhow!("npm error code EUSAGE\nnpm error Invalid npx key {key}"))?;
+                let target = npx_cache.join(resolved);
+                println!("Removing npx key at {}", target.display());
+                if !effective_dry_run {
+                    std::fs::remove_dir_all(&target)?;
+                }
+            }
+        }
+        crate::CacheNpxAction::Info { keys, .. } => {
+            if keys.is_empty() {
+                anyhow::bail!("npm error code EUSAGE\nnpm error npx info requires at least one key");
+            }
+            if !npx_cache.exists() {
+                anyhow::bail!("npm error code EUSAGE\nnpm error Invalid npx key {}", keys[0]);
+            }
+            let mut existing_keys = Vec::new();
+            if let Ok(rd) = std::fs::read_dir(&npx_cache) {
+                for entry in rd.flatten() {
+                    if entry.path().is_dir() {
+                        existing_keys.push(entry.file_name().to_string_lossy().to_string());
+                    }
+                }
+            }
+            for key in &keys {
+                let resolved = resolve_abbrev(&existing_keys, key)
+                    .ok_or_else(|| anyhow::anyhow!("npm error code EUSAGE\nnpm error Invalid npx key {key}"))?;
+                let hash = resolved;
+                let path = npx_cache.join(hash);
+                let pkg_json_path = path.join("package.json");
+                let pkg_val: Option<serde_json::Value> = std::fs::read_to_string(&pkg_json_path)
+                    .ok()
+                    .and_then(|s| serde_json::from_str(&s).ok());
+                let has_lock = path.join("package-lock.json").is_file()
+                    || path.join("node_modules/.package-lock.json").is_file();
+                let valid = pkg_val.is_some() && (has_lock || path.join("node_modules").is_dir());
+                if valid {
+                    println!("valid npx cache entry with key {hash}");
+                    println!("location: {}", path.display());
+                    let pkg = pkg_val.unwrap();
+                    if let Some(pkgs) = pkg.get("_npx").and_then(|v| v.get("packages")).and_then(|v| v.as_array()) {
+                        println!("packages:");
+                        for p in pkgs {
+                            if let Some(spec_str) = p.as_str() {
+                                let (pkg_name, _) = crate::parse_package_spec(spec_str);
+                                let ver = get_installed_pkg_version(&path, &pkg_name);
+                                if let Some(v) = ver {
+                                    println!("- {spec_str} ({pkg_name}@{v})");
+                                } else {
+                                    println!("- {spec_str} ({spec_str})");
+                                }
+                            }
+                        }
+                    } else {
+                        println!("packages: (unknown)");
+                        println!("dependencies:");
+                        if let Some(deps) = pkg.get("dependencies").and_then(|v| v.as_object()) {
+                            for (dep_name, dep_val) in deps {
+                                let ver = get_installed_pkg_version(&path, dep_name);
+                                if let Some(v) = ver {
+                                    println!("- {dep_name}@{v}");
+                                } else {
+                                    let req = dep_val.as_str().unwrap_or("*");
+                                    println!("- {dep_name}@{req}");
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    println!("invalid npx cache entry with key {hash}");
+                    println!("location: {}", path.display());
+                }
+                println!();
+            }
+        }
+    }
+    Ok(())
+}
+
+fn resolve_abbrev<'a>(keys: &'a [String], input: &str) -> Option<&'a str> {
+    if let Some(exact) = keys.iter().find(|k| *k == input) {
+        return Some(exact.as_str());
+    }
+    let candidates: Vec<&'a str> = keys
+        .iter()
+        .filter(|k| k.starts_with(input))
+        .map(|k| k.as_str())
+        .collect();
+    if candidates.len() == 1 {
+        Some(candidates[0])
+    } else {
+        None
+    }
+}
+
+fn get_installed_pkg_version(path: &Path, pkg_name: &str) -> Option<String> {
+    let pkg_json = path.join("node_modules").join(pkg_name).join("package.json");
+    if let Ok(text) = std::fs::read_to_string(pkg_json) {
+        if let Ok(val) = serde_json::from_str::<serde_json::Value>(&text) {
+            if let Some(v) = val.get("version").and_then(|v| v.as_str()) {
+                return Some(v.to_string());
+            }
+        }
+    }
+    let lock_path = path.join("package-lock.json");
+    if let Ok(text) = std::fs::read_to_string(lock_path) {
+        if let Ok(val) = serde_json::from_str::<serde_json::Value>(&text) {
+            let key = format!("node_modules/{pkg_name}");
+            if let Some(packages) = val.get("packages").and_then(|p| p.as_object()) {
+                if let Some(pkg_obj) = packages.get(&key) {
+                    if let Some(v) = pkg_obj.get("version").and_then(|v| v.as_str()) {
+                        return Some(v.to_string());
+                    }
+                }
+            }
+        }
+    }
+    None
 }
 
 fn collect_entries(current: &Path, list: &mut Vec<String>) {

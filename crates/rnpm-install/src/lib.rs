@@ -1734,6 +1734,8 @@ pub struct InstallOptions {
     /// Public package-lock serialization version (1, 2, or 3). Hidden lockfiles remain v3.
     /// If None, inferred from existing lockfile (preserving v2, upgrading v1 to v3, defaulting to v3).
     pub lockfile_version: Option<u32>,
+    /// Format package-lock.json as human readable file (default true; false produces compact single-line JSON).
+    pub format_package_lock: Option<bool>,
     /// High-resolution phase instrumentation and timing output.
     pub timing: bool,
     /// Installation layout strategy: hoisted (default), linked, or nested.
@@ -1792,6 +1794,11 @@ impl InstallOptions {
         }
         3
     }
+
+    /// Evaluates effective format-package-lock setting (default true).
+    pub fn effective_format_package_lock(&self) -> bool {
+        self.format_package_lock.unwrap_or(true)
+    }
 }
 
 impl Default for InstallOptions {
@@ -1839,6 +1846,7 @@ impl Default for InstallOptions {
             workspace: Vec::new(),
             workspaces: false,
             lockfile_version: None,
+            format_package_lock: None,
             timing: false,
             install_strategy: InstallStrategy::Hoisted,
             store_dir: None,
@@ -2364,6 +2372,10 @@ impl Installer {
                 .get("lockfile-version")
                 .and_then(|v| v.parse().ok());
         }
+        if options.format_package_lock.is_none() {
+            options.format_package_lock = config.get_bool("format-package-lock");
+        }
+        rnpm_lockfile::set_format_package_lock(options.effective_format_package_lock());
         options.save_bundle |= config.get_bool("save-bundle").unwrap_or(false);
         // Peer handling is config, whichever command or source sets it.
         options.legacy_peer_deps |= config.get_bool("legacy-peer-deps").unwrap_or(false);
@@ -3719,7 +3731,11 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
             {
                 let _lock_guard = collector.enter_phase(Phase::Lockfile);
                 lockfile
-                    .save_to_file_version(&lockfile_path, self.options.effective_lockfile_version())
+                    .save_to_file_version_formatted_option(
+                        &lockfile_path,
+                        self.options.effective_lockfile_version(),
+                        self.options.effective_format_package_lock(),
+                    )
                     .with_context(|| format!("Failed to save {}", lockfile_path.display()))?;
             }
 
@@ -3988,7 +4004,11 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
             let lockfile_path = project_lockfile_path(&self.options.project_dir);
             if self.options.package_lock_enabled() && !self.options.no_save && !self.options.is_global {
                 lockfile
-                    .save_to_file_version(&lockfile_path, self.options.effective_lockfile_version())
+                    .save_to_file_version_formatted_option(
+                        &lockfile_path,
+                        self.options.effective_lockfile_version(),
+                        self.options.effective_format_package_lock(),
+                    )
                     .with_context(|| format!("Failed to save {}", lockfile_path.display()))?;
             }
             self.run_linked_root_hooks(&manifest).await?;
@@ -5280,7 +5300,11 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
             // 4. Write deterministic lockfile (only for local projects, not global prefix)
             if package_lock_enabled && !self.options.is_global && !self.options.no_save {
                 lockfile
-                    .save_to_file_version(&lockfile_path, self.options.effective_lockfile_version())
+                    .save_to_file_version_formatted_option(
+                        &lockfile_path,
+                        self.options.effective_lockfile_version(),
+                        self.options.effective_format_package_lock(),
+                    )
                     .with_context(|| format!("Failed to save {}", lockfile_path.display()))?;
             }
 
@@ -8959,7 +8983,11 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
 
             // Write updated deterministic lockfile
             lockfile
-                .save_to_file_version(&lockfile_path, self.options.effective_lockfile_version())
+                .save_to_file_version_formatted_option(
+                    &lockfile_path,
+                    self.options.effective_lockfile_version(),
+                    self.options.effective_format_package_lock(),
+                )
                 .with_context(|| format!("Failed to save updated {}", lockfile_path.display()))?;
 
             // Persist hidden lockfile to node_modules/.package-lock.json
@@ -8972,8 +9000,11 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
             && manifest.peer_dependencies.is_empty()
             && workspace_members.is_empty()
         {
-            LockfileV3::from_manifest(&manifest)
-                .save_to_file_version(&lockfile_path, self.options.effective_lockfile_version())?;
+            LockfileV3::from_manifest(&manifest).save_to_file_version_formatted_option(
+                &lockfile_path,
+                self.options.effective_lockfile_version(),
+                self.options.effective_format_package_lock(),
+            )?;
         }
 
         // Remove deleted package directories from node_modules

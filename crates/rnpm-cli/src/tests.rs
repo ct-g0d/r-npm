@@ -1356,6 +1356,8 @@ async fn test_cli_unsupported_protocol_fixture_install_fails_cleanly() {
             include: vec![],
             no_package_lock: false,
             package_lock: None,
+            format_package_lock: None,
+            no_format_package_lock: false,
             lockfile_version: None,
             dry_run: false,
             os: None,
@@ -4240,5 +4242,104 @@ fn test_owner_action_list_alias() {
             _ => panic!("Expected OwnerAction::Ls via 'list' alias"),
         },
         _ => panic!("Expected Commands::Owner"),
+    }
+}
+
+#[test]
+fn test_cli_parse_cache_npx_subcommands() {
+    // 1. cache npx ls
+    let cli = Cli::try_parse_from(["rnpm", "cache", "npx", "ls"]).unwrap();
+    match cli.command {
+        Commands::Cache {
+            action: CacheAction::Npx { action, .. },
+            ..
+        } => match action {
+            CacheNpxAction::Ls { .. } => {}
+            _ => panic!("Expected CacheNpxAction::Ls"),
+        },
+        _ => panic!("Expected Commands::Cache with Npx"),
+    }
+
+    // 2. cache npx rm key1 key2 --force --dry-run
+    let cli = Cli::try_parse_from([
+        "rnpm", "cache", "npx", "rm", "abc1234", "def5678", "--force", "--dry-run",
+    ])
+    .unwrap();
+    match cli.command {
+        Commands::Cache {
+            action: CacheAction::Npx { action, .. },
+            ..
+        } => match action {
+            CacheNpxAction::Rm {
+                keys,
+                force,
+                dry_run,
+                ..
+            } => {
+                assert_eq!(keys, vec!["abc1234", "def5678"]);
+                assert!(force);
+                assert!(dry_run);
+            }
+            _ => panic!("Expected CacheNpxAction::Rm"),
+        },
+        _ => panic!("Expected Commands::Cache with Npx"),
+    }
+
+    // 3. cache npx info key1
+    let cli = Cli::try_parse_from(["rnpm", "cache", "npx", "info", "abc1234"]).unwrap();
+    match cli.command {
+        Commands::Cache {
+            action: CacheAction::Npx { action, .. },
+            ..
+        } => match action {
+            CacheNpxAction::Info { keys, .. } => {
+                assert_eq!(keys, vec!["abc1234"]);
+            }
+            _ => panic!("Expected CacheNpxAction::Info"),
+        },
+        _ => panic!("Expected Commands::Cache with Npx"),
+    }
+}
+
+#[test]
+fn test_cli_parse_format_package_lock_flags() {
+    // install --no-format-package-lock
+    let cli = Cli::try_parse_from(["rnpm", "install", "--no-format-package-lock"]).unwrap();
+    match cli.command {
+        Commands::Install {
+            no_format_package_lock,
+            format_package_lock,
+            ..
+        } => {
+            assert!(no_format_package_lock);
+            assert_eq!(format_package_lock, None);
+        }
+        _ => panic!("Expected Commands::Install"),
+    }
+
+    // install --format-package-lock=false
+    let cli = Cli::try_parse_from(["rnpm", "install", "--format-package-lock=false"]).unwrap();
+    match cli.command {
+        Commands::Install {
+            format_package_lock,
+            ..
+        } => {
+            assert_eq!(format_package_lock, Some(false));
+        }
+        _ => panic!("Expected Commands::Install"),
+    }
+
+    // ci --no-format-package-lock
+    let cli = Cli::try_parse_from(["rnpm", "ci", "--no-format-package-lock"]).unwrap();
+    match cli.command {
+        Commands::Ci {
+            no_format_package_lock,
+            format_package_lock,
+            ..
+        } => {
+            assert!(no_format_package_lock);
+            assert_eq!(format_package_lock, None);
+        }
+        _ => panic!("Expected Commands::Ci"),
     }
 }
