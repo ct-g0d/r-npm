@@ -1076,3 +1076,92 @@ async fn test_allow_git_root_requester_edge_not_fooled_by_same_name_root_dep() {
         "Transitive git repo was never fetched by git subprocess!"
     );
 }
+
+// -----------------------------------------------------------------------------
+// Test 15: allow-registry=root: root declares foo as file:, transitive declares foo as registry
+// -----------------------------------------------------------------------------
+#[tokio::test]
+async fn test_allow_registry_root_cross_kind_name_collision_zero_requests() {
+    let server = CountingServer::start(|_path, _base_url| {
+        let packument = serde_json::json!({
+            "name": "foo",
+            "dist-tags": { "latest": "1.0.0" },
+            "versions": {
+                "1.0.0": {
+                    "name": "foo",
+                    "version": "1.0.0",
+                    "dist": {
+                        "tarball": "http://127.0.0.1/foo/-/foo-1.0.0.tgz"
+                    }
+                }
+            }
+        });
+        Some((200, vec![("Content-Type", "application/json".to_string())], packument.to_string().into_bytes()))
+    }).await;
+
+    let project_dir = tempdir().unwrap();
+    let cache_dir = tempdir().unwrap();
+
+    // Root declares:
+    // 1. "foo": "file:./local-foo" (root declares foo as a FILE dependency, NOT registry)
+    // 2. "holder": "file:./local-holder"
+    // "holder" declares a transitive dependency on "foo": "^1.0.0" from the registry!
+    // Under allow-registry=root, because foo is NOT declared by root as a registry package,
+    // the transitive registry request for foo must fail with EALLOWREGISTRY and ZERO packument HTTP requests!
+    let local_foo = project_dir.path().join("local-foo");
+    std::fs::create_dir_all(&local_foo).unwrap();
+    std::fs::write(
+        local_foo.join("package.json"),
+        r#"{"name":"foo","version":"1.0.0"}"#,
+    ).unwrap();
+
+    let local_holder = project_dir.path().join("local-holder");
+    std::fs::create_dir_all(&local_holder).unwrap();
+    std::fs::write(
+        local_holder.join("package.json"),
+        serde_json::json!({
+            "name": "holder",
+            "version": "1.0.0",
+            "dependencies": {
+                "foo": "^1.0.0"
+            }
+        }).to_string(),
+    ).unwrap();
+
+    setup_test_project(
+        project_dir.path(),
+        &serde_json::json!({
+            "foo": "file:./local-foo",
+            "holder": "file:./local-holder"
+        }),
+        "allow-registry=root\n",
+    );
+
+    let options = InstallOptions {
+        project_dir: project_dir.path().to_path_buf(),
+        cache_dir: Some(cache_dir.path().to_path_buf()),
+        registry_url: Some(server.url()),
+        ..Default::default()
+    };
+
+    let mut installer = Installer::new(options).unwrap();
+    let result = installer.install().await;
+
+    assert!(result.is_err(), "Expected install to fail on transitive registry dep 'foo'");
+    let err_msg = result.unwrap_err().to_string();
+    assert!(
+        err_msg.contains("EALLOWREGISTRY"),
+        "Error message should contain EALLOWREGISTRY, got: {err_msg}"
+    );
+    assert!(
+        err_msg.contains("Fetching non-root packages of type \"registry\" have been disabled"),
+        "Error message should match exact non-root text, got: {err_msg}"
+    );
+
+    // ZERO HTTP packument requests must have hit the server for 'foo'!
+    assert_eq!(
+        server.request_count().await,
+        0,
+        "ZERO HTTP requests should have been made to the registry server for 'foo'"
+    );
+}

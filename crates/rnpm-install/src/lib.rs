@@ -466,6 +466,7 @@ pub struct RegistryPackageProvider {
     unlocked_packages: std::collections::HashSet<String>,
     source_policy: policy::SourcePolicy,
     root_declared: Arc<HashSet<String>>,
+    root_registry_declared: Arc<HashSet<String>>,
 }
 
 /// npm never creates node_modules when nothing is reified, so drop one that
@@ -975,7 +976,7 @@ impl RegistryPackageProvider {
 
     #[allow(clippy::result_large_err)]
     fn fetch_or_revalidate_packument(&self, name: &str) -> Result<PackageMetadata, SolverError> {
-        let is_root = self.root_declared.contains(name);
+        let is_root = self.root_registry_declared.contains(name);
         if let Err(e) = policy::check_source_gate(
             &self.source_policy,
             policy::SourceKind::Registry,
@@ -1262,7 +1263,7 @@ impl PackageMetadataProvider for RegistryPackageProvider {
             }
         }
 
-        let is_root = self.root_declared.contains(name);
+        let is_root = self.root_registry_declared.contains(name);
         if let Err(e) = policy::check_source_gate(
             &self.source_policy,
             policy::SourceKind::Registry,
@@ -1301,7 +1302,7 @@ impl PackageMetadataProvider for RegistryPackageProvider {
             names
                 .iter()
                 .copied()
-                .filter(|n| self.root_declared.contains(*n))
+                .filter(|n| self.root_registry_declared.contains(*n))
                 .collect()
         } else {
             names.to_vec()
@@ -2653,6 +2654,48 @@ impl Installer {
         declared
     }
 
+    fn collect_root_registry_declared(
+        &self,
+        manifest: &Manifest,
+        workspace_members: &[WorkspaceMember],
+    ) -> HashSet<String> {
+        let mut declared = HashSet::new();
+        let mut collect = |m: &Manifest| {
+            for map in [
+                &m.dependencies,
+                &m.dev_dependencies,
+                &m.optional_dependencies,
+                &m.peer_dependencies,
+            ] {
+                for (name, spec) in map {
+                    if policy::parse_source_kind(spec) == policy::SourceKind::Registry {
+                        declared.insert(name.clone());
+                    }
+                }
+            }
+        };
+        collect(manifest);
+        for member in workspace_members {
+            collect(&member.manifest);
+        }
+        for pkg_str in &self.options.packages {
+            if let Ok(s) = rnpm_core::spec::PackageSpec::parse(pkg_str) {
+                let is_registry = match &s.target {
+                    PackageTarget::Tag(_) | PackageTarget::Range(_) | PackageTarget::Version(_) => true,
+                    PackageTarget::Alias { target, .. } => matches!(
+                        target.as_ref(),
+                        PackageTarget::Tag(_) | PackageTarget::Range(_) | PackageTarget::Version(_)
+                    ),
+                    _ => false,
+                };
+                if is_registry {
+                    declared.insert(s.name);
+                }
+            }
+        }
+        declared
+    }
+
     /// Enforce `allow-git`/`allow-file`/... before anything is fetched.
     fn check_source_policy(
         &self,
@@ -3517,6 +3560,7 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
         let _meta_span = tracing::info_span!("metadata").entered();
 
         let root_declared = Arc::new(self.collect_root_declared(&manifest, &workspace_members));
+        let root_registry_declared = Arc::new(self.collect_root_registry_declared(&manifest, &workspace_members));
 
         let check_manifest_deps = |m: &Manifest| -> Result<()> {
             for map in [
@@ -3638,6 +3682,7 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
             unlocked_packages: unlocked_packages.clone(),
             source_policy: self.source_policy.clone(),
             root_declared: root_declared.clone(),
+            root_registry_declared: root_registry_declared.clone(),
         };
 
         let resolver_options = ResolverOptions {

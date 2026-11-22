@@ -216,23 +216,42 @@ fn is_direct_root_dep(
     if !is_root_or_ws {
         return false;
     }
-    let Some(parent_pkg) = packages.get(parent) else {
-        return false;
+    let check_pkg = |pkg: &LockfilePackage| -> bool {
+        for map in [
+            &pkg.dependencies,
+            &pkg.dev_dependencies,
+            &pkg.optional_dependencies,
+            &pkg.peer_dependencies,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if let Some(spec) = map.get(name) {
+                let spec_kind = parse_source_kind(spec);
+                if spec_kind == kind {
+                    return true;
+                }
+            }
+        }
+        false
     };
-    for map in [
-        &parent_pkg.dependencies,
-        &parent_pkg.dev_dependencies,
-        &parent_pkg.optional_dependencies,
-        &parent_pkg.peer_dependencies,
-    ]
-    .into_iter()
-    .flatten()
-    {
-        if let Some(spec) = map.get(name) {
-            let spec_kind = parse_source_kind(spec);
-            if spec_kind == kind {
+
+    if parent.is_empty() {
+        if let Some(root_pkg) = packages.get("") {
+            if check_pkg(root_pkg) {
                 return true;
             }
+        }
+        for ws in workspace_paths {
+            if let Some(ws_pkg) = packages.get(ws) {
+                if check_pkg(ws_pkg) {
+                    return true;
+                }
+            }
+        }
+    } else if let Some(parent_pkg) = packages.get(parent) {
+        if check_pkg(parent_pkg) {
+            return true;
         }
     }
     false
@@ -1461,5 +1480,126 @@ mod tests {
         ));
         assert!(!is_registry_tarball("https://evil.com/-/a-1.0.0.tgz"));
         assert!(!is_registry_tarball("https://example.com/a.tgz"));
+    }
+
+    #[test]
+    fn hoisted_workspace_dep_allowed_under_allow_root_while_transitive_fails() {
+        use rnpm_lockfile::{LockfilePackage, LockfileV3};
+        use std::collections::{BTreeMap, HashSet};
+
+        let mut workspace_paths = HashSet::new();
+        workspace_paths.insert("packages/a".to_string());
+
+        let mut root_declared = HashSet::new();
+        root_declared.insert("workspace-a".to_string());
+        root_declared.insert("packages/a".to_string());
+        root_declared.insert("direct-remote".to_string());
+
+        let mut packages = BTreeMap::new();
+
+        // 1. Root package
+        let mut root_deps = BTreeMap::new();
+        root_deps.insert("workspace-a".to_string(), "file:packages/a".to_string());
+        packages.insert(
+            String::new(),
+            LockfilePackage {
+                dependencies: Some(root_deps),
+                ..Default::default()
+            },
+        );
+
+        // 2. Workspace member packages/a
+        let mut ws_deps = BTreeMap::new();
+        ws_deps.insert(
+            "direct-remote".to_string(),
+            "http://example.com/direct-remote.tgz".to_string(),
+        );
+        ws_deps.insert(
+            "transitive-holder".to_string(),
+            "^1.0.0".to_string(),
+        );
+        packages.insert(
+            "packages/a".to_string(),
+            LockfilePackage {
+                dependencies: Some(ws_deps),
+                ..Default::default()
+            },
+        );
+
+        // 3. Hoisted direct workspace dep at top-level node_modules/direct-remote
+        packages.insert(
+            "node_modules/direct-remote".to_string(),
+            LockfilePackage {
+                resolved: Some("http://example.com/direct-remote.tgz".to_string()),
+                ..Default::default()
+            },
+        );
+
+        // 4. Transitive holder at top-level node_modules/transitive-holder
+        let mut holder_deps = BTreeMap::new();
+        holder_deps.insert(
+            "transitive-remote".to_string(),
+            "http://example.com/transitive-remote.tgz".to_string(),
+        );
+        packages.insert(
+            "node_modules/transitive-holder".to_string(),
+            LockfilePackage {
+                resolved: Some("https://registry.npmjs.org/transitive-holder/-/transitive-holder-1.0.0.tgz".to_string()),
+                dependencies: Some(holder_deps),
+                ..Default::default()
+            },
+        );
+
+        // 5. Hoisted transitive remote at top-level node_modules/transitive-remote
+        packages.insert(
+            "node_modules/transitive-remote".to_string(),
+            LockfilePackage {
+                resolved: Some("http://example.com/transitive-remote.tgz".to_string()),
+                ..Default::default()
+            },
+        );
+
+        let lockfile = LockfileV3 {
+            name: "test".to_string(),
+            version: None,
+            lockfile_version: 3,
+            requires: None,
+            packages,
+        };
+
+        let policy = SourcePolicy {
+            remote: AllowMode::Root,
+            ..Default::default()
+        };
+
+        // Must FAIL because node_modules/transitive-remote is a non-root transitive remote dep!
+        let res = check_sources(&lockfile, &root_declared, &workspace_paths, &policy);
+        assert!(res.is_err(), "Expected transitive remote dep to fail under allow-remote=root");
+        let err = res.unwrap_err().to_string();
+        assert!(err.contains("EALLOWREMOTE"), "Expected EALLOWREMOTE, got: {err}");
+        assert!(err.contains("non-root"), "Expected non-root in error message, got: {err}");
+
+        // Now remove the transitive remote package:
+        let mut clean_packages = lockfile.packages.clone();
+        clean_packages.remove("node_modules/transitive-remote");
+        // Also remove from holder's deps so edge check passes
+        if let Some(h) = clean_packages.get_mut("node_modules/transitive-holder") {
+            h.dependencies = None;
+        }
+        let clean_lockfile = LockfileV3 {
+            name: "test".to_string(),
+            version: None,
+            lockfile_version: 3,
+            requires: None,
+            packages: clean_packages,
+        };
+
+        // Must PASS: direct-remote hoisted to node_modules/direct-remote is declared by workspace packages/a!
+        let clean_res = check_sources(&clean_lockfile, &root_declared, &workspace_paths, &policy);
+        assert!(
+            clean_res.is_ok(),
+            "Hoisted workspace direct-remote dep must pass allow-remote=root, but failed: {:?}",
+            clean_res.err()
+        );
     }
 }
