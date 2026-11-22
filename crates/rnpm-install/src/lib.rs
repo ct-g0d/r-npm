@@ -3167,11 +3167,21 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                     }
                 }
                 PackageTarget::Url(u) => {
-                    if let Ok(bytes) = self
-                        .registry_client
-                        .download_tarball_bytes(u.as_str())
-                        .await
-                    {
+                    let u_str = u.as_str();
+                    let bytes = if let Ok(Some((_entry, data))) = self.cache.get(u_str) {
+                        Some(data)
+                    } else if self.options.offline {
+                        return Err(anyhow!(
+                            "npm error code ENOTCACHED\nnpm error request to {u_str} failed: cache mode is 'only-if-cached' but no cached response is available."
+                        ));
+                    } else {
+                        self.registry_client
+                            .download_tarball_bytes(u_str)
+                            .await
+                            .ok()
+                    };
+
+                    if let Some(bytes) = bytes {
                         if let Ok(m) = inspect_manifest_from_tarball(&bytes) {
                             if let Some(ref real_name) = m.name {
                                 spec.name = real_name.clone();
@@ -7833,7 +7843,7 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                     None
                 };
 
-                if meta.is_none() {
+                if meta.is_none() && !self.options.offline {
                     if let Ok(reg_abbrev) = self.registry_client.get_package_metadata(name).await {
                         meta = Some(abbreviated_to_package_metadata(&reg_abbrev));
                     }
@@ -7931,7 +7941,7 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                                 None
                             };
 
-                            if meta.is_none() {
+                            if meta.is_none() && !self.options.offline {
                                 if let Ok(reg_abbrev) =
                                     self.registry_client.get_package_metadata(name).await
                                 {
@@ -8013,7 +8023,7 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                             None
                         };
 
-                        if meta.is_none() {
+                        if meta.is_none() && !self.options.offline {
                             if let Ok(reg_abbrev) =
                                 self.registry_client.get_package_metadata(name).await
                             {
@@ -8042,10 +8052,20 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                     }
                 }
                 PackageTarget::Url(ref url) => {
-                    let archive_bytes_res = self
-                        .registry_client
-                        .download_tarball_bytes(url.as_str())
-                        .await;
+                    let url_str = url.as_str();
+                    let archive_bytes_res =
+                        if let Ok(Some((_entry, data))) = self.cache.get(url_str) {
+                            Ok(data)
+                        } else if self.options.offline {
+                            return Err(anyhow!(
+                                "npm error code ENOTCACHED\nnpm error request to {url_str} failed: cache mode is 'only-if-cached' but no cached response is available."
+                            ));
+                        } else {
+                            self.registry_client
+                                .download_tarball_bytes(url_str)
+                                .await
+                                .map_err(|e| anyhow!("{e}"))
+                        };
                     let (m, integrity) = if let Ok(archive_bytes) = archive_bytes_res {
                         let integrity = Integrity::from_bytes(
                             &archive_bytes,
@@ -8102,7 +8122,7 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                         None
                     };
 
-                    if meta.is_none() {
+                    if meta.is_none() && !self.options.offline {
                         if let Ok(reg_abbrev) =
                             self.registry_client.get_package_metadata(name).await
                         {
