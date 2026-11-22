@@ -454,11 +454,11 @@ pub struct RegistryPackageProvider {
     client: RegistryClient,
     handle: tokio::runtime::Handle,
     metadata_cache: Arc<std::sync::Mutex<HashMap<String, PackageMetadata>>>,
-    /// Tracks package names whose registry packument has been fetched/merged into `metadata_cache`.
-    /// Entries populated solely by `populate_custom_target_metadata` (file:/url:/git:) are NOT in
-    /// this set, so a later allowed registry edge for the same package name still fetches and merges
-    /// registry versions on demand without eagerly hitting the registry during custom-target prep.
-    registry_fetched: Arc<std::sync::Mutex<HashSet<String>>>,
+    /// Separate metadata cache for custom targets (`file:`, `git:`, `http(s):` URLs) populated by
+    /// `populate_custom_target_metadata`. Kept strictly separate from registry `metadata_cache` so
+    /// a local/custom package with the same name and version never overwrites registry metadata or
+    /// `dist-tags` (e.g. `dep: file:dep.tgz` alongside `npm:dep@latest`).
+    custom_metadata_cache: Arc<std::sync::Mutex<HashMap<String, PackageMetadata>>>,
     cache: Cache,
     offline: bool,
     prefer_offline: bool,
@@ -942,36 +942,6 @@ pub fn extract_stored_etag(metadata: Option<&serde_json::Value>) -> Option<Strin
 }
 
 impl RegistryPackageProvider {
-    /// Stores a fetched registry packument in `metadata_cache`, preserving any custom-target
-    /// versions/tags (file:/git:/url:) already populated for `name`, and marks `name` as fetched.
-    fn merge_and_store_registry_metadata(
-        cache: &std::sync::Mutex<HashMap<String, PackageMetadata>>,
-        registry_fetched: &std::sync::Mutex<HashSet<String>>,
-        name: &str,
-        mut reg_meta: PackageMetadata,
-    ) -> PackageMetadata {
-        if let Ok(mut locked) = cache.lock() {
-            if let Some(existing) = locked.get(name) {
-                // Preserve registry dist-tags (like `latest`) so a local custom target's
-                // synthetic `latest` tag never hijacks registry resolution for `npm:dep@latest`.
-                for (tag, ver) in &existing.dist_tags {
-                    reg_meta
-                        .dist_tags
-                        .entry(tag.clone())
-                        .or_insert_with(|| ver.clone());
-                }
-                for (ver, vm) in &existing.versions {
-                    reg_meta.versions.insert(ver.clone(), vm.clone());
-                }
-            }
-            locked.insert(name.to_string(), reg_meta.clone());
-        }
-        if let Ok(mut fetched) = registry_fetched.lock() {
-            fetched.insert(name.to_string());
-        }
-        reg_meta
-    }
-
     fn is_package_locked(&self, name: &str) -> bool {
         if self.unlocked_packages.contains(name) {
             return false;
@@ -1291,7 +1261,7 @@ impl PackageMetadataProvider for RegistryPackageProvider {
                             dist_tags,
                             versions,
                         };
-                        if let Ok(mut cache) = self.metadata_cache.lock() {
+                        if let Ok(mut cache) = self.custom_metadata_cache.lock() {
                             cache.insert(name.to_string(), meta.clone());
                         }
                         return Ok(Some(meta));
@@ -1316,7 +1286,7 @@ impl PackageMetadataProvider for RegistryPackageProvider {
                         | PackageTarget::Workspace(_))
                 ));
         if is_custom_edge {
-            if let Ok(cache) = self.metadata_cache.lock() {
+            if let Ok(cache) = self.custom_metadata_cache.lock() {
                 if let Some(meta) = cache.get(name) {
                     return Ok(Some(meta.clone()));
                 }
@@ -1335,28 +1305,18 @@ impl PackageMetadataProvider for RegistryPackageProvider {
             ));
         }
 
-        let already_fetched_registry = self
-            .registry_fetched
-            .lock()
-            .map(|s| s.contains(name))
-            .unwrap_or(false);
-        if already_fetched_registry {
-            if let Ok(cache) = self.metadata_cache.lock() {
-                if let Some(meta) = cache.get(name) {
-                    return Ok(Some(meta.clone()));
-                }
+        if let Ok(cache) = self.metadata_cache.lock() {
+            if let Some(meta) = cache.get(name) {
+                return Ok(Some(meta.clone()));
             }
         }
 
         match self.fetch_or_revalidate_packument(name, reg_is_root) {
             Ok(meta) => {
-                let merged = Self::merge_and_store_registry_metadata(
-                    &self.metadata_cache,
-                    &self.registry_fetched,
-                    name,
-                    meta,
-                );
-                Ok(Some(merged))
+                if let Ok(mut cache) = self.metadata_cache.lock() {
+                    cache.insert(name.to_string(), meta.clone());
+                }
+                Ok(Some(meta))
             }
             Err(SolverError::PackageMetadata(_, msg))
                 if msg.contains("404") || msg.contains("Not Found") =>
@@ -1396,13 +1356,13 @@ impl PackageMetadataProvider for RegistryPackageProvider {
         }
         let names = &filtered_names[..];
         let mut missing: Vec<String> = {
-            let fetched = match self.registry_fetched.lock() {
-                Ok(f) => f,
+            let cache = match self.metadata_cache.lock() {
+                Ok(c) => c,
                 Err(_) => return,
             };
             names
                 .iter()
-                .filter(|n| !fetched.contains(**n))
+                .filter(|n| !cache.contains_key(**n))
                 .map(|n| n.to_string())
                 .collect()
         };
@@ -1476,13 +1436,10 @@ impl PackageMetadataProvider for RegistryPackageProvider {
         }
 
         if !fresh_metas.is_empty() {
-            for (name, meta) in fresh_metas {
-                Self::merge_and_store_registry_metadata(
-                    &self.metadata_cache,
-                    &self.registry_fetched,
-                    &name,
-                    meta,
-                );
+            if let Ok(mut locked) = self.metadata_cache.lock() {
+                for (name, meta) in fresh_metas {
+                    locked.insert(name, meta);
+                }
             }
         }
 
@@ -1491,7 +1448,6 @@ impl PackageMetadataProvider for RegistryPackageProvider {
         }
 
         let reg_cache = self.metadata_cache.clone();
-        let reg_fetched = self.registry_fetched.clone();
         let client_c = self.client.clone();
         let lockfile_c = self.lockfile.clone();
         // Cache writes run after the batch, in parallel: written one by one
@@ -1543,12 +1499,9 @@ impl PackageMetadataProvider for RegistryPackageProvider {
                                             }
                                         }
                                     }
-                                    Self::merge_and_store_registry_metadata(
-                                        &reg_cache,
-                                        &reg_fetched,
-                                        &name,
-                                        meta,
-                                    );
+                                    if let Ok(mut locked) = reg_cache.lock() {
+                                        locked.insert(name, meta);
+                                    }
                                 }
                             }
                         }
@@ -1570,12 +1523,9 @@ impl PackageMetadataProvider for RegistryPackageProvider {
                                     }
                                 }
                             }
-                            Self::merge_and_store_registry_metadata(
-                                &reg_cache,
-                                &reg_fetched,
-                                &name,
-                                meta,
-                            );
+                            if let Ok(mut locked) = reg_cache.lock() {
+                                locked.insert(name, meta);
+                            }
                         }
                         Err(err) => {
                             debug!("Conditional fetch error for {name}: {err}");
@@ -1593,12 +1543,9 @@ impl PackageMetadataProvider for RegistryPackageProvider {
                                             }
                                         }
                                     }
-                                    Self::merge_and_store_registry_metadata(
-                                        &reg_cache,
-                                        &reg_fetched,
-                                        &name,
-                                        meta,
-                                    );
+                                    if let Ok(mut locked) = reg_cache.lock() {
+                                        locked.insert(name, meta);
+                                    }
                                 }
                             }
                         }
@@ -3828,12 +3775,18 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
         // 1. Resolve dependency graph via Solver directly
         let handle = tokio::runtime::Handle::current();
         let metadata_cache = Arc::new(std::sync::Mutex::new(HashMap::new()));
-        self.populate_custom_target_metadata(&manifest, &metadata_cache, &root_declared, true)
-            .await?;
+        let custom_metadata_cache = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        self.populate_custom_target_metadata(
+            &manifest,
+            &custom_metadata_cache,
+            &root_declared,
+            true,
+        )
+        .await?;
         for member in &workspace_members {
             self.populate_custom_target_metadata(
                 &member.manifest,
-                &metadata_cache,
+                &custom_metadata_cache,
                 &root_declared,
                 true,
             )
@@ -3916,7 +3869,7 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
             client: self.registry_client.clone(),
             handle,
             metadata_cache,
-            registry_fetched: Arc::new(std::sync::Mutex::new(HashSet::new())),
+            custom_metadata_cache,
             cache: self.cache.clone(),
             offline: self.options.offline,
             prefer_offline,
