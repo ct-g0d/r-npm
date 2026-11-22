@@ -105,6 +105,7 @@ impl<'a> ConfigOptions<'a> {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Config {
     pub npmrc: Npmrc,
+    pub layers: Vec<ConfigLayer>,
 }
 
 impl Config {
@@ -184,7 +185,76 @@ impl Config {
     }
 
     /// npm's `before` / `min-release-age` cutoff computed relative to `now_ms`.
+    ///
+    /// Precedence follows npm 11.20.0 across configuration layers:
+    /// CLI > env > project `.npmrc` > workspace `.npmrc` > user `.npmrc` > global `.npmrc` > default.
+    /// The highest-priority layer specifying either `before` or `min-release-age` wins.
+    /// If both `before` and `min-release-age` appear in the same layer, `before` wins as tie-breaker.
     pub fn before_cutoff_at(&self, now_ms: i64) -> Option<i64> {
+        let parse_before_val = |val: &str| -> Option<i64> {
+            let trimmed = val.trim();
+            if trimmed.eq_ignore_ascii_case("null") || trimmed.is_empty() {
+                return None;
+            }
+            crate::date::parse_js_date(trimmed)
+        };
+
+        let parse_age_val = |val: &str| -> Option<i64> {
+            let trimmed = val.trim();
+            if trimmed.eq_ignore_ascii_case("null") || trimmed.is_empty() {
+                return None;
+            }
+            let days = trimmed.parse::<f64>().ok()?;
+            if days <= 0.0 || !days.is_finite() {
+                return None;
+            }
+            let delta_ms = (days * 86_400_000.0).round() as i64;
+            Some(now_ms.saturating_sub(delta_ms))
+        };
+
+        let layer_lookup = |settings: &BTreeMap<String, String>, key: &str| -> Option<String> {
+            let key_lower = key.to_ascii_lowercase();
+            let dashed = key_lower.replace('_', "-");
+            let underscored = key_lower.replace('-', "_");
+            settings
+                .get(key)
+                .or_else(|| settings.get(&key_lower))
+                .or_else(|| settings.get(&dashed))
+                .or_else(|| settings.get(&underscored))
+                .cloned()
+        };
+
+        if !self.layers.is_empty() {
+            let layer_priority = |name: &str| -> u8 {
+                match name.to_ascii_lowercase().as_str() {
+                    "cli" => 6,
+                    "env" => 5,
+                    "project" => 4,
+                    "workspace" => 3,
+                    "user" => 2,
+                    "global" => 1,
+                    _ => 0,
+                }
+            };
+
+            let mut sorted_layers: Vec<&ConfigLayer> = self.layers.iter().collect();
+            sorted_layers.sort_by_key(|a| std::cmp::Reverse(layer_priority(&a.name)));
+
+            for layer in sorted_layers {
+                let before_opt = layer_lookup(&layer.settings, "before");
+                let age_opt = layer_lookup(&layer.settings, "min-release-age");
+
+                if before_opt.is_some() || age_opt.is_some() {
+                    if let Some(b_val) = before_opt {
+                        return parse_before_val(&b_val);
+                    } else if let Some(a_val) = age_opt {
+                        return parse_age_val(&a_val);
+                    }
+                }
+            }
+            return None;
+        }
+
         if let Some(before_str) = self.get("before") {
             let trimmed = before_str.trim();
             if trimmed.eq_ignore_ascii_case("null") || trimmed.is_empty() {
@@ -249,6 +319,7 @@ impl Config {
         };
 
         let cli_map_opt = options.cli_overrides.or_else(get_process_cli_overrides);
+        let mut layers = Vec::new();
         let mut base_npmrc = Npmrc::default();
 
         let disable_global = options
@@ -284,6 +355,11 @@ impl Config {
         if let Some(path) = global_config_path {
             if path.as_os_str() != "false" && !path.as_os_str().is_empty() && path.exists() {
                 let global_config = Npmrc::from_file(&path)?;
+                layers.push(ConfigLayer {
+                    name: "global".to_string(),
+                    source: Some(path),
+                    settings: global_config.scrubbed_settings(),
+                });
                 base_npmrc.merge(global_config);
             }
         }
@@ -322,168 +398,9 @@ impl Config {
         if let Some(path) = user_config_path {
             if path.as_os_str() != "false" && !path.as_os_str().is_empty() && path.exists() {
                 let user_config = Npmrc::from_file(&path)?;
-                base_npmrc.merge(user_config);
-            }
-        }
-
-        let ws_root = options
-            .workspace_root
-            .map(|path| path.to_path_buf())
-            .or_else(|| options.project_dir.and_then(find_workspace_root));
-
-        if let Some(ws_path) = ws_root {
-            let ws_npmrc_path = ws_path.join(".npmrc");
-            if ws_npmrc_path.exists() {
-                let ws_config = Npmrc::from_file(&ws_npmrc_path)?;
-                base_npmrc.merge(ws_config);
-            }
-        }
-
-        if let Some(dir) = options.project_dir {
-            let project_npmrc_path = dir.join(".npmrc");
-            if project_npmrc_path.exists() {
-                let project_config = Npmrc::from_file(&project_npmrc_path)?;
-                base_npmrc.merge(project_config);
-            }
-        }
-
-        let all_env: BTreeMap<String, String> = if let Some(map) = options.env_vars {
-            map
-        } else {
-            env::vars().collect()
-        };
-
-        for (raw_key, value) in all_env {
-            let lower_key = raw_key.to_ascii_lowercase();
-            if let Some(rest) = lower_key.strip_prefix("npm_config_") {
-                if rest.is_empty() {
-                    continue;
-                }
-                let (prefix, body) = if rest.starts_with('_') {
-                    ("_", &rest[1..])
-                } else {
-                    ("", rest)
-                };
-                let dashed = format!("{prefix}{}", body.replace('_', "-"));
-                base_npmrc.set(&dashed, &value)?;
-                if dashed != rest {
-                    let _ = base_npmrc.set(rest, &value);
-                }
-            }
-        }
-
-        if let Some(cli_map) = cli_map_opt {
-            for (key, value) in cli_map {
-                let clean_key = key.strip_prefix("--").unwrap_or(&key);
-                let lower_clean = clean_key.to_ascii_lowercase();
-                let (prefix, body) = if lower_clean.starts_with('_') {
-                    ("_", &lower_clean[1..])
-                } else {
-                    ("", lower_clean.as_str())
-                };
-                let dashed = format!("{prefix}{}", body.replace('_', "-"));
-                base_npmrc.set(clean_key, &value)?;
-                if clean_key != dashed {
-                    let _ = base_npmrc.set(&dashed, &value);
-                }
-            }
-        }
-
-        Ok(Self { npmrc: base_npmrc })
-    }
-
-    pub fn load_detailed(options: ConfigOptions<'_>) -> Result<ConfigDetailed, ConfigError> {
-        let env_lookup = |var_name: &str| -> Option<String> {
-            if let Some(ref map) = options.env_vars {
-                map.get(var_name).cloned()
-            } else {
-                env::var(var_name).ok()
-            }
-        };
-
-        let cli_map_opt = options.cli_overrides.or_else(get_process_cli_overrides);
-        let mut layers = Vec::new();
-        let mut base_npmrc = Npmrc::default();
-
-        let disable_global = options
-            .globalconfig
-            .as_ref()
-            .map(|p| p.as_os_str() == "false")
-            .unwrap_or(false)
-            || cli_map_opt
-                .as_ref()
-                .and_then(|cli| cli.get("globalconfig").map(|v| v == "false"))
-                .unwrap_or(false);
-
-        let global_config_path = if disable_global {
-            None
-        } else {
-            options
-                .globalconfig
-                .clone()
-                .or_else(get_process_globalconfig)
-                .or_else(|| {
-                    cli_map_opt
-                        .as_ref()
-                        .and_then(|cli| cli.get("globalconfig").map(PathBuf::from))
-                })
-                .or_else(|| {
-                    env_lookup("NPM_CONFIG_GLOBALCONFIG")
-                        .or_else(|| env_lookup("npm_config_globalconfig"))
-                        .map(PathBuf::from)
-                })
-                .or_else(|| find_global_npmrc_with_env(env_lookup))
-        };
-
-        if let Some(path) = &global_config_path {
-            if path.as_os_str() != "false" && !path.as_os_str().is_empty() && path.exists() {
-                let global_config = Npmrc::from_file(path)?;
-                layers.push(ConfigLayer {
-                    name: "global".to_string(),
-                    source: Some(path.clone()),
-                    settings: global_config.scrubbed_settings(),
-                });
-                base_npmrc.merge(global_config);
-            }
-        }
-
-        let disable_user = options
-            .userconfig
-            .as_ref()
-            .map(|p| p.as_os_str() == "false")
-            .unwrap_or(false)
-            || cli_map_opt
-                .as_ref()
-                .and_then(|cli| cli.get("userconfig").map(|v| v == "false"))
-                .unwrap_or(false);
-
-        let user_config_path = if disable_user {
-            None
-        } else {
-            options
-                .userconfig
-                .clone()
-                .or_else(get_process_userconfig)
-                .or_else(|| {
-                    cli_map_opt
-                        .as_ref()
-                        .and_then(|cli| cli.get("userconfig").map(PathBuf::from))
-                })
-                .or_else(|| {
-                    env_lookup("npm_config_userconfig")
-                        .or_else(|| env_lookup("NPM_CONFIG_USERCONFIG"))
-                        .map(PathBuf::from)
-                })
-                .or_else(|| base_npmrc.settings.get("userconfig").map(PathBuf::from))
-                .or_else(|| find_user_npmrc_with_env(env_lookup))
-        };
-
-        if let Some(path) = &user_config_path {
-            if path.as_os_str() != "false" && !path.as_os_str().is_empty() && path.exists() {
-                let user_config = Npmrc::from_file(path)?;
                 layers.push(ConfigLayer {
                     name: "user".to_string(),
-                    source: Some(path.clone()),
+                    source: Some(path),
                     settings: user_config.scrubbed_settings(),
                 });
                 base_npmrc.merge(user_config);
@@ -495,7 +412,7 @@ impl Config {
             .map(|path| path.to_path_buf())
             .or_else(|| options.project_dir.and_then(find_workspace_root));
 
-        if let Some(ws_path) = &ws_root {
+        if let Some(ws_path) = ws_root {
             let ws_npmrc_path = ws_path.join(".npmrc");
             if ws_npmrc_path.exists() {
                 let ws_config = Npmrc::from_file(&ws_npmrc_path)?;
@@ -577,7 +494,10 @@ impl Config {
                 } else {
                     value.clone()
                 };
-                cli_layer_settings.insert(clean_key.to_string(), val_display);
+                cli_layer_settings.insert(clean_key.to_string(), val_display.clone());
+                if clean_key != dashed {
+                    cli_layer_settings.insert(dashed.clone(), val_display);
+                }
                 base_npmrc.set(clean_key, &value)?;
                 if clean_key != dashed {
                     let _ = base_npmrc.set(&dashed, &value);
@@ -592,6 +512,21 @@ impl Config {
             }
         }
 
+        Ok(Self {
+            npmrc: base_npmrc,
+            layers,
+        })
+    }
+
+    pub fn load_detailed(options: ConfigOptions<'_>) -> Result<ConfigDetailed, ConfigError> {
+        let env_lookup = |var_name: &str| -> Option<String> {
+            if let Some(ref map) = options.env_vars {
+                map.get(var_name).cloned()
+            } else {
+                env::var(var_name).ok()
+            }
+        };
+
         let global_prefix = find_global_prefix_with_env(env_lookup);
         let local_prefix = options
             .project_dir
@@ -602,10 +537,11 @@ impl Config {
                     .unwrap_or_else(|_| PathBuf::from("."))
             });
 
-        let effective = base_npmrc.scrubbed_settings();
+        let config = Self::load_with_options(options)?;
+        let effective = config.npmrc.scrubbed_settings();
 
         Ok(ConfigDetailed {
-            layers,
+            layers: config.layers,
             effective,
             global_prefix,
             local_prefix,

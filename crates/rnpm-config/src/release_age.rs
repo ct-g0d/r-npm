@@ -8,12 +8,246 @@
 /// Check whether a package name matches a single glob pattern according to
 /// npm's minimatch configuration (`nonegate: true, nocomment: true, noext: true`).
 pub fn match_package_pattern(pattern: &str, name: &str) -> bool {
+    let expanded = expand_braces(pattern);
+    expanded.iter().any(|p| match_single_pattern(p, name))
+}
+
+fn match_single_pattern(pattern: &str, name: &str) -> bool {
     if pattern == name {
         return true;
     }
     let pat_segments: Vec<&str> = pattern.split('/').collect();
     let name_segments: Vec<&str> = name.split('/').collect();
     match_segments(&pat_segments, &name_segments)
+}
+
+const MAX_EXPANSIONS: usize = 1024;
+
+/// Expand bash-style braces in a pattern, matching npm 11.20.0 `minimatch` behavior.
+///
+/// Supports:
+/// - `{foo,bar}` -> `["foo", "bar"]`
+/// - `@scope/{a,b}` -> `["@scope/a", "@scope/b"]`
+/// - Nested braces: `{a,{b,c}}` -> `["a", "b", "c"]`
+/// - Numeric ranges: `{1..3}` -> `["1", "2", "3"]`, `{01..03}` -> `["01", "02", "03"]`
+/// - Alpha ranges: `{a..c}` -> `["a", "b", "c"]`
+/// - Unmatched/single braces without commas or ranges: `{single}` -> `["{single}"]`
+///
+/// Protected by a maximum expansion cap (`MAX_EXPANSIONS = 1024`) against DoS.
+pub fn expand_braces(pattern: &str) -> Vec<String> {
+    if !pattern.contains('{') || !pattern.contains('}') {
+        return vec![pattern.to_string()];
+    }
+
+    let mut results = Vec::new();
+    let mut queue = vec![pattern.to_string()];
+
+    while let Some(current) = queue.pop() {
+        if results.len() >= MAX_EXPANSIONS {
+            break;
+        }
+
+        if let Some((start, end, options)) = find_expandable_brace(&current) {
+            let prefix = &current[..start];
+            let suffix = &current[end + 1..];
+
+            for opt in options.into_iter().rev() {
+                if queue.len() + results.len() >= MAX_EXPANSIONS {
+                    break;
+                }
+                queue.push(format!("{prefix}{opt}{suffix}"));
+            }
+        } else {
+            results.push(current);
+        }
+    }
+
+    if results.is_empty() {
+        vec![pattern.to_string()]
+    } else {
+        results
+    }
+}
+
+fn find_expandable_brace(s: &str) -> Option<(usize, usize, Vec<String>)> {
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'\\' {
+            i += 2;
+            continue;
+        }
+        if bytes[i] == b'{' {
+            let start = i;
+            let mut depth = 1;
+            let mut j = i + 1;
+            let mut found_end = None;
+            while j < bytes.len() {
+                if bytes[j] == b'\\' {
+                    j += 2;
+                    continue;
+                }
+                if bytes[j] == b'{' {
+                    depth += 1;
+                } else if bytes[j] == b'}' {
+                    depth -= 1;
+                    if depth == 0 {
+                        found_end = Some(j);
+                        break;
+                    }
+                }
+                j += 1;
+            }
+
+            if let Some(end) = found_end {
+                let inner = &s[start + 1..end];
+                let parts = split_top_level_commas(inner);
+                if parts.len() > 1 {
+                    return Some((start, end, parts));
+                } else if let Some(range_parts) = parse_brace_range(inner) {
+                    return Some((start, end, range_parts));
+                }
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+fn split_top_level_commas(inner: &str) -> Vec<String> {
+    let mut parts = Vec::new();
+    let mut cur = String::new();
+    let mut depth = 0;
+    let chars: Vec<char> = inner.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if c == '\\' {
+            cur.push(c);
+            if i + 1 < chars.len() {
+                i += 1;
+                cur.push(chars[i]);
+            }
+        } else if c == '{' {
+            depth += 1;
+            cur.push(c);
+        } else if c == '}' {
+            if depth > 0 {
+                depth -= 1;
+            }
+            cur.push(c);
+        } else if c == ',' && depth == 0 {
+            parts.push(std::mem::take(&mut cur));
+        } else {
+            cur.push(c);
+        }
+        i += 1;
+    }
+    parts.push(cur);
+    parts
+}
+
+fn parse_brace_range(inner: &str) -> Option<Vec<String>> {
+    if inner.contains(',') {
+        return None;
+    }
+    let segments: Vec<&str> = inner.split("..").collect();
+    if segments.len() != 2 && segments.len() != 3 {
+        return None;
+    }
+    let start_str = segments[0];
+    let end_str = segments[1];
+    let step_str = if segments.len() == 3 {
+        Some(segments[2])
+    } else {
+        None
+    };
+
+    if let (Ok(start), Ok(end)) = (start_str.parse::<i64>(), end_str.parse::<i64>()) {
+        let step = if let Some(st) = step_str {
+            st.parse::<i64>().ok()?.abs().max(1)
+        } else {
+            1
+        };
+        let pad_len = if (start_str.starts_with('0') && start_str.len() > 1)
+            || (start_str.starts_with("-0") && start_str.len() > 2)
+            || (end_str.starts_with('0') && end_str.len() > 1)
+            || (end_str.starts_with("-0") && end_str.len() > 2)
+        {
+            start_str.len().max(end_str.len())
+        } else {
+            0
+        };
+
+        let mut res = Vec::new();
+        if start <= end {
+            let mut cur = start;
+            while cur <= end && res.len() < MAX_EXPANSIONS {
+                if pad_len > 0 {
+                    res.push(format!("{:0width$}", cur, width = pad_len));
+                } else {
+                    res.push(cur.to_string());
+                }
+                cur = cur.saturating_add(step);
+                if cur == i64::MAX {
+                    break;
+                }
+            }
+        } else {
+            let mut cur = start;
+            while cur >= end && res.len() < MAX_EXPANSIONS {
+                if pad_len > 0 {
+                    res.push(format!("{:0width$}", cur, width = pad_len));
+                } else {
+                    res.push(cur.to_string());
+                }
+                cur = cur.saturating_sub(step);
+                if cur == i64::MIN {
+                    break;
+                }
+            }
+        }
+        return Some(res);
+    }
+
+    if start_str.len() == 1 && end_str.len() == 1 {
+        let s_char = start_str.chars().next()?;
+        let e_char = end_str.chars().next()?;
+        if (s_char.is_ascii_lowercase() && e_char.is_ascii_lowercase())
+            || (s_char.is_ascii_uppercase() && e_char.is_ascii_uppercase())
+        {
+            let step = if let Some(st) = step_str {
+                st.parse::<usize>().ok()?.max(1)
+            } else {
+                1
+            };
+            let mut res = Vec::new();
+            if s_char <= e_char {
+                let mut cur = s_char as u8;
+                let end = e_char as u8;
+                while cur <= end && res.len() < MAX_EXPANSIONS {
+                    res.push((cur as char).to_string());
+                    cur = cur.saturating_add(step as u8);
+                    if cur > end {
+                        break;
+                    }
+                }
+            } else {
+                let mut cur = s_char as u8;
+                let end = e_char as u8;
+                while cur >= end && res.len() < MAX_EXPANSIONS {
+                    res.push((cur as char).to_string());
+                    if (cur as usize) < step {
+                        break;
+                    }
+                    cur -= step as u8;
+                }
+            }
+            return Some(res);
+        }
+    }
+
+    None
 }
 
 /// Determine whether a package name is exempt from the `min-release-age` /
@@ -167,5 +401,52 @@ mod tests {
         assert!(!is_release_age_excluded("foo", &[] as &[&str]));
         assert!(!is_release_age_excluded("   ", &["foo"]));
         assert!(!is_release_age_excluded("foo", &["   "]));
+    }
+
+    #[test]
+    fn test_brace_expansion_exclude() {
+        // {foo,bar}
+        assert!(is_release_age_excluded("foo", &["{foo,bar}"]));
+        assert!(is_release_age_excluded("bar", &["{foo,bar}"]));
+        assert!(!is_release_age_excluded("baz", &["{foo,bar}"]));
+
+        // @scope/{a,b}
+        assert!(is_release_age_excluded("@scope/a", &["@scope/{a,b}"]));
+        assert!(is_release_age_excluded("@scope/b", &["@scope/{a,b}"]));
+        assert!(!is_release_age_excluded("@scope/c", &["@scope/{a,b}"]));
+        assert!(!is_release_age_excluded("a", &["@scope/{a,b}"]));
+
+        // nested {a,{b,c}}
+        assert!(is_release_age_excluded("a", &["{a,{b,c}}"]));
+        assert!(is_release_age_excluded("b", &["{a,{b,c}}"]));
+        assert!(is_release_age_excluded("c", &["{a,{b,c}}"]));
+        assert!(!is_release_age_excluded("d", &["{a,{b,c}}"]));
+
+        // unmatched {single}
+        assert!(is_release_age_excluded("{single}", &["{single}"]));
+        assert!(!is_release_age_excluded("single", &["{single}"]));
+
+        // wildcard + braces @org/{foo-*,bar}
+        assert!(is_release_age_excluded("@org/foo-1", &["@org/{foo-*,bar}"]));
+        assert!(is_release_age_excluded("@org/foo-alpha", &["@org/{foo-*,bar}"]));
+        assert!(is_release_age_excluded("@org/bar", &["@org/{foo-*,bar}"]));
+        assert!(!is_release_age_excluded("@org/baz", &["@org/{foo-*,bar}"]));
+        assert!(!is_release_age_excluded("foo-1", &["@org/{foo-*,bar}"]));
+
+        // numeric ranges
+        assert!(is_release_age_excluded("pkg-1", &["pkg-{1..3}"]));
+        assert!(is_release_age_excluded("pkg-2", &["pkg-{1..3}"]));
+        assert!(is_release_age_excluded("pkg-3", &["pkg-{1..3}"]));
+        assert!(!is_release_age_excluded("pkg-4", &["pkg-{1..3}"]));
+    }
+
+    #[test]
+    fn test_expand_braces_cases() {
+        assert_eq!(expand_braces("{foo,bar}"), vec!["foo", "bar"]);
+        assert_eq!(expand_braces("@scope/{a,b}"), vec!["@scope/a", "@scope/b"]);
+        assert_eq!(expand_braces("{a,{b,c}}"), vec!["a", "b", "c"]);
+        assert_eq!(expand_braces("{single}"), vec!["{single}"]);
+        assert_eq!(expand_braces("@org/{foo-*,bar}"), vec!["@org/foo-*", "@org/bar"]);
+        assert_eq!(expand_braces("pkg-{1..3}"), vec!["pkg-1", "pkg-2", "pkg-3"]);
     }
 }

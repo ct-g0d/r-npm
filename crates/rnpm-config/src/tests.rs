@@ -1,5 +1,5 @@
 use crate::npmrc::{interpolate_env, Npmrc};
-use crate::Config;
+use crate::{Config, ConfigOptions};
 use std::collections::HashMap;
 use std::fs;
 use tempfile::tempdir;
@@ -983,7 +983,10 @@ min-release-age-exclude[] = my-internal-pkg
 min-release-age-exclude[] = @myorg/*
 "#;
     let npmrc = Npmrc::parse(npmrc_content).unwrap();
-    let config = Config { npmrc };
+    let config = Config {
+        npmrc,
+        ..Default::default()
+    };
     let excludes = config.min_release_age_exclude();
     assert_eq!(excludes, vec!["@myorg/*", "my-internal-pkg"]);
 
@@ -992,7 +995,10 @@ min-release-age-exclude[] = @myorg/*
 min-release-age-exclude = @myorg/*, my-internal-pkg,  foo-lib , , @myorg/*
 "#;
     let npmrc2 = Npmrc::parse(npmrc_comma).unwrap();
-    let config2 = Config { npmrc: npmrc2 };
+    let config2 = Config {
+        npmrc: npmrc2,
+        ..Default::default()
+    };
     let excludes2 = config2.min_release_age_exclude();
     assert_eq!(excludes2, vec!["@myorg/*", "my-internal-pkg", "foo-lib"]);
 }
@@ -1006,6 +1012,7 @@ min-release-age-exclude[] = trusted-internal
 "#;
     let config = Config {
         npmrc: Npmrc::parse(npmrc_content).unwrap(),
+        ..Default::default()
     };
     let excludes = config.min_release_age_exclude();
 
@@ -1014,4 +1021,73 @@ min-release-age-exclude[] = trusted-internal
     assert!(crate::is_release_age_excluded("trusted-internal", &excludes));
     assert!(!crate::is_release_age_excluded("lodash", &excludes));
     assert!(!crate::is_release_age_excluded("@other/utils", &excludes));
+}
+
+#[test]
+fn test_layer_aware_before_vs_min_release_age_precedence() {
+    let now_ms = 1_700_000_000_000_i64;
+    let expected_date_ms = crate::date::parse_js_date("2023-01-01T00:00:00.000Z").unwrap();
+    let expected_age_ms = now_ms - (7 * 86_400_000);
+
+    let temp = tempfile::tempdir().unwrap();
+    let user_npmrc = temp.path().join("user.npmrc");
+    let proj_dir = temp.path().join("project");
+    std::fs::create_dir_all(&proj_dir).unwrap();
+    let proj_npmrc = proj_dir.join(".npmrc");
+
+    // (a) CLI `--min-release-age` beats user `.npmrc` `before`
+    std::fs::write(&user_npmrc, "before = 2023-01-01T00:00:00.000Z\n").unwrap();
+    let config_a = Config::load_with_options(
+        ConfigOptions::new()
+            .userconfig(user_npmrc.clone())
+            .with_cli("min-release-age", "7"),
+    )
+    .unwrap();
+    assert_eq!(
+        config_a.before_cutoff_at(now_ms),
+        Some(expected_age_ms),
+        "CLI min-release-age must beat user .npmrc before"
+    );
+
+    // (b) project `.npmrc` `min-release-age` beats user `.npmrc` `before`
+    std::fs::write(&user_npmrc, "before = 2023-01-01T00:00:00.000Z\n").unwrap();
+    std::fs::write(&proj_npmrc, "min-release-age = 7\n").unwrap();
+    let config_b = Config::load_with_options(
+        ConfigOptions::new()
+            .userconfig(user_npmrc.clone())
+            .project_dir(&proj_dir),
+    )
+    .unwrap();
+    assert_eq!(
+        config_b.before_cutoff_at(now_ms),
+        Some(expected_age_ms),
+        "Project .npmrc min-release-age must beat user .npmrc before"
+    );
+
+    // (c) CLI `--before` beats CLI `--min-release-age`
+    let config_c = Config::load_with_options(
+        ConfigOptions::new()
+            .with_cli("before", "2023-01-01T00:00:00.000Z")
+            .with_cli("min-release-age", "7"),
+    )
+    .unwrap();
+    assert_eq!(
+        config_c.before_cutoff_at(now_ms),
+        Some(expected_date_ms),
+        "CLI --before must beat CLI --min-release-age (tie-breaker in same layer)"
+    );
+
+    // (d) user `.npmrc` `before` beats user `.npmrc` `min-release-age`
+    std::fs::write(
+        &user_npmrc,
+        "before = 2023-01-01T00:00:00.000Z\nmin-release-age = 7\n",
+    )
+    .unwrap();
+    let config_d =
+        Config::load_with_options(ConfigOptions::new().userconfig(user_npmrc.clone())).unwrap();
+    assert_eq!(
+        config_d.before_cutoff_at(now_ms),
+        Some(expected_date_ms),
+        "User .npmrc before must beat user .npmrc min-release-age (tie-breaker in same layer)"
+    );
 }

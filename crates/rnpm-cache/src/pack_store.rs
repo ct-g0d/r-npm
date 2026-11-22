@@ -840,15 +840,26 @@ impl PackStore {
                         break;
                     }
                     let (src, dst) = &files[idx];
+                    let expected_len = match src.metadata() {
+                        Ok(m) => m.len(),
+                        Err(_) => continue,
+                    };
                     let dst_valid = dst
                         .metadata()
                         .ok()
-                        .and_then(|d_meta| {
-                            src.metadata().ok().map(|s_meta| d_meta.len() == s_meta.len())
-                        })
+                        .map(|d_meta| d_meta.len() == expected_len)
                         .unwrap_or(false);
                     if !dst_valid {
-                        let _ = rnpm_fs::copy_file_fast(src, dst);
+                        let count = TMP_COUNTER.fetch_add(1, Ordering::SeqCst);
+                        let pid = std::process::id();
+                        let tmp_path = dst.with_extension(format!("tmp_{pid}_{count}"));
+                        if rnpm_fs::copy_file_fast(src, &tmp_path).is_ok() {
+                            if rename_atomic_cas(&tmp_path, dst, expected_len).is_err() {
+                                let _ = fs::remove_file(&tmp_path);
+                            }
+                        } else {
+                            let _ = fs::remove_file(&tmp_path);
+                        }
                     }
                 });
             }
@@ -2286,6 +2297,57 @@ fn rename_atomic(from: &Path, to: &Path) -> std::io::Result<()> {
     }
 }
 
+/// Atomically renames a temporary file into a CAS destination with Windows retry support.
+///
+/// If `to` already exists and has the expected length, another thread concurrently wrote it;
+/// this is treated as a success, and `from` is cleaned up.
+/// If `to` exists but does not match `expected_len` (e.g. truncated or corrupted), `to` is
+/// removed and replaced.
+/// On failure or exhaustion of retries, `from` is cleaned up to prevent leftover temp files.
+fn rename_atomic_cas(from: &Path, to: &Path, expected_len: u64) -> std::io::Result<()> {
+    if fs::rename(from, to).is_ok() {
+        return Ok(());
+    }
+    let mut attempts = 0;
+    let mut delay = Duration::from_millis(5);
+    loop {
+        attempts += 1;
+        if let Some(parent) = to.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        match fs::rename(from, to) {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                if let Ok(m) = to.metadata() {
+                    if m.len() == expected_len {
+                        let _ = fs::remove_file(from);
+                        return Ok(());
+                    }
+                    let _ = fs::remove_file(to);
+                    if fs::rename(from, to).is_ok() {
+                        return Ok(());
+                    }
+                }
+
+                if attempts >= 10 {
+                    if let Ok(m) = to.metadata() {
+                        if m.len() == expected_len {
+                            let _ = fs::remove_file(from);
+                            return Ok(());
+                        }
+                    }
+                    let _ = fs::remove_file(from);
+                    return Err(e);
+                }
+
+                let jitter = (attempts as u64 * 3) % 7;
+                sleep(delay + Duration::from_millis(jitter));
+                delay = delay.saturating_mul(2).min(Duration::from_millis(200));
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3540,5 +3602,66 @@ mod tests {
         // Running it again with matching size should succeed idempotently
         store.populate_cas_from_installed(&[(src_file, cas_dst.clone())]);
         assert_eq!(fs::read(&cas_dst).unwrap(), content);
+    }
+
+    #[test]
+    fn test_populate_cas_from_installed_atomic_no_leftover_temp_and_repairs_truncated() {
+        let temp = tempdir().unwrap();
+        let store = PackStore::new(temp.path().join("store")).unwrap();
+        let source_dir = temp.path().join("node_modules/my-pkg");
+        fs::create_dir_all(&source_dir).unwrap();
+
+        let src_file = source_dir.join("main.js");
+        let full_content = b"const msg = 'hello world from complete file payload!';\nexport default msg;\n";
+        fs::write(&src_file, full_content).unwrap();
+
+        let cas_dst = store.cas_file_path("abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789");
+        let cas_parent = cas_dst.parent().unwrap();
+        fs::create_dir_all(cas_parent).unwrap();
+
+        // 1. Partial/truncated write: simulate a truncated CAS file (e.g. 10 bytes)
+        fs::write(&cas_dst, &full_content[..10]).unwrap();
+        assert_eq!(fs::metadata(&cas_dst).unwrap().len(), 10);
+
+        // 2. Run populate_cas_from_installed: must atomically repair the truncated file
+        store.populate_cas_from_installed(&[(src_file.clone(), cas_dst.clone())]);
+
+        // 3. Verify destination has the complete valid content
+        assert_eq!(fs::read(&cas_dst).unwrap(), full_content);
+
+        // 4. Verify no leftover temp files exist in cas directory
+        let mut temp_files = Vec::new();
+        for entry in fs::read_dir(cas_parent).unwrap() {
+            let entry = entry.unwrap();
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.contains("tmp") {
+                temp_files.push(name);
+            }
+        }
+        assert!(
+            temp_files.is_empty(),
+            "Found leftover temporary files in CAS dir: {:?}",
+            temp_files
+        );
+
+        // 5. Concurrent / multi-threaded run on multiple files
+        let mut batch = Vec::new();
+        for i in 0..20 {
+            let src = source_dir.join(format!("file_{i}.js"));
+            let content = format!("console.log('file payload {i}');");
+            fs::write(&src, content.as_bytes()).unwrap();
+            let dst = store.cas_dir().join(format!("c{i}")).join(format!("{i:064x}"));
+            batch.push((src, dst));
+        }
+        store.populate_cas_from_installed(&batch);
+
+        for (src, dst) in &batch {
+            assert_eq!(fs::read(dst).unwrap(), fs::read(src).unwrap());
+            let parent = dst.parent().unwrap();
+            for entry in fs::read_dir(parent).unwrap() {
+                let name = entry.unwrap().file_name().to_string_lossy().to_string();
+                assert!(!name.contains("tmp"), "Leftover temp file: {name}");
+            }
+        }
     }
 }
