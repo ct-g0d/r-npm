@@ -386,6 +386,154 @@ pub fn compute_symlink_target(bin_dir: &Path, target_rel_from_node_modules: &str
     }
 }
 
+/// Extracts the npm package name or scoped package name from a relative or absolute target path.
+/// Examples:
+/// - `../lib/node_modules/typescript/bin/tsc.js` -> `Some("typescript")`
+/// - `../lib/node_modules/@scope/pkg/bin/tool.js` -> `Some("@scope/pkg")`
+/// - `typescript/bin/tsc.js` -> `Some("typescript")`
+/// - `@scope/pkg/bin/tool.js` -> `Some("@scope/pkg")`
+/// - `../typescript/bin/tsc.js` -> `Some("typescript")`
+/// - `/usr/bin/bash` -> `None`
+pub fn extract_package_name(path_str: &str) -> Option<String> {
+    let normalized = path_str.replace('\\', "/");
+    let trimmed = normalized.trim();
+
+    if let Some(idx) = trimmed.find("node_modules/") {
+        let remainder = &trimmed[idx + "node_modules/".len()..];
+        let parts: Vec<&str> = remainder.split('/').filter(|s| !s.is_empty()).collect();
+        if parts.is_empty() {
+            return None;
+        }
+        if parts[0].starts_with('@') {
+            if parts.len() >= 2 {
+                return Some(format!("{}/{}", parts[0], parts[1]));
+            }
+            return None;
+        }
+        return Some(parts[0].to_string());
+    }
+
+    // Absolute path without node_modules/ is not an npm package path
+    if trimmed.starts_with('/') || (trimmed.len() >= 2 && trimmed.as_bytes()[1] == b':') {
+        return None;
+    }
+
+    // Strip relative prefixes
+    let mut s = trimmed;
+    while let Some(rest) = s.strip_prefix("../") {
+        s = rest;
+    }
+    while let Some(rest) = s.strip_prefix("./") {
+        s = rest;
+    }
+
+    let parts: Vec<&str> = s.split('/').filter(|s| !s.is_empty()).collect();
+    if parts.is_empty() {
+        return None;
+    }
+    if parts[0].starts_with('@') {
+        if parts.len() >= 2 {
+            Some(format!("{}/{}", parts[0], parts[1]))
+        } else {
+            None
+        }
+    } else {
+        Some(parts[0].to_string())
+    }
+}
+
+/// Checks for collisions with an existing file, directory, or symlink at `link_path`
+/// according to npm's `bin-links` rules:
+/// - If `link_path` does not exist: returns `Ok(())`.
+/// - If `link_path` is a directory: ALWAYS refuses with `EEXIST` (even if `force` is true).
+/// - If `force` is true: returns `Ok(())`.
+/// - If `bin_dir` is a local `.bin` directory: returns `Ok(())` (local `.bin` allows clobbering across dependencies).
+/// - In a global bin directory (not `.bin` and `force == false`):
+///   - If `link_path` is a symlink:
+///     - If the symlink points to the same target or to the same package, returns `Ok(())`.
+///     - If the symlink points to a foreign package or unrelated target, refuses with `EEXIST`.
+///   - If `link_path` is a regular file:
+///     - Refuses with `EEXIST` (cannot overwrite existing file without force).
+pub fn check_existing_bin_collision(
+    bin_dir: &Path,
+    link_path: &Path,
+    rel_target: &str,
+    force: bool,
+) -> Result<()> {
+    let meta = match fs::symlink_metadata(link_path) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => {
+            return Err(e).with_context(|| {
+                format!(
+                    "Failed to check symlink metadata for {}",
+                    link_path.display()
+                )
+            })
+        }
+    };
+
+    // 1. Directory collision: ALWAYS refuse, even with force
+    if meta.is_dir() {
+        anyhow::bail!(
+            "EEXIST: refusing to overwrite existing directory {} with bin link",
+            link_path.display()
+        );
+    }
+
+    // 2. Force allows overwriting files and symlinks
+    if force {
+        return Ok(());
+    }
+
+    // 3. Local .bin allows overwriting stale files/symlinks
+    let is_dot_bin = bin_dir.file_name().is_some_and(|f| f == ".bin");
+    if is_dot_bin {
+        return Ok(());
+    }
+
+    // 4. Global bin directory collision checks (force == false)
+    if meta.file_type().is_symlink() {
+        let existing_dest = match fs::read_link(link_path) {
+            Ok(dest) => dest,
+            Err(_) => {
+                anyhow::bail!(
+                    "EEXIST: file already exists: refusing to overwrite existing symlink at {}",
+                    link_path.display()
+                );
+            }
+        };
+
+        if existing_dest == Path::new(rel_target) {
+            return Ok(());
+        }
+
+        let target_pkg = extract_package_name(rel_target);
+        let existing_pkg = extract_package_name(&existing_dest.to_string_lossy());
+        if target_pkg.is_some() && target_pkg == existing_pkg {
+            return Ok(());
+        }
+
+        anyhow::bail!(
+            "EEXIST: file already exists: refusing to overwrite foreign bin link at {} pointing to {}",
+            link_path.display(),
+            existing_dest.display()
+        );
+    }
+
+    if meta.is_file() {
+        anyhow::bail!(
+            "EEXIST: file already exists: refusing to overwrite existing file at {}",
+            link_path.display()
+        );
+    }
+
+    anyhow::bail!(
+        "EEXIST: file already exists at {}",
+        link_path.display()
+    );
+}
+
 /// Creates bin links/shims in `bin_dir`.
 ///
 /// On Unix (`#[cfg(unix)]`): creates a relative POSIX symlink matching npm's `bin-links`:
@@ -397,6 +545,17 @@ pub fn create_shims(
     bin_dir: &Path,
     bin_name: &str,
     target_rel_from_node_modules: &str,
+) -> Result<()> {
+    create_shims_with_force(bin_dir, bin_name, target_rel_from_node_modules, false)
+}
+
+/// Creates bin links/shims in `bin_dir`, with optional `force` override.
+#[cfg(unix)]
+pub fn create_shims_with_force(
+    bin_dir: &Path,
+    bin_name: &str,
+    target_rel_from_node_modules: &str,
+    force: bool,
 ) -> Result<()> {
     fs::create_dir_all(bin_dir)
         .with_context(|| format!("Failed to create bin dir {}", bin_dir.display()))?;
@@ -420,8 +579,10 @@ pub fn create_shims(
 
     let link_path = bin_dir.join(bin_name);
 
-    // Follow npm's bin-links ownership & force rules:
-    // Refuse to clobber unrelated directories (NEVER call remove_dir_all on a directory!)
+    // Follow npm's bin-links collision & force rules
+    check_existing_bin_collision(bin_dir, &link_path, &rel_target, force)?;
+
+    // If check passed and file/symlink exists, remove it before linking
     if let Ok(meta) = fs::symlink_metadata(&link_path) {
         if meta.is_dir() {
             anyhow::bail!(
@@ -466,10 +627,46 @@ pub fn create_shims(
     bin_name: &str,
     target_rel_from_node_modules: &str,
 ) -> Result<()> {
+    create_shims_with_force(bin_dir, bin_name, target_rel_from_node_modules, false)
+}
+
+/// Creates all three companion shims in `bin_dir`, with optional `force` override.
+#[cfg(not(unix))]
+pub fn create_shims_with_force(
+    bin_dir: &Path,
+    bin_name: &str,
+    target_rel_from_node_modules: &str,
+    force: bool,
+) -> Result<()> {
     fs::create_dir_all(bin_dir)
         .with_context(|| format!("Failed to create bin dir {}", bin_dir.display()))?;
 
     let is_dot_bin = bin_dir.file_name().is_some_and(|f| f == ".bin");
+    let posix_path = bin_dir.join(bin_name);
+    let cmd_path = bin_dir.join(format!("{bin_name}.cmd"));
+    let ps1_path = bin_dir.join(format!("{bin_name}.ps1"));
+    let rel_target = compute_symlink_target(bin_dir, target_rel_from_node_modules);
+
+    // Follow npm's bin-links collision & force rules
+    check_existing_bin_collision(bin_dir, &posix_path, &rel_target, force)?;
+
+    if let Ok(m) = fs::symlink_metadata(&cmd_path) {
+        if m.is_dir() {
+            anyhow::bail!(
+                "EEXIST: refusing to overwrite existing directory {} with bin link",
+                cmd_path.display()
+            );
+        }
+    }
+    if let Ok(m) = fs::symlink_metadata(&ps1_path) {
+        if m.is_dir() {
+            anyhow::bail!(
+                "EEXIST: refusing to overwrite existing directory {} with bin link",
+                ps1_path.display()
+            );
+        }
+    }
+
     let target = bin_dir
         .parent()
         .map(|nm| nm.join(target_rel_from_node_modules))
@@ -489,30 +686,24 @@ pub fn create_shims(
             Some(_) => None,
         });
     if let Some((sh, cmd, ps1)) = custom {
-        let posix_path = bin_dir.join(bin_name);
         fs::write(&posix_path, sh)
             .with_context(|| format!("Failed to write POSIX shim {}", posix_path.display()))?;
-        let cmd_path = bin_dir.join(format!("{bin_name}.cmd"));
         fs::write(&cmd_path, cmd)
             .with_context(|| format!("Failed to write CMD shim {}", cmd_path.display()))?;
-        let ps1_path = bin_dir.join(format!("{bin_name}.ps1"));
         fs::write(&ps1_path, ps1)
             .with_context(|| format!("Failed to write PS1 shim {}", ps1_path.display()))?;
     } else if is_dot_bin {
         // 1. POSIX shell script
-        let posix_path = bin_dir.join(bin_name);
         let posix_content = generate_posix_shim(target_rel_from_node_modules);
         fs::write(&posix_path, posix_content)
             .with_context(|| format!("Failed to write POSIX shim {}", posix_path.display()))?;
 
         // 2. Windows cmd wrapper
-        let cmd_path = bin_dir.join(format!("{bin_name}.cmd"));
         let cmd_content = generate_cmd_shim(target_rel_from_node_modules);
         fs::write(&cmd_path, cmd_content)
             .with_context(|| format!("Failed to write CMD shim {}", cmd_path.display()))?;
 
         // 3. PowerShell wrapper
-        let ps1_path = bin_dir.join(format!("{bin_name}.ps1"));
         let ps1_content = generate_ps1_shim(target_rel_from_node_modules);
         fs::write(&ps1_path, ps1_content)
             .with_context(|| format!("Failed to write PS1 shim {}", ps1_path.display()))?;
@@ -525,15 +716,12 @@ pub fn create_shims(
         };
         let content = generator::generate_shim_content(&rel_path, None);
 
-        let posix_path = bin_dir.join(bin_name);
         fs::write(&posix_path, content.sh)
             .with_context(|| format!("Failed to write POSIX shim {}", posix_path.display()))?;
 
-        let cmd_path = bin_dir.join(format!("{bin_name}.cmd"));
         fs::write(&cmd_path, content.cmd)
             .with_context(|| format!("Failed to write CMD shim {}", cmd_path.display()))?;
 
-        let ps1_path = bin_dir.join(format!("{bin_name}.ps1"));
         fs::write(&ps1_path, content.ps1)
             .with_context(|| format!("Failed to write PS1 shim {}", ps1_path.display()))?;
     }
@@ -543,6 +731,16 @@ pub fn create_shims(
 
 /// Creates shims for all binary targets declared in a package's manifest.
 pub fn create_package_shims(pkg_dir: &Path, bin_dir: &Path, manifest: &Manifest) -> Result<()> {
+    create_package_shims_with_force(pkg_dir, bin_dir, manifest, false)
+}
+
+/// Creates shims for all binary targets declared in a package's manifest with optional force override.
+pub fn create_package_shims_with_force(
+    pkg_dir: &Path,
+    bin_dir: &Path,
+    manifest: &Manifest,
+    force: bool,
+) -> Result<()> {
     for (bin_name, rel_script) in manifest.bin_entries() {
         let script_full_path = pkg_dir.join(&rel_script);
         let _ = normalize_shebang(&script_full_path);
@@ -556,7 +754,7 @@ pub fn create_package_shims(pkg_dir: &Path, bin_dir: &Path, manifest: &Manifest)
             }
         };
 
-        create_shims(bin_dir, &bin_name, &target_rel)?;
+        create_shims_with_force(bin_dir, &bin_name, &target_rel, force)?;
     }
     Ok(())
 }

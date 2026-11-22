@@ -34,7 +34,15 @@ jobs:
           node-version: "26.13.0"
 
       - name: Pin Explicit npm Oracle Version (npm 11.20.0)
-        run: npm install -g npm@11.20.0
+        shell: pwsh
+        run: |
+          $npmVer = (npm --version).Trim()
+          if ($npmVer -ne "11.20.0") {
+            Write-Host "Installing pinned npm 11.20.0 (current: $npmVer)..."
+            npm install -g npm@11.20.0
+          } else {
+            Write-Host "npm is already 11.20.0, skipping install."
+          }
 
       - name: Verify Exact Oracle Versions & Toolchain
         shell: pwsh
@@ -93,7 +101,15 @@ jobs:
           node-version: "24.x"
 
       - name: Pin Explicit npm Oracle Version (npm 11.20.0)
-        run: npm install -g npm@11.20.0
+        shell: pwsh
+        run: |
+          $npmVer = (npm --version).Trim()
+          if ($npmVer -ne "11.20.0") {
+            Write-Host "Installing pinned npm 11.20.0 (current: $npmVer)..."
+            npm install -g npm@11.20.0
+          } else {
+            Write-Host "npm is already 11.20.0, skipping install."
+          }
 
       - name: Verify Node 24 and npm Oracle Versions
         shell: pwsh
@@ -137,7 +153,15 @@ jobs:
           node-version: "26.13.0"
 
       - name: Pin Explicit npm Oracle Version (npm 11.20.0)
-        run: npm install -g npm@11.20.0
+        shell: pwsh
+        run: |
+          $npmVer = (npm --version).Trim()
+          if ($npmVer -ne "11.20.0") {
+            Write-Host "Installing pinned npm 11.20.0 (current: $npmVer)..."
+            npm install -g npm@11.20.0
+          } else {
+            Write-Host "npm is already 11.20.0, skipping install."
+          }
 
       - name: Verify Exact Oracle Versions & Toolchain
         shell: pwsh

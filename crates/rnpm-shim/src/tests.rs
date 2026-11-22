@@ -1022,3 +1022,205 @@ fn test_windows_shim_trio_creation() {
     assert!(cmd.starts_with("@ECHO off"));
     assert!(ps1.starts_with("#!/usr/bin/env pwsh"));
 }
+
+#[test]
+fn test_extract_package_name_helper() {
+    assert_eq!(
+        extract_package_name("../lib/node_modules/typescript/bin/tsc.js"),
+        Some("typescript".to_string())
+    );
+    assert_eq!(
+        extract_package_name("../lib/node_modules/@scope/pkg/bin/tool.js"),
+        Some("@scope/pkg".to_string())
+    );
+    assert_eq!(
+        extract_package_name("typescript/bin/tsc.js"),
+        Some("typescript".to_string())
+    );
+    assert_eq!(
+        extract_package_name("@scope/pkg/bin/tool.js"),
+        Some("@scope/pkg".to_string())
+    );
+    assert_eq!(
+        extract_package_name("../typescript/bin/tsc.js"),
+        Some("typescript".to_string())
+    );
+    assert_eq!(
+        extract_package_name("../@scope/pkg/bin/tool.js"),
+        Some("@scope/pkg".to_string())
+    );
+    assert_eq!(
+        extract_package_name("/usr/bin/bash"),
+        None
+    );
+    assert_eq!(
+        extract_package_name(r"C:\Windows\System32\cmd.exe"),
+        None
+    );
+}
+
+#[test]
+fn test_bin_collision_directory_rejected() {
+    let dir = tempdir().unwrap();
+    let bin_dir = dir.path().join("bin");
+    fs::create_dir_all(&bin_dir).unwrap();
+
+    let link_path = bin_dir.join("my-tool");
+    fs::create_dir_all(&link_path).unwrap();
+
+    // Directory collision must ALWAYS be rejected, even if force=true
+    let err_unforced = check_existing_bin_collision(
+        &bin_dir,
+        &link_path,
+        "../lib/node_modules/my-pkg/bin/cli.js",
+        false,
+    )
+    .unwrap_err();
+    assert!(err_unforced.to_string().contains("EEXIST"));
+
+    let err_forced = check_existing_bin_collision(
+        &bin_dir,
+        &link_path,
+        "../lib/node_modules/my-pkg/bin/cli.js",
+        true,
+    )
+    .unwrap_err();
+    assert!(err_forced.to_string().contains("EEXIST"));
+}
+
+#[test]
+fn test_global_bin_collision_unrelated_regular_file_rejected() {
+    let dir = tempdir().unwrap();
+    let global_bin = dir.path().join("usr").join("local").join("bin");
+    fs::create_dir_all(&global_bin).unwrap();
+
+    let link_path = global_bin.join("my-tool");
+    fs::write(&link_path, b"unrelated binary").unwrap();
+
+    // Regular file collision in global bin without force must be rejected with EEXIST
+    let err = check_existing_bin_collision(
+        &global_bin,
+        &link_path,
+        "../lib/node_modules/my-pkg/bin/cli.js",
+        false,
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("EEXIST: file already exists"));
+}
+
+#[test]
+fn test_global_bin_collision_unrelated_regular_file_forced() {
+    let dir = tempdir().unwrap();
+    let global_bin = dir.path().join("usr").join("local").join("bin");
+    fs::create_dir_all(&global_bin).unwrap();
+
+    let link_path = global_bin.join("my-tool");
+    fs::write(&link_path, b"unrelated binary").unwrap();
+
+    // With force=true, overwrite is permitted
+    assert!(check_existing_bin_collision(
+        &global_bin,
+        &link_path,
+        "../lib/node_modules/my-pkg/bin/cli.js",
+        true,
+    )
+    .is_ok());
+}
+
+#[test]
+fn test_local_dot_bin_allows_clobber() {
+    let dir = tempdir().unwrap();
+    let dot_bin = dir.path().join("node_modules").join(".bin");
+    fs::create_dir_all(&dot_bin).unwrap();
+
+    let link_path = dot_bin.join("my-tool");
+    fs::write(&link_path, b"old-package-link").unwrap();
+
+    // In local .bin, overwriting is allowed even with force=false
+    assert!(check_existing_bin_collision(
+        &dot_bin,
+        &link_path,
+        "../my-pkg/bin/cli.js",
+        false,
+    )
+    .is_ok());
+}
+
+#[test]
+fn test_global_bin_collision_foreign_symlink_rejected() {
+    let dir = tempdir().unwrap();
+    let global_bin = dir.path().join("usr").join("local").join("bin");
+    fs::create_dir_all(&global_bin).unwrap();
+
+    let link_path = global_bin.join("my-tool");
+
+    #[cfg(unix)]
+    let symlink_res = std::os::unix::fs::symlink(
+        std::path::Path::new("../lib/node_modules/foreign-pkg/bin/tool.js"),
+        &link_path,
+    );
+    #[cfg(windows)]
+    let symlink_res = std::os::windows::fs::symlink_file(
+        std::path::Path::new("../lib/node_modules/foreign-pkg/bin/tool.js"),
+        &link_path,
+    );
+
+    if symlink_res.is_err() {
+        eprintln!("Skipping symlink collision test due to platform privilege constraints");
+        return;
+    }
+
+    // Foreign symlink must be rejected with EEXIST when force=false
+    let err = check_existing_bin_collision(
+        &global_bin,
+        &link_path,
+        "../lib/node_modules/my-pkg/bin/cli.js",
+        false,
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("EEXIST: file already exists"));
+    assert!(err.to_string().contains("foreign bin link"));
+
+    // Foreign symlink can be overwritten when force=true
+    assert!(check_existing_bin_collision(
+        &global_bin,
+        &link_path,
+        "../lib/node_modules/my-pkg/bin/cli.js",
+        true,
+    )
+    .is_ok());
+}
+
+#[test]
+fn test_global_bin_collision_same_package_symlink_allowed() {
+    let dir = tempdir().unwrap();
+    let global_bin = dir.path().join("usr").join("local").join("bin");
+    fs::create_dir_all(&global_bin).unwrap();
+
+    let link_path = global_bin.join("my-tool");
+
+    #[cfg(unix)]
+    let symlink_res = std::os::unix::fs::symlink(
+        std::path::Path::new("../lib/node_modules/my-pkg/bin/old-cli.js"),
+        &link_path,
+    );
+    #[cfg(windows)]
+    let symlink_res = std::os::windows::fs::symlink_file(
+        std::path::Path::new("../lib/node_modules/my-pkg/bin/old-cli.js"),
+        &link_path,
+    );
+
+    if symlink_res.is_err() {
+        eprintln!("Skipping symlink collision test due to platform privilege constraints");
+        return;
+    }
+
+    // Symlink from the same package is allowed to update even when force=false
+    assert!(check_existing_bin_collision(
+        &global_bin,
+        &link_path,
+        "../lib/node_modules/my-pkg/bin/new-cli.js",
+        false,
+    )
+    .is_ok());
+}
