@@ -395,6 +395,7 @@ pub struct LifecycleContext {
     pub foreground_scripts: bool,
     pub captured_output: std::sync::Arc<std::sync::Mutex<Option<ScriptOutput>>>,
     pub sandbox_policy: ScriptSandboxPolicy,
+    pub script_shell: Option<String>,
 }
 
 impl LifecycleContext {
@@ -405,9 +406,25 @@ impl LifecycleContext {
         event: impl Into<String>,
         script_cmd: impl Into<String>,
     ) -> Self {
+        let project_root = project_root.into();
+        let package_dir = package_dir.into();
+
+        let script_shell = rnpm_config::Config::load(Some(&package_dir))
+            .ok()
+            .and_then(|c| c.get("script-shell").map(str::to_string))
+            .or_else(|| {
+                rnpm_config::Config::load(Some(&project_root))
+                    .ok()
+                    .and_then(|c| c.get("script-shell").map(str::to_string))
+            })
+            .filter(|s| {
+                let trimmed = s.trim().trim_matches('"');
+                !trimmed.is_empty() && trimmed != "null" && s != "null"
+            });
+
         Self {
-            project_root: project_root.into(),
-            package_dir: package_dir.into(),
+            project_root,
+            package_dir,
             package_name: package_name.into(),
             package_version: None,
             event: event.into(),
@@ -420,7 +437,13 @@ impl LifecycleContext {
             foreground_scripts: false,
             captured_output: std::sync::Arc::new(std::sync::Mutex::new(None)),
             sandbox_policy: ScriptSandboxPolicy::default(),
+            script_shell,
         }
+    }
+
+    pub fn with_script_shell(mut self, script_shell: impl Into<String>) -> Self {
+        self.script_shell = Some(script_shell.into());
+        self
     }
 
     pub fn with_timeout(mut self, timeout: std::time::Duration) -> Self {
@@ -1091,6 +1114,145 @@ pub fn build_lifecycle_env(ctx: &LifecycleContext) -> HashMap<String, String> {
         rnpm_exec.to_string_lossy().to_string(),
     );
 
+    // Honor config node-options: inject or append into NODE_OPTIONS
+    let node_opts = rnpm_config::Config::load(Some(&ctx.package_dir))
+        .ok()
+        .and_then(|c| c.get("node-options").map(str::to_string))
+        .or_else(|| {
+            rnpm_config::Config::load(Some(&ctx.project_root))
+                .ok()
+                .and_then(|c| c.get("node-options").map(str::to_string))
+        })
+        .or_else(|| env.get("npm_config_node_options").cloned())
+        .filter(|s| {
+            let trimmed = s.trim().trim_matches('"');
+            !trimmed.is_empty() && trimmed != "null" && s != "null"
+        });
+
+    if let Some(opts) = node_opts {
+        if let Some(existing) = env.get_mut("NODE_OPTIONS") {
+            let trimmed = existing.trim();
+            if trimmed.is_empty() {
+                *existing = opts;
+            } else if trimmed == opts {
+                // already identical
+            } else {
+                *existing = format!("{trimmed} {opts}");
+            }
+        } else {
+            env.insert("NODE_OPTIONS".to_string(), opts);
+        }
+    }
+
+    // Set NODE_ENV=production on --omit=dev or --production when not already set
+    if !env.contains_key("NODE_ENV") {
+        let is_omit_dev = |val: &str| {
+            val.split(',').any(|p| {
+                matches!(
+                    p.trim().to_ascii_lowercase().as_str(),
+                    "dev" | "development" | "prod" | "production"
+                )
+            })
+        };
+        let is_truthy = |val: &str| {
+            matches!(
+                val.trim().to_ascii_lowercase().as_str(),
+                "true" | "1" | "yes" | "on"
+            )
+        };
+
+        let mut omit_dev_active = false;
+
+        if let Some(val) = env.get("npm_config_omit").or_else(|| env.get("omit")) {
+            if is_omit_dev(val) {
+                omit_dev_active = true;
+            }
+        }
+        if let Some(val) = env
+            .get("npm_config_production")
+            .or_else(|| env.get("production"))
+        {
+            if is_truthy(val) {
+                omit_dev_active = true;
+            }
+        }
+
+        if !omit_dev_active {
+            if let Ok(config) = rnpm_config::Config::load(Some(&ctx.package_dir))
+                .or_else(|_| rnpm_config::Config::load(Some(&ctx.project_root)))
+            {
+                if let Some(val) = config.get("omit") {
+                    if is_omit_dev(val) {
+                        omit_dev_active = true;
+                    }
+                }
+                if let Some(val) = config.get("production") {
+                    if is_truthy(val) {
+                        omit_dev_active = true;
+                    }
+                }
+            }
+        }
+
+        if !omit_dev_active {
+            if let Some(overrides) = rnpm_config::get_process_cli_overrides() {
+                if let Some(val) = overrides.get("omit") {
+                    if is_omit_dev(val) {
+                        omit_dev_active = true;
+                    }
+                }
+                if let Some(val) = overrides.get("production") {
+                    if is_truthy(val) {
+                        omit_dev_active = true;
+                    }
+                }
+            }
+        }
+
+        let has_include_dev = |val: &str| {
+            val.split(',').any(|p| {
+                matches!(
+                    p.trim().to_ascii_lowercase().as_str(),
+                    "dev" | "development" | "prod" | "production"
+                )
+            })
+        };
+
+        let mut include_dev = false;
+        if let Some(val) = env
+            .get("npm_config_include")
+            .or_else(|| env.get("include"))
+        {
+            if has_include_dev(val) {
+                include_dev = true;
+            }
+        }
+        if !include_dev {
+            if let Ok(config) = rnpm_config::Config::load(Some(&ctx.package_dir))
+                .or_else(|_| rnpm_config::Config::load(Some(&ctx.project_root)))
+            {
+                if let Some(val) = config.get("include") {
+                    if has_include_dev(val) {
+                        include_dev = true;
+                    }
+                }
+            }
+        }
+        if !include_dev {
+            if let Some(overrides) = rnpm_config::get_process_cli_overrides() {
+                if let Some(val) = overrides.get("include") {
+                    if has_include_dev(val) {
+                        include_dev = true;
+                    }
+                }
+            }
+        }
+
+        if omit_dev_active && !include_dev {
+            env.insert("NODE_ENV".to_string(), "production".to_string());
+        }
+    }
+
     env
 }
 
@@ -1172,6 +1334,63 @@ fn build_process_env(ctx: &LifecycleContext) -> HashMap<String, String> {
     env
 }
 
+pub fn is_cmd_shell(shell: &str) -> bool {
+    let trimmed = shell.trim().trim_matches('"');
+    let path = std::path::Path::new(trimmed);
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(trimmed);
+    name.eq_ignore_ascii_case("cmd") || name.eq_ignore_ascii_case("cmd.exe")
+}
+
+pub(crate) fn create_shell_command(ctx: &LifecycleContext) -> Command {
+    let configured_shell = ctx.script_shell.as_deref().or_else(|| {
+        ctx.extra_env
+            .get("npm_config_script_shell")
+            .filter(|s| {
+                let trimmed = s.trim().trim_matches('"');
+                !trimmed.is_empty() && trimmed != "null" && *s != "null"
+            })
+            .map(|s| s.as_str())
+    });
+
+    let (shell, is_cmd) = match configured_shell {
+        Some(s) => {
+            let is_cmd = is_cmd_shell(s);
+            (s, is_cmd)
+        }
+        None => {
+            if cfg!(windows) {
+                ("cmd.exe", true)
+            } else {
+                ("/bin/sh", false)
+            }
+        }
+    };
+
+    let mut cmd = Command::new(shell);
+    if is_cmd {
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            cmd.raw_arg(format!("/d /s /c {}", ctx.script_cmd));
+        }
+        #[cfg(not(windows))]
+        {
+            cmd.arg("/d").arg("/s").arg("/c").arg(&ctx.script_cmd);
+        }
+    } else {
+        cmd.arg("-c").arg(&ctx.script_cmd);
+    }
+    #[cfg(not(windows))]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+    cmd
+}
+
 pub fn execute_lifecycle_script(ctx: &LifecycleContext) -> Result<ExitStatus> {
     info!(
         "Running lifecycle script '{}' for package {} in {}",
@@ -1187,22 +1406,7 @@ pub fn execute_lifecycle_script(ctx: &LifecycleContext) -> Result<ExitStatus> {
 
     let env = build_process_env(ctx);
 
-    #[cfg(windows)]
-    let mut cmd = {
-        use std::os::windows::process::CommandExt;
-        let mut c = Command::new("cmd.exe");
-        c.raw_arg(format!("/d /s /c {}", ctx.script_cmd));
-        c
-    };
-
-    #[cfg(not(windows))]
-    let mut cmd = {
-        use std::os::unix::process::CommandExt;
-        let mut c = Command::new("/bin/sh");
-        c.arg("-c").arg(&ctx.script_cmd);
-        c.process_group(0);
-        c
-    };
+    let mut cmd = create_shell_command(ctx);
 
     cmd.current_dir(&ctx.package_dir);
     cmd.env_clear();
@@ -1368,22 +1572,7 @@ where
 
     let env = build_process_env(ctx);
 
-    #[cfg(windows)]
-    let mut cmd = {
-        use std::os::windows::process::CommandExt;
-        let mut c = Command::new("cmd.exe");
-        c.raw_arg(format!("/d /s /c {}", ctx.script_cmd));
-        c
-    };
-
-    #[cfg(not(windows))]
-    let mut cmd = {
-        use std::os::unix::process::CommandExt;
-        let mut c = Command::new("/bin/sh");
-        c.arg("-c").arg(&ctx.script_cmd);
-        c.process_group(0);
-        c
-    };
+    let mut cmd = create_shell_command(ctx);
 
     cmd.current_dir(&ctx.package_dir);
     cmd.env_clear();

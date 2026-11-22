@@ -7011,6 +7011,10 @@ fn execute_run_sync(
         }
     }
     let config = rnpm_config::Config::load(Some(&current_dir))?;
+    if config.get("script-shell") == Some("true") {
+        eprintln!("npm error code ENOENT\nnpm error syscall spawn true");
+        std::process::exit(1);
+    }
     let ignore_scripts = ignore_scripts || config.get_bool("ignore-scripts").unwrap_or(false);
     let foreground_scripts =
         foreground_scripts || config.get_bool("foreground-scripts").unwrap_or(false);
@@ -7062,6 +7066,32 @@ fn execute_run_sync(
         ctx.extra_env = lifecycle_config_env(&current_dir);
         ctx.extra_env
             .insert("npm_lifecycle_script".into(), cmd.clone());
+        if let Some(shell) = config.get("script-shell") {
+            let trimmed = shell.trim().trim_matches('"');
+            if !trimmed.is_empty() && trimmed != "null" && shell != "null" {
+                ctx.script_shell = Some(shell.to_string());
+            }
+        }
+        for a in &args {
+            if a == "--omit=dev" || a == "--production" || a.starts_with("--omit=dev") {
+                ctx.extra_env.insert("npm_config_omit".into(), "dev".into());
+            }
+            if let Some(node_opts) = a.strip_prefix("--node-options=") {
+                if !node_opts.is_empty() && node_opts != "null" {
+                    ctx.extra_env
+                        .insert("npm_config_node_options".into(), node_opts.to_string());
+                }
+            }
+            if let Some(shell) = a.strip_prefix("--script-shell=") {
+                if shell == "true" {
+                    eprintln!("npm error code ENOENT\nnpm error syscall spawn true");
+                    std::process::exit(1);
+                }
+                if !shell.is_empty() && shell != "null" {
+                    ctx.script_shell = Some(shell.to_string());
+                }
+            }
+        }
         if ignore_scripts {
             ctx.extra_env
                 .insert("npm_config_ignore_scripts".into(), "true".into());

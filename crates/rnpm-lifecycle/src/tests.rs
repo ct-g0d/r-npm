@@ -2660,3 +2660,281 @@ fn test_npm_package_environment_variables_flattening() {
         Some("echo building")
     );
 }
+
+#[test]
+fn test_script_shell_context_populated_from_npmrc() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(temp.path().join(".npmrc"), "script-shell = /bin/bash\n").unwrap();
+
+    let ctx = LifecycleContext::new(
+        temp.path(),
+        temp.path(),
+        "test-pkg",
+        "test-event",
+        "echo 1",
+    );
+    assert_eq!(ctx.script_shell.as_deref(), Some("/bin/bash"));
+}
+
+#[test]
+fn test_script_shell_null_or_empty_ignored() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(temp.path().join(".npmrc"), "script-shell = null\n").unwrap();
+
+    let ctx = LifecycleContext::new(
+        temp.path(),
+        temp.path(),
+        "test-pkg",
+        "test-event",
+        "echo 1",
+    );
+    assert_eq!(ctx.script_shell, None);
+
+    let temp2 = tempfile::tempdir().unwrap();
+    std::fs::write(temp2.path().join(".npmrc"), "script-shell = \"\"\n").unwrap();
+
+    let ctx2 = LifecycleContext::new(
+        temp2.path(),
+        temp2.path(),
+        "test-pkg",
+        "test-event",
+        "echo 1",
+    );
+    assert_eq!(ctx2.script_shell, None);
+}
+
+#[test]
+fn test_is_cmd_shell_variants() {
+    assert!(is_cmd_shell("cmd"));
+    assert!(is_cmd_shell("cmd.exe"));
+    assert!(is_cmd_shell("CMD.EXE"));
+    assert!(is_cmd_shell(r"C:\Windows\System32\cmd.exe"));
+    assert!(is_cmd_shell(r#""C:\Windows\System32\cmd.exe""#));
+    assert!(!is_cmd_shell("cmd.bat"));
+    assert!(!is_cmd_shell("/bin/sh"));
+    assert!(!is_cmd_shell("bash"));
+    assert!(!is_cmd_shell("powershell"));
+    assert!(!is_cmd_shell("true"));
+}
+
+#[test]
+fn test_script_shell_execution_sync() {
+    let temp = tempfile::tempdir().unwrap();
+    let shell = if cfg!(windows) { "cmd.exe" } else { "/bin/sh" };
+    let mut ctx = LifecycleContext::new(
+        temp.path(),
+        temp.path(),
+        "test-pkg",
+        "test-event",
+        "node -e \"process.exit(0)\"",
+    );
+    ctx.script_shell = Some(shell.to_string());
+    let status = execute_lifecycle_script(&ctx).unwrap();
+    assert!(status.success());
+}
+
+#[test]
+fn test_script_shell_nonexistent_fails() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut ctx = LifecycleContext::new(
+        temp.path(),
+        temp.path(),
+        "test-pkg",
+        "test-event",
+        "echo 1",
+    );
+    ctx.script_shell = Some("nonexistent_shell_binary_98765".to_string());
+    let res = execute_lifecycle_script(&ctx);
+    assert!(res.is_err(), "Spawning nonexistent shell must fail");
+}
+
+#[test]
+fn test_node_options_injected_when_empty() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut ctx = LifecycleContext::new(
+        temp.path(),
+        temp.path(),
+        "test-pkg",
+        "test-event",
+        "echo 1",
+    );
+    ctx.extra_env.insert(
+        "npm_config_node_options".to_string(),
+        "--max-old-space-size=4096".to_string(),
+    );
+    let env = build_lifecycle_env(&ctx);
+    assert_eq!(
+        env.get("NODE_OPTIONS").map(|s| s.as_str()),
+        Some("--max-old-space-size=4096")
+    );
+}
+
+#[test]
+fn test_node_options_appended_when_existing() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut ctx = LifecycleContext::new(
+        temp.path(),
+        temp.path(),
+        "test-pkg",
+        "test-event",
+        "echo 1",
+    );
+    ctx.extra_env.insert(
+        "NODE_OPTIONS".to_string(),
+        "--trace-warnings".to_string(),
+    );
+    ctx.extra_env.insert(
+        "npm_config_node_options".to_string(),
+        "--max-old-space-size=4096".to_string(),
+    );
+    let env = build_lifecycle_env(&ctx);
+    assert_eq!(
+        env.get("NODE_OPTIONS").map(|s| s.as_str()),
+        Some("--trace-warnings --max-old-space-size=4096")
+    );
+}
+
+#[test]
+fn test_node_options_ignored_when_null_or_empty() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut ctx = LifecycleContext::new(
+        temp.path(),
+        temp.path(),
+        "test-pkg",
+        "test-event",
+        "echo 1",
+    );
+    ctx.extra_env.insert(
+        "npm_config_node_options".to_string(),
+        "null".to_string(),
+    );
+    let env = build_lifecycle_env(&ctx);
+    assert_eq!(env.get("NODE_OPTIONS"), None);
+
+    let mut ctx2 = LifecycleContext::new(
+        temp.path(),
+        temp.path(),
+        "test-pkg",
+        "test-event",
+        "echo 1",
+    );
+    ctx2.extra_env.insert(
+        "npm_config_node_options".to_string(),
+        "".to_string(),
+    );
+    let env2 = build_lifecycle_env(&ctx2);
+    assert_eq!(env2.get("NODE_OPTIONS"), None);
+}
+
+#[test]
+fn test_node_env_production_set_when_omit_dev() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut ctx = LifecycleContext::new(
+        temp.path(),
+        temp.path(),
+        "test-pkg",
+        "test-event",
+        "echo 1",
+    );
+    ctx.extra_env.insert(
+        "npm_config_omit".to_string(),
+        "dev".to_string(),
+    );
+    let env = build_lifecycle_env(&ctx);
+    assert_eq!(
+        env.get("NODE_ENV").map(|s| s.as_str()),
+        Some("production")
+    );
+}
+
+#[test]
+fn test_node_env_production_set_when_production_flag() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut ctx = LifecycleContext::new(
+        temp.path(),
+        temp.path(),
+        "test-pkg",
+        "test-event",
+        "echo 1",
+    );
+    ctx.extra_env.insert(
+        "npm_config_production".to_string(),
+        "true".to_string(),
+    );
+    let env = build_lifecycle_env(&ctx);
+    assert_eq!(
+        env.get("NODE_ENV").map(|s| s.as_str()),
+        Some("production")
+    );
+}
+
+#[test]
+fn test_node_env_not_overwritten_if_already_set() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut ctx = LifecycleContext::new(
+        temp.path(),
+        temp.path(),
+        "test-pkg",
+        "test-event",
+        "echo 1",
+    );
+    ctx.extra_env.insert(
+        "NODE_ENV".to_string(),
+        "development".to_string(),
+    );
+    ctx.extra_env.insert(
+        "npm_config_omit".to_string(),
+        "dev".to_string(),
+    );
+    let env = build_lifecycle_env(&ctx);
+    assert_eq!(
+        env.get("NODE_ENV").map(|s| s.as_str()),
+        Some("development")
+    );
+}
+
+#[test]
+fn test_node_env_not_set_for_other_omit() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut ctx = LifecycleContext::new(
+        temp.path(),
+        temp.path(),
+        "test-pkg",
+        "test-event",
+        "echo 1",
+    );
+    ctx.extra_env.insert(
+        "npm_config_omit".to_string(),
+        "optional".to_string(),
+    );
+    let env = build_lifecycle_env(&ctx);
+    assert_ne!(
+        env.get("NODE_ENV").map(|s| s.as_str()),
+        Some("production")
+    );
+}
+
+#[test]
+fn test_node_env_not_set_when_include_dev_overrides() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut ctx = LifecycleContext::new(
+        temp.path(),
+        temp.path(),
+        "test-pkg",
+        "test-event",
+        "echo 1",
+    );
+    ctx.extra_env.insert(
+        "npm_config_omit".to_string(),
+        "dev".to_string(),
+    );
+    ctx.extra_env.insert(
+        "npm_config_include".to_string(),
+        "dev".to_string(),
+    );
+    let env = build_lifecycle_env(&ctx);
+    assert_ne!(
+        env.get("NODE_ENV").map(|s| s.as_str()),
+        Some("production")
+    );
+}
