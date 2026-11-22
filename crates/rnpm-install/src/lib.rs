@@ -3168,12 +3168,23 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                 }
                 PackageTarget::Url(u) => {
                     let u_str = u.as_str();
-                    let bytes = if let Ok(Some((_entry, data))) = self.cache.get(u_str) {
-                        Some(data)
-                    } else if self.options.offline {
-                        return Err(anyhow!(
-                            "npm error code ENOTCACHED\nnpm error request to {u_str} failed: cache mode is 'only-if-cached' but no cached response is available."
-                        ));
+                    let bytes = if self.options.offline {
+                        if let Ok(Some((_entry, data))) = self.cache.get(u_str) {
+                            Some(data)
+                        } else {
+                            return Err(anyhow!(
+                                "npm error code ENOTCACHED\nnpm error request to {u_str} failed: cache mode is 'only-if-cached' but no cached response is available."
+                            ));
+                        }
+                    } else if self.options.prefer_offline {
+                        if let Ok(Some((_entry, data))) = self.cache.get(u_str) {
+                            Some(data)
+                        } else {
+                            self.registry_client
+                                .download_tarball_bytes(u_str)
+                                .await
+                                .ok()
+                        }
                     } else {
                         self.registry_client
                             .download_tarball_bytes(u_str)
@@ -8053,19 +8064,29 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                 }
                 PackageTarget::Url(ref url) => {
                     let url_str = url.as_str();
-                    let archive_bytes_res =
+                    let archive_bytes_res = if self.options.offline {
                         if let Ok(Some((_entry, data))) = self.cache.get(url_str) {
                             Ok(data)
-                        } else if self.options.offline {
+                        } else {
                             return Err(anyhow!(
                                 "npm error code ENOTCACHED\nnpm error request to {url_str} failed: cache mode is 'only-if-cached' but no cached response is available."
                             ));
+                        }
+                    } else if self.options.prefer_offline {
+                        if let Ok(Some((_entry, data))) = self.cache.get(url_str) {
+                            Ok(data)
                         } else {
                             self.registry_client
                                 .download_tarball_bytes(url_str)
                                 .await
                                 .map_err(|e| anyhow!("{e}"))
-                        };
+                        }
+                    } else {
+                        self.registry_client
+                            .download_tarball_bytes(url_str)
+                            .await
+                            .map_err(|e| anyhow!("{e}"))
+                    };
                     let (m, integrity) = if let Ok(archive_bytes) = archive_bytes_res {
                         let integrity = Integrity::from_bytes(
                             &archive_bytes,

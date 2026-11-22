@@ -39,6 +39,7 @@ fn compute_integrity(bytes: &[u8]) -> (String, rnpm_core::integrity::Integrity) 
 struct MockHttpServer {
     addr: SocketAddr,
     request_count: Arc<AtomicUsize>,
+    tarball_request_count: Arc<AtomicUsize>,
     _shutdown: tokio::sync::oneshot::Sender<()>,
 }
 
@@ -48,6 +49,8 @@ impl MockHttpServer {
         let addr = listener.local_addr().unwrap();
         let request_count = Arc::new(AtomicUsize::new(0));
         let count_clone = Arc::clone(&request_count);
+        let tarball_request_count = Arc::new(AtomicUsize::new(0));
+        let tarball_count_clone = Arc::clone(&tarball_request_count);
         let (tx, mut rx) = tokio::sync::oneshot::channel::<()>();
 
         tokio::spawn(async move {
@@ -59,6 +62,7 @@ impl MockHttpServer {
                             count_clone.fetch_add(1, Ordering::SeqCst);
                             let t_path = tarball_path.clone();
                             let t_bytes = tarball_bytes.clone();
+                            let t_count_clone = Arc::clone(&tarball_count_clone);
                             tokio::spawn(async move {
                                 let mut buf = vec![0u8; 4096];
                                 let n = stream.read(&mut buf).await.unwrap_or(0);
@@ -68,6 +72,7 @@ impl MockHttpServer {
                                     let path = first_line.split_whitespace().nth(1).unwrap_or("/");
 
                                     if path == t_path {
+                                        t_count_clone.fetch_add(1, Ordering::SeqCst);
                                         let response = format!(
                                             "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: application/octet-stream\r\nConnection: close\r\n\r\n",
                                             t_bytes.len()
@@ -90,6 +95,7 @@ impl MockHttpServer {
         Self {
             addr,
             request_count,
+            tarball_request_count,
             _shutdown: tx,
         }
     }
@@ -281,5 +287,60 @@ async fn test_offline_direct_url_cli_arg_cache_hit_success() {
         server.request_count.load(Ordering::SeqCst),
         0,
         "--offline CLI arg cache hit must make zero HTTP requests"
+    );
+}
+
+#[tokio::test]
+async fn test_prefer_online_direct_url_fetches_from_server_even_when_cached() {
+    let tmp = tempfile::tempdir().unwrap();
+    let project_dir = tmp.path().join("proj");
+    let cache_dir = tmp.path().join("cache");
+    std::fs::create_dir_all(&project_dir).unwrap();
+
+    let tarball_bytes = create_tarball("direct-tarball-pkg", "1.0.0");
+    let (_integrity_str, integrity) = compute_integrity(&tarball_bytes);
+    let server = MockHttpServer::start(
+        "/tarballs/direct-tarball-pkg-1.0.0.tgz".to_string(),
+        tarball_bytes.clone(),
+    )
+    .await;
+    let tarball_url = format!("http://{}/tarballs/direct-tarball-pkg-1.0.0.tgz", server.addr);
+
+    // Pre-populate tarball into cache
+    let cache = rnpm_cache::Cache::new(&cache_dir).unwrap();
+    cache
+        .put_with_integrity(&tarball_url, &tarball_bytes, Some(&integrity), None)
+        .unwrap();
+
+    let pkg_json = format!(
+        r#"{{"name": "test-app", "dependencies": {{"direct-tarball-pkg": "{tarball_url}"}}}}"#
+    );
+    std::fs::write(project_dir.join("package.json"), pkg_json).unwrap();
+
+    let options = InstallOptions {
+        project_dir: project_dir.clone(),
+        registry_url: Some(format!("http://{}/", server.addr)),
+        cache_dir: Some(cache_dir),
+        offline: false,
+        prefer_online: true,
+        ignore_scripts: true,
+        ..Default::default()
+    };
+
+    let mut installer = Installer::new(options).unwrap();
+    let summary = installer.run().await.unwrap();
+
+    assert_eq!(summary.packages_installed, 1);
+    assert!(
+        project_dir
+            .join("node_modules")
+            .join("direct-tarball-pkg")
+            .join("package.json")
+            .exists(),
+        "Package must be installed into node_modules"
+    );
+    assert!(
+        server.tarball_request_count.load(Ordering::SeqCst) > 0,
+        "--prefer-online must fetch tarball from the server even when pre-populated in cache"
     );
 }
