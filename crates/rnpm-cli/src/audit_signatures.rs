@@ -230,7 +230,10 @@ pub async fn run(project_dir: &Path, json_output: bool) -> anyhow::Result<()> {
                 ));
             };
             if let Some(expires) = key.expires.as_deref() {
-                if rnpm_config::date::parse_js_date(expires).is_some_and(|end| published >= end) {
+                let is_valid = rnpm_config::date::parse_js_date(expires)
+                    .map(|end| published < end)
+                    .unwrap_or(false);
+                if !is_valid {
                     return Err(anyhow!(
                         "npm error code EEXPIREDSIGNATUREKEY\nnpm error {id} has a registry signature with keyid: {} but the corresponding public key has expired {expires}",
                         signature.keyid
@@ -346,9 +349,16 @@ pub async fn run(project_dir: &Path, json_output: bool) -> anyhow::Result<()> {
                     for k in rkeys {
                         let mut expired = false;
                         if let Some(expires_str) = &k.expires {
-                            if let Some(exp) = rnpm_config::date::parse_js_date(expires_str) {
-                                reg_key_expiries.insert(k.keyid.clone(), (expires_str.clone(), exp));
-                                if published >= exp {
+                            match rnpm_config::date::parse_js_date(expires_str) {
+                                Some(exp) => {
+                                    reg_key_expiries.insert(k.keyid.clone(), (expires_str.clone(), exp));
+                                    if published >= exp {
+                                        expired = true;
+                                    }
+                                }
+                                None => {
+                                    // Non-null unparseable date is treated as expired (invalid)
+                                    reg_key_expiries.insert(k.keyid.clone(), (expires_str.clone(), i64::MIN));
                                     expired = true;
                                 }
                             }

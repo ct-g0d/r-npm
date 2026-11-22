@@ -1292,6 +1292,68 @@ fn test_keyed_attestation_expired_registry_key_rejected() {
 }
 
 #[test]
+fn test_keyed_attestation_unparseable_expiry_rejected() {
+    let tarball_bytes = b"keyed attestation unparseable expiry payload";
+    let sha512_hex = HEXLOWER.encode(&Sha512::digest(tarball_bytes));
+    let signer = EphemeralSigner::new().unwrap();
+
+    let mut digest = HashMap::new();
+    digest.insert("sha512".to_string(), sha512_hex);
+    let statement = InTotoStatement {
+        statement_type: "https://in-toto.io/Statement/v1".into(),
+        subject: vec![InTotoSubject {
+            name: "pkg:npm/unparseable-expiry-pkg@1.0.0".into(),
+            digest,
+        }],
+        predicate_type: "https://slsa.dev/provenance/v1".into(),
+        predicate: SlsaPredicate::default(),
+    };
+    let mut envelope = sign_dsse_envelope(&statement, &signer).unwrap();
+    let keyid = "SHA256:unparseable-expiry-key";
+    envelope.signatures[0].keyid = Some(keyid.to_string());
+
+    let bundle = SigstoreBundle {
+        media_type: Some("application/vnd.sigstore.bundle+json;version=0.1".into()),
+        verification_material: Some(VerificationMaterial {
+            x509_certificate_chain: None,
+            certificate: None,
+            public_key: Some(PublicKeyHint {
+                hint: Some(keyid.to_string()),
+                raw_bytes: None,
+            }),
+            tlog_entries: Vec::new(),
+            timestamp_verification_data: None,
+        }),
+        dsse_envelope: Some(envelope),
+    };
+
+    let mut reg_keys = HashMap::new();
+    reg_keys.insert(keyid.to_string(), signer.public_key_spki().to_vec());
+
+    let mut expiries = HashMap::new();
+    // Unparseable non-null expiry string treated as expired (invalid)
+    expiries.insert(keyid.to_string(), ("invalid-date-string".to_string(), i64::MIN));
+
+    let verifier = ProvenanceVerifier::new(ProvenancePolicy::AllowAny)
+        .with_registry_keys(reg_keys)
+        .with_registry_key_expiries(expiries);
+
+    let err = verifier
+        .verify_package("unparseable-expiry-pkg", Some("1.0.0"), &bundle, None, Some(tarball_bytes))
+        .unwrap_err();
+
+    match err {
+        RegistryError::InvalidSignature(msg) => {
+            assert!(
+                msg.contains("expired"),
+                "Expected expired key error for unparseable date, got: {msg}"
+            );
+        }
+        other => panic!("Expected InvalidSignature error, got: {other:?}"),
+    }
+}
+
+#[test]
 fn test_strict_versioned_purl_subject_matching_rules() {
     let tarball_bytes = b"purl matching test bytes";
     let sha512_hex = HEXLOWER.encode(&Sha512::digest(tarball_bytes));
