@@ -49,6 +49,7 @@ pub use dedupe::{
 mod bundled;
 pub mod fast_path;
 mod legacy_lock;
+pub use legacy_lock::detect_lockfile_version;
 pub use fast_path::{
     compute_project_fingerprint, validate_hidden_lockfile, validate_hidden_lockfile_simple,
 };
@@ -1731,7 +1732,8 @@ pub struct InstallOptions {
     pub workspace: Vec<String>,
     pub workspaces: bool,
     /// Public package-lock serialization version (1, 2, or 3). Hidden lockfiles remain v3.
-    pub lockfile_version: u32,
+    /// If None, inferred from existing lockfile (preserving v2, upgrading v1 to v3, defaulting to v3).
+    pub lockfile_version: Option<u32>,
     /// High-resolution phase instrumentation and timing output.
     pub timing: bool,
     /// Installation layout strategy: hoisted (default), linked, or nested.
@@ -1767,6 +1769,28 @@ impl InstallOptions {
             p.libc = Some(libc.clone());
         }
         p
+    }
+
+    /// Evaluates effective lockfile version to write (1, 2, or 3).
+    ///
+    /// - If explicitly set via CLI or config, uses that version.
+    /// - Otherwise, if an existing package-lock.json / npm-shrinkwrap.json has lockfileVersion == 2, preserves version 2.
+    /// - Otherwise defaults to version 3.
+    pub fn effective_lockfile_version(&self) -> u32 {
+        if let Some(v) = self.lockfile_version {
+            return v;
+        }
+        let (lockfile_path, _) = resolve_lockfile_path(&self.project_dir);
+        if lockfile_path.is_file() {
+            if let Ok(raw) = std::fs::read_to_string(&lockfile_path) {
+                if let Some(version) = detect_lockfile_version(&raw) {
+                    if version == 2 {
+                        return 2;
+                    }
+                }
+            }
+        }
+        3
     }
 }
 
@@ -1814,7 +1838,7 @@ impl Default for InstallOptions {
             workspace_root: false,
             workspace: Vec::new(),
             workspaces: false,
-            lockfile_version: 3,
+            lockfile_version: None,
             timing: false,
             install_strategy: InstallStrategy::Hoisted,
             store_dir: None,
@@ -2335,6 +2359,11 @@ impl Installer {
             let _ = std::fs::create_dir_all(&global_bin);
         }
         let config = Config::load(Some(root_dir)).unwrap_or_default();
+        if options.lockfile_version.is_none() {
+            options.lockfile_version = config
+                .get("lockfile-version")
+                .and_then(|v| v.parse().ok());
+        }
         options.save_bundle |= config.get_bool("save-bundle").unwrap_or(false);
         // Peer handling is config, whichever command or source sets it.
         options.legacy_peer_deps |= config.get_bool("legacy-peer-deps").unwrap_or(false);
@@ -2578,7 +2607,7 @@ impl Installer {
         // npm stays quiet when the lock will not be written back as v3.
         // build-ideal-tree warns for an ancient lock regardless.
         if !self.options.silent
-            && (legacy_lock::is_ancient_lockfile(raw) || self.options.lockfile_version >= 3)
+            && (legacy_lock::is_ancient_lockfile(raw) || self.options.effective_lockfile_version() >= 3)
         {
             let (path, _) = resolve_lockfile_path(&self.options.project_dir);
             let file_name = path.file_name().map(|n| n.to_string_lossy().into_owned());
@@ -3690,7 +3719,7 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
             {
                 let _lock_guard = collector.enter_phase(Phase::Lockfile);
                 lockfile
-                    .save_to_file_version(&lockfile_path, self.options.lockfile_version)
+                    .save_to_file_version(&lockfile_path, self.options.effective_lockfile_version())
                     .with_context(|| format!("Failed to save {}", lockfile_path.display()))?;
             }
 
@@ -3959,7 +3988,7 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
             let lockfile_path = project_lockfile_path(&self.options.project_dir);
             if self.options.package_lock_enabled() && !self.options.no_save && !self.options.is_global {
                 lockfile
-                    .save_to_file_version(&lockfile_path, self.options.lockfile_version)
+                    .save_to_file_version(&lockfile_path, self.options.effective_lockfile_version())
                     .with_context(|| format!("Failed to save {}", lockfile_path.display()))?;
             }
             self.run_linked_root_hooks(&manifest).await?;
@@ -5251,7 +5280,7 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
             // 4. Write deterministic lockfile (only for local projects, not global prefix)
             if package_lock_enabled && !self.options.is_global && !self.options.no_save {
                 lockfile
-                    .save_to_file_version(&lockfile_path, self.options.lockfile_version)
+                    .save_to_file_version(&lockfile_path, self.options.effective_lockfile_version())
                     .with_context(|| format!("Failed to save {}", lockfile_path.display()))?;
             }
 
@@ -8930,7 +8959,7 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
 
             // Write updated deterministic lockfile
             lockfile
-                .save_to_file_version(&lockfile_path, self.options.lockfile_version)
+                .save_to_file_version(&lockfile_path, self.options.effective_lockfile_version())
                 .with_context(|| format!("Failed to save updated {}", lockfile_path.display()))?;
 
             // Persist hidden lockfile to node_modules/.package-lock.json
@@ -8944,7 +8973,7 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
             && workspace_members.is_empty()
         {
             LockfileV3::from_manifest(&manifest)
-                .save_to_file_version(&lockfile_path, self.options.lockfile_version)?;
+                .save_to_file_version(&lockfile_path, self.options.effective_lockfile_version())?;
         }
 
         // Remove deleted package directories from node_modules

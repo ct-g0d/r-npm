@@ -4990,11 +4990,10 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
                 workspace_root,
                 workspace,
                 workspaces,
-                lockfile_version: lockfile_version.unwrap_or_else(|| {
+                lockfile_version: lockfile_version.or_else(|| {
                     config
                         .get("lockfile-version")
                         .and_then(|v| v.parse().ok())
-                        .unwrap_or(3)
                 }),
                 timing: timing_val,
                 install_strategy: effective_strategy,
@@ -5205,11 +5204,10 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
                 workspace_root,
                 workspace,
                 workspaces,
-                lockfile_version: lockfile_version.unwrap_or_else(|| {
+                lockfile_version: lockfile_version.or_else(|| {
                     config
                         .get("lockfile-version")
                         .and_then(|v| v.parse().ok())
-                        .unwrap_or(3)
                 }),
                 timing: timing_val,
                 install_strategy: effective_strategy,

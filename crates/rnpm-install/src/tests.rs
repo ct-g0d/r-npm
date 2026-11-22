@@ -9,7 +9,7 @@ use tempfile::tempdir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
-use crate::{InstallOptions, Installer, UninstallOptions};
+use crate::{detect_lockfile_version, InstallOptions, Installer, UninstallOptions};
 use rnpm_core::integrity::{Algorithm, Integrity};
 use rnpm_core::manifest::{Manifest, PackageBin};
 use rnpm_fs::junction::{create_junction, is_junction};
@@ -4862,4 +4862,313 @@ async fn test_ci_empty_lockfile_leaves_no_node_modules() {
         !root.join("node_modules").exists(),
         "Empty lockfile CI must not leave empty node_modules on disk"
     );
+}
+
+#[test]
+fn test_detect_lockfile_version() {
+    assert_eq!(detect_lockfile_version(r#"{"lockfileVersion": 1}"#), Some(1));
+    assert_eq!(detect_lockfile_version(r#"{"lockfileVersion": 2}"#), Some(2));
+    assert_eq!(detect_lockfile_version(r#"{"lockfileVersion": 3}"#), Some(3));
+    assert_eq!(detect_lockfile_version(r#"{"lockfileVersion": "2"}"#), Some(2));
+    assert_eq!(detect_lockfile_version(r#"{"name": "foo"}"#), None);
+    assert_eq!(detect_lockfile_version(r#"not json"#), None);
+}
+
+#[test]
+fn test_effective_lockfile_version_precedence() {
+    let tmp = tempdir().unwrap();
+    let root = tmp.path().join("proj");
+    fs::create_dir_all(&root).unwrap();
+
+    // 1. Fresh project with no lockfile defaults to 3
+    let opts = InstallOptions {
+        project_dir: root.clone(),
+        ..Default::default()
+    };
+    assert_eq!(opts.effective_lockfile_version(), 3);
+
+    // 2. Explicit flag overrides anything
+    let opts_explicit = InstallOptions {
+        project_dir: root.clone(),
+        lockfile_version: Some(2),
+        ..Default::default()
+    };
+    assert_eq!(opts_explicit.effective_lockfile_version(), 2);
+
+    // 3. Existing v2 lockfile is preserved when not explicitly configured
+    fs::write(
+        root.join("package-lock.json"),
+        r#"{"name":"test","lockfileVersion":2,"requires":true,"packages":{},"dependencies":{}}"#,
+    )
+    .unwrap();
+    let opts_v2 = InstallOptions {
+        project_dir: root.clone(),
+        ..Default::default()
+    };
+    assert_eq!(opts_v2.effective_lockfile_version(), 2);
+
+    // 4. Existing v2 lockfile overridden by explicit lockfile_version = Some(3)
+    let opts_v2_override = InstallOptions {
+        project_dir: root.clone(),
+        lockfile_version: Some(3),
+        ..Default::default()
+    };
+    assert_eq!(opts_v2_override.effective_lockfile_version(), 3);
+
+    // 5. Existing v1 lockfile upgraded to v3 when not explicitly configured
+    fs::write(
+        root.join("package-lock.json"),
+        r#"{"name":"test","lockfileVersion":1,"dependencies":{}}"#,
+    )
+    .unwrap();
+    let opts_v1 = InstallOptions {
+        project_dir: root.clone(),
+        ..Default::default()
+    };
+    assert_eq!(opts_v1.effective_lockfile_version(), 3);
+
+    // 6. Existing v3 lockfile stays v3
+    fs::write(
+        root.join("package-lock.json"),
+        r#"{"name":"test","lockfileVersion":3,"packages":{}}"#,
+    )
+    .unwrap();
+    let opts_v3 = InstallOptions {
+        project_dir: root.clone(),
+        ..Default::default()
+    };
+    assert_eq!(opts_v3.effective_lockfile_version(), 3);
+
+    // 7. Existing v2 npm-shrinkwrap.json is preserved
+    fs::remove_file(root.join("package-lock.json")).unwrap();
+    fs::write(
+        root.join("npm-shrinkwrap.json"),
+        r#"{"name":"test","lockfileVersion":2,"requires":true,"packages":{},"dependencies":{}}"#,
+    )
+    .unwrap();
+    let opts_sw_v2 = InstallOptions {
+        project_dir: root.clone(),
+        ..Default::default()
+    };
+    assert_eq!(opts_sw_v2.effective_lockfile_version(), 2);
+}
+
+#[tokio::test]
+async fn test_install_preserves_existing_v2_lockfile() {
+    let tmp = tempdir().unwrap();
+    let root = tmp.path().join("proj");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(
+        root.join("package.json"),
+        r#"{"name":"v2-proj","version":"1.0.0"}"#,
+    )
+    .unwrap();
+    fs::write(
+        root.join("package-lock.json"),
+        r#"{
+  "name": "v2-proj",
+  "version": "1.0.0",
+  "lockfileVersion": 2,
+  "requires": true,
+  "packages": {
+    "": {
+      "name": "v2-proj",
+      "version": "1.0.0"
+    }
+  },
+  "dependencies": {}
+}
+"#,
+    )
+    .unwrap();
+
+    let options = InstallOptions {
+        project_dir: root.clone(),
+        package_lock_only: true,
+        offline: true,
+        ..Default::default()
+    };
+    let mut installer = Installer::new(options).unwrap();
+    installer.run().await.unwrap();
+
+    let content = fs::read_to_string(root.join("package-lock.json")).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&content).unwrap();
+    assert_eq!(json["lockfileVersion"], 2, "lockfileVersion: 2 must be preserved");
+    assert!(json.get("packages").is_some(), "v2 must have packages map");
+    assert!(json.get("dependencies").is_some(), "v2 must have dependencies map");
+}
+
+#[tokio::test]
+async fn test_install_overrides_existing_v2_with_cli_flag() {
+    let tmp = tempdir().unwrap();
+    let root = tmp.path().join("proj");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(
+        root.join("package.json"),
+        r#"{"name":"v2-proj","version":"1.0.0"}"#,
+    )
+    .unwrap();
+    fs::write(
+        root.join("package-lock.json"),
+        r#"{
+  "name": "v2-proj",
+  "version": "1.0.0",
+  "lockfileVersion": 2,
+  "requires": true,
+  "packages": {
+    "": {
+      "name": "v2-proj",
+      "version": "1.0.0"
+    }
+  },
+  "dependencies": {}
+}
+"#,
+    )
+    .unwrap();
+
+    let options = InstallOptions {
+        project_dir: root.clone(),
+        lockfile_version: Some(3),
+        package_lock_only: true,
+        offline: true,
+        ..Default::default()
+    };
+    let mut installer = Installer::new(options).unwrap();
+    installer.run().await.unwrap();
+
+    let content = fs::read_to_string(root.join("package-lock.json")).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&content).unwrap();
+    assert_eq!(json["lockfileVersion"], 3, "explicit --lockfile-version=3 must upgrade v2 to v3");
+    assert!(json.get("dependencies").is_none(), "v3 must not have dependencies block");
+}
+
+#[tokio::test]
+async fn test_install_upgrades_existing_v1_to_v3() {
+    let tmp = tempdir().unwrap();
+    let root = tmp.path().join("proj");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(
+        root.join("package.json"),
+        r#"{"name":"v1-proj","version":"1.0.0"}"#,
+    )
+    .unwrap();
+    fs::write(
+        root.join("package-lock.json"),
+        r#"{
+  "name": "v1-proj",
+  "version": "1.0.0",
+  "lockfileVersion": 1,
+  "dependencies": {}
+}
+"#,
+    )
+    .unwrap();
+
+    let options = InstallOptions {
+        project_dir: root.clone(),
+        package_lock_only: true,
+        offline: true,
+        ..Default::default()
+    };
+    let mut installer = Installer::new(options).unwrap();
+    installer.run().await.unwrap();
+
+    let content = fs::read_to_string(root.join("package-lock.json")).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&content).unwrap();
+    assert_eq!(json["lockfileVersion"], 3, "v1 lockfile must be upgraded to v3");
+}
+
+#[tokio::test]
+async fn test_install_fresh_project_defaults_to_v3() {
+    let tmp = tempdir().unwrap();
+    let root = tmp.path().join("proj");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(
+        root.join("package.json"),
+        r#"{"name":"fresh-proj","version":"1.0.0"}"#,
+    )
+    .unwrap();
+
+    let options = InstallOptions {
+        project_dir: root.clone(),
+        package_lock_only: true,
+        offline: true,
+        ..Default::default()
+    };
+    let mut installer = Installer::new(options).unwrap();
+    installer.run().await.unwrap();
+
+    let content = fs::read_to_string(root.join("package-lock.json")).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&content).unwrap();
+    assert_eq!(json["lockfileVersion"], 3, "fresh project must default to v3");
+}
+
+#[tokio::test]
+async fn test_install_preserves_existing_v2_shrinkwrap() {
+    let tmp = tempdir().unwrap();
+    let root = tmp.path().join("proj");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(
+        root.join("package.json"),
+        r#"{"name":"sw-proj","version":"1.0.0"}"#,
+    )
+    .unwrap();
+    fs::write(
+        root.join("npm-shrinkwrap.json"),
+        r#"{
+  "name": "sw-proj",
+  "version": "1.0.0",
+  "lockfileVersion": 2,
+  "requires": true,
+  "packages": {
+    "": {
+      "name": "sw-proj",
+      "version": "1.0.0"
+    }
+  },
+  "dependencies": {}
+}
+"#,
+    )
+    .unwrap();
+
+    let options = InstallOptions {
+        project_dir: root.clone(),
+        package_lock_only: true,
+        offline: true,
+        ..Default::default()
+    };
+    let mut installer = Installer::new(options).unwrap();
+    installer.run().await.unwrap();
+
+    let content = fs::read_to_string(root.join("npm-shrinkwrap.json")).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&content).unwrap();
+    assert_eq!(json["lockfileVersion"], 2, "v2 npm-shrinkwrap.json must be preserved");
+}
+
+#[tokio::test]
+async fn test_install_npmrc_lockfile_version_override() {
+    let tmp = tempdir().unwrap();
+    let root = tmp.path().join("proj");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(
+        root.join("package.json"),
+        r#"{"name":"npmrc-proj","version":"1.0.0"}"#,
+    )
+    .unwrap();
+    fs::write(root.join(".npmrc"), "lockfile-version = 2\n").unwrap();
+
+    let options = InstallOptions {
+        project_dir: root.clone(),
+        package_lock_only: true,
+        offline: true,
+        ..Default::default()
+    };
+    let mut installer = Installer::new(options).unwrap();
+    installer.run().await.unwrap();
+
+    let content = fs::read_to_string(root.join("package-lock.json")).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&content).unwrap();
+    assert_eq!(json["lockfileVersion"], 2, "npmrc lockfile-version = 2 must produce v2 lockfile");
 }

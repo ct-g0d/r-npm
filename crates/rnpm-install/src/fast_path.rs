@@ -105,7 +105,7 @@ pub fn compute_project_fingerprint(project_dir: &Path, options: &InstallOptions)
             target_platform.os,
             target_platform.cpu,
             target_platform.libc,
-            options.lockfile_version,
+            options.effective_lockfile_version(),
             sorted_include,
             options.workspaces,
             options.workspace_root,
