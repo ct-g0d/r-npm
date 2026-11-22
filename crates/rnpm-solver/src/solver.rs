@@ -2636,7 +2636,9 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                         None
                     }
                 }),
-            PackageTarget::Git { url, committish } => meta
+            PackageTarget::Git {
+                url, committish, ..
+            } => meta
                 .versions
                 .values()
                 .find(|v| {

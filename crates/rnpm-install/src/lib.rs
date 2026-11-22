@@ -3199,16 +3199,16 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                     spec.target = PackageTarget::File(PathBuf::from(&clean_rel));
                     format!("file:{clean_rel}")
                 }
-                PackageTarget::Git { url, committish } => {
-                    format!(
-                        "{}{}",
-                        url,
-                        committish
-                            .as_ref()
-                            .map(|c| format!("#{c}"))
-                            .unwrap_or_default()
-                    )
-                }
+                PackageTarget::Git {
+                    url,
+                    committish,
+                    subdir,
+                } => match (committish, subdir) {
+                    (Some(c), Some(s)) => format!("{url}#{c}::path:{s}"),
+                    (Some(c), None) => format!("{url}#{c}"),
+                    (None, Some(s)) => format!("{url}#path:{s}"),
+                    (None, None) => url.clone(),
+                },
                 PackageTarget::Workspace(ws) => format!("workspace:{}", ws),
                 PackageTarget::Alias {
                     name: real_name,

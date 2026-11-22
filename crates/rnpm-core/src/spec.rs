@@ -21,6 +21,8 @@ pub enum PackageTarget {
     Git {
         url: String,
         committish: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        subdir: Option<String>,
     },
     Url(Url),
 }
@@ -73,16 +75,17 @@ impl PackageTarget {
         ];
         for prefix in git_prefixes {
             if s.starts_with(prefix) {
-                let (url_part, committish) = if let Some(hash_idx) = s.find('#') {
+                let (url_part, committish, subdir) = if let Some(hash_idx) = s.find('#') {
                     let u = s[..hash_idx].trim().to_string();
-                    let c = s[hash_idx + 1..].trim().to_string();
-                    (u, if c.is_empty() { None } else { Some(c) })
+                    let (committish, subdir) = parse_git_fragment(&s[hash_idx + 1..]);
+                    (u, committish, subdir)
                 } else {
-                    (s.trim().to_string(), None)
+                    (s.trim().to_string(), None, None)
                 };
                 return Ok(PackageTarget::Git {
                     url: url_part,
                     committish,
+                    subdir,
                 });
             }
         }
@@ -145,7 +148,9 @@ impl PackageTarget {
     /// Returns the raw git URL and optional committish if this target is a Git dependency.
     pub fn git(&self) -> Option<(&str, Option<&str>)> {
         match self {
-            PackageTarget::Git { url, committish } => Some((url.as_str(), committish.as_deref())),
+            PackageTarget::Git {
+                url, committish, ..
+            } => Some((url.as_str(), committish.as_deref())),
             _ => None,
         }
     }
@@ -187,6 +192,19 @@ impl PackageTarget {
             PackageTarget::Git { committish, .. } => committish.as_deref(),
             _ => None,
         }
+    }
+
+    /// Returns the subdirectory path if specified via `#path:<subdir>` or `#<committish>::path:<subdir>`.
+    pub fn git_subdir(&self) -> Option<&str> {
+        match self {
+            PackageTarget::Git { subdir, .. } => subdir.as_deref(),
+            _ => None,
+        }
+    }
+
+    /// Alias for `git_subdir`.
+    pub fn git_path(&self) -> Option<&str> {
+        self.git_subdir()
     }
 
     /// Returns the URL reference if this target is a direct HTTP/HTTPS URL dependency.
@@ -237,13 +255,16 @@ impl fmt::Display for PackageTarget {
             PackageTarget::Alias { name, target } => write!(f, "npm:{name}@{target}"),
             PackageTarget::File(p) => write!(f, "file:{}", p.display()),
             PackageTarget::Workspace(w) => write!(f, "workspace:{w}"),
-            PackageTarget::Git { url, committish } => {
-                if let Some(c) = committish {
-                    write!(f, "{url}#{c}")
-                } else {
-                    write!(f, "{url}")
-                }
-            }
+            PackageTarget::Git {
+                url,
+                committish,
+                subdir,
+            } => match (committish, subdir) {
+                (Some(c), Some(s)) => write!(f, "{url}#{c}::path:{s}"),
+                (Some(c), None) => write!(f, "{url}#{c}"),
+                (None, Some(s)) => write!(f, "{url}#path:{s}"),
+                (None, None) => write!(f, "{url}"),
+            },
             PackageTarget::Url(u) => write!(f, "{u}"),
         }
     }
@@ -565,6 +586,44 @@ fn expand_github_shorthand(spec: &str) -> String {
         }
     } else {
         spec.to_string()
+    }
+}
+
+/// Parses git URL fragment into optional committish and optional subdirectory path.
+/// Supports npm formats:
+/// - `#path:<subdir>`
+/// - `#<committish>::path:<subdir>`
+/// - `#<committish>`
+pub fn parse_git_fragment(fragment: &str) -> (Option<String>, Option<String>) {
+    let f = fragment.trim();
+    if f.is_empty() {
+        return (None, None);
+    }
+
+    if let Some((committish_part, subdir_part)) = f.split_once("::path:") {
+        let c = committish_part.trim();
+        let s = subdir_part.trim();
+        let committish = if c.is_empty() {
+            None
+        } else {
+            Some(c.to_string())
+        };
+        let subdir = if s.is_empty() {
+            None
+        } else {
+            Some(s.to_string())
+        };
+        (committish, subdir)
+    } else if let Some(subdir_part) = f.strip_prefix("path:") {
+        let s = subdir_part.trim();
+        let subdir = if s.is_empty() {
+            None
+        } else {
+            Some(s.to_string())
+        };
+        (None, subdir)
+    } else {
+        (Some(f.to_string()), None)
     }
 }
 

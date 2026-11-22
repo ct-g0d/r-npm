@@ -55,9 +55,15 @@ impl GitFetcher {
         let commit_sha = self
             .resolve_commit_sha(&remote_dir, committish, &clone_url, offline)
             .await?;
-        let checkout_dir = self
+        let root_checkout_dir = self
             .checkout_tree(&remote_dir, &commit_sha, &clone_url)
             .await?;
+
+        let checkout_dir = if let Some(subdir) = target.git_subdir() {
+            resolve_git_subdir(&root_checkout_dir, subdir)?
+        } else {
+            root_checkout_dir
+        };
 
         let manifest_path = checkout_dir.join("package.json");
         if !manifest_path.exists() {
@@ -101,9 +107,15 @@ impl GitFetcher {
         let commit_sha = self
             .resolve_commit_sha(&remote_dir, committish, &clone_url, offline)
             .await?;
-        let checkout_dir = self
+        let root_checkout_dir = self
             .checkout_tree(&remote_dir, &commit_sha, &clone_url)
             .await?;
+
+        let checkout_dir = if let Some(subdir) = target.git_subdir() {
+            resolve_git_subdir(&root_checkout_dir, subdir)?
+        } else {
+            root_checkout_dir
+        };
 
         let manifest_path = checkout_dir.join("package.json");
         if !manifest_path.exists() {
@@ -428,7 +440,9 @@ impl GitFetcher {
     ) -> Result<PathBuf> {
         let checkout_dir = self.checkout_cache_dir(clone_url, commit_sha);
 
-        if checkout_dir.join("package.json").exists() {
+        if checkout_dir.join(".rnpm_checkout_done").exists()
+            || checkout_dir.join("package.json").exists()
+        {
             debug!(
                 "Reusing existing checkout for commit {} at '{}'",
                 commit_sha,
@@ -448,7 +462,8 @@ impl GitFetcher {
         let archive_bytes = run_git_archive(remote_dir, commit_sha).await;
         if let Ok(bytes) = archive_bytes {
             let mut archive = tar::Archive::new(std::io::Cursor::new(bytes));
-            if archive.unpack(&checkout_dir).is_ok() && checkout_dir.join("package.json").exists() {
+            if archive.unpack(&checkout_dir).is_ok() {
+                let _ = std::fs::File::create(checkout_dir.join(".rnpm_checkout_done"));
                 return Ok(checkout_dir);
             }
         }
@@ -488,13 +503,68 @@ impl GitFetcher {
             let _ = safe_remove_dir_all(&git_file);
         }
 
+        let _ = std::fs::File::create(checkout_dir.join(".rnpm_checkout_done"));
         Ok(checkout_dir)
     }
 }
 
+/// Validates that a git dependency subdir stays inside the checkout root
+/// (rejecting `..` or absolute path traversal), and returns the resolved directory path.
+pub fn resolve_git_subdir(root: &Path, subdir: &str) -> Result<PathBuf> {
+    let trimmed = subdir.trim();
+    if trimmed.is_empty() {
+        return Ok(root.to_path_buf());
+    }
+
+    let normalized_str = trimmed.replace('\\', "/");
+    let clean_str = normalized_str.trim_matches('/');
+
+    let subpath = Path::new(clean_str);
+    if subpath.is_absolute()
+        || normalized_str.starts_with('/')
+        || normalized_str.starts_with('\\')
+        || (normalized_str.len() >= 2 && normalized_str.as_bytes()[1] == b':')
+    {
+        return Err(anyhow!(
+            "Path traversal rejected: git subdir '{}' is an absolute path",
+            subdir
+        ));
+    }
+
+    for component in subpath.components() {
+        match component {
+            std::path::Component::ParentDir => {
+                return Err(anyhow!(
+                    "Path traversal rejected: git subdir '{}' contains directory traversal ('..')",
+                    subdir
+                ));
+            }
+            std::path::Component::RootDir | std::path::Component::Prefix(_) => {
+                return Err(anyhow!(
+                    "Path traversal rejected: git subdir '{}' is an absolute path",
+                    subdir
+                ));
+            }
+            _ => {}
+        }
+    }
+
+    let target_path = root.join(subpath);
+    let cleaned_target = path_clean::clean(&target_path);
+    let cleaned_root = path_clean::clean(root);
+    if !cleaned_target.starts_with(&cleaned_root) {
+        return Err(anyhow!(
+            "Path traversal rejected: git subdir '{}' escapes checkout root",
+            subdir
+        ));
+    }
+
+    Ok(target_path)
+}
+
 /// Formats canonical locked resolved URL for lockfile v3.
 pub fn format_git_resolved_url(target: &PackageTarget, commit_sha: &str) -> String {
-    match target {
+    let base = match target {
         PackageTarget::Git { url, .. } => {
             if let Some(rest) = url.strip_prefix("github:") {
                 let repo = rest.trim_end_matches(".git");
@@ -517,6 +587,11 @@ pub fn format_git_resolved_url(target: &PackageTarget, commit_sha: &str) -> Stri
             }
         }
         _ => format!("git#{commit_sha}"),
+    };
+    if let Some(subdir) = target.git_subdir() {
+        format!("{base}::path:{subdir}")
+    } else {
+        base
     }
 }
 
@@ -724,6 +799,43 @@ mod tests {
             format_git_resolved_url(&t5, "feedfacefeedfacefeedfacefeedfacefeedface"),
             "git+git://github.com/user/repo.git#feedfacefeedfacefeedfacefeedfacefeedface"
         );
+
+        let t6 = PackageTarget::parse("github:user/repo#path:packages/foo").unwrap();
+        assert_eq!(
+            format_git_resolved_url(&t6, "1234567890abcdef1234567890abcdef12345678"),
+            "git+ssh://git@github.com/user/repo.git#1234567890abcdef1234567890abcdef12345678::path:packages/foo"
+        );
+
+        let t7 = PackageTarget::parse(
+            "git+https://github.com/user/repo.git#v1.0.0::path:packages/bar",
+        )
+        .unwrap();
+        assert_eq!(
+            format_git_resolved_url(&t7, "abcdef1234567890abcdef1234567890abcdef12"),
+            "git+ssh://git@github.com/user/repo.git#abcdef1234567890abcdef1234567890abcdef12::path:packages/bar"
+        );
+    }
+
+    #[test]
+    fn test_resolve_git_subdir_safety() {
+        let root = Path::new("/fake/checkout");
+        assert_eq!(
+            resolve_git_subdir(root, "packages/foo").unwrap(),
+            root.join("packages/foo")
+        );
+        assert_eq!(
+            resolve_git_subdir(root, "./packages/bar/").unwrap(),
+            root.join("packages/bar")
+        );
+
+        // Reject traversal
+        assert!(resolve_git_subdir(root, "../escape").is_err());
+        assert!(resolve_git_subdir(root, "packages/../../escape").is_err());
+        assert!(resolve_git_subdir(root, "/absolute/path").is_err());
+        #[cfg(windows)]
+        {
+            assert!(resolve_git_subdir(root, "C:\\Windows").is_err());
+        }
     }
 
     #[test]

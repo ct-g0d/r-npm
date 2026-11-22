@@ -248,6 +248,7 @@ fn test_package_spec_parsing() {
         PackageTarget::Git {
             url: "github:user/repo".to_string(),
             committish: None,
+            subdir: None,
         }
     );
 
@@ -260,6 +261,7 @@ fn test_package_spec_parsing() {
         PackageTarget::Git {
             url: "git+https://github.com/org/repo.git".to_string(),
             committish: Some("v1.0.0".to_string()),
+            subdir: None,
         }
     );
     assert_eq!(
@@ -348,6 +350,64 @@ fn test_git_spec_edge_cases_and_clone_urls() {
     assert_eq!(PackageTarget::parse(&t1.to_string()).unwrap(), t1);
     assert_eq!(PackageTarget::parse(&t4.to_string()).unwrap(), t4);
     assert_eq!(PackageTarget::parse(&u1.to_string()).unwrap(), u1);
+}
+
+#[test]
+fn test_git_spec_path_subdirectory_support() {
+    // 1. #path:<subdir> without committish
+    let t1 = PackageTarget::parse("github:user/repo#path:packages/foo").unwrap();
+    assert_eq!(t1.git_committish(), None);
+    assert_eq!(t1.git_subdir(), Some("packages/foo"));
+    assert_eq!(t1.git_path(), Some("packages/foo"));
+    assert_eq!(t1.to_string(), "github:user/repo#path:packages/foo");
+    assert_eq!(PackageTarget::parse(&t1.to_string()).unwrap(), t1);
+
+    // 2. #<committish>::path:<subdir>
+    let t2 = PackageTarget::parse(
+        "git+https://github.com/org/repo.git#v1.0.0::path:packages/bar",
+    )
+    .unwrap();
+    assert_eq!(t2.git_committish(), Some("v1.0.0"));
+    assert_eq!(t2.git_subdir(), Some("packages/bar"));
+    assert_eq!(t2.git_path(), Some("packages/bar"));
+    assert_eq!(
+        t2.to_string(),
+        "git+https://github.com/org/repo.git#v1.0.0::path:packages/bar"
+    );
+    assert_eq!(PackageTarget::parse(&t2.to_string()).unwrap(), t2);
+
+    // 3. git+file with #path:
+    let t3 = PackageTarget::parse("git+file:///path/to/repo#path:nested/pkg").unwrap();
+    assert_eq!(t3.git_committish(), None);
+    assert_eq!(t3.git_subdir(), Some("nested/pkg"));
+    assert_eq!(t3.git_clone_url().unwrap(), "file:///path/to/repo");
+
+    // 4. git+file with #branch::path:
+    let t4 = PackageTarget::parse("git+file:///path/to/repo#main::path:nested/pkg").unwrap();
+    assert_eq!(t4.git_committish(), Some("main"));
+    assert_eq!(t4.git_subdir(), Some("nested/pkg"));
+
+    // 5. Semver committish with ::path:
+    let t5 = PackageTarget::parse(
+        "git+ssh://git@github.com/org/repo.git#semver:^1.0.0::path:packages/core",
+    )
+    .unwrap();
+    assert_eq!(t5.git_committish(), Some("semver:^1.0.0"));
+    assert_eq!(t5.git_subdir(), Some("packages/core"));
+
+    // 6. PackageSpec parsing with #path:
+    let spec1 = PackageSpec::parse("git+https://github.com/org/repo.git#path:packages/foo").unwrap();
+    assert_eq!(spec1.target.git_subdir(), Some("packages/foo"));
+    assert_eq!(spec1.target.git_committish(), None);
+
+    let spec2 = PackageSpec::parse_dependency(
+        "my-sub-pkg",
+        "github:user/repo#main::path:packages/my-sub-pkg",
+    )
+    .unwrap();
+    assert_eq!(spec2.name, "my-sub-pkg");
+    assert_eq!(spec2.target.git_committish(), Some("main"));
+    assert_eq!(spec2.target.git_subdir(), Some("packages/my-sub-pkg"));
 }
 
 #[test]
