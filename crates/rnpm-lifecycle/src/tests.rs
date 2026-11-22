@@ -3473,6 +3473,8 @@ fn test_node_gyp_bootstrap_multi_package_transitive_deps_end_to_end() {
         while r_clone.load(Ordering::Relaxed) {
             match listener.accept() {
                 Ok((mut stream, _)) => {
+                    let _ = stream.set_nonblocking(false);
+                    let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(5)));
                     let mut buf = [0u8; 4096];
                     let n = stream.read(&mut buf).unwrap_or(0);
                     if n == 0 {
