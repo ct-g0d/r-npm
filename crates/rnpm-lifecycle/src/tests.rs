@@ -3166,11 +3166,13 @@ fn test_node_gyp_mock_registry_on_demand_bootstrap() {
     let marker_file = project_dir.join("bootstrap-build.marker");
     let marker_escaped = marker_file.to_string_lossy().replace('\\', "/");
     let tarball_bytes = create_mock_node_gyp_tarball(&marker_escaped, "bootstrap node-gyp built package");
+    let integrity = rnpm_core::Integrity::from_bytes(&tarball_bytes, rnpm_core::Algorithm::Sha512).to_string();
 
     // Start mock HTTP registry server
     let listener = TcpListener::bind("127.0.0.1:0").expect("Failed to bind mock registry listener");
     let port = listener.local_addr().unwrap().port();
     let tb_clone = tarball_bytes.clone();
+    let integrity_clone = integrity.clone();
 
     let server_handle = std::thread::spawn(move || {
         for mut stream in listener.incoming().flatten() {
@@ -3179,8 +3181,9 @@ fn test_node_gyp_mock_registry_on_demand_bootstrap() {
             let req = String::from_utf8_lossy(&buf[..n]);
             if req.contains("GET /node-gyp") {
                 let body = format!(
-                    r#"{{"name":"node-gyp","dist-tags":{{"latest":"10.0.0"}},"versions":{{"10.0.0":{{"dist":{{"tarball":"http://127.0.0.1:{}/tarballs/node-gyp.tgz"}}}}}}}}"#,
-                    port
+                    r#"{{"name":"node-gyp","dist-tags":{{"latest":"10.0.0"}},"versions":{{"10.0.0":{{"dist":{{"tarball":"http://127.0.0.1:{}/tarballs/node-gyp.tgz","integrity":"{}"}}}}}}}}"#,
+                    port,
+                    integrity_clone
                 );
                 let resp = format!(
                     "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
@@ -3250,4 +3253,426 @@ fn test_node_gyp_mock_registry_on_demand_bootstrap() {
     assert_eq!(marker_content, "bootstrap node-gyp built package");
 
     let _ = server_handle.join();
+}
+
+fn create_tarball_with_files(files: &[(&str, &[u8])]) -> Vec<u8> {
+    let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    {
+        let mut builder = tar::Builder::new(&mut gz);
+        for &(path, content) in files {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(content.len() as u64);
+            header.set_mode(0o755);
+            let path_bytes = path.as_bytes();
+            if path_bytes.len() <= 100 {
+                header.as_mut_bytes()[..path_bytes.len()].copy_from_slice(path_bytes);
+                header.set_cksum();
+                builder.append(&header, content).unwrap();
+            } else {
+                header.set_path(path).unwrap();
+                header.set_cksum();
+                builder.append(&header, content).unwrap();
+            }
+        }
+        builder.finish().unwrap();
+    }
+    gz.finish().unwrap()
+}
+
+#[test]
+fn test_node_gyp_tampered_integrity_rejected_live_cache_not_created() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    let temp = tempfile::tempdir().unwrap();
+    let cache_dir = temp.path().join("cache");
+    let project_dir = temp.path().join("pkg");
+    std::fs::create_dir_all(&project_dir).unwrap();
+
+    let valid_tarball = create_tarball_with_files(&[
+        ("package/package.json", br#"{"name":"node-gyp","version":"10.0.0","bin":{"node-gyp":"bin/node-gyp.js"}}"#),
+        ("package/bin/node-gyp.js", b"process.exit(0);"),
+    ]);
+
+    // Compute legitimate integrity of the original tarball
+    let legitimate_integrity = rnpm_core::Integrity::from_bytes(&valid_tarball, rnpm_core::Algorithm::Sha512).to_string();
+
+    // Tampered tarball that does NOT match the integrity
+    let tampered_tarball = create_tarball_with_files(&[
+        ("package/package.json", br#"{"name":"node-gyp","version":"10.0.0","bin":{"node-gyp":"bin/node-gyp.js"}}"#),
+        ("package/bin/node-gyp.js", b"console.log('tampered payload'); process.exit(1);"),
+    ]);
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("Failed to bind mock registry listener");
+    let port = listener.local_addr().unwrap().port();
+    let tampered_clone = tampered_tarball.clone();
+    let integrity_clone = legitimate_integrity.clone();
+
+    let server_handle = std::thread::spawn(move || {
+        for mut stream in listener.incoming().flatten() {
+            let mut buf = [0u8; 4096];
+            let n = stream.read(&mut buf).unwrap_or(0);
+            let req = String::from_utf8_lossy(&buf[..n]);
+            if req.contains("GET /node-gyp") {
+                let body = format!(
+                    r#"{{"name":"node-gyp","dist-tags":{{"latest":"10.0.0"}},"versions":{{"10.0.0":{{"dist":{{"tarball":"http://127.0.0.1:{}/tarballs/node-gyp.tgz","integrity":"{}"}}}}}}}}"#,
+                    port,
+                    integrity_clone
+                );
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(resp.as_bytes());
+                let _ = stream.flush();
+            } else if req.contains("GET /tarballs/node-gyp.tgz") {
+                let resp_head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    tampered_clone.len()
+                );
+                let _ = stream.write_all(resp_head.as_bytes());
+                let _ = stream.write_all(&tampered_clone);
+                let _ = stream.flush();
+                break;
+            }
+        }
+    });
+
+    let mut config = rnpm_config::Config::default();
+    config.npmrc.settings.insert("cache".to_string(), cache_dir.to_string_lossy().to_string());
+    config.npmrc.settings.insert("registry".to_string(), format!("http://127.0.0.1:{}/", port));
+    config.npmrc.settings.insert("node-gyp-fallback-npm".to_string(), "false".to_string());
+
+    let res = crate::node_gyp::ensure_node_gyp(
+        &project_dir,
+        &project_dir,
+        &config,
+        None,
+        false,
+        "test-tampered-pkg",
+    );
+
+    assert!(res.is_err(), "ensure_node_gyp must fail when tarball integrity check fails");
+    let err_str = res.unwrap_err().to_string();
+    assert!(
+        err_str.contains("integrity mismatch") || err_str.contains("integrity check failed"),
+        "Error message should mention integrity mismatch: {err_str}"
+    );
+
+    // Live cache directory MUST NOT exist
+    let live_current = cache_dir.join("node-gyp").join("current");
+    assert!(!live_current.exists(), "Live cache directory must not be created on integrity mismatch");
+
+    // No partial .tmp-* staging directory should remain
+    let node_gyp_dir = cache_dir.join("node-gyp");
+    if node_gyp_dir.exists() {
+        let entries = std::fs::read_dir(&node_gyp_dir).unwrap();
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            assert!(
+                !name.starts_with(".tmp-"),
+                "Staging directory must be cleaned up on failure: {name}"
+            );
+        }
+    }
+
+    let _ = server_handle.join();
+}
+
+#[test]
+fn test_node_gyp_malicious_path_traversal_tarball_rejected() {
+    let temp = tempfile::tempdir().unwrap();
+    let staging_dir = temp.path().join("staging");
+    let canary_file = temp.path().join("escape.txt");
+
+    // Construct tarball with ../../escape.txt
+    let malicious_bytes = create_tarball_with_files(&[
+        ("package/../../escape.txt", b"evil traversal payload"),
+    ]);
+
+    let res = crate::node_gyp::unpack_tarball(&malicious_bytes, &staging_dir);
+    assert!(res.is_err(), "unpack_tarball must reject archive with path traversal");
+
+    assert!(
+        !canary_file.exists(),
+        "Canary file must NOT be written outside staging directory"
+    );
+
+    // Direct traversal without package/ prefix
+    let malicious_direct = create_tarball_with_files(&[
+        ("../../escape2.txt", b"evil direct traversal"),
+    ]);
+    let canary2 = temp.path().join("escape2.txt");
+    let res2 = crate::node_gyp::unpack_tarball(&malicious_direct, &staging_dir);
+    assert!(res2.is_err(), "unpack_tarball must reject direct traversal");
+    assert!(!canary2.exists(), "Canary 2 must not exist");
+}
+
+#[test]
+fn test_node_gyp_bootstrap_multi_package_transitive_deps_end_to_end() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    let temp = tempfile::tempdir().unwrap();
+    let project_dir = temp.path().join("pkg");
+    let cache_dir = temp.path().join("cache");
+    std::fs::create_dir_all(&project_dir).unwrap();
+
+    let marker_file = project_dir.join("multi-dep-build.marker");
+    let marker_escaped = marker_file.to_string_lossy().replace('\\', "/");
+
+    // 1. Mock node-gyp depending on dep-a
+    let node_gyp_pkg_json = r#"{"name":"node-gyp","version":"10.0.0","bin":{"node-gyp":"bin/node-gyp.js"},"dependencies":{"dep-a":"^1.0.0"}}"#;
+    let node_gyp_bin_js = "const depA = require('dep-a'); depA.run();";
+    let node_gyp_tb = create_tarball_with_files(&[
+        ("package/package.json", node_gyp_pkg_json.as_bytes()),
+        ("package/bin/node-gyp.js", node_gyp_bin_js.as_bytes()),
+    ]);
+    let node_gyp_integrity = rnpm_core::Integrity::from_bytes(&node_gyp_tb, rnpm_core::Algorithm::Sha512).to_string();
+
+    // 2. Mock dep-a depending on @scope/dep-b
+    let dep_a_pkg_json = r#"{"name":"dep-a","version":"1.0.0","main":"index.js","dependencies":{"@scope/dep-b":"^1.0.0"}}"#;
+    let dep_a_index_js = "const depB = require('@scope/dep-b'); module.exports = { run: function() { depB.run(); } };";
+    let dep_a_tb = create_tarball_with_files(&[
+        ("package/package.json", dep_a_pkg_json.as_bytes()),
+        ("package/index.js", dep_a_index_js.as_bytes()),
+    ]);
+    let dep_a_integrity = rnpm_core::Integrity::from_bytes(&dep_a_tb, rnpm_core::Algorithm::Sha512).to_string();
+
+    // 3. Mock @scope/dep-b writing the marker
+    let dep_b_pkg_json = r#"{"name":"@scope/dep-b","version":"1.0.0","main":"index.js"}"#;
+    let dep_b_index_js = format!(
+        "const fs = require('fs'); module.exports = {{ run: function() {{ fs.writeFileSync('{}', 'multi-dep-success'); process.exit(0); }} }};",
+        marker_escaped
+    );
+    let dep_b_tb = create_tarball_with_files(&[
+        ("package/package.json", dep_b_pkg_json.as_bytes()),
+        ("package/index.js", dep_b_index_js.as_bytes()),
+    ]);
+    let dep_b_integrity = rnpm_core::Integrity::from_bytes(&dep_b_tb, rnpm_core::Algorithm::Sha512).to_string();
+
+    // Start mock HTTP registry server
+    let listener = TcpListener::bind("127.0.0.1:0").expect("Failed to bind mock registry listener");
+    listener.set_nonblocking(true).unwrap();
+    let port = listener.local_addr().unwrap().port();
+
+    let running = Arc::new(AtomicBool::new(true));
+    let r_clone = Arc::clone(&running);
+
+    let ng_tb_clone = node_gyp_tb.clone();
+    let ng_int_clone = node_gyp_integrity.clone();
+    let da_tb_clone = dep_a_tb.clone();
+    let da_int_clone = dep_a_integrity.clone();
+    let db_tb_clone = dep_b_tb.clone();
+    let db_int_clone = dep_b_integrity.clone();
+
+    let server_handle = std::thread::spawn(move || {
+        while r_clone.load(Ordering::Relaxed) {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    let mut buf = [0u8; 4096];
+                    let n = stream.read(&mut buf).unwrap_or(0);
+                    if n == 0 {
+                        continue;
+                    }
+                    let req = String::from_utf8_lossy(&buf[..n]);
+
+                    let (status, content_type, body_bytes) = if req.contains("GET /node-gyp") {
+                        let json = format!(
+                            r#"{{"name":"node-gyp","dist-tags":{{"latest":"10.0.0"}},"versions":{{"10.0.0":{{"name":"node-gyp","version":"10.0.0","dependencies":{{"dep-a":"^1.0.0"}},"dist":{{"tarball":"http://127.0.0.1:{}/tarballs/node-gyp.tgz","integrity":"{}"}}}}}}}}"#,
+                            port, ng_int_clone
+                        );
+                        ("200 OK", "application/json", json.into_bytes())
+                    } else if req.contains("GET /tarballs/node-gyp.tgz") {
+                        ("200 OK", "application/octet-stream", ng_tb_clone.clone())
+                    } else if req.contains("GET /dep-a") {
+                        let json = format!(
+                            r#"{{"name":"dep-a","dist-tags":{{"latest":"1.0.0"}},"versions":{{"1.0.0":{{"name":"dep-a","version":"1.0.0","dependencies":{{"@scope/dep-b":"^1.0.0"}},"dist":{{"tarball":"http://127.0.0.1:{}/tarballs/dep-a.tgz","integrity":"{}"}}}}}}}}"#,
+                            port, da_int_clone
+                        );
+                        ("200 OK", "application/json", json.into_bytes())
+                    } else if req.contains("GET /tarballs/dep-a.tgz") {
+                        ("200 OK", "application/octet-stream", da_tb_clone.clone())
+                    } else if req.contains("GET /@scope") {
+                        let json = format!(
+                            r#"{{"name":"@scope/dep-b","dist-tags":{{"latest":"1.0.0"}},"versions":{{"1.0.0":{{"name":"@scope/dep-b","version":"1.0.0","dist":{{"tarball":"http://127.0.0.1:{}/tarballs/dep-b.tgz","integrity":"{}"}}}}}}}}"#,
+                            port, db_int_clone
+                        );
+                        ("200 OK", "application/json", json.into_bytes())
+                    } else if req.contains("GET /tarballs/dep-b.tgz") {
+                        ("200 OK", "application/octet-stream", db_tb_clone.clone())
+                    } else {
+                        ("404 Not Found", "text/plain", b"Not found".to_vec())
+                    };
+
+                    let resp_header = format!(
+                        "HTTP/1.1 {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        status,
+                        content_type,
+                        body_bytes.len()
+                    );
+                    let _ = stream.write_all(resp_header.as_bytes());
+                    let _ = stream.write_all(&body_bytes);
+                    let _ = stream.flush();
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    std::fs::write(project_dir.join("binding.gyp"), "{}").unwrap();
+    std::fs::write(
+        project_dir.join("package.json"),
+        r#"{"name": "mock-multi-dep-pkg", "version": "1.0.0"}"#,
+    )
+    .unwrap();
+
+    let mut ctx = LifecycleContext::new(
+        &project_dir,
+        &project_dir,
+        "mock-multi-dep-pkg",
+        "install",
+        "node-gyp rebuild",
+    );
+    ctx.extra_env.insert(
+        "npm_config_cache".to_string(),
+        cache_dir.to_string_lossy().to_string(),
+    );
+    ctx.extra_env.insert(
+        "npm_config_registry".to_string(),
+        format!("http://127.0.0.1:{}/", port),
+    );
+    ctx.extra_env.insert(
+        "npm_config_node_gyp_fallback_npm".to_string(),
+        "false".to_string(),
+    );
+
+    let status = execute_lifecycle_script(&ctx)
+        .expect("Lifecycle script execution with multi-package dependencies must succeed");
+    assert!(status.success(), "Lifecycle script must exit successfully");
+
+    // Stop mock server
+    running.store(false, Ordering::Relaxed);
+    let _ = server_handle.join();
+
+    // Verify file structure
+    let current_dir = cache_dir.join("node-gyp").join("current");
+    assert!(current_dir.join("bin").join("node-gyp.js").is_file());
+    assert!(current_dir.join("node_modules").join("dep-a").join("index.js").is_file());
+    assert!(current_dir.join("node_modules").join("@scope").join("dep-b").join("index.js").is_file());
+
+    // Verify that the marker was written by real node executing node-gyp -> dep-a -> @scope/dep-b
+    assert!(
+        marker_file.is_file(),
+        "Transitive dependency @scope/dep-b must have executed and created marker file"
+    );
+    let content = std::fs::read_to_string(&marker_file).unwrap();
+    assert_eq!(content, "multi-dep-success");
+}
+
+#[test]
+fn test_node_gyp_staging_cleanup_on_failure() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    let temp = tempfile::tempdir().unwrap();
+    let cache_dir = temp.path().join("cache");
+    let project_dir = temp.path().join("pkg");
+    std::fs::create_dir_all(&project_dir).unwrap();
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("Failed to bind mock registry listener");
+    let port = listener.local_addr().unwrap().port();
+
+    let server_handle = std::thread::spawn(move || {
+        for mut stream in listener.incoming().flatten() {
+            let mut buf = [0u8; 4096];
+            let n = stream.read(&mut buf).unwrap_or(0);
+            let req = String::from_utf8_lossy(&buf[..n]);
+            if req.contains("GET /node-gyp") {
+                // Invalid SRI format in metadata
+                let body = format!(
+                    r#"{{"name":"node-gyp","dist-tags":{{"latest":"10.0.0"}},"versions":{{"10.0.0":{{"dist":{{"tarball":"http://127.0.0.1:{}/tarballs/node-gyp.tgz","integrity":"sha512-invalid@format!"}}}}}}}}"#,
+                    port
+                );
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(resp.as_bytes());
+                let _ = stream.flush();
+            } else if req.contains("GET /tarballs/node-gyp.tgz") {
+                let bytes = b"dummy tarball content";
+                let resp_head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    bytes.len()
+                );
+                let _ = stream.write_all(resp_head.as_bytes());
+                let _ = stream.write_all(bytes);
+                let _ = stream.flush();
+                break;
+            }
+        }
+    });
+
+    let mut config = rnpm_config::Config::default();
+    config.npmrc.settings.insert("cache".to_string(), cache_dir.to_string_lossy().to_string());
+    config.npmrc.settings.insert("registry".to_string(), format!("http://127.0.0.1:{}/", port));
+    config.npmrc.settings.insert("node-gyp-fallback-npm".to_string(), "false".to_string());
+
+    let res = crate::node_gyp::bootstrap_node_gyp(&project_dir, &config);
+    assert!(res.is_err(), "bootstrap_node_gyp must fail on invalid integrity");
+
+    // Live cache directory must NOT exist
+    assert!(!cache_dir.join("node-gyp").join("current").exists());
+
+    // Verify all .tmp-* directories are cleaned up
+    let node_gyp_dir = cache_dir.join("node-gyp");
+    if node_gyp_dir.exists() {
+        for entry in std::fs::read_dir(&node_gyp_dir).unwrap().flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            assert!(!name.starts_with(".tmp-"), "Leftover staging dir found: {name}");
+        }
+    }
+
+    let _ = server_handle.join();
+}
+
+#[test]
+fn test_node_gyp_shasum_fallback_behavior() {
+    let payload = b"hello node-gyp integrity verification payload";
+    let sha512_sri = rnpm_core::Integrity::from_bytes(payload, rnpm_core::Algorithm::Sha512).to_string();
+    let sha256_sri = rnpm_core::Integrity::from_bytes(payload, rnpm_core::Algorithm::Sha256).to_string();
+    let sha1_sri = rnpm_core::Integrity::from_bytes(payload, rnpm_core::Algorithm::Sha1).to_string();
+
+    let sha1_digest = rnpm_core::Algorithm::Sha1.compute_digest(payload);
+    let sha1_hex: String = sha1_digest.iter().map(|b| format!("{:02x}", b)).collect();
+
+    // 1. Valid SRI verification
+    assert!(crate::node_gyp::verify_tarball_integrity(payload, Some(&sha512_sri), None).is_ok());
+    assert!(crate::node_gyp::verify_tarball_integrity(payload, Some(&sha256_sri), None).is_ok());
+    assert!(crate::node_gyp::verify_tarball_integrity(payload, Some(&sha1_sri), None).is_ok());
+
+    // 2. Mismatching SRI verification
+    let different_payload = b"different data";
+    assert!(crate::node_gyp::verify_tarball_integrity(different_payload, Some(&sha512_sri), None).is_err());
+
+    // 3. Fallback to dist.shasum ONLY when integrity is absent
+    assert!(crate::node_gyp::verify_tarball_integrity(payload, None, Some(&sha1_hex)).is_ok());
+    assert!(crate::node_gyp::verify_tarball_integrity(different_payload, None, Some(&sha1_hex)).is_err());
+
+    // 4. When integrity is present but invalid SRI format, MUST FAIL and not fall back to shasum
+    assert!(
+        crate::node_gyp::verify_tarball_integrity(payload, Some("invalid-sri-format"), Some(&sha1_hex)).is_err(),
+        "Must fail when integrity is invalid SRI even if shasum matches"
+    );
+
+    // 5. When both are absent, MUST FAIL
+    assert!(crate::node_gyp::verify_tarball_integrity(payload, None, None).is_err());
 }

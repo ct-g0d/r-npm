@@ -1,6 +1,58 @@
 use crate::error::LifecycleError;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{debug, info, warn};
+
+static STAGING_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+/// RAII guard to clean up a staging directory if not committed.
+pub struct StagingGuard {
+    path: PathBuf,
+    committed: bool,
+}
+
+impl StagingGuard {
+    pub fn new(path: PathBuf) -> Self {
+        Self {
+            path,
+            committed: false,
+        }
+    }
+
+    pub fn commit(mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for StagingGuard {
+    fn drop(&mut self) {
+        if !self.committed && self.path.exists() {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+}
+
+/// Opportunistically removes old abandoned `.tmp-*` staging directories from prior failed/killed runs.
+fn cleanup_stale_staging(node_gyp_dir: &Path) {
+    if let Ok(entries) = std::fs::read_dir(node_gyp_dir) {
+        for entry in entries.flatten() {
+            let file_name = entry.file_name();
+            let name_str = file_name.to_string_lossy();
+            if name_str.starts_with(".tmp-") {
+                if let Ok(meta) = entry.metadata() {
+                    if let Ok(modified) = meta.modified() {
+                        if let Ok(elapsed) = modified.elapsed() {
+                            if elapsed.as_secs() > 1800 {
+                                let _ = std::fs::remove_dir_all(entry.path());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
 
 /// Locates the cache directory to use for rnpm standalone tools (like node-gyp).
 pub fn find_cache_dir(_project_root: &Path, config: &rnpm_config::Config) -> PathBuf {
@@ -256,29 +308,50 @@ pub fn ensure_node_gyp(
     })
 }
 
-/// Downloads and unpacks node-gyp from the configured npm registry into `<cache_dir>/node-gyp/current/`.
+/// Downloads and unpacks node-gyp and its full production dependency tree from the configured
+/// npm registry into `<cache_dir>/node-gyp/current/` via atomic staging and verification.
 pub fn bootstrap_node_gyp(
     project_root: &Path,
     config: &rnpm_config::Config,
 ) -> anyhow::Result<PathBuf> {
     let cache_dir = find_cache_dir(project_root, config);
-    let target_dir = cache_dir.join("node-gyp").join("current");
+    let node_gyp_dir = cache_dir.join("node-gyp");
+    let target_dir = node_gyp_dir.join("current");
     let registry = find_registry(config);
+
+    std::fs::create_dir_all(&node_gyp_dir)?;
+    cleanup_stale_staging(&node_gyp_dir);
+
+    // Create unique temporary staging directory inside <rnpm_cache>/node-gyp/.tmp-<pid>-<rand>
+    let pid = std::process::id();
+    let counter = STAGING_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let staging_dir = node_gyp_dir.join(format!(".tmp-{pid}-{nanos}-{counter}"));
+    std::fs::create_dir_all(&staging_dir)?;
+
+    let guard = StagingGuard::new(staging_dir.clone());
 
     // Run async network operations on a dedicated thread with a fresh single-thread runtime
     // to guarantee no nested block_on conflicts with existing tokio runtimes.
-    let target_clone = target_dir.clone();
+    let staging_clone = staging_dir.clone();
     let reg_clone = registry.clone();
     std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()?;
         rt.block_on(async move {
-            download_and_unpack_node_gyp(&reg_clone, &target_clone).await
+            download_and_unpack_node_gyp(&reg_clone, &staging_clone).await
         })
     })
     .join()
     .map_err(|_| anyhow::anyhow!("Worker thread panicked during node-gyp bootstrap"))??;
+
+    // Atomically publish into the final target location only after full verification & install succeed
+    rnpm_fs::replace_dir_with_retries(&staging_dir, &target_dir, 30)?;
+    guard.commit();
 
     let candidate1 = target_dir.join("bin").join("node-gyp.js");
     if candidate1.is_file() {
@@ -292,115 +365,412 @@ pub fn bootstrap_node_gyp(
     Ok(candidate1)
 }
 
-async fn download_and_unpack_node_gyp(registry: &str, target_dir: &Path) -> anyhow::Result<()> {
+/// Downloads, integrity-verifies, and unpacks `node-gyp` and its transitive production dependencies
+/// into `staging_dir`.
+pub async fn download_and_unpack_node_gyp(registry: &str, staging_dir: &Path) -> anyhow::Result<()> {
     let mut builder = reqwest::Client::builder();
     if registry.contains("127.0.0.1") || registry.contains("localhost") {
         builder = builder.no_proxy();
     }
     let client = builder.build()?;
-    let reg_trimmed = registry.trim_end_matches('/');
 
-    // 1. Fetch metadata or tarball from registry
-    let node_gyp_url = format!("{reg_trimmed}/node-gyp");
-    let mut resp = client.get(&node_gyp_url).send().await?;
-    if !resp.status().is_success() {
-        // Try /latest endpoint
-        let latest_url = format!("{reg_trimmed}/node-gyp/latest");
-        let latest_resp = client.get(&latest_url).send().await?;
-        if latest_resp.status().is_success() {
-            resp = latest_resp;
-        } else {
-            anyhow::bail!(
-                "Failed to fetch node-gyp from registry at '{}': HTTP {}",
-                node_gyp_url,
-                resp.status()
-            );
+    // 1. Fetch metadata for node-gyp
+    let packument = fetch_packument(&client, registry, "node-gyp").await?;
+
+    let (chosen_version, version_obj) = if let Some(versions) = packument.get("versions").and_then(|v| v.as_object()) {
+        pick_matching_version(versions, packument.get("dist-tags"), "latest")
+            .ok_or_else(|| anyhow::anyhow!("No version found for node-gyp in registry metadata"))?
+    } else if packument.get("dist").is_some() {
+        let v = packument.get("version").and_then(|v| v.as_str()).unwrap_or("latest");
+        (v, &packument)
+    } else {
+        anyhow::bail!("Invalid node-gyp registry metadata: missing versions and dist");
+    };
+
+    let dist = version_obj.get("dist")
+        .ok_or_else(|| anyhow::anyhow!("Missing dist object for node-gyp@{}", chosen_version))?;
+    let tarball_url = dist.get("tarball").and_then(|t| t.as_str())
+        .ok_or_else(|| anyhow::anyhow!("Missing dist.tarball for node-gyp@{}", chosen_version))?;
+    let full_tb_url = resolve_url(registry, tarball_url);
+    let integrity_opt = dist.get("integrity").and_then(|i| i.as_str());
+    let shasum_opt = dist.get("shasum").and_then(|s| s.as_str());
+
+    info!("Downloading node-gyp@{} tarball from '{}'...", chosen_version, full_tb_url);
+    let tb_resp = client.get(&full_tb_url).send().await?;
+    if !tb_resp.status().is_success() {
+        anyhow::bail!("Failed to download node-gyp tarball from '{}': HTTP {}", full_tb_url, tb_resp.status());
+    }
+    let tb_bytes = tb_resp.bytes().await?.to_vec();
+
+    // 2. Verify integrity
+    verify_tarball_integrity(&tb_bytes, integrity_opt, shasum_opt)
+        .map_err(|e| anyhow::anyhow!("node-gyp tarball integrity check failed: {e}"))?;
+
+    // 3. Unpack into staging directory
+    unpack_tarball(&tb_bytes, staging_dir)
+        .map_err(|e| anyhow::anyhow!("Failed to unpack node-gyp tarball: {e}"))?;
+
+    // 4. Resolve and install full production dependency tree into staging/node_modules
+    let mut root_deps = Vec::new();
+    if let Some(deps) = version_obj.get("dependencies").and_then(|d| d.as_object()) {
+        for (k, v) in deps {
+            root_deps.push((k.clone(), v.as_str().unwrap_or("*").to_string()));
+        }
+    } else {
+        let pkg_json = staging_dir.join("package.json");
+        if let Ok(content) = std::fs::read_to_string(&pkg_json) {
+            if let Ok(val) = serde_json::from_str::<serde_json::Value>(&content) {
+                if let Some(deps) = val.get("dependencies").and_then(|d| d.as_object()) {
+                    for (k, v) in deps {
+                        root_deps.push((k.clone(), v.as_str().unwrap_or("*").to_string()));
+                    }
+                }
+            }
         }
     }
 
-    let initial_bytes = resp.bytes().await?;
+    if !root_deps.is_empty() {
+        info!("Installing {} production dependencies for standalone node-gyp...", root_deps.len());
+        install_production_dependencies(&client, registry, staging_dir, root_deps).await?;
+    }
 
-    let tarball_bytes = if initial_bytes.starts_with(&[0x1f, 0x8b]) {
-        // Mock registry or endpoint returned tarball directly
-        initial_bytes.to_vec()
-    } else {
-        // Parsed JSON metadata (packument or version document)
-        let json: serde_json::Value = serde_json::from_slice(&initial_bytes)
-            .map_err(|e| anyhow::anyhow!("Failed to parse node-gyp registry response as JSON: {e}"))?;
+    let c1 = staging_dir.join("bin").join("node-gyp.js");
+    let c2 = staging_dir.join("node-gyp.js");
+    if !c1.is_file() && !c2.is_file() {
+        anyhow::bail!("Unpacked node-gyp archive does not contain bin/node-gyp.js or node-gyp.js");
+    }
 
-        let tarball_url = if let Some(tb) = json.get("dist").and_then(|d| d.get("tarball")).and_then(|t| t.as_str()) {
-            tb.to_string()
-        } else if let Some(latest) = json.get("dist-tags").and_then(|d| d.get("latest")).and_then(|l| l.as_str()) {
-            json.get("versions")
-                .and_then(|v| v.get(latest))
-                .and_then(|m| m.get("dist"))
-                .and_then(|d| d.get("tarball"))
-                .and_then(|t| t.as_str())
-                .map(|s| s.to_string())
-                .unwrap_or_else(|| format!("{reg_trimmed}/node-gyp/-/node-gyp-{latest}.tgz"))
-        } else if let Some(versions) = json.get("versions").and_then(|v| v.as_object()) {
-            versions
-                .values()
-                .next_back()
-                .and_then(|m| m.get("dist"))
-                .and_then(|d| d.get("tarball"))
-                .and_then(|t| t.as_str())
-                .map(|s| s.to_string())
-                .unwrap_or_else(|| format!("{reg_trimmed}/node-gyp/-/node-gyp.tgz"))
+    Ok(())
+}
+
+/// Recursively / transitively resolves and installs production dependencies into `staging_dir/node_modules`.
+async fn install_production_dependencies(
+    client: &reqwest::Client,
+    registry: &str,
+    staging_dir: &Path,
+    root_deps: Vec<(String, String)>,
+) -> anyhow::Result<()> {
+    struct DepJob {
+        name: String,
+        spec: String,
+        parent_dir: PathBuf,
+    }
+
+    let mut queue: std::collections::VecDeque<DepJob> = std::collections::VecDeque::new();
+    for (name, spec) in root_deps {
+        queue.push_back(DepJob {
+            name,
+            spec,
+            parent_dir: staging_dir.to_path_buf(),
+        });
+    }
+
+    let mut packument_cache: std::collections::HashMap<String, serde_json::Value> = std::collections::HashMap::new();
+    let mut installed_packages: std::collections::HashSet<(PathBuf, String)> = std::collections::HashSet::new();
+
+    while let Some(job) = queue.pop_front() {
+        let top_nm = staging_dir.join("node_modules");
+        let top_target = package_dir_in_node_modules(&top_nm, &job.name);
+
+        let target_dir = if top_target.exists() {
+            let installed_ver = get_installed_version(&top_target);
+            if let Some(ref v) = installed_ver {
+                if version_matches_spec(v, &job.spec) {
+                    debug!("Dependency '{}@{}' already satisfied at {}", job.name, v, top_target.display());
+                    continue;
+                }
+            }
+            // Version conflict at top level! Install nested in <job.parent_dir>/node_modules/<job.name>
+            let nested_nm = job.parent_dir.join("node_modules");
+            let nested_target = package_dir_in_node_modules(&nested_nm, &job.name);
+            if nested_target.exists() {
+                let nested_ver = get_installed_version(&nested_target);
+                if let Some(ref v) = nested_ver {
+                    if version_matches_spec(v, &job.spec) {
+                        continue;
+                    }
+                }
+            }
+            nested_target
         } else {
-            format!("{reg_trimmed}/node-gyp/-/node-gyp.tgz")
+            top_target
         };
 
-        info!("Downloading node-gyp tarball from '{}'...", tarball_url);
-        let tb_resp = client.get(&tarball_url).send().await?;
+        let key = (target_dir.clone(), job.spec.clone());
+        if installed_packages.contains(&key) {
+            continue;
+        }
+        installed_packages.insert(key);
+
+        let packument = if let Some(cached) = packument_cache.get(&job.name) {
+            cached.clone()
+        } else {
+            let fetched = fetch_packument(client, registry, &job.name).await?;
+            packument_cache.insert(job.name.clone(), fetched.clone());
+            fetched
+        };
+
+        let (chosen_version, version_obj) = if let Some(versions) = packument.get("versions").and_then(|v| v.as_object()) {
+            pick_matching_version(versions, packument.get("dist-tags"), &job.spec)
+                .ok_or_else(|| anyhow::anyhow!("No matching version found for dependency '{}' satisfying '{}'", job.name, job.spec))?
+        } else if packument.get("dist").is_some() {
+            let v = packument.get("version").and_then(|v| v.as_str()).unwrap_or("0.0.0");
+            (v, &packument)
+        } else {
+            anyhow::bail!("Invalid packument format for '{}'", job.name);
+        };
+
+        let dist = version_obj.get("dist")
+            .ok_or_else(|| anyhow::anyhow!("Missing dist object for '{}@{}'", job.name, chosen_version))?;
+        let tarball_url = dist.get("tarball").and_then(|t| t.as_str())
+            .ok_or_else(|| anyhow::anyhow!("Missing dist.tarball for '{}@{}'", job.name, chosen_version))?;
+        let full_tb_url = resolve_url(registry, tarball_url);
+        let integrity_opt = dist.get("integrity").and_then(|i| i.as_str());
+        let shasum_opt = dist.get("shasum").and_then(|s| s.as_str());
+
+        debug!("Downloading dependency '{}@{}' from '{}'...", job.name, chosen_version, full_tb_url);
+        let tb_resp = client.get(&full_tb_url).send().await?;
         if !tb_resp.status().is_success() {
             anyhow::bail!(
-                "Failed to download node-gyp tarball from '{}': HTTP {}",
-                tarball_url,
+                "Failed to download tarball for '{}@{}' from '{}': HTTP {}",
+                job.name,
+                chosen_version,
+                full_tb_url,
                 tb_resp.status()
             );
         }
-        tb_resp.bytes().await?.to_vec()
-    };
+        let tb_bytes = tb_resp.bytes().await?.to_vec();
 
-    // 2. Unpack tarball into target directory
-    unpack_tarball(&tarball_bytes, target_dir)
-}
+        verify_tarball_integrity(&tb_bytes, integrity_opt, shasum_opt)
+            .map_err(|e| anyhow::anyhow!("Integrity check failed for dependency '{}@{}': {e}", job.name, chosen_version))?;
 
-/// Unpacks a gzipped tarball into the specified target directory, stripping the `package/` prefix.
-pub fn unpack_tarball(tarball_bytes: &[u8], target_dir: &Path) -> anyhow::Result<()> {
-    std::fs::create_dir_all(target_dir)?;
-    let gz = flate2::read::GzDecoder::new(tarball_bytes);
-    let mut archive = tar::Archive::new(gz);
+        unpack_tarball(&tb_bytes, &target_dir)
+            .map_err(|e| anyhow::anyhow!("Failed to unpack dependency '{}@{}': {e}", job.name, chosen_version))?;
 
-    for entry in archive.entries()? {
-        let mut entry = entry?;
-        let path = entry.path()?.to_path_buf();
-        let relative = if let Ok(stripped) = path.strip_prefix("package") {
-            stripped.to_path_buf()
+        let mut child_deps = Vec::new();
+        if let Some(deps) = version_obj.get("dependencies").and_then(|d| d.as_object()) {
+            for (k, v) in deps {
+                child_deps.push((k.clone(), v.as_str().unwrap_or("*").to_string()));
+            }
         } else {
-            path
-        };
-
-        if relative.as_os_str().is_empty() {
-            continue;
+            let pkg_json = target_dir.join("package.json");
+            if let Ok(content) = std::fs::read_to_string(&pkg_json) {
+                if let Ok(val) = serde_json::from_str::<serde_json::Value>(&content) {
+                    if let Some(deps) = val.get("dependencies").and_then(|d| d.as_object()) {
+                        for (k, v) in deps {
+                            child_deps.push((k.clone(), v.as_str().unwrap_or("*").to_string()));
+                        }
+                    }
+                }
+            }
         }
 
-        let out_path = target_dir.join(&relative);
-        if entry.header().entry_type().is_dir() {
-            std::fs::create_dir_all(&out_path)?;
-        } else {
-            if let Some(parent) = out_path.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            entry.unpack(&out_path)?;
+        for (child_name, child_spec) in child_deps {
+            queue.push_back(DepJob {
+                name: child_name,
+                spec: child_spec,
+                parent_dir: target_dir.clone(),
+            });
+        }
+    }
 
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let rel_str = relative.to_string_lossy().replace('\\', "/");
-                if rel_str.starts_with("bin/") || rel_str == "bin" {
-                    let _ = std::fs::set_permissions(&out_path, std::fs::Permissions::from_mode(0o755));
+    Ok(())
+}
+
+async fn fetch_packument(
+    client: &reqwest::Client,
+    registry: &str,
+    pkg_name: &str,
+) -> anyhow::Result<serde_json::Value> {
+    let reg_trimmed = registry.trim_end_matches('/');
+    let encoded = rnpm_config::encode_package_name(pkg_name);
+    let primary_url = format!("{reg_trimmed}/{encoded}");
+
+    let mut resp = client.get(&primary_url).send().await?;
+    if !resp.status().is_success() && pkg_name.contains('/') {
+        let fallback_url = format!("{reg_trimmed}/{pkg_name}");
+        if let Ok(fallback_resp) = client.get(&fallback_url).send().await {
+            if fallback_resp.status().is_success() {
+                resp = fallback_resp;
+            }
+        }
+    }
+    if !resp.status().is_success() {
+        let latest_url = format!("{reg_trimmed}/{encoded}/latest");
+        if let Ok(latest_resp) = client.get(&latest_url).send().await {
+            if latest_resp.status().is_success() {
+                resp = latest_resp;
+            }
+        }
+    }
+    if !resp.status().is_success() {
+        anyhow::bail!(
+            "Failed to fetch metadata for '{}' from registry '{}': HTTP {}",
+            pkg_name,
+            registry,
+            resp.status()
+        );
+    }
+    let bytes = resp.bytes().await?;
+    let json: serde_json::Value = serde_json::from_slice(&bytes)
+        .map_err(|e| anyhow::anyhow!("Failed to parse metadata JSON for '{}': {}", pkg_name, e))?;
+    Ok(json)
+}
+
+fn pick_matching_version<'a>(
+    versions: &'a serde_json::Map<String, serde_json::Value>,
+    dist_tags: Option<&serde_json::Value>,
+    spec: &str,
+) -> Option<(&'a str, &'a serde_json::Value)> {
+    let spec = spec.trim();
+    if let Some(tag_ver) = dist_tags.and_then(|dt| dt.get(spec)).and_then(|v| v.as_str()) {
+        if let Some((k, v)) = versions.get_key_value(tag_ver) {
+            return Some((k.as_str(), v));
+        }
+    }
+
+    let mut candidates: Vec<(rnpm_core::Version, &'a str, &'a serde_json::Value)> = Vec::new();
+    for (v_str, v_val) in versions {
+        if let Ok(ver) = rnpm_core::Version::parse(v_str) {
+            candidates.push((ver, v_str.as_str(), v_val));
+        }
+    }
+    candidates.sort_by(|a, b| a.0.cmp(&b.0));
+
+    if spec.is_empty() || spec == "*" || spec == "latest" {
+        if let Some(latest_ver) = dist_tags.and_then(|dt| dt.get("latest")).and_then(|v| v.as_str()) {
+            if let Some((k, v)) = versions.get_key_value(latest_ver) {
+                return Some((k.as_str(), v));
+            }
+        }
+        return candidates.last().map(|(_, s, v)| (*s, *v));
+    }
+
+    if let Ok(range) = rnpm_core::Range::parse(spec) {
+        for (ver, s, v) in candidates.iter().rev() {
+            if range.satisfies(ver) {
+                return Some((*s, *v));
+            }
+        }
+    }
+
+    if let Some((k, v)) = versions.get_key_value(spec) {
+        return Some((k.as_str(), v));
+    }
+
+    if let Some(latest_ver) = dist_tags.and_then(|dt| dt.get("latest")).and_then(|v| v.as_str()) {
+        if let Some((k, v)) = versions.get_key_value(latest_ver) {
+            return Some((k.as_str(), v));
+        }
+    }
+
+    candidates.last().map(|(_, s, v)| (*s, *v))
+}
+
+fn version_matches_spec(version_str: &str, spec: &str) -> bool {
+    let spec = spec.trim();
+    if spec.is_empty() || spec == "*" || spec == "latest" {
+        return true;
+    }
+    let version = match rnpm_core::Version::parse(version_str) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    if let Ok(range) = rnpm_core::Range::parse(spec) {
+        range.satisfies(&version)
+    } else {
+        version_str == spec
+    }
+}
+
+fn get_installed_version(package_dir: &Path) -> Option<String> {
+    let pkg_json = package_dir.join("package.json");
+    if let Ok(content) = std::fs::read_to_string(pkg_json) {
+        if let Ok(val) = serde_json::from_str::<serde_json::Value>(&content) {
+            return val.get("version").and_then(|v| v.as_str()).map(|s| s.to_string());
+        }
+    }
+    None
+}
+
+fn package_dir_in_node_modules(node_modules_dir: &Path, pkg_name: &str) -> PathBuf {
+    let mut p = node_modules_dir.to_path_buf();
+    for comp in pkg_name.split('/') {
+        let trimmed = comp.trim();
+        if !trimmed.is_empty() {
+            p.push(trimmed);
+        }
+    }
+    p
+}
+
+fn resolve_url(base: &str, target: &str) -> String {
+    if target.starts_with("http://") || target.starts_with("https://") {
+        target.to_string()
+    } else {
+        let base_trimmed = base.trim_end_matches('/');
+        let target_trimmed = target.trim_start_matches('/');
+        format!("{base_trimmed}/{target_trimmed}")
+    }
+}
+
+/// Verifies package tarball integrity against SRI string (`dist.integrity`) or SHA-1 hex (`dist.shasum`).
+/// Falls back to `dist.shasum` ONLY when `integrity` is absent. Fails if neither matches or if `dist.integrity` is missing/invalid.
+pub fn verify_tarball_integrity(
+    tarball_bytes: &[u8],
+    integrity_opt: Option<&str>,
+    shasum_opt: Option<&str>,
+) -> anyhow::Result<()> {
+    if let Some(sri) = integrity_opt.map(str::trim).filter(|s| !s.is_empty()) {
+        let parsed = rnpm_core::Integrity::parse(sri)
+            .map_err(|e| anyhow::anyhow!("Invalid dist.integrity '{}': {}", sri, e))?;
+        parsed
+            .verify(tarball_bytes)
+            .map_err(|e| anyhow::anyhow!("Tarball integrity mismatch for '{}': {}", sri, e))?;
+        return Ok(());
+    }
+
+    if let Some(shasum) = shasum_opt.map(str::trim).filter(|s| !s.is_empty()) {
+        let expected_hex = shasum.to_ascii_lowercase();
+        if expected_hex.len() != 40 || !expected_hex.chars().all(|c| c.is_ascii_hexdigit()) {
+            anyhow::bail!(
+                "Invalid dist.shasum '{}': expected 40-character hex string",
+                shasum
+            );
+        }
+        let actual_digest = rnpm_core::Algorithm::Sha1.compute_digest(tarball_bytes);
+        let actual_hex: String = actual_digest.iter().map(|b| format!("{:02x}", b)).collect();
+        if actual_hex != expected_hex {
+            anyhow::bail!(
+                "Tarball shasum mismatch: expected {}, got {}",
+                expected_hex,
+                actual_hex
+            );
+        }
+        return Ok(());
+    }
+
+    anyhow::bail!("Package metadata missing both dist.integrity and dist.shasum; verification required");
+}
+
+/// Unpacks a gzipped tarball into the specified target directory with strict path containment,
+/// rejecting directory traversal, absolute paths, Windows drive prefixes, and escaping symlinks/hardlinks.
+pub fn unpack_tarball(tarball_bytes: &[u8], target_dir: &Path) -> anyhow::Result<()> {
+    rnpm_fs::extract_tar_gz(std::io::Cursor::new(tarball_bytes), target_dir, None)
+        .map_err(|e| anyhow::anyhow!("Tarball extraction failed: {e}"))?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let bin_dir = target_dir.join("bin");
+        if bin_dir.is_dir() {
+            if let Ok(entries) = std::fs::read_dir(&bin_dir) {
+                for entry in entries.flatten() {
+                    if let Ok(meta) = entry.metadata() {
+                        let mut perms = meta.permissions();
+                        perms.set_mode(perms.mode() | 0o755);
+                        let _ = std::fs::set_permissions(entry.path(), perms);
+                    }
                 }
             }
         }

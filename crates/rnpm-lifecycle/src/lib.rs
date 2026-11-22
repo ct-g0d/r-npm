@@ -16,7 +16,7 @@ pub mod sandbox;
 pub use error::LifecycleError;
 pub use node_gyp::{
     bootstrap_node_gyp, ensure_node_gyp, find_cache_dir, find_node_gyp, find_registry,
-    is_offline_mode, node_gyp_bin_dir, unpack_tarball,
+    is_offline_mode, node_gyp_bin_dir, unpack_tarball, verify_tarball_integrity, StagingGuard,
 };
 pub use policy::{SandboxLevel, ScriptSandboxPolicy};
 pub use sandbox::{check_dangerous_command_patterns, CommandPatternAnalyzer};

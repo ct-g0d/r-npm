@@ -1235,6 +1235,7 @@ dependencies = [
  "reqwest",
  "rnpm-config",
  "rnpm-core",
+ "rnpm-fs",
  "serde_json",
  "tar",
  "tempfile",
