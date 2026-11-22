@@ -6456,3 +6456,51 @@ fn required_peer_provider_cannot_move_beneath_its_owner() {
         resolve_dependency_graph(&manifest, &provider, &ResolverOptions::default()).unwrap_err();
     assert!(matches!(error, crate::SolverError::PeerConflict { .. }));
 }
+
+#[test]
+fn test_prefer_dedupe_prefers_already_placed_compatible_version() {
+    let mut provider = InMemoryPackageProvider::new();
+    provider.add_version("shared", "1.0.0", |_| {});
+    provider.add_version("shared", "1.1.0", |_| {});
+    provider.add_version("shared", "2.0.0", |_| {});
+    provider.add_version("pkg-a", "1.0.0", |v| {
+        v.dependencies.insert("shared".into(), "1.0.0".into());
+    });
+    provider.add_version("pkg-b", "1.0.0", |v| {
+        v.dependencies.insert("shared".into(), "^1.0.0".into());
+    });
+
+    let mut manifest = Manifest::default();
+    manifest.dependencies.insert("shared".into(), "2.0.0".into());
+    manifest.dependencies.insert("pkg-a".into(), "1.0.0".into());
+    manifest.dependencies.insert("pkg-b".into(), "1.0.0".into());
+
+    // 1. Without prefer_dedupe (default: false), pkg-b selects shared@1.1.0 (latest in ^1.0.0 range)
+    let default_opts = ResolverOptions::default();
+    let default_graph = resolve_dependency_graph(&manifest, &provider, &default_opts).unwrap();
+    assert_eq!(default_graph.nodes["node_modules/shared"].version, "2.0.0");
+    assert_eq!(
+        default_graph.nodes["node_modules/pkg-a/node_modules/shared"].version,
+        "1.0.0"
+    );
+    assert_eq!(
+        default_graph.nodes["node_modules/pkg-b/node_modules/shared"].version,
+        "1.1.0"
+    );
+
+    // 2. With prefer_dedupe: true, pkg-b selects already-placed shared@1.0.0 instead of 1.1.0
+    let dedupe_opts = ResolverOptions {
+        prefer_dedupe: true,
+        ..Default::default()
+    };
+    let dedupe_graph = resolve_dependency_graph(&manifest, &provider, &dedupe_opts).unwrap();
+    assert_eq!(dedupe_graph.nodes["node_modules/shared"].version, "2.0.0");
+    assert_eq!(
+        dedupe_graph.nodes["node_modules/pkg-a/node_modules/shared"].version,
+        "1.0.0"
+    );
+    assert_eq!(
+        dedupe_graph.nodes["node_modules/pkg-b/node_modules/shared"].version,
+        "1.0.0"
+    );
+}

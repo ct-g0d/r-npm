@@ -39,6 +39,8 @@ pub struct ResolverOptions {
     pub force: bool,
     /// npm's `install-strategy` for PlaceDep's target walk.
     pub install_strategy: crate::hoisting::PlacementStrategy,
+    /// When true, prefer an already-placed/deduplicatable compatible version in the tree over a newer version when resolving a range.
+    pub prefer_dedupe: bool,
 }
 
 impl Default for ResolverOptions {
@@ -55,6 +57,7 @@ impl Default for ResolverOptions {
             vulnerability_constraints: std::collections::HashMap::new(),
             force: false,
             install_strategy: crate::hoisting::PlacementStrategy::Hoisted,
+            prefer_dedupe: false,
         }
     }
 }
@@ -2520,6 +2523,91 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                         true
                     }
                 };
+
+                if self.options.prefer_dedupe {
+                    let mut scope_buf = String::new();
+                    if let Some(loc) = DependencyGraph::find_in_scope_hierarchy(
+                        &self.graph.nodes,
+                        parent_location,
+                        pkg_name,
+                        &mut scope_buf,
+                    ) {
+                        if let Some(existing_node) = self.graph.nodes.get(loc) {
+                            if existing_node.name == pkg_name {
+                                if let Ok(parsed) = Version::parse(&existing_node.version) {
+                                    if range.satisfies(&parsed)
+                                        && is_safe(&parsed)
+                                        && advisories.iter().all(|target| {
+                                            crate::hoisting::version_satisfies_target(
+                                                &existing_node.version,
+                                                target,
+                                            )
+                                        })
+                                    {
+                                        if let Some(v_meta) = meta.versions.get(&existing_node.version) {
+                                            if v_meta.deprecated.is_none() {
+                                                return Some(v_meta);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    let mut best_placed_undeprecated: Option<(&'b PackageVersionMetadata, Version)> =
+                        None;
+                    let mut best_placed: Option<(&'b PackageVersionMetadata, Version)> = None;
+
+                    for node in self.graph.nodes.values() {
+                        if node.name == pkg_name {
+                            if let Ok(parsed) = Version::parse(&node.version) {
+                                if range.satisfies(&parsed)
+                                    && is_safe(&parsed)
+                                    && advisories.iter().all(|target| {
+                                        crate::hoisting::version_satisfies_target(
+                                            &node.version,
+                                            target,
+                                        )
+                                    })
+                                {
+                                    if let Some(v_meta) = meta.versions.get(&node.version) {
+                                        if v_meta.deprecated.is_none() {
+                                            match &best_placed_undeprecated {
+                                                Some((_, best_v)) => {
+                                                    if &parsed > best_v {
+                                                        best_placed_undeprecated =
+                                                            Some((v_meta, parsed.clone()));
+                                                    }
+                                                }
+                                                None => {
+                                                    best_placed_undeprecated =
+                                                        Some((v_meta, parsed.clone()));
+                                                }
+                                            }
+                                        }
+                                        match &best_placed {
+                                            Some((_, best_v)) => {
+                                                if &parsed > best_v {
+                                                    best_placed = Some((v_meta, parsed));
+                                                }
+                                            }
+                                            None => {
+                                                best_placed = Some((v_meta, parsed));
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    if let Some((v_meta, _)) = best_placed_undeprecated {
+                        return Some(v_meta);
+                    } else if let Some((v_meta, _)) = best_placed {
+                        return Some(v_meta);
+                    }
+                }
 
                 // npm resolves registry ranges through the `latest` dist-tag
                 // when that tagged version satisfies the requested range. This

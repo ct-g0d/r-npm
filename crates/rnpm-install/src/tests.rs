@@ -5475,3 +5475,32 @@ async fn test_no_bin_links_ci() {
         "CI with bin_links=false must create 0 files in node_modules/.bin"
     );
 }
+
+#[test]
+fn test_prefer_dedupe_config_wiring() {
+    let tmp = tempdir().unwrap();
+    let root = tmp.path().join("project");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(
+        root.join("package.json"),
+        r#"{"name":"test-prefer-dedupe","version":"1.0.0"}"#,
+    )
+    .unwrap();
+
+    // Default: prefer-dedupe is false
+    let options = InstallOptions {
+        project_dir: root.clone(),
+        ..Default::default()
+    };
+    let installer = Installer::new(options).unwrap();
+    assert!(!installer.options.prefer_dedupe);
+
+    // With prefer-dedupe = true in .npmrc
+    fs::write(root.join(".npmrc"), "prefer-dedupe=true\n").unwrap();
+    let options2 = InstallOptions {
+        project_dir: root.clone(),
+        ..Default::default()
+    };
+    let installer2 = Installer::new(options2).unwrap();
+    assert!(installer2.options.prefer_dedupe);
+}

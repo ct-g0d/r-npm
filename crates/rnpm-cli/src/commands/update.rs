@@ -17,6 +17,9 @@ pub(crate) struct UpdateOptions {
     pub json: bool,
     pub no_bin_links: bool,
     pub bin_links: Option<bool>,
+    pub workspace_root: bool,
+    pub workspace: Vec<String>,
+    pub workspaces: bool,
 }
 
 pub(crate) async fn run(opts: UpdateOptions, current_dir: PathBuf) -> Result<()> {
@@ -64,6 +67,9 @@ pub(crate) async fn run(opts: UpdateOptions, current_dir: PathBuf) -> Result<()>
         silent: opts.silent,
         unlocked_packages,
         bin_links: bin_links_val,
+        workspace_root: opts.workspace_root,
+        workspace: opts.workspace,
+        workspaces: opts.workspaces,
         ..Default::default()
     };
 

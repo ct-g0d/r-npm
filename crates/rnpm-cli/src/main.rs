@@ -650,6 +650,18 @@ pub(crate) enum Commands {
         /// Toggle binary shim creation in node_modules/.bin
         #[arg(long = "bin-links", num_args = 0..=1, default_missing_value = "true")]
         bin_links: Option<bool>,
+
+        /// Run against workspace root in addition to specified workspaces
+        #[arg(long = "workspace-root", alias = "include-workspace-root")]
+        workspace_root: bool,
+
+        /// Specific workspace(s) to target
+        #[arg(long = "workspace", short = 'w')]
+        workspace: Vec<String>,
+
+        /// Run across all workspaces
+        #[arg(long = "workspaces")]
+        workspaces: bool,
     },
 
     /// Perform a security audit of dependency vulnerabilities
@@ -724,6 +736,18 @@ pub(crate) enum Commands {
         /// Output report in JSON format
         #[arg(long)]
         json: bool,
+
+        /// Run against workspace root in addition to specified workspaces
+        #[arg(long = "workspace-root", alias = "include-workspace-root")]
+        workspace_root: bool,
+
+        /// Specific workspace(s) to target
+        #[arg(long = "workspace", short = 'w')]
+        workspace: Vec<String>,
+
+        /// Run across all workspaces
+        #[arg(long = "workspaces")]
+        workspaces: bool,
     },
 
     /// Reduce duplication in node_modules and package-lock.json
@@ -5948,6 +5972,9 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             strict_sandbox,
             legacy_peer_deps,
             strict_peer_deps,
+            workspace_root,
+            workspace,
+            workspaces,
             json,
             no_bin_links,
             bin_links,
@@ -5967,6 +5994,9 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
                 json,
                 no_bin_links,
                 bin_links,
+                workspace_root,
+                workspace,
+                workspaces,
             };
             commands::update::run(opts, current_dir).await?;
         }
@@ -5975,6 +6005,9 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             include,
             production,
             dry_run,
+            workspace_root,
+            workspace,
+            workspaces,
             json,
         } => {
             let args = commands::prune::PruneCommandArgs {
@@ -5984,6 +6017,9 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
                 dry_run,
                 json,
                 silent,
+                workspace_root,
+                workspace,
+                workspaces,
             };
             commands::prune::run(args, current_dir).await?;
         }

@@ -1697,6 +1697,8 @@ pub struct InstallOptions {
     pub prefer_offline: bool,
     /// `--prefer-online`: revalidate every cached packument and tarball.
     pub prefer_online: bool,
+    /// `--prefer-dedupe`: prefer to deduplicate rather than get newest versions.
+    pub prefer_dedupe: bool,
     /// `--install-links`: pack and copy external `file:` directories.
     pub install_links: bool,
     pub force: bool,
@@ -1814,6 +1816,7 @@ impl Default for InstallOptions {
             offline: false,
             prefer_offline: false,
             prefer_online: false,
+            prefer_dedupe: false,
             install_links: false,
             force: false,
             ignore_scripts: false,
@@ -2389,6 +2392,7 @@ impl Installer {
         options.offline |= config.get_bool("offline").unwrap_or(false);
         options.prefer_offline |= config.get_bool("prefer-offline").unwrap_or(false);
         options.prefer_online |= config.get_bool("prefer-online").unwrap_or(false);
+        options.prefer_dedupe |= config.get_bool("prefer-dedupe").unwrap_or(false);
         options.install_links |= config.get_bool("install-links").unwrap_or(false);
 
         if options.install_strategy == InstallStrategy::Hoisted {
@@ -3491,6 +3495,7 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                     rnpm_solver::hoisting::PlacementStrategy::Hoisted
                 }
             },
+            prefer_dedupe: self.options.prefer_dedupe,
         };
 
         let mut graph = if !workspace_members.is_empty() {
