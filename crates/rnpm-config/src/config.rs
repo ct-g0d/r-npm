@@ -903,3 +903,202 @@ pub fn delete_config_value_from_file(path: &Path, key: &str) -> Result<bool, Con
 
     Ok(deleted)
 }
+
+/// Repairs legacy unscoped auth keys and deprecated config keys in .npmrc content.
+/// Returns the repaired content and a list of formatted summary messages.
+pub fn fix_npmrc_content(
+    content: &str,
+    where_name: &str,
+    nerfed_registry: &str,
+) -> (String, Vec<String>) {
+    // 1. Scan for unscoped username and _password to know if both or only one exist
+    let mut has_unscoped_username = false;
+    let mut has_unscoped_password = false;
+
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('#') || trimmed.starts_with(';') || trimmed.is_empty() {
+            continue;
+        }
+        let key = if let Some(idx) = trimmed.find('=') {
+            trimmed[..idx].trim()
+        } else {
+            trimmed
+        };
+        if key == "username" {
+            has_unscoped_username = true;
+        } else if key == "_password" {
+            has_unscoped_password = true;
+        }
+    }
+
+    let nerfed = if nerfed_registry.ends_with(':') {
+        nerfed_registry.to_string()
+    } else {
+        format!("{nerfed_registry}:")
+    };
+
+    let mut fixed_lines = Vec::new();
+    let mut summaries = Vec::new();
+
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('#') || trimmed.starts_with(';') || trimmed.is_empty() {
+            fixed_lines.push(line.to_string());
+            continue;
+        }
+
+        let (key, val, has_val) = if let Some(idx) = trimmed.find('=') {
+            (trimmed[..idx].trim(), trimmed[idx + 1..].trim(), true)
+        } else {
+            (trimmed, "", false)
+        };
+
+        // Check rules
+        if key == "_authtoken" || key == "-authtoken" {
+            summaries.push(format!("- `{key}` deleted from {where_name} config"));
+            continue;
+        }
+
+        if key == "_authToken" || key == "_auth" || key == "email" {
+            let new_key = format!("{nerfed}{key}");
+            let new_line = if has_val {
+                format!("{new_key}={val}")
+            } else {
+                new_key.clone()
+            };
+            fixed_lines.push(new_line);
+            summaries.push(format!("~ `{key}` renamed to `{new_key}` in {where_name} config"));
+            continue;
+        }
+
+        if key == "username" {
+            if has_unscoped_password {
+                let new_key = format!("{nerfed}username");
+                let new_line = if has_val {
+                    format!("{new_key}={val}")
+                } else {
+                    new_key.clone()
+                };
+                fixed_lines.push(new_line);
+                summaries.push(format!("~ `username` renamed to `{new_key}` in {where_name} config"));
+            } else {
+                summaries.push(format!("- `username` deleted from {where_name} config"));
+            }
+            continue;
+        }
+
+        if key == "_password" {
+            if has_unscoped_username {
+                let new_key = format!("{nerfed}_password");
+                let new_line = if has_val {
+                    format!("{new_key}={val}")
+                } else {
+                    new_key.clone()
+                };
+                fixed_lines.push(new_line);
+                summaries.push(format!("~ `_password` renamed to `{new_key}` in {where_name} config"));
+            } else {
+                summaries.push(format!("- `_password` deleted from {where_name} config"));
+            }
+            continue;
+        }
+
+        // Deprecated keys
+        if key == "global-style" {
+            fixed_lines.push("install-strategy=shallow".to_string());
+            summaries.push(format!("~ `global-style` renamed to `install-strategy=shallow` in {where_name} config"));
+            continue;
+        }
+
+        if key == "legacy-bundling" {
+            fixed_lines.push("install-strategy=nested".to_string());
+            summaries.push(format!("~ `legacy-bundling` renamed to `install-strategy=nested` in {where_name} config"));
+            continue;
+        }
+
+        if key == "only" {
+            if val.eq_ignore_ascii_case("prod") || val.eq_ignore_ascii_case("production") {
+                fixed_lines.push("omit=dev".to_string());
+                summaries.push(format!("~ `only` renamed to `omit=dev` in {where_name} config"));
+            } else if val.eq_ignore_ascii_case("dev") || val.eq_ignore_ascii_case("development") {
+                fixed_lines.push("include=dev".to_string());
+                summaries.push(format!("~ `only` renamed to `include=dev` in {where_name} config"));
+            } else {
+                fixed_lines.push(line.to_string());
+            }
+            continue;
+        }
+
+        if key == "production" {
+            if val.is_empty() || val.eq_ignore_ascii_case("true") {
+                fixed_lines.push("omit=dev".to_string());
+                summaries.push(format!("~ `production` renamed to `omit=dev` in {where_name} config"));
+            } else if val.eq_ignore_ascii_case("false") {
+                summaries.push(format!("- `production` deleted from {where_name} config"));
+            } else {
+                fixed_lines.push(line.to_string());
+            }
+            continue;
+        }
+
+        if key == "shrinkwrap" {
+            if val.eq_ignore_ascii_case("false") {
+                fixed_lines.push("package-lock=false".to_string());
+            } else {
+                fixed_lines.push("package-lock=true".to_string());
+            }
+            summaries.push(format!("~ `shrinkwrap` renamed to `package-lock` in {where_name} config"));
+            continue;
+        }
+
+        if key == "also"
+            && (val.eq_ignore_ascii_case("dev") || val.eq_ignore_ascii_case("development"))
+        {
+            fixed_lines.push("include=dev".to_string());
+            summaries.push(format!("~ `also` renamed to `include=dev` in {where_name} config"));
+            continue;
+        }
+
+        if key == "dev" && (val.is_empty() || val.eq_ignore_ascii_case("true")) {
+            fixed_lines.push("include=dev".to_string());
+            summaries.push(format!("~ `dev` renamed to `include=dev` in {where_name} config"));
+            continue;
+        }
+
+        if key == "optional" {
+            if val.eq_ignore_ascii_case("false") {
+                fixed_lines.push("omit=optional".to_string());
+                summaries.push(format!("~ `optional` renamed to `omit=optional` in {where_name} config"));
+                continue;
+            } else if val.eq_ignore_ascii_case("true") {
+                fixed_lines.push("include=optional".to_string());
+                summaries.push(format!("~ `optional` renamed to `include=optional` in {where_name} config"));
+                continue;
+            }
+        }
+
+        if let Some(rest) = key.strip_prefix("init.") {
+            let normalized_rest = rest.replace('.', "-");
+            let new_key = format!("init-{normalized_rest}");
+            let new_line = if has_val {
+                format!("{new_key}={val}")
+            } else {
+                new_key.clone()
+            };
+            fixed_lines.push(new_line);
+            summaries.push(format!("~ `{key}` renamed to `{new_key}` in {where_name} config"));
+            continue;
+        }
+
+        // Unmodified line
+        fixed_lines.push(line.to_string());
+    }
+
+    let mut out_str = fixed_lines.join("\n");
+    if !fixed_lines.is_empty() && (content.ends_with('\n') || content.ends_with("\r\n")) {
+        out_str.push('\n');
+    }
+
+    (out_str, summaries)
+}

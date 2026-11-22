@@ -33,7 +33,9 @@ pub(crate) fn run(action: ConfigAction, current_dir: PathBuf) -> Result<()> {
             global,
             location,
         } => run_edit(editor, global, location.as_deref(), &current_dir)?,
-        ConfigAction::Fix => run_fix(&current_dir)?,
+        ConfigAction::Fix { location, global } => {
+            run_fix(location.as_deref(), global, &current_dir)?
+        }
     }
     Ok(())
 }
@@ -162,9 +164,69 @@ pub(crate) fn run_edit(
     Ok(())
 }
 
-pub(crate) fn run_fix(current_dir: &Path) -> Result<()> {
-    let opts = rnpm_config::ConfigOptions::new().project_dir(current_dir);
-    let _ = rnpm_config::Config::load_detailed(opts)?;
+pub(crate) fn run_fix(
+    location: Option<&str>,
+    global: bool,
+    current_dir: &Path,
+) -> Result<()> {
+    let mut targets = Vec::new();
+    if global || location == Some("global") {
+        let global_path = rnpm_config::find_global_npmrc().unwrap_or_else(|| {
+            rnpm_config::get_default_global_npmrc(&rnpm_config::find_global_prefix())
+        });
+        targets.push(("global", global_path));
+    } else if location == Some("project") {
+        targets.push(("project", current_dir.join(".npmrc")));
+    } else if location == Some("user") {
+        targets.push(("user", rnpm_config::get_default_user_npmrc()));
+    } else {
+        // Default: inspect project, user, and global if they exist
+        let project_path = current_dir.join(".npmrc");
+        if project_path.exists() {
+            targets.push(("project", project_path));
+        }
+        let user_path = rnpm_config::get_default_user_npmrc();
+        if user_path.exists() {
+            targets.push(("user", user_path));
+        }
+        if let Some(global_path) = rnpm_config::find_global_npmrc() {
+            if global_path.exists() {
+                targets.push(("global", global_path));
+            }
+        }
+    }
+
+    let config = rnpm_config::Config::load(Some(current_dir)).unwrap_or_default();
+    let registry_url = config.npmrc.registry;
+    let host = registry_url.host_str().unwrap_or_default();
+    let port = registry_url.port().map(|p| format!(":{p}")).unwrap_or_default();
+    let path = if registry_url.path().is_empty() {
+        "/".to_string()
+    } else {
+        format!("{}/", registry_url.path().trim_end_matches('/'))
+    };
+    let nerfed_reg = format!("//{host}{port}{path}");
+
+    let mut all_summaries = Vec::new();
+
+    for (where_name, target_path) in targets {
+        if !target_path.exists() {
+            continue;
+        }
+        let content = std::fs::read_to_string(&target_path)?;
+        let (fixed_content, summaries) =
+            rnpm_config::fix_npmrc_content(&content, where_name, &nerfed_reg);
+        if !summaries.is_empty() {
+            std::fs::write(&target_path, fixed_content)?;
+            all_summaries.extend(summaries);
+        }
+    }
+
+    if !all_summaries.is_empty() {
+        println!("The following configuration problems have been repaired:\n");
+        println!("{}", all_summaries.join("\n"));
+    }
+
     Ok(())
 }
 

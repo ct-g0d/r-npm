@@ -10,7 +10,7 @@ pub use config::{
     delete_config_value_from_file, find_global_bin_dir, find_global_node_modules,
     find_global_npmrc, find_global_npmrc_with_env, find_global_prefix, find_global_prefix_with_env,
     find_local_bin_dir, find_local_node_modules, find_local_prefix, find_user_npmrc,
-    find_user_npmrc_with_env, find_workspace_root, get_default_global_npmrc,
+    find_user_npmrc_with_env, find_workspace_root, fix_npmrc_content, get_default_global_npmrc,
     get_default_user_npmrc, get_process_cli_overrides, get_process_globalconfig,
     get_process_userconfig, set_config_value_in_file, set_process_cli_overrides,
     set_process_globalconfig, set_process_userconfig, Config, ConfigDetailed, ConfigLayer,

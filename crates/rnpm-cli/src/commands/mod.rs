@@ -4,6 +4,7 @@ pub mod access;
 pub mod allow_scripts;
 pub mod cache;
 pub mod client_helper;
+pub mod completion;
 pub mod config;
 pub mod dedupe;
 pub mod deprecate;

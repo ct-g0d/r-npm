@@ -1234,7 +1234,11 @@ pub(crate) enum Commands {
         json: bool,
     },
     /// Generate shell completion scripts.
-    Completion { shell: Option<String> },
+    #[command(trailing_var_arg = true)]
+    Completion {
+        #[arg(allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
     /// Manage package distribution tags.
     #[command(alias = "dist-tags")]
     DistTag {
@@ -1754,7 +1758,14 @@ pub(crate) enum ConfigAction {
         location: Option<String>,
     },
     /// Repair or normalize configuration
-    Fix,
+    Fix {
+        /// Fix global configuration
+        #[arg(short = 'g', long = "global")]
+        global: bool,
+        /// Configuration location (global, user, project)
+        #[arg(long)]
+        location: Option<String>,
+    },
 }
 
 #[derive(Subcommand, Debug, Clone)]
@@ -6620,32 +6631,8 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
                 json,
             )?;
         }
-        Commands::Completion { shell } => {
-            if shell.is_none() {
-                #[cfg(windows)]
-                return Err(anyhow::anyhow!(
-                    "npm error code ENOTSUP\nnpm error npm completion supported only in MINGW / Git bash on Windows"
-                ));
-            }
-            const COMMANDS: &str = "install ci test start restart stop run exec pack uninstall update audit prune dedupe find-dupes rebuild pkg init create cache diff sbom version list outdated view query publish whoami ping login logout token approve-scripts deny-scripts completion dist-tag owner unpublish deprecate undeprecate access profile org team doctor fund explain search stars star unstar fix bugs docs edit explore help-search install-ci-test install-scripts install-test shrinkwrap trust config link unlink prefix root bin";
-            match shell.as_deref().unwrap_or("bash") {
-                "bash" => println!("complete -W '{COMMANDS}' rnpm"),
-                "zsh" => println!("#compdef rnpm\n_arguments '1:command:({COMMANDS})'"),
-                "fish" => println!("complete -c rnpm -f -a '{COMMANDS}'"),
-                "powershell" => {
-                    let quoted = COMMANDS
-                        .split_whitespace()
-                        .map(|command| format!("'{command}'"))
-                        .collect::<Vec<_>>()
-                        .join(",");
-                    println!("Register-ArgumentCompleter -Native -CommandName rnpm -ScriptBlock {{ param($wordToComplete) {quoted} | Where-Object {{ $_ -like \"$wordToComplete*\" }} }}");
-                }
-                other => {
-                    return Err(anyhow::anyhow!(
-                        "npm error code EUSAGE\nnpm error unsupported shell '{other}'"
-                    ))
-                }
-            }
+        Commands::Completion { args } => {
+            commands::completion::run(args, &current_dir)?;
         }
         Commands::DistTag {
             args,

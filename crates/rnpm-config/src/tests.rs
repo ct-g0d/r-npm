@@ -836,3 +836,73 @@ fn test_config_detailed_and_paths() {
     assert!(formatted.contains("my-key = \"my-val\""));
     assert!(formatted.contains("npm local prefix ="));
 }
+
+#[test]
+fn test_fix_npmrc_content_repairs_keys() {
+    use crate::fix_npmrc_content;
+
+    let input = r#"
+# Comments should be preserved
+; Semicolon comments too
+_authtoken = should-be-deleted
+-authtoken = also-deleted
+_authToken = my-secret-token
+_auth = basic-auth-string
+email = user@example.com
+username = user1
+_password = pass1
+global-style = true
+legacy-bundling = true
+only = prod
+production = true
+shrinkwrap = false
+also = dev
+dev = true
+optional = false
+init.author.name = Author Name
+init.author.email = author@example.com
+init.license = MIT
+//registry.npmjs.org/:_authToken = already-scoped
+valid-custom-key = preserved
+"#;
+
+    let (fixed, summaries) = fix_npmrc_content(input, "project", "//registry.npmjs.org/");
+
+    assert!(fixed.contains("# Comments should be preserved"));
+    assert!(fixed.contains("; Semicolon comments too"));
+    assert!(!fixed.contains("_authtoken ="));
+    assert!(!fixed.contains("-authtoken ="));
+    assert!(fixed.contains("//registry.npmjs.org/:_authToken=my-secret-token"));
+    assert!(fixed.contains("//registry.npmjs.org/:_auth=basic-auth-string"));
+    assert!(fixed.contains("//registry.npmjs.org/:email=user@example.com"));
+    assert!(fixed.contains("//registry.npmjs.org/:username=user1"));
+    assert!(fixed.contains("//registry.npmjs.org/:_password=pass1"));
+    assert!(fixed.contains("install-strategy=shallow"));
+    assert!(fixed.contains("install-strategy=nested"));
+    assert!(fixed.contains("omit=dev"));
+    assert!(fixed.contains("package-lock=false"));
+    assert!(fixed.contains("include=dev"));
+    assert!(fixed.contains("omit=optional"));
+    assert!(fixed.contains("init-author-name=Author Name"));
+    assert!(fixed.contains("init-author-email=author@example.com"));
+    assert!(fixed.contains("init-license=MIT"));
+    assert!(fixed.contains("//registry.npmjs.org/:_authToken = already-scoped"));
+    assert!(fixed.contains("valid-custom-key = preserved"));
+
+    assert!(!summaries.is_empty());
+}
+
+#[test]
+fn test_fix_npmrc_content_deletes_lonely_username_or_password() {
+    use crate::fix_npmrc_content;
+
+    let input = "username = lonely_user\n";
+    let (fixed, summaries) = fix_npmrc_content(input, "project", "//registry.npmjs.org/");
+    assert!(!fixed.contains("username"));
+    assert!(summaries.iter().any(|s| s.contains("deleted")));
+
+    let input_pw = "_password = lonely_pw\n";
+    let (fixed_pw, summaries_pw) = fix_npmrc_content(input_pw, "project", "//registry.npmjs.org/");
+    assert!(!fixed_pw.contains("_password"));
+    assert!(summaries_pw.iter().any(|s| s.contains("deleted")));
+}
