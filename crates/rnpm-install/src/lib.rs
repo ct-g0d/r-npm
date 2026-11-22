@@ -1526,6 +1526,81 @@ pub fn apply_npmrc_to_client_config(
     if let Some(ms) = connect_timeout_ms {
         client_config.connect_timeout = std::time::Duration::from_millis(ms);
     }
+
+    if let Some(retries_val) = npmrc
+        .settings
+        .get("fetch-retries")
+        .or_else(|| npmrc.settings.get("fetch_retries"))
+        .or_else(|| npmrc.settings.get("retries"))
+    {
+        if let Ok(retries) = retries_val.trim().parse::<usize>() {
+            client_config.max_retries = retries;
+        }
+    }
+
+    if let Some(factor_val) = npmrc
+        .settings
+        .get("fetch-retry-factor")
+        .or_else(|| npmrc.settings.get("fetch_retry_factor"))
+        .or_else(|| npmrc.settings.get("retry-factor"))
+        .or_else(|| npmrc.settings.get("retry_factor"))
+    {
+        if let Ok(factor) = factor_val.trim().parse::<f64>() {
+            client_config.retry_factor = factor;
+        }
+    }
+
+    if let Some(mintimeout_val) = npmrc
+        .settings
+        .get("fetch-retry-mintimeout")
+        .or_else(|| npmrc.settings.get("fetch_retry_mintimeout"))
+        .or_else(|| npmrc.settings.get("fetch-retry-min-timeout"))
+        .or_else(|| npmrc.settings.get("fetch_retry_min_timeout"))
+        .or_else(|| npmrc.settings.get("retry-mintimeout"))
+        .or_else(|| npmrc.settings.get("retry_mintimeout"))
+    {
+        if let Ok(ms) = mintimeout_val.trim().parse::<u64>() {
+            client_config.initial_retry_backoff = std::time::Duration::from_millis(ms);
+        }
+    }
+
+    if let Some(maxtimeout_val) = npmrc
+        .settings
+        .get("fetch-retry-maxtimeout")
+        .or_else(|| npmrc.settings.get("fetch_retry_maxtimeout"))
+        .or_else(|| npmrc.settings.get("fetch-retry-max-timeout"))
+        .or_else(|| npmrc.settings.get("fetch_retry_max_timeout"))
+        .or_else(|| npmrc.settings.get("retry-maxtimeout"))
+        .or_else(|| npmrc.settings.get("retry_maxtimeout"))
+    {
+        if let Ok(ms) = maxtimeout_val.trim().parse::<u64>() {
+            client_config.max_retry_backoff = std::time::Duration::from_millis(ms);
+        }
+    }
+
+    if let Some(sockets_val) = npmrc
+        .settings
+        .get("maxsockets")
+        .or_else(|| npmrc.settings.get("max_sockets"))
+        .or_else(|| npmrc.settings.get("max-sockets"))
+        .or_else(|| npmrc.settings.get("concurrency"))
+    {
+        if let Ok(sockets) = sockets_val.trim().parse::<usize>() {
+            client_config.maxsockets = Some(sockets);
+            if sockets > 0 {
+                client_config.max_concurrent_requests = sockets;
+                client_config.pool_max_idle_per_host = sockets;
+            }
+        }
+    }
+}
+
+/// Applies npm configuration keys from `rnpm_config::Config` to a `RegistryClientConfig`.
+pub fn apply_config_to_client_config(
+    client_config: &mut RegistryClientConfig,
+    config: &rnpm_config::Config,
+) {
+    apply_npmrc_to_client_config(client_config, &config.npmrc);
 }
 
 /// Helper to link a workspace member into node_modules/<pkg-name> using directory junctions (Windows) or symlinks (Unix).
@@ -2362,6 +2437,7 @@ impl Installer {
 
         if let Some(c) = concurrency {
             if c > 0 {
+                client_config.maxsockets = Some(c);
                 client_config.max_concurrent_requests = c;
                 client_config.pool_max_idle_per_host = c;
             }
@@ -2370,7 +2446,7 @@ impl Installer {
             client_config.pool_max_idle_per_host = 64;
         }
 
-        apply_npmrc_to_client_config(&mut client_config, &config.npmrc);
+        apply_config_to_client_config(&mut client_config, &config);
 
         let registry_client = RegistryClient::with_config(client_config)
             .context("Failed to initialize registry client")?;

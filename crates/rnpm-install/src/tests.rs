@@ -2651,6 +2651,90 @@ fn test_apply_npmrc_to_client_config() {
     assert_eq!(client_config.connect_timeout, Duration::from_millis(12000));
 }
 
+#[test]
+fn test_apply_config_to_client_config_wires_retry_and_socket_keys() {
+    use crate::apply_config_to_client_config;
+    use rnpm_config::Config;
+    use rnpm_registry::client::RegistryClientConfig;
+    use std::time::Duration;
+
+    let mut config = Config::new();
+    config.npmrc.set("fetch-retries", "5").unwrap();
+    config.npmrc.set("fetch-retry-factor", "4.5").unwrap();
+    config.npmrc.set("fetch-retry-mintimeout", "250").unwrap();
+    config.npmrc.set("fetch-retry-maxtimeout", "8000").unwrap();
+    config.npmrc.set("maxsockets", "10").unwrap();
+
+    let mut client_config = RegistryClientConfig::default();
+    apply_config_to_client_config(&mut client_config, &config);
+
+    assert_eq!(client_config.max_retries, 5);
+    assert!((client_config.retry_factor - 4.5).abs() < f64::EPSILON);
+    assert_eq!(
+        client_config.initial_retry_backoff,
+        Duration::from_millis(250)
+    );
+    assert_eq!(
+        client_config.max_retry_backoff,
+        Duration::from_millis(8000)
+    );
+    assert_eq!(client_config.maxsockets, Some(10));
+    assert_eq!(client_config.max_concurrent_requests, 10);
+    assert_eq!(client_config.pool_max_idle_per_host, 10);
+
+    let client = rnpm_registry::client::RegistryClient::with_config(client_config).unwrap();
+    assert_eq!(client.semaphore().available_permits(), 10);
+    assert_eq!(client.config().max_retries, 5);
+    assert_eq!(
+        client.calculate_backoff(0),
+        Duration::from_millis(250)
+    );
+    assert_eq!(
+        client.calculate_backoff(1),
+        Duration::from_millis(1125)
+    );
+    assert_eq!(
+        client.calculate_backoff(2),
+        Duration::from_micros(5_062_500)
+    );
+    assert_eq!(
+        client.calculate_backoff(3),
+        Duration::from_millis(8000)
+    );
+}
+
+#[test]
+fn test_apply_npmrc_to_client_config_retry_and_socket_snake_case_aliases() {
+    use crate::apply_npmrc_to_client_config;
+    use rnpm_config::Npmrc;
+    use rnpm_registry::client::RegistryClientConfig;
+    use std::time::Duration;
+
+    let mut npmrc = Npmrc::new();
+    npmrc.set("fetch_retries", "4").unwrap();
+    npmrc.set("fetch_retry_factor", "2.5").unwrap();
+    npmrc.set("fetch_retry_mintimeout", "300").unwrap();
+    npmrc.set("fetch_retry_maxtimeout", "9000").unwrap();
+    npmrc.set("max_sockets", "12").unwrap();
+
+    let mut client_config = RegistryClientConfig::default();
+    apply_npmrc_to_client_config(&mut client_config, &npmrc);
+
+    assert_eq!(client_config.max_retries, 4);
+    assert!((client_config.retry_factor - 2.5).abs() < f64::EPSILON);
+    assert_eq!(
+        client_config.initial_retry_backoff,
+        Duration::from_millis(300)
+    );
+    assert_eq!(
+        client_config.max_retry_backoff,
+        Duration::from_millis(9000)
+    );
+    assert_eq!(client_config.maxsockets, Some(12));
+    assert_eq!(client_config.max_concurrent_requests, 12);
+    assert_eq!(client_config.pool_max_idle_per_host, 12);
+}
+
 #[tokio::test]
 async fn test_offline_mode_metadata_cache_miss_enotcached() {
     let tmp = tempfile::tempdir().unwrap();

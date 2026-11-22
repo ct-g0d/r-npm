@@ -16,11 +16,11 @@ pub mod publish;
 
 pub use circuit_breaker::{CircuitBreaker, CircuitBreakerState};
 pub use client::{
-    default_user_agent, encode_package_name, format_http_date, http_request_count,
-    parse_http_date_to_seconds_from_now, parse_http_date_to_unix_timestamp, parse_retry_after,
-    parse_retry_after_str, reset_http_request_count, BytesFetchResult, MetadataFetchResult,
-    RegistryClient, RegistryClientConfig, TarballFetchResult, TarballStream, HTTP_REQUEST_COUNT,
-    NPM_INSTALL_V1_JSON,
+    calculate_retry_backoff, default_user_agent, encode_package_name, format_http_date,
+    http_request_count, parse_http_date_to_seconds_from_now, parse_http_date_to_unix_timestamp,
+    parse_retry_after, parse_retry_after_str, reset_http_request_count, BytesFetchResult,
+    MetadataFetchResult, RegistryClient, RegistryClientConfig, TarballFetchResult, TarballStream,
+    DEFAULT_RETRY_FACTOR, HTTP_REQUEST_COUNT, NPM_INSTALL_V1_JSON,
 };
 pub use error::RegistryError;
 pub use reqwest::StatusCode;
