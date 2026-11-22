@@ -67,7 +67,7 @@ impl SourcePolicy {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SourceKind {
+pub enum SourceKind {
     Git,
     Remote,
     Registry,
@@ -76,7 +76,7 @@ enum SourceKind {
 }
 
 impl SourceKind {
-    fn label(self) -> &'static str {
+    pub fn label(self) -> &'static str {
         match self {
             SourceKind::Git => "git",
             SourceKind::Remote => "remote",
@@ -87,7 +87,7 @@ impl SourceKind {
     }
 }
 
-fn is_registry_tarball(resolved: &str) -> bool {
+pub fn is_registry_tarball(resolved: &str) -> bool {
     // `<scheme>://<host>/<name>/-/<file>-<digit>...`, as arborist checks.
     let Some(rest) = resolved
         .strip_prefix("https://")
@@ -156,6 +156,45 @@ fn top_level_name(location: &str) -> Option<&str> {
     (!rest.contains("/node_modules/")).then_some(rest)
 }
 
+/// Reject a single dependency source if disabled by `allow-*` source policy.
+///
+/// `is_root` is true if the package is declared directly by the root project,
+/// workspaces, or explicit command-line package arguments.
+pub fn check_source_gate(
+    policy: &SourcePolicy,
+    kind: SourceKind,
+    is_root: bool,
+) -> Result<()> {
+    if policy.is_unrestricted() {
+        return Ok(());
+    }
+    let mode = match kind {
+        SourceKind::Git => policy.git,
+        SourceKind::Remote => policy.remote,
+        SourceKind::Registry => policy.registry,
+        SourceKind::File => policy.file,
+        SourceKind::Directory => policy.directory,
+    };
+    let allowed = match mode {
+        AllowMode::All => true,
+        AllowMode::Root => is_root,
+        AllowMode::None => false,
+    };
+    if !allowed {
+        let qualifier = if mode == AllowMode::Root {
+            " non-root"
+        } else {
+            ""
+        };
+        return Err(anyhow!(
+            "npm error code EALLOW{}\nnpm error Fetching{qualifier} packages of type \"{}\" have been disabled",
+            kind.label().to_ascii_uppercase(),
+            kind.label()
+        ));
+    }
+    Ok(())
+}
+
 /// Reject sources disabled by `allow-*`, as pacote does while fetching.
 /// `root_declared` holds the dependency names the project root and its
 /// workspaces declare; `workspace_paths` are workspace member locations.
@@ -181,31 +220,8 @@ pub fn check_sources(
             continue;
         }
         let kind = classify(pkg);
-        let mode = match kind {
-            SourceKind::Git => policy.git,
-            SourceKind::Remote => policy.remote,
-            SourceKind::Registry => policy.registry,
-            SourceKind::File => policy.file,
-            SourceKind::Directory => policy.directory,
-        };
         let is_root = top_level_name(location).is_some_and(|n| root_declared.contains(n));
-        let allowed = match mode {
-            AllowMode::All => true,
-            AllowMode::Root => is_root,
-            AllowMode::None => false,
-        };
-        if !allowed {
-            let qualifier = if mode == AllowMode::Root {
-                " non-root"
-            } else {
-                ""
-            };
-            return Err(anyhow!(
-                "npm error code EALLOW{}\nnpm error Fetching{qualifier} packages of type \"{}\" have been disabled",
-                kind.label().to_ascii_uppercase(),
-                kind.label()
-            ));
-        }
+        check_source_gate(policy, kind, is_root)?;
     }
     Ok(())
 }

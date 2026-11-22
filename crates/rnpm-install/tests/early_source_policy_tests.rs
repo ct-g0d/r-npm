@@ -1,0 +1,628 @@
+use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use flate2::write::GzEncoder;
+use flate2::Compression;
+use tempfile::tempdir;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpListener;
+use tokio::sync::Mutex;
+
+use rnpm_install::{InstallOptions, Installer};
+
+struct CountingServer {
+    addr: SocketAddr,
+    _shutdown: tokio::sync::oneshot::Sender<()>,
+    pub requested_paths: Arc<Mutex<Vec<String>>>,
+}
+
+impl CountingServer {
+    async fn start<F>(handler: F) -> Self
+    where
+        F: Fn(&str, &str) -> Option<(u16, Vec<(&'static str, String)>, Vec<u8>)>
+            + Send
+            + Sync
+            + 'static,
+    {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, mut rx) = tokio::sync::oneshot::channel::<()>();
+        let requested_paths = Arc::new(Mutex::new(Vec::new()));
+        let handler = Arc::new(handler);
+
+        let reqs = requested_paths.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = &mut rx => {
+                        break;
+                    }
+                    accept_res = listener.accept() => {
+                        if let Ok((mut stream, _)) = accept_res {
+                            let handler_clone = handler.clone();
+                            let reqs_clone = reqs.clone();
+                            let base_url = format!("http://{}", addr);
+                            tokio::spawn(async move {
+                                let mut buf = vec![0u8; 4096];
+                                let n = stream.read(&mut buf).await.unwrap_or(0);
+                                if n > 0 {
+                                    let req_str = String::from_utf8_lossy(&buf[..n]).to_string();
+                                    let first_line = req_str.lines().next().unwrap_or("");
+                                    let path = first_line.split_whitespace().nth(1).unwrap_or("/").to_string();
+                                    reqs_clone.lock().await.push(path.clone());
+
+                                    let (status, headers, body) = match handler_clone(&path, &base_url) {
+                                        Some(resp) => resp,
+                                        None => (404, vec![("Content-Type", "text/plain".to_string())], b"Not Found".to_vec()),
+                                    };
+
+                                    let status_text = match status {
+                                        200 => "OK",
+                                        404 => "Not Found",
+                                        500 => "Internal Server Error",
+                                        _ => "Response",
+                                    };
+
+                                    let mut response = format!(
+                                        "HTTP/1.1 {status} {status_text}\r\nContent-Length: {}\r\nConnection: close\r\n",
+                                        body.len()
+                                    );
+                                    for (k, v) in headers {
+                                        response.push_str(&format!("{k}: {v}\r\n"));
+                                    }
+                                    response.push_str("\r\n");
+                                    let _ = stream.write_all(response.as_bytes()).await;
+                                    let _ = stream.write_all(&body).await;
+                                }
+                            });
+                        }
+                    }
+                }
+            }
+        });
+
+        Self {
+            addr,
+            _shutdown: tx,
+            requested_paths,
+        }
+    }
+
+    fn url(&self) -> String {
+        format!("http://{}", self.addr)
+    }
+
+    fn port(&self) -> u16 {
+        self.addr.port()
+    }
+
+    async fn request_count(&self) -> usize {
+        self.requested_paths.lock().await.len()
+    }
+}
+
+fn create_test_tarball(files: &[(&str, &[u8])]) -> Vec<u8> {
+    let mut gz = GzEncoder::new(Vec::new(), Compression::default());
+    {
+        let mut builder = tar::Builder::new(&mut gz);
+        for &(rel_path, content) in files {
+            let full_path = format!("package/{}", rel_path);
+            let mut header = tar::Header::new_gnu();
+            header.set_size(content.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder
+                .append_data(&mut header, full_path, content)
+                .expect("Failed to append tar entry");
+        }
+        builder.finish().expect("Failed to finish tar archive");
+    }
+    gz.finish().expect("Failed to finish gzip compression")
+}
+
+fn setup_test_project(
+    dir: &Path,
+    manifest_deps: &serde_json::Value,
+    npmrc_content: &str,
+) {
+    let pkg_json = serde_json::json!({
+        "name": "test-project",
+        "version": "1.0.0",
+        "dependencies": manifest_deps
+    });
+    std::fs::write(dir.join("package.json"), pkg_json.to_string()).unwrap();
+    std::fs::write(dir.join(".npmrc"), npmrc_content).unwrap();
+}
+
+struct DummyGitGuard {
+    _temp_dir: tempfile::TempDir,
+    sentinel_path: PathBuf,
+    original_path: String,
+}
+
+impl DummyGitGuard {
+    fn new() -> Self {
+        let temp_dir = tempdir().unwrap();
+        let sentinel_path = temp_dir.path().join("git_invoked.txt");
+        let original_path = std::env::var("PATH").unwrap_or_default();
+
+        if cfg!(windows) {
+            // Compile a small git.exe that marks invocation and exits with failure
+            let marker_escaped = sentinel_path.to_str().unwrap().replace('\\', "\\\\");
+            let src = format!(
+                r#"fn main() {{ let _ = std::fs::write("{}", "invoked"); std::process::exit(99); }}"#,
+                marker_escaped
+            );
+            let src_file = temp_dir.path().join("fake_git.rs");
+            std::fs::write(&src_file, src).unwrap();
+            let status = std::process::Command::new("rustc")
+                .arg(&src_file)
+                .arg("-o")
+                .arg(temp_dir.path().join("git.exe"))
+                .status()
+                .expect("Failed to compile dummy git.exe");
+            assert!(status.success(), "Failed to build dummy git.exe");
+        } else {
+            let sh_path = temp_dir.path().join("git");
+            let script = format!(
+                "#!/bin/sh\necho invoked > \"{}\"\nexit 99\n",
+                sentinel_path.display()
+            );
+            std::fs::write(&sh_path, script).unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(&sh_path, std::fs::Permissions::from_mode(0o755));
+            }
+        }
+
+        let new_path = format!("{};{}", temp_dir.path().display(), original_path);
+        std::env::set_var("PATH", new_path);
+
+        Self {
+            _temp_dir: temp_dir,
+            sentinel_path,
+            original_path,
+        }
+    }
+
+    fn was_invoked(&self) -> bool {
+        self.sentinel_path.exists()
+    }
+}
+
+impl Drop for DummyGitGuard {
+    fn drop(&mut self) {
+        std::env::set_var("PATH", &self.original_path);
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Test 1: allow-remote=none blocks direct manifest URL dep with ZERO HTTP requests
+// -----------------------------------------------------------------------------
+#[tokio::test]
+async fn test_allow_remote_none_blocks_manifest_dep_zero_http_requests() {
+    let server = CountingServer::start(|_path, _base_url| {
+        let pkg = create_test_tarball(&[("package.json", br#"{"name":"remote-pkg","version":"1.0.0"}"#)]);
+        Some((200, vec![("Content-Type", "application/octet-stream".to_string())], pkg))
+    }).await;
+
+    let project_dir = tempdir().unwrap();
+    let cache_dir = tempdir().unwrap();
+
+    let remote_url = format!("{}/remote-pkg.tgz", server.url());
+    setup_test_project(
+        project_dir.path(),
+        &serde_json::json!({
+            "remote-pkg": remote_url
+        }),
+        "allow-remote=none\n",
+    );
+
+    let options = InstallOptions {
+        project_dir: project_dir.path().to_path_buf(),
+        cache_dir: Some(cache_dir.path().to_path_buf()),
+        registry_url: Some(server.url()),
+        ..Default::default()
+    };
+
+    let mut installer = Installer::new(options).unwrap();
+    let result = installer.install().await;
+
+    assert!(result.is_err(), "Expected install to fail with allow-remote=none");
+    let err_msg = result.unwrap_err().to_string();
+    assert!(
+        err_msg.contains("EALLOWREMOTE"),
+        "Error message should contain EALLOWREMOTE, got: {err_msg}"
+    );
+    assert!(
+        err_msg.contains("Fetching packages of type \"remote\" have been disabled"),
+        "Error message should match exact npm text, got: {err_msg}"
+    );
+
+    // ZERO HTTP requests must have hit the server!
+    assert_eq!(
+        server.request_count().await,
+        0,
+        "ZERO HTTP requests should have been made to the remote server"
+    );
+}
+
+// -----------------------------------------------------------------------------
+// Test 2: allow-remote=none blocks CLI argument with ZERO HTTP requests
+// -----------------------------------------------------------------------------
+#[tokio::test]
+async fn test_allow_remote_none_blocks_cli_arg_zero_http_requests() {
+    let server = CountingServer::start(|_path, _base_url| {
+        let pkg = create_test_tarball(&[("package.json", br#"{"name":"cli-remote","version":"1.0.0"}"#)]);
+        Some((200, vec![("Content-Type", "application/octet-stream".to_string())], pkg))
+    }).await;
+
+    let project_dir = tempdir().unwrap();
+    let cache_dir = tempdir().unwrap();
+
+    setup_test_project(
+        project_dir.path(),
+        &serde_json::json!({}),
+        "allow-remote=none\n",
+    );
+
+    let remote_url = format!("{}/cli-remote.tgz", server.url());
+    let options = InstallOptions {
+        project_dir: project_dir.path().to_path_buf(),
+        cache_dir: Some(cache_dir.path().to_path_buf()),
+        registry_url: Some(server.url()),
+        packages: vec![remote_url],
+        ..Default::default()
+    };
+
+    let mut installer = Installer::new(options).unwrap();
+    let result = installer.install().await;
+
+    assert!(result.is_err(), "Expected install to fail with allow-remote=none");
+    let err_msg = result.unwrap_err().to_string();
+    assert!(
+        err_msg.contains("EALLOWREMOTE"),
+        "Error message should contain EALLOWREMOTE, got: {err_msg}"
+    );
+    assert!(
+        err_msg.contains("Fetching packages of type \"remote\" have been disabled"),
+        "Error message should match exact npm text, got: {err_msg}"
+    );
+
+    // ZERO HTTP requests must have hit the server!
+    assert_eq!(
+        server.request_count().await,
+        0,
+        "ZERO HTTP requests should have been made to the remote server"
+    );
+}
+
+// -----------------------------------------------------------------------------
+// Test 3: allow-git=none blocks direct manifest git dep with ZERO git fetches
+// -----------------------------------------------------------------------------
+#[tokio::test]
+async fn test_allow_git_none_blocks_manifest_dep_zero_git_fetches() {
+    let server = CountingServer::start(|_path, _base_url| None).await;
+    let git_guard = DummyGitGuard::new();
+
+    let project_dir = tempdir().unwrap();
+    let cache_dir = tempdir().unwrap();
+
+    let git_url = format!("git+http://127.0.0.1:{}/repo.git", server.port());
+    setup_test_project(
+        project_dir.path(),
+        &serde_json::json!({
+            "git-dep": git_url
+        }),
+        "allow-git=none\n",
+    );
+
+    let options = InstallOptions {
+        project_dir: project_dir.path().to_path_buf(),
+        cache_dir: Some(cache_dir.path().to_path_buf()),
+        registry_url: Some(server.url()),
+        ..Default::default()
+    };
+
+    let mut installer = Installer::new(options).unwrap();
+    let result = installer.install().await;
+
+    assert!(result.is_err(), "Expected install to fail with allow-git=none");
+    let err_msg = result.unwrap_err().to_string();
+    assert!(
+        err_msg.contains("EALLOWGIT"),
+        "Error message should contain EALLOWGIT, got: {err_msg}"
+    );
+    assert!(
+        err_msg.contains("Fetching packages of type \"git\" have been disabled"),
+        "Error message should match exact npm text, got: {err_msg}"
+    );
+
+    // ZERO HTTP requests were sent to the server for git
+    assert_eq!(
+        server.request_count().await,
+        0,
+        "ZERO HTTP requests should have been made to git server"
+    );
+
+    // ZERO git subprocesses were spawned!
+    assert!(
+        !git_guard.was_invoked(),
+        "ZERO git subprocess fetches should occur when allow-git=none"
+    );
+}
+
+// -----------------------------------------------------------------------------
+// Test 4: allow-git=none blocks CLI argument with ZERO git fetches
+// -----------------------------------------------------------------------------
+#[tokio::test]
+async fn test_allow_git_none_blocks_cli_arg_zero_git_fetches() {
+    let server = CountingServer::start(|_path, _base_url| None).await;
+    let git_guard = DummyGitGuard::new();
+
+    let project_dir = tempdir().unwrap();
+    let cache_dir = tempdir().unwrap();
+
+    setup_test_project(
+        project_dir.path(),
+        &serde_json::json!({}),
+        "allow-git=none\n",
+    );
+
+    let git_url = format!("git+http://127.0.0.1:{}/cli-git.git", server.port());
+    let options = InstallOptions {
+        project_dir: project_dir.path().to_path_buf(),
+        cache_dir: Some(cache_dir.path().to_path_buf()),
+        registry_url: Some(server.url()),
+        packages: vec![git_url],
+        ..Default::default()
+    };
+
+    let mut installer = Installer::new(options).unwrap();
+    let result = installer.install().await;
+
+    assert!(result.is_err(), "Expected install to fail with allow-git=none");
+    let err_msg = result.unwrap_err().to_string();
+    assert!(
+        err_msg.contains("EALLOWGIT"),
+        "Error message should contain EALLOWGIT, got: {err_msg}"
+    );
+    assert!(
+        err_msg.contains("Fetching packages of type \"git\" have been disabled"),
+        "Error message should match exact npm text, got: {err_msg}"
+    );
+
+    // ZERO HTTP requests and ZERO git subprocesses
+    assert_eq!(server.request_count().await, 0);
+    assert!(
+        !git_guard.was_invoked(),
+        "ZERO git subprocess fetches should occur when allow-git=none"
+    );
+}
+
+// -----------------------------------------------------------------------------
+// Test 5: allow-remote=root allows root but blocks transitive URL with ZERO requests
+// -----------------------------------------------------------------------------
+#[tokio::test]
+async fn test_allow_remote_root_allows_root_blocks_transitive() {
+    let server_addr_cell: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let cell_clone = server_addr_cell.clone();
+
+    let server = CountingServer::start(move |path, base_url| {
+        if path == "/root-pkg.tgz" {
+            let transitive_url = format!("{base_url}/transitive-pkg.tgz");
+            let manifest = serde_json::json!({
+                "name": "root-pkg",
+                "version": "1.0.0",
+                "dependencies": {
+                    "transitive-pkg": transitive_url
+                }
+            });
+            let pkg = create_test_tarball(&[
+                ("package.json", manifest.to_string().as_bytes())
+            ]);
+            Some((200, vec![("Content-Type", "application/octet-stream".to_string())], pkg))
+        } else if path == "/transitive-pkg.tgz" {
+            let manifest = serde_json::json!({
+                "name": "transitive-pkg",
+                "version": "1.0.0"
+            });
+            let pkg = create_test_tarball(&[
+                ("package.json", manifest.to_string().as_bytes())
+            ]);
+            Some((200, vec![("Content-Type", "application/octet-stream".to_string())], pkg))
+        } else {
+            None
+        }
+    }).await;
+
+    *cell_clone.lock().await = Some(server.url());
+
+    let project_dir = tempdir().unwrap();
+    let cache_dir = tempdir().unwrap();
+
+    let root_url = format!("{}/root-pkg.tgz", server.url());
+    setup_test_project(
+        project_dir.path(),
+        &serde_json::json!({
+            "root-pkg": root_url
+        }),
+        "allow-remote=root\n",
+    );
+
+    let options = InstallOptions {
+        project_dir: project_dir.path().to_path_buf(),
+        cache_dir: Some(cache_dir.path().to_path_buf()),
+        registry_url: Some(server.url()),
+        ..Default::default()
+    };
+
+    let mut installer = Installer::new(options).unwrap();
+    let result = installer.install().await;
+
+    assert!(result.is_err(), "Expected install to fail on transitive remote dep");
+    let err_msg = result.unwrap_err().to_string();
+    assert!(
+        err_msg.contains("EALLOWREMOTE"),
+        "Error message should contain EALLOWREMOTE, got: {err_msg}"
+    );
+    assert!(
+        err_msg.contains("Fetching non-root packages of type \"remote\" have been disabled"),
+        "Error message should match exact non-root text, got: {err_msg}"
+    );
+
+    // Root tarball was downloaded, but transitive tarball was NEVER requested!
+    let reqs = server.requested_paths.lock().await;
+    assert!(
+        reqs.iter().any(|r| r.ends_with("root-pkg.tgz")),
+        "Root package tarball should have been fetched"
+    );
+    assert!(
+        !reqs.iter().any(|r| r.ends_with("transitive-pkg.tgz")),
+        "Transitive package tarball must NEVER be fetched, but was in: {reqs:?}"
+    );
+}
+
+// -----------------------------------------------------------------------------
+// Test 6: allow-file=none and allow-directory=none early rejection
+// -----------------------------------------------------------------------------
+#[tokio::test]
+async fn test_allow_file_and_directory_none() {
+    let project_dir = tempdir().unwrap();
+    let cache_dir = tempdir().unwrap();
+
+    let tgz_path = project_dir.path().join("local.tgz");
+    std::fs::write(&tgz_path, b"fake-archive").unwrap();
+
+    // 1. allow-file=none
+    setup_test_project(
+        project_dir.path(),
+        &serde_json::json!({
+            "local-pkg": "file:./local.tgz"
+        }),
+        "allow-file=none\n",
+    );
+
+    let options = InstallOptions {
+        project_dir: project_dir.path().to_path_buf(),
+        cache_dir: Some(cache_dir.path().to_path_buf()),
+        ..Default::default()
+    };
+
+    let mut installer = Installer::new(options).unwrap();
+    let result = installer.install().await;
+    assert!(result.is_err());
+    let err = result.unwrap_err().to_string();
+    assert!(err.contains("EALLOWFILE"), "Got: {err}");
+    assert!(err.contains("Fetching packages of type \"file\" have been disabled"));
+
+    // 2. allow-directory=none
+    let dir_pkg = project_dir.path().join("local-dir");
+    std::fs::create_dir_all(&dir_pkg).unwrap();
+    std::fs::write(
+        dir_pkg.join("package.json"),
+        r#"{"name":"local-dir","version":"1.0.0"}"#,
+    ).unwrap();
+
+    setup_test_project(
+        project_dir.path(),
+        &serde_json::json!({
+            "local-dir": "file:./local-dir"
+        }),
+        "allow-directory=none\n",
+    );
+
+    let options = InstallOptions {
+        project_dir: project_dir.path().to_path_buf(),
+        cache_dir: Some(cache_dir.path().to_path_buf()),
+        ..Default::default()
+    };
+
+    let mut installer = Installer::new(options).unwrap();
+    let result = installer.install().await;
+    assert!(result.is_err());
+    let err = result.unwrap_err().to_string();
+    assert!(err.contains("EALLOWDIRECTORY"), "Got: {err}");
+    assert!(err.contains("Fetching packages of type \"directory\" have been disabled"));
+}
+
+fn run_git_cmd(dir: &Path, args: &[&str]) {
+    let _ = std::fs::write(dir.join(".empty_gitconfig"), "");
+    let status = std::process::Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_ASKPASS", "")
+        .env("SSH_ASKPASS", "")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", dir.join(".empty_gitconfig"))
+        .status()
+        .expect("Failed to execute git command");
+    assert!(status.success(), "Git command failed: git {:?}", args);
+}
+
+// -----------------------------------------------------------------------------
+// Test 7: allow-git=root allows root git dep, blocks transitive git with ZERO fetches
+// -----------------------------------------------------------------------------
+#[tokio::test]
+async fn test_allow_git_root_allows_root_blocks_transitive() {
+    let server = CountingServer::start(|_path, _base_url| None).await;
+
+    let root_git_dir = tempdir().unwrap();
+    let root_path = root_git_dir.path();
+    run_git_cmd(root_path, &["init"]);
+    run_git_cmd(root_path, &["config", "user.name", "Tester"]);
+    run_git_cmd(root_path, &["config", "user.email", "tester@example.com"]);
+
+    let transitive_url = format!("git+http://127.0.0.1:{}/transitive.git", server.port());
+    let manifest = serde_json::json!({
+        "name": "root-git-pkg",
+        "version": "1.0.0",
+        "dependencies": {
+            "transitive-git": transitive_url
+        }
+    });
+    std::fs::write(root_path.join("package.json"), manifest.to_string()).unwrap();
+    std::fs::write(root_path.join("index.js"), "module.exports = 'root git';\n").unwrap();
+    run_git_cmd(root_path, &["add", "."]);
+    run_git_cmd(root_path, &["commit", "-m", "Initial commit"]);
+
+    let root_git_url = format!("git+file://{}", root_path.to_str().unwrap().replace('\\', "/"));
+
+    let project_dir = tempdir().unwrap();
+    let cache_dir = tempdir().unwrap();
+
+    setup_test_project(
+        project_dir.path(),
+        &serde_json::json!({
+            "root-git-pkg": root_git_url
+        }),
+        "allow-git=root\n",
+    );
+
+    let options = InstallOptions {
+        project_dir: project_dir.path().to_path_buf(),
+        cache_dir: Some(cache_dir.path().to_path_buf()),
+        registry_url: Some(server.url()),
+        ..Default::default()
+    };
+
+    let mut installer = Installer::new(options).unwrap();
+    let result = installer.install().await;
+
+    assert!(result.is_err(), "Expected install to fail on transitive git dep");
+    let err = result.unwrap_err().to_string();
+    assert!(err.contains("EALLOWGIT"), "Got: {err}");
+    assert!(
+        err.contains("Fetching non-root packages of type \"git\" have been disabled"),
+        "Got: {err}"
+    );
+
+    // ZERO git fetch requests (like /info/refs or .git) to the server!
+    let reqs = server.requested_paths.lock().await;
+    assert!(
+        !reqs.iter().any(|r| r.contains(".git") || r.contains("git-upload-pack")),
+        "Transitive git repo was never fetched by git subprocess! Reqs: {reqs:?}"
+    );
+}

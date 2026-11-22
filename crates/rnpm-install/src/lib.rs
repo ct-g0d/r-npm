@@ -443,6 +443,8 @@ pub struct RegistryPackageProvider {
     git_fetcher: crate::git::GitFetcher,
     lockfile: Option<Arc<LockfileV3>>,
     unlocked_packages: std::collections::HashSet<String>,
+    source_policy: policy::SourcePolicy,
+    root_declared: Arc<HashSet<String>>,
 }
 
 /// npm never creates node_modules when nothing is reified, so drop one that
@@ -1140,6 +1142,17 @@ impl PackageMetadataProvider for RegistryPackageProvider {
                 .map(|t| t.is_git())
                 .unwrap_or(false)
         {
+            let is_root = self.root_declared.contains(name);
+            if let Err(e) = policy::check_source_gate(
+                &self.source_policy,
+                policy::SourceKind::Git,
+                is_root,
+            ) {
+                return Err(SolverError::PackageMetadata(
+                    name.to_string(),
+                    e.to_string(),
+                ));
+            }
             if let Ok(target) = PackageTarget::parse(name) {
                 let fetcher = self.git_fetcher.clone();
                 let offline = self.offline;
@@ -2541,6 +2554,35 @@ impl Installer {
         })
     }
 
+    fn collect_root_declared(
+        &self,
+        manifest: &Manifest,
+        workspace_members: &[WorkspaceMember],
+    ) -> HashSet<String> {
+        let mut declared: HashSet<String> = HashSet::new();
+        let mut collect = |m: &Manifest| {
+            declared.extend(m.dependencies.keys().cloned());
+            declared.extend(m.dependencies.values().cloned());
+            declared.extend(m.dev_dependencies.keys().cloned());
+            declared.extend(m.dev_dependencies.values().cloned());
+            declared.extend(m.optional_dependencies.keys().cloned());
+            declared.extend(m.optional_dependencies.values().cloned());
+            declared.extend(m.peer_dependencies.keys().cloned());
+            declared.extend(m.peer_dependencies.values().cloned());
+        };
+        collect(manifest);
+        for member in workspace_members {
+            collect(&member.manifest);
+        }
+        for spec in &self.options.packages {
+            if let Ok(s) = rnpm_core::spec::PackageSpec::parse(spec) {
+                declared.insert(s.name);
+            }
+            declared.insert(spec.clone());
+        }
+        declared
+    }
+
     /// Enforce `allow-git`/`allow-file`/... before anything is fetched.
     fn check_source_policy(
         &self,
@@ -2549,22 +2591,7 @@ impl Installer {
         workspace_members: &[WorkspaceMember],
     ) -> Result<()> {
         assert_root_overrides(manifest)?;
-        let mut declared: HashSet<String> = HashSet::new();
-        let mut collect = |m: &Manifest| {
-            declared.extend(m.dependencies.keys().cloned());
-            declared.extend(m.dev_dependencies.keys().cloned());
-            declared.extend(m.optional_dependencies.keys().cloned());
-            declared.extend(m.peer_dependencies.keys().cloned());
-        };
-        collect(manifest);
-        for member in workspace_members {
-            collect(&member.manifest);
-        }
-        declared.extend(self.options.packages.iter().filter_map(|spec| {
-            rnpm_core::spec::PackageSpec::parse(spec)
-                .ok()
-                .map(|s| s.name.clone())
-        }));
+        let declared = self.collect_root_declared(manifest, workspace_members);
         let workspace_paths: HashSet<String> = workspace_members
             .iter()
             .map(|m| m.relative_path.clone())
@@ -3148,14 +3175,31 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
             let mut spec = PackageSpec::parse(&formatted_input)
                 .map_err(|e| anyhow!("Failed to parse package specifier '{trimmed}': {e}"))?;
 
+            let inner_target = match &spec.target {
+                PackageTarget::Alias { target, .. } => target.as_ref(),
+                t => t,
+            };
+
             // Discover real package name from manifest for File, Url, Git targets
-            match &spec.target {
+            match inner_target {
                 PackageTarget::File(p) => {
                     let abs_path = if p.is_absolute() {
                         p.clone()
                     } else {
                         self.options.project_dir.join(p)
                     };
+                    let p_clean = p.to_string_lossy();
+                    let lower = p_clean.to_ascii_lowercase();
+                    let is_archive = lower.ends_with(".tgz")
+                        || lower.ends_with(".tar.gz")
+                        || lower.ends_with(".tar")
+                        || (abs_path.exists() && abs_path.is_file());
+                    let kind = if is_archive {
+                        policy::SourceKind::File
+                    } else {
+                        policy::SourceKind::Directory
+                    };
+                    policy::check_source_gate(&self.source_policy, kind, true)?;
                     if abs_path.is_file() {
                         if let Ok(bytes) = std::fs::read(&abs_path) {
                             if let Ok(m) = inspect_manifest_from_tarball(&bytes) {
@@ -3176,6 +3220,13 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                     }
                 }
                 PackageTarget::Url(u) => {
+                    let kind = if policy::is_registry_tarball(u.as_str()) {
+                        policy::SourceKind::Registry
+                    } else {
+                        policy::SourceKind::Remote
+                    };
+                    policy::check_source_gate(&self.source_policy, kind, true)?;
+
                     let u_str = u.as_str();
                     let bytes = if self.options.offline {
                         if let Ok(Some((_entry, data))) = self.cache.get(u_str) {
@@ -3210,9 +3261,10 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                     }
                 }
                 PackageTarget::Git { .. } => {
+                    policy::check_source_gate(&self.source_policy, policy::SourceKind::Git, true)?;
                     let git_fetcher = crate::git::GitFetcher::new(self.cache.root());
                     if let Ok(resolved) = git_fetcher
-                        .resolve_git_dependency(&spec.target, self.options.offline)
+                        .resolve_git_dependency(inner_target, self.options.offline)
                         .await
                     {
                         if let Some(ref real_name) = resolved.manifest.name {
@@ -3380,14 +3432,21 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
         let metadata_start = std::time::Instant::now();
         let _meta_span = tracing::info_span!("metadata").entered();
 
+        let root_declared = Arc::new(self.collect_root_declared(&manifest, &workspace_members));
+
         // 1. Resolve dependency graph via Solver directly
         let handle = tokio::runtime::Handle::current();
         let metadata_cache = Arc::new(std::sync::Mutex::new(HashMap::new()));
-        self.populate_custom_target_metadata(&manifest, &metadata_cache)
+        self.populate_custom_target_metadata(&manifest, &metadata_cache, &root_declared, true)
             .await?;
         for member in &workspace_members {
-            self.populate_custom_target_metadata(&member.manifest, &metadata_cache)
-                .await?;
+            self.populate_custom_target_metadata(
+                &member.manifest,
+                &metadata_cache,
+                &root_declared,
+                true,
+            )
+            .await?;
         }
 
         let loc_base_dir = if self.options.is_global {
@@ -3471,6 +3530,8 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
             git_fetcher: crate::git::GitFetcher::new(self.cache.root()),
             lockfile: existing_lockfile.clone(),
             unlocked_packages: unlocked_packages.clone(),
+            source_policy: self.source_policy.clone(),
+            root_declared: root_declared.clone(),
         };
 
         let resolver_options = ResolverOptions {
@@ -7822,6 +7883,8 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
         &self,
         manifest: &Manifest,
         cache: &Arc<std::sync::Mutex<HashMap<String, PackageMetadata>>>,
+        root_declared: &Arc<HashSet<String>>,
+        is_root_pass: bool,
     ) -> Result<()> {
         let mut all_deps = Vec::new();
         for (name, spec) in &manifest.dependencies {
@@ -7849,13 +7912,20 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                 Err(_) => continue,
             };
 
-            let git_target_opt = match &parsed {
-                PackageTarget::Git { .. } => Some(parsed.clone()),
-                PackageTarget::Alias { target, .. } if target.is_git() => Some((**target).clone()),
+            let is_root = is_root_pass || root_declared.contains(name);
+
+            let effective_target = match &parsed {
+                PackageTarget::Alias { target, .. } => target.as_ref(),
+                t => t,
+            };
+
+            let git_target_opt = match effective_target {
+                PackageTarget::Git { .. } => Some(effective_target.clone()),
                 _ => None,
             };
 
             if let Some(git_target) = git_target_opt {
+                policy::check_source_gate(&self.source_policy, policy::SourceKind::Git, is_root)?;
                 let git_fetcher = crate::git::GitFetcher::new(self.cache.root());
                 let resolved = git_fetcher
                     .resolve_git_dependency(&git_target, self.options.offline)
@@ -7930,11 +8000,11 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                     locked.insert(name.clone(), pkg_meta);
                 }
 
-                Box::pin(self.populate_custom_target_metadata(&m, cache)).await?;
+                Box::pin(self.populate_custom_target_metadata(&m, cache, root_declared, false)).await?;
                 continue;
             }
 
-            match parsed {
+            match effective_target {
                 PackageTarget::File(ref rel_path) => {
                     let file_spec_clean = spec.strip_prefix("file:").unwrap_or(spec).trim();
                     let abs_path = if rel_path.is_absolute() {
@@ -7948,91 +8018,95 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                         || file_spec_clean.ends_with(".tar")
                         || (abs_path.exists() && abs_path.is_file());
 
-                    if is_archive && abs_path.exists() {
-                        if let Ok(archive_bytes) = std::fs::read(&abs_path) {
-                            let integrity = Integrity::from_bytes(
-                                &archive_bytes,
-                                rnpm_core::integrity::Algorithm::Sha512,
-                            )
-                            .to_string();
+                    if is_archive {
+                        policy::check_source_gate(&self.source_policy, policy::SourceKind::File, is_root)?;
+                        if abs_path.exists() {
+                            if let Ok(archive_bytes) = std::fs::read(&abs_path) {
+                                let integrity = Integrity::from_bytes(
+                                    &archive_bytes,
+                                    rnpm_core::integrity::Algorithm::Sha512,
+                                )
+                                .to_string();
 
-                            let m =
-                                inspect_manifest_from_tarball(&archive_bytes).unwrap_or_default();
-                            let version = m.version.clone().unwrap_or_else(|| "1.0.0".to_string());
-                            let posix_rel = rnpm_core::to_posix_path(file_spec_clean);
-                            let resolved_url = format!("file:{posix_rel}");
+                                let m =
+                                    inspect_manifest_from_tarball(&archive_bytes).unwrap_or_default();
+                                let version = m.version.clone().unwrap_or_else(|| "1.0.0".to_string());
+                                let posix_rel = rnpm_core::to_posix_path(file_spec_clean);
+                                let resolved_url = format!("file:{posix_rel}");
 
-                            let bin = m.bin.as_ref().map(|b| match b {
-                                rnpm_core::manifest::PackageBin::Single(s) => {
-                                    rnpm_lockfile::PackageBin::Single(s.clone())
+                                let bin = m.bin.as_ref().map(|b| match b {
+                                    rnpm_core::manifest::PackageBin::Single(s) => {
+                                        rnpm_lockfile::PackageBin::Single(s.clone())
+                                    }
+                                    rnpm_core::manifest::PackageBin::Map(map) => {
+                                        rnpm_lockfile::PackageBin::Map(map.clone())
+                                    }
+                                });
+
+                                let ver_meta = PackageVersionMetadata {
+                                    name: name.clone(),
+                                    version: version.clone(),
+                                    dist_tarball: Some(resolved_url),
+                                    dist_integrity: Some(integrity),
+                                    dependencies: m.dependencies.clone(),
+                                    dependency_order: m.dependencies.keys().cloned().collect(),
+                                    dev_dependencies: m.dev_dependencies.clone(),
+                                    peer_dependencies: m.peer_dependencies.clone(),
+                                    peer_dependencies_meta: m.peer_dependencies_meta.clone(),
+                                    optional_dependencies: m.optional_dependencies.clone(),
+                                    os: m.os.clone(),
+                                    cpu: m.cpu.clone(),
+                                    libc: m.libc.clone(),
+                                    bin,
+                                    license: m
+                                        .extra
+                                        .get("license")
+                                        .and_then(|v| v.as_str())
+                                        .map(str::to_owned),
+                                    engines: m.engines.clone(),
+                                    has_install_script: m.scripts.contains_key("install")
+                                        || m.scripts.contains_key("postinstall")
+                                        || m.scripts.contains_key("preinstall"),
+                                    deprecated: None,
+                                    extra: m.extra.clone(),
+                                };
+
+                                let mut meta = if let Ok(locked) = cache.lock() {
+                                    locked.get(name).cloned()
+                                } else {
+                                    None
+                                };
+
+                                if meta.is_none() && !self.options.offline {
+                                    if let Ok(reg_abbrev) =
+                                        self.registry_client.get_package_metadata(name).await
+                                    {
+                                        meta = Some(abbreviated_to_package_metadata(&reg_abbrev));
+                                    }
                                 }
-                                rnpm_core::manifest::PackageBin::Map(map) => {
-                                    rnpm_lockfile::PackageBin::Map(map.clone())
+
+                                let mut pkg_meta = meta.unwrap_or_else(|| PackageMetadata {
+                                    name: name.clone(),
+                                    dist_tags: BTreeMap::new(),
+                                    versions: BTreeMap::new(),
+                                });
+
+                                pkg_meta.versions.insert(version.clone(), ver_meta);
+                                if pkg_meta.dist_tags.is_empty() {
+                                    pkg_meta
+                                        .dist_tags
+                                        .insert("latest".to_string(), version.clone());
                                 }
-                            });
 
-                            let ver_meta = PackageVersionMetadata {
-                                name: name.clone(),
-                                version: version.clone(),
-                                dist_tarball: Some(resolved_url),
-                                dist_integrity: Some(integrity),
-                                dependencies: m.dependencies.clone(),
-                                dependency_order: m.dependencies.keys().cloned().collect(),
-                                dev_dependencies: m.dev_dependencies.clone(),
-                                peer_dependencies: m.peer_dependencies.clone(),
-                                peer_dependencies_meta: m.peer_dependencies_meta.clone(),
-                                optional_dependencies: m.optional_dependencies.clone(),
-                                os: m.os.clone(),
-                                cpu: m.cpu.clone(),
-                                libc: m.libc.clone(),
-                                bin,
-                                license: m
-                                    .extra
-                                    .get("license")
-                                    .and_then(|v| v.as_str())
-                                    .map(str::to_owned),
-                                engines: m.engines.clone(),
-                                has_install_script: m.scripts.contains_key("install")
-                                    || m.scripts.contains_key("postinstall")
-                                    || m.scripts.contains_key("preinstall"),
-                                deprecated: None,
-                                extra: m.extra.clone(),
-                            };
-
-                            let mut meta = if let Ok(locked) = cache.lock() {
-                                locked.get(name).cloned()
-                            } else {
-                                None
-                            };
-
-                            if meta.is_none() && !self.options.offline {
-                                if let Ok(reg_abbrev) =
-                                    self.registry_client.get_package_metadata(name).await
-                                {
-                                    meta = Some(abbreviated_to_package_metadata(&reg_abbrev));
+                                if let Ok(mut locked) = cache.lock() {
+                                    locked.insert(name.clone(), pkg_meta);
                                 }
+
+                                Box::pin(self.populate_custom_target_metadata(&m, cache, root_declared, false)).await?;
                             }
-
-                            let mut pkg_meta = meta.unwrap_or_else(|| PackageMetadata {
-                                name: name.clone(),
-                                dist_tags: BTreeMap::new(),
-                                versions: BTreeMap::new(),
-                            });
-
-                            pkg_meta.versions.insert(version.clone(), ver_meta);
-                            if pkg_meta.dist_tags.is_empty() {
-                                pkg_meta
-                                    .dist_tags
-                                    .insert("latest".to_string(), version.clone());
-                            }
-
-                            if let Ok(mut locked) = cache.lock() {
-                                locked.insert(name.clone(), pkg_meta);
-                            }
-
-                            Box::pin(self.populate_custom_target_metadata(&m, cache)).await?;
                         }
-                    } else if !is_archive {
+                    } else {
+                        policy::check_source_gate(&self.source_policy, policy::SourceKind::Directory, is_root)?;
                         let manifest_path = abs_path.join("package.json");
                         let m = if manifest_path.exists() {
                             Manifest::from_file(&manifest_path).unwrap_or_default()
@@ -8112,10 +8186,17 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                             locked.insert(name.clone(), pkg_meta);
                         }
 
-                        Box::pin(self.populate_custom_target_metadata(&m, cache)).await?;
+                        Box::pin(self.populate_custom_target_metadata(&m, cache, root_declared, false)).await?;
                     }
                 }
                 PackageTarget::Url(ref url) => {
+                    let kind = if policy::is_registry_tarball(url.as_str()) {
+                        policy::SourceKind::Registry
+                    } else {
+                        policy::SourceKind::Remote
+                    };
+                    policy::check_source_gate(&self.source_policy, kind, is_root)?;
+
                     let url_str = url.as_str();
                     let archive_bytes_res = if self.options.offline {
                         if let Ok(Some((_entry, data))) = self.cache.get(url_str) {
@@ -8221,7 +8302,7 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                         locked.insert(name.clone(), pkg_meta);
                     }
 
-                    Box::pin(self.populate_custom_target_metadata(&m, cache)).await?;
+                    Box::pin(self.populate_custom_target_metadata(&m, cache, root_declared, false)).await?;
                 }
                 _ => {}
             }
