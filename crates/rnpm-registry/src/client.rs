@@ -651,6 +651,7 @@ pub fn parse_retry_after_str(s: &str) -> Option<u64> {
 pub struct RegistryClient {
     client: Client,
     config: RegistryClientConfig,
+    user_agent: HeaderValue,
     semaphore: std::sync::Arc<tokio::sync::Semaphore>,
     circuit_breaker: CircuitBreaker,
     http_requests: std::sync::Arc<std::sync::atomic::AtomicU64>,
@@ -671,10 +672,8 @@ impl RegistryClient {
             .filter(|_| config.user_agent == default_user_agent())
             .map(|(_, agent)| agent.as_str())
             .unwrap_or(&config.user_agent);
-        headers.insert(
-            USER_AGENT,
-            HeaderValue::from_str(agent).map_err(|e| RegistryError::Other(e.to_string()))?,
-        );
+        let user_agent =
+            HeaderValue::from_str(agent).map_err(|e| RegistryError::Other(e.to_string()))?;
         if let Some((command, _)) = cli_context {
             headers.insert(
                 "npm-command",
@@ -725,7 +724,7 @@ impl RegistryClient {
                         .filter(|v| !v.is_empty())
                 };
                 let https = env("https_proxy");
-                let http = https.clone().or_else(|| env("http_proxy")).or_else(|| env("proxy"));
+                let http = env("http_proxy").or_else(|| env("proxy"));
                 (https, http)
             } else {
                 (None, None)
@@ -758,14 +757,30 @@ impl RegistryClient {
                 .collect();
             let https = env_https_proxy.and_then(|u| reqwest::Url::parse(&u).ok());
             let http = env_http_proxy.and_then(|u| reqwest::Url::parse(&u).ok());
-            builder = builder.proxy(reqwest::Proxy::custom(move |url| {
-                let proxy = if url.scheme() == "https" { https.as_ref() } else { http.as_ref() }?;
+            let https_p = https.clone();
+            let http_p = http.clone();
+            let mut custom_proxy = reqwest::Proxy::custom(move |url| {
+                let proxy = if url.scheme() == "https" { https_p.as_ref() } else { http_p.as_ref() }?;
                 let host: Vec<&str> = url.host_str()?.split('.').rev().collect();
                 let bypass = no_proxy
                     .iter()
                     .any(|entry| entry.iter().enumerate().all(|(i, s)| host.get(i) == Some(&s.as_str())));
                 (!bypass).then(|| proxy.clone())
-            }));
+            });
+            if let Some(https_u) = &https {
+                if let (Some(u), Some(p)) = (Some(https_u.username()), https_u.password()) {
+                    if !u.is_empty() {
+                        custom_proxy = custom_proxy.basic_auth(u, p);
+                    }
+                }
+            } else if let Some(http_u) = &http {
+                if let (Some(u), Some(p)) = (Some(http_u.username()), http_u.password()) {
+                    if !u.is_empty() {
+                        custom_proxy = custom_proxy.basic_auth(u, p);
+                    }
+                }
+            }
+            builder = builder.proxy(custom_proxy);
         }
 
         if let Some(https_proxy) = &config.https_proxy {
@@ -908,6 +923,7 @@ impl RegistryClient {
         Ok(Self {
             client,
             config,
+            user_agent,
             semaphore,
             circuit_breaker,
             http_requests: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -1264,7 +1280,10 @@ impl RegistryClient {
             seen_redirect_urls.insert(current_url.clone());
 
             let response_result: Result<Response, RegistryError> = loop {
-                let mut req = self.client.request(method.clone(), current_url.clone());
+                let mut req = self
+                    .client
+                    .request(method.clone(), current_url.clone())
+                    .header(USER_AGENT, self.user_agent.clone());
 
                 if let Some(accept) = accept_header {
                     req = req.header(ACCEPT, accept);
@@ -1494,7 +1513,10 @@ impl RegistryClient {
             seen_redirect_urls.insert(current_url.clone());
 
             let response_result: Result<Response, RegistryError> = loop {
-                let mut req = self.client.request(method.clone(), current_url.clone());
+                let mut req = self
+                    .client
+                    .request(method.clone(), current_url.clone())
+                    .header(USER_AGENT, self.user_agent.clone());
 
                 if let Some(ct) = content_type {
                     req = req.header(CONTENT_TYPE, ct);

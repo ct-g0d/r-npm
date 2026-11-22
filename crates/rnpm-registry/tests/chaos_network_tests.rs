@@ -902,3 +902,50 @@ async fn test_chaos_circuit_breaker_transitions_open_fast_fail_and_half_open_rec
 
     server.stop();
 }
+
+#[tokio::test]
+async fn test_chaos_request_send_dropped_connection_retries_and_recovers() {
+    let server = RawChaosServer::start(|mut stream, attempt, _| async move {
+        let mut buf = [0u8; 2048];
+        let _ = stream.read(&mut buf).await;
+
+        if attempt == 0 {
+            // Drop connection immediately during request send
+            drop(stream);
+        } else {
+            let body = r#"{"name": "dropped-request-pkg", "dist-tags": {"latest": "1.0.0"}, "versions": {"1.0.0": {"name": "dropped-request-pkg", "version": "1.0.0", "dist": {"tarball": "http://127.0.0.1/dropped-request-pkg.tgz", "shasum": "da39a3ee5e6b4b0d3255bfef95601890afd80709"}}}}"#;
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = stream.write_all(resp.as_bytes()).await;
+            let _ = stream.flush().await;
+        }
+    })
+    .await;
+
+    let config = RegistryClientConfig {
+        default_registry: server.url(),
+        user_agent: "test-chaos-dropped-request".into(),
+        timeout: Duration::from_secs(5),
+        max_retries: 2,
+        initial_retry_backoff: Duration::from_millis(5),
+        max_retry_backoff: Duration::from_millis(20),
+        ..Default::default()
+    };
+    let client = RegistryClient::with_config(config).unwrap();
+
+    let meta = client
+        .get_package_metadata("dropped-request-pkg")
+        .await
+        .expect("Should have recovered from dropped connection on retry");
+    assert_eq!(meta.name, "dropped-request-pkg");
+    assert_eq!(
+        server.connection_count.load(Ordering::SeqCst),
+        2,
+        "Should have connected twice (1 fail, 1 success retry)"
+    );
+
+    server.stop();
+}

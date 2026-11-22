@@ -100,6 +100,26 @@ pub enum RegistryError {
     Other(String),
 }
 
+fn is_tls_cert_error(e: &reqwest::Error) -> bool {
+    let mut source: Option<&(dyn std::error::Error + 'static)> = std::error::Error::source(e);
+    while let Some(err) = source {
+        let msg = err.to_string().to_ascii_lowercase();
+        if msg.contains("certificate")
+            || msg.contains("cert verify")
+            || msg.contains("invalid cert")
+            || msg.contains("unknownissuer")
+            || msg.contains("self-signed")
+            || msg.contains("badder")
+            || msg.contains("handshake failure")
+            || msg.contains("unsupportednametype")
+        {
+            return true;
+        }
+        source = err.source();
+    }
+    false
+}
+
 impl RegistryError {
     /// Returns the HTTP status code associated with this error, if applicable.
     pub fn status_code(&self) -> Option<u16> {
@@ -199,21 +219,22 @@ impl RegistryError {
         }
     }
 
-    /// Returns true if this error is transient and retryable (timeouts, connect errors, truncated body stream decode errors, 429/502/503/504).
+    /// Returns true if this error is transient and retryable (timeouts, connect errors, request-send errors, truncated body stream decode errors, 429/502/503/504).
     pub fn is_transient(&self) -> bool {
         match self {
             Self::Http(e) => {
                 if e.is_redirect() || e.is_builder() {
                     return false;
                 }
-                if e.is_timeout() || e.is_connect() || e.is_decode() || e.is_body() {
-                    return true;
+                if is_tls_cert_error(e) {
+                    return false;
                 }
                 if let Some(status) = e.status() {
                     let code = status.as_u16();
-                    if code == 429 || code == 502 || code == 503 || code == 504 {
-                        return true;
-                    }
+                    return code == 429 || code == 502 || code == 503 || code == 504;
+                }
+                if e.is_timeout() || e.is_connect() || e.is_decode() || e.is_body() || e.is_request() {
+                    return true;
                 }
                 let mut source: Option<&(dyn std::error::Error + 'static)> =
                     std::error::Error::source(e);
@@ -388,5 +409,47 @@ mod tests {
             message: "Too large".into(),
         };
         assert!(!size_err.is_transient());
+    }
+
+    #[tokio::test]
+    async fn test_is_transient_http_request_send_and_builder_errors() {
+        let client = reqwest::Client::builder().build().unwrap();
+
+        // 1. Builder error (invalid URL): must NOT be transient
+        let builder_err = client.get("not-a-valid-url").send().await.unwrap_err();
+        assert!(builder_err.is_builder());
+        let reg_builder_err = RegistryError::Http(builder_err);
+        assert!(
+            !reg_builder_err.is_transient(),
+            "Builder errors must not be transient"
+        );
+
+        // 2. Dropped connection / closed socket before response (is_request): MUST be transient
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                use tokio::io::AsyncReadExt;
+                let mut buf = [0u8; 128];
+                let _ = stream.read(&mut buf).await;
+                // Abruptly drop socket without sending response headers
+                drop(stream);
+            }
+        });
+
+        let request_send_err = client
+            .get(format!("http://{addr}/"))
+            .send()
+            .await
+            .unwrap_err();
+        assert!(
+            request_send_err.is_request(),
+            "Expected is_request to be true on connection drop: {request_send_err:?}"
+        );
+        let reg_request_err = RegistryError::Http(request_send_err);
+        assert!(
+            reg_request_err.is_transient(),
+            "Request-send dropped connection errors must be classified as transient"
+        );
     }
 }
