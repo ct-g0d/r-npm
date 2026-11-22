@@ -347,25 +347,18 @@ pub async fn run(project_dir: &Path, json_output: bool) -> anyhow::Result<()> {
                 let mut reg_key_expiries = HashMap::new();
                 if let Some(rkeys) = keys.get(&pkg.registry) {
                     for k in rkeys {
-                        let mut expired = false;
                         if let Some(expires_str) = &k.expires {
                             match rnpm_config::date::parse_js_date(expires_str) {
                                 Some(exp) => {
                                     reg_key_expiries.insert(k.keyid.clone(), (expires_str.clone(), exp));
-                                    if published >= exp {
-                                        expired = true;
-                                    }
                                 }
                                 None => {
                                     // Non-null unparseable date is treated as expired (invalid)
                                     reg_key_expiries.insert(k.keyid.clone(), (expires_str.clone(), i64::MIN));
-                                    expired = true;
                                 }
                             }
                         }
-                        if !expired {
-                            reg_keys.insert(k.keyid.clone(), k.spki.clone());
-                        }
+                        reg_keys.insert(k.keyid.clone(), k.spki.clone());
                     }
                 }
 

@@ -6,11 +6,12 @@ use rnpm_registry::metadata::AbbreviatedPackageMetadata;
 use rnpm_registry::provenance::{
     assemble_sigstore_bundle, decode_base64, format_registry_signature_payload,
     normalize_repository_url, sign_dsse_envelope, AttestationItem, AttestationResponse,
-    EphemeralSigner, InTotoStatement, InTotoSubject, LogId, ProvenancePolicy, ProvenanceVerifier,
-    PublicKeyHint, SigstoreBundle, SlsaBuilder, SlsaConfigSource, SlsaInvocation, SlsaPredicate,
-    TlogEntry, VerificationMaterial, FULCIO_INTERMEDIATE_CA_2_DER_B64, FULCIO_ROOT_CA_1_DER_B64,
-    FULCIO_ROOT_CA_2_DER_B64, NPM_REGISTRY_KEYID, REKOR_DEFAULT_LOG_ID,
-    REKOR_DEFAULT_PUBKEY_SPKI_B64, TEST_MOCK_CA_PRIV_PKCS8_B64, TEST_MOCK_REKOR_PRIV_PKCS8_B64,
+    DsseSignature, EphemeralSigner, InTotoStatement, InTotoSubject, LogId, ProvenancePolicy,
+    ProvenanceVerifier, PublicKeyHint, SigstoreBundle, SlsaBuilder, SlsaConfigSource,
+    SlsaInvocation, SlsaPredicate, TlogEntry, VerificationMaterial,
+    FULCIO_INTERMEDIATE_CA_2_DER_B64, FULCIO_ROOT_CA_1_DER_B64, FULCIO_ROOT_CA_2_DER_B64,
+    NPM_REGISTRY_KEYID, REKOR_DEFAULT_LOG_ID, REKOR_DEFAULT_PUBKEY_SPKI_B64,
+    TEST_MOCK_CA_PRIV_PKCS8_B64, TEST_MOCK_REKOR_PRIV_PKCS8_B64,
 };
 use rnpm_registry::RegistryError;
 
@@ -1611,4 +1612,465 @@ fn test_forged_unauthenticated_tlog_integrated_time_cannot_resurrect_expired_key
         }
         other => panic!("Expected InvalidSignature error, got: {other:?}"),
     }
+}
+
+#[test]
+fn test_multi_sig_dsse_envelope_rekor_binding_requires_verified_sig() {
+    let tarball_bytes = b"multi-sig test tarball bytes";
+    let sha512_hex = HEXLOWER.encode(&Sha512::digest(tarball_bytes));
+    let mut bundle = make_test_bundle(
+        "multi-sig-pkg",
+        &sha512_hex,
+        "https://github.com/org/multi-sig-pkg",
+        "abc123commit",
+    );
+
+    let envelope = bundle.dsse_envelope.as_mut().unwrap();
+    let valid_sig = envelope.signatures[0].clone();
+    let bogus_sig = DsseSignature {
+        keyid: Some("bogus-keyid".to_string()),
+        sig: data_encoding::BASE64.encode(b"completely_invalid_signature_bytes_12345678"),
+    };
+    // Put bogus_sig at index 0, valid_sig at index 1
+    envelope.signatures = vec![bogus_sig.clone(), valid_sig.clone()];
+
+    // 1. First, create a Rekor entry whose body is bound ONLY to bogus_sig (signatures[0])
+    let payload_bytes = rnpm_registry::provenance::decode_base64(&envelope.payload).unwrap();
+    let payload_hash_hex = HEXLOWER.encode(&Sha256::digest(&payload_bytes));
+    let cert_raw = bundle
+        .verification_material
+        .as_ref()
+        .unwrap()
+        .certificate
+        .as_ref()
+        .unwrap()
+        .raw_bytes
+        .clone();
+    let cert_der = rnpm_registry::provenance::decode_base64(&cert_raw).unwrap();
+    let leaf_b64 = data_encoding::BASE64.encode(&cert_der);
+
+    let rng = ring::rand::SystemRandom::new();
+    let rekor_priv =
+        rnpm_registry::provenance::decode_base64(TEST_MOCK_REKOR_PRIV_PKCS8_B64).unwrap();
+    let rekor_key_pair = ring::signature::EcdsaKeyPair::from_pkcs8(
+        &ring::signature::ECDSA_P256_SHA256_ASN1_SIGNING,
+        &rekor_priv,
+        &rng,
+    )
+    .unwrap();
+
+    let bogus_body_json = serde_json::json!({
+        "apiVersion": "0.0.1",
+        "kind": "dsse",
+        "spec": {
+            "payloadHash": {
+                "algorithm": "sha256",
+                "value": payload_hash_hex,
+            },
+            "signatures": [
+                {
+                    "signature": bogus_sig.sig,
+                    "verifier": leaf_b64,
+                }
+            ]
+        }
+    });
+    let bogus_body_b64 = data_encoding::BASE64.encode(
+        serde_json::to_string(&bogus_body_json)
+            .unwrap()
+            .as_bytes(),
+    );
+    let now = 1700000000i64;
+    let set_canonical_json = format!(
+        r#"{{"body":"{}","integratedTime":{},"logID":"{}","logIndex":{}}}"#,
+        bogus_body_b64, now, REKOR_DEFAULT_LOG_ID, 998877
+    );
+    let rekor_sig = rekor_key_pair
+        .sign(&rng, set_canonical_json.as_bytes())
+        .unwrap();
+
+    bundle.verification_material.as_mut().unwrap().tlog_entries[0] = TlogEntry {
+        log_index: 998877,
+        log_id: LogId {
+            key_id: REKOR_DEFAULT_LOG_ID.into(),
+        },
+        integrated_time: now,
+        inclusion_promise: Some(rnpm_registry::provenance::InclusionPromise {
+            signed_entry_timestamp: data_encoding::BASE64.encode(rekor_sig.as_ref()),
+        }),
+        inclusion_proof: None,
+        canonicalized_body: Some(bogus_body_b64),
+    };
+
+    let verifier = ProvenanceVerifier::new(ProvenancePolicy::AllowAny).with_test_mock_roots();
+
+    // Verification must FAIL because Rekor body is bound to signatures[0] (bogus), not verified signatures[1]
+    let err = verifier
+        .verify_package(
+            "multi-sig-pkg",
+            Some("1.0.0"),
+            &bundle,
+            None,
+            Some(tarball_bytes),
+        )
+        .unwrap_err();
+    match err {
+        RegistryError::InvalidSigstoreBundle(msg) => {
+            assert!(
+                msg.contains("signature mismatch"),
+                "Expected signature mismatch with Rekor body, got: {msg}"
+            );
+        }
+        other => panic!("Expected InvalidSigstoreBundle error, got: {other:?}"),
+    }
+
+    // 2. Now update Rekor entry body to bind to signatures[1] (valid_sig)
+    let valid_body_json = serde_json::json!({
+        "apiVersion": "0.0.1",
+        "kind": "dsse",
+        "spec": {
+            "payloadHash": {
+                "algorithm": "sha256",
+                "value": payload_hash_hex,
+            },
+            "signatures": [
+                {
+                    "signature": valid_sig.sig,
+                    "verifier": leaf_b64,
+                }
+            ]
+        }
+    });
+    let valid_body_b64 = data_encoding::BASE64.encode(
+        serde_json::to_string(&valid_body_json)
+            .unwrap()
+            .as_bytes(),
+    );
+    let set_canonical_json_valid = format!(
+        r#"{{"body":"{}","integratedTime":{},"logID":"{}","logIndex":{}}}"#,
+        valid_body_b64, now, REKOR_DEFAULT_LOG_ID, 998877
+    );
+    let rekor_sig_valid = rekor_key_pair
+        .sign(&rng, set_canonical_json_valid.as_bytes())
+        .unwrap();
+
+    bundle.verification_material.as_mut().unwrap().tlog_entries[0] = TlogEntry {
+        log_index: 998877,
+        log_id: LogId {
+            key_id: REKOR_DEFAULT_LOG_ID.into(),
+        },
+        integrated_time: now,
+        inclusion_promise: Some(rnpm_registry::provenance::InclusionPromise {
+            signed_entry_timestamp: data_encoding::BASE64.encode(rekor_sig_valid.as_ref()),
+        }),
+        inclusion_proof: None,
+        canonicalized_body: Some(valid_body_b64),
+    };
+
+    // Verification must now SUCCEED cleanly
+    let verified = verifier
+        .verify_package(
+            "multi-sig-pkg",
+            Some("1.0.0"),
+            &bundle,
+            None,
+            Some(tarball_bytes),
+        )
+        .unwrap();
+    assert_eq!(verified.package_name, "multi-sig-pkg");
+}
+
+#[test]
+fn test_rekor_entry_verifier_base64_encoded_pem_passes() {
+    let tarball_bytes = b"base64 pem verifier tarball bytes";
+    let sha512_hex = HEXLOWER.encode(&Sha512::digest(tarball_bytes));
+    let mut bundle = make_test_bundle(
+        "b64-pem-verifier-pkg",
+        &sha512_hex,
+        "https://github.com/org/b64-pem-verifier-pkg",
+        "sha12345",
+    );
+
+    let cert_raw = bundle
+        .verification_material
+        .as_ref()
+        .unwrap()
+        .certificate
+        .as_ref()
+        .unwrap()
+        .raw_bytes
+        .clone();
+    let cert_der = rnpm_registry::provenance::decode_base64(&cert_raw).unwrap();
+
+    // Convert cert DER to PEM string
+    let pem_string = rnpm_registry::provenance::der_to_pem_cert(&cert_der);
+    // Encode the PEM string in base64: BASE64(-----BEGIN CERTIFICATE-----...)
+    let b64_pem = data_encoding::BASE64.encode(pem_string.as_bytes());
+
+    let envelope = bundle.dsse_envelope.as_ref().unwrap();
+    let payload_bytes = rnpm_registry::provenance::decode_base64(&envelope.payload).unwrap();
+    let payload_hash_hex = HEXLOWER.encode(&Sha256::digest(&payload_bytes));
+
+    let body_json = serde_json::json!({
+        "apiVersion": "0.0.1",
+        "kind": "dsse",
+        "spec": {
+            "payloadHash": {
+                "algorithm": "sha256",
+                "value": payload_hash_hex,
+            },
+            "signatures": [
+                {
+                    "signature": envelope.signatures[0].sig,
+                    "verifier": b64_pem,
+                }
+            ]
+        }
+    });
+    let body_b64 = data_encoding::BASE64.encode(
+        serde_json::to_string(&body_json)
+            .unwrap()
+            .as_bytes(),
+    );
+
+    let rng = ring::rand::SystemRandom::new();
+    let rekor_priv =
+        rnpm_registry::provenance::decode_base64(TEST_MOCK_REKOR_PRIV_PKCS8_B64).unwrap();
+    let rekor_key_pair = ring::signature::EcdsaKeyPair::from_pkcs8(
+        &ring::signature::ECDSA_P256_SHA256_ASN1_SIGNING,
+        &rekor_priv,
+        &rng,
+    )
+    .unwrap();
+
+    let now = 1700000000i64;
+    let set_canonical_json = format!(
+        r#"{{"body":"{}","integratedTime":{},"logID":"{}","logIndex":{}}}"#,
+        body_b64, now, REKOR_DEFAULT_LOG_ID, 12345
+    );
+    let rekor_sig = rekor_key_pair
+        .sign(&rng, set_canonical_json.as_bytes())
+        .unwrap();
+
+    bundle.verification_material.as_mut().unwrap().tlog_entries[0] = TlogEntry {
+        log_index: 12345,
+        log_id: LogId {
+            key_id: REKOR_DEFAULT_LOG_ID.into(),
+        },
+        integrated_time: now,
+        inclusion_promise: Some(rnpm_registry::provenance::InclusionPromise {
+            signed_entry_timestamp: data_encoding::BASE64.encode(rekor_sig.as_ref()),
+        }),
+        inclusion_proof: None,
+        canonicalized_body: Some(body_b64),
+    };
+
+    let verifier = ProvenanceVerifier::new(ProvenancePolicy::AllowAny).with_test_mock_roots();
+    let verified = verifier
+        .verify_package(
+            "b64-pem-verifier-pkg",
+            Some("1.0.0"),
+            &bundle,
+            None,
+            Some(tarball_bytes),
+        )
+        .unwrap();
+    assert_eq!(verified.package_name, "b64-pem-verifier-pkg");
+}
+
+#[test]
+fn test_keyed_attestation_valid_set_unrelated_body_cannot_bypass_key_expiry() {
+    let tarball_bytes = b"keyed attestation unrelated body test bytes";
+    let sha512_hex = HEXLOWER.encode(&Sha512::digest(tarball_bytes));
+    let signer = EphemeralSigner::new().unwrap();
+
+    let mut digest = HashMap::new();
+    digest.insert("sha512".to_string(), sha512_hex);
+    let statement = InTotoStatement {
+        statement_type: "https://in-toto.io/Statement/v1".into(),
+        subject: vec![InTotoSubject {
+            name: "pkg:npm/unrelated-body-pkg@1.0.0".into(),
+            digest,
+        }],
+        predicate_type: "https://slsa.dev/provenance/v1".into(),
+        predicate: SlsaPredicate::default(),
+    };
+    let mut envelope = sign_dsse_envelope(&statement, &signer).unwrap();
+    let keyid = "SHA256:unrelated-body-key";
+    envelope.signatures[0].keyid = Some(keyid.to_string());
+
+    // Create a Rekor entry whose body is for a completely UNRELATED payload / signature
+    let unrelated_body_json = serde_json::json!({
+        "apiVersion": "0.0.1",
+        "kind": "dsse",
+        "spec": {
+            "payloadHash": {
+                "algorithm": "sha256",
+                "value": "0000000000000000000000000000000000000000000000000000000000000000",
+            },
+            "signatures": [
+                {
+                    "signature": data_encoding::BASE64.encode(b"completely-unrelated-signature"),
+                    "verifier": data_encoding::BASE64.encode(signer.public_key_spki()),
+                }
+            ]
+        }
+    });
+    let unrelated_body_b64 = data_encoding::BASE64.encode(
+        serde_json::to_string(&unrelated_body_json)
+            .unwrap()
+            .as_bytes(),
+    );
+
+    let rng = ring::rand::SystemRandom::new();
+    let rekor_priv =
+        rnpm_registry::provenance::decode_base64(TEST_MOCK_REKOR_PRIV_PKCS8_B64).unwrap();
+    let rekor_key_pair = ring::signature::EcdsaKeyPair::from_pkcs8(
+        &ring::signature::ECDSA_P256_SHA256_ASN1_SIGNING,
+        &rekor_priv,
+        &rng,
+    )
+    .unwrap();
+
+    // Integrated time is from 2020 (1577836800), before key expiry
+    let old_time = 1577836800i64;
+    let set_canonical_json = format!(
+        r#"{{"body":"{}","integratedTime":{},"logID":"{}","logIndex":{}}}"#,
+        unrelated_body_b64, old_time, REKOR_DEFAULT_LOG_ID, 54321
+    );
+    // SET is cryptographically VALID for the unrelated body!
+    let rekor_sig = rekor_key_pair
+        .sign(&rng, set_canonical_json.as_bytes())
+        .unwrap();
+
+    let bundle = SigstoreBundle {
+        media_type: Some("application/vnd.sigstore.bundle+json;version=0.1".into()),
+        verification_material: Some(VerificationMaterial {
+            x509_certificate_chain: None,
+            certificate: None,
+            public_key: Some(PublicKeyHint {
+                hint: Some(keyid.to_string()),
+                raw_bytes: None,
+            }),
+            tlog_entries: vec![TlogEntry {
+                log_index: 54321,
+                log_id: LogId {
+                    key_id: REKOR_DEFAULT_LOG_ID.to_string(),
+                },
+                integrated_time: old_time,
+                inclusion_promise: Some(rnpm_registry::provenance::InclusionPromise {
+                    signed_entry_timestamp: data_encoding::BASE64.encode(rekor_sig.as_ref()),
+                }),
+                inclusion_proof: None,
+                canonicalized_body: Some(unrelated_body_b64),
+            }],
+            timestamp_verification_data: None,
+        }),
+        dsse_envelope: Some(envelope),
+    };
+
+    let mut reg_keys = HashMap::new();
+    reg_keys.insert(keyid.to_string(), signer.public_key_spki().to_vec());
+
+    let mut expiries = HashMap::new();
+    // Key expired in 2021 (1609459200000 ms)
+    expiries.insert(
+        keyid.to_string(),
+        ("2021-01-01T00:00:00Z".to_string(), 1609459200000i64),
+    );
+
+    // Trusted Rekor key is configured on the verifier
+    let rekor_pub_der = decode_base64(REKOR_DEFAULT_PUBKEY_SPKI_B64).unwrap();
+    let verifier = ProvenanceVerifier::new(ProvenancePolicy::AllowAny)
+        .with_registry_keys(reg_keys)
+        .with_registry_key_expiries(expiries)
+        .with_rekor_public_key(rekor_pub_der);
+
+    // Because the Rekor entry's body is unrelated, verifier must NOT trust the old integratedTime,
+    // falls back to current time (> 2024), and rejects the expired key!
+    let err = verifier
+        .verify_package(
+            "unrelated-body-pkg",
+            Some("1.0.0"),
+            &bundle,
+            None,
+            Some(tarball_bytes),
+        )
+        .unwrap_err();
+
+    match err {
+        RegistryError::InvalidSignature(msg) => {
+            assert!(
+                msg.contains("expired"),
+                "Expected expired key error despite valid SET on unrelated body, got: {msg}"
+            );
+        }
+        other => panic!("Expected InvalidSignature error, got: {other:?}"),
+    }
+}
+
+#[test]
+fn test_live_rekor_submission_payload_builder_produces_base64_pem_roundtrip() {
+    let rng = ring::rand::SystemRandom::new();
+    let ca_priv =
+        rnpm_registry::provenance::decode_base64(TEST_MOCK_CA_PRIV_PKCS8_B64).unwrap();
+    let ca_key_pair = ring::signature::EcdsaKeyPair::from_pkcs8(
+        &ring::signature::ECDSA_P256_SHA256_ASN1_SIGNING,
+        &ca_priv,
+        &rng,
+    )
+    .unwrap();
+
+    let signer = EphemeralSigner::new().unwrap();
+    let fulcio_exts = [(
+        rnpm_registry::asn1::OID_FULCIO_ISSUER,
+        "https://token.actions.githubusercontent.com",
+    )];
+    let now = 1700000000i64;
+    let cert_der = rnpm_registry::asn1::create_test_x509_certificate(
+        "test-signer",
+        "sigstore",
+        signer.public_key_uncompressed(),
+        Some("https://github.com/actions/runner"),
+        &fulcio_exts,
+        now - 60,
+        now + 600,
+        &|tbs| ca_key_pair.sign(&rng, tbs).unwrap().as_ref().to_vec(),
+    );
+
+    // 1. der_to_pem_cert produces valid PEM format
+    let pem_string = rnpm_registry::provenance::der_to_pem_cert(&cert_der);
+    assert!(pem_string.starts_with("-----BEGIN CERTIFICATE-----\n"));
+    assert!(pem_string.ends_with("-----END CERTIFICATE-----\n"));
+
+    // Verify 64-char wrapping of internal lines
+    let inner_lines: Vec<&str> = pem_string
+        .lines()
+        .filter(|l| !l.starts_with("-----"))
+        .collect();
+    for (i, line) in inner_lines.iter().enumerate() {
+        if i + 1 < inner_lines.len() {
+            assert_eq!(
+                line.len(),
+                64,
+                "Inner PEM line should be 64 characters: {line}"
+            );
+        } else {
+            assert!(
+                line.len() <= 64,
+                "Last PEM line should be <= 64 characters: {line}"
+            );
+        }
+    }
+
+    // 2. Base64 encode the PEM bytes (what submit_rekor_dsse_entry sends to Rekor)
+    let leaf_b64 = data_encoding::BASE64.encode(pem_string.as_bytes());
+
+    // 3. decode_rekor_verifier decodes base64(PEM) cleanly back to original DER
+    let decoded_der = rnpm_registry::provenance::decode_rekor_verifier(&leaf_b64).unwrap();
+    assert_eq!(decoded_der, cert_der);
+
+    // 4. decode_pem_to_der also decodes the PEM string back to original DER
+    let pem_decoded_der = rnpm_registry::provenance::decode_pem_to_der(&pem_string).unwrap();
+    assert_eq!(pem_decoded_der, cert_der);
 }

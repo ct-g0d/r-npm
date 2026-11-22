@@ -356,29 +356,34 @@ pub fn verify_signature(
     ))
 }
 
+/// Verifies that a DSSE envelope is authentically signed by the given public key over DSSE PAE,
+/// returning a reference to the exact verified signature.
+pub fn verify_dsse_signature<'a>(
+    envelope: &'a DsseEnvelope,
+    public_key: &[u8],
+) -> Result<&'a DsseSignature, RegistryError> {
+    let payload = envelope.decode_payload()?;
+    let pae = dsse_pre_auth_encoding(&envelope.payload_type, &payload);
+
+    for s in &envelope.signatures {
+        if let Ok(sig_bytes) = decode_base64(&s.sig) {
+            if verify_signature(public_key, &pae, &sig_bytes).is_ok() {
+                return Ok(s);
+            }
+        }
+    }
+
+    Err(RegistryError::InvalidSignature(
+        "None of the DSSE signatures matched the expected public key".into(),
+    ))
+}
+
 /// Verifies that a DSSE envelope is authentically signed by the given public key over DSSE PAE.
 pub fn verify_dsse_envelope(
     envelope: &DsseEnvelope,
     public_key: &[u8],
 ) -> Result<(), RegistryError> {
-    let payload = envelope.decode_payload()?;
-    let pae = dsse_pre_auth_encoding(&envelope.payload_type, &payload);
-
-    let mut any_verified = false;
-    for s in &envelope.signatures {
-        let sig_bytes = decode_base64(&s.sig)?;
-        if verify_signature(public_key, &pae, &sig_bytes).is_ok() {
-            any_verified = true;
-            break;
-        }
-    }
-
-    if !any_verified {
-        return Err(RegistryError::InvalidSignature(
-            "None of the DSSE signatures matched the expected public key".into(),
-        ));
-    }
-    Ok(())
+    verify_dsse_signature(envelope, public_key).map(|_| ())
 }
 
 /// Verifies a Rekor Signed Entry Timestamp (SET) over canonicalized JSON.
@@ -633,11 +638,69 @@ pub fn verify_merkle_inclusion_proof(
     Ok(())
 }
 
-/// Binds a Rekor transparency log entry's canonicalizedBody to the DSSE envelope and leaf certificate.
+fn matches_rekor_signature(entry_sig: &str, expected_sig_b64: &str, expected_sig_bytes: &[u8]) -> bool {
+    let trimmed = entry_sig.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    if trimmed == expected_sig_b64 {
+        return true;
+    }
+    if let Ok(dec) = decode_base64(trimmed) {
+        if dec == expected_sig_bytes {
+            return true;
+        }
+        if let Ok(double_str) = std::str::from_utf8(&dec) {
+            let double_trimmed = double_str.trim();
+            if double_trimmed == expected_sig_b64 {
+                return true;
+            }
+            if let Ok(dec2) = decode_base64(double_trimmed) {
+                if dec2 == expected_sig_bytes {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+fn matches_rekor_verifier(verifier_str: &str, leaf_cert_or_key: &[u8]) -> bool {
+    let Ok(verifier_der) = decode_rekor_verifier(verifier_str) else {
+        return false;
+    };
+    if verifier_der == leaf_cert_or_key {
+        return true;
+    }
+    let target_parsed = parse_x509_certificate(leaf_cert_or_key);
+    let verifier_parsed = parse_x509_certificate(&verifier_der);
+
+    if let Ok(target_cert) = &target_parsed {
+        if verifier_der == target_cert.spki_bytes {
+            return true;
+        }
+        if let Ok(v_cert) = &verifier_parsed {
+            if v_cert.spki_bytes == target_cert.spki_bytes {
+                return true;
+            }
+        }
+    } else {
+        // leaf_cert_or_key is not an X.509 cert; it is an SPKI or registry public key
+        if let Ok(v_cert) = &verifier_parsed {
+            if v_cert.spki_bytes == leaf_cert_or_key {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Binds a Rekor transparency log entry's canonicalizedBody to the DSSE envelope, verified signature, and leaf certificate/key.
 pub fn verify_rekor_body_binding(
     entry: &TlogEntry,
     envelope: &DsseEnvelope,
-    leaf_cert_der: &[u8],
+    verified_sig: &DsseSignature,
+    leaf_cert_or_key: &[u8],
 ) -> Result<(), RegistryError> {
     let body_str = entry.canonicalized_body.as_deref().ok_or_else(|| {
         RegistryError::InvalidSigstoreBundle("Missing canonicalizedBody in Rekor entry".into())
@@ -664,17 +727,11 @@ pub fn verify_rekor_body_binding(
     let payload_bytes = decode_base64(&envelope.payload)?;
     let expected_payload_hash_hex = HEXLOWER.encode(&Sha256::digest(&payload_bytes));
 
-    let expected_sig = envelope
-        .signatures
-        .first()
-        .ok_or_else(|| RegistryError::InvalidSigstoreBundle("DSSE envelope has no signatures".into()))?;
-    let expected_sig_b64 = expected_sig.sig.trim();
+    let expected_sig_b64 = verified_sig.sig.trim();
     if expected_sig_b64.is_empty() {
         return Err(RegistryError::InvalidSigstoreBundle("DSSE envelope signature is empty".into()));
     }
     let expected_sig_bytes = decode_base64(expected_sig_b64)?;
-
-    let leaf_cert_b64 = BASE64.encode(leaf_cert_der);
 
     match kind {
         "dsse" => {
@@ -709,7 +766,7 @@ pub fn verify_rekor_body_binding(
                 )));
             }
 
-            // 2. Verify signature is present, non-empty, and matches DSSE envelope
+            // 2. Verify signature and verifier match BOTH verified signature and leaf certificate/key
             let sigs = spec
                 .get("signatures")
                 .and_then(|s| s.as_array())
@@ -720,60 +777,61 @@ pub fn verify_rekor_body_binding(
                     )
                 })?;
 
-            let sig_entry = &sigs[0];
-            let entry_sig = sig_entry
-                .get("signature")
-                .or_else(|| sig_entry.get("content"))
-                .and_then(|s| s.as_str())
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .ok_or_else(|| {
-                    RegistryError::InvalidSigstoreBundle(
-                        "Missing or empty signature in Rekor dsse entry".into(),
-                    )
-                })?;
+            let default_verifier = spec
+                .get("verifiers")
+                .and_then(|v| v.as_array())
+                .and_then(|arr| arr.first())
+                .and_then(|v| v.as_str());
 
-            let sig_matches = if entry_sig == expected_sig_b64 {
-                true
-            } else if let Ok(dec) = decode_base64(entry_sig) {
-                dec == expected_sig_bytes
-            } else {
-                false
-            };
-            if !sig_matches {
-                return Err(RegistryError::InvalidSigstoreBundle(
-                    "Rekor dsse signature mismatch with DSSE envelope".into(),
-                ));
+            let mut sig_matched = false;
+            let mut matched = false;
+            let mut has_empty_verifier = false;
+            for sig_entry in sigs {
+                let entry_sig = sig_entry
+                    .get("signature")
+                    .or_else(|| sig_entry.get("content"))
+                    .and_then(|s| s.as_str())
+                    .unwrap_or_default();
+
+                if !matches_rekor_signature(entry_sig, expected_sig_b64, &expected_sig_bytes) {
+                    continue;
+                }
+                sig_matched = true;
+
+                let verifier = sig_entry
+                    .get("verifier")
+                    .and_then(|v| v.as_str())
+                    .or(default_verifier)
+                    .map(str::trim)
+                    .unwrap_or_default();
+
+                if verifier.is_empty() {
+                    has_empty_verifier = true;
+                    continue;
+                }
+
+                if matches_rekor_verifier(verifier, leaf_cert_or_key) {
+                    matched = true;
+                    break;
+                }
             }
 
-            // 3. Verify verifier is present, non-empty, and matches leaf certificate
-            let verifier = sig_entry
-                .get("verifier")
-                .and_then(|v| v.as_str())
-                .or_else(|| {
-                    spec.get("verifiers")
-                        .and_then(|v| v.as_array())
-                        .and_then(|arr| arr.first())
-                        .and_then(|v| v.as_str())
-                })
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .ok_or_else(|| {
-                    RegistryError::InvalidSigstoreBundle(
-                        "Missing or empty verifier in Rekor dsse entry".into(),
-                    )
-                })?;
-
-            if verifier != leaf_cert_b64.trim() {
-                let verifier_der = decode_pem_to_der(verifier)
-                    .or_else(|_| decode_base64(verifier))
-                    .unwrap_or_default();
-                let spki_matches = parse_x509_certificate(leaf_cert_der)
-                    .map(|c| c.spki_bytes == verifier_der)
-                    .unwrap_or(false);
-                if verifier_der != leaf_cert_der && !spki_matches {
+            if !matched {
+                if has_empty_verifier && !sig_matched {
                     return Err(RegistryError::InvalidSigstoreBundle(
-                        "Rekor dsse verifier mismatch with leaf X.509 certificate".into(),
+                        "Rekor dsse signature mismatch with DSSE envelope".into(),
+                    ));
+                } else if has_empty_verifier {
+                    return Err(RegistryError::InvalidSigstoreBundle(
+                        "Missing or empty verifier in Rekor dsse entry".into(),
+                    ));
+                } else if sig_matched {
+                    return Err(RegistryError::InvalidSigstoreBundle(
+                        "Rekor dsse verifier mismatch with leaf certificate or public key".into(),
+                    ));
+                } else {
+                    return Err(RegistryError::InvalidSigstoreBundle(
+                        "Rekor dsse signature mismatch with DSSE envelope".into(),
                     ));
                 }
             }
@@ -811,7 +869,7 @@ pub fn verify_rekor_body_binding(
                 )));
             }
 
-            // 2. Verify signature in envelope is present, non-empty, and matches DSSE envelope
+            // 2. Verify signature in envelope matches BOTH verified signature and leaf certificate/key
             let env_val = content.get("envelope").ok_or_else(|| {
                 RegistryError::InvalidSigstoreBundle(
                     "Missing envelope in Rekor intoto entry".into(),
@@ -827,72 +885,62 @@ pub fn verify_rekor_body_binding(
                     )
                 })?;
 
-            let sig_entry = &sigs[0];
-            let entry_sig = sig_entry
-                .get("sig")
-                .or_else(|| sig_entry.get("signature"))
-                .and_then(|s| s.as_str())
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .ok_or_else(|| {
-                    RegistryError::InvalidSigstoreBundle(
-                        "Missing or empty signature in Rekor intoto entry".into(),
-                    )
-                })?;
+            let default_verifier = spec
+                .get("verifiers")
+                .and_then(|v| v.as_array())
+                .and_then(|arr| arr.first())
+                .and_then(|v| v.as_str());
 
-            let sig_matches = if entry_sig == expected_sig_b64 {
-                true
-            } else if let Ok(dec) = decode_base64(entry_sig) {
-                if dec == expected_sig_bytes {
-                    true
-                } else if let Ok(double_str) = String::from_utf8(dec) {
-                    if double_str.trim() == expected_sig_b64 {
-                        true
-                    } else if let Ok(dec2) = decode_base64(double_str.trim()) {
-                        dec2 == expected_sig_bytes
-                    } else {
-                        false
-                    }
-                } else {
-                    false
+            let mut sig_matched = false;
+            let mut matched = false;
+            let mut has_empty_verifier = false;
+            for sig_entry in sigs {
+                let entry_sig = sig_entry
+                    .get("sig")
+                    .or_else(|| sig_entry.get("signature"))
+                    .and_then(|s| s.as_str())
+                    .unwrap_or_default();
+
+                if !matches_rekor_signature(entry_sig, expected_sig_b64, &expected_sig_bytes) {
+                    continue;
                 }
-            } else {
-                false
-            };
-            if !sig_matches {
-                return Err(RegistryError::InvalidSigstoreBundle(
-                    "Rekor intoto signature mismatch with DSSE envelope".into(),
-                ));
+                sig_matched = true;
+
+                let verifier = sig_entry
+                    .get("publicKey")
+                    .or_else(|| sig_entry.get("verifier"))
+                    .and_then(|v| v.as_str())
+                    .or(default_verifier)
+                    .map(str::trim)
+                    .unwrap_or_default();
+
+                if verifier.is_empty() {
+                    has_empty_verifier = true;
+                    continue;
+                }
+
+                if matches_rekor_verifier(verifier, leaf_cert_or_key) {
+                    matched = true;
+                    break;
+                }
             }
 
-            // 3. Verify verifier / publicKey is present, non-empty, and matches leaf certificate
-            let verifier = sig_entry
-                .get("publicKey")
-                .or_else(|| sig_entry.get("verifier"))
-                .or_else(|| {
-                    spec.get("verifiers")
-                        .and_then(|v| v.as_array())
-                        .and_then(|arr| arr.first())
-                })
-                .and_then(|v| v.as_str())
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .ok_or_else(|| {
-                    RegistryError::InvalidSigstoreBundle(
-                        "Missing or empty verifier/publicKey in Rekor intoto entry".into(),
-                    )
-                })?;
-
-            if verifier != leaf_cert_b64.trim() {
-                let verifier_der = decode_pem_to_der(verifier)
-                    .or_else(|_| decode_base64(verifier))
-                    .unwrap_or_default();
-                let spki_matches = parse_x509_certificate(leaf_cert_der)
-                    .map(|c| c.spki_bytes == verifier_der)
-                    .unwrap_or(false);
-                if verifier_der != leaf_cert_der && !spki_matches {
+            if !matched {
+                if has_empty_verifier && !sig_matched {
                     return Err(RegistryError::InvalidSigstoreBundle(
-                        "Rekor intoto verifier mismatch with leaf X.509 certificate".into(),
+                        "Rekor intoto signature mismatch with DSSE envelope".into(),
+                    ));
+                } else if has_empty_verifier {
+                    return Err(RegistryError::InvalidSigstoreBundle(
+                        "Missing or empty verifier/publicKey in Rekor intoto entry".into(),
+                    ));
+                } else if sig_matched {
+                    return Err(RegistryError::InvalidSigstoreBundle(
+                        "Rekor intoto verifier mismatch with leaf certificate or public key".into(),
+                    ));
+                } else {
+                    return Err(RegistryError::InvalidSigstoreBundle(
+                        "Rekor intoto signature mismatch with DSSE envelope".into(),
                     ));
                 }
             }
@@ -938,7 +986,7 @@ pub fn verify_rekor_body_binding(
                 )));
             }
 
-            // 2. Verify signature is present, non-empty, and matches DSSE envelope
+            // 2. Verify signature is present, non-empty, and matches verified DSSE signature
             let sig_obj = spec.get("signature").ok_or_else(|| {
                 RegistryError::InvalidSigstoreBundle(
                     "Missing signature in Rekor hashedrekord entry".into(),
@@ -947,52 +995,32 @@ pub fn verify_rekor_body_binding(
             let entry_sig = sig_obj
                 .get("content")
                 .and_then(|c| c.as_str())
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .ok_or_else(|| {
-                    RegistryError::InvalidSigstoreBundle(
-                        "Missing or empty signature.content in Rekor hashedrekord entry".into(),
-                    )
-                })?;
+                .unwrap_or_default();
 
-            let sig_matches = if entry_sig == expected_sig_b64 {
-                true
-            } else if let Ok(dec) = decode_base64(entry_sig) {
-                dec == expected_sig_bytes
-            } else {
-                false
-            };
-            if !sig_matches {
+            if !matches_rekor_signature(entry_sig, expected_sig_b64, &expected_sig_bytes) {
                 return Err(RegistryError::InvalidSigstoreBundle(
                     "Rekor hashedrekord signature mismatch with DSSE envelope".into(),
                 ));
             }
 
-            // 3. Verify verifier / publicKey is present, non-empty, and matches leaf certificate
+            // 3. Verify verifier / publicKey matches leaf certificate or registry key
             let verifier = sig_obj
                 .get("publicKey")
                 .and_then(|pk| pk.get("content"))
                 .and_then(|c| c.as_str())
                 .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .ok_or_else(|| {
-                    RegistryError::InvalidSigstoreBundle(
-                        "Missing or empty signature.publicKey.content in Rekor hashedrekord entry".into(),
-                    )
-                })?;
+                .unwrap_or_default();
 
-            if verifier != leaf_cert_b64.trim() {
-                let verifier_der = decode_pem_to_der(verifier)
-                    .or_else(|_| decode_base64(verifier))
-                    .unwrap_or_default();
-                let spki_matches = parse_x509_certificate(leaf_cert_der)
-                    .map(|c| c.spki_bytes == verifier_der)
-                    .unwrap_or(false);
-                if verifier_der != leaf_cert_der && !spki_matches {
-                    return Err(RegistryError::InvalidSigstoreBundle(
-                        "Rekor hashedrekord verifier mismatch with leaf X.509 certificate".into(),
-                    ));
-                }
+            if verifier.is_empty() {
+                return Err(RegistryError::InvalidSigstoreBundle(
+                    "Missing or empty signature.publicKey.content in Rekor hashedrekord entry".into(),
+                ));
+            }
+
+            if !matches_rekor_verifier(verifier, leaf_cert_or_key) {
+                return Err(RegistryError::InvalidSigstoreBundle(
+                    "Rekor hashedrekord verifier mismatch with leaf certificate or public key".into(),
+                ));
             }
         }
         _ => unreachable!(),
@@ -1853,7 +1881,7 @@ fn current_time_ms() -> i64 {
                 .public_key
                 .as_ref()
                 .and_then(|pk| pk.hint.as_deref())
-                .or_else(|| envelope.signatures[0].keyid.as_deref())
+                .or(envelope.signatures[0].keyid.as_deref())
                 .unwrap_or_default();
 
             if keyid.trim().is_empty() {
@@ -1868,13 +1896,30 @@ fn current_time_ms() -> i64 {
                 ))
             })?;
 
-            // Enforce key expiry if tracked
+            reg_key.clone()
+        };
+
+        // 4. Verify DSSE envelope cryptographic signature over PAE first to get verified_sig
+        let verified_sig = verify_dsse_signature(envelope, &signing_key)?;
+
+        // Enforce key expiry for keyed attestation
+        if raw_cert_chain.is_empty() {
+            let keyid = vm
+                .public_key
+                .as_ref()
+                .and_then(|pk| pk.hint.as_deref())
+                .or(verified_sig.keyid.as_deref())
+                .unwrap_or_default();
+
             if let Some((expires_str, expires_ms)) = self.registry_key_expiries.get(keyid) {
                 let signing_time_ms = if let Some(tlog) = vm.tlog_entries.first() {
-                    if tlog.integrated_time > 0
+                    let valid_set = tlog.integrated_time > 0
                         && tlog.inclusion_promise.is_some()
-                        && verify_rekor_set(&self.rekor_public_keys, tlog).is_ok()
-                    {
+                        && verify_rekor_set(&self.rekor_public_keys, tlog).is_ok();
+                    let valid_binding =
+                        verify_rekor_body_binding(tlog, envelope, verified_sig, &signing_key).is_ok();
+
+                    if valid_set && valid_binding {
                         tlog.integrated_time * 1000
                     } else {
                         Self::current_time_ms()
@@ -1889,12 +1934,7 @@ fn current_time_ms() -> i64 {
                     )));
                 }
             }
-
-            reg_key.clone()
-        };
-
-        // 4. Verify DSSE envelope cryptographic signature over PAE
-        verify_dsse_envelope(envelope, &signing_key)?;
+        }
 
         // 5. For Fulcio-backed bundles: require authenticated Rekor evidence and bind Rekor body
         let mut tlog_metadata = TransparencyLogMetadata {
@@ -1924,7 +1964,20 @@ fn current_time_ms() -> i64 {
 
             // Bind Rekor body to DSSE envelope & leaf certificate
             let leaf_cert = parsed_leaf_cert.as_ref().unwrap();
-            verify_rekor_body_binding(tlog, envelope, &leaf_cert.raw_der)?;
+            verify_rekor_body_binding(tlog, envelope, verified_sig, &leaf_cert.raw_der)?;
+        } else if let Some(tlog) = vm.tlog_entries.first() {
+            let valid_set = tlog.integrated_time > 0
+                && tlog.inclusion_promise.is_some()
+                && verify_rekor_set(&self.rekor_public_keys, tlog).is_ok();
+            let valid_binding =
+                verify_rekor_body_binding(tlog, envelope, verified_sig, &signing_key).is_ok();
+            if valid_set && valid_binding {
+                tlog_metadata = TransparencyLogMetadata {
+                    log_index: tlog.log_index,
+                    log_id: tlog.log_id.key_id.clone(),
+                    integrated_time: tlog.integrated_time,
+                };
+            }
         }
 
         // 6. Parse and validate in-toto statement
@@ -2707,6 +2760,42 @@ pub fn decode_pem_to_der(pem: &str) -> Result<Vec<u8>, RegistryError> {
     decode_base64(&clean)
 }
 
+/// Encodes raw DER certificate bytes into standard PEM format with 64-character lines.
+pub fn der_to_pem_cert(der: &[u8]) -> String {
+    let b64 = BASE64.encode(der);
+    let mut pem = String::from("-----BEGIN CERTIFICATE-----\n");
+    for chunk in b64.as_bytes().chunks(64) {
+        if let Ok(line) = std::str::from_utf8(chunk) {
+            pem.push_str(line);
+            pem.push('\n');
+        }
+    }
+    pem.push_str("-----END CERTIFICATE-----\n");
+    pem
+}
+
+/// Decodes a Rekor verifier string in any supported format:
+/// (a) raw PEM string -> DER bytes,
+/// (b) base64-encoded DER bytes -> DER bytes,
+/// (c) base64-encoded PEM string -> UTF-8 PEM -> DER bytes.
+pub fn decode_rekor_verifier(verifier: &str) -> Result<Vec<u8>, RegistryError> {
+    let trimmed = verifier.trim();
+    if trimmed.is_empty() {
+        return Err(RegistryError::InvalidSigstoreBundle("Empty verifier".into()));
+    }
+    if trimmed.contains("-----BEGIN ") {
+        return decode_pem_to_der(trimmed);
+    }
+    let raw = decode_base64(trimmed)?;
+    if let Ok(as_str) = std::str::from_utf8(&raw) {
+        let trimmed_str = as_str.trim();
+        if trimmed_str.contains("-----BEGIN ") {
+            return decode_pem_to_der(trimmed_str);
+        }
+    }
+    Ok(raw)
+}
+
 /// Submits a DSSE entry to Rekor and returns the created TlogEntry.
 pub async fn submit_rekor_dsse_entry(
     rekor_url: &str,
@@ -2715,7 +2804,8 @@ pub async fn submit_rekor_dsse_entry(
 ) -> Result<TlogEntry, RegistryError> {
     let envelope_json = serde_json::to_string(dsse_envelope)
         .map_err(|e| RegistryError::Other(format!("Failed to serialize DSSE envelope: {e}")))?;
-    let leaf_b64 = BASE64.encode(leaf_cert_der);
+    let pem_cert = der_to_pem_cert(leaf_cert_der);
+    let leaf_b64 = BASE64.encode(pem_cert.as_bytes());
 
     let proposed_entry = serde_json::json!({
         "apiVersion": "0.0.1",
