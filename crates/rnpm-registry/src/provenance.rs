@@ -672,24 +672,16 @@ fn matches_rekor_verifier(verifier_str: &str, leaf_cert_or_key: &[u8]) -> bool {
     if verifier_der == leaf_cert_or_key {
         return true;
     }
-    let target_parsed = parse_x509_certificate(leaf_cert_or_key);
-    let verifier_parsed = parse_x509_certificate(&verifier_der);
-
-    if let Ok(target_cert) = &target_parsed {
-        if verifier_der == target_cert.spki_bytes {
+    // If the expected verifier is a Fulcio X.509 leaf certificate, require an exact
+    // certificate DER match so another certificate reusing the same keypair cannot pass.
+    if parse_x509_certificate(leaf_cert_or_key).is_ok() {
+        return false;
+    }
+    // Otherwise leaf_cert_or_key is a registry public key SPKI; also accept an X.509 cert
+    // whose SPKI matches that key.
+    if let Ok(v_cert) = parse_x509_certificate(&verifier_der) {
+        if v_cert.spki_bytes == leaf_cert_or_key {
             return true;
-        }
-        if let Ok(v_cert) = &verifier_parsed {
-            if v_cert.spki_bytes == target_cert.spki_bytes {
-                return true;
-            }
-        }
-    } else {
-        // leaf_cert_or_key is not an X.509 cert; it is an SPKI or registry public key
-        if let Ok(v_cert) = &verifier_parsed {
-            if v_cert.spki_bytes == leaf_cert_or_key {
-                return true;
-            }
         }
     }
     false
@@ -1832,6 +1824,7 @@ fn current_time_ms() -> i64 {
 
         let mut parsed_leaf_cert: Option<ParsedCertificate> = None;
         let mut primary_tlog: Option<&TlogEntry> = None;
+        let mut resolved_keyid: Option<String> = None;
         let cert_count = raw_cert_chain.len();
 
         let signing_key = if !raw_cert_chain.is_empty() {
@@ -1896,22 +1889,16 @@ fn current_time_ms() -> i64 {
                 ))
             })?;
 
+            resolved_keyid = Some(keyid.to_string());
             reg_key.clone()
         };
 
         // 4. Verify DSSE envelope cryptographic signature over PAE first to get verified_sig
         let verified_sig = verify_dsse_signature(envelope, &signing_key)?;
 
-        // Enforce key expiry for keyed attestation
-        if raw_cert_chain.is_empty() {
-            let keyid = vm
-                .public_key
-                .as_ref()
-                .and_then(|pk| pk.hint.as_deref())
-                .or(verified_sig.keyid.as_deref())
-                .unwrap_or_default();
-
-            if let Some((expires_str, expires_ms)) = self.registry_key_expiries.get(keyid) {
+        // Enforce key expiry for keyed attestation using the exact resolved keyid
+        if let Some(ref keyid) = resolved_keyid {
+            if let Some((expires_str, expires_ms)) = self.registry_key_expiries.get(keyid.as_str()) {
                 let signing_time_ms = if let Some(tlog) = vm.tlog_entries.first() {
                     let valid_set = tlog.integrated_time > 0
                         && tlog.inclusion_promise.is_some()
