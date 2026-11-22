@@ -385,11 +385,17 @@ pub async fn run_outdated_inner(
     let mut join_set = tokio::task::JoinSet::new();
     // `before` needs publish times, which only the full packument carries.
     let before = config.before_cutoff();
+    let excludes = config.min_release_age_exclude();
 
     for (dep, current, homepage) in installed_info {
         let client_clone = client.clone();
+        let effective_before = if rnpm_config::is_release_age_excluded(&dep.name, &excludes) {
+            None
+        } else {
+            before
+        };
         join_set.spawn(async move {
-            let res = match before {
+            let res = match effective_before {
                 Some(cutoff) => client_clone
                     .get_package_metadata_full(&dep.name)
                     .await

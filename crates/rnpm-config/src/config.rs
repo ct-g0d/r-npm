@@ -135,10 +135,90 @@ impl Config {
             })
     }
 
-    /// npm's `before`: resolve only versions published on or before this
-    /// instant (milliseconds since the epoch).
+    /// Parse `min-release-age` config (in days) into a UTC cutoff timestamp
+    /// (milliseconds since epoch), computed relative to `now_ms`.
+    ///
+    /// In npm 11.20.0, `min-release-age` accepts a relative number of days (`<days>`).
+    /// The cutoff timestamp is `now - (86400000 * age)`.
+    /// If age is 0 or non-positive, no cutoff applies (`None`).
+    pub fn min_release_age_cutoff_at(&self, now_ms: i64) -> Option<i64> {
+        let val_str = self
+            .get("min-release-age")
+            .or_else(|| self.get("min_release_age"))?;
+        let trimmed = val_str.trim();
+        if trimmed.eq_ignore_ascii_case("null") || trimmed.is_empty() {
+            return None;
+        }
+        let days = trimmed.parse::<f64>().ok()?;
+        if days <= 0.0 || !days.is_finite() {
+            return None;
+        }
+        let delta_ms = (days * 86_400_000.0).round() as i64;
+        Some(now_ms.saturating_sub(delta_ms))
+    }
+
+    /// Parse `min-release-age` config into a UTC cutoff timestamp (milliseconds
+    /// since epoch) relative to the current system time.
+    pub fn min_release_age_cutoff(&self) -> Option<i64> {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        self.min_release_age_cutoff_at(now_ms)
+    }
+
+    /// npm's `before` / `min-release-age`: resolve only versions published on
+    /// or before this instant (milliseconds since the epoch).
+    ///
+    /// Matching npm 11.20.0 semantics:
+    /// - `before` accepts an exact JS date/timestamp.
+    /// - `min-release-age` accepts a relative number of days.
+    /// - When both apply within config, `before` wins (an explicit date overrides a relative window).
+    /// - When `before` is explicitly set to `"null"` or empty, it disables the cutoff.
     pub fn before_cutoff(&self) -> Option<i64> {
-        self.get("before").and_then(crate::date::parse_js_date)
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        self.before_cutoff_at(now_ms)
+    }
+
+    /// npm's `before` / `min-release-age` cutoff computed relative to `now_ms`.
+    pub fn before_cutoff_at(&self, now_ms: i64) -> Option<i64> {
+        if let Some(before_str) = self.get("before") {
+            let trimmed = before_str.trim();
+            if trimmed.eq_ignore_ascii_case("null") || trimmed.is_empty() {
+                return None;
+            }
+            if let Some(cutoff) = crate::date::parse_js_date(trimmed) {
+                return Some(cutoff);
+            }
+            return None;
+        }
+        self.min_release_age_cutoff_at(now_ms)
+    }
+
+    /// npm's `min-release-age-exclude`: list of package names or `minimatch` glob patterns
+    /// that are exempt from the `min-release-age` and `before` release-age filter.
+    pub fn min_release_age_exclude(&self) -> Vec<String> {
+        let mut list = Vec::new();
+        let keys = [
+            "min-release-age-exclude",
+            "min-release-age-exclude[]",
+            "min_release_age_exclude",
+            "min_release_age_exclude[]",
+        ];
+        for k in keys {
+            if let Some(val) = self.get(k) {
+                for item in val.split(',') {
+                    let trimmed = item.trim();
+                    if !trimmed.is_empty() && !list.contains(&trimmed.to_string()) {
+                        list.push(trimmed.to_string());
+                    }
+                }
+            }
+        }
+        list
     }
 
     pub fn load(project_dir: Option<&Path>) -> Result<Self, ConfigError> {

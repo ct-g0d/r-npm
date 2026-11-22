@@ -2621,7 +2621,19 @@ fn extract_config_flag(
                 );
             }
             if !((key == "ca" || key == "cafile") && (val == "true" || val == "false")) {
-                overrides.insert(key, val.to_string());
+                let clean_key = key.strip_suffix("[]").unwrap_or(&key);
+                if clean_key == "min-release-age-exclude" {
+                    if let Some(existing) = overrides.get_mut("min-release-age-exclude") {
+                        if !existing.is_empty() {
+                            existing.push(',');
+                        }
+                        existing.push_str(val);
+                    } else {
+                        overrides.insert("min-release-age-exclude".to_string(), val.to_string());
+                    }
+                } else {
+                    overrides.insert(key, val.to_string());
+                }
             }
             return Some(1);
         } else {
@@ -2647,7 +2659,19 @@ fn extract_config_flag(
                         if !((key == "ca" || key == "cafile")
                             && (next == "true" || next == "false"))
                         {
-                            overrides.insert(key, next.to_string());
+                            let clean_key = key.strip_suffix("[]").unwrap_or(&key);
+                            if clean_key == "min-release-age-exclude" {
+                                if let Some(existing) = overrides.get_mut("min-release-age-exclude") {
+                                    if !existing.is_empty() {
+                                        existing.push(',');
+                                    }
+                                    existing.push_str(next);
+                                } else {
+                                    overrides.insert("min-release-age-exclude".to_string(), next.to_string());
+                                }
+                            } else {
+                                overrides.insert(key, next.to_string());
+                            }
                         }
                         return Some(2);
                     }

@@ -5,6 +5,7 @@ pub mod date;
 pub mod error;
 pub mod npm_keys;
 pub mod npmrc;
+pub mod release_age;
 
 pub use config::{
     delete_config_value_from_file, find_global_bin_dir, find_global_node_modules,
@@ -27,6 +28,7 @@ pub use npmrc::{
     encode_package_name, interpolate_env, is_sensitive_credential_key, mask_credential,
     scrub_credentials, validate_package_name, Npmrc, DEFAULT_REGISTRY,
 };
+pub use release_age::{is_release_age_excluded, match_package_pattern};
 
 use url::Url;
 

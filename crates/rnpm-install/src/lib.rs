@@ -209,9 +209,11 @@ use rnpm_solver::{
 /// Converts registry AbbreviatedPackageMetadata to Solver PackageMetadata.
 pub fn abbreviated_to_package_metadata(meta: &AbbreviatedPackageMetadata) -> PackageMetadata {
     if let Some(cutoff) = before_cutoff().filter(|_| !meta.time.is_empty()) {
-        let mut dated = meta.clone();
-        apply_before(&mut dated, cutoff);
-        return abbreviated_to_package_metadata(&dated);
+        if !rnpm_config::is_release_age_excluded(&meta.name, &min_release_age_exclude()) {
+            let mut dated = meta.clone();
+            apply_before(&mut dated, cutoff);
+            return abbreviated_to_package_metadata(&dated);
+        }
     }
     let mut dist_tags = BTreeMap::new();
     for (k, v) in &meta.dist_tags {
@@ -372,6 +374,25 @@ pub fn set_before_cutoff(cutoff: Option<i64>) {
 
 fn before_cutoff() -> Option<i64> {
     Some(BEFORE_CUTOFF.load(std::sync::atomic::Ordering::Relaxed)).filter(|&c| c != i64::MAX)
+}
+
+/// Package names / glob patterns exempt from the release-age filter.
+static MIN_RELEASE_AGE_EXCLUDE: std::sync::RwLock<Vec<String>> =
+    std::sync::RwLock::new(Vec::new());
+
+/// Sets the list of package names / glob patterns exempt from release-age filtering.
+pub fn set_min_release_age_exclude(excludes: Vec<String>) {
+    if let Ok(mut lock) = MIN_RELEASE_AGE_EXCLUDE.write() {
+        *lock = excludes;
+    }
+}
+
+/// Gets the list of package names / glob patterns exempt from release-age filtering.
+pub fn min_release_age_exclude() -> Vec<String> {
+    MIN_RELEASE_AGE_EXCLUDE
+        .read()
+        .map(|l| l.clone())
+        .unwrap_or_default()
 }
 
 /// npm-pick-manifest under `before`: versions published after the cutoff are
@@ -963,9 +984,13 @@ impl RegistryPackageProvider {
                 self.merge_lockfile_metadata(name, &mut meta);
                 let is_in_lockfile =
                     self.is_package_locked(name) && !self.named_packages.contains(name);
-                if is_in_lockfile
-                    || (!self.prefer_online
-                        && is_packument_fresh(&entry, self.prefer_offline, self.offline))
+                let age_filter_active = before_cutoff().is_some()
+                    && !rnpm_config::is_release_age_excluded(name, &min_release_age_exclude());
+                let lacks_publish_times = age_filter_active && abbrev.time.is_empty();
+                if !lacks_publish_times
+                    && (is_in_lockfile
+                        || (!self.prefer_online
+                            && is_packument_fresh(&entry, self.prefer_offline, self.offline)))
                 {
                     return Ok(meta);
                 }
@@ -1284,11 +1309,15 @@ impl PackageMetadataProvider for RegistryPackageProvider {
                             {
                                 let mut meta = abbreviated_to_package_metadata(&abbrev);
                                 self.merge_lockfile_metadata(name, &mut meta);
+                                let age_filter_active = before_cutoff().is_some()
+                                    && !rnpm_config::is_release_age_excluded(name, &min_release_age_exclude());
+                                let lacks_publish_times = age_filter_active && abbrev.time.is_empty();
                                 // A package named on the command line is
                                 // resolved afresh, so its packument is revalidated.
-                                if (is_in_lockfile && !self.named_packages.contains(name))
-                                    || (!self.prefer_online
-                                        && is_packument_fresh(&entry, self.prefer_offline, false))
+                                if !lacks_publish_times
+                                    && ((is_in_lockfile && !self.named_packages.contains(name))
+                                        || (!self.prefer_online
+                                            && is_packument_fresh(&entry, self.prefer_offline, false)))
                                 {
                                     local_fresh.push((name.to_string(), meta));
                                     continue;
@@ -2402,6 +2431,7 @@ impl Installer {
         options.legacy_peer_deps |= config.get_bool("legacy-peer-deps").unwrap_or(false);
         options.strict_peer_deps |= config.get_bool("strict-peer-deps").unwrap_or(false);
         set_before_cutoff(config.before_cutoff());
+        set_min_release_age_exclude(config.min_release_age_exclude());
         options.offline |= config.get_bool("offline").unwrap_or(false);
         options.prefer_offline |= config.get_bool("prefer-offline").unwrap_or(false);
         options.prefer_online |= config.get_bool("prefer-online").unwrap_or(false);
@@ -2823,6 +2853,11 @@ impl Installer {
                     .flatten();
                 let metadata = if cached.is_some() || self.options.offline {
                     cached
+                } else if before_cutoff().is_some() {
+                    self.registry_client
+                        .get_package_metadata_full(&spec.package_name)
+                        .await
+                        .ok()
                 } else {
                     self.registry_client
                         .get_package_metadata(&spec.package_name)
@@ -7962,7 +7997,12 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                 };
 
                 if meta.is_none() && !self.options.offline {
-                    if let Ok(reg_abbrev) = self.registry_client.get_package_metadata(name).await {
+                    let fetch_res = if before_cutoff().is_some() {
+                        self.registry_client.get_package_metadata_full(name).await
+                    } else {
+                        self.registry_client.get_package_metadata(name).await
+                    };
+                    if let Ok(reg_abbrev) = fetch_res {
                         meta = Some(abbreviated_to_package_metadata(&reg_abbrev));
                     }
                 }
@@ -8062,9 +8102,12 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                                 };
 
                                 if meta.is_none() && !self.options.offline {
-                                    if let Ok(reg_abbrev) =
+                                    let fetch_res = if before_cutoff().is_some() {
+                                        self.registry_client.get_package_metadata_full(name).await
+                                    } else {
                                         self.registry_client.get_package_metadata(name).await
-                                    {
+                                    };
+                                    if let Ok(reg_abbrev) = fetch_res {
                                         meta = Some(abbreviated_to_package_metadata(&reg_abbrev));
                                     }
                                 }
@@ -8146,9 +8189,12 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                         };
 
                         if meta.is_none() && !self.options.offline {
-                            if let Ok(reg_abbrev) =
+                            let fetch_res = if before_cutoff().is_some() {
+                                self.registry_client.get_package_metadata_full(name).await
+                            } else {
                                 self.registry_client.get_package_metadata(name).await
-                            {
+                            };
+                            if let Ok(reg_abbrev) = fetch_res {
                                 meta = Some(abbreviated_to_package_metadata(&reg_abbrev));
                             }
                         }
@@ -8262,9 +8308,12 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                     };
 
                     if meta.is_none() && !self.options.offline {
-                        if let Ok(reg_abbrev) =
+                        let fetch_res = if before_cutoff().is_some() {
+                            self.registry_client.get_package_metadata_full(name).await
+                        } else {
                             self.registry_client.get_package_metadata(name).await
-                        {
+                        };
+                        if let Ok(reg_abbrev) = fetch_res {
                             meta = Some(abbreviated_to_package_metadata(&reg_abbrev));
                         }
                     }
@@ -8457,11 +8506,16 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
         let metadata = if let Some(cached) = self.metadata_cache.get(lookup_name) {
             cached.clone()
         } else {
-            let meta = self
-                .registry_client
-                .get_package_metadata(lookup_name)
-                .await
-                .map_err(|e| anyhow!("Failed to fetch metadata for {lookup_name}: {e}"))?;
+            let meta = if before_cutoff().is_some() {
+                self.registry_client
+                    .get_package_metadata_full(lookup_name)
+                    .await
+            } else {
+                self.registry_client
+                    .get_package_metadata(lookup_name)
+                    .await
+            }
+            .map_err(|e| anyhow!("Failed to fetch metadata for {lookup_name}: {e}"))?;
             self.metadata_cache
                 .insert(lookup_name.to_string(), meta.clone());
             meta
@@ -8598,10 +8652,26 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
             return Ok(());
         }
 
-        let results = self
-            .registry_client
-            .get_package_metadata_concurrent(&missing)
-            .await;
+        let results = if before_cutoff().is_some() {
+            let reqs: Vec<(String, Option<String>)> =
+                missing.iter().map(|s| (s.clone(), None)).collect();
+            self.registry_client
+                .get_package_metadata_full_conditional_concurrent(&reqs)
+                .await
+                .into_iter()
+                .map(|r| {
+                    r.and_then(|m| {
+                        m.into_metadata().ok_or_else(|| {
+                            rnpm_registry::RegistryError::Other("Not modified".into())
+                        })
+                    })
+                })
+                .collect()
+        } else {
+            self.registry_client
+                .get_package_metadata_concurrent(&missing)
+                .await
+        };
 
         for (name, res) in missing.into_iter().zip(results) {
             if let Ok(meta) = res {

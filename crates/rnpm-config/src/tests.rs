@@ -906,3 +906,112 @@ fn test_fix_npmrc_content_deletes_lonely_username_or_password() {
     assert!(!fixed_pw.contains("_password"));
     assert!(summaries_pw.iter().any(|s| s.contains("deleted")));
 }
+
+#[test]
+fn test_min_release_age_parsing() {
+    let now_ms = 1_700_000_000_000_i64;
+
+    // 7 days = 7 * 86,400,000 = 604,800,000 ms
+    let mut config = Config::new();
+    config.npmrc.set("min-release-age", "7").unwrap();
+    assert_eq!(
+        config.min_release_age_cutoff_at(now_ms),
+        Some(now_ms - 604_800_000)
+    );
+    assert_eq!(
+        config.before_cutoff_at(now_ms),
+        Some(now_ms - 604_800_000)
+    );
+
+    // Float days: 0.5 days = 43,200,000 ms
+    let mut config_float = Config::new();
+    config_float.npmrc.set("min-release-age", "0.5").unwrap();
+    assert_eq!(
+        config_float.min_release_age_cutoff_at(now_ms),
+        Some(now_ms - 43_200_000)
+    );
+
+    // 0 days disables cutoff (matching npm 11.20.0 `age ? new Date(...) : null`)
+    let mut config_zero = Config::new();
+    config_zero.npmrc.set("min-release-age", "0").unwrap();
+    assert_eq!(config_zero.min_release_age_cutoff_at(now_ms), None);
+    assert_eq!(config_zero.before_cutoff_at(now_ms), None);
+
+    // Negative days disables cutoff
+    let mut config_neg = Config::new();
+    config_neg.npmrc.set("min-release-age", "-5").unwrap();
+    assert_eq!(config_neg.min_release_age_cutoff_at(now_ms), None);
+
+    // "null" string disables cutoff
+    let mut config_null = Config::new();
+    config_null.npmrc.set("min-release-age", "null").unwrap();
+    assert_eq!(config_null.min_release_age_cutoff_at(now_ms), None);
+
+    // Underscore alias min_release_age
+    let mut config_under = Config::new();
+    config_under.npmrc.set("min_release_age", "14").unwrap();
+    assert_eq!(
+        config_under.min_release_age_cutoff_at(now_ms),
+        Some(now_ms - 14 * 86_400_000)
+    );
+}
+
+#[test]
+fn test_before_vs_min_release_age_precedence() {
+    let now_ms = 1_700_000_000_000_i64;
+
+    // When both before and min-release-age are present, before wins
+    let mut config = Config::new();
+    config.npmrc.set("min-release-age", "7").unwrap();
+    config.npmrc.set("before", "2023-01-01T00:00:00.000Z").unwrap();
+    let expected_before = crate::date::parse_js_date("2023-01-01T00:00:00.000Z").unwrap();
+    assert_eq!(config.before_cutoff_at(now_ms), Some(expected_before));
+
+    // When before is explicitly "null", it wins over min-release-age and disables cutoff
+    let mut config_null_before = Config::new();
+    config_null_before.npmrc.set("min-release-age", "7").unwrap();
+    config_null_before.npmrc.set("before", "null").unwrap();
+    assert_eq!(config_null_before.before_cutoff_at(now_ms), None);
+}
+
+#[test]
+fn test_min_release_age_exclude_parsing() {
+    // Array syntax in .npmrc: min-release-age-exclude[]
+    let npmrc_content = r#"
+min-release-age-exclude[] = @myorg/*
+min-release-age-exclude[] = my-internal-pkg
+min-release-age-exclude[] = @myorg/*
+"#;
+    let npmrc = Npmrc::parse(npmrc_content).unwrap();
+    let config = Config { npmrc };
+    let excludes = config.min_release_age_exclude();
+    assert_eq!(excludes, vec!["@myorg/*", "my-internal-pkg"]);
+
+    // Comma-separated list syntax
+    let npmrc_comma = r#"
+min-release-age-exclude = @myorg/*, my-internal-pkg,  foo-lib , , @myorg/*
+"#;
+    let npmrc2 = Npmrc::parse(npmrc_comma).unwrap();
+    let config2 = Config { npmrc: npmrc2 };
+    let excludes2 = config2.min_release_age_exclude();
+    assert_eq!(excludes2, vec!["@myorg/*", "my-internal-pkg", "foo-lib"]);
+}
+
+#[test]
+fn test_min_release_age_exclude_matching_with_config() {
+    let npmrc_content = r#"
+min-release-age = 7
+min-release-age-exclude[] = @myorg/*
+min-release-age-exclude[] = trusted-internal
+"#;
+    let config = Config {
+        npmrc: Npmrc::parse(npmrc_content).unwrap(),
+    };
+    let excludes = config.min_release_age_exclude();
+
+    assert!(crate::is_release_age_excluded("@myorg/utils", &excludes));
+    assert!(crate::is_release_age_excluded("@myorg/core", &excludes));
+    assert!(crate::is_release_age_excluded("trusted-internal", &excludes));
+    assert!(!crate::is_release_age_excluded("lodash", &excludes));
+    assert!(!crate::is_release_age_excluded("@other/utils", &excludes));
+}
