@@ -96,8 +96,9 @@ async fn finish_pack_tasks(tasks: Vec<tokio::task::JoinHandle<Result<()>>>) -> R
 fn materialize_warm_files(
     files: Vec<rnpm_fs::MaterializeFileRef<'_>>,
     config: &rnpm_fs::ParallelWriterConfig,
+    estimated_packages: usize,
 ) -> Result<(), rnpm_fs::FsError> {
-    let Ok(writer) = rnpm_fs::AsyncFileWriter::spawn() else {
+    let Ok(writer) = rnpm_fs::AsyncFileWriter::spawn_for_hint(estimated_packages) else {
         return rnpm_fs::materialize_files_parallel_refs(files, config);
     };
     let sender = writer.sender();
@@ -4698,7 +4699,7 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                 if files_valid {
                     let dir_refs: Vec<&Path> = all_dirs.iter().map(|p| p.as_path()).collect();
                     if precreate_directories(dir_refs).is_ok()
-                        && materialize_warm_files(all_file_refs, &writer_cfg).is_ok()
+                        && materialize_warm_files(all_file_refs, &writer_cfg, loaded_packs.len()).is_ok()
                     {
                         for (link_path, target_path) in all_symlinks {
                             let _ = rnpm_fs::create_link_or_copy(&link_path, &target_path);
@@ -4746,7 +4747,8 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
             let unlocked_packages = self.options.unlocked_packages.clone();
             // Stored packages are written through the async writer (the node
             // helper on Windows, where its writes are several times faster).
-            let pack_writer = rnpm_fs::AsyncFileWriter::spawn().ok();
+            let pack_writer =
+                rnpm_fs::AsyncFileWriter::spawn_for_hint(packages_to_download.len()).ok();
             let pack_sender = pack_writer.as_ref().map(|w| w.sender());
 
             for (loc, node) in &packages_to_download {
@@ -5150,10 +5152,12 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
             // Every queued file must be on disk before bins and scripts run.
             drop(pack_sender);
             if let Some(writer) = pack_writer {
+                let t_writer = std::time::Instant::now();
                 tokio::task::spawn_blocking(move || writer.finish())
                     .await
                     .map_err(|e| anyhow!("File writer panicked: {e}"))?
                     .map_err(|e| anyhow!("Failed to write package files: {e}"))?;
+                collector.record_phase(Phase::Materialize, t_writer.elapsed());
             }
         }
 
@@ -6367,7 +6371,8 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
             let seen_dirs = Arc::new(std::sync::RwLock::new(init_dirs));
             let mut join_set = tokio::task::JoinSet::new();
 
-            let mut async_writer = rnpm_fs::AsyncFileWriter::spawn().ok();
+            let mut async_writer =
+                rnpm_fs::AsyncFileWriter::spawn_for_hint(missing_packs.len()).ok();
             let writer_sender = async_writer.as_ref().map(|w| w.sender());
 
             for (idx, pkg_key, resolved_url, integrity_str, is_optional) in &missing_packs {
@@ -6730,6 +6735,7 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                         })
                         .await
                         .map_err(|e| anyhow!("AsyncFileWriter panicked: {e}"))??;
+                        collector.record_phase(Phase::Materialize, t_w.elapsed());
                         let t_writer_done = t_missing_start.elapsed();
                         if timing_debug {
                             eprintln!(
@@ -6994,7 +7000,7 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
 
                         // Bin shims read script headers, so complete the files
                         // and symlinks before selecting their interpreter.
-                        materialize_warm_files(all_file_refs, &ci_writer_cfg)
+                        materialize_warm_files(all_file_refs, &ci_writer_cfg, packages_to_process.len())
                             .map_err(|e| anyhow!("{e}"))?;
                         collector.record_phase(Phase::Materialize, t_mat.elapsed());
 
