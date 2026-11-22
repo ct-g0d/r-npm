@@ -486,6 +486,10 @@ pub(crate) enum Commands {
         #[arg(short = 'y', long = "yes")]
         yes: bool,
 
+        /// Automatically say no to installation prompts
+        #[arg(long = "no-yes")]
+        no_yes: bool,
+
         /// Package to install for the command
         #[arg(short = 'p', long = "package")]
         packages: Vec<String>,
@@ -2631,8 +2635,42 @@ fn preprocess_exec_args(
         }
 
         if token == "-y" || token == "--yes" {
+            clap_flags.retain(|f| f != "--no-yes");
             clap_flags.push(token.clone());
             overrides.insert("yes".into(), "true".into());
+            i += 1;
+            continue;
+        }
+        if token == "--no-yes" {
+            clap_flags.retain(|f| f != "--yes" && f != "-y");
+            clap_flags.push(token.clone());
+            overrides.insert("yes".into(), "false".into());
+            i += 1;
+            continue;
+        }
+        if let Some(val) = token.strip_prefix("--yes=") {
+            if val == "false" || val == "0" || val == "no" || val == "off" {
+                clap_flags.retain(|f| f != "--yes" && f != "-y");
+                clap_flags.push("--no-yes".into());
+                overrides.insert("yes".into(), "false".into());
+            } else if val == "true" || val == "1" || val == "yes" || val == "on" {
+                clap_flags.retain(|f| f != "--no-yes");
+                clap_flags.push("--yes".into());
+                overrides.insert("yes".into(), "true".into());
+            }
+            i += 1;
+            continue;
+        }
+        if let Some(val) = token.strip_prefix("-y=") {
+            if val == "false" || val == "0" || val == "no" || val == "off" {
+                clap_flags.retain(|f| f != "--yes" && f != "-y");
+                clap_flags.push("--no-yes".into());
+                overrides.insert("yes".into(), "false".into());
+            } else if val == "true" || val == "1" || val == "yes" || val == "on" {
+                clap_flags.retain(|f| f != "--no-yes");
+                clap_flags.push("-y".into());
+                overrides.insert("yes".into(), "true".into());
+            }
             i += 1;
             continue;
         }
@@ -3305,12 +3343,119 @@ pub(crate) fn parse_package_spec(spec: &str) -> (String, String) {
     }
 }
 
+pub(crate) fn resolve_npx_consent(
+    project_dir: &Path,
+    cli_yes: bool,
+    cli_no_yes: bool,
+) -> Option<bool> {
+    if cli_no_yes {
+        return Some(false);
+    }
+    if cli_yes {
+        return Some(true);
+    }
+    let config = rnpm_config::Config::load(Some(project_dir)).unwrap_or_default();
+    config.get_bool("yes")
+}
+
+fn is_ci_environment() -> bool {
+    std::env::var_os("CI").is_some()
+        || std::env::var_os("CONTINUOUS_INTEGRATION").is_some()
+        || std::env::var_os("BUILD_NUMBER").is_some()
+        || std::env::var_os("GITHUB_ACTIONS").is_some()
+        || std::env::var_os("GITLAB_CI").is_some()
+        || std::env::var_os("CIRCLECI").is_some()
+        || std::env::var_os("TRAVIS").is_some()
+}
+
+pub(crate) fn prompt_npx_consent<R: std::io::BufRead, W: std::io::Write>(
+    add_list: &[String],
+    reader: &mut R,
+    writer: &mut W,
+) -> anyhow::Result<()> {
+    write!(
+        writer,
+        "Need to install the following packages:\n{}\nOk to proceed? (y) ",
+        add_list.join("\n")
+    )?;
+    writer.flush()?;
+    let mut line = String::new();
+    if reader.read_line(&mut line)? == 0 {
+        anyhow::bail!("npm error canceled");
+    }
+    let trimmed = line.trim();
+    let accepted = if trimmed.is_empty() {
+        true
+    } else {
+        trimmed.to_ascii_lowercase().starts_with('y')
+    };
+    if !accepted {
+        anyhow::bail!("npm error canceled");
+    }
+    Ok(())
+}
+
+pub(crate) fn check_npx_consent(
+    project_dir: &Path,
+    specs: &[String],
+    consent: Option<bool>,
+) -> anyhow::Result<()> {
+    if specs.is_empty() {
+        return Ok(());
+    }
+    let add_list: Vec<String> = specs
+        .iter()
+        .map(|s| s.strip_suffix('@').unwrap_or(s).to_string())
+        .collect();
+
+    match consent {
+        Some(true) => Ok(()),
+        Some(false) => {
+            let json_list = serde_json::to_string(&add_list)?;
+            anyhow::bail!(
+                "npm error npx canceled due to missing packages and no YES option: {json_list}"
+            );
+        }
+        None => {
+            use std::io::IsTerminal;
+            let is_interactive = std::io::stdin().is_terminal() && !is_ci_environment();
+            if is_interactive {
+                let stdin = std::io::stdin();
+                let mut stdin_lock = stdin.lock();
+                let stdout = std::io::stdout();
+                let mut stdout_lock = stdout.lock();
+                prompt_npx_consent(&add_list, &mut stdin_lock, &mut stdout_lock)
+            } else {
+                let silent = is_loglevel_silent(project_dir);
+                let config = rnpm_config::Config::load(Some(project_dir)).unwrap_or_default();
+                let loglevel = config.get("loglevel").unwrap_or("notice");
+                if !silent && loglevel != "error" {
+                    if add_list.len() == 1 {
+                        eprintln!(
+                            "npm warn exec The following package was not found and will be installed: {}",
+                            add_list[0]
+                        );
+                    } else {
+                        eprintln!(
+                            "npm warn exec The following packages were not found and will be installed: {}",
+                            add_list.join(", ")
+                        );
+                    }
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
 /// Install `specs` into a cached npx environment and return its directory.
 pub(crate) async fn ensure_npx_environment(
+    project_dir: &Path,
     specs: &[String],
     registry: Option<String>,
     cache: Option<PathBuf>,
     offline: bool,
+    consent: Option<bool>,
 ) -> anyhow::Result<PathBuf> {
     let cache_path = cache
         .or_else(|| {
@@ -3354,6 +3499,7 @@ pub(crate) async fn ensure_npx_environment(
     let installed = env_dir.join("node_modules").is_dir()
         && std::fs::read_to_string(env_dir.join("package.json")).is_ok_and(|t| t == manifest_text);
     if !installed {
+        check_npx_consent(project_dir, specs, consent)?;
         if offline {
             anyhow::bail!("npm error code ENOTCACHED\nnpm error request to install {} failed: cache mode is 'only-if-cached'", specs.join(" "));
         }
@@ -3407,6 +3553,7 @@ pub(crate) async fn execute_exec(
     cache: Option<PathBuf>,
     offline: bool,
     banner: bool,
+    consent: Option<bool>,
 ) -> anyhow::Result<()> {
     if command.is_empty() && package_specs.is_empty() {
         return Ok(());
@@ -3486,6 +3633,7 @@ pub(crate) async fn execute_exec(
             if let Some(target) = bin_target {
                 target
             } else {
+                check_npx_consent(current_dir, &[command.to_string()], consent)?;
                 if offline {
                     return Err(anyhow::anyhow!(
                         "Package '{}' is not installed locally and offline mode prevents dynamic fetching",
@@ -3567,6 +3715,7 @@ pub(crate) async fn execute_exec(
         if let Some(target) = bin_target {
             target
         } else {
+            check_npx_consent(current_dir, package_specs, consent)?;
             if offline {
                 return Err(anyhow::anyhow!(
                     "Package(s) '{}' not installed locally and offline mode prevents dynamic fetching",
@@ -5727,7 +5876,8 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             call,
             package,
             args,
-            yes: _,
+            yes,
+            no_yes,
             packages,
             registry,
             cache,
@@ -5745,6 +5895,7 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             };
 
             for target_dir in targets {
+                let consent = resolve_npx_consent(&target_dir, yes, no_yes);
                 if let Some(cmd_str) = &call {
                     let full_cmd = if args.is_empty() {
                         cmd_str.clone()
@@ -5777,10 +5928,12 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
                     // npx environment and put its bins first on PATH.
                     if !packages.is_empty() {
                         let env_dir = ensure_npx_environment(
+                            &target_dir,
                             &packages,
                             registry.clone(),
                             cache.clone(),
                             offline,
+                            consent,
                         )
                         .await?;
                         let bin = env_dir.join("node_modules").join(".bin");
@@ -5821,6 +5974,7 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
                         cache.clone(),
                         offline,
                         false,
+                        consent,
                     )
                     .await?;
                 }

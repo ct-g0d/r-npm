@@ -538,6 +538,7 @@ async fn test_cli_exec_local_binary_success() {
             package: "echo-tool".to_string(),
             args: vec![],
             yes: false,
+            no_yes: false,
             packages: vec![],
             registry: None,
             cache: None,
@@ -584,6 +585,7 @@ async fn test_cli_exec_exit_code_fidelity() {
             package: "fail-tool".to_string(),
             args: vec![],
             yes: false,
+            no_yes: false,
             packages: vec![],
             registry: None,
             cache: None,
@@ -781,6 +783,7 @@ async fn test_cli_exec_dynamic_ephemeral_install_and_run() {
             package: "mock-cli-tool".to_string(),
             args: vec![],
             yes: false,
+            no_yes: false,
             packages: vec![],
             registry: Some(server_url),
             cache: Some(cache_dir.path().to_path_buf()),
@@ -965,6 +968,7 @@ async fn test_cli_exec_package_flag_installs_package_and_runs_command() {
             package: "custom-runner".to_string(),
             args: vec!["test-arg".to_string()],
             yes: true,
+            no_yes: false,
             packages: vec!["custom-tool-pkg@1.0.0".to_string()],
             registry: Some(server_url),
             cache: Some(cache_dir.path().to_path_buf()),
@@ -1105,6 +1109,7 @@ async fn test_cli_exec_multiple_package_flags_installs_all_packages() {
             package: "multi-runner".to_string(),
             args: vec![],
             yes: true,
+            no_yes: false,
             packages: vec!["pkg-data@1.0.0".to_string(), "pkg-runner@1.0.0".to_string()],
             registry: Some(server_url),
             cache: Some(cache_dir.path().to_path_buf()),
@@ -4388,4 +4393,67 @@ fn test_cli_parse_format_package_lock_flags() {
         }
         _ => panic!("Expected Commands::Ci"),
     }
+}
+
+#[test]
+fn test_npx_consent_prompt_accept_default_enter() {
+    let add_list = vec!["cowsay@1.5.0".to_string()];
+    let mut reader = std::io::Cursor::new(b"\n");
+    let mut writer = Vec::new();
+
+    let res = crate::prompt_npx_consent(&add_list, &mut reader, &mut writer);
+    assert!(res.is_ok());
+
+    let output_str = String::from_utf8(writer).unwrap();
+    assert_eq!(
+        output_str,
+        "Need to install the following packages:\ncowsay@1.5.0\nOk to proceed? (y) "
+    );
+}
+
+#[test]
+fn test_npx_consent_prompt_accept_y() {
+    for input in [b"y\n".as_slice(), b"yes\n".as_slice(), b"Y\n".as_slice(), b"YES\n".as_slice()] {
+        let add_list = vec!["tool-a@1.0.0".to_string(), "tool-b@2.0.0".to_string()];
+        let mut reader = std::io::Cursor::new(input);
+        let mut writer = Vec::new();
+
+        let res = crate::prompt_npx_consent(&add_list, &mut reader, &mut writer);
+        assert!(res.is_ok());
+
+        let output_str = String::from_utf8(writer).unwrap();
+        assert_eq!(
+            output_str,
+            "Need to install the following packages:\ntool-a@1.0.0\ntool-b@2.0.0\nOk to proceed? (y) "
+        );
+    }
+}
+
+#[test]
+fn test_npx_consent_prompt_decline() {
+    for input in [b"n\n".as_slice(), b"no\n".as_slice(), b"q\n".as_slice(), b"".as_slice()] {
+        let add_list = vec!["cowsay@1.5.0".to_string()];
+        let mut reader = std::io::Cursor::new(input);
+        let mut writer = Vec::new();
+
+        let res = crate::prompt_npx_consent(&add_list, &mut reader, &mut writer);
+        assert!(res.is_err());
+        let err = res.unwrap_err().to_string();
+        assert!(err.contains("npm error canceled"), "error was: {err}");
+    }
+}
+
+#[test]
+fn test_check_npx_consent_explicit_yes_and_no() {
+    let temp = tempfile::tempdir().unwrap();
+    let specs = vec!["cowsay@1.5.0".to_string()];
+
+    // Explicit yes succeeds silently
+    assert!(crate::check_npx_consent(temp.path(), &specs, Some(true)).is_ok());
+
+    // Explicit no fails with cancellation message
+    let err = crate::check_npx_consent(temp.path(), &specs, Some(false)).unwrap_err();
+    assert!(err.to_string().contains(
+        "npm error npx canceled due to missing packages and no YES option: [\"cowsay@1.5.0\"]"
+    ));
 }

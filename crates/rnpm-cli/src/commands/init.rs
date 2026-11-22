@@ -20,6 +20,7 @@ pub(crate) async fn run(args: InitCommandArgs, current_dir: PathBuf) -> Result<(
         if let Some(pos) = forwarded.iter().position(|a| a == "--") {
             forwarded.remove(pos);
         }
+        let consent = crate::resolve_npx_consent(&current_dir, args.yes, false);
         crate::execute_exec(
             &current_dir,
             &transformed,
@@ -29,6 +30,7 @@ pub(crate) async fn run(args: InitCommandArgs, current_dir: PathBuf) -> Result<(
             args.cache,
             args.offline,
             true,
+            consent,
         )
         .await?;
     } else {
