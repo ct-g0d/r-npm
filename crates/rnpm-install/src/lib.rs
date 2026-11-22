@@ -21,7 +21,7 @@ use rnpm_lockfile::{LockfilePackage, LockfileV3};
 use rnpm_registry::client::{RegistryClient, RegistryClientConfig};
 use rnpm_registry::metadata::AbbreviatedPackageMetadata;
 const INSTALL_PACKUMENT_ACCEPT: &str = "application/json";
-use rnpm_shim::{create_shims, normalize_shebang};
+use rnpm_shim::{create_shims_with_force, normalize_shebang};
 use rnpm_solver::graph::DependencyGraph;
 use std::sync::Arc;
 pub mod git;
@@ -5524,7 +5524,8 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                 &node_modules_dir,
                 false,
                 Some(&collector),
-            );
+                self.options.force,
+            )?;
         } else {
             remove_all_bin_dirs(&node_modules_dir);
             for member in &workspace_members {
@@ -7268,7 +7269,8 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                                 nm_dir_ref,
                                 true,
                                 None,
-                            );
+                                self.options.force,
+                            )?;
                             collector.record_phase(Phase::Bins, t_bins.elapsed());
                         } else {
                             remove_all_bin_dirs(nm_dir_ref);
@@ -7722,7 +7724,8 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                     &node_modules_dir,
                     true,
                     Some(&collector),
-                );
+                    self.options.force,
+                )?;
                 if std::env::var_os("RNPM_TIMING_DEBUG").is_some() {
                     eprintln!(
                         "[TIMING_PROFILE] bin link finished: {:.1} ms",
@@ -8952,7 +8955,7 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                         let target_rel = compute_bin_target_rel(&dest_dir, &pkg_bin_dir, &script_rel);
                         let script_path = dest_dir.join(&script_rel);
                         let _ = normalize_shebang(&script_path);
-                        let _ = create_shims(&pkg_bin_dir, &bin_name, &target_rel);
+                        create_shims_with_force(&pkg_bin_dir, &bin_name, &target_rel, self.options.force)?;
                     }
                 }
 

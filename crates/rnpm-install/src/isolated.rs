@@ -818,7 +818,12 @@ impl crate::Installer {
                 for (bin_name, script) in bins {
                     let script = script.trim_start_matches("./");
                     let _ = rnpm_shim::normalize_shebang(&project.join(&target).join(script));
-                    rnpm_shim::create_shims(&bin_dir, bin_name, &format!("{name}/{script}"))?;
+                    rnpm_shim::create_shims_with_force(
+                        &bin_dir,
+                        bin_name,
+                        &format!("{name}/{script}"),
+                        self.options.force,
+                    )?;
                 }
             }
         } else {

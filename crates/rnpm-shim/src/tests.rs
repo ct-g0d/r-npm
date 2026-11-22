@@ -1224,3 +1224,63 @@ fn test_global_bin_collision_same_package_symlink_allowed() {
     )
     .is_ok());
 }
+
+#[test]
+fn test_global_bin_collision_same_package_regular_shim_allowed() {
+    let dir = tempdir().unwrap();
+    let global_bin = dir.path().join("usr").join("local").join("bin");
+    fs::create_dir_all(&global_bin).unwrap();
+
+    // Create a global shim for my-pkg (as created by create_shims in a global dir)
+    create_shims(&global_bin, "my-tool", "my-pkg/bin/old-cli.js").unwrap();
+
+    // Reinstalling or upgrading the same package's shim must succeed without force!
+    let res = create_shims_with_force(&global_bin, "my-tool", "my-pkg/bin/new-cli.js", false);
+    assert!(res.is_ok(), "Self-upgrade of same package shim must succeed without force");
+}
+
+#[test]
+fn test_global_bin_collision_foreign_package_regular_shim_rejected() {
+    let dir = tempdir().unwrap();
+    let global_bin = dir.path().join("usr").join("local").join("bin");
+    fs::create_dir_all(&global_bin).unwrap();
+
+    // Create a global shim for foreign-pkg
+    create_shims(&global_bin, "my-tool", "foreign-pkg/bin/cli.js").unwrap();
+
+    // Trying to install another package's shim to the same bin name without force must fail with EEXIST!
+    let err = create_shims_with_force(&global_bin, "my-tool", "my-pkg/bin/cli.js", false).unwrap_err();
+    assert!(err.to_string().contains("EEXIST"));
+
+    // With force=true, overwrite is permitted
+    assert!(create_shims_with_force(&global_bin, "my-tool", "my-pkg/bin/cli.js", true).is_ok());
+}
+
+#[test]
+fn test_windows_companion_shims_collision_checks() {
+    let dir = tempdir().unwrap();
+    let global_bin = dir.path().join("usr").join("local").join("bin");
+    fs::create_dir_all(&global_bin).unwrap();
+
+    // Put an unrelated regular file at <bin_name>.cmd
+    let cmd_file = global_bin.join("custom-tool.cmd");
+    fs::write(&cmd_file, b"@echo custom batch script").unwrap();
+
+    // Without force, create_shims_with_force must reject with EEXIST because of the collision on custom-tool.cmd!
+    let err = create_shims_with_force(&global_bin, "custom-tool", "my-pkg/bin/cli.js", false).unwrap_err();
+    assert!(err.to_string().contains("EEXIST"), "Expected EEXIST for colliding .cmd file, got: {err}");
+
+    // With force, it must succeed and overwrite
+    assert!(create_shims_with_force(&global_bin, "custom-tool", "my-pkg/bin/cli.js", true).is_ok());
+
+    // Similarly for .ps1:
+    let dir2 = tempdir().unwrap();
+    let global_bin2 = dir2.path().join("usr").join("local").join("bin");
+    fs::create_dir_all(&global_bin2).unwrap();
+    let ps1_file = global_bin2.join("custom-tool2.ps1");
+    fs::write(&ps1_file, b"Write-Host 'custom ps1'").unwrap();
+
+    let err2 = create_shims_with_force(&global_bin2, "custom-tool2", "my-pkg/bin/cli.js", false).unwrap_err();
+    assert!(err2.to_string().contains("EEXIST"), "Expected EEXIST for colliding .ps1 file, got: {err2}");
+    assert!(create_shims_with_force(&global_bin2, "custom-tool2", "my-pkg/bin/cli.js", true).is_ok());
+}

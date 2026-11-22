@@ -225,7 +225,9 @@ fn test_link_tree_bins_ansi_html() {
         &nm,
         true,
         None,
-    );
+        false,
+    )
+    .unwrap();
 
     assert!(bin.join("ansi-html").exists(), "bin/ansi-html exists");
     assert!(

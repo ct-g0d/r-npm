@@ -165,7 +165,7 @@ fn parse_brace_range(inner: &str) -> Option<Vec<String>> {
 
     if let (Ok(start), Ok(end)) = (start_str.parse::<i64>(), end_str.parse::<i64>()) {
         let step = if let Some(st) = step_str {
-            st.parse::<i64>().ok()?.abs().max(1)
+            st.parse::<i64>().ok()?.checked_abs().unwrap_or(i64::MAX).max(1)
         } else {
             1
         };
@@ -217,30 +217,34 @@ fn parse_brace_range(inner: &str) -> Option<Vec<String>> {
             || (s_char.is_ascii_uppercase() && e_char.is_ascii_uppercase())
         {
             let step = if let Some(st) = step_str {
-                st.parse::<usize>().ok()?.max(1)
+                st.parse::<i64>().ok()?.checked_abs().unwrap_or(i64::MAX).max(1) as u64
             } else {
-                1
+                1u64
             };
             let mut res = Vec::new();
             if s_char <= e_char {
-                let mut cur = s_char as u8;
-                let end = e_char as u8;
+                let mut cur = s_char as u64;
+                let end = e_char as u64;
                 while cur <= end && res.len() < MAX_EXPANSIONS {
-                    res.push((cur as char).to_string());
-                    cur = cur.saturating_add(step as u8);
+                    if let Some(c) = u32::try_from(cur).ok().and_then(char::from_u32) {
+                        res.push(c.to_string());
+                    }
+                    cur = cur.saturating_add(step);
                     if cur > end {
                         break;
                     }
                 }
             } else {
-                let mut cur = s_char as u8;
-                let end = e_char as u8;
+                let mut cur = s_char as u64;
+                let end = e_char as u64;
                 while cur >= end && res.len() < MAX_EXPANSIONS {
-                    res.push((cur as char).to_string());
-                    if (cur as usize) < step {
+                    if let Some(c) = u32::try_from(cur).ok().and_then(char::from_u32) {
+                        res.push(c.to_string());
+                    }
+                    if cur < step {
                         break;
                     }
-                    cur -= step as u8;
+                    cur -= step;
                 }
             }
             return Some(res);
@@ -448,5 +452,21 @@ mod tests {
         assert_eq!(expand_braces("{single}"), vec!["{single}"]);
         assert_eq!(expand_braces("@org/{foo-*,bar}"), vec!["@org/foo-*", "@org/bar"]);
         assert_eq!(expand_braces("pkg-{1..3}"), vec!["pkg-1", "pkg-2", "pkg-3"]);
+
+        // Regression tests: step overflow, step 0, negative step matching npm minimatch braceExpand
+        assert_eq!(expand_braces("{a..z..256}"), vec!["a"]);
+        let all_az: Vec<String> = (b'a'..=b'z').map(|b| (b as char).to_string()).collect();
+        assert_eq!(expand_braces("{a..z..0}"), all_az);
+        assert_eq!(
+            expand_braces("{a..z..-2}"),
+            vec!["a", "c", "e", "g", "i", "k", "m", "o", "q", "s", "u", "w", "y"]
+        );
+        assert_eq!(expand_braces("{1..5..-2}"), vec!["1", "3", "5"]);
+        assert_eq!(expand_braces("{1..5..0}"), vec!["1", "2", "3", "4", "5"]);
+        assert_eq!(expand_braces("{z..a..256}"), vec!["z"]);
+        assert_eq!(
+            expand_braces("{z..a..-2}"),
+            vec!["z", "x", "v", "t", "r", "p", "n", "l", "j", "h", "f", "d", "b"]
+        );
     }
 }

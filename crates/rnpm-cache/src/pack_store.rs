@@ -2297,15 +2297,70 @@ fn rename_atomic(from: &Path, to: &Path) -> std::io::Result<()> {
     }
 }
 
+#[cfg(windows)]
+mod windows_rename {
+    use std::io;
+    use std::os::windows::ffi::OsStrExt;
+    use std::path::Path;
+
+    const MOVEFILE_REPLACE_EXISTING: u32 = 0x00000001;
+    const MOVEFILE_WRITE_THROUGH: u32 = 0x00000008;
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn MoveFileExW(
+            lpExistingFileName: *const u16,
+            lpNewFileName: *const u16,
+            dwFlags: u32,
+        ) -> i32;
+    }
+
+    pub fn move_file_replace(from: &Path, to: &Path) -> io::Result<()> {
+        let from_wide: Vec<u16> = from.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+        let to_wide: Vec<u16> = to.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+
+        let ret = unsafe {
+            MoveFileExW(
+                from_wide.as_ptr(),
+                to_wide.as_ptr(),
+                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+            )
+        };
+        if ret == 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    }
+}
+
+#[inline]
+fn atomic_replace_file(from: &Path, to: &Path) -> std::io::Result<()> {
+    #[cfg(windows)]
+    {
+        windows_rename::move_file_replace(from, to)
+    }
+    #[cfg(not(windows))]
+    {
+        fs::rename(from, to)
+    }
+}
+
 /// Atomically renames a temporary file into a CAS destination with Windows retry support.
 ///
 /// If `to` already exists and has the expected length, another thread concurrently wrote it;
 /// this is treated as a success, and `from` is cleaned up.
 /// If `to` exists but does not match `expected_len` (e.g. truncated or corrupted), `to` is
-/// removed and replaced.
+/// replaced atomically without removing it first.
 /// On failure or exhaustion of retries, `from` is cleaned up to prevent leftover temp files.
 fn rename_atomic_cas(from: &Path, to: &Path, expected_len: u64) -> std::io::Result<()> {
-    if fs::rename(from, to).is_ok() {
+    if let Ok(m) = to.metadata() {
+        if m.len() == expected_len {
+            let _ = fs::remove_file(from);
+            return Ok(());
+        }
+    }
+    if atomic_replace_file(from, to).is_ok() {
         return Ok(());
     }
     let mut attempts = 0;
@@ -2315,16 +2370,18 @@ fn rename_atomic_cas(from: &Path, to: &Path, expected_len: u64) -> std::io::Resu
         if let Some(parent) = to.parent() {
             let _ = fs::create_dir_all(parent);
         }
-        match fs::rename(from, to) {
+        if let Ok(m) = to.metadata() {
+            if m.len() == expected_len {
+                let _ = fs::remove_file(from);
+                return Ok(());
+            }
+        }
+        match atomic_replace_file(from, to) {
             Ok(()) => return Ok(()),
             Err(e) => {
                 if let Ok(m) = to.metadata() {
                     if m.len() == expected_len {
                         let _ = fs::remove_file(from);
-                        return Ok(());
-                    }
-                    let _ = fs::remove_file(to);
-                    if fs::rename(from, to).is_ok() {
                         return Ok(());
                     }
                 }
@@ -2354,6 +2411,33 @@ mod tests {
     use flate2::write::GzEncoder;
     use flate2::Compression;
     use tempfile::tempdir;
+
+    #[test]
+    fn test_rename_atomic_cas_cases() {
+        let dir = tempdir().unwrap();
+        let from = dir.path().join("temp.dat");
+        let to = dir.path().join("final.dat");
+
+        // 1. Rename into non-existing destination
+        fs::write(&from, b"content-1234").unwrap();
+        rename_atomic_cas(&from, &to, 12).unwrap();
+        assert_eq!(fs::read(&to).unwrap(), b"content-1234");
+        assert!(!from.exists());
+
+        // 2. Destination exists with matching expected length: treated as concurrent success
+        fs::write(&from, b"content-5678").unwrap();
+        rename_atomic_cas(&from, &to, 12).unwrap();
+        // Destination preserved, from cleaned up
+        assert_eq!(fs::read(&to).unwrap(), b"content-1234");
+        assert!(!from.exists());
+
+        // 3. Destination exists with mismatched length (e.g. truncated/corrupted):
+        // Atomically replaced with new content
+        fs::write(&from, b"new-longer-content").unwrap();
+        rename_atomic_cas(&from, &to, 18).unwrap();
+        assert_eq!(fs::read(&to).unwrap(), b"new-longer-content");
+        assert!(!from.exists());
+    }
 
     #[test]
     fn test_4k_alignment_and_index_serialization() {
