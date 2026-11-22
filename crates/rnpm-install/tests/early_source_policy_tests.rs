@@ -1414,8 +1414,82 @@ async fn test_allow_registry_root_npm_alias_succeeds() {
 
     assert!(result.is_ok(), "Expected install of aliased root registry dep to succeed: {:?}", result.err());
 
+    let reqs = server.requested_paths.lock().await.clone();
+    let alias_requests = reqs.iter().filter(|p| p.starts_with("/my-foo") || p.as_str() == "/my-foo").count();
+    assert_eq!(alias_requests, 0, "ZERO HTTP requests must be sent to /my-foo, but got: {:?}", reqs);
+
     let installed_pkg_json = project_dir.path().join("node_modules").join("my-foo").join("package.json");
     assert!(installed_pkg_json.exists(), "node_modules/my-foo/package.json should exist");
     let content = std::fs::read_to_string(&installed_pkg_json).unwrap();
     assert!(content.contains("\"name\": \"foo\"") || content.contains("\"name\":\"foo\""), "Content should match foo");
+}
+
+// -----------------------------------------------------------------------------
+// Test 19: Finding #4 regression test: allow-registry=root with npm: alias
+// Asserts that when root declares "my-alias": "npm:real-pkg@^1.0.0":
+// 1. ZERO HTTP requests are ever sent to /my-alias (alias_requests == 0).
+// 2. ONLY /real-pkg is fetched and installed cleanly under node_modules/my-alias.
+// -----------------------------------------------------------------------------
+#[tokio::test]
+async fn test_allow_registry_root_npm_alias_zero_requests_to_alias_name() {
+    let real_pkg_tgz = create_test_tarball(&[("package.json", br#"{"name":"real-pkg","version":"1.0.0"}"#)]);
+    let real_pkg_tgz_bytes = Arc::new(real_pkg_tgz);
+
+    let server = CountingServer::start(move |path, base_url| {
+        if path == "/real-pkg" {
+            let packument = serde_json::json!({
+                "name": "real-pkg",
+                "dist-tags": { "latest": "1.0.0" },
+                "versions": {
+                    "1.0.0": {
+                        "name": "real-pkg",
+                        "version": "1.0.0",
+                        "dist": {
+                            "tarball": format!("{base_url}/real-pkg/-/real-pkg-1.0.0.tgz")
+                        }
+                    }
+                }
+            });
+            Some((200, vec![("Content-Type", "application/json".to_string())], packument.to_string().into_bytes()))
+        } else if path == "/real-pkg/-/real-pkg-1.0.0.tgz" {
+            Some((200, vec![("Content-Type", "application/octet-stream".to_string())], (*real_pkg_tgz_bytes).clone()))
+        } else {
+            None
+        }
+    }).await;
+
+    let project_dir = tempdir().unwrap();
+    let cache_dir = tempdir().unwrap();
+
+    setup_test_project(
+        project_dir.path(),
+        &serde_json::json!({
+            "my-alias": "npm:real-pkg@^1.0.0"
+        }),
+        "allow-registry=root\n",
+    );
+
+    let options = InstallOptions {
+        project_dir: project_dir.path().to_path_buf(),
+        cache_dir: Some(cache_dir.path().to_path_buf()),
+        registry_url: Some(server.url()),
+        ..Default::default()
+    };
+
+    let mut installer = Installer::new(options).unwrap();
+    let result = installer.install().await;
+
+    assert!(result.is_ok(), "Expected install of aliased root registry dep to succeed: {:?}", result.err());
+
+    let reqs = server.requested_paths.lock().await.clone();
+    let alias_requests = reqs.iter().filter(|p| p.starts_with("/my-alias") || p.as_str() == "/my-alias").count();
+    assert_eq!(alias_requests, 0, "ZERO HTTP requests must be sent to /my-alias, but got: {:?}", reqs);
+
+    let real_pkg_requests = reqs.iter().filter(|p| p.as_str() == "/real-pkg").count();
+    assert!(real_pkg_requests >= 1, "Expected packument request for /real-pkg, got: {:?}", reqs);
+
+    let installed_pkg_json = project_dir.path().join("node_modules").join("my-alias").join("package.json");
+    assert!(installed_pkg_json.exists(), "node_modules/my-alias/package.json should exist");
+    let content = std::fs::read_to_string(&installed_pkg_json).unwrap();
+    assert!(content.contains("\"name\": \"real-pkg\"") || content.contains("\"name\":\"real-pkg\""), "Content should match real-pkg");
 }

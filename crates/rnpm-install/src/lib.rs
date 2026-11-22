@@ -2762,9 +2762,15 @@ impl Installer {
             ] {
                 for (name, spec) in map {
                     if policy::parse_source_kind(spec) == policy::SourceKind::Registry {
-                        declared.insert(name.clone());
                         if let Ok(dep_spec) = rnpm_solver::DependencySpec::parse(name, spec) {
-                            declared.insert(dep_spec.package_name);
+                            if matches!(
+                                dep_spec.target,
+                                PackageTarget::Range(_) | PackageTarget::Version(_) | PackageTarget::Tag(_)
+                            ) {
+                                declared.insert(dep_spec.package_name);
+                            }
+                        } else if !spec.trim().starts_with("npm:") {
+                            declared.insert(name.clone());
                         }
                     }
                 }
@@ -2776,22 +2782,24 @@ impl Installer {
         }
         for pkg_str in &self.options.packages {
             if let Ok(s) = rnpm_core::spec::PackageSpec::parse(pkg_str) {
-                let is_registry = match &s.target {
-                    PackageTarget::Tag(_) | PackageTarget::Range(_) | PackageTarget::Version(_) => true,
-                    PackageTarget::Alias { name: ref target_name, ref target } => {
-                        let inner_reg = matches!(
+                match &s.target {
+                    PackageTarget::Tag(_) | PackageTarget::Range(_) | PackageTarget::Version(_) => {
+                        declared.insert(s.name);
+                    }
+                    PackageTarget::Alias {
+                        name: ref target_name,
+                        ref target,
+                    } => {
+                        if matches!(
                             target.as_ref(),
-                            PackageTarget::Tag(_) | PackageTarget::Range(_) | PackageTarget::Version(_)
-                        );
-                        if inner_reg {
+                            PackageTarget::Tag(_)
+                                | PackageTarget::Range(_)
+                                | PackageTarget::Version(_)
+                        ) {
                             declared.insert(target_name.clone());
                         }
-                        inner_reg
                     }
-                    _ => false,
-                };
-                if is_registry {
-                    declared.insert(s.name);
+                    _ => {}
                 }
             }
         }

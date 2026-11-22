@@ -487,7 +487,22 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
             }
         }
 
-        let root_edges: Vec<(&str, bool)> = root_deps.keys().map(|k| (k.as_str(), true)).collect();
+        let mut root_targets = Vec::new();
+        for (name, (spec, _)) in &root_deps {
+            let Ok(dep_spec) = DependencySpec::parse(name, spec) else {
+                continue;
+            };
+            if matches!(
+                dep_spec.target,
+                PackageTarget::Range(_) | PackageTarget::Version(_) | PackageTarget::Tag(_)
+            ) {
+                root_targets.push(dep_spec);
+            }
+        }
+        let root_edges: Vec<(&str, bool)> = root_targets
+            .iter()
+            .map(|t| (t.package_name.as_str(), true))
+            .collect();
         self.provider.prefetch_packages_for_edge(&root_edges);
         if self.options.lockfile.is_none() {
             self.prefetch_closure(&root_deps);
