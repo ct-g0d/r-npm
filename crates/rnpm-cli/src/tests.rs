@@ -1229,6 +1229,12 @@ async fn test_cli_audit_clean_lockfile_zero_vulnerabilities() {
             audit_level: "low".to_string(),
             dry_run: false,
             force: false,
+            package_lock_only: false,
+            omit: Vec::new(),
+            include: Vec::new(),
+            legacy_peer_deps: false,
+            strict_peer_deps: false,
+            install_strategy: None,
         },
     };
 
@@ -1808,6 +1814,25 @@ fn test_cli_parse_package_lock_only() {
             package_lock_only, ..
         } => assert!(package_lock_only),
         _ => panic!("Expected Commands::Ci"),
+    }
+
+    // audit fix parses --package-lock-only
+    let parsed_audit =
+        Cli::try_parse_from(["rnpm", "audit", "fix", "--package-lock-only"]).unwrap();
+    match parsed_audit.command {
+        Commands::Audit {
+            package_lock_only, ..
+        } => assert!(package_lock_only),
+        _ => panic!("Expected Commands::Audit"),
+    }
+
+    // fix parses --package-lock-only
+    let parsed_fix = Cli::try_parse_from(["rnpm", "fix", "--package-lock-only"]).unwrap();
+    match parsed_fix.command {
+        Commands::Fix {
+            package_lock_only, ..
+        } => assert!(package_lock_only),
+        _ => panic!("Expected Commands::Fix"),
     }
 
     // default is false

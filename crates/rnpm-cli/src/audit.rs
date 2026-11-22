@@ -505,7 +505,7 @@ pub async fn build_audit_report_with_advisories(
     project_dir: &Path,
     registry_url: Option<String>,
 ) -> anyhow::Result<(AuditReport, Option<Severity>, Vec<AuditAdvisory>)> {
-    let lock_path = project_dir.join("package-lock.json");
+    let (lock_path, is_shrinkwrap) = rnpm_install::resolve_lockfile_path(project_dir);
     if !lock_path.exists() {
         return Err(anyhow::anyhow!(
             "npm error code ENOLOCK\n\
@@ -514,8 +514,16 @@ pub async fn build_audit_report_with_advisories(
         ));
     }
 
-    let lockfile = rnpm_lockfile::load_and_migrate(&lock_path)
-        .map_err(|e| anyhow::anyhow!("Failed to parse package-lock.json: {e}"))?;
+    let lockfile = rnpm_lockfile::load_and_migrate(&lock_path).map_err(|e| {
+        anyhow::anyhow!(
+            "Failed to parse {}: {e}",
+            if is_shrinkwrap {
+                "npm-shrinkwrap.json"
+            } else {
+                "package-lock.json"
+            }
+        )
+    })?;
 
     let config = rnpm_config::Config::load(Some(project_dir)).unwrap_or_default();
 
@@ -936,7 +944,7 @@ pub async fn run_post_install_audit(
     project_dir: &Path,
     registry_url: Option<String>,
 ) -> anyhow::Result<()> {
-    let lock_path = project_dir.join("package-lock.json");
+    let (lock_path, _) = rnpm_install::resolve_lockfile_path(project_dir);
     if !lock_path.exists() {
         return Ok(());
     }
@@ -951,7 +959,7 @@ pub async fn run_post_install_audit(
 
 /// Counts installed packages that declare funding notices.
 pub fn count_funding_packages(project_dir: &Path) -> usize {
-    let lock_path = project_dir.join("package-lock.json");
+    let (lock_path, _) = rnpm_install::resolve_lockfile_path(project_dir);
     if lock_path.exists() {
         if let Ok(lockfile) = rnpm_lockfile::load_and_migrate(&lock_path) {
             let count = lockfile

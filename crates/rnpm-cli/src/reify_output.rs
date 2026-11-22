@@ -121,7 +121,9 @@ fn warn_deprecated(project_dir: &Path, report: &ReifyReport) {
     let read = |file: &str| -> Option<Value> {
         serde_json::from_slice(&std::fs::read(project_dir.join(file)).ok()?).ok()
     };
-    let Some(lock) = read("node_modules/.package-lock.json").or_else(|| read("package-lock.json"))
+    let Some(lock) = read("node_modules/.package-lock.json")
+        .or_else(|| read("npm-shrinkwrap.json"))
+        .or_else(|| read("package-lock.json"))
     else {
         return;
     };
@@ -295,7 +297,8 @@ pub(crate) type Tree = std::collections::BTreeMap<String, rnpm_lockfile::Lockfil
 
 /// The tree on disk, as arborist's loadActual sees it.
 pub(crate) fn snapshot(project_dir: &Path) -> Tree {
-    let lock = rnpm_lockfile::load_and_migrate(&project_dir.join("package-lock.json"))
+    let (lock_path, _) = rnpm_install::resolve_lockfile_path(project_dir);
+    let lock = rnpm_lockfile::load_and_migrate(&lock_path)
         .ok()
         .map(|l| l.packages);
     rnpm_install::reify_report::load_actual(

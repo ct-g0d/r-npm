@@ -677,6 +677,30 @@ pub(crate) enum Commands {
         /// Force audit fix with potential breaking changes
         #[arg(long)]
         force: bool,
+
+        /// Resolve and write package-lock.json without extracting or modifying node_modules
+        #[arg(long = "package-lock-only")]
+        package_lock_only: bool,
+
+        /// Dependency types to omit (dev, optional, peer)
+        #[arg(long, value_delimiter = ',')]
+        omit: Vec<String>,
+
+        /// Dependency types to include (dev, prod, optional, peer)
+        #[arg(long, value_delimiter = ',')]
+        include: Vec<String>,
+
+        /// Bypass peer dependency installation conflicts
+        #[arg(long = "legacy-peer-deps")]
+        legacy_peer_deps: bool,
+
+        /// Fail installation if any peer dependencies are missing or invalid
+        #[arg(long = "strict-peer-deps")]
+        strict_peer_deps: bool,
+
+        /// Installation layout strategy: hoisted, nested, shallow, linked
+        #[arg(long = "install-strategy")]
+        install_strategy: Option<String>,
     },
 
     /// Remove extraneous packages from node_modules
@@ -1351,6 +1375,18 @@ pub(crate) enum Commands {
         registry: Option<String>,
         #[arg(long)]
         dry_run: bool,
+        #[arg(long = "package-lock-only")]
+        package_lock_only: bool,
+        #[arg(long, value_delimiter = ',')]
+        omit: Vec<String>,
+        #[arg(long, value_delimiter = ',')]
+        include: Vec<String>,
+        #[arg(long = "legacy-peer-deps")]
+        legacy_peer_deps: bool,
+        #[arg(long = "strict-peer-deps")]
+        strict_peer_deps: bool,
+        #[arg(long = "install-strategy")]
+        install_strategy: Option<String>,
     },
     /// Show package bug tracker URL.
     #[command(alias = "issues")]
@@ -4463,6 +4499,12 @@ async fn run_audit_fix(
     force: bool,
     json: bool,
     audit_level: &str,
+    package_lock_only: bool,
+    omit: &[String],
+    include: &[String],
+    legacy_peer_deps: bool,
+    strict_peer_deps: bool,
+    install_strategy: Option<&str>,
 ) -> anyhow::Result<()> {
     let manifest_path = project_dir.join("package.json");
     if !manifest_path.exists() {
@@ -4470,7 +4512,7 @@ async fn run_audit_fix(
             "npm error code ENOENT\nnpm error package.json not found"
         ));
     }
-    let lock_path = project_dir.join("package-lock.json");
+    let (lock_path, _is_shrinkwrap) = rnpm_install::resolve_lockfile_path(project_dir);
     if !lock_path.exists() {
         return Err(anyhow::anyhow!(
             "npm error code ENOLOCK\n\
@@ -4505,8 +4547,12 @@ async fn run_audit_fix(
     let config = rnpm_config::Config::load(Some(project_dir)).unwrap_or_default();
     if initial_vulns == 0 {
         let (post_report, _) = audit::build_audit_report(project_dir, registry.clone()).await?;
-        let tree = reify_output::snapshot(project_dir);
-        let inventory = tree.keys().filter(|k| !k.is_empty()).count() + 1;
+        let inventory = if let Ok(lockfile) = rnpm_lockfile::load_and_migrate(&lock_path) {
+            lockfile.packages.keys().filter(|k| !k.is_empty()).count() + 1
+        } else {
+            let tree = reify_output::snapshot(project_dir);
+            tree.keys().filter(|k| !k.is_empty()).count() + 1
+        };
         let report = rnpm_install::ReifyReport {
             changes: Vec::new(),
             inventory,
@@ -4705,12 +4751,56 @@ async fn run_audit_fix(
     }
 
     // 2. Perform real package resolution, tarball extraction, and lockfile updates via Installer!
+    let effective_package_lock_only =
+        package_lock_only || config.get_bool("package-lock-only").unwrap_or(false);
+    let effective_legacy_peer_deps =
+        legacy_peer_deps || config.get_bool("legacy-peer-deps").unwrap_or(false);
+    let effective_strict_peer_deps =
+        strict_peer_deps || config.get_bool("strict-peer-deps").unwrap_or(false);
+    let strategy_str = install_strategy
+        .or_else(|| config.get("install-strategy"))
+        .or_else(|| config.get("install_strategy"))
+        .unwrap_or("hoisted");
+    let effective_strategy = strategy_str
+        .parse::<rnpm_install::InstallStrategy>()
+        .unwrap_or_else(|_| {
+            eprintln!(
+                "npm warn invalid config install-strategy={} set in command line options",
+                strategy_str
+            );
+            eprintln!(
+                "npm warn invalid config Must be one of: hoisted, nested, shallow, linked"
+            );
+            rnpm_install::InstallStrategy::Hoisted
+        });
+    let mut effective_omit = omit.to_vec();
+    if effective_omit.is_empty() {
+        if let Some(config_omit) = config.get("omit") {
+            effective_omit.push(config_omit.to_string());
+        }
+    }
+    let mut effective_include = include.to_vec();
+    if effective_include.is_empty() {
+        if let Some(config_include) = config.get("include") {
+            effective_include.push(config_include.to_string());
+        }
+    }
+    let (omit_dev, omit_optional, omit_peer) =
+        parse_omit_and_include_options(&effective_omit, &effective_include);
+
     let options = InstallOptions {
         project_dir: project_dir.to_path_buf(),
         registry_url: registry.clone(),
         ignore_scripts: config.get_bool("ignore-scripts").unwrap_or(false),
         foreground_scripts: config.get_bool("foreground-scripts").unwrap_or(false),
         strict_sandbox: config.get_bool("strict-sandbox").unwrap_or(false),
+        package_lock_only: effective_package_lock_only,
+        omit_dev,
+        omit_optional,
+        omit_peer,
+        legacy_peer_deps: effective_legacy_peer_deps,
+        strict_peer_deps: effective_strict_peer_deps,
+        install_strategy: effective_strategy,
         dry_run,
         ..Default::default()
     };
@@ -4759,7 +4849,12 @@ async fn run_audit_fix(
     }
 
     // npm reifies, then prints the detailed audit report of the new tree.
-    let report = summary.reify.unwrap_or_default();
+    let mut report = summary.reify.unwrap_or_default();
+    if report.inventory == 0 {
+        if let Ok(lockfile) = rnpm_lockfile::load_and_migrate(&lock_path) {
+            report.inventory = lockfile.packages.keys().filter(|k| !k.is_empty()).count() + 1;
+        }
+    }
     let post_report = if dry_run {
         // A dry run prints the old tree's report as building the ideal tree
         // left it.
@@ -5930,10 +6025,29 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             audit_level,
             dry_run,
             force,
-            ..
+            package_lock_only,
+            omit,
+            include,
+            legacy_peer_deps,
+            strict_peer_deps,
+            install_strategy,
         } => {
             if action.as_deref() == Some("fix") {
-                run_audit_fix(&current_dir, registry, dry_run, force, json, &audit_level).await?;
+                run_audit_fix(
+                    &current_dir,
+                    registry,
+                    dry_run,
+                    force,
+                    json,
+                    &audit_level,
+                    package_lock_only,
+                    &omit,
+                    &include,
+                    legacy_peer_deps,
+                    strict_peer_deps,
+                    install_strategy.as_deref(),
+                )
+                .await?;
             } else if action.as_deref() == Some("signatures") {
                 audit_signatures::run(&current_dir, json).await?;
             } else {
@@ -6672,8 +6786,28 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             force,
             registry,
             dry_run,
+            package_lock_only,
+            omit,
+            include,
+            legacy_peer_deps,
+            strict_peer_deps,
+            install_strategy,
         } => {
-            run_audit_fix(&current_dir, registry, dry_run, force, false, "low").await?;
+            run_audit_fix(
+                &current_dir,
+                registry,
+                dry_run,
+                force,
+                false,
+                "low",
+                package_lock_only,
+                &omit,
+                &include,
+                legacy_peer_deps,
+                strict_peer_deps,
+                install_strategy.as_deref(),
+            )
+            .await?;
         }
         Commands::Trust {
             action,
