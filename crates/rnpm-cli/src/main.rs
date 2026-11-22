@@ -4496,7 +4496,7 @@ pub(crate) async fn execute_publish(
         if manifest_json.get("private").is_some_and(|v| v == true) {
             anyhow::bail!("npm error code EPRIVATE\nnpm error This package has been marked as private\nnpm error Remove the 'private' field from the package.json to publish it.");
         }
-        let mut provenance_attestation_val: Option<serde_json::Value> = None;
+        let mut provenance_bundle_val: Option<rnpm_registry::SigstoreBundle> = None;
         if provenance_requested {
             let oidc_token = get_sigstore_oidc_token().await?;
             let sha512_hex = data_encoding::HEXLOWER.encode(&sha2::Sha512::digest(&tarball_bytes));
@@ -4514,12 +4514,7 @@ pub(crate) async fn execute_publish(
             .map_err(|e| anyhow::anyhow!("npm error code EPROVENANCE\nnpm error Failed to generate provenance: {e}"))?;
 
             published_tlog_url = Some(tlog_url);
-            provenance_attestation_val = Some(serde_json::json!({
-                "bundle": bundle,
-                "provenance": {
-                    "predicateType": "https://slsa.dev/provenance/v1"
-                }
-            }));
+            provenance_bundle_val = Some(bundle);
         }
         let mut publish_manifest = manifest_json.clone();
         if tarball_spec {
@@ -4588,7 +4583,8 @@ pub(crate) async fn execute_publish(
             manifest: &publish_manifest,
             tarball: tarball_data,
             registry_url: &registry_url,
-            provenance_attestation: provenance_attestation_val.as_ref(),
+            provenance_attestation: None,
+            provenance_bundle: provenance_bundle_val.as_ref(),
         };
         let payload = rnpm_registry::create_publish_payload(&payload_opts);
         let put_url = registry_url

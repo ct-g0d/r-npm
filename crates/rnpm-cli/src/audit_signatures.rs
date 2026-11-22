@@ -340,10 +340,35 @@ pub async fn run(project_dir: &Path, json_output: bool) -> anyhow::Result<()> {
             }
 
             if !bundles.is_empty() {
-                let verifier = rnpm_registry::ProvenanceVerifier::new(rnpm_registry::ProvenancePolicy::AllowAny);
+                let mut reg_keys = HashMap::new();
+                if let Some(rkeys) = keys.get(&pkg.registry) {
+                    for k in rkeys {
+                        reg_keys.insert(k.keyid.clone(), k.spki.clone());
+                    }
+                }
+                for rkeys in keys.values() {
+                    for k in rkeys {
+                        reg_keys.entry(k.keyid.clone()).or_insert_with(|| k.spki.clone());
+                    }
+                }
+
+                let mut verifier = rnpm_registry::ProvenanceVerifier::new(rnpm_registry::ProvenancePolicy::AllowAny)
+                    .with_registry_keys(reg_keys);
+
+                if let Ok(path) = std::env::var("SIGSTORE_ROOT_CERT") {
+                    if let Ok(bytes) = std::fs::read(&path) {
+                        verifier = verifier.with_fulcio_root_cert(bytes);
+                    }
+                }
+                if let Ok(key_b64) = std::env::var("SIGSTORE_REKOR_KEY") {
+                    if let Ok(bytes) = rnpm_registry::provenance::decode_base64(&key_b64) {
+                        verifier = verifier.with_rekor_public_key(bytes);
+                    }
+                }
+
                 let mut att_err = None;
                 for (pred_type, bundle) in &bundles {
-                    if let Err(e) = verifier.verify(&pkg.name, bundle, integrity.as_deref(), None) {
+                    if let Err(e) = verifier.verify_package(&pkg.name, Some(&pkg.version), bundle, integrity.as_deref(), None) {
                         att_err = Some((pred_type.clone(), e.to_string()));
                         break;
                     }
@@ -571,10 +596,14 @@ async fn fetch_keys(
         .into_iter()
         .flatten()
         .filter_map(|k| {
+            let keyid = k["keyid"].as_str().or_else(|| k["keyId"].as_str())?.to_string();
+            let spki_b64 = k["key"].as_str().or_else(|| k["publicKey"]["rawBytes"].as_str())?;
+            let spki = data_encoding::BASE64.decode(spki_b64.as_bytes()).ok()?;
+            let expires = k["expires"].as_str().or_else(|| k["publicKey"]["validFor"]["end"].as_str()).map(str::to_string);
             Some(RegistryKey {
-                keyid: k["keyid"].as_str()?.to_string(),
-                spki: data_encoding::BASE64.decode(k["key"].as_str()?.as_bytes()).ok()?,
-                expires: k["expires"].as_str().map(str::to_string),
+                keyid,
+                spki,
+                expires,
             })
         })
         .collect();

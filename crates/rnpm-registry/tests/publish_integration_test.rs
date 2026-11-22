@@ -216,6 +216,7 @@ async fn test_publish_unscoped_success() {
         tarball,
         registry_url: &server_url,
         provenance_attestation: None,
+        provenance_bundle: None,
     };
     let payload = create_publish_payload(&opts);
 
@@ -300,6 +301,7 @@ async fn test_publish_scoped_success() {
         tarball,
         registry_url: &server_url,
         provenance_attestation: None,
+        provenance_bundle: None,
     };
     let payload = create_publish_payload(&opts);
 

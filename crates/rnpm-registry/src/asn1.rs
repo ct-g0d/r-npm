@@ -44,6 +44,11 @@ pub const OID_FULCIO_RUN_COMMIT_SHA: &str = "1.3.6.1.4.1.57264.1.9";
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParsedCertificate {
     pub raw_der: Vec<u8>,
+    pub tbs_bytes: Vec<u8>,
+    pub signature_value: Vec<u8>,
+    pub signature_algorithm_oid: String,
+    pub issuer_raw: Vec<u8>,
+    pub subject_raw: Vec<u8>,
     pub spki_bytes: Vec<u8>,
     pub public_key_bytes: Vec<u8>,
     pub algorithm_oid: String,
@@ -261,9 +266,9 @@ pub fn parse_x509_certificate(der: &[u8]) -> Result<ParsedCertificate, RegistryE
     }
 
     let cert_elems = parse_sequence(cert_val)?;
-    if cert_elems.is_empty() {
+    if cert_elems.len() < 3 {
         return Err(RegistryError::InvalidSigstoreBundle(
-            "Empty certificate sequence".into(),
+            "X.509 certificate sequence requires tbsCertificate, signatureAlgorithm, and signatureValue".into(),
         ));
     }
 
@@ -273,6 +278,21 @@ pub fn parse_x509_certificate(der: &[u8]) -> Result<ParsedCertificate, RegistryE
             "Expected TBSCertificate SEQUENCE".into(),
         ));
     }
+    let tbs_bytes = der_tlv(tbs_tag, tbs_val);
+
+    let sig_algo_elems = parse_sequence(cert_elems[1].1)?;
+    let signature_algorithm_oid = if !sig_algo_elems.is_empty() {
+        decode_oid(sig_algo_elems[0].1)
+    } else {
+        String::new()
+    };
+
+    let sig_bitstring = cert_elems[2].1;
+    let signature_value = if !sig_bitstring.is_empty() {
+        sig_bitstring[1..].to_vec()
+    } else {
+        Vec::new()
+    };
 
     let tbs_elems = parse_sequence(tbs_val)?;
     let mut cursor = 0;
@@ -309,6 +329,7 @@ pub fn parse_x509_certificate(der: &[u8]) -> Result<ParsedCertificate, RegistryE
             "Missing issuer in TBSCertificate".into(),
         ));
     }
+    let issuer_raw = der_tlv(tbs_elems[cursor].0, tbs_elems[cursor].1);
     cursor += 1;
 
     // validity (Validity)
@@ -333,6 +354,7 @@ pub fn parse_x509_certificate(der: &[u8]) -> Result<ParsedCertificate, RegistryE
             "Missing subject in TBSCertificate".into(),
         ));
     }
+    let subject_raw = der_tlv(tbs_elems[cursor].0, tbs_elems[cursor].1);
     cursor += 1;
 
     // subjectPublicKeyInfo (SubjectPublicKeyInfo)
@@ -382,6 +404,11 @@ pub fn parse_x509_certificate(der: &[u8]) -> Result<ParsedCertificate, RegistryE
 
     Ok(ParsedCertificate {
         raw_der: der.to_vec(),
+        tbs_bytes,
+        signature_value,
+        signature_algorithm_oid,
+        issuer_raw,
+        subject_raw,
         spki_bytes,
         public_key_bytes,
         algorithm_oid,
