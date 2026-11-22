@@ -1871,7 +1871,10 @@ fn current_time_ms() -> i64 {
             // Enforce key expiry if tracked
             if let Some((expires_str, expires_ms)) = self.registry_key_expiries.get(keyid) {
                 let signing_time_ms = if let Some(tlog) = vm.tlog_entries.first() {
-                    if tlog.integrated_time > 0 {
+                    if tlog.integrated_time > 0
+                        && tlog.inclusion_promise.is_some()
+                        && verify_rekor_set(&self.rekor_public_keys, tlog).is_ok()
+                    {
                         tlog.integrated_time * 1000
                     } else {
                         Self::current_time_ms()
@@ -2038,12 +2041,12 @@ fn current_time_ms() -> i64 {
             };
 
             // Require an exact versioned PURL with '@<version>'
-            let Some((name_part, version_part)) = purl_rest.split_once('@') else {
+            let Some((name_part, version_part)) = purl_rest.rsplit_once('@') else {
                 // NEVER accept a subject missing '@<version>'!
                 continue;
             };
 
-            if version_part.trim().is_empty() {
+            if name_part.is_empty() || version_part.trim().is_empty() {
                 continue;
             }
 

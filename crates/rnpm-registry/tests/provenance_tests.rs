@@ -1504,3 +1504,111 @@ fn test_publish_sigstore_attachment_data_is_raw_json_string() {
     assert_eq!(data_str, bundle_serialized);
     assert_eq!(att["length"].as_u64().unwrap(), bundle_serialized.len() as u64);
 }
+
+#[test]
+fn test_unencoded_scoped_purl_matching_and_unversioned_rejection() {
+    let tarball_bytes = b"scoped purl test tarball payload";
+    let sha512_hex = HEXLOWER.encode(&Sha512::digest(tarball_bytes));
+
+    // 1. Unencoded scoped PURL with version: `pkg:npm/@scope/pkg@1.0.0`
+    let bundle_unencoded = make_test_bundle_with_subject(
+        "pkg:npm/@scope/pkg@1.0.0",
+        &sha512_hex,
+        "org/repo",
+        "sha123",
+    );
+    let verifier = ProvenanceVerifier::new(ProvenancePolicy::AllowAny).with_test_mock_roots();
+    let res = verifier.verify_package("@scope/pkg", Some("1.0.0"), &bundle_unencoded, None, Some(tarball_bytes));
+    assert!(res.is_ok(), "pkg:npm/@scope/pkg@1.0.0 must succeed for @scope/pkg v1.0.0: {:?}", res.err());
+
+    // 2. Unencoded scoped PURL without version: `pkg:npm/@scope/pkg` -> must be rejected
+    let bundle_unversioned = make_test_bundle_with_subject(
+        "pkg:npm/@scope/pkg",
+        &sha512_hex,
+        "org/repo",
+        "sha123",
+    );
+    let err = verifier
+        .verify_package("@scope/pkg", Some("1.0.0"), &bundle_unversioned, None, Some(tarball_bytes))
+        .unwrap_err();
+    assert!(
+        matches!(err, RegistryError::ProvenanceVerificationFailed(ref msg) if msg.contains("Attestation subject name mismatch")),
+        "Expected subject name mismatch for unversioned scoped PURL, got: {err:?}"
+    );
+}
+
+#[test]
+fn test_forged_unauthenticated_tlog_integrated_time_cannot_resurrect_expired_key() {
+    let tarball_bytes = b"forged tlog time tarball";
+    let sha512_hex = HEXLOWER.encode(&Sha512::digest(tarball_bytes));
+    let signer = EphemeralSigner::new().unwrap();
+
+    let mut digest = HashMap::new();
+    digest.insert("sha512".to_string(), sha512_hex);
+    let statement = InTotoStatement {
+        statement_type: "https://in-toto.io/Statement/v1".into(),
+        subject: vec![InTotoSubject {
+            name: "pkg:npm/keyed-pkg@1.0.0".into(),
+            digest,
+        }],
+        predicate_type: "https://slsa.dev/provenance/v1".into(),
+        predicate: SlsaPredicate::default(),
+    };
+    let mut envelope = sign_dsse_envelope(&statement, &signer).unwrap();
+    let keyid = "SHA256:expiring-key";
+    envelope.signatures[0].keyid = Some(keyid.to_string());
+
+    // Bundle contains a forged tlog entry with an old integratedTime (year 2020: 1577836800)
+    // but NO valid verified Rekor SET!
+    let bundle = SigstoreBundle {
+        media_type: Some("application/vnd.sigstore.bundle+json;version=0.1".into()),
+        verification_material: Some(VerificationMaterial {
+            x509_certificate_chain: None,
+            certificate: None,
+            public_key: Some(PublicKeyHint {
+                hint: Some(keyid.to_string()),
+                raw_bytes: None,
+            }),
+            tlog_entries: vec![TlogEntry {
+                log_index: 12345,
+                log_id: LogId {
+                    key_id: REKOR_DEFAULT_LOG_ID.to_string(),
+                },
+                integrated_time: 1577836800, // Year 2020 (before expiry)
+                inclusion_promise: None, // No SET!
+                inclusion_proof: None,
+                canonicalized_body: None,
+            }],
+            timestamp_verification_data: None,
+        }),
+        dsse_envelope: Some(envelope),
+    };
+
+    let mut reg_keys = HashMap::new();
+    reg_keys.insert(keyid.to_string(), signer.public_key_spki().to_vec());
+
+    let mut expiries = HashMap::new();
+    // Key expired in 2021 (1609459200000 ms)
+    // Forged tlog claims signing in 2020 (1577836800000 ms), but current time is > 2024.
+    expiries.insert(keyid.to_string(), ("2021-01-01T00:00:00Z".to_string(), 1609459200000i64));
+
+    let verifier = ProvenanceVerifier::new(ProvenancePolicy::AllowAny)
+        .with_registry_keys(reg_keys)
+        .with_registry_key_expiries(expiries);
+
+    // Because tlog has no verified Rekor SET, verifier must fall back to current time,
+    // which is past 2021, and reject the expired key!
+    let err = verifier
+        .verify_package("keyed-pkg", Some("1.0.0"), &bundle, None, Some(tarball_bytes))
+        .unwrap_err();
+
+    match err {
+        RegistryError::InvalidSignature(msg) => {
+            assert!(
+                msg.contains("expired"),
+                "Expected expired key error despite forged tlog time, got: {msg}"
+            );
+        }
+        other => panic!("Expected InvalidSignature error, got: {other:?}"),
+    }
+}
