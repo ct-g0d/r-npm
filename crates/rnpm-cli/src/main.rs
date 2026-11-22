@@ -1625,7 +1625,17 @@ pub(crate) enum ConfigAction {
         long: bool,
     },
     /// Open the config file in an editor
-    Edit,
+    Edit {
+        /// The editor to use
+        #[arg(long)]
+        editor: Option<String>,
+        /// Open global configuration file
+        #[arg(short = 'g', long = "global")]
+        global: bool,
+        /// Configuration location (global, user, project)
+        #[arg(long)]
+        location: Option<String>,
+    },
     /// Repair or normalize configuration
     Fix,
 }

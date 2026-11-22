@@ -56,9 +56,13 @@ fn test_config_lifecycle() {
     assert!(list_json.contains("coverage_test_key"));
 
     // 4. Config edit
+    #[cfg(windows)]
+    let dummy_editor = "cmd /c exit 0";
+    #[cfg(not(windows))]
+    let dummy_editor = "true";
     let edit_out = Command::new(rnpm_bin)
         .current_dir(tmp.path())
-        .args(["config", "edit"])
+        .args(["config", "edit", &format!("--editor={dummy_editor}")])
         .output()
         .expect("config edit failed");
     assert!(

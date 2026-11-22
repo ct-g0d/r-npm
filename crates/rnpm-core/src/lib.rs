@@ -22,8 +22,8 @@ pub use manifest::{
 };
 pub use ordered_json::{OrderedJsonMap, OrderedJsonValue};
 pub use pkg::{
-    coerce_value, delete_value, get_value_at_path, parse_path, pkg_delete, pkg_get, pkg_get_value,
-    pkg_get_workspaces, pkg_set, resolve_manifest_path, set_value, PathSegment,
+    coerce_value, delete_value, get_value_at_path, parse_path, pkg_delete, pkg_fix, pkg_get,
+    pkg_get_value, pkg_get_workspaces, pkg_set, resolve_manifest_path, set_value, PathSegment,
 };
 pub use platform_list::PlatformList;
 pub use semver::{Comparator, ComparatorSet, Op, PrereleaseId, Range, Version};

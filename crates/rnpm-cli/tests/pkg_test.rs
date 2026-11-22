@@ -629,3 +629,148 @@ fn test_pkg_prefix_flag() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert_eq!(stdout.trim(), "\"pkg-a\"");
 }
+
+#[test]
+fn test_pkg_fix_manifest_repairs() {
+    let tmp = tempdir().unwrap();
+    let project_dir = tmp.path();
+    let rnpm_bin = env!("CARGO_BIN_EXE_rnpm");
+
+    let broken_manifest = serde_json::json!({
+        "_id": "broken-manifest@1.0.0",
+        "name": "  @my-scope/my-app  ",
+        "version": "v1.2.3",
+        "bin": "./bin/run.js",
+        "repository": "github:test-org/my-app",
+        "bugs": "https://github.com/test-org/my-app/issues",
+        "funding": "https://example.com/donate",
+        "scripts": {
+            "test": "node_modules/.bin/jest --coverage",
+            "build": "./node_modules/.bin/webpack"
+        },
+        "bundledDependencies": ["shared-util"],
+        "keywords": "react, tooling, cli"
+    });
+
+    let manifest_path = project_dir.join("package.json");
+    std::fs::write(
+        &manifest_path,
+        serde_json::to_string_pretty(&broken_manifest).unwrap(),
+    )
+    .unwrap();
+
+    let output = Command::new(rnpm_bin)
+        .arg("pkg")
+        .arg("fix")
+        .current_dir(project_dir)
+        .output()
+        .expect("Failed to execute rnpm pkg fix");
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let fixed_content = std::fs::read_to_string(&manifest_path).unwrap();
+    let fixed: Value = serde_json::from_str(&fixed_content).unwrap();
+
+    // 1. _id should be removed
+    assert!(fixed.get("_id").is_none(), "Expected _id to be removed");
+
+    // 2. Name should be trimmed
+    assert_eq!(fixed["name"], "@my-scope/my-app");
+
+    // 3. Version should be semver-cleaned
+    assert_eq!(fixed["version"], "1.2.3");
+
+    // 4. bin string should be converted to object using unscoped name "my-app" and normalized path "bin/run.js"
+    assert_eq!(fixed["bin"]["my-app"], "bin/run.js");
+
+    // 5. repository github shorthand should be normalized
+    assert_eq!(fixed["repository"]["type"], "git");
+    assert_eq!(
+        fixed["repository"]["url"],
+        "git+https://github.com/test-org/my-app.git"
+    );
+
+    // 6. bugs URL string should be converted to object
+    assert_eq!(
+        fixed["bugs"]["url"],
+        "https://github.com/test-org/my-app/issues"
+    );
+
+    // 7. funding URL string should be converted to object
+    assert_eq!(fixed["funding"]["url"], "https://example.com/donate");
+
+    // 8. scripts node_modules/.bin references should be stripped
+    assert_eq!(fixed["scripts"]["test"], "jest --coverage");
+    assert_eq!(fixed["scripts"]["build"], "webpack");
+
+    // 9. bundledDependencies should be renamed to bundleDependencies
+    assert!(fixed.get("bundledDependencies").is_none());
+    assert_eq!(fixed["bundleDependencies"][0], "shared-util");
+
+    // 10. keywords string should be split into array
+    let kws = fixed["keywords"].as_array().unwrap();
+    assert_eq!(kws, &vec!["react", "tooling", "cli"]);
+}
+
+#[test]
+fn test_pkg_fix_cleanups_and_workspaces() {
+    let tmp = tempdir().unwrap();
+    let project_dir = tmp.path();
+    setup_workspace_monorepo(project_dir);
+    let rnpm_bin = env!("CARGO_BIN_EXE_rnpm");
+
+    // Inject dirty manifest into pkg-a
+    let pkg_a_manifest = serde_json::json!({
+        "_where": "/tmp/somewhere",
+        "name": "pkg-a",
+        "version": " =2.0.0-beta.1 ",
+        "bin": {
+            "./tool": ".\\bin\\tool.js",
+            "broken": ""
+        },
+        "bugs": "bugs@pkg-a.org",
+        "bundleDependencies": false,
+        "scripts": {
+            "start": "node_modules\\.bin\\server"
+        }
+    });
+    std::fs::write(
+        project_dir.join("packages/pkg-a/package.json"),
+        serde_json::to_string_pretty(&pkg_a_manifest).unwrap(),
+    )
+    .unwrap();
+
+    let output = Command::new(rnpm_bin)
+        .arg("pkg")
+        .arg("fix")
+        .arg("--workspace=pkg-a")
+        .current_dir(project_dir)
+        .output()
+        .expect("Failed to execute rnpm pkg fix --workspace=pkg-a");
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let fixed_a_content =
+        std::fs::read_to_string(project_dir.join("packages/pkg-a/package.json")).unwrap();
+    let fixed_a: Value = serde_json::from_str(&fixed_a_content).unwrap();
+
+    assert!(fixed_a.get("_where").is_none());
+    assert_eq!(fixed_a["version"], "2.0.0-beta.1");
+    // bin map values normalized, broken removed, key basename taken
+    assert_eq!(fixed_a["bin"]["tool"], "bin/tool.js");
+    assert!(fixed_a["bin"].get("broken").is_none());
+    // bugs email normalized
+    assert_eq!(fixed_a["bugs"]["email"], "bugs@pkg-a.org");
+    // bundleDependencies: false becomes empty array []
+    assert_eq!(fixed_a["bundleDependencies"], serde_json::json!([]));
+    // script stripped Windows backslash node_modules\.bin\ prefix
+    assert_eq!(fixed_a["scripts"]["start"], "server");
+}

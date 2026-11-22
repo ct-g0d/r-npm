@@ -28,7 +28,11 @@ pub(crate) fn run(action: ConfigAction, current_dir: PathBuf) -> Result<()> {
             location,
         } => run_delete(&key, global, location.as_deref(), &current_dir)?,
         ConfigAction::List { json, long } => report::run(json, long, &current_dir)?,
-        ConfigAction::Edit => run_edit(&current_dir)?,
+        ConfigAction::Edit {
+            editor,
+            global,
+            location,
+        } => run_edit(editor, global, location.as_deref(), &current_dir)?,
         ConfigAction::Fix => run_fix(&current_dir)?,
     }
     Ok(())
@@ -101,14 +105,60 @@ pub(crate) fn run_delete(
     Ok(())
 }
 
-pub(crate) fn run_edit(current_dir: &Path) -> Result<()> {
-    let user_npmrc = rnpm_config::get_default_user_npmrc();
-    let path_to_edit = if current_dir.join(".npmrc").exists() {
-        current_dir.join(".npmrc")
-    } else {
-        user_npmrc
-    };
-    println!("{}", path_to_edit.display());
+pub(crate) fn run_edit(
+    editor: Option<String>,
+    global: bool,
+    location: Option<&str>,
+    current_dir: &Path,
+) -> Result<()> {
+    let (target_path, where_str) =
+        resolve_target_npmrc_with_location(global, location, current_dir);
+
+    if !target_path.exists() {
+        if let Some(parent) = target_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let header = format!(
+            ";;;;\n\
+             ; npm {where_str}config file: {}\n\
+             ; this is a simple ini-formatted file\n\
+             ; lines that start with semi-colons are comments\n\
+             ; run `npm help 7 config` for documentation of the various options\n\
+             ;\n\
+             ; Configs like `@scope:registry` map a scope to a given registry url.\n\
+             ;\n\
+             ; Configs like `//<hostname>/:_authToken` are auth that is restricted\n\
+             ; to the registry host specified.\n\n",
+            target_path.display()
+        );
+        std::fs::write(&target_path, header)?;
+    }
+
+    let editor_str = crate::commands::edit::resolve_editor_command(editor, current_dir)?;
+    let mut tokens = crate::commands::edit::parse_editor_command(&editor_str);
+    if tokens.is_empty() {
+        return Err(anyhow::anyhow!(
+            "npm error code ENOENT\nnpm error no editor configured"
+        ));
+    }
+
+    let bin = tokens.remove(0);
+    let mut spawn_args = tokens;
+    spawn_args.push(target_path.to_string_lossy().to_string());
+
+    let status = std::process::Command::new(&bin)
+        .args(&spawn_args)
+        .current_dir(current_dir)
+        .status()
+        .map_err(|e| anyhow::anyhow!("npm error failed to spawn editor '{}': {e}", bin))?;
+
+    if !status.success() {
+        let code = status.code().unwrap_or(1);
+        return Err(anyhow::anyhow!(
+            "npm error editor process exited with code: {code}"
+        ));
+    }
+
     Ok(())
 }
 
@@ -118,18 +168,27 @@ pub(crate) fn run_fix(current_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-fn resolve_target_npmrc(global: bool, location: Option<&str>, current_dir: &Path) -> PathBuf {
+fn resolve_target_npmrc_with_location(
+    global: bool,
+    location: Option<&str>,
+    current_dir: &Path,
+) -> (PathBuf, &'static str) {
     if global || location == Some("global") {
-        rnpm_config::find_global_npmrc().unwrap_or_else(|| {
+        let path = rnpm_config::find_global_npmrc().unwrap_or_else(|| {
             rnpm_config::get_default_global_npmrc(&rnpm_config::find_global_prefix())
-        })
+        });
+        (path, "global")
     } else if location == Some("project") {
-        current_dir.join(".npmrc")
+        (current_dir.join(".npmrc"), "project")
     } else if location == Some("user") {
-        rnpm_config::get_default_user_npmrc()
+        (rnpm_config::get_default_user_npmrc(), "user")
     } else if current_dir.join(".npmrc").exists() {
-        current_dir.join(".npmrc")
+        (current_dir.join(".npmrc"), "project")
     } else {
-        rnpm_config::get_default_user_npmrc()
+        (rnpm_config::get_default_user_npmrc(), "user")
     }
+}
+
+fn resolve_target_npmrc(global: bool, location: Option<&str>, current_dir: &Path) -> PathBuf {
+    resolve_target_npmrc_with_location(global, location, current_dir).0
 }

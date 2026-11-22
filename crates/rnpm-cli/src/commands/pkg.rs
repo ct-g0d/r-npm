@@ -99,7 +99,7 @@ pub(crate) fn run(
             }
             PkgAction::Fix => {
                 for m in &matched_members {
-                    fix_manifest(&m.manifest_path())?;
+                    rnpm_core::pkg::pkg_fix(&m.manifest_path())?;
                 }
             }
         }
@@ -116,20 +116,10 @@ pub(crate) fn run(
                 rnpm_core::pkg::pkg_delete(&root_manifest_path, &fields)?;
             }
             PkgAction::Fix => {
-                fix_manifest(&root_manifest_path)?;
+                rnpm_core::pkg::pkg_fix(&root_manifest_path)?;
             }
         }
     }
 
-    Ok(())
-}
-
-fn fix_manifest(path: &Path) -> Result<()> {
-    if path.exists() {
-        let content = std::fs::read_to_string(path)?;
-        let val: serde_json::Value = serde_json::from_str(&content)?;
-        let formatted = serde_json::to_string_pretty(&val)?;
-        std::fs::write(path, formatted + "\n")?;
-    }
     Ok(())
 }
