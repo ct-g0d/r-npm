@@ -1165,3 +1165,168 @@ async fn test_allow_registry_root_cross_kind_name_collision_zero_requests() {
         "ZERO HTTP requests should have been made to the registry server for 'foo'"
     );
 }
+
+// -----------------------------------------------------------------------------
+// Test 16: allow-registry=root: root declares foo: ^1.0.0 (registry) AND local-a: file:./a
+// where local-a depends on foo: ^2.0.0.
+// Under allow-registry=root, even though foo is in root_registry_declared,
+// the transitive edge local-a -> foo@^2.0.0 must be rejected at the solver edge with EALLOWREGISTRY!
+// -----------------------------------------------------------------------------
+#[tokio::test]
+async fn test_allow_registry_root_solver_edge_transitive_collision_rejected() {
+    let server = CountingServer::start(|path, base_url| {
+        if path == "/foo" {
+            let packument = serde_json::json!({
+                "name": "foo",
+                "dist-tags": { "latest": "2.0.0" },
+                "versions": {
+                    "1.0.0": {
+                        "name": "foo",
+                        "version": "1.0.0",
+                        "dist": {
+                            "tarball": format!("{base_url}/foo/-/foo-1.0.0.tgz")
+                        }
+                    },
+                    "2.0.0": {
+                        "name": "foo",
+                        "version": "2.0.0",
+                        "dist": {
+                            "tarball": format!("{base_url}/foo/-/foo-2.0.0.tgz")
+                        }
+                    }
+                }
+            });
+            Some((200, vec![("Content-Type", "application/json".to_string())], packument.to_string().into_bytes()))
+        } else {
+            None
+        }
+    }).await;
+
+    let project_dir = tempdir().unwrap();
+    let cache_dir = tempdir().unwrap();
+
+    // Create local package "local-a" at project_dir/a
+    // local-a has dependency on "foo": "^2.0.0" (registry)
+    let local_a = project_dir.path().join("a");
+    std::fs::create_dir_all(&local_a).unwrap();
+    std::fs::write(
+        local_a.join("package.json"),
+        serde_json::json!({
+            "name": "local-a",
+            "version": "1.0.0",
+            "dependencies": {
+                "foo": "^2.0.0"
+            }
+        }).to_string(),
+    ).unwrap();
+
+    // Root declares:
+    // 1. "foo": "^1.0.0" (from registry)
+    // 2. "local-a": "file:./a"
+    setup_test_project(
+        project_dir.path(),
+        &serde_json::json!({
+            "foo": "^1.0.0",
+            "local-a": "file:./a"
+        }),
+        "allow-registry=root\n",
+    );
+
+    let options = InstallOptions {
+        project_dir: project_dir.path().to_path_buf(),
+        cache_dir: Some(cache_dir.path().to_path_buf()),
+        registry_url: Some(server.url()),
+        ..Default::default()
+    };
+
+    let mut installer = Installer::new(options).unwrap();
+    let result = installer.install().await;
+
+    assert!(result.is_err(), "Expected install to fail on transitive registry dep foo@^2.0.0 from local-a");
+    let err_msg = result.unwrap_err().to_string();
+    assert!(
+        err_msg.contains("EALLOWREGISTRY"),
+        "Error message should contain EALLOWREGISTRY, got: {err_msg}"
+    );
+    assert!(
+        err_msg.contains("Fetching non-root packages of type \"registry\" have been disabled"),
+        "Error message should match exact non-root text, got: {err_msg}"
+    );
+}
+
+// -----------------------------------------------------------------------------
+// Test 17: allow-registry=root: root declares local-a: file:./a where local-a depends
+// on foo: ^2.0.0 (or bar: ^1.0.0). When root does not fetch foo (or root only needed local/cached),
+// ZERO transitive packument fetches occur!
+// -----------------------------------------------------------------------------
+#[tokio::test]
+async fn test_allow_registry_root_solver_edge_transitive_zero_requests() {
+    let server = CountingServer::start(|_path, _base_url| {
+        let packument = serde_json::json!({
+            "name": "foo",
+            "dist-tags": { "latest": "2.0.0" },
+            "versions": {
+                "2.0.0": {
+                    "name": "foo",
+                    "version": "2.0.0",
+                    "dist": {
+                        "tarball": "http://127.0.0.1/foo/-/foo-2.0.0.tgz"
+                    }
+                }
+            }
+        });
+        Some((200, vec![("Content-Type", "application/json".to_string())], packument.to_string().into_bytes()))
+    }).await;
+
+    let project_dir = tempdir().unwrap();
+    let cache_dir = tempdir().unwrap();
+
+    let local_a = project_dir.path().join("a");
+    std::fs::create_dir_all(&local_a).unwrap();
+    std::fs::write(
+        local_a.join("package.json"),
+        serde_json::json!({
+            "name": "local-a",
+            "version": "1.0.0",
+            "dependencies": {
+                "foo": "^2.0.0"
+            }
+        }).to_string(),
+    ).unwrap();
+
+    setup_test_project(
+        project_dir.path(),
+        &serde_json::json!({
+            "local-a": "file:./a"
+        }),
+        "allow-registry=root\n",
+    );
+
+    let options = InstallOptions {
+        project_dir: project_dir.path().to_path_buf(),
+        cache_dir: Some(cache_dir.path().to_path_buf()),
+        registry_url: Some(server.url()),
+        ..Default::default()
+    };
+
+    let mut installer = Installer::new(options).unwrap();
+    let result = installer.install().await;
+
+    assert!(result.is_err(), "Expected install to fail on transitive registry dep foo@^2.0.0");
+    let err_msg = result.unwrap_err().to_string();
+    assert!(
+        err_msg.contains("EALLOWREGISTRY"),
+        "Error message should contain EALLOWREGISTRY, got: {err_msg}"
+    );
+    assert!(
+        err_msg.contains("Fetching non-root packages of type \"registry\" have been disabled"),
+        "Error message should match exact non-root text, got: {err_msg}"
+    );
+
+    // ZERO HTTP packument requests must have hit the server!
+    assert_eq!(
+        server.request_count().await,
+        0,
+        "ZERO HTTP requests should have been made to the registry server for 'foo'"
+    );
+}

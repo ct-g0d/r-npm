@@ -975,12 +975,16 @@ impl RegistryPackageProvider {
     }
 
     #[allow(clippy::result_large_err)]
-    fn fetch_or_revalidate_packument(&self, name: &str) -> Result<PackageMetadata, SolverError> {
-        let is_root = self.root_registry_declared.contains(name);
+    fn fetch_or_revalidate_packument(
+        &self,
+        name: &str,
+        is_root: bool,
+    ) -> Result<PackageMetadata, SolverError> {
+        let reg_is_root = is_root && self.root_registry_declared.contains(name);
         if let Err(e) = policy::check_source_gate(
             &self.source_policy,
             policy::SourceKind::Registry,
-            is_root,
+            reg_is_root,
         ) {
             return Err(SolverError::PackageMetadata(
                 name.to_string(),
@@ -1168,23 +1172,27 @@ impl PackageMetadataProvider for RegistryPackageProvider {
     }
 
     fn get_package(&self, name: &str) -> Result<Option<PackageMetadata>, SolverError> {
-        if let Ok(cache) = self.metadata_cache.lock() {
-            if let Some(meta) = cache.get(name) {
-                return Ok(Some(meta.clone()));
-            }
-        }
+        let is_root = self.root_registry_declared.contains(name);
+        self.get_package_for_edge(name, "", is_root)
+    }
 
+    fn get_package_for_edge(
+        &self,
+        name: &str,
+        _range: &str,
+        is_root: bool,
+    ) -> Result<Option<PackageMetadata>, SolverError> {
         if name.starts_with("git+")
             || name.starts_with("git:")
             || PackageTarget::parse(name)
                 .map(|t| t.is_git())
                 .unwrap_or(false)
         {
-            let is_root = self.root_declared.contains(name);
+            let git_is_root = is_root && self.root_declared.contains(name);
             if let Err(e) = policy::check_source_gate(
                 &self.source_policy,
                 policy::SourceKind::Git,
-                is_root,
+                git_is_root,
             ) {
                 return Err(SolverError::PackageMetadata(
                     name.to_string(),
@@ -1263,11 +1271,11 @@ impl PackageMetadataProvider for RegistryPackageProvider {
             }
         }
 
-        let is_root = self.root_registry_declared.contains(name);
+        let reg_is_root = is_root && self.root_registry_declared.contains(name);
         if let Err(e) = policy::check_source_gate(
             &self.source_policy,
             policy::SourceKind::Registry,
-            is_root,
+            reg_is_root,
         ) {
             return Err(SolverError::PackageMetadata(
                 name.to_string(),
@@ -1275,7 +1283,13 @@ impl PackageMetadataProvider for RegistryPackageProvider {
             ));
         }
 
-        match self.fetch_or_revalidate_packument(name) {
+        if let Ok(cache) = self.metadata_cache.lock() {
+            if let Some(meta) = cache.get(name) {
+                return Ok(Some(meta.clone()));
+            }
+        }
+
+        match self.fetch_or_revalidate_packument(name, reg_is_root) {
             Ok(meta) => {
                 if let Ok(mut cache) = self.metadata_cache.lock() {
                     cache.insert(name.to_string(), meta.clone());
@@ -1292,6 +1306,14 @@ impl PackageMetadataProvider for RegistryPackageProvider {
     }
 
     fn prefetch_packages(&self, names: &[&str]) {
+        let edges: Vec<(&str, bool)> = names
+            .iter()
+            .map(|n| (*n, self.root_registry_declared.contains(*n)))
+            .collect();
+        self.prefetch_packages_for_edge(&edges);
+    }
+
+    fn prefetch_packages_for_edge(&self, edges: &[(&str, bool)]) {
         if self.offline {
             return;
         }
@@ -1299,13 +1321,13 @@ impl PackageMetadataProvider for RegistryPackageProvider {
             return;
         }
         let filtered_names: Vec<&str> = if self.source_policy.registry == policy::AllowMode::Root {
-            names
+            edges
                 .iter()
-                .copied()
-                .filter(|n| self.root_registry_declared.contains(*n))
+                .filter(|(n, is_root)| *is_root && self.root_registry_declared.contains(*n))
+                .map(|(n, _)| *n)
                 .collect()
         } else {
-            names.to_vec()
+            edges.iter().map(|(n, _)| *n).collect()
         };
         if filtered_names.is_empty() {
             return;
