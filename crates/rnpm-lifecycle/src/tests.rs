@@ -4235,3 +4235,261 @@ fn test_node_gyp_ancestor_resolution_nested_node_modules_shadows_self() {
     let satisfied_v1 = crate::node_gyp::is_ancestor_satisfied("pkg-a", "^1.0.0", &parent_pkg_a, &staging).unwrap();
     assert!(!satisfied_v1, "Nested node_modules/pkg-a@2.0.0 must shadow parent package v1.0.0 when spec is ^1.0.0");
 }
+
+#[test]
+fn test_node_gyp_version_matches_spec_semver_validation() {
+    use crate::node_gyp::version_matches_spec;
+
+    // Must return false if version_str fails semver parsing, even for wildcard or latest
+    assert!(!version_matches_spec("not-a-semver", "*"), "version_matches_spec(\"not-a-semver\", \"*\") == false");
+    assert!(!version_matches_spec("not-a-semver", "latest"), "version_matches_spec(\"not-a-semver\", \"latest\") == false");
+    assert!(!version_matches_spec("not-a-semver", ""), "version_matches_spec(\"not-a-semver\", \"\") == false");
+    assert!(!version_matches_spec("1.2", "*"), "version_matches_spec(\"1.2\", \"*\") == false");
+    assert!(!version_matches_spec("1.2", "latest"), "version_matches_spec(\"1.2\", \"latest\") == false");
+    assert!(!version_matches_spec("1.2", ""), "version_matches_spec(\"1.2\", \"\") == false");
+    assert!(!version_matches_spec("../../evil", "*"), "version_matches_spec(\"../../evil\", \"*\") == false");
+
+    // Valid semver strings must still match appropriately
+    assert!(version_matches_spec("1.2.3", "*"));
+    assert!(version_matches_spec("1.2.3", "latest"));
+    assert!(version_matches_spec("1.2.3", ""));
+    assert!(version_matches_spec("1.2.3", "^1.0.0"));
+    assert!(!version_matches_spec("1.2.3", "^2.0.0"));
+}
+
+#[test]
+fn test_node_gyp_pick_matching_version_rejects_non_semver_keys_and_values() {
+    let mut versions = serde_json::Map::new();
+    versions.insert("not-a-semver".to_string(), serde_json::json!({ "version": "not-a-semver" }));
+    versions.insert("1.2".to_string(), serde_json::json!({ "version": "1.2" }));
+    versions.insert("../../evil".to_string(), serde_json::json!({ "version": "../../evil" }));
+
+    let dist_tags_invalid = serde_json::json!({ "latest": "not-a-semver" });
+
+    // When all versions are invalid semver, pick_matching_version must return None
+    assert!(crate::node_gyp::pick_matching_version(&versions, Some(&dist_tags_invalid), "*").is_none());
+    assert!(crate::node_gyp::pick_matching_version(&versions, Some(&dist_tags_invalid), "latest").is_none());
+    assert!(crate::node_gyp::pick_matching_version(&versions, Some(&dist_tags_invalid), "").is_none());
+    assert!(crate::node_gyp::pick_matching_version(&versions, None, "not-a-semver").is_none());
+    assert!(crate::node_gyp::pick_matching_version(&versions, None, "^1.0.0").is_none());
+
+    // When valid semver exists alongside invalid ones, it must pick only valid semver
+    versions.insert("1.0.0".to_string(), serde_json::json!({ "version": "1.0.0" }));
+    let dist_tags_valid = serde_json::json!({ "latest": "1.0.0" });
+    let matched = crate::node_gyp::pick_matching_version(&versions, Some(&dist_tags_valid), "*");
+    assert_eq!(matched.map(|(v, _)| v), Some("1.0.0"));
+
+    // If dist-tags.latest points to invalid version but valid version exists, falls back to highest valid semver
+    let dist_tags_bad_latest = serde_json::json!({ "latest": "not-a-semver" });
+    let matched_fallback = crate::node_gyp::pick_matching_version(&versions, Some(&dist_tags_bad_latest), "*");
+    assert_eq!(matched_fallback.map(|(v, _)| v), Some("1.0.0"));
+
+    // If version object contains mismatched or invalid version field
+    let mut bad_obj_versions = serde_json::Map::new();
+    bad_obj_versions.insert("2.0.0".to_string(), serde_json::json!({ "version": "not-a-semver" }));
+    assert!(crate::node_gyp::pick_matching_version(&bad_obj_versions, None, "*").is_none());
+}
+
+#[test]
+fn test_node_gyp_single_version_not_a_semver_rejected_for_wildcard() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    let temp = tempfile::tempdir().unwrap();
+    let cache_dir = temp.path().join("cache");
+    let project_dir = temp.path().join("pkg");
+    std::fs::create_dir_all(&project_dir).unwrap();
+
+    // 1. Mock node-gyp depends on "dep-bad-ver": "*"
+    let node_gyp_pkg_json = r#"{"name":"node-gyp","version":"10.0.0","bin":{"node-gyp":"bin/node-gyp.js"},"dependencies":{"dep-bad-ver":"*"}}"#;
+    let node_gyp_tb = create_tarball_with_files(&[
+        ("package/package.json", node_gyp_pkg_json.as_bytes()),
+        ("package/bin/node-gyp.js", b"process.exit(0);"),
+    ]);
+    let node_gyp_integrity = rnpm_core::Integrity::from_bytes(&node_gyp_tb, rnpm_core::Algorithm::Sha512).to_string();
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("Failed to bind mock registry listener");
+    listener.set_nonblocking(true).unwrap();
+    let port = listener.local_addr().unwrap().port();
+
+    let running = Arc::new(AtomicBool::new(true));
+    let r_clone = Arc::clone(&running);
+
+    let server_handle = std::thread::spawn(move || {
+        while r_clone.load(Ordering::Relaxed) {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    let _ = stream.set_nonblocking(false);
+                    let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(5)));
+                    let mut buf = [0u8; 4096];
+                    let n = stream.read(&mut buf).unwrap_or(0);
+                    if n == 0 {
+                        continue;
+                    }
+                    let req = String::from_utf8_lossy(&buf[..n]);
+
+                    let (status, content_type, body_bytes) = if req.contains("GET /node-gyp") {
+                        let json = format!(
+                            r#"{{"name":"node-gyp","dist-tags":{{"latest":"10.0.0"}},"versions":{{"10.0.0":{{"name":"node-gyp","version":"10.0.0","dependencies":{{"dep-bad-ver":"*"}},"dist":{{"tarball":"http://127.0.0.1:{}/tarballs/node-gyp.tgz","integrity":"{}"}}}}}}}}"#,
+                            port, node_gyp_integrity
+                        );
+                        ("200 OK", "application/json", json.into_bytes())
+                    } else if req.contains("GET /tarballs/node-gyp.tgz") {
+                        ("200 OK", "application/octet-stream", node_gyp_tb.clone())
+                    } else if req.contains("GET /dep-bad-ver") {
+                        // Single-version packument response returning "version": "not-a-semver"
+                        let json = format!(
+                            r#"{{"name":"dep-bad-ver","version":"not-a-semver","dist":{{"tarball":"http://127.0.0.1:{}/tarballs/dep-bad-ver.tgz","integrity":"sha512-placeholder"}}}}"#,
+                            port
+                        );
+                        ("200 OK", "application/json", json.into_bytes())
+                    } else {
+                        ("404 Not Found", "text/plain", b"Not found".to_vec())
+                    };
+
+                    let resp_header = format!(
+                        "HTTP/1.1 {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        status,
+                        content_type,
+                        body_bytes.len()
+                    );
+                    let _ = stream.write_all(resp_header.as_bytes());
+                    let _ = stream.write_all(&body_bytes);
+                    let _ = stream.flush();
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    let mut config = rnpm_config::Config::default();
+    config.npmrc.settings.insert("cache".to_string(), cache_dir.to_string_lossy().to_string());
+    config.npmrc.settings.insert("registry".to_string(), format!("http://127.0.0.1:{}/", port));
+    config.npmrc.settings.insert("node-gyp-fallback-npm".to_string(), "false".to_string());
+
+    let res = crate::node_gyp::bootstrap_node_gyp(&project_dir, &config);
+
+    // Stop mock server
+    running.store(false, Ordering::Relaxed);
+    let _ = server_handle.join();
+
+    // Verify rejection when spec is "*" and version is "not-a-semver"
+    assert!(res.is_err(), "Single-version packument with 'version': 'not-a-semver' MUST be rejected for '*'");
+    let err_msg = res.unwrap_err().to_string();
+    assert!(
+        err_msg.contains("not-a-semver") || err_msg.contains("does not satisfy"),
+        "Error message must indicate version rejection: {err_msg}"
+    );
+
+    assert!(
+        !cache_dir.join("node-gyp").join("current").exists(),
+        "Live cache directory must not be created when version is not-a-semver"
+    );
+}
+
+#[test]
+fn test_node_gyp_single_version_not_a_semver_rejected_for_latest() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    let temp = tempfile::tempdir().unwrap();
+    let cache_dir = temp.path().join("cache");
+    let project_dir = temp.path().join("pkg");
+    std::fs::create_dir_all(&project_dir).unwrap();
+
+    // 1. Mock node-gyp depends on "dep-bad-latest": "latest"
+    let node_gyp_pkg_json = r#"{"name":"node-gyp","version":"10.0.0","bin":{"node-gyp":"bin/node-gyp.js"},"dependencies":{"dep-bad-latest":"latest"}}"#;
+    let node_gyp_tb = create_tarball_with_files(&[
+        ("package/package.json", node_gyp_pkg_json.as_bytes()),
+        ("package/bin/node-gyp.js", b"process.exit(0);"),
+    ]);
+    let node_gyp_integrity = rnpm_core::Integrity::from_bytes(&node_gyp_tb, rnpm_core::Algorithm::Sha512).to_string();
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("Failed to bind mock registry listener");
+    listener.set_nonblocking(true).unwrap();
+    let port = listener.local_addr().unwrap().port();
+
+    let running = Arc::new(AtomicBool::new(true));
+    let r_clone = Arc::clone(&running);
+
+    let server_handle = std::thread::spawn(move || {
+        while r_clone.load(Ordering::Relaxed) {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    let _ = stream.set_nonblocking(false);
+                    let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(5)));
+                    let mut buf = [0u8; 4096];
+                    let n = stream.read(&mut buf).unwrap_or(0);
+                    if n == 0 {
+                        continue;
+                    }
+                    let req = String::from_utf8_lossy(&buf[..n]);
+
+                    let (status, content_type, body_bytes) = if req.contains("GET /node-gyp") {
+                        let json = format!(
+                            r#"{{"name":"node-gyp","dist-tags":{{"latest":"10.0.0"}},"versions":{{"10.0.0":{{"name":"node-gyp","version":"10.0.0","dependencies":{{"dep-bad-latest":"latest"}},"dist":{{"tarball":"http://127.0.0.1:{}/tarballs/node-gyp.tgz","integrity":"{}"}}}}}}}}"#,
+                            port, node_gyp_integrity
+                        );
+                        ("200 OK", "application/json", json.into_bytes())
+                    } else if req.contains("GET /tarballs/node-gyp.tgz") {
+                        ("200 OK", "application/octet-stream", node_gyp_tb.clone())
+                    } else if req.contains("GET /dep-bad-latest") {
+                        // Single-version packument response returning "version": "not-a-semver"
+                        let json = format!(
+                            r#"{{"name":"dep-bad-latest","version":"not-a-semver","dist":{{"tarball":"http://127.0.0.1:{}/tarballs/dep-bad-latest.tgz","integrity":"sha512-placeholder"}}}}"#,
+                            port
+                        );
+                        ("200 OK", "application/json", json.into_bytes())
+                    } else {
+                        ("404 Not Found", "text/plain", b"Not found".to_vec())
+                    };
+
+                    let resp_header = format!(
+                        "HTTP/1.1 {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        status,
+                        content_type,
+                        body_bytes.len()
+                    );
+                    let _ = stream.write_all(resp_header.as_bytes());
+                    let _ = stream.write_all(&body_bytes);
+                    let _ = stream.flush();
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    let mut config = rnpm_config::Config::default();
+    config.npmrc.settings.insert("cache".to_string(), cache_dir.to_string_lossy().to_string());
+    config.npmrc.settings.insert("registry".to_string(), format!("http://127.0.0.1:{}/", port));
+    config.npmrc.settings.insert("node-gyp-fallback-npm".to_string(), "false".to_string());
+
+    let res = crate::node_gyp::bootstrap_node_gyp(&project_dir, &config);
+
+    // Stop mock server
+    running.store(false, Ordering::Relaxed);
+    let _ = server_handle.join();
+
+    // Verify rejection when spec is "latest" and version is "not-a-semver"
+    assert!(res.is_err(), "Single-version packument with 'version': 'not-a-semver' MUST be rejected for 'latest'");
+    let err_msg = res.unwrap_err().to_string();
+    assert!(
+        err_msg.contains("not-a-semver") || err_msg.contains("does not satisfy"),
+        "Error message must indicate version rejection: {err_msg}"
+    );
+
+    assert!(
+        !cache_dir.join("node-gyp").join("current").exists(),
+        "Live cache directory must not be created when version is not-a-semver"
+    );
+}

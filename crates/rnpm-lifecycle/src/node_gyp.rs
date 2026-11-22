@@ -381,7 +381,22 @@ pub async fn download_and_unpack_node_gyp(registry: &str, staging_dir: &Path) ->
         pick_matching_version(versions, packument.get("dist-tags"), "latest")
             .ok_or_else(|| anyhow::anyhow!("No version found for node-gyp in registry metadata"))?
     } else if packument.get("dist").is_some() {
-        let v = packument.get("version").and_then(|v| v.as_str()).unwrap_or("latest");
+        let v = packument
+            .get("version")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Single-version response for 'node-gyp' is missing a valid 'version' field"
+                )
+            })?;
+        if !version_matches_spec(v, "latest") {
+            anyhow::bail!(
+                "Single-version response for 'node-gyp' has version '{}', which does not satisfy 'latest'",
+                v
+            );
+        }
         (v, &packument)
     } else {
         anyhow::bail!("Invalid node-gyp registry metadata: missing versions and dist");
@@ -756,6 +771,24 @@ async fn fetch_packument(
     Ok(json)
 }
 
+fn is_valid_version_entry(key: &str, val: &serde_json::Value) -> bool {
+    let key_ver = match rnpm_core::Version::parse(key) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    if let Some(v_ver) = val.get("version").and_then(|v| v.as_str()) {
+        match rnpm_core::Version::parse(v_ver) {
+            Ok(v) => {
+                if v != key_ver {
+                    return false;
+                }
+            }
+            Err(_) => return false,
+        }
+    }
+    true
+}
+
 pub fn pick_matching_version<'a>(
     versions: &'a serde_json::Map<String, serde_json::Value>,
     dist_tags: Option<&serde_json::Value>,
@@ -766,13 +799,17 @@ pub fn pick_matching_version<'a>(
     if spec.is_empty() || spec == "*" || spec == "latest" {
         if let Some(latest_ver) = dist_tags.and_then(|dt| dt.get("latest")).and_then(|v| v.as_str()) {
             if let Some((k, v)) = versions.get_key_value(latest_ver) {
-                return Some((k.as_str(), v));
+                if is_valid_version_entry(k.as_str(), v) {
+                    return Some((k.as_str(), v));
+                }
             }
         }
         let mut candidates: Vec<(rnpm_core::Version, &'a str, &'a serde_json::Value)> = Vec::new();
         for (v_str, v_val) in versions {
-            if let Ok(ver) = rnpm_core::Version::parse(v_str) {
-                candidates.push((ver, v_str.as_str(), v_val));
+            if is_valid_version_entry(v_str, v_val) {
+                if let Ok(ver) = rnpm_core::Version::parse(v_str) {
+                    candidates.push((ver, v_str.as_str(), v_val));
+                }
             }
         }
         candidates.sort_by(|a, b| a.0.cmp(&b.0));
@@ -782,7 +819,9 @@ pub fn pick_matching_version<'a>(
     // 2. Named dist-tag match (e.g. "next", "beta")
     if let Some(tag_ver) = dist_tags.and_then(|dt| dt.get(spec)).and_then(|v| v.as_str()) {
         if let Some((k, v)) = versions.get_key_value(tag_ver) {
-            return Some((k.as_str(), v));
+            if is_valid_version_entry(k.as_str(), v) {
+                return Some((k.as_str(), v));
+            }
         }
     }
 
@@ -790,8 +829,10 @@ pub fn pick_matching_version<'a>(
     if let Ok(range) = rnpm_core::Range::parse(spec) {
         let mut candidates: Vec<(rnpm_core::Version, &'a str, &'a serde_json::Value)> = Vec::new();
         for (v_str, v_val) in versions {
-            if let Ok(ver) = rnpm_core::Version::parse(v_str) {
-                candidates.push((ver, v_str.as_str(), v_val));
+            if is_valid_version_entry(v_str, v_val) {
+                if let Ok(ver) = rnpm_core::Version::parse(v_str) {
+                    candidates.push((ver, v_str.as_str(), v_val));
+                }
             }
         }
         candidates.sort_by(|a, b| a.0.cmp(&b.0));
@@ -807,21 +848,23 @@ pub fn pick_matching_version<'a>(
 
     // 4. Exact version string match fallback
     if let Some((k, v)) = versions.get_key_value(spec) {
-        return Some((k.as_str(), v));
+        if is_valid_version_entry(k.as_str(), v) {
+            return Some((k.as_str(), v));
+        }
     }
 
     None
 }
 
-fn version_matches_spec(version_str: &str, spec: &str) -> bool {
-    let spec = spec.trim();
-    if spec.is_empty() || spec == "*" || spec == "latest" {
-        return true;
-    }
+pub fn version_matches_spec(version_str: &str, spec: &str) -> bool {
     let version = match rnpm_core::Version::parse(version_str) {
         Ok(v) => v,
         Err(_) => return false,
     };
+    let spec = spec.trim();
+    if spec.is_empty() || spec == "*" || spec == "latest" {
+        return true;
+    }
     if let Ok(range) = rnpm_core::Range::parse(spec) {
         range.satisfies(&version)
     } else {
