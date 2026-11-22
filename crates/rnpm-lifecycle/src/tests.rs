@@ -3678,3 +3678,99 @@ fn test_node_gyp_shasum_fallback_behavior() {
     // 5. When both are absent, MUST FAIL
     assert!(crate::node_gyp::verify_tarball_integrity(payload, None, None).is_err());
 }
+
+#[test]
+fn test_node_gyp_malicious_dependency_name_rejected() {
+    let temp = tempfile::tempdir().unwrap();
+    let nm = temp.path().join("node_modules");
+
+    // 1. Malicious traversal names
+    let bad_names = [
+        "../../escape",
+        "@scope/../../escape",
+        "@../escape",
+        ".",
+        "..",
+        ".hidden",
+        "_private",
+        "foo/bar/baz",
+        "foo\\bar",
+        "foo:bar",
+        "foo\0bar",
+        "foo|bar",
+        "",
+        "   ",
+    ];
+
+    for name in bad_names {
+        assert!(
+            crate::node_gyp::validate_package_name(name).is_err(),
+            "validate_package_name must reject malicious or invalid name: '{name}'"
+        );
+        assert!(
+            crate::node_gyp::package_dir_in_node_modules(&nm, name).is_err(),
+            "package_dir_in_node_modules must reject malicious name: '{name}'"
+        );
+    }
+
+    // 2. Valid package names must succeed and be contained within node_modules
+    let good_names = [
+        "dep-a",
+        "dep_b",
+        "dep.c",
+        "dep123",
+        "@scope/dep-b",
+        "@my-org/core.utils",
+    ];
+
+    for name in good_names {
+        assert!(
+            crate::node_gyp::validate_package_name(name).is_ok(),
+            "validate_package_name must accept valid name: '{name}'"
+        );
+        let path = crate::node_gyp::package_dir_in_node_modules(&nm, name).unwrap();
+        assert!(
+            path.starts_with(&nm),
+            "Package path must stay strictly inside node_modules: {}",
+            path.display()
+        );
+    }
+}
+
+#[test]
+fn test_node_gyp_pick_matching_version_no_silent_fallback_on_unsatisfiable_semver() {
+    let mut versions = serde_json::Map::new();
+    versions.insert("1.0.0".to_string(), serde_json::json!({ "version": "1.0.0" }));
+    versions.insert("1.1.0".to_string(), serde_json::json!({ "version": "1.1.0" }));
+    versions.insert("1.2.0".to_string(), serde_json::json!({ "version": "1.2.0" }));
+
+    let dist_tags = serde_json::json!({ "latest": "1.2.0" });
+
+    // 1. Unsatisfiable semver ranges MUST return None, NOT silently fall back to latest or highest!
+    assert!(
+        crate::node_gyp::pick_matching_version(&versions, Some(&dist_tags), "^2.0.0").is_none(),
+        "Must return None for unsatisfiable semver range ^2.0.0"
+    );
+    assert!(
+        crate::node_gyp::pick_matching_version(&versions, Some(&dist_tags), ">=3.0.0").is_none(),
+        "Must return None for unsatisfiable semver range >=3.0.0"
+    );
+    assert!(
+        crate::node_gyp::pick_matching_version(&versions, Some(&dist_tags), "~0.9.0").is_none(),
+        "Must return None for unsatisfiable semver range ~0.9.0"
+    );
+
+    // 2. Satisfiable ranges must pick highest matching version
+    let match_caret = crate::node_gyp::pick_matching_version(&versions, Some(&dist_tags), "^1.0.0");
+    assert_eq!(match_caret.map(|(v, _)| v), Some("1.2.0"));
+
+    let match_tilde = crate::node_gyp::pick_matching_version(&versions, Some(&dist_tags), "~1.0.0");
+    assert_eq!(match_tilde.map(|(v, _)| v), Some("1.0.0"));
+
+    // 3. Explicit "latest" or "*" returns dist-tags.latest
+    let match_latest = crate::node_gyp::pick_matching_version(&versions, Some(&dist_tags), "latest");
+    assert_eq!(match_latest.map(|(v, _)| v), Some("1.2.0"));
+
+    let match_star = crate::node_gyp::pick_matching_version(&versions, Some(&dist_tags), "*");
+    assert_eq!(match_star.map(|(v, _)| v), Some("1.2.0"));
+}

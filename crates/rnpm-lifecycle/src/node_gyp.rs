@@ -470,7 +470,7 @@ async fn install_production_dependencies(
 
     while let Some(job) = queue.pop_front() {
         let top_nm = staging_dir.join("node_modules");
-        let top_target = package_dir_in_node_modules(&top_nm, &job.name);
+        let top_target = package_dir_in_node_modules(&top_nm, &job.name)?;
 
         let target_dir = if top_target.exists() {
             let installed_ver = get_installed_version(&top_target);
@@ -482,7 +482,7 @@ async fn install_production_dependencies(
             }
             // Version conflict at top level! Install nested in <job.parent_dir>/node_modules/<job.name>
             let nested_nm = job.parent_dir.join("node_modules");
-            let nested_target = package_dir_in_node_modules(&nested_nm, &job.name);
+            let nested_target = package_dir_in_node_modules(&nested_nm, &job.name)?;
             if nested_target.exists() {
                 let nested_ver = get_installed_version(&nested_target);
                 if let Some(ref v) = nested_ver {
@@ -617,54 +617,61 @@ async fn fetch_packument(
     Ok(json)
 }
 
-fn pick_matching_version<'a>(
+pub fn pick_matching_version<'a>(
     versions: &'a serde_json::Map<String, serde_json::Value>,
     dist_tags: Option<&serde_json::Value>,
     spec: &str,
 ) -> Option<(&'a str, &'a serde_json::Value)> {
     let spec = spec.trim();
-    if let Some(tag_ver) = dist_tags.and_then(|dt| dt.get(spec)).and_then(|v| v.as_str()) {
-        if let Some((k, v)) = versions.get_key_value(tag_ver) {
-            return Some((k.as_str(), v));
-        }
-    }
-
-    let mut candidates: Vec<(rnpm_core::Version, &'a str, &'a serde_json::Value)> = Vec::new();
-    for (v_str, v_val) in versions {
-        if let Ok(ver) = rnpm_core::Version::parse(v_str) {
-            candidates.push((ver, v_str.as_str(), v_val));
-        }
-    }
-    candidates.sort_by(|a, b| a.0.cmp(&b.0));
-
+    // 1. Explicit empty, "*", or "latest" -> resolve latest tag or highest semver
     if spec.is_empty() || spec == "*" || spec == "latest" {
         if let Some(latest_ver) = dist_tags.and_then(|dt| dt.get("latest")).and_then(|v| v.as_str()) {
             if let Some((k, v)) = versions.get_key_value(latest_ver) {
                 return Some((k.as_str(), v));
             }
         }
+        let mut candidates: Vec<(rnpm_core::Version, &'a str, &'a serde_json::Value)> = Vec::new();
+        for (v_str, v_val) in versions {
+            if let Ok(ver) = rnpm_core::Version::parse(v_str) {
+                candidates.push((ver, v_str.as_str(), v_val));
+            }
+        }
+        candidates.sort_by(|a, b| a.0.cmp(&b.0));
         return candidates.last().map(|(_, s, v)| (*s, *v));
     }
 
+    // 2. Named dist-tag match (e.g. "next", "beta")
+    if let Some(tag_ver) = dist_tags.and_then(|dt| dt.get(spec)).and_then(|v| v.as_str()) {
+        if let Some((k, v)) = versions.get_key_value(tag_ver) {
+            return Some((k.as_str(), v));
+        }
+    }
+
+    // 3. Valid semver range matching
     if let Ok(range) = rnpm_core::Range::parse(spec) {
+        let mut candidates: Vec<(rnpm_core::Version, &'a str, &'a serde_json::Value)> = Vec::new();
+        for (v_str, v_val) in versions {
+            if let Ok(ver) = rnpm_core::Version::parse(v_str) {
+                candidates.push((ver, v_str.as_str(), v_val));
+            }
+        }
+        candidates.sort_by(|a, b| a.0.cmp(&b.0));
+
         for (ver, s, v) in candidates.iter().rev() {
             if range.satisfies(ver) {
                 return Some((*s, *v));
             }
         }
+        // Valid semver range was specified, but no version in metadata satisfies it: NEVER silently fallback!
+        return None;
     }
 
+    // 4. Exact version string match fallback
     if let Some((k, v)) = versions.get_key_value(spec) {
         return Some((k.as_str(), v));
     }
 
-    if let Some(latest_ver) = dist_tags.and_then(|dt| dt.get("latest")).and_then(|v| v.as_str()) {
-        if let Some((k, v)) = versions.get_key_value(latest_ver) {
-            return Some((k.as_str(), v));
-        }
-    }
-
-    candidates.last().map(|(_, s, v)| (*s, *v))
+    None
 }
 
 fn version_matches_spec(version_str: &str, spec: &str) -> bool {
@@ -693,15 +700,85 @@ fn get_installed_version(package_dir: &Path) -> Option<String> {
     None
 }
 
-fn package_dir_in_node_modules(node_modules_dir: &Path, pkg_name: &str) -> PathBuf {
-    let mut p = node_modules_dir.to_path_buf();
+/// Validates that a package name is a valid npm package name and contains no path traversal
+/// characters (such as `..`, `/` in unscoped names, `\`, `:`, or control characters).
+pub fn validate_package_name(pkg_name: &str) -> anyhow::Result<()> {
+    let trimmed = pkg_name.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!("Package name cannot be empty");
+    }
+    if trimmed.len() > 214 {
+        anyhow::bail!("Package name '{}' exceeds maximum allowed length of 214 characters", trimmed);
+    }
+    if trimmed.contains('\\') || trimmed.contains(':') || trimmed.contains('\0') {
+        anyhow::bail!("Package name '{}' contains forbidden characters ('\\', ':', or null)", trimmed);
+    }
+    if trimmed.chars().any(|c| (c as u32) < 0x20 || "<>\"|?*".contains(c)) {
+        anyhow::bail!("Package name '{}' contains forbidden filesystem or control characters", trimmed);
+    }
+
+    if let Some(scoped) = trimmed.strip_prefix('@') {
+        let parts: Vec<&str> = scoped.split('/').collect();
+        if parts.len() != 2 {
+            anyhow::bail!(
+                "Scoped package name '{}' must have exactly one '/' separating scope and package name",
+                trimmed
+            );
+        }
+        let scope = parts[0];
+        let name = parts[1];
+        validate_name_segment(scope, true)?;
+        validate_name_segment(name, false)?;
+    } else {
+        if trimmed.contains('/') {
+            anyhow::bail!("Unscoped package name '{}' cannot contain '/'", trimmed);
+        }
+        validate_name_segment(trimmed, false)?;
+    }
+
+    Ok(())
+}
+
+fn validate_name_segment(segment: &str, is_scope: bool) -> anyhow::Result<()> {
+    if segment.is_empty() {
+        anyhow::bail!("Package name segment cannot be empty");
+    }
+    if segment == "." || segment == ".." {
+        anyhow::bail!("Package name segment cannot be '.' or '..'");
+    }
+    if segment.starts_with('.') || segment.starts_with('_') {
+        anyhow::bail!("Package name segment '{}' cannot start with '.' or '_'", segment);
+    }
+    if !segment.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.') {
+        let kind = if is_scope { "scope" } else { "package" };
+        anyhow::bail!("Invalid characters in {} name '{}'", kind, segment);
+    }
+    Ok(())
+}
+
+/// Safely constructs and validates the directory path for `pkg_name` inside `node_modules_dir`.
+/// Strictly rejects path traversal, malicious names, and escaping paths.
+pub fn package_dir_in_node_modules(node_modules_dir: &Path, pkg_name: &str) -> anyhow::Result<PathBuf> {
+    validate_package_name(pkg_name)?;
+
+    let mut target = node_modules_dir.to_path_buf();
     for comp in pkg_name.split('/') {
-        let trimmed = comp.trim();
-        if !trimmed.is_empty() {
-            p.push(trimmed);
+        target.push(comp);
+    }
+
+    // Verify strict containment within node_modules_dir
+    let rel = target
+        .strip_prefix(node_modules_dir)
+        .map_err(|_| anyhow::anyhow!("Package path '{}' escaped node_modules", pkg_name))?;
+
+    for comp in rel.components() {
+        match comp {
+            std::path::Component::Normal(_) => {}
+            _ => anyhow::bail!("Invalid non-normal path component in package path: {:?}", target),
         }
     }
-    p
+
+    Ok(target)
 }
 
 fn resolve_url(base: &str, target: &str) -> String {
