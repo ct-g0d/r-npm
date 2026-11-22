@@ -504,28 +504,9 @@ pub fn is_ancestor_satisfied(
             continue;
         }
 
-        // 1. Direct self/mutual cycle check:
-        // If an ancestor directory itself IS `<name>` with a version satisfying `job.spec`, STOP!
-        if dir != staging_dir {
-            let (pkg_name_opt, pkg_ver_opt) = get_installed_pkg_info(dir);
-            let ver_opt = pkg_ver_opt.or_else(|| get_installed_version(dir));
-            let name_matches = pkg_name_opt.as_deref() == Some(job_name)
-                || directory_matches_pkg_name(dir, job_name);
-            if name_matches {
-                if let Some(ref v) = ver_opt {
-                    if version_matches_spec(v, job_spec) {
-                        debug!(
-                            "Dependency '{}@{}' satisfied by ancestor package directory {}",
-                            job_name, v, dir.display()
-                        );
-                        return Ok(true);
-                    }
-                }
-            }
-        }
-
-        // 2. Ancestor's node_modules resolution check:
-        // If ANY ancestor's `node_modules/<name>` exists and its installed version satisfies `job.spec`, STOP!
+        // 1. Ancestor's node_modules resolution check:
+        // In Node.js module resolution, `dir/node_modules/<job_name>` is checked BEFORE `dir` itself!
+        // If ANY ancestor's `node_modules/<name>` exists, it shadows `dir` and all higher ancestors.
         let nm_dir = dir.join("node_modules");
         if nm_dir.is_dir() {
             if let Ok(cand) = package_dir_in_node_modules(&nm_dir, job_name) {
@@ -540,9 +521,30 @@ pub fn is_ancestor_satisfied(
                         }
                     }
                     // In Node module resolution, an existing cand in a closer node_modules
-                    // shadows all higher ancestors. If it does not satisfy job_spec,
+                    // shadows both `dir` itself and all higher ancestors. If it does not satisfy job_spec,
                     // higher ancestors cannot satisfy this require call.
                     break;
+                }
+            }
+        }
+
+        // 2. Direct self/mutual cycle check:
+        // If an ancestor directory itself IS `<name>` with a version satisfying `job.spec` (and was not shadowed
+        // by `dir/node_modules/<job_name>`), STOP!
+        if dir != staging_dir {
+            let (pkg_name_opt, pkg_ver_opt) = get_installed_pkg_info(dir);
+            let ver_opt = pkg_ver_opt.or_else(|| get_installed_version(dir));
+            let name_matches = pkg_name_opt.as_deref() == Some(job_name)
+                || directory_matches_pkg_name(dir, job_name);
+            if name_matches {
+                if let Some(ref v) = ver_opt {
+                    if version_matches_spec(v, job_spec) {
+                        debug!(
+                            "Dependency '{}@{}' satisfied by ancestor package directory {}",
+                            job_name, v, dir.display()
+                        );
+                        return Ok(true);
+                    }
                 }
             }
         }
@@ -633,7 +635,17 @@ pub async fn install_production_dependencies(
             pick_matching_version(versions, packument.get("dist-tags"), &job.spec)
                 .ok_or_else(|| anyhow::anyhow!("No matching version found for dependency '{}' satisfying '{}'", job.name, job.spec))?
         } else if packument.get("dist").is_some() {
-            let v = packument.get("version").and_then(|v| v.as_str()).unwrap_or("0.0.0");
+            let v = packument
+                .get("version")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "Single-version response for dependency '{}' is missing a valid 'version' field",
+                        job.name
+                    )
+                })?;
             if !version_matches_spec(v, &job.spec) {
                 anyhow::bail!(
                     "Single-version response for dependency '{}' has version '{}', which does not satisfy '{}'",
