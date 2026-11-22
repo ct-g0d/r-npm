@@ -100,6 +100,8 @@ async fn test_optional_lifecycle_script_failure_isolation() {
         foreground_scripts: false,
         timeout: None,
         sandbox_policy: ScriptSandboxPolicy::default(),
+        node_gyp: None,
+        offline: false,
     };
 
     // When optional is true, script failure is isolated and does NOT fail execution
@@ -304,6 +306,8 @@ async fn test_topological_dependency_cycle_prevention() {
         foreground_scripts: false,
         timeout: None,
         sandbox_policy: ScriptSandboxPolicy::default(),
+        node_gyp: None,
+        offline: false,
     };
 
     // Cyclic dependency should NOT overflow the stack and should successfully execute
@@ -358,6 +362,8 @@ async fn test_optional_dependency_disk_removal_on_failure() {
         foreground_scripts: false,
         timeout: None,
         sandbox_policy: ScriptSandboxPolicy::default(),
+        node_gyp: None,
+        offline: false,
     };
 
     let res = execute_topological(&[node], &root_manifest, &opts).await;
@@ -876,6 +882,8 @@ async fn test_lifecycle_topological_stress_50_plus_packages() {
         foreground_scripts: false,
         timeout: None,
         sandbox_policy: ScriptSandboxPolicy::default(),
+        node_gyp: None,
+        offline: false,
     };
 
     let res = execute_topological(&nodes, &root_manifest, &opts).await;
@@ -2937,4 +2945,309 @@ fn test_node_env_not_set_when_include_dev_overrides() {
         env.get("NODE_ENV").map(|s| s.as_str()),
         Some("production")
     );
+}
+
+#[test]
+fn test_node_gyp_explicit_config_precedence() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("proj");
+    std::fs::create_dir_all(&root).unwrap();
+
+    // 1. Setup local project node_modules/.bin/node-gyp and node_modules/node-gyp/bin/node-gyp.js
+    let local_bin = root.join("node_modules").join(".bin");
+    std::fs::create_dir_all(&local_bin).unwrap();
+    let local_sh = local_bin.join("node-gyp");
+    std::fs::write(&local_sh, "#!/bin/sh\nexit 0\n").unwrap();
+
+    let local_js_dir = root.join("node_modules").join("node-gyp").join("bin");
+    std::fs::create_dir_all(&local_js_dir).unwrap();
+    let local_js = local_js_dir.join("node-gyp.js");
+    std::fs::write(&local_js, "console.log('local');").unwrap();
+
+    // 2. Setup cached standalone node-gyp
+    let cache_dir = temp.path().join("cache");
+    let cached_js_dir = cache_dir.join("node-gyp").join("current").join("bin");
+    std::fs::create_dir_all(&cached_js_dir).unwrap();
+    let cached_js = cached_js_dir.join("node-gyp.js");
+    std::fs::write(&cached_js, "console.log('cached');").unwrap();
+
+    let mut config = rnpm_config::Config::default();
+    config.npmrc.settings.insert(
+        "cache".to_string(),
+        cache_dir.to_string_lossy().to_string(),
+    );
+
+    // Verify without explicit override, local project node_modules takes precedence
+    let local_resolved = find_node_gyp(&root, &root, &config, None).unwrap();
+    assert!(
+        local_resolved == local_sh || local_resolved == local_js || local_resolved.starts_with(&root),
+        "Local node-gyp must take precedence over cache when no explicit config is set: {}",
+        local_resolved.display()
+    );
+
+    // 3. Explicit config override (explicit option) takes precedence over EVERYTHING
+    let explicit_path = temp.path().join("custom-gyp").join("node-gyp.js");
+    let resolved_explicit = find_node_gyp(&root, &root, &config, Some(&explicit_path)).unwrap();
+    assert_eq!(
+        resolved_explicit, explicit_path,
+        "Explicit option must override local and cached node-gyp"
+    );
+
+    // 4. Explicit config via .npmrc (node-gyp = <path>) takes precedence over local & cached
+    let rc_path = temp.path().join("rc-custom-gyp").join("node-gyp.js");
+    let mut config_rc = config.clone();
+    config_rc.npmrc.settings.insert(
+        "node-gyp".to_string(),
+        rc_path.to_string_lossy().to_string(),
+    );
+    let resolved_rc = find_node_gyp(&root, &root, &config_rc, None).unwrap();
+    assert_eq!(
+        resolved_rc, rc_path,
+        ".npmrc node-gyp setting must override local and cached node-gyp"
+    );
+
+    // 5. Verify LifecycleOptions and LifecycleContext wiring
+    let ctx = LifecycleContext::new(&root, &root, "test-native", "install", "node-gyp rebuild")
+        .with_node_gyp(&explicit_path);
+    let env = build_lifecycle_env(&ctx);
+    assert_eq!(
+        env.get("npm_config_node_gyp").map(|s| s.as_str()),
+        Some(explicit_path.to_str().unwrap()),
+        "npm_config_node_gyp must match the explicit override"
+    );
+}
+
+#[test]
+fn test_node_gyp_cached_standalone_without_npm() {
+    let temp = tempfile::tempdir().unwrap();
+    let project_dir = temp.path().join("pkg");
+    std::fs::create_dir_all(&project_dir).unwrap();
+
+    // Write binding.gyp to indicate a native package
+    std::fs::write(project_dir.join("binding.gyp"), "{}").unwrap();
+    std::fs::write(
+        project_dir.join("package.json"),
+        r#"{"name": "native-test-pkg", "version": "1.0.0"}"#,
+    )
+    .unwrap();
+
+    // Create standalone cached node-gyp in <cache>/node-gyp/current/bin/node-gyp.js
+    let cache_dir = temp.path().join("cache");
+    let cached_bin = cache_dir.join("node-gyp").join("current").join("bin");
+    std::fs::create_dir_all(&cached_bin).unwrap();
+    let marker_file = project_dir.join("cached-build.marker");
+    let marker_escaped = marker_file.to_string_lossy().replace('\\', "/");
+    let node_gyp_content = format!(
+        "const fs = require('fs'); fs.writeFileSync('{}', 'cached node-gyp executed'); process.exit(0);",
+        marker_escaped
+    );
+    std::fs::write(cached_bin.join("node-gyp.js"), &node_gyp_content).unwrap();
+
+    let mut ctx = LifecycleContext::new(
+        &project_dir,
+        &project_dir,
+        "native-test-pkg",
+        "install",
+        "node-gyp rebuild",
+    );
+    ctx.extra_env.insert(
+        "npm_config_cache".to_string(),
+        cache_dir.to_string_lossy().to_string(),
+    );
+    ctx.extra_env.insert(
+        "npm_config_node_gyp_fallback_npm".to_string(),
+        "false".to_string(),
+    );
+
+    let status = execute_lifecycle_script(&ctx).expect("Execution with standalone cached node-gyp must succeed");
+    assert!(status.success(), "Lifecycle script must exit successfully");
+    assert!(
+        marker_file.is_file(),
+        "Cached standalone node-gyp.js must be executed and create marker file"
+    );
+    let content = std::fs::read_to_string(&marker_file).unwrap();
+    assert_eq!(content, "cached node-gyp executed");
+}
+
+#[test]
+fn test_node_gyp_offline_error_when_absent() {
+    let temp = tempfile::tempdir().unwrap();
+    let project_dir = temp.path().join("pkg");
+    std::fs::create_dir_all(&project_dir).unwrap();
+
+    std::fs::write(project_dir.join("binding.gyp"), "{}").unwrap();
+    std::fs::write(
+        project_dir.join("package.json"),
+        r#"{"name": "offline-native-pkg", "version": "1.0.0"}"#,
+    )
+    .unwrap();
+
+    // Point cache to an empty directory
+    let empty_cache = temp.path().join("empty_cache");
+    std::fs::create_dir_all(&empty_cache).unwrap();
+
+    let mut config = rnpm_config::Config::default();
+    config.npmrc.settings.insert(
+        "cache".to_string(),
+        empty_cache.to_string_lossy().to_string(),
+    );
+    config.npmrc.settings.insert(
+        "node-gyp-fallback-npm".to_string(),
+        "false".to_string(),
+    );
+
+    // Call ensure_node_gyp in offline mode
+    let err = ensure_node_gyp(
+        &project_dir,
+        &project_dir,
+        &config,
+        None,
+        true, // offline = true
+        "offline-native-pkg",
+    )
+    .expect_err("ensure_node_gyp must fail in offline mode when node-gyp is absent");
+
+    let err_str = err.to_string();
+    assert!(
+        err_str.contains("offline-native-pkg"),
+        "Error message must name the affected package: {err_str}"
+    );
+    assert!(
+        err_str.contains("offline mode") || err_str.contains("In offline mode"),
+        "Error message must mention offline mode: {err_str}"
+    );
+    assert!(
+        err_str.contains("npm_config_node_gyp") || err_str.contains(".npmrc") || err_str.contains("node-gyp=<path>"),
+        "Error message must provide actionable instructions on how to configure node-gyp: {err_str}"
+    );
+}
+
+fn create_mock_node_gyp_tarball(marker_file: &str, marker_content: &str) -> Vec<u8> {
+    let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    {
+        let mut builder = tar::Builder::new(&mut gz);
+
+        // package/package.json
+        let pkg_json = r#"{"name":"node-gyp","version":"10.0.0","bin":{"node-gyp":"bin/node-gyp.js"}}"#;
+        let mut header = tar::Header::new_gnu();
+        header.set_path("package/package.json").unwrap();
+        header.set_size(pkg_json.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        builder.append(&header, pkg_json.as_bytes()).unwrap();
+
+        // package/bin/node-gyp.js
+        let js_script = format!(
+            "const fs = require('fs'); fs.writeFileSync('{}', '{}'); process.exit(0);",
+            marker_file.replace('\\', "/"),
+            marker_content
+        );
+        let mut header_js = tar::Header::new_gnu();
+        header_js.set_path("package/bin/node-gyp.js").unwrap();
+        header_js.set_size(js_script.len() as u64);
+        header_js.set_mode(0o755);
+        header_js.set_cksum();
+        builder.append(&header_js, js_script.as_bytes()).unwrap();
+
+        builder.finish().unwrap();
+    }
+    gz.finish().unwrap()
+}
+
+#[test]
+fn test_node_gyp_mock_registry_on_demand_bootstrap() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    let temp = tempfile::tempdir().unwrap();
+    let project_dir = temp.path().join("pkg");
+    std::fs::create_dir_all(&project_dir).unwrap();
+
+    let marker_file = project_dir.join("bootstrap-build.marker");
+    let marker_escaped = marker_file.to_string_lossy().replace('\\', "/");
+    let tarball_bytes = create_mock_node_gyp_tarball(&marker_escaped, "bootstrap node-gyp built package");
+
+    // Start mock HTTP registry server
+    let listener = TcpListener::bind("127.0.0.1:0").expect("Failed to bind mock registry listener");
+    let port = listener.local_addr().unwrap().port();
+    let tb_clone = tarball_bytes.clone();
+
+    let server_handle = std::thread::spawn(move || {
+        for mut stream in listener.incoming().flatten() {
+            let mut buf = [0u8; 4096];
+            let n = stream.read(&mut buf).unwrap_or(0);
+            let req = String::from_utf8_lossy(&buf[..n]);
+            if req.contains("GET /node-gyp") {
+                let body = format!(
+                    r#"{{"name":"node-gyp","dist-tags":{{"latest":"10.0.0"}},"versions":{{"10.0.0":{{"dist":{{"tarball":"http://127.0.0.1:{}/tarballs/node-gyp.tgz"}}}}}}}}"#,
+                    port
+                );
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(resp.as_bytes());
+                let _ = stream.flush();
+            } else if req.contains("GET /tarballs/node-gyp.tgz") {
+                let resp_head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    tb_clone.len()
+                );
+                let _ = stream.write_all(resp_head.as_bytes());
+                let _ = stream.write_all(&tb_clone);
+                let _ = stream.flush();
+                break;
+            }
+        }
+    });
+
+    std::fs::write(project_dir.join("binding.gyp"), "{}").unwrap();
+    std::fs::write(
+        project_dir.join("package.json"),
+        r#"{"name": "mock-native-pkg", "version": "1.0.0"}"#,
+    )
+    .unwrap();
+
+    let cache_dir = temp.path().join("cache");
+    let mut ctx = LifecycleContext::new(
+        &project_dir,
+        &project_dir,
+        "mock-native-pkg",
+        "install",
+        "node-gyp rebuild",
+    );
+    ctx.extra_env.insert(
+        "npm_config_cache".to_string(),
+        cache_dir.to_string_lossy().to_string(),
+    );
+    ctx.extra_env.insert(
+        "npm_config_registry".to_string(),
+        format!("http://127.0.0.1:{}/", port),
+    );
+    ctx.extra_env.insert(
+        "npm_config_node_gyp_fallback_npm".to_string(),
+        "false".to_string(),
+    );
+
+    let status = execute_lifecycle_script(&ctx).expect("execute_lifecycle_script with bootstrap should succeed");
+    assert!(status.success(), "Lifecycle script must exit successfully");
+
+    // Verify downloaded & unpacked node-gyp.js in cache
+    let cached_js = cache_dir.join("node-gyp").join("current").join("bin").join("node-gyp.js");
+    assert!(
+        cached_js.is_file(),
+        "Bootstrap must unpack node-gyp into cache directory: {}",
+        cached_js.display()
+    );
+
+    // Verify dummy package was built
+    assert!(
+        marker_file.is_file(),
+        "Dummy native package must have been built by bootstrapped node-gyp"
+    );
+    let marker_content = std::fs::read_to_string(&marker_file).unwrap();
+    assert_eq!(marker_content, "bootstrap node-gyp built package");
+
+    let _ = server_handle.join();
 }

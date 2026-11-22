@@ -598,6 +598,16 @@ impl crate::Installer {
             } else {
                 rnpm_lifecycle::ScriptSandboxPolicy::permissive()
             },
+            node_gyp: std::env::var("npm_config_node_gyp")
+                .or_else(|_| std::env::var("NPM_CONFIG_NODE_GYP"))
+                .ok()
+                .map(std::path::PathBuf::from)
+                .or_else(|| {
+                    rnpm_config::Config::load(Some(&self.options.project_dir))
+                        .ok()
+                        .and_then(|c| c.get("node-gyp").map(std::path::PathBuf::from))
+                }),
+            offline: self.options.offline,
         };
         rnpm_lifecycle::execute_root_hooks(manifest, &opts).await
     }
@@ -828,6 +838,16 @@ impl crate::Installer {
                 } else {
                     rnpm_lifecycle::ScriptSandboxPolicy::permissive()
                 },
+                node_gyp: std::env::var("npm_config_node_gyp")
+                    .or_else(|_| std::env::var("NPM_CONFIG_NODE_GYP"))
+                    .ok()
+                    .map(std::path::PathBuf::from)
+                    .or_else(|| {
+                        rnpm_config::Config::load(Some(&project))
+                            .ok()
+                            .and_then(|c| c.get("node-gyp").map(std::path::PathBuf::from))
+                    }),
+                offline: self.options.offline,
             };
             rnpm_lifecycle::execute_dependency_hooks(&lifecycle_nodes, &opts).await?;
         }

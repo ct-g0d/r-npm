@@ -1229,10 +1229,13 @@ name = "rnpm-lifecycle"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "flate2",
  "libc",
+ "reqwest",
  "rnpm-config",
  "rnpm-core",
  "serde_json",
+ "tar",
  "tempfile",
  "thiserror",
  "tokio",

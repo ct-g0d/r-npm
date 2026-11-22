@@ -2640,6 +2640,16 @@ impl Installer {
             foreground_scripts: self.options.foreground_scripts,
             timeout: None,
             sandbox_policy,
+            node_gyp: std::env::var("npm_config_node_gyp")
+                .or_else(|_| std::env::var("NPM_CONFIG_NODE_GYP"))
+                .ok()
+                .map(std::path::PathBuf::from)
+                .or_else(|| {
+                    rnpm_config::Config::load(Some(&self.options.project_dir))
+                        .ok()
+                        .and_then(|c| c.get("node-gyp").map(std::path::PathBuf::from))
+                }),
+            offline: self.options.offline,
         }
     }
 
@@ -5362,20 +5372,7 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
         // npm reify builds dependencies before saving, then install runs root hooks.
         let lifecycle_opts = if !self.options.ignore_scripts {
             let _life_guard = collector.enter_phase(Phase::Lifecycle);
-            let sandbox_policy = if self.options.strict_sandbox {
-                rnpm_lifecycle::ScriptSandboxPolicy::restricted()
-            } else {
-                rnpm_lifecycle::ScriptSandboxPolicy::permissive()
-            };
-            let lifecycle_opts = LifecycleOptions {
-                root_dir: self.options.project_dir.clone(),
-                init_cwd: self.options.project_dir.clone(),
-                ignore_scripts: false,
-                capture_output: !self.options.foreground_scripts,
-                foreground_scripts: self.options.foreground_scripts,
-                timeout: None,
-                sandbox_policy,
-            };
+            let lifecycle_opts = self.lifecycle_options();
             let lifecycle_nodes = policy::apply_script_policy(
                 lifecycle_nodes,
                 &lockfile,
@@ -7575,20 +7572,7 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
         // before root hooks can fail.
         let lifecycle_opts = if !self.options.ignore_scripts {
             let _life_guard = collector.enter_phase(Phase::Lifecycle);
-            let sandbox_policy = if self.options.strict_sandbox {
-                rnpm_lifecycle::ScriptSandboxPolicy::restricted()
-            } else {
-                rnpm_lifecycle::ScriptSandboxPolicy::permissive()
-            };
-            let lifecycle_opts = LifecycleOptions {
-                root_dir: self.options.project_dir.clone(),
-                init_cwd: self.options.project_dir.clone(),
-                ignore_scripts: false,
-                capture_output: !self.options.foreground_scripts,
-                foreground_scripts: self.options.foreground_scripts,
-                timeout: None,
-                sandbox_policy,
-            };
+            let lifecycle_opts = self.lifecycle_options();
             let lifecycle_nodes = policy::apply_script_policy(
                 lifecycle_nodes,
                 &lockfile,

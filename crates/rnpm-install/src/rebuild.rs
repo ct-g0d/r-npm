@@ -250,6 +250,16 @@ pub async fn execute_rebuild(options: &RebuildOptions) -> Result<RebuildSummary>
         ScriptSandboxPolicy::permissive()
     };
 
+    let node_gyp = std::env::var("npm_config_node_gyp")
+        .or_else(|_| std::env::var("NPM_CONFIG_NODE_GYP"))
+        .ok()
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            rnpm_config::Config::load(Some(project_dir))
+                .ok()
+                .and_then(|c| c.get("node-gyp").map(std::path::PathBuf::from))
+        });
+
     let lifecycle_opts = LifecycleOptions {
         root_dir: project_dir.clone(),
         init_cwd: project_dir.clone(),
@@ -258,6 +268,8 @@ pub async fn execute_rebuild(options: &RebuildOptions) -> Result<RebuildSummary>
         foreground_scripts: options.foreground_scripts,
         timeout: None,
         sandbox_policy,
+        node_gyp,
+        offline: false,
     };
 
     // Execute through lifecycle topological runner with empty root manifest (dependencies only)

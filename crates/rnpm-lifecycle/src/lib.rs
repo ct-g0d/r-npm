@@ -9,10 +9,15 @@ use std::process::{Command, ExitStatus};
 use tracing::{debug, info, warn};
 
 pub mod error;
+pub mod node_gyp;
 pub mod policy;
 pub mod sandbox;
 
 pub use error::LifecycleError;
+pub use node_gyp::{
+    bootstrap_node_gyp, ensure_node_gyp, find_cache_dir, find_node_gyp, find_registry,
+    is_offline_mode, node_gyp_bin_dir, unpack_tarball,
+};
 pub use policy::{SandboxLevel, ScriptSandboxPolicy};
 pub use sandbox::{check_dangerous_command_patterns, CommandPatternAnalyzer};
 
@@ -306,6 +311,8 @@ pub struct LifecycleOptions {
     pub foreground_scripts: bool,
     pub timeout: Option<std::time::Duration>,
     pub sandbox_policy: ScriptSandboxPolicy,
+    pub node_gyp: Option<PathBuf>,
+    pub offline: bool,
 }
 
 impl Default for LifecycleOptions {
@@ -318,6 +325,8 @@ impl Default for LifecycleOptions {
             foreground_scripts: false,
             timeout: None,
             sandbox_policy: ScriptSandboxPolicy::default(),
+            node_gyp: None,
+            offline: false,
         }
     }
 }
@@ -325,6 +334,15 @@ impl Default for LifecycleOptions {
 impl LifecycleOptions {
     pub fn new(root_dir: impl Into<PathBuf>) -> Self {
         let root = root_dir.into();
+        let node_gyp = std::env::var("npm_config_node_gyp")
+            .or_else(|_| std::env::var("NPM_CONFIG_NODE_GYP"))
+            .ok()
+            .map(PathBuf::from)
+            .or_else(|| {
+                rnpm_config::Config::load(Some(&root))
+                    .ok()
+                    .and_then(|c| c.get("node-gyp").map(PathBuf::from))
+            });
         Self {
             init_cwd: root.clone(),
             root_dir: root,
@@ -333,6 +351,8 @@ impl LifecycleOptions {
             foreground_scripts: false,
             timeout: None,
             sandbox_policy: ScriptSandboxPolicy::default(),
+            node_gyp,
+            offline: false,
         }
     }
 
@@ -356,6 +376,16 @@ impl LifecycleOptions {
 
     pub fn with_ignore_scripts(mut self, ignore: bool) -> Self {
         self.ignore_scripts = ignore;
+        self
+    }
+
+    pub fn with_node_gyp(mut self, node_gyp: impl Into<PathBuf>) -> Self {
+        self.node_gyp = Some(node_gyp.into());
+        self
+    }
+
+    pub fn with_offline(mut self, offline: bool) -> Self {
+        self.offline = offline;
         self
     }
 }
@@ -396,6 +426,8 @@ pub struct LifecycleContext {
     pub captured_output: std::sync::Arc<std::sync::Mutex<Option<ScriptOutput>>>,
     pub sandbox_policy: ScriptSandboxPolicy,
     pub script_shell: Option<String>,
+    pub node_gyp: Option<PathBuf>,
+    pub offline: bool,
 }
 
 impl LifecycleContext {
@@ -422,6 +454,17 @@ impl LifecycleContext {
                 !trimmed.is_empty() && trimmed != "null" && s != "null"
             });
 
+        let node_gyp = std::env::var("npm_config_node_gyp")
+            .or_else(|_| std::env::var("NPM_CONFIG_NODE_GYP"))
+            .ok()
+            .map(PathBuf::from)
+            .or_else(|| {
+                rnpm_config::Config::load(Some(&package_dir))
+                    .or_else(|_| rnpm_config::Config::load(Some(&project_root)))
+                    .ok()
+                    .and_then(|c| c.get("node-gyp").map(PathBuf::from))
+            });
+
         Self {
             project_root,
             package_dir,
@@ -438,6 +481,8 @@ impl LifecycleContext {
             captured_output: std::sync::Arc::new(std::sync::Mutex::new(None)),
             sandbox_policy: ScriptSandboxPolicy::default(),
             script_shell,
+            node_gyp,
+            offline: false,
         }
     }
 
@@ -466,6 +511,16 @@ impl LifecycleContext {
 
     pub fn with_sandbox_policy(mut self, policy: ScriptSandboxPolicy) -> Self {
         self.sandbox_policy = policy;
+        self
+    }
+
+    pub fn with_node_gyp(mut self, node_gyp: impl Into<PathBuf>) -> Self {
+        self.node_gyp = Some(node_gyp.into());
+        self
+    }
+
+    pub fn with_offline(mut self, offline: bool) -> Self {
+        self.offline = offline;
         self
     }
 
@@ -930,24 +985,7 @@ fn npm_config_env(project_root: &Path) -> Vec<(String, String)> {
             user.to_string_lossy().to_string(),
         ));
     }
-    if let Some(gyp) = node_executable()
-        .and_then(|n| n.parent().map(Path::to_path_buf))
-        .map(|d| {
-            if cfg!(windows) {
-                d.join("node_modules")
-            } else {
-                d.join("..").join("lib").join("node_modules")
-            }
-        })
-        .map(|d| {
-            d.join("npm")
-                .join("node_modules")
-                .join("node-gyp")
-                .join("bin")
-                .join("node-gyp.js")
-        })
-        .filter(|p| p.is_file())
-    {
+    if let Some(gyp) = find_node_gyp(project_root, project_root, &config, None) {
         out.push((
             "npm_config_node_gyp".into(),
             gyp.to_string_lossy().to_string(),
@@ -1029,6 +1067,12 @@ pub fn build_lifecycle_env(ctx: &LifecycleContext) -> HashMap<String, String> {
         }
     }
 
+    if let Some(gyp_bin) = node_gyp_bin_dir() {
+        if !path_entries.contains(&gyp_bin) {
+            path_entries.push(gyp_bin);
+        }
+    }
+
     // Append existing system PATH
     let existing_path = std::env::var("PATH")
         .or_else(|_| std::env::var("Path"))
@@ -1079,6 +1123,13 @@ pub fn build_lifecycle_env(ctx: &LifecycleContext) -> HashMap<String, String> {
 
     if let Some(ref ver) = ctx.package_version {
         env.insert("npm_package_version".to_string(), ver.clone());
+    }
+
+    if let Some(ref gyp) = ctx.node_gyp {
+        env.insert(
+            "npm_config_node_gyp".to_string(),
+            gyp.to_string_lossy().to_string(),
+        );
     }
 
     let pkg_json = ctx.package_dir.join("package.json");
@@ -1319,6 +1370,11 @@ fn build_process_env(ctx: &LifecycleContext) -> HashMap<String, String> {
         .ancestors()
         .map(|dir| dir.join("node_modules").join(".bin"))
         .collect();
+    if let Some(gyp_bin) = node_gyp_bin_dir() {
+        if !bins.contains(&gyp_bin) {
+            bins.push(gyp_bin);
+        }
+    }
     let inherited = std::env::var_os("PATH")
         .or_else(|| std::env::var_os("Path"))
         .unwrap_or_default();
@@ -1327,6 +1383,12 @@ fn build_process_env(ctx: &LifecycleContext) -> HashMap<String, String> {
         env.remove("Path");
         env.remove("path");
         env.insert("PATH".into(), path.to_string_lossy().into_owned());
+    }
+    if let Some(ref gyp) = ctx.node_gyp {
+        env.insert(
+            "npm_config_node_gyp".to_string(),
+            gyp.to_string_lossy().to_string(),
+        );
     }
     if let Some(script) = ctx.extra_env.get("npm_lifecycle_script") {
         env.insert("npm_lifecycle_script".into(), script.clone());
@@ -1391,6 +1453,20 @@ pub(crate) fn create_shell_command(ctx: &LifecycleContext) -> Command {
     cmd
 }
 
+fn load_config_for_context(ctx: &LifecycleContext) -> rnpm_config::Config {
+    let mut config = rnpm_config::Config::load(Some(&ctx.package_dir))
+        .or_else(|_| rnpm_config::Config::load(Some(&ctx.project_root)))
+        .unwrap_or_default();
+    for (k, v) in &ctx.extra_env {
+        if let Some(stripped) = k.strip_prefix("npm_config_") {
+            config.npmrc.settings.insert(stripped.replace('_', "-"), v.clone());
+        } else if let Some(stripped) = k.strip_prefix("NPM_CONFIG_") {
+            config.npmrc.settings.insert(stripped.to_ascii_lowercase().replace('_', "-"), v.clone());
+        }
+    }
+    config
+}
+
 pub fn execute_lifecycle_script(ctx: &LifecycleContext) -> Result<ExitStatus> {
     info!(
         "Running lifecycle script '{}' for package {} in {}",
@@ -1404,7 +1480,24 @@ pub fn execute_lifecycle_script(ctx: &LifecycleContext) -> Result<ExitStatus> {
         .check_execution_allowed(&ctx.package_name, &ctx.script_cmd)
         .map_err(|e| anyhow::anyhow!(e))?;
 
-    let env = build_process_env(ctx);
+    let mut env = build_process_env(ctx);
+
+    if ctx.package_dir.join("binding.gyp").is_file() || ctx.script_cmd.contains("node-gyp") {
+        let config = load_config_for_context(ctx);
+        let gyp_path = ensure_node_gyp(
+            &ctx.project_root,
+            &ctx.package_dir,
+            &config,
+            ctx.node_gyp.as_deref(),
+            ctx.offline,
+            &ctx.package_name,
+        )
+        .map_err(|e| anyhow::anyhow!(e))?;
+        env.insert(
+            "npm_config_node_gyp".to_string(),
+            gyp_path.to_string_lossy().to_string(),
+        );
+    }
 
     let mut cmd = create_shell_command(ctx);
 
@@ -1570,7 +1663,24 @@ where
         .check_execution_allowed(&ctx.package_name, &ctx.script_cmd)
         .map_err(|e| anyhow::anyhow!(e))?;
 
-    let env = build_process_env(ctx);
+    let mut env = build_process_env(ctx);
+
+    if ctx.package_dir.join("binding.gyp").is_file() || ctx.script_cmd.contains("node-gyp") {
+        let config = load_config_for_context(ctx);
+        let gyp_path = ensure_node_gyp(
+            &ctx.project_root,
+            &ctx.package_dir,
+            &config,
+            ctx.node_gyp.as_deref(),
+            ctx.offline,
+            &ctx.package_name,
+        )
+        .map_err(|e| anyhow::anyhow!(e))?;
+        env.insert(
+            "npm_config_node_gyp".to_string(),
+            gyp_path.to_string_lossy().to_string(),
+        );
+    }
 
     let mut cmd = create_shell_command(ctx);
 
@@ -2597,6 +2707,8 @@ async fn execute_dependency_hooks_with_abort(
                 ctx.foreground_scripts = opts.foreground_scripts;
                 // Dependency build output is captured and only shown on failure.
                 ctx.capture_output = opts.capture_output && !opts.foreground_scripts;
+                ctx.node_gyp = opts.node_gyp.clone();
+                ctx.offline = opts.offline;
 
                 let abort_fut = {
                     let mut rx_opt = abort_rx.clone();
@@ -2747,6 +2859,8 @@ async fn execute_root_hooks_with_abort(
             if opts.foreground_scripts {
                 ctx.capture_output = false;
             }
+            ctx.node_gyp = opts.node_gyp.clone();
+            ctx.offline = opts.offline;
 
             let abort_fut = {
                 let mut rx_opt = abort_rx.clone();
