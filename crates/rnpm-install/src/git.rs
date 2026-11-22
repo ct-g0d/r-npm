@@ -439,15 +439,21 @@ impl GitFetcher {
         clone_url: &str,
     ) -> Result<PathBuf> {
         let checkout_dir = self.checkout_cache_dir(clone_url, commit_sha);
+        let marker_file = checkout_marker_file(&checkout_dir);
 
-        if checkout_dir.join(".rnpm_checkout_done").exists()
-            || checkout_dir.join("package.json").exists()
+        if (marker_file.exists() || checkout_dir.join(".rnpm_checkout_done").exists())
+            && checkout_dir.join("package.json").exists()
         {
             debug!(
                 "Reusing existing checkout for commit {} at '{}'",
                 commit_sha,
                 checkout_dir.display()
             );
+            // Clean up any legacy in-tree marker if present
+            let legacy_marker = checkout_dir.join(".rnpm_checkout_done");
+            if legacy_marker.exists() {
+                let _ = std::fs::remove_file(&legacy_marker);
+            }
             return Ok(checkout_dir);
         }
 
@@ -463,7 +469,8 @@ impl GitFetcher {
         if let Ok(bytes) = archive_bytes {
             let mut archive = tar::Archive::new(std::io::Cursor::new(bytes));
             if archive.unpack(&checkout_dir).is_ok() {
-                let _ = std::fs::File::create(checkout_dir.join(".rnpm_checkout_done"));
+                let _ = std::fs::File::create(&marker_file);
+                let _ = std::fs::remove_file(checkout_dir.join(".rnpm_checkout_done"));
                 return Ok(checkout_dir);
             }
         }
@@ -489,6 +496,7 @@ impl GitFetcher {
 
         if !checkout_ok {
             let _ = safe_remove_dir_all(&checkout_dir);
+            let _ = std::fs::remove_file(&marker_file);
             return Err(anyhow!(
                 "Failed to checkout git commit '{}' from '{}': {}",
                 commit_sha,
@@ -503,7 +511,8 @@ impl GitFetcher {
             let _ = safe_remove_dir_all(&git_file);
         }
 
-        let _ = std::fs::File::create(checkout_dir.join(".rnpm_checkout_done"));
+        let _ = std::fs::File::create(&marker_file);
+        let _ = std::fs::remove_file(checkout_dir.join(".rnpm_checkout_done"));
         Ok(checkout_dir)
     }
 }
@@ -631,6 +640,16 @@ pub fn normalize_clone_url_for_git(url: &str) -> String {
     url.to_string()
 }
 
+/// Path to the checkout marker file, placed as a sibling to the checkout directory
+/// so that it never leaks into the checked-out package contents.
+pub fn checkout_marker_file(checkout_dir: &Path) -> PathBuf {
+    if let (Some(parent), Some(name)) = (checkout_dir.parent(), checkout_dir.file_name()) {
+        parent.join(format!("{}.rnpm_checkout_done", name.to_string_lossy()))
+    } else {
+        checkout_dir.with_extension("rnpm_checkout_done")
+    }
+}
+
 pub fn copy_dir_all(src: &Path, dst: &Path) -> Result<()> {
     std::fs::create_dir_all(dst)
         .with_context(|| format!("Failed to create directory '{}'", dst.display()))?;
@@ -640,6 +659,16 @@ pub fn copy_dir_all(src: &Path, dst: &Path) -> Result<()> {
         if let Ok(manifest) = Manifest::from_file(&manifest_path) {
             if let Ok(files) = rnpm_fs::collect_pack_files(src, &manifest) {
                 for (rel, file_path) in files {
+                    if rel == ".rnpm_checkout_done"
+                        || rel.ends_with("/.rnpm_checkout_done")
+                        || rel.ends_with("\\.rnpm_checkout_done")
+                        || file_path
+                            .file_name()
+                            .and_then(|n| n.to_str())
+                            == Some(".rnpm_checkout_done")
+                    {
+                        continue;
+                    }
                     let to = dst.join(&rel);
                     if let Some(p) = to.parent() {
                         let _ = std::fs::create_dir_all(p);
@@ -662,7 +691,7 @@ pub fn copy_dir_all(src: &Path, dst: &Path) -> Result<()> {
     {
         let entry = entry?;
         let file_name = entry.file_name();
-        if file_name == ".git" {
+        if file_name == ".git" || file_name == ".rnpm_checkout_done" {
             continue;
         }
         let ty = entry.file_type()?;
@@ -899,5 +928,51 @@ mod tests {
         let checkout_commit = checkout_p.file_name().unwrap().to_str().unwrap();
         assert_eq!(checkout_commit.len(), 16);
         assert_eq!(checkout_commit, &commit[..16]);
+    }
+
+    #[test]
+    fn test_git_checkout_marker_not_leaked_into_package() {
+        use tempfile::tempdir;
+
+        // 1. Verify marker file path is a sibling outside checkout_dir
+        let cache_dir = Path::new("C:/fake/cache/_git-checkouts/hash123/commit456");
+        let marker = checkout_marker_file(cache_dir);
+        assert_ne!(marker, cache_dir.join(".rnpm_checkout_done"));
+        assert_eq!(marker.parent(), cache_dir.parent());
+        assert_eq!(
+            marker.file_name().unwrap().to_string_lossy(),
+            "commit456.rnpm_checkout_done"
+        );
+
+        // 2. Verify copy_dir_all skips .rnpm_checkout_done (with package.json manifest)
+        let tmp = tempdir().unwrap();
+        let src_with_manifest = tmp.path().join("src_manifest");
+        let dst_with_manifest = tmp.path().join("dst_manifest");
+        std::fs::create_dir_all(&src_with_manifest).unwrap();
+        std::fs::write(
+            src_with_manifest.join("package.json"),
+            r#"{"name":"test-git-pkg","version":"1.0.0"}"#,
+        )
+        .unwrap();
+        std::fs::write(src_with_manifest.join("index.js"), "module.exports = 42;").unwrap();
+        std::fs::write(src_with_manifest.join(".rnpm_checkout_done"), "").unwrap();
+        std::fs::write(src_with_manifest.join(".git"), "gitdir: ...").unwrap();
+
+        copy_dir_all(&src_with_manifest, &dst_with_manifest).unwrap();
+        assert!(dst_with_manifest.join("package.json").exists());
+        assert!(dst_with_manifest.join("index.js").exists());
+        assert!(!dst_with_manifest.join(".rnpm_checkout_done").exists());
+        assert!(!dst_with_manifest.join(".git").exists());
+
+        // 3. Verify copy_dir_all skips .rnpm_checkout_done (without package.json manifest fallback)
+        let src_no_manifest = tmp.path().join("src_no_manifest");
+        let dst_no_manifest = tmp.path().join("dst_no_manifest");
+        std::fs::create_dir_all(&src_no_manifest).unwrap();
+        std::fs::write(src_no_manifest.join("data.txt"), "hello").unwrap();
+        std::fs::write(src_no_manifest.join(".rnpm_checkout_done"), "").unwrap();
+
+        copy_dir_all(&src_no_manifest, &dst_no_manifest).unwrap();
+        assert!(dst_no_manifest.join("data.txt").exists());
+        assert!(!dst_no_manifest.join(".rnpm_checkout_done").exists());
     }
 }
