@@ -4256,7 +4256,12 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                         .checkout_git_dependency(&target, self.options.offline)
                         .await?;
 
-                    crate::git::copy_dir_all(&checkout_dir, &dest_dir)?;
+                    crate::git::materialize_git_dependency(
+                        &checkout_dir,
+                        &dest_dir,
+                        self.options.ignore_scripts,
+                        self.options.foreground_scripts,
+                    )?;
                     packages_installed += 1;
                     cache_hits += 1;
 
@@ -4266,13 +4271,12 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                             if m.scripts.contains_key("preinstall")
                                 || m.scripts.contains_key("install")
                                 || m.scripts.contains_key("postinstall")
-                                || m.scripts.contains_key("prepare")
                             {
                                 lifecycle_nodes.push(LifecyclePackageNode {
                                     package_path: loc.clone(),
                                     disk_path: dest_dir.clone(),
                                     manifest: m,
-                                    source: PackageSource::Git,
+                                    source: PackageSource::Registry,
                                     dependencies: node.dependencies.keys().cloned().collect(),
                                     optional: node.flags.optional,
                                 });
@@ -6171,7 +6175,12 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
 
                 let t_mat = std::time::Instant::now();
                 let _mat_span = tracing::info_span!("materialize", package = %pkg_key).entered();
-                crate::git::copy_dir_all(&checkout_dir, &full_target)?;
+                crate::git::materialize_git_dependency(
+                    &checkout_dir,
+                    &full_target,
+                    self.options.ignore_scripts,
+                    self.options.foreground_scripts,
+                )?;
                 drop(_mat_span);
                 collector.record_phase(Phase::Materialize, t_mat.elapsed());
 
@@ -6184,8 +6193,7 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                     if let Ok(pkg_manifest) = Manifest::from_file(&pkg_manifest_path) {
                         let has_scripts = pkg_manifest.scripts.contains_key("preinstall")
                             || pkg_manifest.scripts.contains_key("install")
-                            || pkg_manifest.scripts.contains_key("postinstall")
-                            || pkg_manifest.scripts.contains_key("prepare");
+                            || pkg_manifest.scripts.contains_key("postinstall");
                         if has_scripts {
                             let deps = pkg_info
                                 .dependencies
@@ -6198,7 +6206,7 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                                 package_path: pkg_key.clone(),
                                 disk_path: full_target.clone(),
                                 manifest: pkg_manifest,
-                                source: PackageSource::Git,
+                                source: PackageSource::Registry,
                                 dependencies: deps,
                                 optional: is_optional,
                             });

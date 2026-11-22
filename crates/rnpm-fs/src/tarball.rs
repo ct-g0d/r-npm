@@ -1432,6 +1432,7 @@ fn is_strictly_excluded(rel_path: &str, is_dir: bool) -> bool {
         || filename == ".gitignore"
         || filename == ".npmignore"
         || filename == ".npmrc"
+        || filename == ".rnpm_checkout_done"
         || rel_path == "node_modules"
         || rel_path.starts_with("node_modules/")
         || filename == "package-lock.json"
