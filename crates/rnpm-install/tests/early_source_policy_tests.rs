@@ -134,14 +134,18 @@ fn setup_test_project(
     std::fs::write(dir.join(".npmrc"), npmrc_content).unwrap();
 }
 
+static GIT_TEST_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 struct DummyGitGuard {
     _temp_dir: tempfile::TempDir,
     sentinel_path: PathBuf,
     original_path: String,
+    _lock: std::sync::MutexGuard<'static, ()>,
 }
 
 impl DummyGitGuard {
     fn new() -> Self {
+        let lock = GIT_TEST_MUTEX.lock().unwrap();
         let temp_dir = tempdir().unwrap();
         let sentinel_path = temp_dir.path().join("git_invoked.txt");
         let original_path = std::env::var("PATH").unwrap_or_default();
@@ -183,6 +187,7 @@ impl DummyGitGuard {
             _temp_dir: temp_dir,
             sentinel_path,
             original_path,
+            _lock: lock,
         }
     }
 
@@ -548,6 +553,7 @@ async fn test_allow_file_and_directory_none() {
 }
 
 fn run_git_cmd(dir: &Path, args: &[&str]) {
+    let _lock = GIT_TEST_MUTEX.lock().unwrap();
     let _ = std::fs::write(dir.join(".empty_gitconfig"), "");
     let status = std::process::Command::new("git")
         .args(args)
@@ -624,5 +630,449 @@ async fn test_allow_git_root_allows_root_blocks_transitive() {
     assert!(
         !reqs.iter().any(|r| r.contains(".git") || r.contains("git-upload-pack")),
         "Transitive git repo was never fetched by git subprocess! Reqs: {reqs:?}"
+    );
+}
+
+// -----------------------------------------------------------------------------
+// Test 8: Direct tarball URLs with /-/ are Remote (NOT registry): blocked by allow-remote=none (manifest)
+// -----------------------------------------------------------------------------
+#[tokio::test]
+async fn test_allow_remote_none_blocks_registry_like_tarball_url_manifest() {
+    let server = CountingServer::start(|_path, _base_url| {
+        let pkg = create_test_tarball(&[("package.json", br#"{"name":"foo","version":"1.0.0"}"#)]);
+        Some((200, vec![("Content-Type", "application/octet-stream".to_string())], pkg))
+    }).await;
+
+    let project_dir = tempdir().unwrap();
+    let cache_dir = tempdir().unwrap();
+
+    let remote_url = format!("{}/foo/-/foo-1.0.0.tgz", server.url());
+    setup_test_project(
+        project_dir.path(),
+        &serde_json::json!({
+            "foo": remote_url
+        }),
+        "allow-remote=none\n",
+    );
+
+    let options = InstallOptions {
+        project_dir: project_dir.path().to_path_buf(),
+        cache_dir: Some(cache_dir.path().to_path_buf()),
+        registry_url: Some(server.url()),
+        ..Default::default()
+    };
+
+    let mut installer = Installer::new(options).unwrap();
+    let result = installer.install().await;
+
+    assert!(result.is_err(), "Expected install to fail with allow-remote=none");
+    let err_msg = result.unwrap_err().to_string();
+    assert!(
+        err_msg.contains("EALLOWREMOTE"),
+        "Direct tarball URL with /-/ must be classified as Remote and fail with EALLOWREMOTE, got: {err_msg}"
+    );
+    assert!(
+        err_msg.contains("Fetching packages of type \"remote\" have been disabled"),
+        "Error message should match exact npm text, got: {err_msg}"
+    );
+
+    assert_eq!(
+        server.request_count().await,
+        0,
+        "ZERO HTTP requests should have been made to the server"
+    );
+}
+
+// -----------------------------------------------------------------------------
+// Test 9: Direct tarball URLs with /-/ are Remote (NOT registry): blocked by allow-remote=none (CLI)
+// -----------------------------------------------------------------------------
+#[tokio::test]
+async fn test_allow_remote_none_blocks_registry_like_tarball_url_cli() {
+    let server = CountingServer::start(|_path, _base_url| {
+        let pkg = create_test_tarball(&[("package.json", br#"{"name":"foo","version":"1.0.0"}"#)]);
+        Some((200, vec![("Content-Type", "application/octet-stream".to_string())], pkg))
+    }).await;
+
+    let project_dir = tempdir().unwrap();
+    let cache_dir = tempdir().unwrap();
+
+    setup_test_project(
+        project_dir.path(),
+        &serde_json::json!({}),
+        "allow-remote=none\n",
+    );
+
+    let remote_url = format!("{}/foo/-/foo-1.0.0.tgz", server.url());
+    let options = InstallOptions {
+        project_dir: project_dir.path().to_path_buf(),
+        cache_dir: Some(cache_dir.path().to_path_buf()),
+        registry_url: Some(server.url()),
+        packages: vec![remote_url],
+        ..Default::default()
+    };
+
+    let mut installer = Installer::new(options).unwrap();
+    let result = installer.install().await;
+
+    assert!(result.is_err(), "Expected install to fail with allow-remote=none");
+    let err_msg = result.unwrap_err().to_string();
+    assert!(
+        err_msg.contains("EALLOWREMOTE"),
+        "CLI direct tarball URL with /-/ must be classified as Remote, got: {err_msg}"
+    );
+    assert!(
+        err_msg.contains("Fetching packages of type \"remote\" have been disabled"),
+        "Error message should match exact npm text, got: {err_msg}"
+    );
+
+    assert_eq!(
+        server.request_count().await,
+        0,
+        "ZERO HTTP requests should have been made to the server"
+    );
+}
+
+// -----------------------------------------------------------------------------
+// Test 10: allow-registry=none blocks manifest registry dep with ZERO requests
+// -----------------------------------------------------------------------------
+#[tokio::test]
+async fn test_allow_registry_none_blocks_manifest_dep_zero_packument_requests() {
+    let server = CountingServer::start(|_path, _base_url| {
+        let packument = serde_json::json!({
+            "name": "foo",
+            "dist-tags": { "latest": "1.0.0" },
+            "versions": {
+                "1.0.0": {
+                    "name": "foo",
+                    "version": "1.0.0",
+                    "dist": {
+                        "tarball": "http://127.0.0.1/foo/-/foo-1.0.0.tgz"
+                    }
+                }
+            }
+        });
+        Some((200, vec![("Content-Type", "application/json".to_string())], packument.to_string().into_bytes()))
+    }).await;
+
+    let project_dir = tempdir().unwrap();
+    let cache_dir = tempdir().unwrap();
+
+    setup_test_project(
+        project_dir.path(),
+        &serde_json::json!({
+            "foo": "^1.0.0"
+        }),
+        "allow-registry=none\n",
+    );
+
+    let options = InstallOptions {
+        project_dir: project_dir.path().to_path_buf(),
+        cache_dir: Some(cache_dir.path().to_path_buf()),
+        registry_url: Some(server.url()),
+        ..Default::default()
+    };
+
+    let mut installer = Installer::new(options).unwrap();
+    let result = installer.install().await;
+
+    assert!(result.is_err(), "Expected install to fail with allow-registry=none");
+    let err_msg = result.unwrap_err().to_string();
+    assert!(
+        err_msg.contains("EALLOWREGISTRY"),
+        "Error message should contain EALLOWREGISTRY, got: {err_msg}"
+    );
+    assert!(
+        err_msg.contains("Fetching packages of type \"registry\" have been disabled"),
+        "Error message should match exact npm text, got: {err_msg}"
+    );
+
+    assert_eq!(
+        server.request_count().await,
+        0,
+        "ZERO HTTP requests should have been made to the registry server"
+    );
+}
+
+// -----------------------------------------------------------------------------
+// Test 11: allow-registry=none blocks CLI registry dep with ZERO requests
+// -----------------------------------------------------------------------------
+#[tokio::test]
+async fn test_allow_registry_none_blocks_cli_dep_zero_packument_requests() {
+    let server = CountingServer::start(|_path, _base_url| {
+        let packument = serde_json::json!({
+            "name": "foo",
+            "dist-tags": { "latest": "1.0.0" },
+            "versions": {
+                "1.0.0": {
+                    "name": "foo",
+                    "version": "1.0.0",
+                    "dist": {
+                        "tarball": "http://127.0.0.1/foo/-/foo-1.0.0.tgz"
+                    }
+                }
+            }
+        });
+        Some((200, vec![("Content-Type", "application/json".to_string())], packument.to_string().into_bytes()))
+    }).await;
+
+    let project_dir = tempdir().unwrap();
+    let cache_dir = tempdir().unwrap();
+
+    setup_test_project(
+        project_dir.path(),
+        &serde_json::json!({}),
+        "allow-registry=none\n",
+    );
+
+    let options = InstallOptions {
+        project_dir: project_dir.path().to_path_buf(),
+        cache_dir: Some(cache_dir.path().to_path_buf()),
+        registry_url: Some(server.url()),
+        packages: vec!["foo@^1.0.0".to_string()],
+        ..Default::default()
+    };
+
+    let mut installer = Installer::new(options).unwrap();
+    let result = installer.install().await;
+
+    assert!(result.is_err(), "Expected install to fail with allow-registry=none");
+    let err_msg = result.unwrap_err().to_string();
+    assert!(
+        err_msg.contains("EALLOWREGISTRY"),
+        "Error message should contain EALLOWREGISTRY, got: {err_msg}"
+    );
+    assert!(
+        err_msg.contains("Fetching packages of type \"registry\" have been disabled"),
+        "Error message should match exact npm text, got: {err_msg}"
+    );
+
+    assert_eq!(
+        server.request_count().await,
+        0,
+        "ZERO HTTP requests should have been made to the registry server"
+    );
+}
+
+// -----------------------------------------------------------------------------
+// Test 12: allow-registry=root blocks transitive registry dep with ZERO packument requests
+// -----------------------------------------------------------------------------
+#[tokio::test]
+async fn test_allow_registry_root_blocks_transitive_registry_dep_zero_requests() {
+    let server = CountingServer::start(|_path, _base_url| {
+        let packument = serde_json::json!({
+            "name": "transitive-reg",
+            "dist-tags": { "latest": "1.0.0" },
+            "versions": {
+                "1.0.0": {
+                    "name": "transitive-reg",
+                    "version": "1.0.0",
+                    "dist": {
+                        "tarball": "http://127.0.0.1/transitive-reg/-/transitive-reg-1.0.0.tgz"
+                    }
+                }
+            }
+        });
+        Some((200, vec![("Content-Type", "application/json".to_string())], packument.to_string().into_bytes()))
+    }).await;
+
+    let project_dir = tempdir().unwrap();
+    let cache_dir = tempdir().unwrap();
+
+    // Create a local directory package `local-pkg` that has a transitive registry dep
+    let local_pkg_dir = project_dir.path().join("local-pkg");
+    std::fs::create_dir_all(&local_pkg_dir).unwrap();
+    std::fs::write(
+        local_pkg_dir.join("package.json"),
+        serde_json::json!({
+            "name": "local-pkg",
+            "version": "1.0.0",
+            "dependencies": {
+                "transitive-reg": "^1.0.0"
+            }
+        }).to_string(),
+    ).unwrap();
+
+    setup_test_project(
+        project_dir.path(),
+        &serde_json::json!({
+            "local-pkg": "file:./local-pkg"
+        }),
+        "allow-registry=root\n",
+    );
+
+    let options = InstallOptions {
+        project_dir: project_dir.path().to_path_buf(),
+        cache_dir: Some(cache_dir.path().to_path_buf()),
+        registry_url: Some(server.url()),
+        ..Default::default()
+    };
+
+    let mut installer = Installer::new(options).unwrap();
+    let result = installer.install().await;
+
+    assert!(result.is_err(), "Expected install to fail on transitive registry dep");
+    let err_msg = result.unwrap_err().to_string();
+    assert!(
+        err_msg.contains("EALLOWREGISTRY"),
+        "Error message should contain EALLOWREGISTRY, got: {err_msg}"
+    );
+    assert!(
+        err_msg.contains("Fetching non-root packages of type \"registry\" have been disabled"),
+        "Error message should match exact non-root text, got: {err_msg}"
+    );
+
+    assert_eq!(
+        server.request_count().await,
+        0,
+        "ZERO HTTP requests should have been made to the registry server"
+    );
+}
+
+// -----------------------------------------------------------------------------
+// Test 13: allow-remote=root: requester edge check, NOT package name match
+// -----------------------------------------------------------------------------
+#[tokio::test]
+async fn test_allow_remote_root_requester_edge_not_fooled_by_same_name_root_dep() {
+    let server = CountingServer::start(|_path, _base_url| {
+        let pkg = create_test_tarball(&[("package.json", br#"{"name":"bar","version":"2.0.0"}"#)]);
+        Some((200, vec![("Content-Type", "application/octet-stream".to_string())], pkg))
+    }).await;
+
+    let project_dir = tempdir().unwrap();
+    let cache_dir = tempdir().unwrap();
+
+    // Root project declares:
+    // 1. "bar": "file:./bar" (a root file dependency named "bar")
+    // 2. "local-a": "file:./local-a"
+    // "local-a" has a transitive dependency "bar": "http://.../bar.tgz".
+    // Even though root declares a package named "bar", the transitive edge for "bar"
+    // comes from "local-a", NOT root! So allow-remote=root MUST reject it!
+    let bar_dir = project_dir.path().join("bar");
+    std::fs::create_dir_all(&bar_dir).unwrap();
+    std::fs::write(
+        bar_dir.join("package.json"),
+        r#"{"name":"bar","version":"1.0.0"}"#,
+    ).unwrap();
+
+    let remote_bar_url = format!("{}/bar/-/bar-2.0.0.tgz", server.url());
+    let local_a_dir = project_dir.path().join("local-a");
+    std::fs::create_dir_all(&local_a_dir).unwrap();
+    std::fs::write(
+        local_a_dir.join("package.json"),
+        serde_json::json!({
+            "name": "local-a",
+            "version": "1.0.0",
+            "dependencies": {
+                "bar": remote_bar_url
+            }
+        }).to_string(),
+    ).unwrap();
+
+    setup_test_project(
+        project_dir.path(),
+        &serde_json::json!({
+            "bar": "file:./bar",
+            "local-a": "file:./local-a"
+        }),
+        "allow-remote=root\n",
+    );
+
+    let options = InstallOptions {
+        project_dir: project_dir.path().to_path_buf(),
+        cache_dir: Some(cache_dir.path().to_path_buf()),
+        registry_url: Some(server.url()),
+        ..Default::default()
+    };
+
+    let mut installer = Installer::new(options).unwrap();
+    let result = installer.install().await;
+
+    assert!(result.is_err(), "Expected install to fail on transitive remote dep 'bar'");
+    let err_msg = result.unwrap_err().to_string();
+    assert!(
+        err_msg.contains("EALLOWREMOTE"),
+        "Error message should contain EALLOWREMOTE, got: {err_msg}"
+    );
+    assert!(
+        err_msg.contains("Fetching non-root packages of type \"remote\" have been disabled"),
+        "Error message should match exact non-root text, got: {err_msg}"
+    );
+
+    assert_eq!(
+        server.request_count().await,
+        0,
+        "Transitive bar.tgz must NEVER be fetched over HTTP!"
+    );
+}
+
+// -----------------------------------------------------------------------------
+// Test 14: allow-git=root: requester edge check, NOT package name match
+// -----------------------------------------------------------------------------
+#[tokio::test]
+async fn test_allow_git_root_requester_edge_not_fooled_by_same_name_root_dep() {
+    let server = CountingServer::start(|_path, _base_url| None).await;
+    let git_guard = DummyGitGuard::new();
+
+    let project_dir = tempdir().unwrap();
+    let cache_dir = tempdir().unwrap();
+
+    // Root declares "bar": "file:./bar" and "local-a": "file:./local-a"
+    // "local-a" declares "bar": "git+http://.../bar.git"
+    // Even though root declares a package named "bar", the transitive edge is non-root!
+    let bar_dir = project_dir.path().join("bar");
+    std::fs::create_dir_all(&bar_dir).unwrap();
+    std::fs::write(
+        bar_dir.join("package.json"),
+        r#"{"name":"bar","version":"1.0.0"}"#,
+    ).unwrap();
+
+    let git_bar_url = format!("git+http://127.0.0.1:{}/bar.git", server.port());
+    let local_a_dir = project_dir.path().join("local-a");
+    std::fs::create_dir_all(&local_a_dir).unwrap();
+    std::fs::write(
+        local_a_dir.join("package.json"),
+        serde_json::json!({
+            "name": "local-a",
+            "version": "1.0.0",
+            "dependencies": {
+                "bar": git_bar_url
+            }
+        }).to_string(),
+    ).unwrap();
+
+    setup_test_project(
+        project_dir.path(),
+        &serde_json::json!({
+            "bar": "file:./bar",
+            "local-a": "file:./local-a"
+        }),
+        "allow-git=root\n",
+    );
+
+    let options = InstallOptions {
+        project_dir: project_dir.path().to_path_buf(),
+        cache_dir: Some(cache_dir.path().to_path_buf()),
+        registry_url: Some(server.url()),
+        ..Default::default()
+    };
+
+    let mut installer = Installer::new(options).unwrap();
+    let result = installer.install().await;
+
+    assert!(result.is_err(), "Expected install to fail on transitive git dep 'bar'");
+    let err_msg = result.unwrap_err().to_string();
+    assert!(
+        err_msg.contains("EALLOWGIT"),
+        "Error message should contain EALLOWGIT, got: {err_msg}"
+    );
+    assert!(
+        err_msg.contains("Fetching non-root packages of type \"git\" have been disabled"),
+        "Error message should match exact non-root text, got: {err_msg}"
+    );
+
+    assert_eq!(server.request_count().await, 0);
+    assert!(
+        !git_guard.was_invoked(),
+        "Transitive git repo was never fetched by git subprocess!"
     );
 }

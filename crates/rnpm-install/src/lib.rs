@@ -975,6 +975,18 @@ impl RegistryPackageProvider {
 
     #[allow(clippy::result_large_err)]
     fn fetch_or_revalidate_packument(&self, name: &str) -> Result<PackageMetadata, SolverError> {
+        let is_root = self.root_declared.contains(name);
+        if let Err(e) = policy::check_source_gate(
+            &self.source_policy,
+            policy::SourceKind::Registry,
+            is_root,
+        ) {
+            return Err(SolverError::PackageMetadata(
+                name.to_string(),
+                e.to_string(),
+            ));
+        }
+
         let registry_url = self.client.registry_for_package(name).as_str().to_string();
         let cached = self.get_cached_packument(name);
 
@@ -1250,6 +1262,18 @@ impl PackageMetadataProvider for RegistryPackageProvider {
             }
         }
 
+        let is_root = self.root_declared.contains(name);
+        if let Err(e) = policy::check_source_gate(
+            &self.source_policy,
+            policy::SourceKind::Registry,
+            is_root,
+        ) {
+            return Err(SolverError::PackageMetadata(
+                name.to_string(),
+                e.to_string(),
+            ));
+        }
+
         match self.fetch_or_revalidate_packument(name) {
             Ok(meta) => {
                 if let Ok(mut cache) = self.metadata_cache.lock() {
@@ -1270,6 +1294,22 @@ impl PackageMetadataProvider for RegistryPackageProvider {
         if self.offline {
             return;
         }
+        if self.source_policy.registry == policy::AllowMode::None {
+            return;
+        }
+        let filtered_names: Vec<&str> = if self.source_policy.registry == policy::AllowMode::Root {
+            names
+                .iter()
+                .copied()
+                .filter(|n| self.root_declared.contains(*n))
+                .collect()
+        } else {
+            names.to_vec()
+        };
+        if filtered_names.is_empty() {
+            return;
+        }
+        let names = &filtered_names[..];
         let mut missing: Vec<String> = {
             let cache = match self.metadata_cache.lock() {
                 Ok(c) => c,
@@ -3265,11 +3305,7 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                     }
                 }
                 PackageTarget::Url(u) => {
-                    let kind = if policy::is_registry_tarball(u.as_str()) {
-                        policy::SourceKind::Registry
-                    } else {
-                        policy::SourceKind::Remote
-                    };
+                    let kind = policy::SourceKind::Remote;
                     policy::check_source_gate(&self.source_policy, kind, true)?;
 
                     let u_str = u.as_str();
@@ -3316,6 +3352,9 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                             spec.name = real_name.clone();
                         }
                     }
+                }
+                PackageTarget::Tag(_) | PackageTarget::Range(_) | PackageTarget::Version(_) => {
+                    policy::check_source_gate(&self.source_policy, policy::SourceKind::Registry, true)?;
                 }
                 _ => {}
             }
@@ -3479,6 +3518,25 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
 
         let root_declared = Arc::new(self.collect_root_declared(&manifest, &workspace_members));
 
+        let check_manifest_deps = |m: &Manifest| -> Result<()> {
+            for map in [
+                &m.dependencies,
+                &m.dev_dependencies,
+                &m.optional_dependencies,
+                &m.peer_dependencies,
+            ] {
+                for spec in map.values() {
+                    let kind = policy::parse_source_kind(spec);
+                    policy::check_source_gate(&self.source_policy, kind, true)?;
+                }
+            }
+            Ok(())
+        };
+        check_manifest_deps(&manifest)?;
+        for member in &workspace_members {
+            check_manifest_deps(&member.manifest)?;
+        }
+
         // 1. Resolve dependency graph via Solver directly
         let handle = tokio::runtime::Handle::current();
         let metadata_cache = Arc::new(std::sync::Mutex::new(HashMap::new()));
@@ -3519,6 +3577,9 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
             let mut lock = raw
                 .as_deref()
                 .and_then(|s| rnpm_lockfile::parse_and_migrate(s).ok());
+            if let Some(ref lock) = lock {
+                self.check_source_policy(lock, &manifest, &workspace_members)?;
+            }
             if let Some(lock) = lock
                 .as_mut()
                 .filter(|_| raw.as_deref().is_some_and(legacy_lock::is_old_lockfile))
@@ -5598,6 +5659,12 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
         let lockfile_str = std::fs::read_to_string(&lockfile_path)?;
         let mut lockfile = rnpm_lockfile::parse_and_migrate(&lockfile_str)
             .with_context(|| format!("Failed to parse {lockfile_name}"))?;
+        // 0. Discover workspace members (if any)
+        let workspace_members =
+            discover_workspaces_from_manifest(&self.options.project_dir, &manifest)
+                .unwrap_or_default();
+        self.check_source_policy(&lockfile, &manifest, &workspace_members)?;
+
         // npm ci inflates an old lock internally; the public lock is untouched.
         if legacy_lock::is_old_lockfile(&lockfile_str) {
             self.hydrate_old_lockfile(&mut lockfile, &lockfile_str, &HashSet::new())
@@ -5605,12 +5672,6 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
         }
         let platform_skipped_packages =
             lockfile_platform_skipped_packages(&lockfile, &self.options.platform());
-
-        // 0. Discover workspace members (if any)
-        let workspace_members =
-            discover_workspaces_from_manifest(&self.options.project_dir, &manifest)
-                .unwrap_or_default();
-        self.check_source_policy(&lockfile, &manifest, &workspace_members)?;
 
         let ws_graph_opt = if !workspace_members.is_empty() {
             WorkspaceDependencyGraph::construct(&workspace_members).ok()
@@ -7935,7 +7996,7 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                 Err(_) => continue,
             };
 
-            let is_root = is_root_pass || root_declared.contains(name);
+            let is_root = is_root_pass;
 
             let effective_target = match &parsed {
                 PackageTarget::Alias { target, .. } => target.as_ref(),
@@ -7994,22 +8055,11 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                     extra: m.extra.clone(),
                 };
 
-                let mut meta = if let Ok(locked) = cache.lock() {
+                let meta = if let Ok(locked) = cache.lock() {
                     locked.get(name).cloned()
                 } else {
                     None
                 };
-
-                if meta.is_none() && !self.options.offline {
-                    let fetch_res = if before_cutoff().is_some() {
-                        self.registry_client.get_package_metadata_full(name).await
-                    } else {
-                        self.registry_client.get_package_metadata(name).await
-                    };
-                    if let Ok(reg_abbrev) = fetch_res {
-                        meta = Some(abbreviated_to_package_metadata(&reg_abbrev));
-                    }
-                }
 
                 let mut pkg_meta = meta.unwrap_or_else(|| PackageMetadata {
                     name: name.clone(),
@@ -8099,22 +8149,11 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                                     extra: m.extra.clone(),
                                 };
 
-                                let mut meta = if let Ok(locked) = cache.lock() {
+                                let meta = if let Ok(locked) = cache.lock() {
                                     locked.get(name).cloned()
                                 } else {
                                     None
                                 };
-
-                                if meta.is_none() && !self.options.offline {
-                                    let fetch_res = if before_cutoff().is_some() {
-                                        self.registry_client.get_package_metadata_full(name).await
-                                    } else {
-                                        self.registry_client.get_package_metadata(name).await
-                                    };
-                                    if let Ok(reg_abbrev) = fetch_res {
-                                        meta = Some(abbreviated_to_package_metadata(&reg_abbrev));
-                                    }
-                                }
 
                                 let mut pkg_meta = meta.unwrap_or_else(|| PackageMetadata {
                                     name: name.clone(),
@@ -8186,22 +8225,11 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                             extra: m.extra.clone(),
                         };
 
-                        let mut meta = if let Ok(locked) = cache.lock() {
+                        let meta = if let Ok(locked) = cache.lock() {
                             locked.get(name).cloned()
                         } else {
                             None
                         };
-
-                        if meta.is_none() && !self.options.offline {
-                            let fetch_res = if before_cutoff().is_some() {
-                                self.registry_client.get_package_metadata_full(name).await
-                            } else {
-                                self.registry_client.get_package_metadata(name).await
-                            };
-                            if let Ok(reg_abbrev) = fetch_res {
-                                meta = Some(abbreviated_to_package_metadata(&reg_abbrev));
-                            }
-                        }
 
                         let mut pkg_meta = meta.unwrap_or_else(|| PackageMetadata {
                             name: name.clone(),
@@ -8224,11 +8252,7 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                     }
                 }
                 PackageTarget::Url(ref url) => {
-                    let kind = if policy::is_registry_tarball(url.as_str()) {
-                        policy::SourceKind::Registry
-                    } else {
-                        policy::SourceKind::Remote
-                    };
+                    let kind = policy::SourceKind::Remote;
                     policy::check_source_gate(&self.source_policy, kind, is_root)?;
 
                     let url_str = url.as_str();
@@ -8305,22 +8329,11 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                         extra: m.extra.clone(),
                     };
 
-                    let mut meta = if let Ok(locked) = cache.lock() {
+                    let meta = if let Ok(locked) = cache.lock() {
                         locked.get(name).cloned()
                     } else {
                         None
                     };
-
-                    if meta.is_none() && !self.options.offline {
-                        let fetch_res = if before_cutoff().is_some() {
-                            self.registry_client.get_package_metadata_full(name).await
-                        } else {
-                            self.registry_client.get_package_metadata(name).await
-                        };
-                        if let Ok(reg_abbrev) = fetch_res {
-                            meta = Some(abbreviated_to_package_metadata(&reg_abbrev));
-                        }
-                    }
 
                     let mut pkg_meta = meta.unwrap_or_else(|| PackageMetadata {
                         name: name.clone(),
@@ -8340,6 +8353,9 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                     }
 
                     Box::pin(self.populate_custom_target_metadata(&m, cache, root_declared, false)).await?;
+                }
+                PackageTarget::Tag(_) | PackageTarget::Range(_) | PackageTarget::Version(_) => {
+                    policy::check_source_gate(&self.source_policy, policy::SourceKind::Registry, is_root)?;
                 }
                 _ => {}
             }

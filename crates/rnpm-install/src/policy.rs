@@ -128,6 +128,44 @@ fn is_git_spec(spec: &str) -> bool {
     .any(|p| spec.starts_with(p))
 }
 
+/// Classify a dependency spec string into its `SourceKind`.
+pub fn parse_source_kind(spec: &str) -> SourceKind {
+    let spec = spec.trim();
+    let spec = if let Some(sub) = spec.strip_prefix("npm:") {
+        if let Some(at_idx) = sub.rfind('@') {
+            let slash_idx = sub.find('/').unwrap_or(0);
+            if at_idx > slash_idx {
+                sub[at_idx + 1..].trim()
+            } else {
+                sub.trim()
+            }
+        } else {
+            sub.trim()
+        }
+    } else {
+        spec
+    };
+
+    if is_git_spec(spec) {
+        return SourceKind::Git;
+    }
+    if spec.starts_with("http://") || spec.starts_with("https://") {
+        return SourceKind::Remote;
+    }
+    if spec.starts_with("file:") {
+        let lower = spec.to_ascii_lowercase();
+        return if lower.ends_with(".tgz") || lower.ends_with(".tar.gz") || lower.ends_with(".tar") {
+            SourceKind::File
+        } else {
+            SourceKind::Directory
+        };
+    }
+    if spec.ends_with(".tgz") || spec.ends_with(".tar.gz") || spec.ends_with(".tar") {
+        return SourceKind::File;
+    }
+    SourceKind::Registry
+}
+
 fn classify(pkg: &LockfilePackage) -> SourceKind {
     let resolved = pkg.resolved.as_deref().unwrap_or("");
     if pkg.link == Some(true) {
@@ -150,10 +188,54 @@ fn classify(pkg: &LockfilePackage) -> SourceKind {
     SourceKind::Remote
 }
 
-/// Name a top-level `node_modules/<name>` location refers to.
-fn top_level_name(location: &str) -> Option<&str> {
-    let rest = location.strip_prefix("node_modules/")?;
-    (!rest.contains("/node_modules/")).then_some(rest)
+fn split_parent_and_name(location: &str) -> Option<(&str, &str)> {
+    if let Some(idx) = location.rfind("/node_modules/") {
+        let parent = &location[..idx];
+        let name = &location[idx + "/node_modules/".len()..];
+        if !name.contains("/node_modules/") {
+            return Some((parent, name));
+        }
+    } else if let Some(name) = location.strip_prefix("node_modules/") {
+        if !name.contains("/node_modules/") {
+            return Some(("", name));
+        }
+    }
+    None
+}
+
+fn is_direct_root_dep(
+    location: &str,
+    packages: &std::collections::BTreeMap<String, LockfilePackage>,
+    workspace_paths: &HashSet<String>,
+    kind: SourceKind,
+) -> bool {
+    let Some((parent, name)) = split_parent_and_name(location) else {
+        return false;
+    };
+    let is_root_or_ws = parent.is_empty() || workspace_paths.contains(parent);
+    if !is_root_or_ws {
+        return false;
+    }
+    let Some(parent_pkg) = packages.get(parent) else {
+        return false;
+    };
+    for map in [
+        &parent_pkg.dependencies,
+        &parent_pkg.dev_dependencies,
+        &parent_pkg.optional_dependencies,
+        &parent_pkg.peer_dependencies,
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if let Some(spec) = map.get(name) {
+            let spec_kind = parse_source_kind(spec);
+            if spec_kind == kind {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Reject a single dependency source if disabled by `allow-*` source policy.
@@ -207,6 +289,55 @@ pub fn check_sources(
     if policy.is_unrestricted() {
         return Ok(());
     }
+
+    // 1. Collect all explicit remote URLs from root_declared and lockfile specs.
+    let mut explicit_remote_specs = HashSet::new();
+    for item in root_declared {
+        let trimmed = item.trim();
+        if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+            explicit_remote_specs.insert(trimmed.to_string());
+        }
+    }
+    for pkg in lockfile.packages.values() {
+        for map in [
+            &pkg.dependencies,
+            &pkg.dev_dependencies,
+            &pkg.optional_dependencies,
+            &pkg.peer_dependencies,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            for spec in map.values() {
+                let trimmed = spec.trim();
+                if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+                    explicit_remote_specs.insert(trimmed.to_string());
+                }
+            }
+        }
+    }
+
+    // 2. Gate every original dependency edge by (parsed_source_kind, is_actual_root_or_workspace_edge).
+    for (requester_loc, pkg) in &lockfile.packages {
+        let is_root_edge = requester_loc.is_empty() || workspace_paths.contains(requester_loc);
+        for map in [
+            &pkg.dependencies,
+            &pkg.dev_dependencies,
+            &pkg.optional_dependencies,
+            &pkg.peer_dependencies,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            for spec in map.values() {
+                let kind = parse_source_kind(spec);
+                check_source_gate(policy, kind, is_root_edge)?;
+            }
+        }
+    }
+
+    // 3. Gate every placed package node in lockfile.packages.
+    let explicit_refs: HashSet<&str> = explicit_remote_specs.iter().map(|s| s.as_str()).collect();
     for (location, pkg) in &lockfile.packages {
         if location.is_empty() || !location.contains("node_modules/") {
             continue;
@@ -219,8 +350,16 @@ pub fn check_sources(
         {
             continue;
         }
-        let kind = classify(pkg);
-        let is_root = top_level_name(location).is_some_and(|n| root_declared.contains(n));
+        let is_explicit_remote = pkg
+            .resolved
+            .as_deref()
+            .is_some_and(|r| explicit_refs.contains(r));
+        let kind = if is_explicit_remote {
+            SourceKind::Remote
+        } else {
+            classify(pkg)
+        };
+        let is_root = is_direct_root_dep(location, &lockfile.packages, workspace_paths, kind);
         check_source_gate(policy, kind, is_root)?;
     }
     Ok(())
