@@ -60,7 +60,43 @@ fn test_npx_argument_translation_unit() {
     );
     assert_eq!(
         translate_npx_args(&["--no-install".into(), "nonexistent-pkg".into()]),
-        vec!["exec", "--yes=false", "--", "nonexistent-pkg"]
+        vec!["exec", "--no-yes", "--", "nonexistent-pkg"]
+    );
+    assert_eq!(
+        translate_npx_args(&["--yes=false".into(), "nonexistent-pkg".into()]),
+        vec!["exec", "--no-yes", "--", "nonexistent-pkg"]
+    );
+    assert_eq!(
+        translate_npx_args(&["--yes=0".into(), "nonexistent-pkg".into()]),
+        vec!["exec", "--no-yes", "--", "nonexistent-pkg"]
+    );
+    assert_eq!(
+        translate_npx_args(&["-y=false".into(), "nonexistent-pkg".into()]),
+        vec!["exec", "--no-yes", "--", "nonexistent-pkg"]
+    );
+    assert_eq!(
+        translate_npx_args(&["-y=0".into(), "nonexistent-pkg".into()]),
+        vec!["exec", "--no-yes", "--", "nonexistent-pkg"]
+    );
+    assert_eq!(
+        translate_npx_args(&["--yes=true".into(), "cowsay".into()]),
+        vec!["exec", "--yes", "--", "cowsay"]
+    );
+    assert_eq!(
+        translate_npx_args(&["--yes=1".into(), "cowsay".into()]),
+        vec!["exec", "--yes", "--", "cowsay"]
+    );
+    assert_eq!(
+        translate_npx_args(&["-y=true".into(), "cowsay".into()]),
+        vec!["exec", "--yes", "--", "cowsay"]
+    );
+    assert_eq!(
+        translate_npx_args(&["-y=1".into(), "cowsay".into()]),
+        vec!["exec", "--yes", "--", "cowsay"]
+    );
+    assert_eq!(
+        translate_npx_args(&["--no-yes=false".into(), "cowsay".into()]),
+        vec!["exec", "--yes", "--", "cowsay"]
     );
 
     // 4. -p / --package
@@ -399,4 +435,73 @@ fn test_rnpm_argv0_dispatch_as_npx() {
     assert!(stdout.contains("mytool_CALLED"));
     assert!(stdout.contains("--help"));
     assert!(stdout.contains("custom_val"));
+}
+
+#[test]
+fn test_compiled_npx_yes_false_rejects_without_installing() {
+    let npx_bin = env!("CARGO_BIN_EXE_npx");
+    let temp = tempdir().unwrap();
+    let temp_path = temp.path();
+    let cache_dir = temp_path.join("cache");
+    fs::create_dir_all(&cache_dir).unwrap();
+
+    // Run npx --yes=false nonexistent-pkg
+    let output = Command::new(npx_bin)
+        .current_dir(temp_path)
+        .args([
+            &format!("--cache={}", cache_dir.display()),
+            "--yes=false",
+            "nonexistent-pkg-w3-2-random-xyz-12345",
+        ])
+        .output()
+        .expect("failed to execute npx --yes=false");
+
+    assert!(!output.status.success());
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("npx canceled due to missing packages and no YES option"),
+        "stderr was: {stderr}"
+    );
+
+    // Verify no _npx package directory was created in cache
+    let npx_cache = cache_dir.join("_npx");
+    assert!(
+        !npx_cache.exists() || fs::read_dir(&npx_cache).unwrap().count() == 0,
+        "No npx cache mutations should occur on cancel"
+    );
+}
+
+#[test]
+fn test_compiled_npx_yes_0_rejects_without_installing() {
+    let npx_bin = env!("CARGO_BIN_EXE_npx");
+    let temp = tempdir().unwrap();
+    let temp_path = temp.path();
+    let cache_dir = temp_path.join("cache");
+    fs::create_dir_all(&cache_dir).unwrap();
+
+    // Run npx --yes=0 nonexistent-pkg
+    let output = Command::new(npx_bin)
+        .current_dir(temp_path)
+        .args([
+            &format!("--cache={}", cache_dir.display()),
+            "--yes=0",
+            "nonexistent-pkg-w3-2-random-xyz-67890",
+        ])
+        .output()
+        .expect("failed to execute npx --yes=0");
+
+    assert!(!output.status.success());
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("npx canceled due to missing packages and no YES option"),
+        "stderr was: {stderr}"
+    );
+
+    let npx_cache = cache_dir.join("_npx");
+    assert!(
+        !npx_cache.exists() || fs::read_dir(&npx_cache).unwrap().count() == 0,
+        "No npx cache mutations should occur on cancel"
+    );
 }

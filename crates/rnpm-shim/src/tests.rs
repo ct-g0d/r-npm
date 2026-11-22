@@ -22,6 +22,14 @@ fn test_generate_shims_content() {
 fn test_create_shims_on_disk() {
     let dir = tempdir().unwrap();
     let bin_dir = dir.path().join("node_modules").join(".bin");
+    let target_file = dir
+        .path()
+        .join("node_modules")
+        .join("typescript")
+        .join("bin")
+        .join("tsc.js");
+    fs::create_dir_all(target_file.parent().unwrap()).unwrap();
+    fs::write(&target_file, b"#!/usr/bin/env node\nconsole.log('tsc');\n").unwrap();
     create_shims(&bin_dir, "tsc", "typescript/bin/tsc.js").unwrap();
 
     #[cfg(not(unix))]
@@ -929,6 +937,70 @@ fn test_unix_symlink_creation_and_chmod() {
     );
     assert!(!bin_dir.join("my-tool.cmd").exists());
     assert!(!bin_dir.join("my-tool.ps1").exists());
+}
+
+#[test]
+#[cfg(unix)]
+fn test_unix_missing_bin_target_skipped_gracefully() {
+    let dir = tempdir().unwrap();
+    let bin_dir = dir.path().join("node_modules").join(".bin");
+    // Target does not exist
+    create_shims(&bin_dir, "missing-bin", "nonexistent-pkg/bin/script.js").unwrap();
+    assert!(!bin_dir.join("missing-bin").exists());
+}
+
+#[test]
+#[cfg(unix)]
+fn test_unix_refuse_clobber_colliding_directory() {
+    let dir = tempdir().unwrap();
+    let bin_dir = dir.path().join("node_modules").join(".bin");
+    let pkg_dir = dir.path().join("node_modules").join("my-pkg").join("bin");
+    fs::create_dir_all(&pkg_dir).unwrap();
+    let script = pkg_dir.join("cli.js");
+    fs::write(&script, b"#!/usr/bin/env node\n").unwrap();
+
+    // Create a directory where the bin link would go
+    let colliding_dir = bin_dir.join("colliding-bin");
+    fs::create_dir_all(&colliding_dir).unwrap();
+    let important_file = colliding_dir.join("important.txt");
+    fs::write(&important_file, b"cannot be nuked").unwrap();
+
+    // Attempting to create a bin link must fail and NOT remove the directory!
+    let res = create_shims(&bin_dir, "colliding-bin", "my-pkg/bin/cli.js");
+    assert!(res.is_err());
+    assert!(important_file.exists());
+    assert!(colliding_dir.is_dir());
+}
+
+#[test]
+#[cfg(unix)]
+fn test_unix_crlf_shebang_normalized_and_chmod_before_linking() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempdir().unwrap();
+    let bin_dir = dir.path().join("node_modules").join(".bin");
+    let pkg_dir = dir.path().join("node_modules").join("crlf-pkg").join("bin");
+    fs::create_dir_all(&pkg_dir).unwrap();
+
+    let script = pkg_dir.join("cli.js");
+    fs::write(&script, b"#!/usr/bin/env node\r\nconsole.log('hi');\r\n").unwrap();
+    let mut initial_perms = fs::metadata(&script).unwrap().permissions();
+    initial_perms.set_mode(0o644);
+    fs::set_permissions(&script, initial_perms).unwrap();
+
+    create_shims(&bin_dir, "crlf-bin", "crlf-pkg/bin/cli.js").unwrap();
+
+    // Target script must have normalized shebang (LF only)
+    let content = fs::read(&script).unwrap();
+    assert!(content.starts_with(b"#!/usr/bin/env node\n"));
+
+    // Target script permissions must be 0o755
+    let perms = fs::metadata(&script).unwrap().permissions();
+    assert_eq!(perms.mode() & 0o777, 0o755);
+
+    // Bin symlink must exist
+    let link = bin_dir.join("crlf-bin");
+    assert!(link.is_symlink());
 }
 
 #[test]

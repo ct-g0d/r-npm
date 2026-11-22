@@ -89,17 +89,33 @@ pub fn translate_npx_args(tokens: &[String]) -> Vec<String> {
             match key {
                 // Shorthands & aliases
                 "y" | "yes" => {
-                    result.push("--yes".to_string());
+                    if let Some(val) = inline_val {
+                        if val == "false" || val == "0" || val == "no" || val == "off" {
+                            result.push("--no-yes".to_string());
+                        } else {
+                            result.push("--yes".to_string());
+                        }
+                    } else {
+                        result.push("--yes".to_string());
+                    }
                     i += 1;
                     continue;
                 }
                 "no" | "no-yes" => {
-                    result.push("--no-yes".to_string());
+                    if let Some(val) = inline_val {
+                        if val == "false" || val == "0" || val == "no" || val == "off" {
+                            result.push("--yes".to_string());
+                        } else {
+                            result.push("--no-yes".to_string());
+                        }
+                    } else {
+                        result.push("--no-yes".to_string());
+                    }
                     i += 1;
                     continue;
                 }
                 "no-install" => {
-                    result.push("--yes=false".to_string());
+                    result.push("--no-yes".to_string());
                     i += 1;
                     continue;
                 }
@@ -414,7 +430,7 @@ mod tests {
         let input: Vec<String> = vec!["--no-install".into(), "cowsay".into()];
         assert_eq!(
             translate_npx_args(&input),
-            vec!["exec", "--yes=false", "--", "cowsay"]
+            vec!["exec", "--no-yes", "--", "cowsay"]
         );
 
         // --no and --no-yes
@@ -425,6 +441,44 @@ mod tests {
         assert_eq!(
             translate_npx_args(&["--no-yes".into(), "cowsay".into()]),
             vec!["exec", "--no-yes", "--", "cowsay"]
+        );
+
+        // --yes=false / --yes=0 / -y=false / -y=0 / --yes=true / --yes=1 / -y=true / -y=1
+        assert_eq!(
+            translate_npx_args(&["--yes=false".into(), "nonexistent-pkg".into()]),
+            vec!["exec", "--no-yes", "--", "nonexistent-pkg"]
+        );
+        assert_eq!(
+            translate_npx_args(&["--yes=0".into(), "nonexistent-pkg".into()]),
+            vec!["exec", "--no-yes", "--", "nonexistent-pkg"]
+        );
+        assert_eq!(
+            translate_npx_args(&["-y=false".into(), "nonexistent-pkg".into()]),
+            vec!["exec", "--no-yes", "--", "nonexistent-pkg"]
+        );
+        assert_eq!(
+            translate_npx_args(&["-y=0".into(), "nonexistent-pkg".into()]),
+            vec!["exec", "--no-yes", "--", "nonexistent-pkg"]
+        );
+        assert_eq!(
+            translate_npx_args(&["--yes=true".into(), "cowsay".into()]),
+            vec!["exec", "--yes", "--", "cowsay"]
+        );
+        assert_eq!(
+            translate_npx_args(&["--yes=1".into(), "cowsay".into()]),
+            vec!["exec", "--yes", "--", "cowsay"]
+        );
+        assert_eq!(
+            translate_npx_args(&["-y=true".into(), "cowsay".into()]),
+            vec!["exec", "--yes", "--", "cowsay"]
+        );
+        assert_eq!(
+            translate_npx_args(&["-y=1".into(), "cowsay".into()]),
+            vec!["exec", "--yes", "--", "cowsay"]
+        );
+        assert_eq!(
+            translate_npx_args(&["--no-yes=false".into(), "cowsay".into()]),
+            vec!["exec", "--yes", "--", "cowsay"]
         );
 
         // -p / --package

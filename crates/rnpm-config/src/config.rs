@@ -857,6 +857,13 @@ pub fn get_default_user_npmrc() -> PathBuf {
     if let Some(userconfig) = get_process_userconfig() {
         return userconfig;
     }
+    if let Some(overrides) = get_process_cli_overrides() {
+        if let Some(val) = overrides.get("userconfig").or_else(|| overrides.get("user-config")) {
+            if val != "false" && !val.is_empty() {
+                return PathBuf::from(val);
+            }
+        }
+    }
     if let Some(user) = find_user_npmrc() {
         return user;
     }

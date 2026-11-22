@@ -402,20 +402,41 @@ pub fn create_shims(
         .with_context(|| format!("Failed to create bin dir {}", bin_dir.display()))?;
 
     let rel_target = compute_symlink_target(bin_dir, target_rel_from_node_modules);
+    let target_script = bin_dir.join(&rel_target);
+
+    // Skip missing bin script targets gracefully (matching npm bin-links)
+    if !target_script.exists() {
+        return Ok(());
+    }
+
+    // Normalize CRLF in shebang lines and ensure executable mode 0o755 before linking
+    let _ = normalize_shebang(&target_script);
+    use std::os::unix::fs::PermissionsExt;
+    if let Ok(meta) = fs::metadata(&target_script) {
+        let mut perms = meta.permissions();
+        perms.set_mode(0o755);
+        let _ = fs::set_permissions(&target_script, perms);
+    }
+
     let link_path = bin_dir.join(bin_name);
 
-    // Remove any stale existing file/symlink/directory first
+    // Follow npm's bin-links ownership & force rules:
+    // Refuse to clobber unrelated directories (NEVER call remove_dir_all on a directory!)
     if let Ok(meta) = fs::symlink_metadata(&link_path) {
-        let res = if meta.is_dir() {
-            fs::remove_dir_all(&link_path)
+        if meta.is_dir() {
+            anyhow::bail!(
+                "EEXIST: refusing to overwrite existing directory {} with bin link {}",
+                link_path.display(),
+                bin_name
+            );
         } else {
-            fs::remove_file(&link_path)
-        };
-        if let Err(e) = res {
-            if e.kind() != std::io::ErrorKind::NotFound {
-                return Err(e).with_context(|| {
-                    format!("Failed to remove stale bin link at {}", link_path.display())
-                });
+            let res = fs::remove_file(&link_path);
+            if let Err(e) = res {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    return Err(e).with_context(|| {
+                        format!("Failed to remove stale bin link at {}", link_path.display())
+                    });
+                }
             }
         }
     }
@@ -431,15 +452,6 @@ pub fn create_shims(
             rel_target
         )
     })?;
-
-    // chmod 0755 the target script (if it exists)
-    let target_script = bin_dir.join(&rel_target);
-    if let Ok(meta) = fs::metadata(&target_script) {
-        use std::os::unix::fs::PermissionsExt;
-        let mut perms = meta.permissions();
-        perms.set_mode(0o755);
-        let _ = fs::set_permissions(&target_script, perms);
-    }
 
     Ok(())
 }

@@ -242,11 +242,10 @@ fn resolve_target_npmrc_with_location(
         (path, "global")
     } else if location == Some("project") {
         (current_dir.join(".npmrc"), "project")
-    } else if location == Some("user") {
-        (rnpm_config::get_default_user_npmrc(), "user")
-    } else if current_dir.join(".npmrc").exists() {
-        (current_dir.join(".npmrc"), "project")
     } else {
+        // In npm 11.20.0, bare `config edit` (and location=user) defaults to user config
+        // (~/.npmrc or explicit --userconfig / npm_config_userconfig)
+        // unless --location=project or --location=global is explicitly passed!
         (rnpm_config::get_default_user_npmrc(), "user")
     }
 }

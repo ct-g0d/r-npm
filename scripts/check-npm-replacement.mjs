@@ -6,19 +6,74 @@ import http from 'node:http';
 import { gunzipSync } from 'node:zlib';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { createHash, createSign, generateKeyPairSync } from 'node:crypto';
-import { execFileSync, spawn } from 'node:child_process';
+import { execFileSync, execSync, spawn } from 'node:child_process';
 const repo = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const cli = process.argv.slice(2);
 const option = (name, fallback) => cli.includes(name) ? cli[cli.indexOf(name) + 1] : fallback;
 const caseFilters = cli.flatMap((arg, index) => arg === '--case' ? [cli[index + 1]] : []);
 const matchesCase = name => !caseFilters.length || caseFilters.some(filter => name.includes(filter));
-const binary = path.resolve(option('--binary', path.join(repo, 'target/release', process.platform === 'win32' ? 'rnpm.exe' : 'rnpm')));
+const defaultTargetDir = process.env.CARGO_TARGET_DIR && fs.existsSync(path.join(process.env.CARGO_TARGET_DIR, 'release', process.platform === 'win32' ? 'rnpm.exe' : 'rnpm'))
+  ? process.env.CARGO_TARGET_DIR
+  : path.join(repo, 'target');
+const defaultBinary = path.join(defaultTargetDir, 'release', process.platform === 'win32' ? 'rnpm.exe' : 'rnpm');
+const binary = path.resolve(option('--binary', defaultBinary));
 const output = path.resolve(option('--output', path.join(repo, 'target/npm-replacement-smoke.json')));
 // Long real path: npm compares realpaths, so an 8.3 short temp path would
 // make npm's own path-keyed policies miss.
 const root = fs.mkdtempSync(path.join(fs.realpathSync.native(os.tmpdir()), 'rnpm-replacement-'));
 console.log(`Fixtures and raw logs: ${root}`);
-const npmCli = path.join(path.dirname(process.execPath), 'node_modules/npm/bin/npm-cli.js');
+
+function resolveNpmCli() {
+  const cliOption = option('--npm-cli', null);
+  const candidates = [];
+  if (cliOption) {
+    candidates.push(path.resolve(cliOption));
+  }
+  try {
+    const globalRoot = execSync('npm root -g', { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], windowsHide: true }).trim();
+    if (globalRoot) {
+      candidates.push(path.join(globalRoot, 'npm/bin/npm-cli.js'));
+    }
+  } catch {
+    // fallback if npm command fails
+  }
+  const nodeDir = path.dirname(process.execPath);
+  candidates.push(path.resolve(nodeDir, '../lib/node_modules/npm/bin/npm-cli.js'));
+  candidates.push(path.resolve(nodeDir, 'node_modules/npm/bin/npm-cli.js'));
+
+  let foundCandidate = null;
+  let foundVersion = null;
+  let foundPkgPath = null;
+
+  for (const candidate of candidates) {
+    if (fs.existsSync(candidate)) {
+      const pkgPath = path.resolve(path.dirname(candidate), '../package.json');
+      if (fs.existsSync(pkgPath)) {
+        try {
+          const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8'));
+          if (pkg.version === '11.20.0') {
+            console.log(`Resolved npm: ${candidate} (v${pkg.version})`);
+            return candidate;
+          }
+          if (!foundCandidate) {
+            foundCandidate = candidate;
+            foundVersion = pkg.version;
+            foundPkgPath = pkgPath;
+          }
+        } catch {
+          // ignore parse error
+        }
+      }
+    }
+  }
+
+  if (foundCandidate) {
+    throw new Error(`Expected resolved npm version 11.20.0, found ${foundVersion} at ${foundPkgPath}`);
+  }
+  throw new Error(`Cannot locate npm-cli.js in candidates: ${candidates.join(', ')}`);
+}
+
+const npmCli = resolveNpmCli();
 const baseEnv = Object.fromEntries(Object.entries(process.env).filter(([k]) => !/^(npm_config_|rnpm_|npm_token$|node_auth_token$|https?_proxy$|all_proxy$)/i.test(k)));
 const write = (dir, name, value) => { const p=path.join(dir,name); fs.mkdirSync(path.dirname(p),{recursive:true}); fs.writeFileSync(p,typeof value==='string'||Buffer.isBuffer(value)?value:JSON.stringify(value,null,2)+'\n'); };
 const manifest = (dir, fields={}) => write(dir,'package.json',{name:'readiness-case',version:'1.0.0',...fields});
