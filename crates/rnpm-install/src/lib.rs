@@ -2714,6 +2714,9 @@ impl Installer {
                 for (name, spec) in map {
                     if policy::parse_source_kind(spec) == policy::SourceKind::Registry {
                         declared.insert(name.clone());
+                        if let Ok(dep_spec) = rnpm_solver::DependencySpec::parse(name, spec) {
+                            declared.insert(dep_spec.package_name);
+                        }
                     }
                 }
             }
@@ -2726,10 +2729,16 @@ impl Installer {
             if let Ok(s) = rnpm_core::spec::PackageSpec::parse(pkg_str) {
                 let is_registry = match &s.target {
                     PackageTarget::Tag(_) | PackageTarget::Range(_) | PackageTarget::Version(_) => true,
-                    PackageTarget::Alias { target, .. } => matches!(
-                        target.as_ref(),
-                        PackageTarget::Tag(_) | PackageTarget::Range(_) | PackageTarget::Version(_)
-                    ),
+                    PackageTarget::Alias { name: ref target_name, ref target } => {
+                        let inner_reg = matches!(
+                            target.as_ref(),
+                            PackageTarget::Tag(_) | PackageTarget::Range(_) | PackageTarget::Version(_)
+                        );
+                        if inner_reg {
+                            declared.insert(target_name.clone());
+                        }
+                        inner_reg
+                    }
                     _ => false,
                 };
                 if is_registry {

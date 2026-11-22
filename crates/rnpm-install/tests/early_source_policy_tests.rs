@@ -1167,15 +1167,34 @@ async fn test_allow_registry_root_cross_kind_name_collision_zero_requests() {
 }
 
 // -----------------------------------------------------------------------------
-// Test 16: allow-registry=root: root declares foo: ^1.0.0 (registry) AND local-a: file:./a
-// where local-a depends on foo: ^2.0.0.
-// Under allow-registry=root, even though foo is in root_registry_declared,
-// the transitive edge local-a -> foo@^2.0.0 must be rejected at the solver edge with EALLOWREGISTRY!
+// Test 16: allow-registry=root: root declares reg-parent: ^1.0.0 AND foo: ^1.0.0 (both registry).
+// reg-parent depends on foo: ^2.0.0.
+// Under allow-registry=root, even though foo is declared at root (and cached in metadata_cache),
+// the solver edge for reg-parent -> foo@^2.0.0 passes is_root=false.
+// The solver edge in RegistryPackageProvider must reject with EALLOWREGISTRY, and zero transitive fetches occur.
 // -----------------------------------------------------------------------------
 #[tokio::test]
 async fn test_allow_registry_root_solver_edge_transitive_collision_rejected() {
     let server = CountingServer::start(|path, base_url| {
-        if path == "/foo" {
+        if path == "/reg-parent" {
+            let packument = serde_json::json!({
+                "name": "reg-parent",
+                "dist-tags": { "latest": "1.0.0" },
+                "versions": {
+                    "1.0.0": {
+                        "name": "reg-parent",
+                        "version": "1.0.0",
+                        "dependencies": {
+                            "foo": "^2.0.0"
+                        },
+                        "dist": {
+                            "tarball": format!("{base_url}/reg-parent/-/reg-parent-1.0.0.tgz")
+                        }
+                    }
+                }
+            });
+            Some((200, vec![("Content-Type", "application/json".to_string())], packument.to_string().into_bytes()))
+        } else if path == "/foo" {
             let packument = serde_json::json!({
                 "name": "foo",
                 "dist-tags": { "latest": "2.0.0" },
@@ -1205,29 +1224,16 @@ async fn test_allow_registry_root_solver_edge_transitive_collision_rejected() {
     let project_dir = tempdir().unwrap();
     let cache_dir = tempdir().unwrap();
 
-    // Create local package "local-a" at project_dir/a
-    // local-a has dependency on "foo": "^2.0.0" (registry)
-    let local_a = project_dir.path().join("a");
-    std::fs::create_dir_all(&local_a).unwrap();
-    std::fs::write(
-        local_a.join("package.json"),
-        serde_json::json!({
-            "name": "local-a",
-            "version": "1.0.0",
-            "dependencies": {
-                "foo": "^2.0.0"
-            }
-        }).to_string(),
-    ).unwrap();
-
     // Root declares:
-    // 1. "foo": "^1.0.0" (from registry)
-    // 2. "local-a": "file:./a"
+    // 1. "reg-parent": "^1.0.0" (registry)
+    // 2. "foo": "^1.0.0" (registry)
+    // No custom targets (file: or git:) exist, so populate_custom_target_metadata
+    // does not inspect child manifests. The rejection occurs purely at the solver edge!
     setup_test_project(
         project_dir.path(),
         &serde_json::json!({
-            "foo": "^1.0.0",
-            "local-a": "file:./a"
+            "reg-parent": "^1.0.0",
+            "foo": "^1.0.0"
         }),
         "allow-registry=root\n",
     );
@@ -1242,7 +1248,7 @@ async fn test_allow_registry_root_solver_edge_transitive_collision_rejected() {
     let mut installer = Installer::new(options).unwrap();
     let result = installer.install().await;
 
-    assert!(result.is_err(), "Expected install to fail on transitive registry dep foo@^2.0.0 from local-a");
+    assert!(result.is_err(), "Expected install to fail on transitive registry dep foo@^2.0.0 from reg-parent");
     let err_msg = result.unwrap_err().to_string();
     assert!(
         err_msg.contains("EALLOWREGISTRY"),
@@ -1252,52 +1258,71 @@ async fn test_allow_registry_root_solver_edge_transitive_collision_rejected() {
         err_msg.contains("Fetching non-root packages of type \"registry\" have been disabled"),
         "Error message should match exact non-root text, got: {err_msg}"
     );
+
+    // Exactly 2 root packument requests were made: /reg-parent and /foo.
+    // Zero transitive requests were made.
+    assert_eq!(
+        server.request_count().await,
+        2,
+        "Exactly 2 root HTTP packument requests should have been made (/reg-parent, /foo)"
+    );
 }
 
 // -----------------------------------------------------------------------------
-// Test 17: allow-registry=root: root declares local-a: file:./a where local-a depends
-// on foo: ^2.0.0 (or bar: ^1.0.0). When root does not fetch foo (or root only needed local/cached),
-// ZERO transitive packument fetches occur!
+// Test 17: allow-registry=root: root declares reg-parent: ^1.0.0 which depends on bar: ^1.0.0.
+// Under allow-registry=root, bar is not declared at root.
+// When reg-parent is solved, the solver edge for bar: ^1.0.0 passes is_root=false.
+// The solver edge in RegistryPackageProvider must reject with EALLOWREGISTRY,
+// and ZERO HTTP requests for /bar must ever hit the registry server!
 // -----------------------------------------------------------------------------
 #[tokio::test]
 async fn test_allow_registry_root_solver_edge_transitive_zero_requests() {
-    let server = CountingServer::start(|_path, _base_url| {
-        let packument = serde_json::json!({
-            "name": "foo",
-            "dist-tags": { "latest": "2.0.0" },
-            "versions": {
-                "2.0.0": {
-                    "name": "foo",
-                    "version": "2.0.0",
-                    "dist": {
-                        "tarball": "http://127.0.0.1/foo/-/foo-2.0.0.tgz"
+    let server = CountingServer::start(|path, base_url| {
+        if path == "/reg-parent" {
+            let packument = serde_json::json!({
+                "name": "reg-parent",
+                "dist-tags": { "latest": "1.0.0" },
+                "versions": {
+                    "1.0.0": {
+                        "name": "reg-parent",
+                        "version": "1.0.0",
+                        "dependencies": {
+                            "bar": "^1.0.0"
+                        },
+                        "dist": {
+                            "tarball": format!("{base_url}/reg-parent/-/reg-parent-1.0.0.tgz")
+                        }
                     }
                 }
-            }
-        });
-        Some((200, vec![("Content-Type", "application/json".to_string())], packument.to_string().into_bytes()))
+            });
+            Some((200, vec![("Content-Type", "application/json".to_string())], packument.to_string().into_bytes()))
+        } else if path == "/bar" {
+            let packument = serde_json::json!({
+                "name": "bar",
+                "dist-tags": { "latest": "1.0.0" },
+                "versions": {
+                    "1.0.0": {
+                        "name": "bar",
+                        "version": "1.0.0",
+                        "dist": {
+                            "tarball": format!("{base_url}/bar/-/bar-1.0.0.tgz")
+                        }
+                    }
+                }
+            });
+            Some((200, vec![("Content-Type", "application/json".to_string())], packument.to_string().into_bytes()))
+        } else {
+            None
+        }
     }).await;
 
     let project_dir = tempdir().unwrap();
     let cache_dir = tempdir().unwrap();
 
-    let local_a = project_dir.path().join("a");
-    std::fs::create_dir_all(&local_a).unwrap();
-    std::fs::write(
-        local_a.join("package.json"),
-        serde_json::json!({
-            "name": "local-a",
-            "version": "1.0.0",
-            "dependencies": {
-                "foo": "^2.0.0"
-            }
-        }).to_string(),
-    ).unwrap();
-
     setup_test_project(
         project_dir.path(),
         &serde_json::json!({
-            "local-a": "file:./a"
+            "reg-parent": "^1.0.0"
         }),
         "allow-registry=root\n",
     );
@@ -1312,7 +1337,7 @@ async fn test_allow_registry_root_solver_edge_transitive_zero_requests() {
     let mut installer = Installer::new(options).unwrap();
     let result = installer.install().await;
 
-    assert!(result.is_err(), "Expected install to fail on transitive registry dep foo@^2.0.0");
+    assert!(result.is_err(), "Expected install to fail on transitive registry dep bar@^1.0.0");
     let err_msg = result.unwrap_err().to_string();
     assert!(
         err_msg.contains("EALLOWREGISTRY"),
@@ -1323,10 +1348,74 @@ async fn test_allow_registry_root_solver_edge_transitive_zero_requests() {
         "Error message should match exact non-root text, got: {err_msg}"
     );
 
-    // ZERO HTTP packument requests must have hit the server!
-    assert_eq!(
-        server.request_count().await,
-        0,
-        "ZERO HTTP requests should have been made to the registry server for 'foo'"
+    // 1 request for /reg-parent was made, and ZERO requests for /bar!
+    let reqs = server.requested_paths.lock().await.clone();
+    assert_eq!(reqs.len(), 1, "Only 1 HTTP request should have occurred (/reg-parent)");
+    assert_eq!(reqs[0], "/reg-parent");
+    assert!(
+        !reqs.contains(&"/bar".to_string()),
+        "ZERO HTTP requests should have been made to the registry server for 'bar'"
     );
+}
+
+// -----------------------------------------------------------------------------
+// Test 18: allow-registry=root: root declares npm: alias "my-foo": "npm:foo@^1.0.0".
+// Under allow-registry=root, the underlying package "foo" must be recognized in
+// root_registry_declared so the solver can fetch and install "foo" successfully.
+// -----------------------------------------------------------------------------
+#[tokio::test]
+async fn test_allow_registry_root_npm_alias_succeeds() {
+    let foo_tgz = create_test_tarball(&[("package.json", br#"{"name":"foo","version":"1.0.0"}"#)]);
+    let foo_tgz_bytes = Arc::new(foo_tgz);
+
+    let server = CountingServer::start(move |path, base_url| {
+        if path == "/foo" {
+            let packument = serde_json::json!({
+                "name": "foo",
+                "dist-tags": { "latest": "1.0.0" },
+                "versions": {
+                    "1.0.0": {
+                        "name": "foo",
+                        "version": "1.0.0",
+                        "dist": {
+                            "tarball": format!("{base_url}/foo/-/foo-1.0.0.tgz")
+                        }
+                    }
+                }
+            });
+            Some((200, vec![("Content-Type", "application/json".to_string())], packument.to_string().into_bytes()))
+        } else if path == "/foo/-/foo-1.0.0.tgz" {
+            Some((200, vec![("Content-Type", "application/octet-stream".to_string())], (*foo_tgz_bytes).clone()))
+        } else {
+            None
+        }
+    }).await;
+
+    let project_dir = tempdir().unwrap();
+    let cache_dir = tempdir().unwrap();
+
+    setup_test_project(
+        project_dir.path(),
+        &serde_json::json!({
+            "my-foo": "npm:foo@^1.0.0"
+        }),
+        "allow-registry=root\n",
+    );
+
+    let options = InstallOptions {
+        project_dir: project_dir.path().to_path_buf(),
+        cache_dir: Some(cache_dir.path().to_path_buf()),
+        registry_url: Some(server.url()),
+        ..Default::default()
+    };
+
+    let mut installer = Installer::new(options).unwrap();
+    let result = installer.install().await;
+
+    assert!(result.is_ok(), "Expected install of aliased root registry dep to succeed: {:?}", result.err());
+
+    let installed_pkg_json = project_dir.path().join("node_modules").join("my-foo").join("package.json");
+    assert!(installed_pkg_json.exists(), "node_modules/my-foo/package.json should exist");
+    let content = std::fs::read_to_string(&installed_pkg_json).unwrap();
+    assert!(content.contains("\"name\": \"foo\"") || content.contains("\"name\":\"foo\""), "Content should match foo");
 }
