@@ -14,6 +14,7 @@ pub mod init;
 pub mod inspect_tree;
 pub mod json_errors;
 pub mod list;
+pub(crate) mod npx;
 pub mod outdated;
 pub mod query;
 mod reify_output;
@@ -2641,9 +2642,9 @@ fn preprocess_exec_args(
             i += 1;
             continue;
         }
-        if token == "--no-yes" {
+        if token == "--no" || token == "--no-yes" || token == "--no-install" || token == "--yes=false" {
             clap_flags.retain(|f| f != "--yes" && f != "-y");
-            clap_flags.push(token.clone());
+            clap_flags.push("--no-yes".into());
             overrides.insert("yes".into(), "false".into());
             i += 1;
             continue;
@@ -7896,7 +7897,21 @@ fn main() {
             .try_init();
     }
 
-    let (filtered_args, _scoped_registries) = extract_scoped_registries(std::env::args_os());
+    let raw_args_vec: Vec<String> = std::env::args().collect();
+    let is_npx = raw_args_vec
+        .first()
+        .map(|a| npx::is_npx_argv0(a))
+        .unwrap_or(false);
+
+    let effective_args: Vec<String> = if is_npx {
+        let mut new_args = vec![raw_args_vec[0].clone()];
+        new_args.extend(npx::translate_npx_args(&raw_args_vec[1..]));
+        new_args
+    } else {
+        raw_args_vec
+    };
+
+    let (filtered_args, _scoped_registries) = extract_scoped_registries(effective_args);
     let warn_workspaces = filtered_args
         .iter()
         .take_while(|a| a.as_str() != "--")

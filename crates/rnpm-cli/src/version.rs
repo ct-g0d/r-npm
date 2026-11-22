@@ -1,5 +1,5 @@
 /// npm release whose behavior rnpm emulates.
-pub(crate) const NPM_VERSION: &str = "11.20.0";
+pub const NPM_VERSION: &str = "11.20.0";
 
 use anyhow::{Context, Result};
 use rnpm_core::semver::Version;

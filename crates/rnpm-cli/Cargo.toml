@@ -6,9 +6,17 @@ rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
 
+[lib]
+name = "rnpm_cli"
+path = "src/lib.rs"
+
 [[bin]]
 name = "rnpm"
 path = "src/main.rs"
+
+[[bin]]
+name = "npx"
+path = "src/bin/npx.rs"
 
 [dependencies]
 rnpm-core = { workspace = true }
