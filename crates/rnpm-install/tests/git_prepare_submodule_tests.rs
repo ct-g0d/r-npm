@@ -1313,3 +1313,78 @@ fs.writeFileSync('dist/built.js', 'module.exports = 777;\n');
     let built_file = installed_pkg.join("dist").join("built.js");
     assert!(built_file.exists());
 }
+
+/// Test H (Finding #8 P1 regression): An attacker commits a hostile `.npmrc` setting
+/// `script-shell=/nonexistent/evil-shell-should-never-run` and `ignore-scripts=false` inside a Git repo.
+/// Materializing/installing the Git dependency must ignore the untrusted repo's `.npmrc`, run the `prepare`
+/// script cleanly using the trusted outer config (never invoking `/nonexistent/evil-shell-should-never-run`),
+/// and generate the marker file.
+#[tokio::test]
+async fn test_git_prepare_hostile_npmrc_script_shell_ignored_adversarial() {
+    let tmp = tempdir().unwrap();
+    let repo_dir = tmp.path().join("git-repo-with-hostile-script-shell");
+    std::fs::create_dir_all(&repo_dir).unwrap();
+    run_git(&repo_dir, &["init"]);
+    run_git(&repo_dir, &["config", "user.name", "Tester"]);
+    run_git(&repo_dir, &["config", "user.email", "tester@example.com"]);
+
+    let git_pkg_json = serde_json::json!({
+        "name": "pkg-hostile-script-shell",
+        "version": "1.0.0",
+        "scripts": {
+            "prepare": "node -e \"const fs = require('fs'); fs.mkdirSync('dist', {recursive: true}); fs.writeFileSync('dist/marker.txt', 'prepared-ok');\""
+        },
+        "files": ["dist"]
+    });
+    std::fs::write(repo_dir.join("package.json"), git_pkg_json.to_string()).unwrap();
+
+    // Repo commits hostile .npmrc attempting to hijack shell execution with a nonexistent/evil shell path
+    let hostile_npmrc = "script-shell=/nonexistent/evil-shell-should-never-run\nignore-scripts=false\n";
+    std::fs::write(repo_dir.join(".npmrc"), hostile_npmrc).unwrap();
+
+    run_git(&repo_dir, &["add", "."]);
+    run_git(&repo_dir, &["commit", "-m", "repo with hostile script-shell .npmrc"]);
+
+    let git_url = format!(
+        "git+file://{}",
+        repo_dir.to_string_lossy().replace('\\', "/")
+    );
+
+    let proj_dir = tmp.path().join("consumer-hostile-shell");
+    let cache_dir = tmp.path().join("cache-hostile-shell");
+    std::fs::create_dir_all(&proj_dir).unwrap();
+    std::fs::create_dir_all(&cache_dir).unwrap();
+
+    let consumer_json = serde_json::json!({
+        "name": "consumer-hostile-shell",
+        "version": "1.0.0",
+        "dependencies": {
+            "pkg-hostile-script-shell": git_url
+        }
+    });
+    std::fs::write(proj_dir.join("package.json"), consumer_json.to_string()).unwrap();
+
+    let mut installer = Installer::new(InstallOptions {
+        project_dir: proj_dir.clone(),
+        cache_dir: Some(cache_dir),
+        ..Default::default()
+    })
+    .unwrap();
+
+    let summary = installer
+        .install()
+        .await
+        .expect("Install should succeed using trusted outer config, ignoring hostile .npmrc script-shell");
+    assert_eq!(summary.packages_installed, 1);
+
+    let installed_pkg = proj_dir.join("node_modules").join("pkg-hostile-script-shell");
+    let marker_file = installed_pkg.join("dist").join("marker.txt");
+    assert!(
+        marker_file.exists(),
+        "Expected prepare script to successfully generate dist/marker.txt using trusted outer config"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&marker_file).unwrap().trim(),
+        "prepared-ok"
+    );
+}

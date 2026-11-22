@@ -997,6 +997,11 @@ pub async fn materialize_git_dependency_with_options(
 
         copy_dir_all_raw_pack(src, staging_dir.path())?;
 
+        let trusted_config = options
+            .config_override
+            .clone()
+            .unwrap_or_else(|| rnpm_config::Config::load(None).unwrap_or_default());
+
         let new_no_prepare = if no_prepare_env.is_empty() {
             src_key.clone()
         } else {
@@ -1048,7 +1053,7 @@ pub async fn materialize_git_dependency_with_options(
                 force_non_root_policy: true,
                 before_cutoff: options.before_cutoff,
                 min_release_age_exclude: options.min_release_age_exclude.clone(),
-                config_override: options.config_override.clone(),
+                config_override: Some(trusted_config.clone()),
                 ..Default::default()
             };
 
@@ -1088,12 +1093,13 @@ pub async fn materialize_git_dependency_with_options(
             };
 
             if let Some(cmd) = current_manifest.scripts.get(hook) {
-                let mut ctx = rnpm_lifecycle::LifecycleContext::new(
+                let mut ctx = rnpm_lifecycle::LifecycleContext::new_with_config(
                     staging_dir.path(),
                     staging_dir.path(),
                     current_manifest.name.as_deref().unwrap_or("git-pkg"),
                     hook,
                     cmd,
+                    trusted_config.clone(),
                 );
                 ctx.package_version = current_manifest.version.clone();
                 ctx.foreground_scripts = options.foreground_scripts;
@@ -1135,12 +1141,13 @@ pub async fn materialize_git_dependency_with_options(
 
         // 5. Run postpack (if present) AFTER collection/packing
         if let Some(cmd) = effective_manifest.scripts.get("postpack") {
-            let mut ctx = rnpm_lifecycle::LifecycleContext::new(
+            let mut ctx = rnpm_lifecycle::LifecycleContext::new_with_config(
                 staging_dir.path(),
                 staging_dir.path(),
                 effective_manifest.name.as_deref().unwrap_or("git-pkg"),
                 "postpack",
                 cmd,
+                trusted_config.clone(),
             );
             ctx.package_version = effective_manifest.version.clone();
             ctx.foreground_scripts = options.foreground_scripts;

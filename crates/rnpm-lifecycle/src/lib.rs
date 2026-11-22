@@ -333,6 +333,33 @@ impl Default for LifecycleOptions {
     }
 }
 
+tokio::task_local! {
+    static SCOPED_TRUSTED_CONFIG: Option<rnpm_config::Config>;
+}
+
+static GLOBAL_TRUSTED_CONFIG: std::sync::RwLock<Option<rnpm_config::Config>> = std::sync::RwLock::new(None);
+
+pub fn set_trusted_config(config: Option<rnpm_config::Config>) {
+    if let Ok(mut lock) = GLOBAL_TRUSTED_CONFIG.write() {
+        *lock = config;
+    }
+}
+
+pub fn get_trusted_config() -> Option<rnpm_config::Config> {
+    SCOPED_TRUSTED_CONFIG
+        .try_with(|c| c.clone())
+        .ok()
+        .flatten()
+        .or_else(|| GLOBAL_TRUSTED_CONFIG.read().ok().and_then(|lock| lock.clone()))
+}
+
+pub async fn with_trusted_config<F, R>(config: Option<rnpm_config::Config>, f: F) -> R
+where
+    F: std::future::Future<Output = R>,
+{
+    SCOPED_TRUSTED_CONFIG.scope(config, f).await
+}
+
 impl LifecycleOptions {
     pub fn new(root_dir: impl Into<PathBuf>) -> Self {
         let root = root_dir.into();
@@ -341,9 +368,13 @@ impl LifecycleOptions {
             .ok()
             .map(PathBuf::from)
             .or_else(|| {
-                rnpm_config::Config::load(Some(&root))
-                    .ok()
-                    .and_then(|c| c.get("node-gyp").map(PathBuf::from))
+                if let Some(cfg) = get_trusted_config() {
+                    cfg.get("node-gyp").map(PathBuf::from)
+                } else {
+                    rnpm_config::Config::load(Some(&root))
+                        .ok()
+                        .and_then(|c| c.get("node-gyp").map(PathBuf::from))
+                }
             });
         Self {
             init_cwd: root.clone(),
@@ -430,6 +461,7 @@ pub struct LifecycleContext {
     pub script_shell: Option<String>,
     pub node_gyp: Option<PathBuf>,
     pub offline: bool,
+    pub config: Option<rnpm_config::Config>,
 }
 
 impl LifecycleContext {
@@ -442,6 +474,20 @@ impl LifecycleContext {
     ) -> Self {
         let project_root = project_root.into();
         let package_dir = package_dir.into();
+        let package_name = package_name.into();
+        let event = event.into();
+        let script_cmd = script_cmd.into();
+
+        if let Some(trusted) = get_trusted_config() {
+            return Self::new_with_config(
+                project_root,
+                package_dir,
+                package_name,
+                event,
+                script_cmd,
+                trusted,
+            );
+        }
 
         let script_shell = rnpm_config::Config::load(Some(&package_dir))
             .ok()
@@ -470,10 +516,10 @@ impl LifecycleContext {
         Self {
             project_root,
             package_dir,
-            package_name: package_name.into(),
+            package_name,
             package_version: None,
-            event: event.into(),
-            script_cmd: script_cmd.into(),
+            event,
+            script_cmd,
             node_execpath: None,
             npm_execpath: None,
             extra_env: HashMap::new(),
@@ -485,7 +531,86 @@ impl LifecycleContext {
             script_shell,
             node_gyp,
             offline: false,
+            config: None,
         }
+    }
+
+    pub fn new_with_config(
+        project_root: impl Into<PathBuf>,
+        package_dir: impl Into<PathBuf>,
+        package_name: impl Into<String>,
+        event: impl Into<String>,
+        script_cmd: impl Into<String>,
+        config: rnpm_config::Config,
+    ) -> Self {
+        let project_root = project_root.into();
+        let package_dir = package_dir.into();
+        let package_name = package_name.into();
+        let event = event.into();
+        let script_cmd = script_cmd.into();
+
+        let script_shell = config
+            .get("script-shell")
+            .map(str::to_string)
+            .filter(|s| {
+                let trimmed = s.trim().trim_matches('"');
+                !trimmed.is_empty() && trimmed != "null" && s != "null"
+            });
+
+        let node_gyp = std::env::var("npm_config_node_gyp")
+            .or_else(|_| std::env::var("NPM_CONFIG_NODE_GYP"))
+            .ok()
+            .map(PathBuf::from)
+            .or_else(|| config.get("node-gyp").map(PathBuf::from));
+
+        Self {
+            project_root,
+            package_dir,
+            package_name,
+            package_version: None,
+            event,
+            script_cmd,
+            node_execpath: None,
+            npm_execpath: None,
+            extra_env: HashMap::new(),
+            timeout: None,
+            capture_output: false,
+            foreground_scripts: false,
+            captured_output: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            sandbox_policy: ScriptSandboxPolicy::default(),
+            script_shell,
+            node_gyp,
+            offline: false,
+            config: Some(config),
+        }
+    }
+
+    pub fn from_config(
+        project_root: impl Into<PathBuf>,
+        package_dir: impl Into<PathBuf>,
+        package_name: impl Into<String>,
+        event: impl Into<String>,
+        script_cmd: impl Into<String>,
+        config: rnpm_config::Config,
+    ) -> Self {
+        Self::new_with_config(project_root, package_dir, package_name, event, script_cmd, config)
+    }
+
+    pub fn with_config(mut self, config: rnpm_config::Config) -> Self {
+        if self.script_shell.is_none() {
+            self.script_shell = config
+                .get("script-shell")
+                .map(str::to_string)
+                .filter(|s| {
+                    let trimmed = s.trim().trim_matches('"');
+                    !trimmed.is_empty() && trimmed != "null" && s != "null"
+                });
+        }
+        if self.node_gyp.is_none() {
+            self.node_gyp = config.get("node-gyp").map(PathBuf::from);
+        }
+        self.config = Some(config);
+        self
     }
 
     pub fn with_script_shell(mut self, script_shell: impl Into<String>) -> Self {
@@ -941,9 +1066,15 @@ pub fn node_entrypoint() -> Option<PathBuf> {
 
 /// Config npm exports to scripts (@npmcli/config set-envs): non-default
 /// settings, plus prefixes, cache, userconfig, node-gyp and npm version.
-fn npm_config_env(project_root: &Path) -> Vec<(String, String)> {
+fn npm_config_env(project_root: &Path, trusted_config: Option<&rnpm_config::Config>) -> Vec<(String, String)> {
     let mut out = Vec::new();
-    let config = rnpm_config::Config::load(Some(project_root)).unwrap_or_default();
+    let loaded_config;
+    let config = if let Some(cfg) = trusted_config {
+        cfg
+    } else {
+        loaded_config = rnpm_config::Config::load(Some(project_root)).unwrap_or_default();
+        &loaded_config
+    };
     for (key, value) in &config.npmrc.settings {
         if key.starts_with(['/', '@', '_']) || key.contains(":_") || key.contains("//") {
             continue;
@@ -987,7 +1118,7 @@ fn npm_config_env(project_root: &Path) -> Vec<(String, String)> {
             user.to_string_lossy().to_string(),
         ));
     }
-    if let Some(gyp) = find_node_gyp(project_root, project_root, &config, None) {
+    if let Some(gyp) = find_node_gyp(project_root, project_root, config, None) {
         out.push((
             "npm_config_node_gyp".into(),
             gyp.to_string_lossy().to_string(),
@@ -1023,7 +1154,7 @@ pub fn build_lifecycle_env(ctx: &LifecycleContext) -> HashMap<String, String> {
     } else {
         env.insert("npm_config_user_agent".to_string(), npm_user_agent());
     }
-    for (key, value) in npm_config_env(&ctx.project_root) {
+    for (key, value) in npm_config_env(&ctx.project_root, ctx.config.as_ref()) {
         env.entry(key).or_insert(value);
     }
 
@@ -1168,19 +1299,23 @@ pub fn build_lifecycle_env(ctx: &LifecycleContext) -> HashMap<String, String> {
     );
 
     // Honor config node-options: inject or append into NODE_OPTIONS
-    let node_opts = rnpm_config::Config::load(Some(&ctx.package_dir))
-        .ok()
-        .and_then(|c| c.get("node-options").map(str::to_string))
-        .or_else(|| {
-            rnpm_config::Config::load(Some(&ctx.project_root))
-                .ok()
-                .and_then(|c| c.get("node-options").map(str::to_string))
-        })
-        .or_else(|| env.get("npm_config_node_options").cloned())
-        .filter(|s| {
-            let trimmed = s.trim().trim_matches('"');
-            !trimmed.is_empty() && trimmed != "null" && s != "null"
-        });
+    let node_opts = if let Some(ref config) = ctx.config {
+        config.get("node-options").map(str::to_string)
+    } else {
+        rnpm_config::Config::load(Some(&ctx.package_dir))
+            .ok()
+            .and_then(|c| c.get("node-options").map(str::to_string))
+            .or_else(|| {
+                rnpm_config::Config::load(Some(&ctx.project_root))
+                    .ok()
+                    .and_then(|c| c.get("node-options").map(str::to_string))
+            })
+    }
+    .or_else(|| env.get("npm_config_node_options").cloned())
+    .filter(|s| {
+        let trimmed = s.trim().trim_matches('"');
+        !trimmed.is_empty() && trimmed != "null" && s != "null"
+    });
 
     if let Some(opts) = node_opts {
         if let Some(existing) = env.get_mut("NODE_OPTIONS") {
@@ -1231,9 +1366,13 @@ pub fn build_lifecycle_env(ctx: &LifecycleContext) -> HashMap<String, String> {
         }
 
         if !omit_dev_active {
-            if let Ok(config) = rnpm_config::Config::load(Some(&ctx.package_dir))
-                .or_else(|_| rnpm_config::Config::load(Some(&ctx.project_root)))
-            {
+            let config_res = if let Some(ref config) = ctx.config {
+                Ok(config.clone())
+            } else {
+                rnpm_config::Config::load(Some(&ctx.package_dir))
+                    .or_else(|_| rnpm_config::Config::load(Some(&ctx.project_root)))
+            };
+            if let Ok(config) = config_res {
                 if let Some(val) = config.get("omit") {
                     if is_omit_dev(val) {
                         omit_dev_active = true;
@@ -1281,9 +1420,13 @@ pub fn build_lifecycle_env(ctx: &LifecycleContext) -> HashMap<String, String> {
             }
         }
         if !include_dev {
-            if let Ok(config) = rnpm_config::Config::load(Some(&ctx.package_dir))
-                .or_else(|_| rnpm_config::Config::load(Some(&ctx.project_root)))
-            {
+            let config_res = if let Some(ref config) = ctx.config {
+                Ok(config.clone())
+            } else {
+                rnpm_config::Config::load(Some(&ctx.package_dir))
+                    .or_else(|_| rnpm_config::Config::load(Some(&ctx.project_root)))
+            };
+            if let Ok(config) = config_res {
                 if let Some(val) = config.get("include") {
                     if has_include_dev(val) {
                         include_dev = true;
@@ -1354,7 +1497,12 @@ fn build_process_env(ctx: &LifecycleContext) -> HashMap<String, String> {
             }
         }
     }
-    if let Ok(config) = rnpm_config::Config::load(Some(&ctx.package_dir)) {
+    let config_res = if let Some(ref config) = ctx.config {
+        Ok(config.clone())
+    } else {
+        rnpm_config::Config::load(Some(&ctx.package_dir))
+    };
+    if let Ok(config) = config_res {
         for (key, value) in config.npmrc.settings {
             if !is_sensitive_credential_key(&key) {
                 env.insert(format!("npm_config_{}", key.replace('-', "_")), value);
@@ -1456,9 +1604,13 @@ pub(crate) fn create_shell_command(ctx: &LifecycleContext) -> Command {
 }
 
 fn load_config_for_context(ctx: &LifecycleContext) -> rnpm_config::Config {
-    let mut config = rnpm_config::Config::load(Some(&ctx.package_dir))
-        .or_else(|_| rnpm_config::Config::load(Some(&ctx.project_root)))
-        .unwrap_or_default();
+    let mut config = if let Some(ref cfg) = ctx.config {
+        cfg.clone()
+    } else {
+        rnpm_config::Config::load(Some(&ctx.package_dir))
+            .or_else(|_| rnpm_config::Config::load(Some(&ctx.project_root)))
+            .unwrap_or_default()
+    };
     for (k, v) in &ctx.extra_env {
         if let Some(stripped) = k.strip_prefix("npm_config_") {
             config.npmrc.settings.insert(stripped.replace('_', "-"), v.clone());
@@ -2832,7 +2984,14 @@ async fn execute_root_hooks_with_abort(
                 script_cmd,
             );
             ctx.package_version = root_manifest.version.clone();
-            if rnpm_config::Config::load(Some(&opts.root_dir))?.get("loglevel") != Some("silent") {
+            let is_silent = if let Some(trusted) = get_trusted_config() {
+                trusted.get("loglevel") == Some("silent")
+            } else {
+                rnpm_config::Config::load(Some(&opts.root_dir))
+                    .map(|c| c.get("loglevel") == Some("silent"))
+                    .unwrap_or(false)
+            };
+            if !is_silent {
                 let name = root_manifest.name.as_deref().unwrap_or("");
                 let id = root_manifest
                     .version

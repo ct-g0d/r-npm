@@ -2861,6 +2861,26 @@ impl Installer {
         } else {
             rnpm_lifecycle::ScriptSandboxPolicy::permissive()
         };
+        let trusted_config = self.options.config_override.clone().or_else(|| {
+            if self.options.force_non_root_policy {
+                rnpm_config::Config::load(None).ok()
+            } else {
+                None
+            }
+        });
+        let node_gyp = std::env::var("npm_config_node_gyp")
+            .or_else(|_| std::env::var("NPM_CONFIG_NODE_GYP"))
+            .ok()
+            .map(std::path::PathBuf::from)
+            .or_else(|| {
+                if let Some(ref cfg) = trusted_config {
+                    cfg.get("node-gyp").map(std::path::PathBuf::from)
+                } else {
+                    rnpm_config::Config::load(Some(&self.options.project_dir))
+                        .ok()
+                        .and_then(|c| c.get("node-gyp").map(std::path::PathBuf::from))
+                }
+            });
         LifecycleOptions {
             root_dir: self.options.project_dir.clone(),
             init_cwd: self.options.project_dir.clone(),
@@ -2869,16 +2889,26 @@ impl Installer {
             foreground_scripts: self.options.foreground_scripts,
             timeout: None,
             sandbox_policy,
-            node_gyp: std::env::var("npm_config_node_gyp")
-                .or_else(|_| std::env::var("NPM_CONFIG_NODE_GYP"))
-                .ok()
-                .map(std::path::PathBuf::from)
-                .or_else(|| {
-                    rnpm_config::Config::load(Some(&self.options.project_dir))
-                        .ok()
-                        .and_then(|c| c.get("node-gyp").map(std::path::PathBuf::from))
-                }),
+            node_gyp,
             offline: self.options.offline,
+        }
+    }
+
+    async fn run_lifecycle_hooks<F, R>(&self, f: F) -> R
+    where
+        F: std::future::Future<Output = R>,
+    {
+        if self.options.force_non_root_policy || self.options.config_override.is_some() {
+            let trusted_cfg = self.options.config_override.clone().or_else(|| {
+                if self.options.force_non_root_policy {
+                    rnpm_config::Config::load(None).ok()
+                } else {
+                    None
+                }
+            });
+            rnpm_lifecycle::with_trusted_config(trusted_cfg, f).await
+        } else {
+            f.await
         }
     }
 
@@ -3188,7 +3218,7 @@ impl Installer {
                                 .context("Failed to parse project package.json")?;
                             let opts = self.lifecycle_options();
                             let _life_guard = collector.enter_phase(Phase::Lifecycle);
-                            rnpm_lifecycle::execute_root_hooks(&root_manifest, &opts).await?;
+                            self.run_lifecycle_hooks(rnpm_lifecycle::execute_root_hooks(&root_manifest, &opts)).await?;
                         }
                         let actual = LockfileV3::load_from_file(
                             &self
@@ -5647,7 +5677,7 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                 &loc_base_dir,
                 &self.script_policy,
             )?;
-            rnpm_lifecycle::execute_dependency_hooks(&lifecycle_nodes, &lifecycle_opts).await?;
+            self.run_lifecycle_hooks(rnpm_lifecycle::execute_dependency_hooks(&lifecycle_nodes, &lifecycle_opts)).await?;
             Some(lifecycle_opts)
         } else {
             None
@@ -5738,7 +5768,7 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
         if let Some(opts) = lifecycle_opts {
             let _life_guard = collector.enter_phase(Phase::Lifecycle);
             if self.options.packages.is_empty() && !self.options.is_global {
-                rnpm_lifecycle::execute_root_hooks(&manifest, &opts).await?;
+                self.run_lifecycle_hooks(rnpm_lifecycle::execute_root_hooks(&manifest, &opts)).await?;
             }
         }
 
@@ -7854,7 +7884,7 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                 &self.options.project_dir,
                 &self.script_policy,
             )?;
-            rnpm_lifecycle::execute_dependency_hooks(&lifecycle_nodes, &lifecycle_opts).await?;
+            self.run_lifecycle_hooks(rnpm_lifecycle::execute_dependency_hooks(&lifecycle_nodes, &lifecycle_opts)).await?;
             Some(lifecycle_opts)
         } else {
             None
@@ -7878,7 +7908,7 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
         self.warn_unreviewed_scripts(&lockfile, &self.options.project_dir);
         if let Some(opts) = lifecycle_opts {
             let _life_guard = collector.enter_phase(Phase::Lifecycle);
-            rnpm_lifecycle::execute_root_hooks(&manifest, &opts).await?;
+            self.run_lifecycle_hooks(rnpm_lifecycle::execute_root_hooks(&manifest, &opts)).await?;
         }
 
         if !self.options.dry_run && !self.options.package_lock_only {
