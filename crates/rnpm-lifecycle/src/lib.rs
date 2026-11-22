@@ -2861,11 +2861,7 @@ async fn execute_dependency_hooks_with_abort(
                 ctx.foreground_scripts = opts.foreground_scripts;
                 // Dependency build output is captured and only shown on failure.
                 ctx.capture_output = opts.capture_output && !opts.foreground_scripts;
-                if let Some(ref cfg) = ctx.config {
-                    ctx.node_gyp = cfg.get("node-gyp").map(PathBuf::from);
-                } else {
-                    ctx.node_gyp = opts.node_gyp.clone();
-                }
+                ctx.node_gyp = opts.node_gyp.clone();
                 ctx.offline = opts.offline;
 
                 let abort_fut = {
@@ -3024,11 +3020,7 @@ async fn execute_root_hooks_with_abort(
             if opts.foreground_scripts {
                 ctx.capture_output = false;
             }
-            if let Some(ref cfg) = ctx.config {
-                ctx.node_gyp = cfg.get("node-gyp").map(PathBuf::from);
-            } else {
-                ctx.node_gyp = opts.node_gyp.clone();
-            }
+            ctx.node_gyp = opts.node_gyp.clone();
             ctx.offline = opts.offline;
 
             let abort_fut = {

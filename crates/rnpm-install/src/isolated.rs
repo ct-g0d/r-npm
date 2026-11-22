@@ -586,29 +586,7 @@ impl crate::Installer {
         if self.options.ignore_scripts {
             return Ok(());
         }
-        let opts = rnpm_lifecycle::LifecycleOptions {
-            root_dir: self.options.project_dir.clone(),
-            init_cwd: self.options.project_dir.clone(),
-            ignore_scripts: false,
-            capture_output: !self.options.foreground_scripts,
-            foreground_scripts: self.options.foreground_scripts,
-            timeout: None,
-            sandbox_policy: if self.options.strict_sandbox {
-                rnpm_lifecycle::ScriptSandboxPolicy::restricted()
-            } else {
-                rnpm_lifecycle::ScriptSandboxPolicy::permissive()
-            },
-            node_gyp: std::env::var("npm_config_node_gyp")
-                .or_else(|_| std::env::var("NPM_CONFIG_NODE_GYP"))
-                .ok()
-                .map(std::path::PathBuf::from)
-                .or_else(|| {
-                    rnpm_config::Config::load(Some(&self.options.project_dir))
-                        .ok()
-                        .and_then(|c| c.get("node-gyp").map(std::path::PathBuf::from))
-                }),
-            offline: self.options.offline,
-        };
+        let opts = self.lifecycle_options();
         rnpm_lifecycle::execute_root_hooks(manifest, &opts).await
     }
 
@@ -831,29 +809,7 @@ impl crate::Installer {
         }
 
         if !self.options.ignore_scripts && !lifecycle_nodes.is_empty() {
-            let opts = rnpm_lifecycle::LifecycleOptions {
-                root_dir: project.clone(),
-                init_cwd: project.clone(),
-                ignore_scripts: false,
-                capture_output: !self.options.foreground_scripts,
-                foreground_scripts: self.options.foreground_scripts,
-                timeout: None,
-                sandbox_policy: if self.options.strict_sandbox {
-                    rnpm_lifecycle::ScriptSandboxPolicy::restricted()
-                } else {
-                    rnpm_lifecycle::ScriptSandboxPolicy::permissive()
-                },
-                node_gyp: std::env::var("npm_config_node_gyp")
-                    .or_else(|_| std::env::var("NPM_CONFIG_NODE_GYP"))
-                    .ok()
-                    .map(std::path::PathBuf::from)
-                    .or_else(|| {
-                        rnpm_config::Config::load(Some(&project))
-                            .ok()
-                            .and_then(|c| c.get("node-gyp").map(std::path::PathBuf::from))
-                    }),
-                offline: self.options.offline,
-            };
+            let opts = self.lifecycle_options();
             rnpm_lifecycle::execute_dependency_hooks(&lifecycle_nodes, &opts).await?;
         }
 

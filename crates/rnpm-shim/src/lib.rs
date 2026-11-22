@@ -752,8 +752,25 @@ pub fn create_shims_with_force(
     let write_shim_file = |path: &Path, data: &[u8]| -> Result<()> {
         if let Ok(meta) = fs::symlink_metadata(path) {
             if meta.file_type().is_symlink() {
-                fs::remove_file(path)
-                    .with_context(|| format!("Failed to remove existing symlink {}", path.display()))?;
+                #[cfg(windows)]
+                {
+                    use std::os::windows::fs::FileTypeExt;
+                    if meta.file_type().is_symlink_dir() {
+                        fs::remove_dir(path).with_context(|| {
+                            format!("Failed to remove existing directory symlink {}", path.display())
+                        })?;
+                    } else {
+                        fs::remove_file(path).with_context(|| {
+                            format!("Failed to remove existing symlink {}", path.display())
+                        })?;
+                    }
+                }
+                #[cfg(not(windows))]
+                {
+                    fs::remove_file(path).with_context(|| {
+                        format!("Failed to remove existing symlink {}", path.display())
+                    })?;
+                }
             } else if meta.permissions().readonly() {
                 let mut perms = meta.permissions();
                 perms.set_readonly(false);

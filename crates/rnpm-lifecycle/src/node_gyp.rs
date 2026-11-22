@@ -776,14 +776,13 @@ fn is_valid_version_entry(key: &str, val: &serde_json::Value) -> bool {
         Ok(v) => v,
         Err(_) => return false,
     };
-    if let Some(v_ver) = val.get("version").and_then(|v| v.as_str()) {
+    if let Some(v_val) = val.get("version") {
+        let Some(v_ver) = v_val.as_str() else {
+            return false;
+        };
         match rnpm_core::Version::parse(v_ver) {
-            Ok(v) => {
-                if v != key_ver {
-                    return false;
-                }
-            }
-            Err(_) => return false,
+            Ok(v) if v == key_ver => {}
+            _ => return false,
         }
     }
     true

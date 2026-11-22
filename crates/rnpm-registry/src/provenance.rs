@@ -356,26 +356,39 @@ pub fn verify_signature(
     ))
 }
 
-/// Verifies that a DSSE envelope is authentically signed by the given public key over DSSE PAE,
-/// returning a reference to the exact verified signature.
-pub fn verify_dsse_signature<'a>(
+/// Verifies a DSSE envelope against the given public key over DSSE PAE,
+/// returning all signatures that cryptographically verify under that key.
+pub fn verify_dsse_signatures<'a>(
     envelope: &'a DsseEnvelope,
     public_key: &[u8],
-) -> Result<&'a DsseSignature, RegistryError> {
+) -> Result<Vec<&'a DsseSignature>, RegistryError> {
     let payload = envelope.decode_payload()?;
     let pae = dsse_pre_auth_encoding(&envelope.payload_type, &payload);
 
+    let mut verified = Vec::new();
     for s in &envelope.signatures {
         if let Ok(sig_bytes) = decode_base64(&s.sig) {
             if verify_signature(public_key, &pae, &sig_bytes).is_ok() {
-                return Ok(s);
+                verified.push(s);
             }
         }
     }
 
-    Err(RegistryError::InvalidSignature(
-        "None of the DSSE signatures matched the expected public key".into(),
-    ))
+    if verified.is_empty() {
+        return Err(RegistryError::InvalidSignature(
+            "None of the DSSE signatures matched the expected public key".into(),
+        ));
+    }
+    Ok(verified)
+}
+
+/// Verifies that a DSSE envelope is authentically signed by the given public key over DSSE PAE,
+/// returning a reference to the first verified signature.
+pub fn verify_dsse_signature<'a>(
+    envelope: &'a DsseEnvelope,
+    public_key: &[u8],
+) -> Result<&'a DsseSignature, RegistryError> {
+    verify_dsse_signatures(envelope, public_key).map(|sigs| sigs[0])
 }
 
 /// Verifies that a DSSE envelope is authentically signed by the given public key over DSSE PAE.
@@ -685,6 +698,24 @@ fn matches_rekor_verifier(verifier_str: &str, leaf_cert_or_key: &[u8]) -> bool {
         }
     }
     false
+}
+
+fn verify_rekor_body_binding_any(
+    entry: &TlogEntry,
+    envelope: &DsseEnvelope,
+    verified_sigs: &[&DsseSignature],
+    leaf_cert_or_key: &[u8],
+) -> Result<(), RegistryError> {
+    let mut last_err = None;
+    for sig in verified_sigs {
+        match verify_rekor_body_binding(entry, envelope, sig, leaf_cert_or_key) {
+            Ok(()) => return Ok(()),
+            Err(e) => last_err = Some(e),
+        }
+    }
+    Err(last_err.unwrap_or_else(|| {
+        RegistryError::InvalidSigstoreBundle("No verified DSSE signatures available for Rekor binding".into())
+    }))
 }
 
 /// Binds a Rekor transparency log entry's canonicalizedBody to the DSSE envelope, verified signature, and leaf certificate/key.
@@ -1893,8 +1924,8 @@ fn current_time_ms() -> i64 {
             reg_key.clone()
         };
 
-        // 4. Verify DSSE envelope cryptographic signature over PAE first to get verified_sig
-        let verified_sig = verify_dsse_signature(envelope, &signing_key)?;
+        // 4. Verify DSSE envelope cryptographic signatures over PAE first to collect all verified_sigs
+        let verified_sigs = verify_dsse_signatures(envelope, &signing_key)?;
 
         // Enforce key expiry for keyed attestation using the exact resolved keyid
         if let Some(ref keyid) = resolved_keyid {
@@ -1903,8 +1934,13 @@ fn current_time_ms() -> i64 {
                     let valid_set = tlog.integrated_time > 0
                         && tlog.inclusion_promise.is_some()
                         && verify_rekor_set(&self.rekor_public_keys, tlog).is_ok();
-                    let valid_binding =
-                        verify_rekor_body_binding(tlog, envelope, verified_sig, &signing_key).is_ok();
+                    let valid_binding = verify_rekor_body_binding_any(
+                        tlog,
+                        envelope,
+                        &verified_sigs,
+                        &signing_key,
+                    )
+                    .is_ok();
 
                     if valid_set && valid_binding {
                         tlog.integrated_time * 1000
@@ -1949,15 +1985,15 @@ fn current_time_ms() -> i64 {
                 }
             }
 
-            // Bind Rekor body to DSSE envelope & leaf certificate
+            // Bind Rekor body to DSSE envelope & leaf certificate (matching any verified signature paired with leaf cert)
             let leaf_cert = parsed_leaf_cert.as_ref().unwrap();
-            verify_rekor_body_binding(tlog, envelope, verified_sig, &leaf_cert.raw_der)?;
+            verify_rekor_body_binding_any(tlog, envelope, &verified_sigs, &leaf_cert.raw_der)?;
         } else if let Some(tlog) = vm.tlog_entries.first() {
             let valid_set = tlog.integrated_time > 0
                 && tlog.inclusion_promise.is_some()
                 && verify_rekor_set(&self.rekor_public_keys, tlog).is_ok();
             let valid_binding =
-                verify_rekor_body_binding(tlog, envelope, verified_sig, &signing_key).is_ok();
+                verify_rekor_body_binding_any(tlog, envelope, &verified_sigs, &signing_key).is_ok();
             if valid_set && valid_binding {
                 tlog_metadata = TransparencyLogMetadata {
                     log_index: tlog.log_index,
