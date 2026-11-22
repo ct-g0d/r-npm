@@ -65,7 +65,7 @@ fn test_update_workspace_forwarding() {
         .current_dir(root)
         .env("npm_config_audit", "false")
         .env("npm_config_fund", "false")
-        .args(["update", "--workspace=pkg-a", "--dry-run"])
+        .args(["update", "--workspace=pkg-a"])
         .output()
         .expect("update --workspace failed");
     assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
@@ -75,7 +75,7 @@ fn test_update_workspace_forwarding() {
         .current_dir(root)
         .env("npm_config_audit", "false")
         .env("npm_config_fund", "false")
-        .args(["update", "-w", "pkg-a", "--dry-run"])
+        .args(["update", "-w", "pkg-a"])
         .output()
         .expect("update -w failed");
     assert!(out_short.status.success(), "stderr: {}", String::from_utf8_lossy(&out_short.stderr));
@@ -85,7 +85,7 @@ fn test_update_workspace_forwarding() {
         .current_dir(root)
         .env("npm_config_audit", "false")
         .env("npm_config_fund", "false")
-        .args(["update", "--workspaces", "--include-workspace-root", "--dry-run"])
+        .args(["update", "--workspaces", "--include-workspace-root"])
         .output()
         .expect("update --workspaces failed");
     assert!(out_ws.status.success(), "stderr: {}", String::from_utf8_lossy(&out_ws.stderr));
@@ -95,7 +95,7 @@ fn test_update_workspace_forwarding() {
         .current_dir(root)
         .env("npm_config_audit", "false")
         .env("npm_config_fund", "false")
-        .args(["update", "--workspace=nonexistent", "--dry-run"])
+        .args(["update", "--workspace=nonexistent"])
         .output()
         .expect("update command run");
     assert!(!out_err.status.success());

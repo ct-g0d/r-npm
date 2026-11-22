@@ -148,6 +148,9 @@ async fn test_cli_update_command_integration() {
             no_fund: false,
             no_bin_links: false,
             bin_links: None,
+            workspace_root: false,
+            workspace: vec![],
+            workspaces: false,
         },
     };
 
@@ -1754,6 +1757,20 @@ fn test_cli_parse_legacy_peer_deps() {
             legacy_peer_deps, ..
         } => assert!(!legacy_peer_deps),
         _ => panic!("Expected Commands::Install"),
+    }
+}
+
+#[test]
+fn test_cli_parse_prune_and_update_workspaces() {
+    let p1 = Cli::try_parse_from(["rnpm", "prune", "-w", "pkg-a", "--dry-run"]).unwrap();
+    match p1.command {
+        Commands::Prune { workspace, .. } => assert_eq!(workspace, vec!["pkg-a".to_string()]),
+        _ => panic!("Expected Prune"),
+    }
+    let p2 = Cli::try_parse_from(["rnpm", "update", "-w", "pkg-a"]).unwrap();
+    match p2.command {
+        Commands::Update { workspace, .. } => assert_eq!(workspace, vec!["pkg-a".to_string()]),
+        _ => panic!("Expected Update"),
     }
 }
 
