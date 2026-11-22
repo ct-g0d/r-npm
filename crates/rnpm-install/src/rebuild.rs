@@ -253,11 +253,18 @@ pub async fn execute_rebuild(options: &RebuildOptions) -> Result<RebuildSummary>
     let node_gyp = std::env::var("npm_config_node_gyp")
         .or_else(|_| std::env::var("NPM_CONFIG_NODE_GYP"))
         .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
         .map(std::path::PathBuf::from)
         .or_else(|| {
             rnpm_config::Config::load(Some(project_dir))
                 .ok()
-                .and_then(|c| c.get("node-gyp").map(std::path::PathBuf::from))
+                .and_then(|c| {
+                    c.get("node-gyp")
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(std::path::PathBuf::from)
+                })
         });
 
     let lifecycle_opts = LifecycleOptions {

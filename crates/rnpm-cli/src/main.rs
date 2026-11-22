@@ -2607,7 +2607,7 @@ fn extract_config_flag(
                 "npm warn Unknown cli config \"--{raw_key}\". This will stop working in the next major version of npm."
             );
         }
-        if !(key == "ca" || key == "cafile") {
+        if !(key == "ca" || key == "cafile" || key == "allow-registry") {
             overrides.insert(key, "false".to_string());
         }
         return Some(1);
@@ -2633,7 +2633,7 @@ fn extract_config_flag(
                     } else {
                         overrides.insert("min-release-age-exclude".to_string(), val.to_string());
                     }
-                } else {
+                } else if clean_key != "allow-registry" {
                     overrides.insert(key, val.to_string());
                 }
             }
