@@ -305,16 +305,30 @@ pub fn check_sources(
     workspace_paths: &HashSet<String>,
     policy: &SourcePolicy,
 ) -> Result<()> {
+    check_sources_with_root_context(lockfile, root_declared, workspace_paths, policy, false)
+}
+
+/// Reject sources disabled by `allow-*`, with optional forced non-root context
+/// (e.g. for staging dependency preparation of git dependencies).
+pub fn check_sources_with_root_context(
+    lockfile: &LockfileV3,
+    root_declared: &HashSet<String>,
+    workspace_paths: &HashSet<String>,
+    policy: &SourcePolicy,
+    force_non_root: bool,
+) -> Result<()> {
     if policy.is_unrestricted() {
         return Ok(());
     }
 
     // 1. Collect all explicit remote URLs from root_declared and lockfile specs.
     let mut explicit_remote_specs = HashSet::new();
-    for item in root_declared {
-        let trimmed = item.trim();
-        if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
-            explicit_remote_specs.insert(trimmed.to_string());
+    if !force_non_root {
+        for item in root_declared {
+            let trimmed = item.trim();
+            if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+                explicit_remote_specs.insert(trimmed.to_string());
+            }
         }
     }
     for pkg in lockfile.packages.values() {
@@ -338,7 +352,11 @@ pub fn check_sources(
 
     // 2. Gate every original dependency edge by (parsed_source_kind, is_actual_root_or_workspace_edge).
     for (requester_loc, pkg) in &lockfile.packages {
-        let is_root_edge = requester_loc.is_empty() || workspace_paths.contains(requester_loc);
+        let is_root_edge = if force_non_root {
+            false
+        } else {
+            requester_loc.is_empty() || workspace_paths.contains(requester_loc)
+        };
         for map in [
             &pkg.dependencies,
             &pkg.dev_dependencies,
@@ -378,7 +396,11 @@ pub fn check_sources(
         } else {
             classify(pkg)
         };
-        let is_root = is_direct_root_dep(location, &lockfile.packages, workspace_paths, kind);
+        let is_root = if force_non_root {
+            false
+        } else {
+            is_direct_root_dep(location, &lockfile.packages, workspace_paths, kind)
+        };
         check_source_gate(policy, kind, is_root)?;
     }
     Ok(())

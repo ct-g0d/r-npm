@@ -1865,6 +1865,14 @@ pub struct InstallOptions {
     pub git_no_prepare: Vec<String>,
     /// Recursion guard: current depth of git dependency preparation.
     pub git_prepare_depth: usize,
+    /// Override for source policy (e.g. inherited from outer install during git dependency prepare).
+    pub source_policy_override: Option<policy::SourcePolicy>,
+    /// When true, force all dependencies (including manifest deps) to be treated as non-root dependencies.
+    pub force_non_root_policy: bool,
+    /// Override for before cutoff timestamp (inherited from outer install).
+    pub before_cutoff: Option<i64>,
+    /// Package names / glob patterns exempt from the release-age filter (inherited from outer install).
+    pub min_release_age_exclude: Vec<String>,
 }
 
 impl InstallOptions {
@@ -1881,6 +1889,10 @@ impl InstallOptions {
             strict_sandbox: self.strict_sandbox,
             git_no_prepare: self.git_no_prepare.clone(),
             git_prepare_depth: self.git_prepare_depth,
+            source_policy_override: self.source_policy_override.clone(),
+            force_non_root_policy: self.force_non_root_policy,
+            before_cutoff: self.before_cutoff,
+            min_release_age_exclude: self.min_release_age_exclude.clone(),
         }
     }
 
@@ -1989,6 +2001,10 @@ impl Default for InstallOptions {
             bin_links: true,
             git_no_prepare: Vec::new(),
             git_prepare_depth: 0,
+            source_policy_override: None,
+            force_non_root_policy: false,
+            before_cutoff: None,
+            min_release_age_exclude: Vec::new(),
         }
     }
 }
@@ -2515,8 +2531,21 @@ impl Installer {
         // Peer handling is config, whichever command or source sets it.
         options.legacy_peer_deps |= config.get_bool("legacy-peer-deps").unwrap_or(false);
         options.strict_peer_deps |= config.get_bool("strict-peer-deps").unwrap_or(false);
-        set_before_cutoff(config.before_cutoff());
-        set_min_release_age_exclude(config.min_release_age_exclude());
+        if options.force_non_root_policy || options.before_cutoff.is_some() {
+            set_before_cutoff(options.before_cutoff);
+        } else {
+            let cutoff = config.before_cutoff();
+            set_before_cutoff(cutoff);
+            options.before_cutoff = cutoff;
+        }
+
+        if options.force_non_root_policy || !options.min_release_age_exclude.is_empty() {
+            set_min_release_age_exclude(options.min_release_age_exclude.clone());
+        } else {
+            let excludes = config.min_release_age_exclude();
+            set_min_release_age_exclude(excludes.clone());
+            options.min_release_age_exclude = excludes;
+        }
         options.offline |= config.get_bool("offline").unwrap_or(false);
         options.prefer_offline |= config.get_bool("prefer-offline").unwrap_or(false);
         options.prefer_online |= config.get_bool("prefer-online").unwrap_or(false);
@@ -2644,7 +2673,12 @@ impl Installer {
                         .collect()
                 }),
         );
-        let source_policy = policy::SourcePolicy::from_config(&config);
+        let source_policy = if let Some(ref override_policy) = options.source_policy_override {
+            override_policy.clone()
+        } else {
+            policy::SourcePolicy::from_config(&config)
+        };
+        options.source_policy_override = Some(source_policy.clone());
         let script_policy =
             policy::ScriptPolicy::load(&options.project_dir, &config, options.is_global);
         if !options.silent {
@@ -2762,7 +2796,13 @@ impl Installer {
             .iter()
             .map(|m| m.relative_path.clone())
             .collect();
-        policy::check_sources(lockfile, &declared, &workspace_paths, &self.source_policy)?;
+        policy::check_sources_with_root_context(
+            lockfile,
+            &declared,
+            &workspace_paths,
+            &self.source_policy,
+            self.options.force_non_root_policy,
+        )?;
         let base_dir = if self.options.is_global {
             rnpm_config::find_global_node_modules(&self.options.project_dir)
                 .parent()
@@ -3615,6 +3655,7 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
         let root_declared = Arc::new(self.collect_root_declared(&manifest, &workspace_members));
         let root_registry_declared = Arc::new(self.collect_root_registry_declared(&manifest, &workspace_members));
 
+        let is_root_manifest = !self.options.force_non_root_policy;
         let check_manifest_deps = |m: &Manifest| -> Result<()> {
             for map in [
                 &m.dependencies,
@@ -3624,7 +3665,7 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
             ] {
                 for spec in map.values() {
                     let kind = policy::parse_source_kind(spec);
-                    policy::check_source_gate(&self.source_policy, kind, true)?;
+                    policy::check_source_gate(&self.source_policy, kind, is_root_manifest)?;
                 }
             }
             Ok(())
@@ -8099,7 +8140,11 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                 Err(_) => continue,
             };
 
-            let is_root = is_root_pass;
+            let is_root = if self.options.force_non_root_policy {
+                false
+            } else {
+                is_root_pass
+            };
 
             let effective_target = match &parsed {
                 PackageTarget::Alias { target, .. } => target.as_ref(),

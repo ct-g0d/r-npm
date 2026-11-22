@@ -916,6 +916,10 @@ pub struct GitMaterializeOptions {
     pub strict_sandbox: bool,
     pub git_no_prepare: Vec<String>,
     pub git_prepare_depth: usize,
+    pub source_policy_override: Option<crate::policy::SourcePolicy>,
+    pub force_non_root_policy: bool,
+    pub before_cutoff: Option<i64>,
+    pub min_release_age_exclude: Vec<String>,
 }
 
 /// Materializes a git dependency into the destination folder in node_modules,
@@ -1039,17 +1043,24 @@ pub async fn materialize_git_dependency_with_options(
                 silent: true,
                 git_no_prepare: next_no_prepare.clone(),
                 git_prepare_depth: current_depth + 1,
+                source_policy_override: options.source_policy_override.clone(),
+                force_non_root_policy: true,
+                before_cutoff: options.before_cutoff,
+                min_release_age_exclude: options.min_release_age_exclude.clone(),
                 ..Default::default()
             };
 
-            let mut installer = crate::Installer::new(staging_options)?;
+            let mut installer = crate::Installer::new(staging_options).map_err(|e| {
+                anyhow!(
+                    "Failed to initialize installer for staging directory of git dependency '{src_key}': {e:#}"
+                )
+            })?;
             let install_fut: std::pin::Pin<
                 Box<dyn std::future::Future<Output = Result<crate::InstallSummary>>>,
             > = Box::pin(installer.install());
-            install_fut.await.with_context(|| {
-                format!(
-                    "Failed to install build dependencies in staging directory for git dependency '{}'",
-                    src_key
+            install_fut.await.map_err(|e| {
+                anyhow!(
+                    "Failed to install build dependencies in staging directory for git dependency '{src_key}': {e:#}"
                 )
             })?;
         }
