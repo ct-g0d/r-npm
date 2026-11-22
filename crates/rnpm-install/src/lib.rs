@@ -952,8 +952,13 @@ impl RegistryPackageProvider {
     ) -> PackageMetadata {
         if let Ok(mut locked) = cache.lock() {
             if let Some(existing) = locked.get(name) {
+                // Preserve registry dist-tags (like `latest`) so a local custom target's
+                // synthetic `latest` tag never hijacks registry resolution for `npm:dep@latest`.
                 for (tag, ver) in &existing.dist_tags {
-                    reg_meta.dist_tags.insert(tag.clone(), ver.clone());
+                    reg_meta
+                        .dist_tags
+                        .entry(tag.clone())
+                        .or_insert_with(|| ver.clone());
                 }
                 for (ver, vm) in &existing.versions {
                     reg_meta.versions.insert(ver.clone(), vm.clone());
@@ -1353,24 +1358,12 @@ impl PackageMetadataProvider for RegistryPackageProvider {
                 );
                 Ok(Some(merged))
             }
-            Err(e) => {
-                if let Ok(cache) = self.metadata_cache.lock() {
-                    if let Some(existing) = cache.get(name) {
-                        if let Ok(mut fetched) = self.registry_fetched.lock() {
-                            fetched.insert(name.to_string());
-                        }
-                        return Ok(Some(existing.clone()));
-                    }
-                }
-                match e {
-                    SolverError::PackageMetadata(_, ref msg)
-                        if msg.contains("404") || msg.contains("Not Found") =>
-                    {
-                        Ok(None)
-                    }
-                    other => Err(other),
-                }
+            Err(SolverError::PackageMetadata(_, msg))
+                if msg.contains("404") || msg.contains("Not Found") =>
+            {
+                Ok(None)
             }
+            Err(e) => Err(e),
         }
     }
 

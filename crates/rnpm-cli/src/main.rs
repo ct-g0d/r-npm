@@ -2679,7 +2679,7 @@ fn extract_config_flag(
                     }
                 }
             }
-            if !(key == "ca" || key == "cafile") {
+            if !(key == "ca" || key == "cafile" || key == "allow-registry") {
                 overrides.insert(key, "true".to_string());
             }
             return Some(1);
