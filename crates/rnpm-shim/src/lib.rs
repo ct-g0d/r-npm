@@ -634,9 +634,9 @@ pub fn check_existing_bin_collision(
 /// Creates bin links/shims in `bin_dir`.
 ///
 /// On Unix (`#[cfg(unix)]`): creates a relative POSIX symlink matching npm's `bin-links`:
-/// - `<bin_name>` -> pointing to `../<target_rel_from_node_modules>` (or global target)
-/// removes any stale existing file/symlink first, and sets executable permissions (0755)
-/// on the target script (if it exists). Does NOT write `.cmd` or `.ps1` files on Unix.
+/// - `<bin_name>` -> pointing to `../<target_rel_from_node_modules>` (or global target),
+///   removes any stale existing file/symlink first, and sets executable permissions (0755)
+///   on the target script (if it exists). Does NOT write `.cmd` or `.ps1` files on Unix.
 #[cfg(unix)]
 pub fn create_shims(
     bin_dir: &Path,

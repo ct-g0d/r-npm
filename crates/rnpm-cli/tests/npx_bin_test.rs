@@ -234,12 +234,37 @@ fn create_mock_local_tool(dir: &std::path::Path, name: &str) {
     }
 }
 
+fn isolated_npx_cmd(root: &std::path::Path) -> Command {
+    let iso = root.join(".iso");
+    let cache = iso.join("cache");
+    let prefix = iso.join("prefix");
+    let appdata = iso.join("appdata");
+    let localappdata = iso.join("localappdata");
+    let userconfig = iso.join("user.npmrc");
+    let globalconfig = iso.join("global.npmrc");
+    let _ = fs::create_dir_all(&cache);
+    let _ = fs::create_dir_all(&prefix);
+    let _ = fs::create_dir_all(&appdata);
+    let _ = fs::create_dir_all(&localappdata);
+    let _ = fs::write(&userconfig, "registry=http://127.0.0.1:9/\n");
+    let _ = fs::write(&globalconfig, "");
+
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_npx"));
+    cmd.env("NPM_CONFIG_CACHE", &cache)
+        .env("NPM_CONFIG_PREFIX", &prefix)
+        .env("NPM_CONFIG_USERCONFIG", &userconfig)
+        .env("NPM_CONFIG_GLOBALCONFIG", &globalconfig)
+        .env("APPDATA", &appdata)
+        .env("LOCALAPPDATA", &localappdata);
+    cmd
+}
+
 #[test]
 fn test_compiled_npx_version_and_help() {
-    let npx_bin = env!("CARGO_BIN_EXE_npx");
+    let temp = tempdir().unwrap();
 
     // npx --version
-    let output = Command::new(npx_bin)
+    let output = isolated_npx_cmd(temp.path())
         .arg("--version")
         .output()
         .expect("failed to execute npx --version");
@@ -248,7 +273,7 @@ fn test_compiled_npx_version_and_help() {
     assert!(stdout.contains("11.20.0"));
 
     // npx -v
-    let output = Command::new(npx_bin)
+    let output = isolated_npx_cmd(temp.path())
         .arg("-v")
         .output()
         .expect("failed to execute npx -v");
@@ -257,7 +282,7 @@ fn test_compiled_npx_version_and_help() {
     assert!(stdout.contains("11.20.0"));
 
     // npx --help
-    let output = Command::new(npx_bin)
+    let output = isolated_npx_cmd(temp.path())
         .arg("--help")
         .output()
         .expect("failed to execute npx --help");
@@ -268,7 +293,6 @@ fn test_compiled_npx_version_and_help() {
 
 #[test]
 fn test_compiled_npx_runs_local_bin_with_forwarded_flags() {
-    let npx_bin = env!("CARGO_BIN_EXE_npx");
     let temp = tempdir().unwrap();
     let temp_path = temp.path();
 
@@ -279,7 +303,7 @@ fn test_compiled_npx_runs_local_bin_with_forwarded_flags() {
 
     // Run `npx mytool --help --custom-flag value`
     // CRITICAL: --help must go to mytool, NOT be consumed by npx!
-    let output = Command::new(npx_bin)
+    let output = isolated_npx_cmd(temp_path)
         .current_dir(temp_path)
         .args(["mytool", "--help", "--custom-flag", "value"])
         .output()
@@ -307,7 +331,6 @@ fn test_compiled_npx_runs_local_bin_with_forwarded_flags() {
 
 #[test]
 fn test_compiled_npx_call_option() {
-    let npx_bin = env!("CARGO_BIN_EXE_npx");
     let temp = tempdir().unwrap();
     let temp_path = temp.path();
 
@@ -315,7 +338,7 @@ fn test_compiled_npx_call_option() {
     fs::write(temp_path.join("package.json"), r#"{"name":"test-call","version":"1.0.0"}"#).unwrap();
 
     // Test npx -c "mytool arg1"
-    let output = Command::new(npx_bin)
+    let output = isolated_npx_cmd(temp_path)
         .current_dir(temp_path)
         .args(["-c", "mytool arg1"])
         .output()
@@ -329,7 +352,6 @@ fn test_compiled_npx_call_option() {
 
 #[test]
 fn test_compiled_npx_package_option() {
-    let npx_bin = env!("CARGO_BIN_EXE_npx");
     let temp = tempdir().unwrap();
     let temp_path = temp.path();
 
@@ -341,7 +363,7 @@ fn test_compiled_npx_package_option() {
     fs::write(temp_path.join("package.json"), r#"{"name":"test-pkg-opt","version":"1.0.0"}"#).unwrap();
 
     // Test npx -p local-pkg mytool
-    let output = Command::new(npx_bin)
+    let output = isolated_npx_cmd(temp_path)
         .current_dir(temp_path)
         .args([
             &format!("--cache={}", cache_dir.display()),
@@ -361,12 +383,11 @@ fn test_compiled_npx_package_option() {
 
 #[test]
 fn test_compiled_npx_no_install() {
-    let npx_bin = env!("CARGO_BIN_EXE_npx");
     let temp = tempdir().unwrap();
     let temp_path = temp.path();
 
     // Run npx --no-install nonexistent-pkg
-    let output = Command::new(npx_bin)
+    let output = isolated_npx_cmd(temp_path)
         .current_dir(temp_path)
         .args(["--no-install", "nonexistent-pkg-w3-2-random-xyz"])
         .output()
@@ -378,7 +399,6 @@ fn test_compiled_npx_no_install() {
 
 #[test]
 fn test_compiled_npx_dashdash_separator_forwarding() {
-    let npx_bin = env!("CARGO_BIN_EXE_npx");
     let temp = tempdir().unwrap();
     let temp_path = temp.path();
 
@@ -386,7 +406,7 @@ fn test_compiled_npx_dashdash_separator_forwarding() {
     fs::write(temp_path.join("package.json"), r#"{"name":"test-dashdash","version":"1.0.0"}"#).unwrap();
 
     // Run npx -- mytool --yes
-    let output = Command::new(npx_bin)
+    let output = isolated_npx_cmd(temp_path)
         .current_dir(temp_path)
         .args(["--", "mytool", "--yes"])
         .output()
@@ -439,14 +459,13 @@ fn test_rnpm_argv0_dispatch_as_npx() {
 
 #[test]
 fn test_compiled_npx_yes_false_rejects_without_installing() {
-    let npx_bin = env!("CARGO_BIN_EXE_npx");
     let temp = tempdir().unwrap();
     let temp_path = temp.path();
     let cache_dir = temp_path.join("cache");
     fs::create_dir_all(&cache_dir).unwrap();
 
     // Run npx --yes=false nonexistent-pkg
-    let output = Command::new(npx_bin)
+    let output = isolated_npx_cmd(temp_path)
         .current_dir(temp_path)
         .args([
             &format!("--cache={}", cache_dir.display()),
@@ -474,14 +493,13 @@ fn test_compiled_npx_yes_false_rejects_without_installing() {
 
 #[test]
 fn test_compiled_npx_yes_0_rejects_without_installing() {
-    let npx_bin = env!("CARGO_BIN_EXE_npx");
     let temp = tempdir().unwrap();
     let temp_path = temp.path();
     let cache_dir = temp_path.join("cache");
     fs::create_dir_all(&cache_dir).unwrap();
 
     // Run npx --yes=0 nonexistent-pkg
-    let output = Command::new(npx_bin)
+    let output = isolated_npx_cmd(temp_path)
         .current_dir(temp_path)
         .args([
             &format!("--cache={}", cache_dir.display()),

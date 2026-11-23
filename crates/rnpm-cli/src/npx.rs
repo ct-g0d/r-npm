@@ -1,26 +1,24 @@
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 /// Check if argv[0] matches npx binary names.
 /// Matches "npx", "npx.exe", "rnpm-npx", "rnpm-npx.exe" regardless of directory path or case.
 pub fn is_npx_argv0(argv0: &str) -> bool {
-    let path = Path::new(argv0);
-    let file_name = path
-        .file_name()
-        .and_then(|s| s.to_str())
+    let base = argv0
+        .rsplit(['/', '\\'])
+        .next()
         .unwrap_or(argv0)
-        .to_lowercase();
-    if file_name == "npx"
-        || file_name == "npx.exe"
-        || file_name == "rnpm-npx"
-        || file_name == "rnpm-npx.exe"
+        .to_ascii_lowercase();
+    if base == "npx"
+        || base == "npx.exe"
+        || base == "rnpm-npx"
+        || base == "rnpm-npx.exe"
     {
         return true;
     }
-    let stem = path
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or(argv0)
-        .to_lowercase();
+    let stem = base
+        .rsplit_once('.')
+        .map(|(s, _)| s)
+        .unwrap_or(&base);
     stem == "npx" || stem == "rnpm-npx"
 }
 
