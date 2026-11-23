@@ -39,6 +39,15 @@ fn compute_integrity(bytes: &[u8]) -> (String, rnpm_core::integrity::Integrity) 
     (integrity_str, integrity)
 }
 
+fn test_config() -> rnpm_config::Config {
+    let mut cfg = rnpm_config::Config::default();
+    cfg.npmrc.settings.insert("noproxy".to_string(), "127.0.0.1,localhost".to_string());
+    cfg.npmrc.settings.insert("proxy".to_string(), "null".to_string());
+    cfg.npmrc.settings.insert("http-proxy".to_string(), "null".to_string());
+    cfg.npmrc.settings.insert("https-proxy".to_string(), "null".to_string());
+    cfg
+}
+
 struct MockRegistryServer {
     addr: SocketAddr,
     request_count: Arc<AtomicUsize>,
@@ -197,6 +206,7 @@ async fn test_offline_direct_url_cached_vs_uncached() {
         project_dir: project_dir.clone(),
         registry_url: Some(server.url()),
         cache_dir: Some(cache_dir.clone()),
+        config_override: Some(test_config()),
         offline: true,
         ignore_scripts: true,
         ..Default::default()
@@ -224,6 +234,7 @@ async fn test_offline_direct_url_cached_vs_uncached() {
         project_dir: project_dir.clone(),
         registry_url: Some(server.url()),
         cache_dir: Some(cache_dir.clone()),
+        config_override: Some(test_config()),
         offline: true,
         ignore_scripts: true,
         ..Default::default()
@@ -261,6 +272,7 @@ async fn test_offline_missing_packument_returns_enotcached() {
         project_dir: project_dir.clone(),
         registry_url: Some(server.url()),
         cache_dir: Some(cache_dir),
+        config_override: Some(test_config()),
         offline: true,
         ignore_scripts: true,
         ..Default::default()
@@ -339,6 +351,7 @@ async fn test_prefer_offline_skips_network_when_cached() {
         project_dir: project_dir.clone(),
         registry_url: Some(registry_url),
         cache_dir: Some(cache_dir),
+        config_override: Some(test_config()),
         prefer_offline: true,
         ignore_scripts: true,
         ..Default::default()
@@ -458,6 +471,7 @@ async fn test_prefer_online_revalidates_and_handles_304() {
         project_dir: project_dir.clone(),
         registry_url: Some(registry_url),
         cache_dir: Some(cache_dir),
+        config_override: Some(test_config()),
         prefer_online: true,
         ignore_scripts: true,
         ..Default::default()
@@ -550,6 +564,7 @@ async fn test_before_boundary_timestamps_exact_millisecond() {
         project_dir: project_dir.clone(),
         registry_url: Some(server.url()),
         cache_dir: Some(cache_dir),
+        config_override: Some(test_config()),
         before_cutoff: Some(cutoff_ms),
         ignore_scripts: true,
         ..Default::default()
@@ -570,28 +585,41 @@ async fn test_before_boundary_timestamps_exact_millisecond() {
 async fn test_before_epoch_future_and_missing_time() {
     let _guard = TEST_MUTEX.lock().await;
     let tmp = tempfile::tempdir().unwrap();
-    let project_dir = tmp.path().join("proj");
     let cache_dir = tmp.path().join("cache");
-    std::fs::create_dir_all(&project_dir).unwrap();
     std::fs::create_dir_all(&cache_dir).unwrap();
 
     let pkg_name = "time-variations-pkg";
+    let tgz_010 = create_tarball(pkg_name, "0.1.0");
+    let (int_010, _) = compute_integrity(&tgz_010);
     let tgz_100 = create_tarball(pkg_name, "1.0.0");
     let (int_100, _) = compute_integrity(&tgz_100);
     let tgz_200 = create_tarball(pkg_name, "2.0.0");
     let (int_200, _) = compute_integrity(&tgz_200);
 
+    let tgz_010_clone = tgz_010.clone();
     let tgz_100_clone = tgz_100.clone();
     let tgz_200_clone = tgz_200.clone();
 
-    // Serve packument without "time" object
+    // Serve packument with 0.1.0 at epoch (0ms), 1.0.0 at 1 day post-epoch, 2.0.0 in year 2026
     let server = MockRegistryServer::start(move |_method, path, _headers, base_url| {
         if path == format!("/{pkg_name}") {
             let json = serde_json::json!({
                 "name": pkg_name,
                 "dist-tags": { "latest": "2.0.0" },
-                // NO "time" object at all!
+                "time": {
+                    "0.1.0": "1970-01-01T00:00:00.000Z",
+                    "1.0.0": "1970-01-02T00:00:00.000Z",
+                    "2.0.0": "2026-11-20T00:00:00.000Z"
+                },
                 "versions": {
+                    "0.1.0": {
+                        "name": pkg_name,
+                        "version": "0.1.0",
+                        "dist": {
+                            "tarball": format!("{base_url}/{pkg_name}/-/{pkg_name}-0.1.0.tgz"),
+                            "integrity": int_010
+                        }
+                    },
                     "1.0.0": {
                         "name": pkg_name,
                         "version": "1.0.0",
@@ -611,34 +639,126 @@ async fn test_before_epoch_future_and_missing_time() {
                 }
             });
             Some((200, vec![("Content-Type", "application/json".to_string())], json.to_string().into_bytes()))
-        } else if path == format!("/{pkg_name}/-/{pkg_name}-2.0.0.tgz") {
-            Some((200, vec![("Content-Type", "application/octet-stream".to_string())], tgz_200_clone.clone()))
+        } else if path == format!("/{pkg_name}/-/{pkg_name}-0.1.0.tgz") {
+            Some((200, vec![("Content-Type", "application/octet-stream".to_string())], tgz_010_clone.clone()))
         } else if path == format!("/{pkg_name}/-/{pkg_name}-1.0.0.tgz") {
             Some((200, vec![("Content-Type", "application/octet-stream".to_string())], tgz_100_clone.clone()))
+        } else if path == format!("/{pkg_name}/-/{pkg_name}-2.0.0.tgz") {
+            Some((200, vec![("Content-Type", "application/octet-stream".to_string())], tgz_200_clone.clone()))
         } else {
             None
         }
     });
 
-    let pkg_json = format!(
-        r#"{{"name":"test-app","dependencies":{{"{pkg_name}":"*"}}}}"#
-    );
-    std::fs::write(project_dir.join("package.json"), pkg_json).unwrap();
+    // (A) Epoch cutoff (before_cutoff: Some(0)):
+    // 0.1.0 published at 1970-01-01T00:00:00Z (timestamp 0) must be accepted (<= 0),
+    // 1.0.0 and 2.0.0 must be excluded.
+    let proj_epoch = tmp.path().join("proj-epoch");
+    std::fs::create_dir_all(&proj_epoch).unwrap();
+    std::fs::write(
+        proj_epoch.join("package.json"),
+        format!(r#"{{"name":"test-app","dependencies":{{"{pkg_name}":"*"}}}}"#),
+    ).unwrap();
 
-    // With cutoff set, missing "time" should be handled gracefully without error
-    let options = InstallOptions {
-        project_dir: project_dir.clone(),
+    let options_epoch = InstallOptions {
+        project_dir: proj_epoch.clone(),
         registry_url: Some(server.url()),
-        cache_dir: Some(cache_dir),
-        before_cutoff: Some(1000000000), // Some cutoff
+        cache_dir: Some(cache_dir.clone()),
+        config_override: Some(test_config()),
+        before_cutoff: Some(0), // Epoch cutoff
         ignore_scripts: true,
         ..Default::default()
     };
-    let mut installer = Installer::new(options).unwrap();
-    installer.run().await.expect("Missing time object must be handled gracefully");
+    let mut installer_epoch = Installer::new(options_epoch).unwrap();
+    installer_epoch.run().await.expect("Install with epoch cutoff must succeed");
 
-    let installed_pkg_json = project_dir.join("node_modules").join(pkg_name).join("package.json");
-    assert!(installed_pkg_json.exists(), "Package must be installed even when time metadata is absent");
+    let epoch_pkg_json = proj_epoch.join("node_modules").join(pkg_name).join("package.json");
+    let content_epoch = std::fs::read_to_string(&epoch_pkg_json).unwrap();
+    assert!(
+        content_epoch.contains("\"version\":\"0.1.0\""),
+        "Epoch cutoff (Some(0)) must resolve 0.1.0 (published at 0ms): {content_epoch}"
+    );
+
+    // (B) Far-future cutoff (e.g. year 2100):
+    // All versions are accepted, resolves to highest/latest (2.0.0).
+    let proj_future = tmp.path().join("proj-future");
+    std::fs::create_dir_all(&proj_future).unwrap();
+    std::fs::write(
+        proj_future.join("package.json"),
+        format!(r#"{{"name":"test-app","dependencies":{{"{pkg_name}":"*"}}}}"#),
+    ).unwrap();
+
+    let options_future = InstallOptions {
+        project_dir: proj_future.clone(),
+        registry_url: Some(server.url()),
+        cache_dir: Some(cache_dir.clone()),
+        config_override: Some(test_config()),
+        before_cutoff: Some(4_102_444_800_000), // 2100-01-01
+        ignore_scripts: true,
+        ..Default::default()
+    };
+    let mut installer_future = Installer::new(options_future).unwrap();
+    installer_future.run().await.expect("Install with future cutoff must succeed");
+
+    let future_pkg_json = proj_future.join("node_modules").join(pkg_name).join("package.json");
+    let content_future = std::fs::read_to_string(&future_pkg_json).unwrap();
+    assert!(
+        content_future.contains("\"version\":\"2.0.0\""),
+        "Future cutoff must resolve latest 2.0.0: {content_future}"
+    );
+
+    // (C) Missing "time" object in packument handled gracefully:
+    let no_time_pkg = "no-time-pkg";
+    let tgz_notime = create_tarball(no_time_pkg, "1.0.0");
+    let (int_notime, _) = compute_integrity(&tgz_notime);
+    let tgz_notime_clone = tgz_notime.clone();
+
+    let server_notime = MockRegistryServer::start(move |_method, path, _headers, base_url| {
+        if path == format!("/{no_time_pkg}") {
+            let json = serde_json::json!({
+                "name": no_time_pkg,
+                "dist-tags": { "latest": "1.0.0" },
+                // NO "time" object!
+                "versions": {
+                    "1.0.0": {
+                        "name": no_time_pkg,
+                        "version": "1.0.0",
+                        "dist": {
+                            "tarball": format!("{base_url}/{no_time_pkg}/-/{no_time_pkg}-1.0.0.tgz"),
+                            "integrity": int_notime
+                        }
+                    }
+                }
+            });
+            Some((200, vec![("Content-Type", "application/json".to_string())], json.to_string().into_bytes()))
+        } else if path == format!("/{no_time_pkg}/-/{no_time_pkg}-1.0.0.tgz") {
+            Some((200, vec![("Content-Type", "application/octet-stream".to_string())], tgz_notime_clone.clone()))
+        } else {
+            None
+        }
+    });
+
+    let proj_notime = tmp.path().join("proj-notime");
+    std::fs::create_dir_all(&proj_notime).unwrap();
+    std::fs::write(
+        proj_notime.join("package.json"),
+        format!(r#"{{"name":"test-app","dependencies":{{"{no_time_pkg}":"*"}}}}"#),
+    ).unwrap();
+
+    let options_notime = InstallOptions {
+        project_dir: proj_notime.clone(),
+        registry_url: Some(server_notime.url()),
+        cache_dir: Some(cache_dir),
+        config_override: Some(test_config()),
+        before_cutoff: Some(1_000_000_000),
+        ignore_scripts: true,
+        ..Default::default()
+    };
+    let mut installer_notime = Installer::new(options_notime).unwrap();
+    installer_notime.run().await.expect("Missing time object must be handled gracefully");
+
+    let notime_pkg_json = proj_notime.join("node_modules").join(no_time_pkg).join("package.json");
+    assert!(notime_pkg_json.exists(), "Package must be installed even when time metadata is absent");
 }
 
 /// 7. Test min-release-age-exclude with scoped wildcard `@scope/*` and exact package names:
@@ -768,6 +888,7 @@ async fn test_min_release_age_exclude_scope_and_exact() {
         project_dir: project_dir.clone(),
         registry_url: Some(server.url()),
         cache_dir: Some(cache_dir),
+        config_override: Some(test_config()),
         before_cutoff: Some(cutoff_ms),
         min_release_age_exclude: vec!["@mycorp/*".to_string(), "exact-exempt".to_string()],
         ignore_scripts: true,
@@ -866,6 +987,7 @@ async fn test_dist_tags_filtered_by_before_date() {
         project_dir: project_dir.clone(),
         registry_url: Some(server.url()),
         cache_dir: Some(cache_dir),
+        config_override: Some(test_config()),
         before_cutoff: Some(cutoff_ms),
         ignore_scripts: true,
         ..Default::default()

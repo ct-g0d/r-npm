@@ -9,15 +9,6 @@ pub fn parse_js_date(input: &str) -> Option<i64> {
     if s.is_empty() {
         return None;
     }
-    // Epoch or numeric millisecond timestamp string (e.g. "0" or "1700000000000", but not 4-digit year like "2020")
-    if s == "0" {
-        return Some(0);
-    }
-    if s.len() != 4 && (s.starts_with('-') || s.chars().all(|c| c.is_ascii_digit())) {
-        if let Ok(ms) = s.parse::<i64>() {
-            return Some(ms);
-        }
-    }
 
     let (date, time) = match s.find(['T', 't', ' ']) {
         Some(i) => (&s[..i], Some(&s[i + 1..])),
@@ -260,9 +251,10 @@ mod tests {
 
     #[test]
     fn parses_utc_forms() {
-        assert_eq!(parse_js_date("0"), Some(0));
-        assert_eq!(parse_js_date("1700000000000"), Some(1_700_000_000_000));
-        assert_eq!(parse_js_date("-1000"), Some(-1000));
+        assert_eq!(parse_js_date("0"), None);
+        assert_eq!(parse_js_date("1700000000000"), None);
+        assert_eq!(parse_js_date("-1000"), None);
+        assert_eq!(parse_js_date("1970"), Some(0));
         assert_eq!(parse_js_date("1970-01-01T00:00:00.000Z"), Some(0));
         assert_eq!(parse_js_date("1970-01-02"), Some(DAY_MS));
         assert_eq!(parse_js_date("2020-06-01"), Some(1_590_969_600_000));

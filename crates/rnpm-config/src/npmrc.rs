@@ -900,10 +900,11 @@ pub fn is_sensitive_credential_key(key: &str) -> bool {
 
 /// Masks a credential for display (e.g. "npm_1234567890abcdef" -> "npm_***cdef").
 pub fn mask_credential(token: &str) -> String {
-    if token.is_empty() {
+    let char_count = token.chars().count();
+    if char_count == 0 {
         return String::new();
     }
-    if token.len() <= 6 {
+    if char_count <= 6 {
         return "[REDACTED]".to_string();
     }
     let prefix = if token.starts_with("npm_") {
@@ -913,7 +914,9 @@ pub fn mask_credential(token: &str) -> String {
     } else {
         "***"
     };
-    let tail = &token[token.len().saturating_sub(4)..];
+    let skip_count = char_count.saturating_sub(4);
+    let tail_start = token.char_indices().nth(skip_count).map(|(i, _)| i).unwrap_or(0);
+    let tail = &token[tail_start..];
     format!("{prefix}{tail}")
 }
 
@@ -966,32 +969,61 @@ fn replace_basic_auth(text: &str) -> String {
 fn replace_url_credentials(text: &str) -> String {
     let mut out = String::new();
     let mut last_idx = 0;
+    let mut curr_idx = 0;
 
-    for scheme in &["http://", "https://"] {
-        let mut search_idx = last_idx;
-        while let Some(scheme_idx) = text[search_idx..].find(scheme) {
-            let abs_scheme_idx = search_idx + scheme_idx;
-            let after_scheme = &text[abs_scheme_idx + scheme.len()..];
-            let end_auth = after_scheme.find(|c: char| c == '/' || c.is_whitespace() || c == '"' || c == '\'');
-            let auth_slice = match end_auth {
-                Some(len) => &after_scheme[..len],
-                None => after_scheme,
-            };
-            if let Some(at_idx) = auth_slice.find('@') {
-                let userinfo = &auth_slice[..at_idx];
-                out.push_str(&text[last_idx..abs_scheme_idx + scheme.len()]);
-                if let Some((user, _pass)) = userinfo.split_once(':') {
-                    out.push_str(user);
-                    out.push_str(":[REDACTED]");
+    while curr_idx < text.len() {
+        let next_http = text[curr_idx..].find("http://").map(|i| curr_idx + i);
+        let next_https = text[curr_idx..].find("https://").map(|i| curr_idx + i);
+
+        let next_match = match (next_http, next_https) {
+            (Some(i1), Some(i2)) => {
+                if i1 < i2 {
+                    Some((i1, "http://"))
                 } else {
-                    out.push_str("[REDACTED]");
+                    Some((i2, "https://"))
                 }
-                out.push('@');
-                last_idx = abs_scheme_idx + scheme.len() + at_idx + 1;
-                search_idx = last_idx;
-            } else {
-                search_idx = abs_scheme_idx + scheme.len();
             }
+            (Some(i1), None) => Some((i1, "http://")),
+            (None, Some(i2)) => Some((i2, "https://")),
+            (None, None) => None,
+        };
+
+        let Some((abs_scheme_idx, scheme)) = next_match else {
+            break;
+        };
+
+        let after_scheme_idx = abs_scheme_idx + scheme.len();
+        let after_scheme = &text[after_scheme_idx..];
+        let end_auth = after_scheme.find(|c: char| {
+            c == '/'
+                || c == '?'
+                || c == '#'
+                || c.is_whitespace()
+                || c == '"'
+                || c == '\''
+                || c == '\\'
+                || c == '\n'
+                || c == '\r'
+        });
+        let auth_slice = match end_auth {
+            Some(len) => &after_scheme[..len],
+            None => after_scheme,
+        };
+
+        if let Some(at_idx) = auth_slice.find('@') {
+            let userinfo = &auth_slice[..at_idx];
+            out.push_str(&text[last_idx..after_scheme_idx]);
+            if let Some((user, _pass)) = userinfo.split_once(':') {
+                out.push_str(user);
+                out.push_str(":[REDACTED]");
+            } else {
+                out.push_str("[REDACTED]");
+            }
+            out.push('@');
+            last_idx = after_scheme_idx + at_idx + 1;
+            curr_idx = last_idx;
+        } else {
+            curr_idx = after_scheme_idx;
         }
     }
     out.push_str(&text[last_idx..]);
@@ -1053,21 +1085,52 @@ fn replace_kv_pairs(text: &str, key_name: &str) -> String {
             }
             let val_start = chars.peek().map(|&(i, _)| i).unwrap_or(after_key.len());
             let val_slice = &after_key[val_start..];
-            let end_token = val_slice
-                .find(|c: char| {
-                    c.is_whitespace()
-                        || c == ';'
-                        || c == '&'
-                        || c == '"'
-                        || c == '\''
-                        || c == '\n'
-                        || c == '\r'
-                })
-                .unwrap_or(val_slice.len());
+            if val_slice.starts_with('"') || val_slice.starts_with('\'') {
+                let quote = val_slice.chars().next().unwrap();
+                let inner = &val_slice[1..];
+                let mut closing_offset = None;
+                let mut escaped = false;
+                for (ci, ch) in inner.char_indices() {
+                    if escaped {
+                        escaped = false;
+                        continue;
+                    }
+                    if ch == '\\' {
+                        escaped = true;
+                    } else if ch == quote {
+                        closing_offset = Some(ci);
+                        break;
+                    } else if ch == '\n' || ch == '\r' {
+                        break;
+                    }
+                }
+                let (val_len, replacement) = match closing_offset {
+                    Some(end_q) => (1 + end_q + 1, format!("{quote}[REDACTED]{quote}")),
+                    None => {
+                        let end_line = val_slice
+                            .find(['\n', '\r'])
+                            .unwrap_or(val_slice.len());
+                        (end_line, format!("{quote}[REDACTED]{quote}"))
+                    }
+                };
+                out.push_str(&text[last_idx..idx + key_name.len() + val_start]);
+                out.push_str(&replacement);
+                last_idx = idx + key_name.len() + val_start + val_len;
+            } else {
+                let end_token = val_slice
+                    .find(|c: char| {
+                        c.is_whitespace()
+                            || c == ';'
+                            || c == '&'
+                            || c == '\n'
+                            || c == '\r'
+                    })
+                    .unwrap_or(val_slice.len());
 
-            out.push_str(&text[last_idx..idx + key_name.len() + val_start]);
-            out.push_str("[REDACTED]");
-            last_idx = idx + key_name.len() + val_start + end_token;
+                out.push_str(&text[last_idx..idx + key_name.len() + val_start]);
+                out.push_str("[REDACTED]");
+                last_idx = idx + key_name.len() + val_start + end_token;
+            }
         }
     }
     out.push_str(&text[last_idx..]);
@@ -1131,11 +1194,12 @@ impl NoProxyRule {
             }
         }
 
-        // Check for IPv6 bracketed with port: [::1]:8080
+        // Check for IPv6 bracketed with port: [::1]:8080 or [::1]
         if let Some(stripped) = trimmed.strip_prefix('[') {
             if let Some((ip_str, rest)) = stripped.split_once(']') {
                 let port = rest.strip_prefix(':').and_then(|p| p.parse::<u16>().ok());
-                if let Ok(ip) = ip_str.parse::<IpAddr>() {
+                let clean_ip = ip_str.trim();
+                if let Ok(ip) = clean_ip.parse::<IpAddr>() {
                     return Some(Self::ExactIp { ip, port });
                 }
             }
@@ -1153,7 +1217,8 @@ impl NoProxyRule {
         };
 
         // Check if host_part is an exact IP
-        if let Ok(ip) = host_part.parse::<IpAddr>() {
+        let clean_host = host_part.trim().trim_start_matches('[').trim_end_matches(']');
+        if let Ok(ip) = clean_host.parse::<IpAddr>() {
             return Some(Self::ExactIp { ip, port });
         }
 
@@ -1176,9 +1241,10 @@ impl NoProxyRule {
 
     fn parse_cidr(cidr: &str, port: Option<u16>) -> Option<Self> {
         let (ip_str, prefix_str) = cidr.split_once('/')?;
+        let clean_ip_str = ip_str.trim().trim_start_matches('[').trim_end_matches(']');
         let prefix_len = prefix_str.parse::<u32>().ok()?;
 
-        if let Ok(ipv4) = ip_str.parse::<Ipv4Addr>() {
+        if let Ok(ipv4) = clean_ip_str.parse::<Ipv4Addr>() {
             if prefix_len > 32 {
                 return None;
             }
@@ -1195,7 +1261,7 @@ impl NoProxyRule {
             });
         }
 
-        if let Ok(ipv6) = ip_str.parse::<Ipv6Addr>() {
+        if let Ok(ipv6) = clean_ip_str.parse::<Ipv6Addr>() {
             if prefix_len > 128 {
                 return None;
             }
@@ -1216,13 +1282,14 @@ impl NoProxyRule {
     }
 
     pub fn matches(&self, host: &str, port: Option<u16>) -> bool {
+        let clean_host = host.trim().trim_start_matches('[').trim_end_matches(']');
         match self {
             Self::All => true,
             Self::ExactIp { ip, port: rule_port } => {
                 if rule_port.is_some() && *rule_port != port {
                     return false;
                 }
-                if let Ok(target_ip) = host.parse::<IpAddr>() {
+                if let Ok(target_ip) = clean_host.parse::<IpAddr>() {
                     target_ip == *ip
                 } else {
                     false
@@ -1232,7 +1299,7 @@ impl NoProxyRule {
                 if rule_port.is_some() && *rule_port != port {
                     return false;
                 }
-                if let Ok(target_ip) = host.parse::<Ipv4Addr>() {
+                if let Ok(target_ip) = clean_host.parse::<Ipv4Addr>() {
                     (u32::from(target_ip) & mask) == *network
                 } else {
                     false
@@ -1242,7 +1309,7 @@ impl NoProxyRule {
                 if rule_port.is_some() && *rule_port != port {
                     return false;
                 }
-                if let Ok(target_ip) = host.parse::<Ipv6Addr>() {
+                if let Ok(target_ip) = clean_host.parse::<Ipv6Addr>() {
                     (u128::from(target_ip) & mask) == *network
                 } else {
                     false
@@ -1252,13 +1319,13 @@ impl NoProxyRule {
                 if rule_port.is_some() && *rule_port != port {
                     return false;
                 }
-                let clean_host = host.trim_end_matches('.').to_ascii_lowercase();
+                let host_domain = clean_host.trim_end_matches('.').to_ascii_lowercase();
                 let clean_suffix = suffix.trim_start_matches('.').to_ascii_lowercase();
 
-                if clean_host == clean_suffix {
+                if host_domain == clean_suffix {
                     return true;
                 }
-                if clean_host.ends_with(&format!(".{clean_suffix}")) {
+                if host_domain.ends_with(&format!(".{clean_suffix}")) {
                     return true;
                 }
                 false

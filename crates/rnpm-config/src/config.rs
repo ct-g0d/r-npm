@@ -169,15 +169,16 @@ impl Config {
             Some(h) => h,
             None => return false,
         };
-        if host == "localhost"
-            || host == "127.0.0.1"
-            || host == "::1"
-            || host.ends_with(".localhost")
+        let clean_host = host.trim().trim_start_matches('[').trim_end_matches(']');
+        if clean_host == "localhost"
+            || clean_host == "127.0.0.1"
+            || clean_host == "::1"
+            || clean_host.ends_with(".localhost")
         {
             return true;
         }
         let port = url.port_or_known_default();
-        self.no_proxy_matcher().matches(host, port)
+        self.no_proxy_matcher().matches(clean_host, port)
     }
 
     /// Parse `min-release-age` config (in days) into a UTC cutoff timestamp

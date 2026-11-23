@@ -1289,3 +1289,91 @@ fn test_malformed_npmrc_lines_and_null_bytes() {
     // Null byte in content
     assert!(Npmrc::parse("key=val\0ue").is_err());
 }
+
+#[test]
+fn test_url_credentials_linear_order_scrubbing() {
+    use crate::npmrc::scrub_credentials;
+
+    // Both orders: https followed by http, and http followed by https
+    let text1 = "https://user1:pass1@secure.example.com/api and http://user2:pass2@plain.example.com/api";
+    let scrubbed1 = scrub_credentials(text1);
+    assert!(!scrubbed1.contains("pass1"), "pass1 must be scrubbed");
+    assert!(!scrubbed1.contains("pass2"), "pass2 must be scrubbed");
+    assert!(scrubbed1.contains("https://user1:[REDACTED]@secure.example.com/api"));
+    assert!(scrubbed1.contains("http://user2:[REDACTED]@plain.example.com/api"));
+
+    let text2 = "http://userA:passA@plain.example.com/api and https://userB:passB@secure.example.com/api";
+    let scrubbed2 = scrub_credentials(text2);
+    assert!(!scrubbed2.contains("passA"), "passA must be scrubbed");
+    assert!(!scrubbed2.contains("passB"), "passB must be scrubbed");
+    assert!(scrubbed2.contains("http://userA:[REDACTED]@plain.example.com/api"));
+    assert!(scrubbed2.contains("https://userB:[REDACTED]@secure.example.com/api"));
+}
+
+#[test]
+fn test_quoted_kv_scrubbing() {
+    use crate::npmrc::scrub_credentials;
+
+    // Double quoted value
+    let raw_double = "password=\"secret_pass_123\" and foo=\"bar\"";
+    let scrubbed_double = scrub_credentials(raw_double);
+    assert!(!scrubbed_double.contains("secret_pass_123"), "Secret password inside double quotes must not leak: {scrubbed_double}");
+    assert!(scrubbed_double.contains("password=\"[REDACTED]\""));
+    assert!(scrubbed_double.contains("foo=\"bar\""));
+
+    // Single quoted value
+    let raw_single = "password='secret_pass_456' and key=value";
+    let scrubbed_single = scrub_credentials(raw_single);
+    assert!(!scrubbed_single.contains("secret_pass_456"), "Secret password inside single quotes must not leak: {scrubbed_single}");
+    assert!(scrubbed_single.contains("password='[REDACTED]'"));
+    assert!(scrubbed_single.contains("key=value"));
+
+    // Colon separator with quotes
+    let raw_colon = "_auth: \"secret_token_abc\"";
+    let scrubbed_colon = scrub_credentials(raw_colon);
+    assert!(!scrubbed_colon.contains("secret_token_abc"));
+    assert!(scrubbed_colon.contains("_auth: \"[REDACTED]\""));
+}
+
+#[test]
+fn test_mask_credential_utf8_multibyte() {
+    use crate::npmrc::mask_credential;
+
+    // Standard ASCII
+    assert_eq!(mask_credential("npm_1234567890abcdef"), "npm_***cdef");
+    assert_eq!(mask_credential("ghp_1234567890"), "ghp_***7890");
+    assert_eq!(mask_credential("short"), "[REDACTED]");
+    assert_eq!(mask_credential(""), "");
+
+    // Multi-byte UTF-8 characters: must not panic on char boundary slicing
+    let multi_byte1 = "secret_🔑";
+    let masked1 = mask_credential(multi_byte1);
+    assert!(masked1.contains("🔑"), "Masked multi-byte string must preserve trailing char: {masked1}");
+
+    let multi_byte2 = "ghp_1234你好";
+    let masked2 = mask_credential(multi_byte2);
+    assert!(masked2.starts_with("ghp_***"));
+    assert!(masked2.ends_with("34你好"));
+}
+
+#[test]
+fn test_bracketed_ipv6_no_proxy() {
+    use crate::npmrc::NoProxyMatcher;
+
+    // Matcher with bracketed and CIDR IPv6 rules
+    let matcher = NoProxyMatcher::parse("[::1], [::1]:8080, ::1/128, fd00::/8");
+
+    // Match against bracketed URL host
+    let url_bracketed = Url::parse("http://[::1]:8080/path").unwrap();
+    assert!(matcher.matches_url(&url_bracketed));
+
+    // Match against bracketed host string directly
+    assert!(matcher.matches("[::1]", Some(8080)));
+    assert!(matcher.matches("::1", Some(8080)));
+    assert!(matcher.matches("[::1]", Some(9000))); // matched by ::1/128 or [::1]
+
+    // Config helper should_bypass_proxy with bracketed IPv6
+    let cfg = Config::default();
+    let local_v6 = Url::parse("http://[::1]:3000/").unwrap();
+    assert!(cfg.should_bypass_proxy(&local_v6), "http://[::1]:3000/ must bypass proxy");
+}

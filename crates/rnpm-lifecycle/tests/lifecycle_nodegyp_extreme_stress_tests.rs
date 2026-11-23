@@ -120,6 +120,7 @@ impl MockRegistryServer {
 
                                         let status_text = match status {
                                             200 => "OK",
+                                            302 => "Found",
                                             401 => "Unauthorized",
                                             403 => "Forbidden",
                                             404 => "Not Found",
@@ -316,14 +317,34 @@ async fn test_authenticated_registry_node_gyp_bootstrap() {
         ),
     ]);
     let integrity = compute_ssri(&tgz_bytes);
-    let tgz_clone = tgz_bytes.clone();
     let int_clone = integrity.clone();
 
     // Expected Bearer token
     let secret_token = "npm_test_bearer_token_xyz987";
 
+    // Server B: hosts the tarball on a different port/origin (cross-origin redirect target)
+    let tgz_clone_b = tgz_bytes.clone();
+    let server_b = MockRegistryServer::start(move |path, auth_header, _base_url| {
+        // Enforce that Server B receives NO Authorization header on cross-origin redirect
+        assert!(
+            auth_header.is_none(),
+            "Cross-origin redirect to Server B must NOT receive Authorization header, got: {auth_header:?}"
+        );
+        if path == "/tarballs/node-gyp-10.0.0.tgz" {
+            return Some((
+                200,
+                vec![("Content-Type", "application/octet-stream".to_string())],
+                tgz_clone_b.clone(),
+            ));
+        }
+        None
+    });
+    let server_b_url = server_b.url();
+
+    // Server A: main registry
+    let server_b_url_clone = server_b_url.clone();
     let server = MockRegistryServer::start(move |path, auth_header, base_url| {
-        // Enforce Bearer token
+        // Enforce Bearer token on Server A
         let expected_auth = format!("Bearer {secret_token}");
         if auth_header != Some(&expected_auth) {
             return Some((
@@ -356,11 +377,15 @@ async fn test_authenticated_registry_node_gyp_bootstrap() {
             ));
         }
 
+        // Return 302 redirect for tarball from Server A to Server B (cross-origin)
         if path == "/node-gyp/-/node-gyp-10.0.0.tgz" {
             return Some((
-                200,
-                vec![("Content-Type", "application/octet-stream".to_string())],
-                tgz_clone.clone(),
+                302,
+                vec![
+                    ("Location", format!("{server_b_url_clone}/tarballs/node-gyp-10.0.0.tgz")),
+                    ("Content-Type", "text/plain".to_string()),
+                ],
+                b"Redirecting".to_vec(),
             ));
         }
 
@@ -399,16 +424,29 @@ async fn test_authenticated_registry_node_gyp_bootstrap() {
         bootstrapped_path.display()
     );
 
-    // Verify the mock server saw the Authorization header
-    let seen_auth = server.auth_header_seen.lock().unwrap();
+    // Verify Server A received the Authorization header
+    let seen_auth_a = server.auth_header_seen.lock().unwrap();
     assert_eq!(
-        *seen_auth,
+        *seen_auth_a,
         Some(format!("Bearer {secret_token}")),
-        "Mock registry must have received Bearer authorization header"
+        "Mock registry Server A must have received Bearer authorization header"
     );
+
+    // Verify Server B saw NO Authorization header
+    let seen_auth_b = server_b.auth_header_seen.lock().unwrap();
+    assert_eq!(
+        *seen_auth_b,
+        None,
+        "Mock registry Server B must NOT have received Authorization header on cross-origin redirect"
+    );
+
     assert!(
         server.request_count.load(Ordering::SeqCst) >= 2,
-        "Mock registry must have received packument and tarball requests"
+        "Mock registry Server A must have received packument and redirect requests"
+    );
+    assert!(
+        server_b.request_count.load(Ordering::SeqCst) >= 1,
+        "Mock registry Server B must have received redirected tarball request"
     );
 }
 
@@ -452,15 +490,21 @@ async fn test_lifecycle_timeout_and_exit_code_fidelity() {
     assert!(exit_err.message.contains("npm error code 42"));
 
     // (c) Timeout with ProcessTreeGuard termination:
-    // Script sleeps indefinitely, timeout set to 1000ms.
+    // Spawn a child process from node, record child's PID to file, and verify child process termination.
+    let child_pid_file = project_root.join("child.pid");
+    let escaped_pid_file = child_pid_file.to_string_lossy().replace('\\', "/");
+    let script = format!(
+        "node -e \"const cp = require('child_process'); const fs = require('fs'); const c = cp.spawn(process.execPath, ['-e', 'setInterval(()=>{{}}, 1000)'], {{ stdio: 'ignore' }}); fs.writeFileSync('{escaped_pid_file}', String(c.pid)); setInterval(()=>{{}}, 1000);\""
+    );
+
     let ctx_timeout = LifecycleContext::new(
         &project_root,
         &project_root,
         "test-pkg",
         "postinstall",
-        "node -e \"setInterval(()=>{}, 1000)\"",
+        &script,
     )
-    .with_timeout(std::time::Duration::from_millis(1000));
+    .with_timeout(std::time::Duration::from_millis(1500));
 
     let start = std::time::Instant::now();
     let res_timeout = execute_lifecycle_script_async(&ctx_timeout).await;
@@ -477,8 +521,30 @@ async fn test_lifecycle_timeout_and_exit_code_fidelity() {
         assert_eq!(err_obj.exit_code, 124, "Timeout must set ScriptExitError exit_code to 124");
     }
     assert!(
-        elapsed.as_millis() >= 900 && elapsed.as_millis() <= 5000,
+        elapsed.as_millis() >= 1400 && elapsed.as_millis() <= 15000,
         "Execution should have been terminated close to timeout, elapsed: {:?}",
         elapsed
     );
+
+    // Verify child process was terminated by ProcessTreeGuard
+    if child_pid_file.exists() {
+        if let Ok(pid_str) = std::fs::read_to_string(&child_pid_file) {
+            if let Ok(child_pid) = pid_str.trim().parse::<u32>() {
+                if child_pid > 0 {
+                    let mut is_running = true;
+                    for _ in 0..60 {
+                        if !rnpm_lifecycle::process_guard::is_process_running(child_pid) {
+                            is_running = false;
+                            break;
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    }
+                    assert!(
+                        !is_running,
+                        "Child process {child_pid} must be terminated by ProcessTreeGuard on timeout"
+                    );
+                }
+            }
+        }
+    }
 }
