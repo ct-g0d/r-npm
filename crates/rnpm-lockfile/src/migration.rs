@@ -276,12 +276,16 @@ fn enrich_packages_from_legacy(
             }
             pkg.normalize_flags();
         } else {
-            // Missing from packages map in v2: inflate from legacy dependency
+            // Missing from packages map in v2: inflate from legacy dependency.
+            // Insert missing paths only to preserve valid child metadata
+            // (e.g. version, bin, hasInstallScript) that already exists in `packages`.
             let mut sub_map = BTreeMap::new();
             let mut single_dep = BTreeMap::new();
             single_dep.insert(dep_name.clone(), dep.clone());
             flatten_legacy_dependencies(parent_path, &single_dep, &mut sub_map);
-            packages.append(&mut sub_map);
+            for (path, pkg) in sub_map {
+                packages.entry(path).or_insert(pkg);
+            }
         }
 
         if let Some(child_deps) = &dep.dependencies {
@@ -494,4 +498,99 @@ pub fn parse_and_migrate(json_str: &str) -> Result<LockfileV3, LockfileError> {
 pub fn load_and_migrate(path: &Path) -> Result<LockfileV3, LockfileError> {
     let content = fs::read_to_string(path)?;
     parse_and_migrate(&content)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::PackageBin;
+
+    #[test]
+    fn test_v2_migration_preserves_child_metadata_when_parent_missing() {
+        let v2_json = r#"{
+            "name": "test-app",
+            "version": "1.0.0",
+            "lockfileVersion": 2,
+            "requires": true,
+            "packages": {
+                "": {
+                    "name": "test-app",
+                    "version": "1.0.0",
+                    "dependencies": {
+                        "parent-pkg": "^1.0.0"
+                    }
+                },
+                "node_modules/parent-pkg/node_modules/child-pkg": {
+                    "version": "2.5.0",
+                    "resolved": "https://registry.npmjs.org/child-pkg/-/child-pkg-2.5.0.tgz",
+                    "integrity": "sha512-child512",
+                    "bin": {
+                        "child-cli": "bin/cli.js"
+                    },
+                    "hasInstallScript": true
+                }
+            },
+            "dependencies": {
+                "parent-pkg": {
+                    "version": "1.0.0",
+                    "resolved": "https://registry.npmjs.org/parent-pkg/-/parent-pkg-1.0.0.tgz",
+                    "integrity": "sha512-parent512",
+                    "dependencies": {
+                        "child-pkg": {
+                            "version": "2.0.0",
+                            "resolved": "https://registry.npmjs.org/child-pkg/-/child-pkg-2.0.0.tgz",
+                            "integrity": "sha512-child-legacy512"
+                        },
+                        "child-two": {
+                            "version": "1.2.0",
+                            "resolved": "https://registry.npmjs.org/child-two/-/child-two-1.2.0.tgz",
+                            "integrity": "sha512-childtwo512"
+                        }
+                    }
+                }
+            }
+        }"#;
+
+        let migrated = parse_and_migrate(v2_json).expect("migration must succeed");
+        assert_eq!(migrated.lockfile_version, 3);
+
+        // Missing parent should be inflated from legacy dependencies
+        let parent = migrated
+            .packages
+            .get("node_modules/parent-pkg")
+            .expect("parent-pkg must be inflated from legacy dependencies");
+        assert_eq!(parent.version.as_deref(), Some("1.0.0"));
+
+        // Valid child package metadata already in packages must be preserved
+        let child = migrated
+            .packages
+            .get("node_modules/parent-pkg/node_modules/child-pkg")
+            .expect("child-pkg must be present");
+        assert_eq!(
+            child.version.as_deref(),
+            Some("2.5.0"),
+            "child version must be preserved from packages rather than overwritten by legacy"
+        );
+        assert_eq!(
+            child.bin,
+            Some(PackageBin::Map(
+                [("child-cli".to_string(), "bin/cli.js".to_string())]
+                    .into_iter()
+                    .collect()
+            )),
+            "child bin must be preserved from packages"
+        );
+        assert_eq!(
+            child.has_install_script,
+            Some(true),
+            "child hasInstallScript must be preserved from packages"
+        );
+
+        // Sibling child that was missing from packages must be inserted from legacy dependencies
+        let child_two = migrated
+            .packages
+            .get("node_modules/parent-pkg/node_modules/child-two")
+            .expect("missing sibling child-two must be inserted from legacy dependencies");
+        assert_eq!(child_two.version.as_deref(), Some("1.2.0"));
+    }
 }
