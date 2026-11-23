@@ -21,7 +21,12 @@ pub fn to_verbatim_path(path: &Path) -> PathBuf {
 
         // If it already has verbatim prefix, check if already clean
         if path_str.starts_with(r"\\?\") || path_str.starts_with(r"\??\") {
-            if !path_str.contains('/') && !path_str.contains("..") && !path_str.contains(r"\.\") {
+            if !path_str.contains('/')
+                && !path_str.contains("..")
+                && !path_str.contains(r"\.\")
+                && !path_str.ends_with(r"\.")
+                && (path_str.len() <= 4 || !path_str[4..].contains(r"\\"))
+            {
                 return path.to_path_buf();
             }
             let normalized = path_str.replace('/', "\\");
@@ -44,17 +49,21 @@ pub fn to_verbatim_path(path: &Path) -> PathBuf {
             && !path_str.contains('/')
             && !path_str.contains("..")
             && !path_str.contains(r"\.\")
+            && !path_str.ends_with(r"\.")
+            && !path_str[3..].contains(r"\\")
         {
             return PathBuf::from(format!(r"\\?\{path_str}"));
         }
 
         // Make path absolute if relative so verbatim path has a valid root
-        let abs_path = if path.is_relative() {
-            if let Ok(cwd) = std::env::current_dir() {
-                cwd.join(path)
-            } else {
-                path.to_path_buf()
-            }
+        let abs_path = if path.is_relative() || !path.has_root() {
+            std::path::absolute(path).unwrap_or_else(|_| {
+                if let Ok(cwd) = std::env::current_dir() {
+                    cwd.join(path)
+                } else {
+                    path.to_path_buf()
+                }
+            })
         } else {
             path.to_path_buf()
         };
