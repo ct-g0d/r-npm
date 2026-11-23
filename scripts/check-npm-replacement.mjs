@@ -1014,5 +1014,25 @@ for(const c of cases){
 const git=(...args)=>execFileSync('git',args,{cwd:repo,encoding:'utf8'}).trim();
 const expectedCases=cases.filter(c=>matchesCase(c.name)).length;
 write(path.dirname(output),path.basename(output),{head:git('rev-parse','HEAD'),binary_revision:option('--binary-revision',null),source_dirty:git('status','--porcelain','--untracked-files=no')!=='',binary_sha256:createHash('sha256').update(fs.readFileSync(binary)).digest('hex'),node:process.version,npm:execFileSync(process.execPath,[npmCli,'--version'],{env:oracleEnv,encoding:'utf8'}).trim(),platform:process.platform,root,expected_cases:expectedCases,normalization:'Fixture/config paths (including JSON escaping), loopback registry origin, CRLF, elapsed summary/ping times, and diagnostic log timestamps. JSON file key order ignored; all fields retained. Full normalized stream hashes retained; streams over 16KB truncated in this report, with complete raw streams in root/logs. Only npm/Node internal JavaScript stack frames removed; error messages and properties retained.',results});
+const diffs=results.filter(r=>!r.match);
+if(diffs.length>0){
+  console.log(`--- DIFF SUMMARY (${diffs.length}) ---`);
+  for(const d of diffs){
+    const cmp=d.comparison||{};
+    const reasons=[];
+    if(cmp.exit===false)reasons.push(`exit npm=${d.npm?.exit} rnpm=${d.rnpm?.exit}`);
+    if(cmp.stdout===false)reasons.push(`stdout npm=${JSON.stringify((d.npm?.stdout||'').slice(0,160))} rnpm=${JSON.stringify((d.rnpm?.stdout||'').slice(0,160))}`);
+    if(cmp.stderr===false)reasons.push(`stderr npm=${JSON.stringify((d.npm?.stderr||'').slice(0,160))} rnpm=${JSON.stringify((d.rnpm?.stderr||'').slice(0,160))}`);
+    if(cmp.files===false){
+      const af=d.npm?.files||{},bf=d.rnpm?.files||{};
+      const keys=[...new Set([...Object.keys(af),...Object.keys(bf)])].sort();
+      const bad=keys.filter(k=>stable(af[k])!==stable(bf[k])).slice(0,3);
+      reasons.push(`files[${bad.join(', ')}] npm=${JSON.stringify(af[bad[0]])?.slice(0,120)} rnpm=${JSON.stringify(bf[bad[0]])?.slice(0,120)}`);
+    }
+    if(cmp.mutations===false)reasons.push('mutations mismatch');
+    if(cmp.observation===false)reasons.push(`obs npm=${JSON.stringify(d.npm?.observation)?.slice(0,120)} rnpm=${JSON.stringify(d.rnpm?.observation)?.slice(0,120)}`);
+    console.log(`FAIL ${d.name} ${JSON.stringify(cmp)} | ${reasons.join(' ; ')}`);
+  }
+}
 console.log(`Evidence: ${output}; ${results.filter(r=>r.match).length}/${results.length} match`);
 process.exitCode=results.length>0&&results.length===expectedCases&&results.every(r=>r.match)?0:1;
