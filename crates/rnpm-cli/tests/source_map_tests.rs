@@ -257,9 +257,19 @@ fn test_source_map_11_cmd_shim() {
     fs::write(&target_js, "#!/usr/bin/env node\nconsole.log('hi');").unwrap();
 
     create_shims(&bin_dir, "my-cli", "my-package/bin/my-cli.js").unwrap();
-    assert!(bin_dir.join("my-cli").exists());
-    assert!(bin_dir.join("my-cli.cmd").exists());
-    assert!(bin_dir.join("my-cli.ps1").exists());
+    #[cfg(unix)]
+    {
+        let meta = fs::symlink_metadata(bin_dir.join("my-cli")).unwrap();
+        assert!(meta.file_type().is_symlink());
+        assert!(!bin_dir.join("my-cli.cmd").exists());
+        assert!(!bin_dir.join("my-cli.ps1").exists());
+    }
+    #[cfg(not(unix))]
+    {
+        assert!(bin_dir.join("my-cli").exists());
+        assert!(bin_dir.join("my-cli.cmd").exists());
+        assert!(bin_dir.join("my-cli.ps1").exists());
+    }
 }
 
 #[test]
