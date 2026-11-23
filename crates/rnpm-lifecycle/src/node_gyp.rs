@@ -371,8 +371,38 @@ fn build_bootstrap_client(
     config: &rnpm_config::Config,
 ) -> anyhow::Result<reqwest::Client> {
     let mut builder = reqwest::Client::builder();
-    if registry.contains("127.0.0.1") || registry.contains("localhost") {
+    let reg_url = reqwest::Url::parse(registry).ok();
+
+    let bypass_proxy = if let Some(ref url) = reg_url {
+        config.should_bypass_proxy(url)
+    } else {
+        registry.contains("127.0.0.1") || registry.contains("localhost")
+    };
+
+    if bypass_proxy {
         builder = builder.no_proxy();
+    } else {
+        let https_proxy = config.https_proxy();
+        let http_proxy = config.http_proxy();
+        let general_proxy = config.proxy();
+
+        if let Some(https_val) = https_proxy {
+            if let Ok(proxy) = reqwest::Proxy::https(https_val) {
+                builder = builder.proxy(proxy);
+            }
+        }
+        if let Some(http_val) = http_proxy {
+            if let Ok(proxy) = reqwest::Proxy::http(http_val) {
+                builder = builder.proxy(proxy);
+            }
+        }
+        if let Some(gen_val) = general_proxy {
+            if https_proxy.is_none() && http_proxy.is_none() {
+                if let Ok(proxy) = reqwest::Proxy::all(gen_val) {
+                    builder = builder.proxy(proxy);
+                }
+            }
+        }
     }
     if config.get_bool("strict-ssl") == Some(false) {
         builder = builder.danger_accept_invalid_certs(true);
@@ -410,24 +440,8 @@ fn registry_auth_header(registry: &str, config: &rnpm_config::Config) -> Option<
     if let Some(token) = config.npmrc.get_auth_token(&url) {
         return Some(format!("Bearer {token}"));
     }
-    let host = url.host_str()?.to_ascii_lowercase();
-    let port_part = url.port().map(|p| format!(":{p}")).unwrap_or_default();
-    let path = url.path();
-    let norm_path = if path.ends_with('/') {
-        path.to_string()
-    } else {
-        format!("{path}/")
-    };
-    let basic_auths = config.npmrc.basic_auths();
-    for key in [
-        format!("//{host}{port_part}{norm_path}"),
-        format!("//{host}{port_part}{path}"),
-        format!("//{host}{port_part}/"),
-        format!("//{host}/"),
-    ] {
-        if let Some(basic) = basic_auths.get(&key) {
-            return Some(format!("Basic {basic}"));
-        }
+    if let Some(basic) = config.npmrc.get_basic_auth(&url) {
+        return Some(format!("Basic {basic}"));
     }
     None
 }
@@ -1169,6 +1183,36 @@ pub fn unpack_tarball(tarball_bytes: &[u8], target_dir: &Path) -> anyhow::Result
     Ok(())
 }
 
+/// Creates a dedicated private node-gyp shim directory on disk with strict private permissions
+/// (0o700 for the directory, 0o755 for the POSIX shim).
+pub fn create_private_node_gyp_shim(dir: &Path) -> std::io::Result<PathBuf> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+    }
+
+    let cmd_path = dir.join("node-gyp.cmd");
+    let cmd_script = "@ECHO off\r\nIF NOT DEFINED npm_config_node_gyp GOTO no_gyp\r\nSET \"GYP_PATH=%npm_config_node_gyp:\"=%\"\r\nIF /I \"%GYP_PATH:~-3%\"==\".js\" GOTO run_js\r\n\"%GYP_PATH%\" %*\r\nEXIT /B %ERRORLEVEL%\r\n:run_js\r\nnode \"%GYP_PATH%\" %*\r\nEXIT /B %ERRORLEVEL%\r\n:no_gyp\r\nnode \"%~dp0node-gyp.js\" %*\r\nEXIT /B %ERRORLEVEL%\r\n";
+    std::fs::write(&cmd_path, cmd_script)?;
+
+    let sh_path = dir.join("node-gyp");
+    let sh_script = "#!/usr/bin/env sh\nif [ -z \"$npm_config_node_gyp\" ]; then\n  exec node \"$(dirname \"$0\")/node-gyp.js\" \"$@\"\nelse\n  case \"$npm_config_node_gyp\" in\n    *.js) exec node \"$npm_config_node_gyp\" \"$@\" ;;\n    *) exec \"$npm_config_node_gyp\" \"$@\" ;;\n  esac\nfi\n";
+    std::fs::write(&sh_path, sh_script)?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&sh_path, std::fs::Permissions::from_mode(0o755));
+    }
+
+    if cfg!(windows) {
+        Ok(cmd_path)
+    } else {
+        Ok(sh_path)
+    }
+}
+
 /// Prepares and returns a dedicated privately-owned directory containing standalone `node-gyp` shims
 /// (`node-gyp.cmd` on Windows and `node-gyp` on Unix) that forward to `%npm_config_node_gyp%`.
 pub fn node_gyp_bin_dir() -> Option<PathBuf> {
@@ -1186,41 +1230,9 @@ pub fn node_gyp_bin_dir() -> Option<PathBuf> {
                 }
             };
             let dir = tmp_dir.path();
-
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                if let Err(e) =
-                    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
-                {
-                    warn!("Failed to set permissions on node-gyp-bin directory: {}", e);
-                    return None;
-                }
-            }
-
-            let cmd_path = dir.join("node-gyp.cmd");
-            let cmd_script = "@ECHO off\r\nIF NOT DEFINED npm_config_node_gyp GOTO no_gyp\r\nSET \"GYP_PATH=%npm_config_node_gyp:\"=%\"\r\nIF /I \"%GYP_PATH:~-3%\"==\".js\" GOTO run_js\r\n\"%GYP_PATH%\" %*\r\nEXIT /B %ERRORLEVEL%\r\n:run_js\r\nnode \"%GYP_PATH%\" %*\r\nEXIT /B %ERRORLEVEL%\r\n:no_gyp\r\nnode \"%~dp0node-gyp.js\" %*\r\nEXIT /B %ERRORLEVEL%\r\n";
-            if let Err(e) = std::fs::write(&cmd_path, cmd_script) {
-                warn!("Failed to write node-gyp.cmd shim: {}", e);
+            if let Err(e) = create_private_node_gyp_shim(dir) {
+                warn!("Failed to populate private node-gyp-bin directory: {}", e);
                 return None;
-            }
-
-            let sh_path = dir.join("node-gyp");
-            let sh_script = "#!/usr/bin/env sh\nif [ -z \"$npm_config_node_gyp\" ]; then\n  exec node \"$(dirname \"$0\")/node-gyp.js\" \"$@\"\nelse\n  case \"$npm_config_node_gyp\" in\n    *.js) exec node \"$npm_config_node_gyp\" \"$@\" ;;\n    *) exec \"$npm_config_node_gyp\" \"$@\" ;;\n  esac\nfi\n";
-            if let Err(e) = std::fs::write(&sh_path, sh_script) {
-                warn!("Failed to write node-gyp POSIX shim: {}", e);
-                return None;
-            }
-
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                if let Err(e) =
-                    std::fs::set_permissions(&sh_path, std::fs::Permissions::from_mode(0o755))
-                {
-                    warn!("Failed to chmod node-gyp POSIX shim: {}", e);
-                    return None;
-                }
             }
 
             Some(tmp_dir)

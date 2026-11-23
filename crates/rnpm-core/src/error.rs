@@ -16,6 +16,9 @@ pub enum CoreError {
 
     #[error("Workspace error: {0}")]
     Workspace(#[from] WorkspaceError),
+
+    #[error("Override error: {0}")]
+    Override(#[from] OverrideError),
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -113,4 +116,10 @@ pub enum WorkspaceError {
         first: std::path::PathBuf,
         second: std::path::PathBuf,
     },
+}
+
+#[derive(Debug, Error, Clone, PartialEq, Eq)]
+pub enum OverrideError {
+    #[error("Unable to resolve reference ${0}")]
+    UnresolvableReference(String),
 }

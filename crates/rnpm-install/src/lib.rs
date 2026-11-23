@@ -2173,16 +2173,15 @@ fn peer_graph_from_lockfile(lockfile: &LockfileV3, manifest: &Manifest) -> Depen
     }
     if let Ok(overrides) = rnpm_solver::Overrides::from_manifest(manifest) {
         for edge in &mut graph.edges {
-            let ancestors = edge
-                .from_location
-                .split("/node_modules/")
-                .filter(|part| !part.is_empty())
-                .map(|part| {
-                    part.strip_prefix("node_modules/")
-                        .unwrap_or(part)
-                        .to_string()
-                })
-                .collect::<Vec<_>>();
+            let mut ancestors = Vec::new();
+            for scope in rnpm_solver::hoisting::iter_ancestor_scopes(&edge.from_location) {
+                if let Some(n) = graph.nodes.get(scope) {
+                    ancestors.push(n.name.clone());
+                } else if scope.is_empty() {
+                    ancestors.push(manifest.name.clone().unwrap_or_default());
+                }
+            }
+            ancestors.reverse();
             if let Ok(Some(spec)) =
                 overrides.resolve_override_strings(&edge.install_name, &edge.spec, &ancestors)
             {
@@ -3368,13 +3367,18 @@ impl Installer {
             ));
         };
 
+        let workspace_members = if !self.options.is_global {
+            discover_workspaces_from_manifest(&self.options.project_dir, &manifest)
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+
         // npm-package-arg rejects unknown spec protocols (yarn/pnpm's
         // `workspace:`, `patch:`, `link:`...) while loading the root and
         // workspace edges, before anything is resolved.
         if !self.options.is_global {
-            let members = discover_workspaces_from_manifest(&self.options.project_dir, &manifest)
-                .unwrap_or_default();
-            let manifests = std::iter::once(&manifest).chain(members.iter().map(|m| &m.manifest));
+            let manifests = std::iter::once(&manifest).chain(workspace_members.iter().map(|m| &m.manifest));
             for m in manifests {
                 // Node#loadDeps: one edge per name, later types replacing
                 // earlier ones (peer, unless legacy, then prod, optional, dev).
@@ -3416,7 +3420,12 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                     .filter(|s| !legacy_lock::is_old_lockfile(s))
                 {
                     if let Ok(existing_lockfile) = rnpm_lockfile::parse_and_migrate(&lockfile_str) {
-                        if existing_lockfile.matches_manifest(&manifest, !self.options.omit_dev) {
+                        if existing_lockfile.matches_manifest_ext_with_workspaces(
+                            &manifest,
+                            !self.options.omit_dev,
+                            false,
+                            Some(&workspace_members),
+                        ) {
                             info!(
                                 "Lockfile matches manifest: taking lockfile reification fast path"
                             );
@@ -6059,7 +6068,7 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
         }
 
         // 4. Comprehensive lockfile validation via matches_manifest_for_ci
-        if !lockfile.matches_manifest_for_ci(&manifest, true) {
+        if !lockfile.matches_manifest_for_ci_with_workspaces(&manifest, true, Some(&workspace_members)) {
             return Err(anyhow!(
                 "rnpm ERR! code ELOCKFILE_DRIFT: package.json and {} are out of sync. Please run `rnpm install` to update your lockfile. (EUSAGE)",
                 lockfile_name
@@ -6078,41 +6087,45 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                 continue;
             }
             if let Some(deps) = &pkg_info.dependencies {
+                let caller_specs = pkg_info.all_dependency_specs();
                 for (dep_name, range_str) in deps {
                     let effective_range = if let Some(ref ov) = overrides {
                         let mut ancestors: Vec<String> = Vec::new();
-                        let parts = pkg_key.split("/node_modules/").filter(|p| !p.is_empty());
-                        for p in parts {
-                            let clean_p = p.strip_prefix("node_modules/").unwrap_or(p);
-                            ancestors.push(clean_p.to_string());
+                        for scope in rnpm_solver::hoisting::iter_ancestor_scopes(pkg_key) {
+                            if let Some(pkg) = lockfile.packages.get(scope) {
+                                if let Some(ref name) = pkg.name {
+                                    ancestors.push(name.clone());
+                                } else if scope.is_empty() {
+                                    ancestors.push(lockfile.name.clone());
+                                }
+                            } else if scope.is_empty() {
+                                ancestors.push(lockfile.name.clone());
+                            }
                         }
-                        ov.resolve_override_strings(dep_name, range_str, &ancestors)
-                            .ok()
-                            .flatten()
-                            .unwrap_or_else(|| range_str.clone())
+                        ancestors.reverse();
+                        ov.resolve_override_with_caller(
+                            dep_name,
+                            range_str,
+                            &ancestors,
+                            Some(&caller_specs),
+                        )
+                        .ok()
+                        .flatten()
+                        .unwrap_or_else(|| range_str.clone())
                     } else {
                         range_str.clone()
                     };
 
                     let mut found_node: Option<&LockfilePackage> = None;
-                    let mut curr = pkg_key.as_str();
-                    loop {
-                        let candidate_key = if curr.is_empty() {
+                    for scope in rnpm_solver::hoisting::iter_ancestor_scopes(pkg_key) {
+                        let candidate_key = if scope.is_empty() {
                             format!("node_modules/{dep_name}")
                         } else {
-                            format!("{curr}/node_modules/{dep_name}")
+                            format!("{scope}/node_modules/{dep_name}")
                         };
                         if let Some(p) = lockfile.packages.get(&candidate_key) {
                             found_node = Some(p);
                             break;
-                        }
-                        if curr.is_empty() {
-                            break;
-                        }
-                        if let Some(idx) = curr.rfind("/node_modules/") {
-                            curr = &curr[..idx];
-                        } else {
-                            curr = "";
                         }
                     }
 
@@ -10063,8 +10076,7 @@ pub fn resolve_lockfile_dependency_path(
     parent_key: &str,
     dependency_name: &str,
 ) -> Option<String> {
-    let mut scope = parent_key.to_string();
-    loop {
+    for scope in rnpm_solver::hoisting::iter_ancestor_scopes(parent_key) {
         let candidate = if scope.is_empty() {
             format!("node_modules/{dependency_name}")
         } else {
@@ -10073,19 +10085,8 @@ pub fn resolve_lockfile_dependency_path(
         if lockfile.packages.contains_key(&candidate) {
             return Some(candidate);
         }
-        if scope.is_empty() {
-            return None;
-        }
-        if let Some(index) = scope.rfind("/node_modules/") {
-            scope.truncate(index);
-        } else if scope.starts_with("node_modules/") {
-            scope.clear();
-        } else if let Some(index) = scope.rfind('/') {
-            scope.truncate(index);
-        } else {
-            scope.clear();
-        }
     }
+    None
 }
 
 /// Prunes unreferenced packages from lockfile based on reachability from manifest direct dependencies.
@@ -10146,30 +10147,7 @@ pub fn prune_lockfile(lockfile: &mut LockfileV3, manifest: &Manifest) -> HashSet
 
             for dep_name in all_deps {
                 // Resolution in node_modules tree: check closest scope up through parent ancestors to root
-                let mut target_key = None;
-                let nested_key = format!("{current_key}/node_modules/{dep_name}");
-                if lockfile.packages.contains_key(&nested_key) {
-                    target_key = Some(nested_key);
-                } else {
-                    let mut curr = current_key.as_str();
-                    while let Some(idx) = curr.rfind("/node_modules/") {
-                        curr = &curr[..idx];
-                        if !curr.is_empty() {
-                            let candidate = format!("{curr}/node_modules/{dep_name}");
-                            if lockfile.packages.contains_key(&candidate) {
-                                target_key = Some(candidate);
-                                break;
-                            }
-                        }
-                    }
-                    if target_key.is_none() {
-                        let root_key = format!("node_modules/{dep_name}");
-                        if lockfile.packages.contains_key(&root_key) {
-                            target_key = Some(root_key);
-                        }
-                    }
-                }
-
+                let target_key = resolve_lockfile_dependency_path(lockfile, &current_key, &dep_name);
                 if let Some(k) = target_key {
                     if !reachable_keys.contains(&k) {
                         reachable_keys.insert(k.clone());

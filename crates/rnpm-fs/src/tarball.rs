@@ -186,8 +186,13 @@ pub fn extract_tar_gz<R: Read>(
             });
         }
 
-        // Check non-UTF-8 path bytes before entry.path()
+        // Check non-UTF-8 path bytes or embedded null bytes before entry.path()
         let path_bytes = entry.path_bytes();
+        if path_bytes.contains(&0) {
+            return Err(FsError::PathTraversal {
+                path: PathBuf::from(String::from_utf8_lossy(&path_bytes).into_owned()),
+            });
+        }
         if std::str::from_utf8(&path_bytes).is_err() {
             return Err(FsError::InvalidUtf8Path {
                 path: PathBuf::from(String::from_utf8_lossy(&path_bytes).into_owned()),
@@ -396,6 +401,11 @@ pub fn extract_tar_gz<R: Read>(
             }
 
             if let Some(link_bytes) = entry.link_name_bytes() {
+                if link_bytes.contains(&0) {
+                    return Err(FsError::PathTraversal {
+                        path: PathBuf::from(String::from_utf8_lossy(&link_bytes).into_owned()),
+                    });
+                }
                 if std::str::from_utf8(&link_bytes).is_err() {
                     return Err(FsError::InvalidUtf8Path {
                         path: PathBuf::from(String::from_utf8_lossy(&link_bytes).into_owned()),
@@ -605,7 +615,34 @@ pub fn extract_tar_gz<R: Read>(
         if entry_type.is_dir() {
             if !target_path.is_dir() {
                 unlink_target_path(&target_path);
-                fs::create_dir_all(&target_path)?;
+                if let Err(e) = fs::create_dir_all(&target_path) {
+                    #[cfg(unix)]
+                    if e.kind() == std::io::ErrorKind::PermissionDenied {
+                        if let Some(parent) = target_path.parent() {
+                            if let Ok(meta) = fs::metadata(parent) {
+                                use std::os::unix::fs::PermissionsExt;
+                                let mut perms = meta.permissions();
+                                if perms.mode() & 0o200 == 0 {
+                                    perms.set_mode(perms.mode() | 0o700);
+                                    let _ = fs::set_permissions(parent, perms);
+                                }
+                            }
+                        }
+                    }
+                    #[cfg(windows)]
+                    if e.kind() == std::io::ErrorKind::PermissionDenied {
+                        if let Some(parent) = target_path.parent() {
+                            if let Ok(meta) = fs::metadata(parent) {
+                                let mut perms = meta.permissions();
+                                if perms.readonly() {
+                                    perms.set_readonly(false);
+                                    let _ = fs::set_permissions(parent, perms);
+                                }
+                            }
+                        }
+                    }
+                    fs::create_dir_all(&target_path)?;
+                }
             }
         } else if entry_type.is_file() {
             // Check single entry size limit from header if available
@@ -655,19 +692,42 @@ pub fn extract_tar_gz<R: Read>(
                 Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {
                     unlink_target_path(&target_path);
                     #[cfg(windows)]
-                    if let Ok(meta) = fs::metadata(&target_path) {
-                        let mut perms = meta.permissions();
-                        if perms.readonly() {
-                            perms.set_readonly(false);
-                            let _ = fs::set_permissions(&target_path, perms);
+                    {
+                        if let Some(parent) = target_path.parent() {
+                            if let Ok(meta) = fs::metadata(parent) {
+                                let mut perms = meta.permissions();
+                                if perms.readonly() {
+                                    perms.set_readonly(false);
+                                    let _ = fs::set_permissions(parent, perms);
+                                }
+                            }
+                        }
+                        if let Ok(meta) = fs::metadata(&target_path) {
+                            let mut perms = meta.permissions();
+                            if perms.readonly() {
+                                perms.set_readonly(false);
+                                let _ = fs::set_permissions(&target_path, perms);
+                            }
                         }
                     }
                     #[cfg(unix)]
-                    if let Ok(meta) = fs::metadata(&target_path) {
-                        use std::os::unix::fs::PermissionsExt;
-                        let mut perms = meta.permissions();
-                        perms.set_mode(perms.mode() | 0o600);
-                        let _ = fs::set_permissions(&target_path, perms);
+                    {
+                        if let Some(parent) = target_path.parent() {
+                            if let Ok(meta) = fs::metadata(parent) {
+                                use std::os::unix::fs::PermissionsExt;
+                                let mut perms = meta.permissions();
+                                if perms.mode() & 0o200 == 0 {
+                                    perms.set_mode(perms.mode() | 0o700);
+                                    let _ = fs::set_permissions(parent, perms);
+                                }
+                            }
+                        }
+                        if let Ok(meta) = fs::metadata(&target_path) {
+                            use std::os::unix::fs::PermissionsExt;
+                            let mut perms = meta.permissions();
+                            perms.set_mode(perms.mode() | 0o600);
+                            let _ = fs::set_permissions(&target_path, perms);
+                        }
                     }
                     File::create(&target_path)?
                 }
@@ -757,21 +817,44 @@ pub fn extract_tar_gz<R: Read>(
 /// On Windows, directory junctions are safely unlinked using `remove_junction` or `fs::remove_dir`
 /// to prevent `fs::remove_file` failures and avoid deleting target contents.
 pub(crate) fn unlink_target_path(path: &Path) {
-    #[cfg(windows)]
-    if crate::junction::is_junction(path).unwrap_or(false) {
-        let _ = crate::junction::remove_junction(path);
-        return;
-    }
-    if path.is_symlink() || path.is_file() {
+    let path_v = crate::path::to_verbatim_path(path);
+    if let Ok(meta) = fs::symlink_metadata(&path_v) {
         #[cfg(windows)]
-        if let Ok(meta) = fs::metadata(path) {
+        {
             let mut perms = meta.permissions();
             if perms.readonly() {
                 perms.set_readonly(false);
-                let _ = fs::set_permissions(path, perms);
+                let _ = fs::set_permissions(&path_v, perms);
+            }
+            use std::os::windows::fs::MetadataExt;
+            const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x10;
+            const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+            let attrs = meta.file_attributes();
+            if (attrs & FILE_ATTRIBUTE_REPARSE_POINT) != 0 || (attrs & FILE_ATTRIBUTE_DIRECTORY) != 0 {
+                if (attrs & FILE_ATTRIBUTE_DIRECTORY) != 0 {
+                    if (attrs & FILE_ATTRIBUTE_REPARSE_POINT) != 0 {
+                        let _ = crate::junction::remove_junction(&path_v);
+                    } else {
+                        let _ = fs::remove_dir(&path_v);
+                    }
+                    return;
+                } else {
+                    let _ = fs::remove_file(&path_v);
+                    return;
+                }
             }
         }
-        let _ = fs::remove_file(path);
+        #[cfg(not(windows))]
+        {
+            if meta.file_type().is_symlink() || !meta.is_dir() {
+                let _ = fs::remove_file(&path_v);
+                return;
+            } else if meta.is_dir() {
+                let _ = fs::remove_dir(&path_v);
+                return;
+            }
+        }
+        let _ = fs::remove_file(&path_v);
     }
 }
 
@@ -937,6 +1020,12 @@ pub fn validate_entry_path(path: &Path) -> Result<(), FsError> {
         return Ok(());
     }
 
+    if path_str.contains('\0') {
+        return Err(FsError::PathTraversal {
+            path: path.to_path_buf(),
+        });
+    }
+
     // Reject absolute paths, UNC paths, verbatim paths across all platforms
     if path.is_absolute()
         || path_str.starts_with('/')
@@ -1080,6 +1169,12 @@ pub fn validate_link_target(
             });
         }
     };
+
+    if target_str.contains('\0') {
+        return Err(FsError::PathTraversal {
+            path: target.to_path_buf(),
+        });
+    }
 
     if target.is_absolute()
         || target.has_root()

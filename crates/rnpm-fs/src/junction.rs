@@ -1,4 +1,5 @@
 use crate::error::FsError;
+use path_clean::clean;
 use std::fs;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -91,6 +92,12 @@ pub fn create_junction(link: &Path, target: &Path) -> Result<(), FsError> {
     let link_v = crate::path::to_verbatim_path(link);
     let target_v = crate::path::to_verbatim_path(target);
 
+    // If link already exists as a junction or symlink, safely remove the reparse point first
+    // so replacing a junction/symlink succeeds without clobbering target contents!
+    if is_reparse_point_or_symlink(&link_v).unwrap_or(false) {
+        let _ = remove_junction(&link_v);
+    }
+
     let res = {
         #[cfg(windows)]
         {
@@ -131,11 +138,24 @@ pub fn create_link_or_copy(link: &Path, target: &Path) -> Result<(), FsError> {
     if let Some(parent) = link.parent() {
         let _ = fs::create_dir_all(parent);
     }
-    // If link already exists, remove it first
-    if link.is_symlink() || link.is_file() {
-        let _ = fs::remove_file(link);
-    } else if is_junction(link).unwrap_or(false) {
-        let _ = remove_junction(link);
+    let link_v = crate::path::to_verbatim_path(link);
+    // If link already exists, safely remove it first without clobbering target contents
+    if is_reparse_point_or_symlink(&link_v).unwrap_or(false) {
+        let _ = remove_junction(&link_v);
+    } else if let Ok(meta) = fs::symlink_metadata(&link_v) {
+        #[cfg(windows)]
+        {
+            let mut perms = meta.permissions();
+            if perms.readonly() {
+                perms.set_readonly(false);
+                let _ = fs::set_permissions(&link_v, perms);
+            }
+        }
+        if meta.is_dir() {
+            let _ = remove_dir_all_safe(&link_v);
+        } else {
+            let _ = fs::remove_file(&link_v);
+        }
     }
 
     #[cfg(windows)]
@@ -193,14 +213,30 @@ pub fn remove_junction(path: &Path) -> Result<(), FsError> {
             }
         }
 
+        let is_dir = fs::symlink_metadata(&path_v)
+            .map(|m| {
+                use std::os::windows::fs::MetadataExt;
+                m.file_attributes() & 0x10 != 0
+            })
+            .unwrap_or(true);
+
         let mut attempts = 0;
         let mut delay = std::time::Duration::from_millis(5);
         loop {
             attempts += 1;
-            match fs::remove_dir(&path_v) {
+            let res = if is_dir {
+                fs::remove_dir(&path_v)
+            } else {
+                fs::remove_file(&path_v)
+            };
+            match res {
                 Ok(()) => return Ok(()),
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
                 Err(err) => {
+                    // If remove_dir failed because it's a file symlink, try remove_file
+                    if is_dir && err.raw_os_error() == Some(267) && fs::remove_file(&path_v).is_ok() {
+                        return Ok(());
+                    }
                     if attempts >= 15 || !crate::atomic::is_retryable_error(&err) {
                         return Err(FsError::JunctionError {
                             path: path.to_path_buf(),
@@ -637,17 +673,20 @@ pub fn junction_points_to(link: &Path, expected_target: &Path) -> bool {
         raw_actual
     };
     let clean_expected = crate::path::strip_verbatim_prefix(expected_target);
+    let norm_actual = clean(&actual);
+    let norm_expected = clean(&clean_expected);
 
     #[cfg(windows)]
-    if actual
+    if norm_actual
         .as_os_str()
         .to_string_lossy()
-        .eq_ignore_ascii_case(&clean_expected.as_os_str().to_string_lossy())
+        .replace('/', "\\")
+        .eq_ignore_ascii_case(&norm_expected.as_os_str().to_string_lossy().replace('/', "\\"))
     {
         return true;
     }
     #[cfg(not(windows))]
-    if actual == clean_expected {
+    if norm_actual == norm_expected {
         return true;
     }
 

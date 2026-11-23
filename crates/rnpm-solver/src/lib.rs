@@ -25,6 +25,7 @@ mod tests;
 pub use aliases::DependencySpec;
 pub use error::SolverError;
 pub use graph::{DependencyEdge, DependencyGraph, DependencyType, Node, NodeFlags};
+pub use hoisting::{iter_ancestor_scopes, parent_scope};
 pub use overrides::Overrides;
 pub use platform::{is_platform_compatible, Platform};
 pub use solver::{

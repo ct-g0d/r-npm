@@ -27,10 +27,23 @@ fn make_writable(path: &Path) {
     }
 }
 
-/// Recursively clear readonly attribute on all files and subdirectories.
+/// Recursively clear readonly attribute on all files and subdirectories without following symlinks or junctions.
 fn clear_readonly_recursive(path: &Path) {
     make_writable(path);
     if let Ok(meta) = fs::symlink_metadata(path) {
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::MetadataExt;
+            if (meta.file_attributes() & 0x400) != 0 {
+                return; // Reparse point / junction / symlink: do not traverse
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            if meta.file_type().is_symlink() {
+                return;
+            }
+        }
         if meta.is_dir() {
             if let Ok(entries) = fs::read_dir(path) {
                 for entry in entries.flatten() {
@@ -70,23 +83,22 @@ fn remove_file_with_retries(path: &Path) -> std::io::Result<()> {
 }
 
 /// Helper to reliably remove a directory tree, clearing Windows readonly attributes and retrying on transient locks.
+/// Uses `rnpm_fs::remove_dir_all_safe` to ensure junctions/symlinks are never followed into external targets.
 fn remove_dir_all_with_retries(dir: &Path) -> std::io::Result<()> {
     if !dir.exists() {
         return Ok(());
     }
 
-    clear_readonly_recursive(dir);
-
     let mut attempts = 0;
     let mut delay = Duration::from_millis(5);
     loop {
         attempts += 1;
-        match fs::remove_dir_all(dir) {
+        match rnpm_fs::remove_dir_all_safe(dir) {
             Ok(()) => return Ok(()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(_) if !dir.exists() => return Ok(()),
             Err(e) => {
                 if attempts >= 10 {
-                    return Err(e);
+                    return Err(std::io::Error::other(e.to_string()));
                 }
                 clear_readonly_recursive(dir);
                 let jitter = (attempts as u64 * 3) % 7;

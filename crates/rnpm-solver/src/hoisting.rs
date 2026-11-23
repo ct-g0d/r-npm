@@ -233,6 +233,38 @@ pub fn node_satisfies_target(node: &crate::graph::Node, target: &PackageTarget) 
     }
 }
 
+/// Returns the next ancestor scope in the node_modules directory hierarchy,
+/// walking from `scope` towards the project root `""`.
+///
+/// For packages nested under node_modules (e.g. `packages/a/node_modules/b` or `node_modules/a/node_modules/b`),
+/// the ancestor is the enclosing package scope (`packages/a` or `node_modules/a`).
+/// For packages directly under root node_modules (e.g. `node_modules/a` or `node_modules/@scope/a`),
+/// the ancestor is `""` (the root).
+/// For workspace packages (e.g. `packages/parent/nested`), the ancestor is the parent
+/// directory `packages/parent`, then `packages`, then `""`.
+/// Returns `None` once `scope` is already the root `""`.
+#[inline]
+pub fn parent_scope(scope: &str) -> Option<&str> {
+    if scope.is_empty() {
+        return None;
+    }
+    if let Some(idx) = scope.rfind("/node_modules/") {
+        Some(&scope[..idx])
+    } else if scope.starts_with("node_modules/") {
+        Some("")
+    } else if let Some(idx) = scope.rfind('/') {
+        Some(&scope[..idx])
+    } else {
+        Some("")
+    }
+}
+
+/// Returns an iterator over ancestor scopes starting from `from_scope` up to and including root `""`.
+#[inline]
+pub fn iter_ancestor_scopes(from_scope: &str) -> impl Iterator<Item = &str> {
+    std::iter::successors(Some(from_scope), |&s| parent_scope(s))
+}
+
 /// Determines the tree placement for a dependency according to npm/Arborist hoisting rules:
 /// 1. Top-Level Hoisting: Try to place at root `node_modules/<install_name>`.
 /// 2. Deduplication: If already occupied by a compatible version, reuse the existing node.
@@ -390,11 +422,17 @@ pub fn determine_placement_with_peers(
     // Attempt 2: Check intermediate ancestor scopes from root towards parent
     let mut ancestors = Vec::new();
     let mut curr = parent_location;
-    while let Some(idx) = curr.rfind("/node_modules/") {
-        curr = &curr[..idx];
-        if !curr.is_empty() {
-            ancestors.push(curr);
+    while let Some(next) = parent_scope(curr) {
+        if next.is_empty() {
+            break;
         }
+        if next.contains("/node_modules/")
+            || next.starts_with("node_modules/")
+            || graph.nodes.contains_key(next)
+        {
+            ancestors.push(next);
+        }
+        curr = next;
     }
 
     for ancestor in ancestors.into_iter().rev() {
@@ -478,7 +516,11 @@ fn candidate_shadows_ancestor_dep(
         .get(install_name)
         .or_else(|| ancestor_node.dependencies.get(package_name))
         .or_else(|| ancestor_node.optional_dependencies.get(install_name))
-        .or_else(|| ancestor_node.optional_dependencies.get(package_name));
+        .or_else(|| ancestor_node.optional_dependencies.get(package_name))
+        .or_else(|| ancestor_node.dev_dependencies.get(install_name))
+        .or_else(|| ancestor_node.dev_dependencies.get(package_name))
+        .or_else(|| ancestor_node.peer_dependencies.get(install_name))
+        .or_else(|| ancestor_node.peer_dependencies.get(package_name));
 
     let Some(spec) = dep_spec else {
         return false;
@@ -514,6 +556,18 @@ fn candidate_shadows_ancestor_dep(
     false
 }
 
+#[inline]
+fn is_in_scope_subtree(loc: &str, scope: &str) -> bool {
+    if loc == scope {
+        return false;
+    }
+    if scope.is_empty() {
+        loc.starts_with("node_modules/")
+    } else {
+        iter_ancestor_scopes(loc).any(|s| s == scope)
+    }
+}
+
 // CanPlaceDep.checkCanPlaceNoCurrent: introducing a node in an empty slot
 // must not intercept a valid descendant edge that currently resolves above
 // this scope. Otherwise a later sibling silently breaks an earlier branch.
@@ -526,14 +580,13 @@ fn candidate_shadows_descendant_dep(
     let Some(version) = resolved_version else {
         return false;
     };
-    let prefix = format!("{scope}/node_modules/");
     // Arborist attaches edgesOut when a node enters the tree, before that
     // node's turn in depsQueue. Our graph.edges only contains processed
     // tasks, so also inspect pending edges from the manifest.
     if graph
         .nodes
         .values()
-        .filter(|node| node.location.starts_with(&prefix))
+        .filter(|node| is_in_scope_subtree(&node.location, scope))
         .any(|node| {
             let Some(spec) = node
                 .optional_dependencies
@@ -547,7 +600,7 @@ fn candidate_shadows_descendant_dep(
                 return false;
             };
             find_visible_node(graph, &node.location, install_name).is_some_and(|current| {
-                !current.location.starts_with(&prefix)
+                !is_in_scope_subtree(&current.location, scope)
                     && node_satisfies_target(current, &target)
                     && !version_satisfies_target(version, &target)
             })
@@ -557,8 +610,8 @@ fn candidate_shadows_descendant_dep(
     }
     graph.edges.iter().any(|edge| {
         if edge.install_name != install_name
-            || !edge.from_location.starts_with(&prefix)
-            || edge.to_location.starts_with(&prefix)
+            || !is_in_scope_subtree(&edge.from_location, scope)
+            || is_in_scope_subtree(&edge.to_location, scope)
         {
             return false;
         }
@@ -722,15 +775,12 @@ fn is_shadowed_by_incompatible_between(
         candidate_buf.push_str("/node_modules/");
         candidate_buf.push_str(install_name);
         if let Some(node) = graph.nodes.get(&candidate_buf) {
-            if !node_satisfies_target(node, target) {
-                return true;
-            }
+            return !node_satisfies_target(node, target);
         }
-        if let Some(idx) = current.rfind("/node_modules/") {
-            current = &current[..idx];
-        } else {
-            break;
-        }
+        current = match parent_scope(current) {
+            Some(p) => p,
+            None => break,
+        };
     }
     false
 }
@@ -789,14 +839,10 @@ pub fn find_visible_peer_node<'a>(
         // `@typescript/native` -> typescript is never `typescript`'s peer.
 
         // Ascend one directory level in node_modules hierarchy
-        if let Some(idx) = current.rfind("/node_modules/") {
-            current = &current[..idx];
-        } else if let Some(idx) = current.rfind('/') {
-            // For workspace packages like "packages/app", ascend to parent directory
-            current = &current[..idx];
-        } else {
-            break;
-        }
+        current = match parent_scope(current) {
+            Some(p) if !p.is_empty() => p,
+            _ => break,
+        };
     }
 
     // Finally, check root scope ("")
@@ -1035,5 +1081,315 @@ mod tests {
         // When resolved matches exactly
         node.resolved = Some("https://example.com/test-1.0.0.tgz".to_string());
         assert!(node_satisfies_target(&node, &url_target));
+    }
+
+    #[test]
+    fn test_nested_workspace_intermediate_ancestor_scope_traversal() {
+        let mut graph = DependencyGraph::new();
+        // Root has conflicting lib@2.0.0
+        graph.nodes.insert(
+            "node_modules/lib".to_string(),
+            make_test_node("node_modules/lib", "lib", "2.0.0"),
+        );
+        // Parent workspace node
+        graph.nodes.insert(
+            "packages/parent".to_string(),
+            make_test_node("packages/parent", "parent-ws", "1.0.0"),
+        );
+        // Nested workspace node
+        graph.nodes.insert(
+            "packages/parent/nested".to_string(),
+            make_test_node("packages/parent/nested", "nested-ws", "1.0.0"),
+        );
+
+        let target = PackageTarget::Range(Range::parse("^1.0.0").unwrap());
+        // Vacant intermediate scope in parent workspace is chosen over nesting inside nested workspace
+        let decision = determine_placement(
+            &graph,
+            "packages/parent/nested",
+            "lib",
+            "lib",
+            &target,
+        );
+        assert_eq!(
+            decision,
+            PlacementDecision::PlaceNew("packages/parent/node_modules/lib".to_string())
+        );
+
+        // If parent workspace already has a compatible lib@1.2.0, it is reused
+        graph.nodes.insert(
+            "packages/parent/node_modules/lib".to_string(),
+            make_test_node("packages/parent/node_modules/lib", "lib", "1.2.0"),
+        );
+        let decision_reuse = determine_placement(
+            &graph,
+            "packages/parent/nested",
+            "lib",
+            "lib",
+            &target,
+        );
+        assert_eq!(
+            decision_reuse,
+            PlacementDecision::Reuse("packages/parent/node_modules/lib".to_string())
+        );
+    }
+
+    #[test]
+    fn test_candidate_shadows_ancestor_dev_and_peer_dependencies() {
+        let mut graph = DependencyGraph::new();
+        let mut ancestor_node = make_test_node("node_modules/parent", "parent", "1.0.0");
+        ancestor_node
+            .dev_dependencies
+            .insert("dev-dep".to_string(), "^1.0.0".to_string());
+        ancestor_node
+            .peer_dependencies
+            .insert("peer-dep".to_string(), "^1.0.0".to_string());
+        graph
+            .nodes
+            .insert("node_modules/parent".to_string(), ancestor_node);
+
+        let target_v2 = PackageTarget::Range(Range::parse("^2.0.0").unwrap());
+        let target_v1 = PackageTarget::Range(Range::parse("^1.0.0").unwrap());
+
+        // devDependencies shadowing guard
+        assert!(candidate_shadows_ancestor_dep(
+            &graph,
+            "node_modules/parent",
+            "dev-dep",
+            "dev-dep",
+            &target_v2,
+            Some("2.0.0"),
+        ));
+        assert!(!candidate_shadows_ancestor_dep(
+            &graph,
+            "node_modules/parent",
+            "dev-dep",
+            "dev-dep",
+            &target_v1,
+            Some("1.1.0"),
+        ));
+
+        // peerDependencies shadowing guard
+        assert!(candidate_shadows_ancestor_dep(
+            &graph,
+            "node_modules/parent",
+            "peer-dep",
+            "peer-dep",
+            &target_v2,
+            Some("2.0.0"),
+        ));
+        assert!(!candidate_shadows_ancestor_dep(
+            &graph,
+            "node_modules/parent",
+            "peer-dep",
+            "peer-dep",
+            &target_v1,
+            Some("1.5.0"),
+        ));
+    }
+
+    #[test]
+    fn test_candidate_shadows_descendant_dep_root_empty_scope() {
+        use crate::graph::{DependencyEdge, DependencyType};
+
+        let mut graph = DependencyGraph::new();
+        let child_node =
+            make_test_node("node_modules/parent/node_modules/child", "child", "1.0.0");
+        graph.nodes.insert(
+            "node_modules/parent/node_modules/child".to_string(),
+            child_node,
+        );
+
+        // Workspace package outside node_modules (e.g. packages/shared-lib@1.0.0)
+        let ws_node = make_test_node("packages/shared-lib", "shared-lib", "1.0.0");
+        graph
+            .nodes
+            .insert("packages/shared-lib".to_string(), ws_node);
+
+        // Edge from descendant child pointing to workspace package outside node_modules
+        graph.edges.push(DependencyEdge {
+            from_location: "node_modules/parent/node_modules/child".to_string(),
+            to_location: "packages/shared-lib".to_string(),
+            install_name: "shared-lib".to_string(),
+            package_name: "shared-lib".to_string(),
+            spec: "^1.0.0".to_string(),
+            dep_type: DependencyType::Prod,
+        });
+
+        // When placing at root scope "" (prefix "node_modules/"):
+        // Introducing shared-lib@2.0.0 shadows child's requirement ^1.0.0 -> returns true
+        assert!(candidate_shadows_descendant_dep(
+            &graph,
+            "",
+            "shared-lib",
+            Some("2.0.0"),
+        ));
+
+        // Introducing shared-lib@1.2.0 is compatible -> returns false
+        assert!(!candidate_shadows_descendant_dep(
+            &graph,
+            "",
+            "shared-lib",
+            Some("1.2.0"),
+        ));
+    }
+
+    #[test]
+    fn test_is_shadowed_by_incompatible_between_nested_workspace_boundaries() {
+        let mut graph = DependencyGraph::new();
+        // Intermediate node at packages/parent/node_modules/pkg has version 2.0.0
+        graph.nodes.insert(
+            "packages/parent/node_modules/pkg".to_string(),
+            make_test_node("packages/parent/node_modules/pkg", "pkg", "2.0.0"),
+        );
+
+        let target_v1 = PackageTarget::Range(Range::parse("^1.0.0").unwrap());
+        let target_v2 = PackageTarget::Range(Range::parse("^2.0.0").unwrap());
+
+        // From packages/parent/nested to root "": traverses through packages/parent
+        // Finds incompatible pkg@2.0.0 when target is ^1.0.0
+        assert!(is_shadowed_by_incompatible_between(
+            &graph,
+            "packages/parent/nested",
+            "",
+            "pkg",
+            &target_v1,
+        ));
+
+        // When target is ^2.0.0, pkg@2.0.0 satisfies target -> not shadowed by incompatible
+        assert!(!is_shadowed_by_incompatible_between(
+            &graph,
+            "packages/parent/nested",
+            "",
+            "pkg",
+            &target_v2,
+        ));
+    }
+
+    #[test]
+    fn test_parent_scope_and_iter_ancestor_scopes() {
+        assert_eq!(parent_scope(""), None);
+        assert_eq!(parent_scope("node_modules/foo"), Some(""));
+        assert_eq!(parent_scope("node_modules/@scope/pkg"), Some(""));
+        assert_eq!(
+            parent_scope("node_modules/foo/node_modules/bar"),
+            Some("node_modules/foo")
+        );
+        assert_eq!(
+            parent_scope("packages/parent/nested"),
+            Some("packages/parent")
+        );
+        assert_eq!(parent_scope("packages/parent"), Some("packages"));
+        assert_eq!(parent_scope("packages"), Some(""));
+        assert_eq!(
+            parent_scope("packages/parent/nested/node_modules/dep"),
+            Some("packages/parent/nested")
+        );
+        assert_eq!(
+            parent_scope("packages/parent/nested/node_modules/@scope/dep"),
+            Some("packages/parent/nested")
+        );
+
+        let scopes: Vec<&str> = iter_ancestor_scopes("packages/parent/nested").collect();
+        assert_eq!(
+            scopes,
+            vec!["packages/parent/nested", "packages/parent", "packages", ""]
+        );
+
+        let root_scopes: Vec<&str> = iter_ancestor_scopes("node_modules/foo").collect();
+        assert_eq!(root_scopes, vec!["node_modules/foo", ""]);
+
+        let empty_scopes: Vec<&str> = iter_ancestor_scopes("").collect();
+        assert_eq!(empty_scopes, vec![""]);
+    }
+
+    #[test]
+    fn test_candidate_shadows_descendant_in_nested_workspace() {
+        use crate::graph::{DependencyEdge, DependencyType};
+
+        let mut graph = DependencyGraph::new();
+        // A node inside nested workspace packages/parent/nested
+        let nested_dep = make_test_node(
+            "packages/parent/nested/node_modules/leaf",
+            "leaf",
+            "1.0.0",
+        );
+        graph.nodes.insert(
+            "packages/parent/nested/node_modules/leaf".to_string(),
+            nested_dep,
+        );
+
+        // Outside dependency at root node_modules/shared-pkg@1.0.0
+        let root_dep = make_test_node("node_modules/shared-pkg", "shared-pkg", "1.0.0");
+        graph
+            .nodes
+            .insert("node_modules/shared-pkg".to_string(), root_dep);
+
+        // Edge from leaf in nested workspace pointing to root shared-pkg
+        graph.edges.push(DependencyEdge {
+            from_location: "packages/parent/nested/node_modules/leaf".to_string(),
+            to_location: "node_modules/shared-pkg".to_string(),
+            install_name: "shared-pkg".to_string(),
+            package_name: "shared-pkg".to_string(),
+            spec: "^1.0.0".to_string(),
+            dep_type: DependencyType::Prod,
+        });
+
+        // Introducing incompatible shared-pkg@2.0.0 at intermediate ancestor scope "packages/parent"
+        // must be detected as shadowing descendant leaf's dependency!
+        assert!(candidate_shadows_descendant_dep(
+            &graph,
+            "packages/parent",
+            "shared-pkg",
+            Some("2.0.0"),
+        ));
+
+        // Introducing compatible shared-pkg@1.5.0 at "packages/parent" does not shadow
+        assert!(!candidate_shadows_descendant_dep(
+            &graph,
+            "packages/parent",
+            "shared-pkg",
+            Some("1.5.0"),
+        ));
+    }
+
+    #[test]
+    fn test_nearest_shadowing_intermediate_scopes() {
+        let mut graph = DependencyGraph::new();
+        // Nearest intermediate node at packages/parent/node_modules/pkg has compatible 1.0.0
+        graph.nodes.insert(
+            "packages/parent/node_modules/pkg".to_string(),
+            make_test_node("packages/parent/node_modules/pkg", "pkg", "1.0.0"),
+        );
+        // Higher intermediate node at packages/node_modules/pkg has incompatible 2.0.0
+        graph.nodes.insert(
+            "packages/node_modules/pkg".to_string(),
+            make_test_node("packages/node_modules/pkg", "pkg", "2.0.0"),
+        );
+
+        let target = PackageTarget::Range(Range::parse("^1.0.0").unwrap());
+
+        // Nearest intermediate node is 1.0.0 which satisfies ^1.0.0,
+        // so it shadows the higher 2.0.0 and returns false (not shadowed by incompatible)
+        assert!(!is_shadowed_by_incompatible_between(
+            &graph,
+            "packages/parent/nested",
+            "",
+            "pkg",
+            &target,
+        ));
+
+        // If nearest intermediate node is 0.5.0 (incompatible), it returns true
+        graph.nodes.insert(
+            "packages/parent/node_modules/pkg".to_string(),
+            make_test_node("packages/parent/node_modules/pkg", "pkg", "0.5.0"),
+        );
+        assert!(is_shadowed_by_incompatible_between(
+            &graph,
+            "packages/parent/nested",
+            "",
+            "pkg",
+            &target,
+        ));
     }
 }

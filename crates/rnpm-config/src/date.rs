@@ -6,6 +6,10 @@ const DAY_MS: i64 = 86_400_000;
 /// a date-time without an offset is local time. Milliseconds since the epoch.
 pub fn parse_js_date(input: &str) -> Option<i64> {
     let s = input.trim();
+    if s.is_empty() {
+        return None;
+    }
+
     let (date, time) = match s.find(['T', 't', ' ']) {
         Some(i) => (&s[..i], Some(&s[i + 1..])),
         None => (s, None),
@@ -247,6 +251,11 @@ mod tests {
 
     #[test]
     fn parses_utc_forms() {
+        assert_eq!(parse_js_date("0"), None);
+        assert_eq!(parse_js_date("1700000000000"), None);
+        assert_eq!(parse_js_date("-1000"), None);
+        assert_eq!(parse_js_date("1970"), Some(0));
+        assert_eq!(parse_js_date("1970-01-01T00:00:00.000Z"), Some(0));
         assert_eq!(parse_js_date("1970-01-02"), Some(DAY_MS));
         assert_eq!(parse_js_date("2020-06-01"), Some(1_590_969_600_000));
         assert_eq!(

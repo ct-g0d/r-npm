@@ -1044,6 +1044,7 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
         let matched_version_opt = self
             .select_version(
                 &task.parent_location,
+                &task.install_name,
                 &dep_spec.package_name,
                 &pkg_meta,
                 &dep_spec.target,
@@ -1052,6 +1053,7 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
             .or_else(|| {
                 self.select_version(
                     &task.parent_location,
+                    &task.install_name,
                     &dep_spec.package_name,
                     &pkg_meta,
                     &dep_spec.target,
@@ -1278,27 +1280,18 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
 
         if !is_unlocked {
             if let Some(ref lockfile) = self.options.lockfile {
-                let mut curr = task.parent_location.as_str();
                 let mut found_loc = None;
-                loop {
-                    let cand = if curr.is_empty() {
+                for scope in crate::hoisting::iter_ancestor_scopes(&task.parent_location) {
+                    let cand = if scope.is_empty() {
                         format!("node_modules/{}", dep_spec.install_name)
                     } else {
-                        format!("{curr}/node_modules/{}", dep_spec.install_name)
+                        format!("{scope}/node_modules/{}", dep_spec.install_name)
                     };
                     if let Some(pkg) = lockfile.packages.get(&cand) {
                         if pkg.version.as_deref() == Some(&chosen_version.version) {
                             found_loc = Some(cand);
                             break;
                         }
-                    }
-                    if curr.is_empty() {
-                        break;
-                    }
-                    if let Some(idx) = curr.rfind("/node_modules/") {
-                        curr = &curr[..idx];
-                    } else {
-                        curr = "";
                     }
                 }
                 if let Some(loc) = found_loc {
@@ -2045,9 +2038,14 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
             else {
                 continue;
             };
-            let Some(chosen) =
-                self.select_version("", &dep_spec.package_name, &meta, &dep_spec.target, &[])
-            else {
+            let Some(chosen) = self.select_version(
+                "",
+                &dep_spec.install_name,
+                &dep_spec.package_name,
+                &meta,
+                &dep_spec.target,
+                &[],
+            ) else {
                 continue;
             };
             for (peer, peer_spec) in &chosen.peer_dependencies {
@@ -2096,11 +2094,12 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                     .select_version(
                         "",
                         peer,
+                        peer,
                         &peer_meta,
                         &root_target,
                         std::slice::from_ref(&peer_target),
                     )
-                    .or_else(|| self.select_version("", peer, &peer_meta, &root_target, &[]));
+                    .or_else(|| self.select_version("", peer, peer, &peer_meta, &root_target, &[]));
                 let Some(root_choice) = root_choice else {
                     continue;
                 };
@@ -2237,6 +2236,7 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
             .and_then(|meta| {
                 self.select_version(
                     parent_location,
+                    &dep_spec.install_name,
                     &dep_spec.package_name,
                     &meta,
                     &dep_spec.target,
@@ -2445,9 +2445,14 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
             let Some(meta) = self.provider.cached_package(&dep_spec.package_name) else {
                 continue;
             };
-            let Some(version) =
-                self.select_version("", &dep_spec.package_name, &meta, &dep_spec.target, &[])
-            else {
+            let Some(version) = self.select_version(
+                "",
+                &dep_spec.install_name,
+                &dep_spec.package_name,
+                &meta,
+                &dep_spec.target,
+                &[],
+            ) else {
                 continue;
             };
             // Follow the edges placement follows: no peers under
@@ -2496,37 +2501,37 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
     fn select_version<'b>(
         &self,
         parent_location: &str,
+        install_name: &str,
         pkg_name: &str,
         meta: &'b PackageMetadata,
         target: &PackageTarget,
         advisories: &[PackageTarget],
     ) -> Option<&'b PackageVersionMetadata> {
-        let is_unlocked = self.options.unlocked_packages.contains(pkg_name)
+        let is_unlocked = self.options.unlocked_packages.contains(install_name)
+            || self.options.unlocked_packages.contains(pkg_name)
+            || self
+                .options
+                .vulnerability_constraints
+                .contains_key(install_name)
             || self
                 .options
                 .vulnerability_constraints
                 .contains_key(pkg_name);
         if !is_unlocked {
             if let Some(ref lockfile) = self.options.lockfile {
-                let mut curr = parent_location;
                 let mut found_pkg = None;
-                loop {
-                    let cand = if curr.is_empty() {
-                        format!("node_modules/{pkg_name}")
+                for scope in crate::hoisting::iter_ancestor_scopes(parent_location) {
+                    let cand = if scope.is_empty() {
+                        format!("node_modules/{install_name}")
                     } else {
-                        format!("{curr}/node_modules/{pkg_name}")
+                        format!("{scope}/node_modules/{install_name}")
                     };
                     if let Some(pkg) = lockfile.packages.get(&cand) {
-                        found_pkg = Some(pkg);
-                        break;
-                    }
-                    if curr.is_empty() {
-                        break;
-                    }
-                    if let Some(idx) = curr.rfind("/node_modules/") {
-                        curr = &curr[..idx];
-                    } else {
-                        curr = "";
+                        let entry_name = pkg.name.as_deref().unwrap_or(install_name);
+                        if entry_name == pkg_name {
+                            found_pkg = Some(pkg);
+                            break;
+                        }
                     }
                 }
                 if let Some(pkg) = found_pkg {
@@ -2562,7 +2567,11 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                 meta.versions.get(tagged_version)
             }
             PackageTarget::Range(range) => {
-                let vuln_ranges = self.options.vulnerability_constraints.get(pkg_name);
+                let vuln_ranges = self
+                    .options
+                    .vulnerability_constraints
+                    .get(install_name)
+                    .or_else(|| self.options.vulnerability_constraints.get(pkg_name));
                 let is_safe = |ver: &Version| -> bool {
                     if let Some(ranges) = vuln_ranges {
                         !ranges.iter().any(|r| r.satisfies(ver))
@@ -2576,7 +2585,7 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                     if let Some(loc) = DependencyGraph::find_in_scope_hierarchy(
                         &self.graph.nodes,
                         parent_location,
-                        pkg_name,
+                        install_name,
                         &mut scope_buf,
                     ) {
                         if let Some(existing_node) = self.graph.nodes.get(loc) {
@@ -2740,8 +2749,8 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                     best_any.map(|(v_meta, _)| v_meta)
                 }
             }
-            PackageTarget::Alias { target, .. } => {
-                self.select_version(parent_location, pkg_name, meta, target, advisories)
+            PackageTarget::Alias { name: ref aliased_name, ref target } => {
+                self.select_version(parent_location, install_name, aliased_name, meta, target, advisories)
             }
             PackageTarget::Url(u) => {
                 let u_str = u.as_str();
@@ -3038,15 +3047,9 @@ fn validate_fast_path_dep(
     } else {
         let mut ancestors = Vec::new();
         if !from_loc.is_empty() {
-            let mut curr = from_loc;
-            while !curr.is_empty() {
-                if let Some(n) = graph.nodes.get(curr) {
+            for scope in crate::hoisting::iter_ancestor_scopes(from_loc) {
+                if let Some(n) = graph.nodes.get(scope) {
                     ancestors.push(n.name.as_str());
-                }
-                if let Some(idx) = curr.rfind("/node_modules/") {
-                    curr = &curr[..idx];
-                } else {
-                    break;
                 }
             }
             ancestors.reverse();

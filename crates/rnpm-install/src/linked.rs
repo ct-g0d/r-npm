@@ -92,31 +92,15 @@ pub fn resolve_lockfile_dep<'a>(
     consumer_loc: &str,
     dep_name: &str,
 ) -> Option<(String, &'a LockfilePackage)> {
-    if consumer_loc.is_empty() {
-        let root_key = format!("node_modules/{dep_name}");
-        if let Some(pkg) = lockfile.packages.get(&root_key) {
-            return Some((root_key, pkg));
-        }
-        return None;
-    }
-
-    let mut current = consumer_loc;
-    loop {
-        let candidate = format!("{current}/node_modules/{dep_name}");
+    for scope in rnpm_solver::hoisting::iter_ancestor_scopes(consumer_loc) {
+        let candidate = if scope.is_empty() {
+            format!("node_modules/{dep_name}")
+        } else {
+            format!("{scope}/node_modules/{dep_name}")
+        };
         if let Some(pkg) = lockfile.packages.get(&candidate) {
             return Some((candidate, pkg));
         }
-        if let Some(idx) = current.rfind("/node_modules/") {
-            current = &current[..idx];
-        } else {
-            break;
-        }
     }
-
-    let root_candidate = format!("node_modules/{dep_name}");
-    if let Some(pkg) = lockfile.packages.get(&root_candidate) {
-        return Some((root_candidate, pkg));
-    }
-
     None
 }

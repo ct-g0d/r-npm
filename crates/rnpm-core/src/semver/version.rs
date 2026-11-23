@@ -59,8 +59,12 @@ impl Version {
 
     pub fn parse(input: &str) -> Result<Self, SemverError> {
         let trimmed = input.trim();
-        // node-semver strips leading 'v', 'V', or '='
-        let s = trimmed.trim_start_matches(['v', 'V', '=', ' ']);
+        // Support leading '=' and/or 'v'/'V' prefix (e.g. '=1.2.3', 'v1.2.3', '=v1.2.3')
+        let s = trimmed.strip_prefix('=').unwrap_or(trimmed);
+        let s = s
+            .strip_prefix('v')
+            .or_else(|| s.strip_prefix('V'))
+            .unwrap_or(s);
         let s = s.trim();
         // node-semver never accepts inner whitespace: "2.5.0 - 3" is a range.
         if s.is_empty() || s.contains(char::is_whitespace) {
@@ -70,7 +74,17 @@ impl Version {
         // Split off build metadata first '+'
         let (ver_pre, build) = if let Some(idx) = s.find('+') {
             let b_str = &s[idx + 1..];
-            let builds: Vec<String> = b_str.split('.').map(|p| p.trim().to_string()).collect();
+            if b_str.is_empty() {
+                return Err(SemverError::InvalidVersion(input.to_string()));
+            }
+            let mut builds = Vec::new();
+            for part in b_str.split('.') {
+                let part = part.trim();
+                if part.is_empty() || !part.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+                    return Err(SemverError::InvalidVersion(input.to_string()));
+                }
+                builds.push(part.to_string());
+            }
             (&s[..idx], builds)
         } else {
             (s, Vec::new())
@@ -85,19 +99,22 @@ impl Version {
             let mut pres = Vec::new();
             for part in p_str.split('.') {
                 let part = part.trim();
-                if part.is_empty() {
+                if part.is_empty() || !part.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
                     return Err(SemverError::InvalidPrerelease(p_str.to_string()));
                 }
-                // Check if part is purely numeric and has no leading zero (or 0 itself)
-                if part.chars().all(|c| c.is_ascii_digit())
-                    && (part.len() == 1 || !part.starts_with('0'))
-                {
-                    if let Ok(n) = part.parse::<u64>() {
-                        pres.push(PrereleaseId::Numeric(n));
-                        continue;
+                // Check if part is purely numeric
+                if part.chars().all(|c| c.is_ascii_digit()) {
+                    // SemVer 2.0.0 §9: Numeric identifiers MUST NOT include leading zeroes
+                    if part.len() > 1 && part.starts_with('0') {
+                        return Err(SemverError::InvalidPrerelease(p_str.to_string()));
                     }
+                    let n = part
+                        .parse::<u64>()
+                        .map_err(|_| SemverError::InvalidPrerelease(p_str.to_string()))?;
+                    pres.push(PrereleaseId::Numeric(n));
+                } else {
+                    pres.push(PrereleaseId::Alpha(part.to_string()));
                 }
-                pres.push(PrereleaseId::Alpha(part.to_string()));
             }
             (&ver_pre[..idx], pres)
         } else {
@@ -108,6 +125,17 @@ impl Version {
         let parts: Vec<&str> = ver_part.split('.').collect();
         if parts.len() != 3 {
             return Err(SemverError::InvalidVersion(input.to_string()));
+        }
+
+        for p in &parts {
+            let p = p.trim();
+            if p.is_empty() || !p.chars().all(|c| c.is_ascii_digit()) {
+                return Err(SemverError::InvalidVersion(input.to_string()));
+            }
+            // SemVer 2.0.0 §2: Numeric segments MUST NOT contain leading zeroes
+            if p.len() > 1 && p.starts_with('0') {
+                return Err(SemverError::InvalidVersion(input.to_string()));
+            }
         }
 
         let major = parts[0]

@@ -640,8 +640,18 @@ pub fn parse_retry_after(header: Option<&HeaderValue>) -> Option<u64> {
 /// Parses a `Retry-After` string which may be either integer seconds or an HTTP-date.
 pub fn parse_retry_after_str(s: &str) -> Option<u64> {
     let s = s.trim();
-    if let Ok(secs) = s.parse::<u64>() {
-        return Some(secs);
+    if s.is_empty() {
+        return None;
+    }
+    // Handle signed integer seconds (e.g. "-10" -> 0 seconds, retry immediately per RFC 7231 / 9110)
+    if let Ok(signed) = s.parse::<i64>() {
+        return Some(if signed < 0 { 0 } else { signed as u64 });
+    }
+    // Handle huge integer seconds that overflow u64 (exceeding budget cap)
+    let is_numeric = (s.starts_with('+') && s[1..].chars().all(|c| c.is_ascii_digit()))
+        || s.chars().all(|c| c.is_ascii_digit());
+    if is_numeric {
+        return Some(u64::MAX);
     }
     parse_http_date_to_seconds_from_now(s)
 }
@@ -760,8 +770,18 @@ impl RegistryClient {
             let https_p = https.clone();
             let http_p = http.clone();
             let mut custom_proxy = reqwest::Proxy::custom(move |url| {
+                let host_str = url.host_str()?;
+                // Never proxy RFC 2606 / RFC 6761 special-use reserved test domains (.invalid, .test, .example, .localhost)
+                if host_str.ends_with(".invalid")
+                    || host_str.ends_with(".test")
+                    || host_str.ends_with(".example")
+                    || host_str.ends_with(".localhost")
+                    || host_str.eq_ignore_ascii_case("localhost")
+                {
+                    return None;
+                }
                 let proxy = if url.scheme() == "https" { https_p.as_ref() } else { http_p.as_ref() }?;
-                let host: Vec<&str> = url.host_str()?.split('.').rev().collect();
+                let host: Vec<&str> = host_str.split('.').rev().collect();
                 let bypass = no_proxy
                     .iter()
                     .any(|entry| entry.iter().enumerate().all(|(i, s)| host.get(i) == Some(&s.as_str())));
@@ -1191,6 +1211,11 @@ impl RegistryClient {
             return true;
         }
 
+        // Never forward authorization headers across an HTTPS -> HTTP downgrade!
+        if initial_url.scheme() == "https" && current_url.scheme() == "http" {
+            return false;
+        }
+
         // To receive the registry auth token, BOTH initial_url and current_url MUST be trusted hosts!
         if !self.is_trusted_host(initial_url) || !self.is_trusted_host(current_url) {
             return false;
@@ -1205,7 +1230,24 @@ impl RegistryClient {
             return true;
         }
 
-        self.is_trusted_host(current_url)
+        // For cross-origin redirects (different host, port, or scheme), only forward authorization
+        // if current_url host and port are explicitly trusted in trusted_hosts
+        if let Some(port) = current_url.port_or_known_default() {
+            if self
+                .config
+                .trusted_hosts
+                .contains(&format!("{host}:{port}"))
+            {
+                return true;
+            }
+        }
+        if self.config.trusted_hosts.contains(&host)
+            && initial_url.port_or_known_default() == current_url.port_or_known_default()
+        {
+            return true;
+        }
+
+        false
     }
 
     /// Execute a request under semaphore permit with redirect security and retry backoff.

@@ -137,28 +137,16 @@ pub struct PruneSummary {
 /// Builds candidate paths in order: from most nested to hoisted root.
 pub fn get_candidate_paths(current_pkg_path: &str, dep_name: &str) -> Vec<String> {
     let mut candidates = Vec::new();
-    if current_pkg_path.is_empty() {
-        candidates.push(format!("node_modules/{dep_name}"));
-        return candidates;
+    for scope in rnpm_solver::hoisting::iter_ancestor_scopes(current_pkg_path) {
+        let candidate = if scope.is_empty() {
+            format!("node_modules/{dep_name}")
+        } else {
+            format!("{scope}/node_modules/{dep_name}")
+        };
+        if !candidates.contains(&candidate) {
+            candidates.push(candidate);
+        }
     }
-
-    // 1. Nested directly inside current package
-    candidates.push(format!("{current_pkg_path}/node_modules/{dep_name}"));
-
-    // 2. Ancestor packages up the tree
-    let mut curr = current_pkg_path;
-    while let Some(idx) = curr.rfind("/node_modules/") {
-        let ancestor = &curr[..idx];
-        candidates.push(format!("{ancestor}/node_modules/{dep_name}"));
-        curr = ancestor;
-    }
-
-    // 3. Hoisted root level
-    let root_cand = format!("node_modules/{dep_name}");
-    if !candidates.contains(&root_cand) {
-        candidates.push(root_cand);
-    }
-
     candidates
 }
 

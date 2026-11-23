@@ -5,7 +5,7 @@ use rnpm_core::spec::PackageTarget;
 use rnpm_core::to_posix_path;
 use rnpm_core::PlatformList;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::Path;
 
@@ -478,6 +478,29 @@ impl LockfilePackage {
         self.dev = if val { Some(true) } else { None };
     }
 
+    /// `$name` override references of this package, in arborist's edge.js
+    /// lookup order: dev, optional, dependencies, peer. The first non-empty
+    /// spec wins (an empty string is falsy in arborist).
+    pub fn all_dependency_specs(&self) -> BTreeMap<String, String> {
+        let mut specs = BTreeMap::new();
+        for section in [
+            &self.peer_dependencies,
+            &self.dependencies,
+            &self.optional_dependencies,
+            &self.dev_dependencies,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            for (name, spec) in section {
+                if !spec.is_empty() {
+                    specs.insert(name.clone(), spec.clone());
+                }
+            }
+        }
+        specs
+    }
+
     pub fn with_dev(mut self, val: bool) -> Self {
         self.set_dev(val);
         self
@@ -736,7 +759,11 @@ pub struct LockfileV3 {
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub version: Option<String>,
 
-    #[serde(rename = "lockfileVersion")]
+    #[serde(
+        rename = "lockfileVersion",
+        default = "crate::migration::default_lockfile_version",
+        deserialize_with = "crate::migration::deserialize_lockfile_version"
+    )]
     pub lockfile_version: u32,
 
     #[serde(skip_serializing_if = "Option::is_none", default)]
@@ -744,6 +771,7 @@ pub struct LockfileV3 {
 
     /// Node packages keyed by their POSIX forward-slash path (e.g. `""`, `"node_modules/foo"`).
     /// Sorted keys via `BTreeMap` guarantee deterministic byte output across runs.
+    #[serde(default)]
     pub packages: BTreeMap<String, LockfilePackage>,
 }
 
@@ -753,15 +781,34 @@ fn project_lockfile_format(
     project_dir: &Path,
     fallbacks: &[std::path::PathBuf],
 ) -> rnpm_core::ManifestFormat {
-    let mut format = std::iter::once(project_dir.join("package.json"))
+    let all_paths: Vec<_> = std::iter::once(project_dir.join("package.json"))
         .chain(fallbacks.iter().cloned())
-        .find_map(|path| std::fs::read_to_string(path).ok())
-        .map(|raw| rnpm_core::ManifestFormat::detect(&raw))
-        .unwrap_or_default();
-    if format.indent.is_empty() {
-        format.indent = rnpm_core::ManifestFormat::default().indent;
+        .collect();
+
+    let mut detected_indent = None;
+    let mut detected_newline = None;
+
+    for path in all_paths {
+        if let Ok(raw) = std::fs::read_to_string(&path) {
+            let fmt = rnpm_core::ManifestFormat::detect(&raw);
+            if detected_indent.is_none() && !fmt.indent.is_empty() {
+                detected_indent = Some(fmt.indent);
+            }
+            if detected_newline.is_none() && !fmt.newline.is_empty() {
+                detected_newline = Some(fmt.newline);
+            }
+            if detected_indent.is_some() && detected_newline.is_some() {
+                break;
+            }
+        }
     }
-    format
+
+    rnpm_core::ManifestFormat {
+        indent: detected_indent.unwrap_or_else(|| rnpm_core::ManifestFormat::default().indent),
+        newline: detected_newline.unwrap_or_else(|| rnpm_core::ManifestFormat::default().newline),
+        trailing_newline: true,
+        has_bom: false,
+    }
 }
 
 impl LockfileV3 {
@@ -840,6 +887,14 @@ impl LockfileV3 {
             }
         };
 
+        let workspaces_vec = match &manifest.workspaces {
+            Some(rnpm_core::manifest::PackageWorkspaces::List(list)) => Some(list.clone()),
+            Some(rnpm_core::manifest::PackageWorkspaces::Config { packages }) => {
+                Some(packages.clone())
+            }
+            None => None,
+        };
+
         packages.insert(
             "".to_string(),
             LockfilePackage {
@@ -867,6 +922,7 @@ impl LockfileV3 {
                     Some(manifest.optional_dependencies.clone())
                 },
                 bundle_dependencies: manifest.bundled_dependencies.clone(),
+                workspaces: workspaces_vec,
                 extra: {
                     let mut extra = manifest.extra.clone();
                     extra.remove("overrides");
@@ -938,6 +994,13 @@ impl LockfileV3 {
             }
         };
         root.bundle_dependencies = manifest.bundled_dependencies.clone();
+        root.workspaces = match &manifest.workspaces {
+            Some(rnpm_core::manifest::PackageWorkspaces::List(list)) => Some(list.clone()),
+            Some(rnpm_core::manifest::PackageWorkspaces::Config { packages }) => {
+                Some(packages.clone())
+            }
+            None => None,
+        };
         for (k, v) in &manifest.extra {
             if k == "overrides" || k == "directories" {
                 continue;
@@ -1068,7 +1131,16 @@ impl LockfileV3 {
         manifest: &rnpm_core::manifest::Manifest,
         include_dev: bool,
     ) -> bool {
-        self.matches_manifest_ext(manifest, include_dev, true)
+        self.matches_manifest_ext_with_workspaces(manifest, include_dev, true, None)
+    }
+
+    pub fn matches_manifest_for_ci_with_workspaces(
+        &self,
+        manifest: &rnpm_core::manifest::Manifest,
+        include_dev: bool,
+        workspace_members: Option<&[rnpm_core::workspace::WorkspaceMember]>,
+    ) -> bool {
+        self.matches_manifest_ext_with_workspaces(manifest, include_dev, true, workspace_members)
     }
 
     pub fn matches_manifest_ext(
@@ -1076,6 +1148,16 @@ impl LockfileV3 {
         manifest: &rnpm_core::manifest::Manifest,
         include_dev: bool,
         allow_extra_lock_deps: bool,
+    ) -> bool {
+        self.matches_manifest_ext_with_workspaces(manifest, include_dev, allow_extra_lock_deps, None)
+    }
+
+    pub fn matches_manifest_ext_with_workspaces(
+        &self,
+        manifest: &rnpm_core::manifest::Manifest,
+        include_dev: bool,
+        allow_extra_lock_deps: bool,
+        workspace_members: Option<&[rnpm_core::workspace::WorkspaceMember]>,
     ) -> bool {
         let Some(root_pkg) = self.root_package() else {
             return false;
@@ -1154,6 +1236,172 @@ impl LockfileV3 {
             return false;
         }
 
+        // Check workspaces drift
+        let manifest_ws: Option<Vec<String>> = match &manifest.workspaces {
+            Some(rnpm_core::manifest::PackageWorkspaces::List(list)) => Some(list.clone()),
+            Some(rnpm_core::manifest::PackageWorkspaces::Config { packages }) => {
+                Some(packages.clone())
+            }
+            None => None,
+        };
+        let manifest_has_ws = manifest_ws.as_ref().is_some_and(|w| !w.is_empty());
+        let root_has_ws = root_pkg.workspaces.as_ref().is_some_and(|w| !w.is_empty());
+
+        if manifest_has_ws && root_has_ws {
+            let mut m = manifest_ws.unwrap();
+            let mut r = root_pkg.workspaces.clone().unwrap_or_default();
+            m.sort();
+            r.sort();
+            if m != r {
+                return false;
+            }
+        } else if !manifest_has_ws && root_has_ws {
+            return false;
+        } else if manifest_has_ws && !root_has_ws {
+            // Root workspace metadata is absent in lockfile (e.g. npm v1 workspace lock or npm v3 omission).
+            // Validate legacy / omitted lockfile via discovered members and available links while preserving genuine drift checks.
+            let patterns = manifest.workspace_patterns();
+
+            // Collect discovered workspace member paths from packages map
+            // Exclude any key that has a "node_modules" path segment (e.g. unhoisted packages in packages/member/node_modules/dep)
+            let lockfile_member_paths: BTreeSet<String> = self
+                .packages
+                .keys()
+                .filter(|k| !k.is_empty() && !k.split(['/', '\\']).any(|seg| seg == "node_modules"))
+                .cloned()
+                .collect();
+
+            // Collect available links (target relative paths and link package names)
+            let mut available_link_targets = BTreeSet::new();
+            let mut available_link_names = BTreeSet::new();
+
+            for (loc, pkg) in &self.packages {
+                let mut target_opt = None;
+                if pkg.link == Some(true) {
+                    if let Some(res) = &pkg.resolved {
+                        target_opt = Some(res.as_str());
+                    }
+                } else if let Some(ver) = &pkg.version {
+                    if let Some(t) = ver.strip_prefix("file:") {
+                        target_opt = Some(t);
+                    }
+                } else if let Some(res) = &pkg.resolved {
+                    if let Some(t) = res.strip_prefix("file:") {
+                        target_opt = Some(t);
+                    }
+                }
+
+                if let Some(raw_target) = target_opt {
+                    let clean = raw_target
+                        .strip_prefix("./")
+                        .unwrap_or(raw_target)
+                        .strip_prefix(".\\")
+                        .unwrap_or(raw_target);
+                    let posix = clean.replace('\\', "/");
+                    let posix = posix.trim_end_matches('/').to_string();
+                    available_link_targets.insert(posix);
+                    if let Some(name) = loc.strip_prefix("node_modules/") {
+                        available_link_names.insert(name.to_string());
+                    }
+                    if let Some(ref name) = pkg.name {
+                        available_link_names.insert(name.clone());
+                    }
+                }
+            }
+
+            // All lockfile member paths outside node_modules must match workspace patterns
+            for member_path in &lockfile_member_paths {
+                if !Self::path_matches_workspace_patterns(member_path, &patterns) {
+                    return false;
+                }
+            }
+
+            if let Some(members) = workspace_members {
+                // Workspace discovery is available (caller supplied workspace_members).
+                // 1. Every discovered member on disk must exist in the lockfile
+                for member in members {
+                    let has_entry = lockfile_member_paths.contains(&member.relative_path)
+                        || available_link_targets.contains(&member.relative_path)
+                        || available_link_names.contains(&member.name);
+                    if !has_entry {
+                        return false;
+                    }
+                }
+
+                // 2. Every member path in lockfile must exist on disk (detects stale / deleted members)
+                for member_path in &lockfile_member_paths {
+                    if !members.iter().any(|m| m.relative_path == *member_path) {
+                        return false;
+                    }
+                }
+
+                // 3. Every available link target that matches workspace patterns must exist on disk
+                for link_target in &available_link_targets {
+                    if Self::path_matches_workspace_patterns(link_target, &patterns)
+                        && !members.iter().any(|m| m.relative_path == *link_target)
+                    {
+                        return false;
+                    }
+                }
+            } else {
+                // Workspace discovery is unavailable (None).
+                // Lockfile must have at least one workspace member or link matching patterns.
+                let has_matching_member = lockfile_member_paths
+                    .iter()
+                    .any(|p| Self::path_matches_workspace_patterns(p, &patterns));
+                let has_matching_link = available_link_targets
+                    .iter()
+                    .any(|t| Self::path_matches_workspace_patterns(t, &patterns));
+
+                if !has_matching_member && !has_matching_link {
+                    return false;
+                }
+            }
+        } else if !manifest_has_ws && !root_has_ws && !allow_extra_lock_deps {
+            let has_lockfile_members = self
+                .packages
+                .keys()
+                .any(|k| !k.is_empty() && !k.split(['/', '\\']).any(|seg| seg == "node_modules"));
+            if has_lockfile_members {
+                return false;
+            }
+        }
+
+        // Check direct overrides
+        let overrides = rnpm_core::overrides::Overrides::from_manifest(manifest).ok();
+
+        if let Some(ref ov) = overrides {
+            for rule_key in ov.rules.keys() {
+                let dep_name = rule_key
+                    .split_once('@')
+                    .map(|(name, _)| {
+                        if name.is_empty() && rule_key.starts_with('@') {
+                            if let Some((sub_name, _)) = rule_key[1..].split_once('@') {
+                                format!("@{sub_name}")
+                            } else {
+                                rule_key.clone()
+                            }
+                        } else if name.is_empty() {
+                            rule_key.clone()
+                        } else {
+                            name.to_string()
+                        }
+                    })
+                    .unwrap_or_else(|| rule_key.clone());
+
+                let key = format!("node_modules/{dep_name}");
+                if let Some(pkg) = self.packages.get(&key) {
+                    let req_spec = pkg.version.as_deref().unwrap_or("*");
+                    if let Ok(Some(eff_spec)) = ov.resolve_override(&dep_name, req_spec, &[]) {
+                        if !Self::package_satisfies_spec(&dep_name, pkg, &eff_spec) {
+                            return false;
+                        }
+                    }
+                }
+            }
+        }
+
+
         // 7. Verify direct dependencies exist in packages map and satisfy specs
         for (dep, spec) in &manifest.dependencies {
             if manifest.optional_dependencies.contains_key(dep) {
@@ -1163,7 +1411,15 @@ impl LockfileV3 {
             let Some(pkg) = self.packages.get(&key) else {
                 return false;
             };
-            if !Self::package_satisfies_spec(dep, pkg, spec) {
+            let eff_spec = if let Some(ref ov) = overrides {
+                ov.resolve_override(dep, spec, &[])
+                    .ok()
+                    .flatten()
+                    .unwrap_or_else(|| spec.clone())
+            } else {
+                spec.clone()
+            };
+            if !Self::package_satisfies_spec(dep, pkg, &eff_spec) {
                 return false;
             }
         }
@@ -1175,7 +1431,15 @@ impl LockfileV3 {
                 let Some(pkg) = self.packages.get(&key) else {
                     return false;
                 };
-                if !Self::package_satisfies_spec(dep, pkg, spec) {
+                let eff_spec = if let Some(ref ov) = overrides {
+                    ov.resolve_override(dep, spec, &[])
+                        .ok()
+                        .flatten()
+                        .unwrap_or_else(|| spec.clone())
+                } else {
+                    spec.clone()
+                };
+                if !Self::package_satisfies_spec(dep, pkg, &eff_spec) {
                     return false;
                 }
             }
@@ -1185,7 +1449,15 @@ impl LockfileV3 {
         for (dep, spec) in &manifest.optional_dependencies {
             let key = format!("node_modules/{dep}");
             if let Some(pkg) = self.packages.get(&key) {
-                if !Self::package_satisfies_spec(dep, pkg, spec) {
+                let eff_spec = if let Some(ref ov) = overrides {
+                    ov.resolve_override(dep, spec, &[])
+                        .ok()
+                        .flatten()
+                        .unwrap_or_else(|| spec.clone())
+                } else {
+                    spec.clone()
+                };
+                if !Self::package_satisfies_spec(dep, pkg, &eff_spec) {
                     return false;
                 }
             }
@@ -1200,8 +1472,16 @@ impl LockfileV3 {
                 .unwrap_or_else(|| root_pkg.is_peer_dep_optional(dep));
 
             let key = format!("node_modules/{dep}");
+            let eff_spec = if let Some(ref ov) = overrides {
+                ov.resolve_override(dep, spec, &[])
+                    .ok()
+                    .flatten()
+                    .unwrap_or_else(|| spec.clone())
+            } else {
+                spec.clone()
+            };
             if let Some(pkg) = self.packages.get(&key) {
-                if !Self::package_satisfies_spec(dep, pkg, spec) {
+                if !Self::package_satisfies_spec(dep, pkg, &eff_spec) {
                     return false;
                 }
             } else if !is_optional {
@@ -1212,14 +1492,23 @@ impl LockfileV3 {
         true
     }
 
+    pub fn path_matches_workspace_patterns(path: &str, patterns: &[String]) -> bool {
+        rnpm_core::workspace::path_matches_workspace_patterns(path, patterns)
+    }
+
     pub fn package_satisfies_spec(install_name: &str, pkg: &LockfilePackage, spec: &str) -> bool {
+        let Ok(target) = PackageTarget::parse(spec) else {
+            return false;
+        };
         if pkg.link == Some(true) {
+            if let PackageTarget::Alias { ref name, .. } = target {
+                if pkg.name.as_deref() != Some(name) {
+                    return false;
+                }
+            }
             return true;
         }
         let Some(ref ver_str) = pkg.version else {
-            return false;
-        };
-        let Ok(target) = PackageTarget::parse(spec) else {
             return false;
         };
         match &target {
@@ -1241,24 +1530,39 @@ impl LockfileV3 {
     }
 
     fn version_matches_target(ver_str: &str, target: &PackageTarget) -> bool {
-        let Ok(v) = Version::parse(ver_str) else {
-            return false;
-        };
         match target {
-            PackageTarget::Version(expected) => &v == expected,
-            PackageTarget::Range(range) => range.satisfies(&v),
-            PackageTarget::Tag(_) => true,
-            PackageTarget::File(_) => true,
-            PackageTarget::Git { .. } => true,
-            PackageTarget::Url(_) => true,
+            PackageTarget::Tag(_)
+            | PackageTarget::File(_)
+            | PackageTarget::Git { .. }
+            | PackageTarget::Url(_) => true,
+            PackageTarget::Version(expected) => {
+                let Ok(v) = Version::parse(ver_str) else {
+                    return false;
+                };
+                &v == expected
+            }
+            PackageTarget::Range(range) => {
+                let Ok(v) = Version::parse(ver_str) else {
+                    return false;
+                };
+                range.satisfies(&v)
+            }
             PackageTarget::Workspace(ws_spec) => {
                 let s = ws_spec.trim();
                 if s == "*" || s == "^" || s == "~" || s.is_empty() {
                     true
                 } else if let Ok(range) = rnpm_core::semver::Range::parse(s) {
-                    range.satisfies(&v)
+                    if let Ok(v) = Version::parse(ver_str) {
+                        range.satisfies(&v)
+                    } else {
+                        false
+                    }
                 } else if let Ok(expected) = Version::parse(s) {
-                    v == expected
+                    if let Ok(v) = Version::parse(ver_str) {
+                        v == expected
+                    } else {
+                        false
+                    }
                 } else {
                     true
                 }
@@ -1304,9 +1608,52 @@ impl LockfileV3 {
                 }
             }
             // For other spec differences, verify whether resolved package in packages satisfies manifest spec,
-            // but ONLY if the lock spec itself was not a file/link/target that diverged.
-            if lock_spec.starts_with("file:") || manifest_spec.starts_with("file:") {
+            // but ONLY if the lock spec itself was not a non-registry/tarball/git spec that diverged.
+            let is_non_registry = |s: &str| {
+                s.starts_with("file:")
+                    || s.starts_with("git:")
+                    || s.starts_with("git+")
+                    || s.starts_with("github:")
+                    || s.starts_with("http:")
+                    || s.starts_with("https:")
+                    || s.ends_with(".tgz")
+                    || s.ends_with(".tar.gz")
+            };
+            if is_non_registry(lock_spec) || is_non_registry(manifest_spec) {
                 return false;
+            }
+
+            let m_alias = manifest_spec.starts_with("npm:");
+            let l_alias = lock_spec.starts_with("npm:");
+            if m_alias != l_alias {
+                return false;
+            }
+            if m_alias && l_alias {
+                let Ok(PackageTarget::Alias {
+                    name: m_name,
+                    target: _m_target,
+                }) = PackageTarget::parse(manifest_spec)
+                else {
+                    return false;
+                };
+                let Ok(PackageTarget::Alias {
+                    name: l_name,
+                    target: _l_target,
+                }) = PackageTarget::parse(lock_spec)
+                else {
+                    return false;
+                };
+                if m_name != l_name {
+                    return false;
+                }
+                let key = format!("node_modules/{k}");
+                let Some(pkg) = packages.get(&key) else {
+                    return false;
+                };
+                if !Self::package_satisfies_spec(k, pkg, manifest_spec) {
+                    return false;
+                }
+                continue;
             }
             let key = format!("node_modules/{k}");
             let Some(pkg) = packages.get(&key) else {
@@ -1651,10 +1998,27 @@ impl LockfileV3 {
     }
 
     fn to_legacy_dependencies(&self) -> serde_json::Value {
-        fn package_value(package: &LockfilePackage) -> serde_json::Value {
+        fn package_value(dep_name: &str, package: &LockfilePackage) -> serde_json::Value {
             let mut value = serde_json::Map::new();
             if let Some(v) = &package.version {
-                value.insert("version".into(), serde_json::Value::String(v.clone()));
+                let ver_str = if let Some(real_name) = &package.name {
+                    if real_name != dep_name {
+                        format!("npm:{real_name}@{v}")
+                    } else {
+                        v.clone()
+                    }
+                } else {
+                    v.clone()
+                };
+                value.insert("version".into(), serde_json::Value::String(ver_str));
+            } else if package.link == Some(true) {
+                let resolved = package.resolved.as_deref().unwrap_or("");
+                let ver_str = if resolved.starts_with("file:") {
+                    resolved.to_string()
+                } else {
+                    format!("file:{resolved}")
+                };
+                value.insert("version".into(), serde_json::Value::String(ver_str));
             }
             if let Some(v) = &package.resolved {
                 value.insert("resolved".into(), serde_json::Value::String(v.clone()));
@@ -1687,10 +2051,12 @@ impl LockfileV3 {
                 value.insert("hasShrinkwrap".into(), serde_json::Value::Bool(true));
             }
             if let Some(deps) = &package.dependencies {
-                value.insert(
-                    "requires".into(),
-                    serde_json::to_value(deps).unwrap_or_default(),
-                );
+                if !deps.is_empty() {
+                    value.insert(
+                        "requires".into(),
+                        serde_json::to_value(deps).unwrap_or_default(),
+                    );
+                }
             }
             serde_json::Value::Object(value)
         }
@@ -1705,32 +2071,33 @@ impl LockfileV3 {
             }
             let name = segments[0];
             if segments.len() == 1 {
-                root.insert(name.to_string(), package_value(package));
+                root.insert(name.to_string(), package_value(name, package));
                 return;
             }
             let entry = root
                 .entry(name.to_string())
                 .or_insert_with(|| serde_json::json!({}));
-            let object = entry
-                .as_object_mut()
-                .expect("legacy dependency entry must be an object");
+            let Some(object) = entry.as_object_mut() else {
+                return;
+            };
             let nested = object
                 .entry("dependencies")
                 .or_insert_with(|| serde_json::json!({}));
-            insert_node(
-                nested
-                    .as_object_mut()
-                    .expect("legacy dependencies must be an object"),
-                &segments[1..],
-                package,
-            );
+            let Some(nested_obj) = nested.as_object_mut() else {
+                return;
+            };
+            insert_node(nested_obj, &segments[1..], package);
         }
 
         let mut root = serde_json::Map::new();
-        let mut keys: Vec<_> = self.packages.keys().filter(|k| !k.is_empty()).collect();
+        let mut keys: Vec<_> = self
+            .packages
+            .keys()
+            .filter(|k| k.starts_with("node_modules/"))
+            .collect();
         keys.sort_by_key(|k| k.matches("/node_modules/").count());
         for key in keys {
-            let path = key.trim_start_matches("node_modules/");
+            let path = key.strip_prefix("node_modules/").unwrap_or(key);
             let segments: Vec<_> = path.split("/node_modules/").collect();
             if let Some(package) = self.packages.get(key) {
                 insert_node(&mut root, &segments, package);
@@ -1834,8 +2201,8 @@ impl LockfileV3 {
             project_dir,
             &[
                 hidden_path.clone(),
-                project_dir.join("package-lock.json"),
                 project_dir.join("npm-shrinkwrap.json"),
+                project_dir.join("package-lock.json"),
             ],
         );
         let content = hidden.to_npm_json_string_formatted(&format, root_metadata)?;
@@ -1907,7 +2274,7 @@ impl LockfileV3 {
             out.push('\n');
         }
         if format.newline == "\r\n" {
-            out = out.replace('\n', "\r\n");
+            out = out.replace("\r\n", "\n").replace('\n', "\r\n");
         }
         Ok(out)
     }

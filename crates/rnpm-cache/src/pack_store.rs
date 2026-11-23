@@ -530,15 +530,15 @@ impl PackagePack {
 
             if entry.cas_verified {
                 if let Some(ref cas_path) = entry.cas_path {
-                    let is_corrupted = cas_path
+                    let is_corrupted_or_missing = cas_path
                         .metadata()
                         .map(|metadata| {
                             metadata.len() != entry.size
                                 || (entry.cas_mtime.is_some()
                                     && mtime_to_timestamp(&metadata) != entry.cas_mtime)
                         })
-                        .unwrap_or(false);
-                    if is_corrupted {
+                        .unwrap_or(true);
+                    if is_corrupted_or_missing {
                         let _ = PackStore::write_cas_file_safe(cas_path, slice);
                     }
                 }
@@ -766,8 +766,32 @@ impl PackStore {
         match fs::rename(&tmp_path, cas_path) {
             Ok(()) => Ok(()),
             Err(_) => {
+                if let Ok(meta) = cas_path.metadata() {
+                    if meta.len() == data.len() as u64 {
+                        let _ = fs::remove_file(&tmp_path);
+                        return Ok(());
+                    }
+                }
+                #[cfg(windows)]
+                {
+                    if let Ok(meta) = fs::symlink_metadata(cas_path) {
+                        let mut perms = meta.permissions();
+                        if perms.readonly() {
+                            perms.set_readonly(false);
+                            let _ = fs::set_permissions(cas_path, perms);
+                        }
+                    }
+                }
                 let _ = fs::remove_file(cas_path);
                 let res = fs::rename(&tmp_path, cas_path);
+                if res.is_err() {
+                    if let Ok(meta) = cas_path.metadata() {
+                        if meta.len() == data.len() as u64 {
+                            let _ = fs::remove_file(&tmp_path);
+                            return Ok(());
+                        }
+                    }
+                }
                 let _ = fs::remove_file(&tmp_path);
                 res
             }
@@ -909,16 +933,16 @@ impl PackStore {
             }
         }
 
-        // 2. Remove files on disk
+        // 2. Remove files on disk (clearing readonly on Windows if set)
         let (pack_path, idx_path) = self.pack_paths(integrity);
-        let _ = fs::remove_file(&pack_path);
-        let _ = fs::remove_file(&idx_path);
+        remove_file_clearing_readonly(&pack_path);
+        remove_file_clearing_readonly(&idx_path);
 
         let prefix_dir = self.packs_dir().join(&prefix);
         let alt_pack = prefix_dir.join(format!("{sha512_hex}.pack"));
         let alt_idx = prefix_dir.join(format!("{sha512_hex}.idx"));
-        let _ = fs::remove_file(&alt_pack);
-        let _ = fs::remove_file(&alt_idx);
+        remove_file_clearing_readonly(&alt_pack);
+        remove_file_clearing_readonly(&alt_idx);
 
         Ok(())
     }
@@ -2297,12 +2321,24 @@ fn rename_atomic(from: &Path, to: &Path) -> std::io::Result<()> {
     }
 }
 
+/// Helper to reliably remove a file, clearing readonly attributes if set.
+fn remove_file_clearing_readonly(path: &Path) {
+    if let Ok(meta) = fs::symlink_metadata(path) {
+        let mut perms = meta.permissions();
+        if perms.readonly() {
+            perms.set_readonly(false);
+            let _ = fs::set_permissions(path, perms);
+        }
+    }
+    let _ = fs::remove_file(path);
+}
+
 /// Atomically renames a temporary file into a CAS destination with Windows retry support.
 ///
 /// If `to` already exists and has the expected length, another thread concurrently wrote it;
 /// this is treated as a success, and `from` is cleaned up.
 /// If `to` exists but does not match `expected_len` (e.g. truncated or corrupted), `to` is
-/// replaced atomically without removing it first.
+/// replaced cleanly clearing any readonly attributes.
 /// On failure or exhaustion of retries, `from` is cleaned up to prevent leftover temp files.
 fn rename_atomic_cas(from: &Path, to: &Path, expected_len: u64) -> std::io::Result<()> {
     if let Ok(m) = to.metadata() {
@@ -2325,6 +2361,8 @@ fn rename_atomic_cas(from: &Path, to: &Path, expected_len: u64) -> std::io::Resu
             if m.len() == expected_len {
                 let _ = fs::remove_file(from);
                 return Ok(());
+            } else {
+                remove_file_clearing_readonly(to);
             }
         }
         match fs::rename(from, to) {

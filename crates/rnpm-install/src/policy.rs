@@ -9,10 +9,13 @@
 
 use anyhow::{anyhow, Result};
 use rnpm_core::manifest::Manifest;
-use rnpm_lifecycle::LifecyclePackageNode;
 use rnpm_lockfile::{LockfilePackage, LockfileV3};
 use std::collections::HashSet;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+
+#[path = "allow_scripts.rs"]
+pub mod allow_scripts;
+pub use allow_scripts::*;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum AllowMode {
@@ -23,9 +26,9 @@ pub enum AllowMode {
 }
 
 impl AllowMode {
-    fn parse(value: Option<&str>) -> Self {
-        match value {
-            Some("none") => AllowMode::None,
+    pub fn parse(value: Option<&str>) -> Self {
+        match value.map(|s| s.trim().to_ascii_lowercase()).as_deref() {
+            Some("none" | "false" | "0") => AllowMode::None,
             Some("root") => AllowMode::Root,
             _ => AllowMode::All,
         }
@@ -53,7 +56,7 @@ impl SourcePolicy {
         }
     }
 
-    fn is_unrestricted(&self) -> bool {
+    pub fn is_unrestricted(&self) -> bool {
         [
             self.git,
             self.remote,
@@ -88,11 +91,12 @@ impl SourceKind {
 }
 
 pub fn is_registry_tarball(resolved: &str) -> bool {
-    // `<scheme>://<host>/<name>/-/<file>-<digit>...`, as arborist checks.
-    let Some(rest) = resolved
-        .strip_prefix("https://")
-        .or_else(|| resolved.strip_prefix("http://"))
-    else {
+    let resolved = resolved.trim();
+    let rest = if resolved.get(..8).is_some_and(|p| p.eq_ignore_ascii_case("https://")) {
+        &resolved[8..]
+    } else if resolved.get(..7).is_some_and(|p| p.eq_ignore_ascii_case("http://")) {
+        &resolved[7..]
+    } else {
         return false;
     };
     let Some((_host, path)) = rest.split_once('/') else {
@@ -104,76 +108,160 @@ pub fn is_registry_tarball(resolved: &str) -> bool {
     if idx == 0 {
         return false;
     }
-    let file = &path[idx + 3..];
-    file.char_indices().any(|(i, c)| {
-        c == '-'
-            && file[i + 1..]
-                .chars()
-                .next()
-                .is_some_and(|d| d.is_ascii_digit())
+    let before = &path[..idx];
+    let name_part = before
+        .replace("%2f", "/")
+        .replace("%2F", "/")
+        .replace("%40", "@");
+    let segs: Vec<&str> = name_part.split('/').filter(|s| !s.is_empty()).collect();
+    let name = match segs.as_slice() {
+        [.., scope, n] if scope.starts_with('@') => format!("{scope}/{n}"),
+        [.., n] => (*n).to_string(),
+        [] => return false,
+    };
+    let unscoped = name.rsplit('/').next().unwrap_or(&name);
+    let file = path[idx + 3..].split(['?', '#']).next().unwrap_or("");
+    if !file.ends_with(".tgz") {
+        return false;
+    }
+    let Some(file_without_tgz) = file.strip_suffix(".tgz") else {
+        return false;
+    };
+    let prefix = format!("{unscoped}-");
+    let Some(ver) = file_without_tgz.strip_prefix(&prefix) else {
+        return false;
+    };
+    let first_char = ver.chars().next();
+    first_char.is_some_and(|c| {
+        c.is_ascii_digit()
+            || (c == 'v' && ver[1..].chars().next().is_some_and(|d| d.is_ascii_digit()))
     })
 }
 
-fn is_git_spec(spec: &str) -> bool {
-    [
+pub(crate) fn is_git_spec(spec: &str) -> bool {
+    let spec = spec.trim();
+    let lower = spec.to_ascii_lowercase();
+    if [
         "git+",
         "git://",
         "git@",
+        "ssh://",
         "github:",
         "gitlab:",
         "bitbucket:",
         "gist:",
     ]
     .iter()
-    .any(|p| spec.starts_with(p))
+    .any(|p| lower.starts_with(p))
+    {
+        return true;
+    }
+    if lower.ends_with(".git") || lower.contains(".git#") {
+        return true;
+    }
+    // GitHub shortcut: "user/repo" or "user/repo#committish"
+    if !spec.starts_with('@')
+        && !spec.starts_with('.')
+        && !spec.starts_with('/')
+        && !spec.starts_with('~')
+        && !spec.contains('\\')
+        && !(spec.len() > 2 && spec.as_bytes()[1] == b':' && spec.as_bytes()[0].is_ascii_alphabetic())
+    {
+        let base = spec.split_once('#').map(|(b, _)| b).unwrap_or(spec);
+        if let Some((user, repo)) = base.split_once('/') {
+            if !user.is_empty()
+                && !repo.is_empty()
+                && !repo.contains('/')
+                && user.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+                && repo.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
+            {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Classify a dependency spec string into its `SourceKind`.
 pub fn parse_source_kind(spec: &str) -> SourceKind {
     let spec = spec.trim();
-    let spec = if let Some(sub) = spec.strip_prefix("npm:") {
-        if let Some(at_idx) = sub.rfind('@') {
-            let slash_idx = sub.find('/').unwrap_or(0);
-            if at_idx > slash_idx {
-                sub[at_idx + 1..].trim()
+    let spec = if spec
+        .get(..4)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("npm:"))
+     {
+        let sub = spec[4..].trim();
+        if sub.starts_with('@') {
+            if let Some(slash_idx) = sub.find('/') {
+                if let Some(at_idx) = sub[slash_idx + 1..].find('@') {
+                    sub[slash_idx + 1 + at_idx + 1..].trim()
+                } else {
+                    ""
+                }
             } else {
-                sub.trim()
+                ""
             }
+        } else if let Some(at_idx) = sub.find('@') {
+            sub[at_idx + 1..].trim()
         } else {
-            sub.trim()
+            ""
         }
     } else {
         spec
     };
 
+    if spec.is_empty() {
+        return SourceKind::Registry;
+    }
+
     if is_git_spec(spec) {
         return SourceKind::Git;
     }
-    if spec.starts_with("http://") || spec.starts_with("https://") {
+    let lower = spec.to_ascii_lowercase();
+    if lower.starts_with("http://") || lower.starts_with("https://") {
         return SourceKind::Remote;
     }
-    if spec.starts_with("file:") {
-        let lower = spec.to_ascii_lowercase();
-        return if lower.ends_with(".tgz") || lower.ends_with(".tar.gz") || lower.ends_with(".tar") {
+    if lower.starts_with("file:") {
+        let path = spec[5..].trim();
+        let lower_path = path.to_ascii_lowercase();
+        return if lower_path.ends_with(".tgz")
+            || lower_path.ends_with(".tar.gz")
+            || lower_path.ends_with(".tar")
+        {
             SourceKind::File
         } else {
             SourceKind::Directory
         };
     }
-    if spec.ends_with(".tgz") || spec.ends_with(".tar.gz") || spec.ends_with(".tar") {
+    if lower.ends_with(".tgz") || lower.ends_with(".tar.gz") || lower.ends_with(".tar") {
         return SourceKind::File;
+    }
+    if spec.starts_with("./")
+        || spec.starts_with(".\\")
+        || spec.starts_with("../")
+        || spec.starts_with("..\\")
+        || spec.starts_with('/')
+        || spec.starts_with("~/")
+        || spec.starts_with("~\\")
+        || (spec.len() > 2 && spec.as_bytes()[1] == b':' && spec.as_bytes()[0].is_ascii_alphabetic())
+    {
+        return SourceKind::Directory;
     }
     SourceKind::Registry
 }
 
 fn classify(pkg: &LockfilePackage) -> SourceKind {
-    let resolved = pkg.resolved.as_deref().unwrap_or("");
+    let resolved = pkg.resolved.as_deref().unwrap_or("").trim();
     if pkg.link == Some(true) {
         return SourceKind::Directory;
     }
-    if let Some(path) = resolved.strip_prefix("file:") {
-        let lower = path.to_ascii_lowercase();
-        return if lower.ends_with(".tgz") || lower.ends_with(".tar.gz") || lower.ends_with(".tar") {
+    let lower = resolved.to_ascii_lowercase();
+    if lower.starts_with("file:") {
+        let path = resolved[5..].trim();
+        let lower_path = path.to_ascii_lowercase();
+        return if lower_path.ends_with(".tgz")
+            || lower_path.ends_with(".tar.gz")
+            || lower_path.ends_with(".tar")
+        {
             SourceKind::File
         } else {
             SourceKind::Directory
@@ -182,6 +270,22 @@ fn classify(pkg: &LockfilePackage) -> SourceKind {
     if is_git_spec(resolved) {
         return SourceKind::Git;
     }
+    if (lower.ends_with(".tgz") || lower.ends_with(".tar.gz") || lower.ends_with(".tar"))
+        && !lower.starts_with("http://")
+        && !lower.starts_with("https://")
+    {
+        return SourceKind::File;
+    }
+    if lower.starts_with("./")
+        || lower.starts_with(".\\")
+        || lower.starts_with("../")
+        || lower.starts_with("..\\")
+        || (resolved.len() > 2
+            && resolved.as_bytes()[1] == b':'
+            && resolved.as_bytes()[0].is_ascii_alphabetic())
+    {
+        return SourceKind::Directory;
+    }
     if resolved.is_empty() || is_registry_tarball(resolved) {
         return SourceKind::Registry;
     }
@@ -189,13 +293,14 @@ fn classify(pkg: &LockfilePackage) -> SourceKind {
 }
 
 fn split_parent_and_name(location: &str) -> Option<(&str, &str)> {
-    if let Some(idx) = location.rfind("/node_modules/") {
-        let parent = &location[..idx];
-        let name = &location[idx + "/node_modules/".len()..];
+    let loc = location.trim_matches('/');
+    if let Some(idx) = loc.rfind("/node_modules/") {
+        let parent = &loc[..idx];
+        let name = &loc[idx + "/node_modules/".len()..];
         if !name.contains("/node_modules/") {
             return Some((parent, name));
         }
-    } else if let Some(name) = location.strip_prefix("node_modules/") {
+    } else if let Some(name) = loc.strip_prefix("node_modules/") {
         if !name.contains("/node_modules/") {
             return Some(("", name));
         }
@@ -209,7 +314,8 @@ fn is_direct_root_dep(
     workspace_paths: &HashSet<String>,
     kind: SourceKind,
 ) -> bool {
-    let Some((parent, name)) = split_parent_and_name(location) else {
+    let location_norm = location.replace('\\', "/");
+    let Some((parent, name)) = split_parent_and_name(&location_norm) else {
         return false;
     };
     let is_root_or_ws = parent.is_empty() || workspace_paths.contains(parent);
@@ -323,12 +429,38 @@ pub fn check_sources_with_root_context(
 
     // 1. Collect all explicit remote URLs from root_declared and lockfile specs.
     let mut explicit_remote_specs = HashSet::new();
+    let mut add_remote_spec = |spec: &str| {
+        let trimmed = spec.trim();
+        let extracted = if trimmed.len() >= 4 && trimmed[..4].eq_ignore_ascii_case("npm:") {
+            let sub = trimmed[4..].trim();
+            if sub.starts_with('@') {
+                if let Some(slash_idx) = sub.find('/') {
+                    if let Some(at_idx) = sub[slash_idx + 1..].find('@') {
+                        sub[slash_idx + 1 + at_idx + 1..].trim()
+                    } else {
+                        ""
+                    }
+                } else {
+                    ""
+                }
+            } else if let Some(at_idx) = sub.find('@') {
+                sub[at_idx + 1..].trim()
+            } else {
+                ""
+            }
+        } else {
+            trimmed
+        };
+        let lower = extracted.to_ascii_lowercase();
+        if lower.starts_with("http://") || lower.starts_with("https://") {
+            explicit_remote_specs.insert(extracted.to_string());
+            explicit_remote_specs.insert(extracted.to_ascii_lowercase());
+        }
+    };
+
     if !force_non_root {
         for item in root_declared {
-            let trimmed = item.trim();
-            if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
-                explicit_remote_specs.insert(trimmed.to_string());
-            }
+            add_remote_spec(item);
         }
     }
     for pkg in lockfile.packages.values() {
@@ -342,20 +474,18 @@ pub fn check_sources_with_root_context(
         .flatten()
         {
             for spec in map.values() {
-                let trimmed = spec.trim();
-                if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
-                    explicit_remote_specs.insert(trimmed.to_string());
-                }
+                add_remote_spec(spec);
             }
         }
     }
 
     // 2. Gate every original dependency edge by (parsed_source_kind, is_actual_root_or_workspace_edge).
     for (requester_loc, pkg) in &lockfile.packages {
+        let norm_req = requester_loc.replace('\\', "/");
         let is_root_edge = if force_non_root {
             false
         } else {
-            requester_loc.is_empty() || workspace_paths.contains(requester_loc)
+            norm_req.is_empty() || workspace_paths.contains(&norm_req)
         };
         for map in [
             &pkg.dependencies,
@@ -371,26 +501,61 @@ pub fn check_sources_with_root_context(
                 check_source_gate(policy, kind, is_root_edge)?;
             }
         }
+
+        // Gate overrides in pkg.extra if present
+        if let Some(overrides) = pkg.extra.get("overrides") {
+            fn check_overrides_recursive(
+                val: &serde_json::Value,
+                policy: &SourcePolicy,
+                is_root_edge: bool,
+            ) -> Result<()> {
+                match val {
+                    serde_json::Value::String(spec) => {
+                        if !spec.starts_with('$') {
+                            let kind = parse_source_kind(spec);
+                            check_source_gate(policy, kind, is_root_edge)?;
+                        }
+                    }
+                    serde_json::Value::Object(map) => {
+                        for v in map.values() {
+                            check_overrides_recursive(v, policy, false)?;
+                        }
+                    }
+                    serde_json::Value::Array(arr) => {
+                        for v in arr {
+                            check_overrides_recursive(v, policy, is_root_edge)?;
+                        }
+                    }
+                    _ => {}
+                }
+                Ok(())
+            }
+            check_overrides_recursive(overrides, policy, is_root_edge)?;
+        }
     }
 
     // 3. Gate every placed package node in lockfile.packages.
-    let explicit_refs: HashSet<&str> = explicit_remote_specs.iter().map(|s| s.as_str()).collect();
     for (location, pkg) in &lockfile.packages {
-        if location.is_empty() || !location.contains("node_modules/") {
+        let norm_loc = location.replace('\\', "/");
+        if norm_loc.is_empty() {
             continue;
         }
         if pkg.link == Some(true)
             && pkg
                 .resolved
                 .as_deref()
-                .is_some_and(|target| workspace_paths.contains(target))
+                .is_some_and(|target| workspace_paths.contains(&target.replace('\\', "/")))
         {
             continue;
         }
         let is_explicit_remote = pkg
             .resolved
             .as_deref()
-            .is_some_and(|r| explicit_refs.contains(r));
+            .map(|r| r.trim())
+            .is_some_and(|r| {
+                explicit_remote_specs.contains(r)
+                    || explicit_remote_specs.contains(&r.to_ascii_lowercase())
+            });
         let kind = if is_explicit_remote {
             SourceKind::Remote
         } else {
@@ -398,8 +563,10 @@ pub fn check_sources_with_root_context(
         };
         let is_root = if force_non_root {
             false
+        } else if workspace_paths.contains(&norm_loc) {
+            true
         } else {
-            is_direct_root_dep(location, &lockfile.packages, workspace_paths, kind)
+            is_direct_root_dep(&norm_loc, &lockfile.packages, workspace_paths, kind)
         };
         check_source_gate(policy, kind, is_root)?;
     }
@@ -643,7 +810,6 @@ pub fn check_dev_engines(project_dir: &Path, force: bool) -> Result<()> {
                         "npm error Invalid non-string value for \"version\" within \"{engine}\""
                     ));
                 };
-                // os.version is the kernel release, which rnpm does not read.
                 let Some(current_version) = current_version.as_deref() else {
                     continue;
                 };
@@ -748,13 +914,11 @@ pub fn check_engines(
             .unwrap_or(false),
         _ => false,
     };
-    // npm never checks engines on optional packages skipped for platform.
     let skipped = crate::lockfile_platform_skipped_packages(lockfile, platform);
     for (location, pkg) in &lockfile.packages {
         if location.is_empty() || skipped.contains(location) {
             continue;
         }
-        // Links and directory targets carry their engines on disk.
         let disk_dir = if pkg.link == Some(true) {
             pkg.resolved.as_deref().map(|t| base_dir.join(t))
         } else if !location.contains("node_modules/") {
@@ -813,8 +977,6 @@ pub fn check_engines(
                 json_map(&current)
             ));
         }
-        // Arborist checks each inventory node: a directory dependency is both
-        // a link and its target, so npm reports it twice.
         let is_directory_dep = pkg.link == Some(true)
             || pkg.resolved.as_deref().is_some_and(|r| {
                 r.strip_prefix("file:")
@@ -823,606 +985,15 @@ pub fn check_engines(
         for _ in 0..if is_directory_dep { 2 } else { 1 } {
             if !silent {
                 eprintln!(
-                "npm warn EBADENGINE Unsupported engine {{\nnpm warn EBADENGINE   package: {},\nnpm warn EBADENGINE   required: {},\nnpm warn EBADENGINE   current: {}\nnpm warn EBADENGINE }}",
-                js_inspect_str(&pkgid),
-                js_inspect_map(&engines),
-                js_inspect_map(&current)
-            );
+                    "npm warn EBADENGINE Unsupported engine {{\nnpm warn EBADENGINE   package: {},\nnpm warn EBADENGINE   required: {},\nnpm warn EBADENGINE   current: {}\nnpm warn EBADENGINE }}",
+                    js_inspect_str(&pkgid),
+                    js_inspect_map(&engines),
+                    js_inspect_map(&current)
+                );
             }
         }
     }
     Ok(())
-}
-
-// -------------------------------------------------------------------------
-// allowScripts
-// -------------------------------------------------------------------------
-
-/// The effective allowScripts policy plus the strictness flags.
-#[derive(Debug, Clone, Default)]
-pub struct ScriptPolicy {
-    entries: Option<Vec<(String, bool)>>,
-    pub strict: bool,
-    pub allow_all: bool,
-    /// Warnings for policy keys npm drops (ranges, dist-tags).
-    pub warnings: Vec<String>,
-}
-
-fn is_exact_version_disjunction(spec: &str) -> bool {
-    let parts: Vec<&str> = spec.split("||").map(str::trim).collect();
-    !parts.is_empty()
-        && parts
-            .iter()
-            .all(|p| !p.is_empty() && rnpm_core::semver::Version::parse(p).is_ok())
-}
-
-/// Split a registry-style key into name and raw spec (`""` for bare names).
-fn split_name_spec(key: &str) -> (&str, &str) {
-    let search_from = usize::from(key.starts_with('@'));
-    match key[search_from..].find('@') {
-        Some(i) => (&key[..search_from + i], &key[search_from + i + 1..]),
-        None => (key, ""),
-    }
-}
-
-fn is_path_spec(key: &str) -> bool {
-    key.starts_with("file:")
-        || key.starts_with("./")
-        || key.starts_with("../")
-        || key.starts_with('/')
-        || key.starts_with('~')
-        || (key.len() > 2 && key.as_bytes()[1] == b':' && key.as_bytes()[0].is_ascii_alphabetic())
-}
-
-fn is_range_like(spec: &str) -> bool {
-    rnpm_core::semver::Range::parse(spec).is_ok()
-}
-
-impl ScriptPolicy {
-    /// Resolve the policy like npm's resolve-allow-scripts.js: the root
-    /// package.json `allowScripts` wins over the `.npmrc` `allow-scripts`
-    /// list; global installs skip package.json.
-    pub fn load(project_dir: &Path, config: &rnpm_config::Config, is_global: bool) -> Self {
-        let mut policy = ScriptPolicy {
-            strict: config.get_bool("strict-allow-scripts").unwrap_or(false),
-            allow_all: config
-                .get_bool("dangerously-allow-all-scripts")
-                .unwrap_or(false),
-            ..Default::default()
-        };
-        let mut pkg_entries = None;
-        if !is_global {
-            let text =
-                std::fs::read_to_string(project_dir.join("package.json")).unwrap_or_default();
-            if let Ok(value) =
-                serde_json::from_str::<serde_json::Value>(text.trim_start_matches('\u{feff}'))
-            {
-                if let Some(obj) = value.get("allowScripts").and_then(|v| v.as_object()) {
-                    let entries: Vec<(String, bool)> = obj
-                        .iter()
-                        .filter_map(|(k, v)| v.as_bool().map(|b| (k.clone(), b)))
-                        .collect();
-                    if !entries.is_empty() {
-                        pkg_entries = Some(entries);
-                    }
-                }
-            }
-        }
-        let rc_entries = config.get("allow-scripts").and_then(|list| {
-            let names: Vec<(String, bool)> = list
-                .split([',', '\n'])
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(|s| (s.to_string(), true))
-                .collect();
-            (!names.is_empty()).then_some(names)
-        });
-        let pkg = pkg_entries.and_then(|e| policy.validate(e, "package.json"));
-        let rc = rc_entries.and_then(|e| policy.validate(e, ".npmrc"));
-        policy.entries = match (pkg, rc) {
-            (Some(pkg), Some(_)) => {
-                policy.warnings.push(
-                    ".npmrc allow-scripts setting is being ignored because package.json declares its own allowScripts field"
-                        .into(),
-                );
-                Some(pkg)
-            }
-            (Some(pkg), None) => Some(pkg),
-            (None, rc) => rc,
-        };
-        policy
-    }
-
-    fn validate(
-        &mut self,
-        entries: Vec<(String, bool)>,
-        label: &str,
-    ) -> Option<Vec<(String, bool)>> {
-        let mut kept = Vec::new();
-        for (key, value) in entries {
-            let registry_like = !is_path_spec(&key)
-                && !is_git_spec(&key)
-                && !key.starts_with("http://")
-                && !key.starts_with("https://");
-            if registry_like {
-                let (_, spec) = split_name_spec(&key);
-                let name_only = spec.is_empty() || spec == "*";
-                if !name_only && !spec.starts_with("npm:") {
-                    if !is_range_like(spec) {
-                        self.warnings.push(format!(
-                            "{label}: ignoring \"{key}\" — dist-tag specs (@latest, @next, ...) are not allowed; use exact versions joined by \"||\", or the bare package name, instead"
-                        ));
-                        continue;
-                    }
-                    if !is_exact_version_disjunction(spec) {
-                        self.warnings.push(format!(
-                            "{label}: ignoring \"{key}\" — semver ranges (^, ~, >=, <) are not allowed; use exact versions joined by \"||\" instead"
-                        ));
-                        continue;
-                    }
-                }
-            }
-            kept.push((key, value));
-        }
-        (!kept.is_empty()).then_some(kept)
-    }
-
-    /// `Some(true)` allowed, `Some(false)` denied, `None` unreviewed.
-    pub fn verdict(&self, node: &ScriptNode<'_>) -> Option<bool> {
-        if node.in_bundle {
-            return None;
-        }
-        let entries = self.entries.as_ref()?;
-        let mut allow = false;
-        let mut deny = false;
-        for (key, value) in entries {
-            if node.matches(key, !*value) {
-                if *value {
-                    allow = true;
-                } else {
-                    deny = true;
-                }
-            }
-        }
-        if deny {
-            Some(false)
-        } else if allow {
-            Some(true)
-        } else {
-            None
-        }
-    }
-}
-
-/// What the policy matcher knows about one installed dependency.
-pub struct ScriptNode<'a> {
-    pub location: &'a str,
-    pub resolved: Option<&'a str>,
-    /// Real package name recorded by the lockfile for aliased entries.
-    pub lock_name: Option<&'a str>,
-    pub in_bundle: bool,
-    pub link: bool,
-    pub project_dir: &'a Path,
-}
-
-fn normalize_path(path: &Path) -> String {
-    let p = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-    let s = p.to_string_lossy().replace('\\', "/");
-    let s = s.strip_prefix("//?/").unwrap_or(&s).to_string();
-    if cfg!(windows) {
-        s.to_ascii_lowercase()
-    } else {
-        s
-    }
-}
-
-/// `host/user/repo` identity plus committish for a git spec.
-fn git_identity(spec: &str) -> Option<(String, String)> {
-    let (body, committish) = spec.split_once('#').unwrap_or((spec, ""));
-    let body = body
-        .trim_start_matches("git+")
-        .trim_start_matches("ssh://")
-        .trim_start_matches("https://")
-        .trim_start_matches("http://")
-        .trim_start_matches("git://")
-        .trim_start_matches("git@");
-    let body = if let Some(rest) = body.strip_prefix("github:") {
-        format!("github.com/{rest}")
-    } else if let Some(rest) = body.strip_prefix("gitlab:") {
-        format!("gitlab.com/{rest}")
-    } else if let Some(rest) = body.strip_prefix("bitbucket:") {
-        format!("bitbucket.org/{rest}")
-    } else {
-        body.replacen(':', "/", 1)
-    };
-    let body = body
-        .trim_end_matches('/')
-        .trim_end_matches(".git")
-        .to_ascii_lowercase();
-    (!body.is_empty()).then(|| (body, committish.to_string()))
-}
-
-impl ScriptNode<'_> {
-    fn is_registry(&self) -> bool {
-        !self.link && self.resolved.is_none_or(is_registry_tarball)
-    }
-
-    /// Trusted registry identity: from the resolved tarball URL, else the
-    /// lockfile/location name with no version.
-    fn registry_identity(&self) -> Option<(String, Option<String>)> {
-        if let Some(resolved) = self.resolved {
-            if let Some(idx) = resolved.find("/-/") {
-                let before = &resolved[..idx];
-                let path = before.split_once("://").map(|(_, r)| r).unwrap_or(before);
-                let name_part = path.split_once('/').map(|(_, n)| n).unwrap_or("");
-                let name = name_part.replace("%2f", "/").replace("%2F", "/");
-                // The registry path may carry a prefix (e.g. a proxy path);
-                // keep the trailing `name` or `@scope/name`.
-                let segs: Vec<&str> = name.split('/').collect();
-                let name = match segs.as_slice() {
-                    [.., scope, n] if scope.starts_with('@') => format!("{scope}/{n}"),
-                    [.., n] => (*n).to_string(),
-                    [] => String::new(),
-                };
-                let unscoped = name.rsplit('/').next().unwrap_or(&name);
-                let file = resolved[idx + 3..].split(['?', '#']).next().unwrap_or("");
-                let version = file
-                    .strip_prefix(&format!("{unscoped}-"))
-                    .and_then(|v| v.strip_suffix(".tgz"))
-                    .map(str::to_string);
-                if !name.is_empty() && version.is_some() {
-                    return Some((name, version));
-                }
-            }
-        }
-        let name = self
-            .lock_name
-            .map(str::to_string)
-            .or_else(|| top_level_or_nested_name(self.location))?;
-        Some((name, None))
-    }
-
-    fn matches(&self, key: &str, fail_closed: bool) -> bool {
-        if is_git_spec(key) {
-            let (Some(resolved), Some((key_repo, key_ref))) = (self.resolved, git_identity(key))
-            else {
-                return false;
-            };
-            if !is_git_spec(resolved) {
-                return false;
-            }
-            let Some((node_repo, node_ref)) = git_identity(resolved) else {
-                return false;
-            };
-            return key_repo == node_repo && (key_ref.is_empty() || node_ref.starts_with(&key_ref));
-        }
-        if key.starts_with("http://") || key.starts_with("https://") {
-            return self.resolved == Some(key);
-        }
-        if is_path_spec(key) {
-            let key_path = key.strip_prefix("file:").unwrap_or(key);
-            let key_abs = normalize_path(&self.project_dir.join(key_path));
-            let node_target = self
-                .resolved
-                .map(|r| r.strip_prefix("file:").unwrap_or(r))
-                .map(|r| normalize_path(&self.project_dir.join(r)));
-            return node_target.as_deref() == Some(key_abs.as_str());
-        }
-        let (name, spec) = split_name_spec(key);
-        if spec.starts_with("npm:") || !self.is_registry() {
-            return false;
-        }
-        let Some((trusted_name, trusted_version)) = self.registry_identity() else {
-            return false;
-        };
-        if trusted_name != name {
-            return false;
-        }
-        if spec.is_empty() || spec == "*" {
-            return true;
-        }
-        match trusted_version {
-            None => fail_closed,
-            Some(v) => spec.split("||").map(str::trim).any(|want| want == v),
-        }
-    }
-}
-
-fn top_level_or_nested_name(location: &str) -> Option<String> {
-    location
-        .rsplit_once("node_modules/")
-        .map(|(_, n)| n.to_string())
-        .filter(|n| !n.is_empty())
-}
-
-/// arborist install-scripts.js: the scripts installing this package runs.
-pub fn install_scripts(
-    manifest: &Manifest,
-    disk_path: &Path,
-    registry_source: bool,
-) -> Vec<(String, String)> {
-    let mut out = Vec::new();
-    for event in ["preinstall", "install", "postinstall"] {
-        if let Some(body) = manifest.scripts.get(event).filter(|b| !b.is_empty()) {
-            out.push((event.to_string(), body.clone()));
-        }
-    }
-    if !registry_source {
-        if let Some(body) = manifest.scripts.get("prepare").filter(|b| !b.is_empty()) {
-            out.push(("prepare".to_string(), body.clone()));
-        }
-    }
-    let explicit_gate =
-        manifest.scripts.contains_key("preinstall") || manifest.scripts.contains_key("install");
-    let gyp_disabled = manifest.extra.get("gypfile") == Some(&serde_json::Value::Bool(false));
-    if !explicit_gate && !gyp_disabled && disk_path.join("binding.gyp").is_file() {
-        out.retain(|(e, _)| e != "install");
-        out.insert(
-            out.iter()
-                .position(|(e, _)| e == "postinstall")
-                .unwrap_or(out.len()),
-            ("install".to_string(), "node-gyp rebuild".to_string()),
-        );
-    }
-    out
-}
-
-fn node_for<'a>(
-    location: &'a str,
-    pkg: Option<&'a LockfilePackage>,
-    project_dir: &'a Path,
-) -> ScriptNode<'a> {
-    ScriptNode {
-        location,
-        resolved: pkg.and_then(|p| p.resolved.as_deref()),
-        lock_name: pkg.and_then(|p| p.name.as_deref()),
-        in_bundle: pkg.is_some_and(|p| p.is_in_bundle()),
-        link: pkg.is_some_and(|p| p.link == Some(true)),
-        project_dir,
-    }
-}
-
-fn label(manifest: &Manifest, location: &str) -> String {
-    let name = manifest
-        .name
-        .clone()
-        .or_else(|| top_level_or_nested_name(location))
-        .unwrap_or_default();
-    match &manifest.version {
-        Some(v) if !v.is_empty() => format!("{name}@{v}"),
-        _ => name,
-    }
-}
-
-fn describe(scripts: &[(String, String)]) -> String {
-    scripts
-        .iter()
-        .map(|(e, b)| format!("{e}: {b}"))
-        .collect::<Vec<_>>()
-        .join("; ")
-}
-
-type UnreviewedPackageScripts = (String, String, Vec<(String, String)>);
-
-fn strict_error(mut unreviewed: Vec<UnreviewedPackageScripts>) -> anyhow::Error {
-    unreviewed.sort_by(|a, b| a.0.cmp(&b.0));
-    let lines = unreviewed
-        .iter()
-        .map(|(_, l, s)| format!("npm error   {l} ({})", describe(s)))
-        .collect::<Vec<_>>()
-        .join("\n");
-    anyhow!(
-        "npm error code ESTRICTALLOWSCRIPTS\nnpm error --strict-allow-scripts: {} package(s) have install scripts not covered by allowScripts:\n{lines}\nnpm error Approve them with `npm install-scripts approve`, deny them with `npm install-scripts deny`, or bypass this check with `--dangerously-allow-all-scripts`.",
-        unreviewed.len()
-    )
-}
-
-/// `--strict-allow-scripts` preflight on the resolved tree, before anything
-/// is written (npm's strict-allow-scripts-preflight.js). Registry packages not
-/// on disk yet are reported with npm's `(install scripts present)` sentinel.
-pub fn strict_preflight(
-    lockfile: &LockfileV3,
-    base_dir: &Path,
-    workspace_paths: &HashSet<String>,
-    policy: &ScriptPolicy,
-    ignore_scripts: bool,
-) -> Result<()> {
-    if !policy.strict || policy.allow_all || ignore_scripts {
-        return Ok(());
-    }
-    let mut unreviewed = Vec::new();
-    for (location, pkg) in &lockfile.packages {
-        if location.is_empty() || !location.contains("node_modules/") {
-            continue;
-        }
-        let local_dir = pkg
-            .resolved
-            .as_deref()
-            .and_then(|r| r.strip_prefix("file:"))
-            .map(|r| base_dir.join(r))
-            .filter(|d| d.is_dir());
-        let dir: PathBuf = if pkg.link == Some(true) {
-            match pkg.resolved.as_deref() {
-                Some(target) if !workspace_paths.contains(target) => base_dir.join(target),
-                _ => continue,
-            }
-        } else if let Some(local) = local_dir {
-            local
-        } else {
-            base_dir.join(location)
-        };
-        let ident = node_for(location, Some(pkg), base_dir);
-        if ident.in_bundle || policy.verdict(&ident).is_some() {
-            continue;
-        }
-        let manifest = Manifest::from_file(dir.join("package.json")).ok();
-        let mut scripts = manifest
-            .as_ref()
-            .map(|m| install_scripts(m, &dir, ident.is_registry()))
-            .unwrap_or_default();
-        if scripts.is_empty() && pkg.has_install_script() {
-            scripts.push(("install".into(), "(install scripts present)".into()));
-        }
-        if scripts.is_empty() {
-            continue;
-        }
-        let label = manifest
-            .as_ref()
-            .map(|m| label(m, location))
-            .unwrap_or_else(|| {
-                let name = pkg
-                    .name
-                    .clone()
-                    .or_else(|| top_level_or_nested_name(location))
-                    .unwrap_or_default();
-                match &pkg.version {
-                    Some(v) => format!("{name}@{v}"),
-                    None => name,
-                }
-            });
-        unreviewed.push((location.clone(), label, scripts));
-    }
-    if unreviewed.is_empty() {
-        Ok(())
-    } else {
-        Err(strict_error(unreviewed))
-    }
-}
-
-/// Drop dependencies whose scripts are denied, and enforce
-/// `--strict-allow-scripts` before any script runs.
-pub fn apply_script_policy(
-    nodes: Vec<LifecyclePackageNode>,
-    lockfile: &LockfileV3,
-    project_dir: &Path,
-    policy: &ScriptPolicy,
-) -> Result<Vec<LifecyclePackageNode>> {
-    if policy.allow_all {
-        return Ok(nodes);
-    }
-    let mut kept = Vec::new();
-    let mut unreviewed = Vec::new();
-    for node in nodes {
-        let pkg = lockfile.packages.get(&node.package_path);
-        let ident = node_for(&node.package_path, pkg, project_dir);
-        match policy.verdict(&ident) {
-            Some(false) => continue,
-            Some(true) => kept.push(node),
-            None => {
-                let scripts = install_scripts(&node.manifest, &node.disk_path, ident.is_registry());
-                if policy.strict && !scripts.is_empty() && !ident.in_bundle {
-                    unreviewed.push((
-                        node.package_path.clone(),
-                        label(&node.manifest, &node.package_path),
-                        scripts,
-                    ));
-                }
-                kept.push(node);
-            }
-        }
-    }
-    if !unreviewed.is_empty() {
-        return Err(strict_error(unreviewed));
-    }
-    Ok(kept)
-}
-
-/// The advisory npm prints after reify: installed dependencies with install
-/// scripts that the policy neither allows nor denies.
-pub fn unreviewed_scripts_warning(
-    lockfile: &LockfileV3,
-    base_dir: &Path,
-    workspace_paths: &HashSet<String>,
-    policy: &ScriptPolicy,
-    is_global: bool,
-) -> Option<String> {
-    if policy.allow_all {
-        return None;
-    }
-    let mut found: Vec<(String, String)> = Vec::new();
-    let mut names = Vec::new();
-    for (location, pkg) in &lockfile.packages {
-        if location.is_empty() || !location.contains("node_modules/") {
-            continue;
-        }
-        // A link stands for its target directory; workspaces are skipped.
-        let dir: PathBuf = if pkg.link == Some(true) {
-            match pkg.resolved.as_deref() {
-                Some(target) if !workspace_paths.contains(target) => base_dir.join(target),
-                _ => continue,
-            }
-        } else {
-            base_dir.join(location)
-        };
-        let ident = node_for(location, Some(pkg), base_dir);
-        if ident.in_bundle || policy.verdict(&ident).is_some() {
-            continue;
-        }
-        let Ok(manifest) = Manifest::from_file(dir.join("package.json")) else {
-            continue;
-        };
-        let scripts = install_scripts(&manifest, &dir, ident.is_registry());
-        if scripts.is_empty() {
-            continue;
-        }
-        let (name, version) = ident
-            .registry_identity()
-            .filter(|_| ident.is_registry())
-            .map(|(n, v)| (n, v.or_else(|| manifest.version.clone())))
-            .unwrap_or_else(|| {
-                (
-                    manifest
-                        .name
-                        .clone()
-                        .unwrap_or_else(|| location.to_string()),
-                    manifest.version.clone(),
-                )
-            });
-        names.push(name.clone());
-        let ver = version.map(|v| format!("@{v}")).unwrap_or_default();
-        found.push((
-            location.clone(),
-            format!("  {name}{ver} ({})", describe(&scripts)),
-        ));
-    }
-    if found.is_empty() {
-        return None;
-    }
-    let count = found.len();
-    let noun = if count == 1 {
-        "package has"
-    } else {
-        "packages have"
-    };
-    let mut lines = vec![format!(
-        "{count} {noun} install scripts not yet covered by allowScripts:"
-    )];
-    lines.extend(found.into_iter().map(|(_, l)| l));
-    lines.push(String::new());
-    if is_global {
-        let list = names.join(",");
-        lines.push(format!(
-            "Run `npm install -g --allow-scripts={list}` to allow these scripts once, or `npm config set allow-scripts={list} --location=global` to allow them for all global installs."
-        ));
-    } else {
-        lines.push(
-            "Run `npm install-scripts ls` to review, or `npm install-scripts approve <pkg>` to allow."
-                .into(),
-        );
-    }
-    Some(
-        lines
-            .iter()
-            .map(|l| {
-                if l.is_empty() {
-                    "npm warn install-scripts".to_string()
-                } else {
-                    format!("npm warn install-scripts {l}")
-                }
-            })
-            .collect::<Vec<_>>()
-            .join("\n"),
-    )
 }
 
 #[cfg(test)]
@@ -1500,8 +1071,18 @@ mod tests {
         assert!(is_registry_tarball(
             "https://registry.npmjs.org/a/-/a-1.0.0.tgz"
         ));
+        assert!(is_registry_tarball(
+            "Https://registry.npmjs.org/a/-/a-1.0.0.tgz"
+        ));
+        assert!(is_registry_tarball(
+            "Http://registry.npmjs.org/a/-/a-1.0.0.tgz"
+        ));
+        assert!(is_registry_tarball(
+            "https://registry.npmjs.org/%40scope%2Fpkg/-/pkg-1.0.0.tgz"
+        ));
         assert!(!is_registry_tarball("https://evil.com/-/a-1.0.0.tgz"));
         assert!(!is_registry_tarball("https://example.com/a.tgz"));
+        assert!(!is_registry_tarball("https://evil.com/downloads/-/payload-1.0.0.tgz"));
     }
 
     #[test]
