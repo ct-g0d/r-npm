@@ -255,7 +255,7 @@ pub fn find_node_gyp(
                 if cfg!(windows) {
                     d.join("node_modules")
                 } else {
-                    d.join("..").join("lib").join("node_modules")
+                    d.parent().unwrap_or(&d).join("lib").join("node_modules")
                 }
             })
             .map(|d| {

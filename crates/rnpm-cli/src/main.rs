@@ -3919,12 +3919,17 @@ pub(crate) async fn execute_exec(
             .file_stem()
             .unwrap_or_default()
             .to_string_lossy();
+        let display_bin = if cfg!(windows) {
+            bin.into_owned()
+        } else {
+            format!("'{}'", bin.replace('\'', "'\\''"))
+        };
         let suffix = if args.is_empty() {
             String::new()
         } else {
             format!(" {}", args.join(" "))
         };
-        println!("\n> {id}npx\n> {bin}{suffix}\n");
+        println!("\n> {id}npx\n> {display_bin}{suffix}\n");
     }
 
     // Execute the resolved binary with ancestor bin directories prepended to PATH
@@ -6529,7 +6534,12 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
                     current_dir.join(p)
                 }
             } else if global {
-                rnpm_config::find_global_prefix()
+                let prefix = rnpm_config::find_global_prefix();
+                if cfg!(windows) {
+                    prefix
+                } else {
+                    prefix.join("lib")
+                }
             } else {
                 current_dir
             };
@@ -6603,7 +6613,12 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             include_workspace_root,
         } => {
             let target_dir = if global {
-                rnpm_config::find_global_prefix()
+                let prefix = rnpm_config::find_global_prefix();
+                if cfg!(windows) {
+                    prefix
+                } else {
+                    prefix.join("lib")
+                }
             } else {
                 current_dir
             };
@@ -7460,6 +7475,16 @@ fn npm_usage() -> String {
         .ok()
         .and_then(|p| p.parent().map(|d| d.display().to_string()))
         .unwrap_or_default();
+    let viewer = std::env::current_dir()
+        .ok()
+        .and_then(|d| rnpm_config::Config::load(Some(&d)).ok())
+        .and_then(|c| c.get("viewer").map(str::to_owned))
+        .unwrap_or_else(|| if cfg!(windows) { "browser" } else { "man" }.to_string());
+    let browser = if viewer == "browser" {
+        " (in a browser)"
+    } else {
+        ""
+    };
     format!(
         "npm <command>
 
@@ -7471,8 +7496,8 @@ npm test           run this project's tests
 npm run <foo>      run the script named <foo>
 npm <command> -h   quick help on <command>
 npm -l             display usage info for all commands
-npm help <term>    search for help on <term> (in a browser)
-npm help npm       more involved overview (in a browser)
+npm help <term>    search for help on <term>{browser}
+npm help npm       more involved overview{browser}
 
 All commands:
 {}
@@ -7801,9 +7826,21 @@ fn lifecycle_config_env(dir: &Path) -> std::collections::HashMap<String, String>
     if let Ok(cwd) = std::env::current_dir() {
         env.insert("INIT_CWD".into(), cwd.to_string_lossy().into_owned());
     }
-    if let Ok(config) = rnpm_config::Config::load(Some(dir)) {
-        for (key, value) in config.npmrc.settings {
-            env.insert(format!("npm_config_{}", key.replace('-', "_")), value);
+    if let Ok(detailed) =
+        rnpm_config::Config::load_detailed(rnpm_config::ConfigOptions::new().project_dir(dir))
+    {
+        let mut winning: std::collections::BTreeMap<String, (&str, String)> =
+            std::collections::BTreeMap::new();
+        for layer in detailed.layers {
+            let source = if layer.name == "env" { "env" } else { "other" };
+            for (key, value) in layer.settings {
+                winning.insert(key, (source, value));
+            }
+        }
+        for (key, (source, value)) in winning {
+            if source != "env" {
+                env.insert(format!("npm_config_{}", key.replace('-', "_")), value);
+            }
         }
     }
     env

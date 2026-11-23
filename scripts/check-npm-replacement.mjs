@@ -213,7 +213,7 @@ for(const [name,flags]of [['global',['-g']],['workspace',['-w','a']],['workspace
   manifest(dir,{workspaces:['modules/*']});
   for(const [member,dep]of [['a','dep'],['b','parent']])manifest(path.join(dir,'modules',member),{name:member,dependencies:{[dep]:'^1.0.0'}});
   for(const dep of ['dep','parent'])manifest(path.join(dir,'node_modules',dep),{name:dep});
-},{before:async ctx=>{if(name==='global')manifest(path.join(ctx.env.NPM_CONFIG_PREFIX,'node_modules/dep'),{name:'dep'});}});
+},{before:async ctx=>{if(name==='global')manifest(path.join(ctx.env.NPM_CONFIG_PREFIX,process.platform==='win32'?'node_modules/dep':'lib/node_modules/dep'),{name:'dep'});}});
 const packArgs=['pack','--dry-run','--json','--ignore-scripts'];
 for(const [name,fields,files] of [
   ['pack-explicit-file-vs-root-ignore',{files:['keep.js']},{'keep.js':'hello','.npmignore':'keep.js\n'}],
@@ -510,8 +510,8 @@ const cliWorkspaceTree=dir=>{
   manifest(path.join(dir,'node_modules/parent'),{name:'parent'});
   for(const name of ['a','b'])fs.symlinkSync(path.join(dir,'modules',name),path.join(dir,'node_modules',name),'junction');
 };
-for(const [name,args] of [['workspace',['ls','-w','a']],['workspace-json',['ls','-w','a','--json']],['global',['ls','-g']]])add(`cli-ls-${name}`,'ls',args,cliWorkspaceTree,{before:async ctx=>{if(args.includes('-g'))manifest(path.join(ctx.env.NPM_CONFIG_PREFIX,'node_modules/dep'),{name:'dep'});}});
-for(const [name,args] of [['workspace',['outdated','-w','a']],['workspace-json',['outdated','-w','a','--json']],['global',['outdated','-g']],['global-json',['outdated','-g','--json']]])add(`cli-outdated-${name}`,'outdated',args,cliWorkspaceTree,{before:async ctx=>{if(args.includes('-g'))manifest(path.join(ctx.env.NPM_CONFIG_PREFIX,'node_modules/dep'),{name:'dep'});}});
+for(const [name,args] of [['workspace',['ls','-w','a']],['workspace-json',['ls','-w','a','--json']],['global',['ls','-g']]])add(`cli-ls-${name}`,'ls',args,cliWorkspaceTree,{before:async ctx=>{if(args.includes('-g'))manifest(path.join(ctx.env.NPM_CONFIG_PREFIX,process.platform==='win32'?'node_modules/dep':'lib/node_modules/dep'),{name:'dep'});}});
+for(const [name,args] of [['workspace',['outdated','-w','a']],['workspace-json',['outdated','-w','a','--json']],['global',['outdated','-g']],['global-json',['outdated','-g','--json']]])add(`cli-outdated-${name}`,'outdated',args,cliWorkspaceTree,{before:async ctx=>{if(args.includes('-g'))manifest(path.join(ctx.env.NPM_CONFIG_PREFIX,process.platform==='win32'?'node_modules/dep':'lib/node_modules/dep'),{name:'dep'});}});
 for(const [name,selector] of [['workspace','.workspace'],['private',':private'],['is',':is(.workspace, #dep)'],['attribute','[name|=readiness]'],['array','[keywords~=tool]']])add(`cli-query-${name}`,'query',['query',selector],dir=>{cliWorkspaceTree(dir);edit(path.join(dir,'node_modules/dep'),p=>{p.keywords=['build','tool'];});});
 for(const [name,flags] of [['list',[]],['json',['--json']],['long',['-l']]])add(`cli-config-${name}`,'config',['config','list',...flags],dir=>{manifest(dir);write(dir,'.npmrc','save-prefix=~\n');});
 
@@ -993,7 +993,7 @@ for(const c of cases){
     write(path.join(root,'logs'),`${c.name}-${tool}.stdout`,p.stdout);write(path.join(root,'logs'),`${c.name}-${tool}.stderr`,p.stderr);
     const files=snapshot(dir,config);
     files['<userconfig>']=fs.existsSync(path.join(config,'user.npmrc'))?normalize(fs.readFileSync(path.join(config,'user.npmrc'),'utf8'),dir,config):null;
-    if(c.command==='link')files['<global-prefix>']=JSON.parse(normalize(JSON.stringify(snapshot(path.join(config,'prefix'),config)),dir,config));
+    if(c.command==='link')files['<global-prefix>']=JSON.parse(normalize(JSON.stringify(snapshot(path.join(config,'prefix'),config)),dir,config).replaceAll(`/${c.name}/${tool}/project`,`/${c.name}/<tool>/project`));
     result[tool]={exit:p.exit,execution_error:p.error,stdout:normalize(p.stdout,dir,config),stderr:normalize(p.stderr,dir,config),files,requests:requests.slice(start)};
     if(c.observe)result[tool].observation=c.observe({dir,env,requests:requests.slice(start)});
   }

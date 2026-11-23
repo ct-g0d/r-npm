@@ -314,6 +314,20 @@ fn load_embedded_docs() -> Result<Vec<(String, String)>> {
     let mut json_bytes = Vec::new();
     decoder.read_to_end(&mut json_bytes)?;
     let entries: Vec<(String, String)> = serde_json::from_slice(&json_bytes)?;
+    // Embedded docs are archived from Windows CRLF npm files; Unix Node/npm ships LF files
+    // so npm's `/^---\n(.*\n)*?---\n/` front-matter stripper matches on Unix and skips on Windows.
+    #[cfg(not(windows))]
+    let entries = entries
+        .into_iter()
+        .map(|(k, v)| {
+            let v = if v.contains('\r') {
+                v.replace("\r\n", "\n")
+            } else {
+                v
+            };
+            (k, v)
+        })
+        .collect();
     Ok(entries)
 }
 

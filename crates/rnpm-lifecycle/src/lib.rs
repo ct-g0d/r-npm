@@ -1114,7 +1114,7 @@ pub fn node_entrypoint() -> Option<PathBuf> {
 }
 
 /// Config npm exports to scripts (@npmcli/config set-envs): non-default
-/// settings, plus prefixes, cache, userconfig, node-gyp and npm version.
+/// non-env settings, plus global/local prefix, node-gyp and npm version.
 fn npm_config_env(project_root: &Path, trusted_config: Option<&rnpm_config::Config>) -> Vec<(String, String)> {
     let mut out = Vec::new();
     let loaded_config;
@@ -1124,49 +1124,53 @@ fn npm_config_env(project_root: &Path, trusted_config: Option<&rnpm_config::Conf
         loaded_config = rnpm_config::Config::load(Some(project_root)).unwrap_or_default();
         &loaded_config
     };
-    for (key, value) in &config.npmrc.settings {
-        if key.starts_with(['/', '@', '_']) || key.contains(":_") || key.contains("//") {
-            continue;
+    if trusted_config.is_none() {
+        if let Ok(detailed) = rnpm_config::Config::load_detailed(
+            rnpm_config::ConfigOptions::new().project_dir(project_root),
+        ) {
+            let mut winning: std::collections::BTreeMap<String, (&str, String)> =
+                std::collections::BTreeMap::new();
+            for layer in detailed.layers {
+                let source = if layer.name == "env" { "env" } else { "other" };
+                for (key, value) in layer.settings {
+                    winning.insert(key, (source, value));
+                }
+            }
+            for (key, (source, value)) in winning {
+                if source == "env"
+                    || key.starts_with(['/', '@', '_'])
+                    || key.contains(":_")
+                    || key.contains("//")
+                {
+                    continue;
+                }
+                out.push((
+                    format!("npm_config_{}", key.replace('-', "_").to_ascii_lowercase()),
+                    value,
+                ));
+            }
         }
-        out.push((
-            format!("npm_config_{}", key.replace('-', "_").to_ascii_lowercase()),
-            value.clone(),
-        ));
+    } else {
+        for (key, value) in &config.npmrc.settings {
+            if key.starts_with(['/', '@', '_']) || key.contains(":_") || key.contains("//") {
+                continue;
+            }
+            out.push((
+                format!("npm_config_{}", key.replace('-', "_").to_ascii_lowercase()),
+                value.clone(),
+            ));
+        }
     }
     let global_prefix = config
         .get("prefix")
         .map(PathBuf::from)
         .unwrap_or_else(rnpm_config::find_global_prefix);
     let prefix = global_prefix.to_string_lossy().to_string();
-    out.push(("npm_config_global_prefix".into(), prefix.clone()));
-    out.push(("npm_config_prefix".into(), prefix));
+    out.push(("npm_config_global_prefix".into(), prefix));
     out.push((
         "npm_config_local_prefix".into(),
         project_root.to_string_lossy().to_string(),
     ));
-    let cache = config.get("cache").map(PathBuf::from).unwrap_or_else(|| {
-        if cfg!(windows) {
-            std::env::var_os("LOCALAPPDATA")
-                .map(PathBuf::from)
-                .unwrap_or_else(std::env::temp_dir)
-                .join("npm-cache")
-        } else {
-            std::env::var_os("HOME")
-                .map(PathBuf::from)
-                .unwrap_or_else(std::env::temp_dir)
-                .join(".npm")
-        }
-    });
-    out.push((
-        "npm_config_cache".into(),
-        cache.to_string_lossy().to_string(),
-    ));
-    if let Some(user) = rnpm_config::find_user_npmrc() {
-        out.push((
-            "npm_config_userconfig".into(),
-            user.to_string_lossy().to_string(),
-        ));
-    }
     if let Some(gyp) = find_node_gyp(project_root, project_root, config, None) {
         out.push((
             "npm_config_node_gyp".into(),

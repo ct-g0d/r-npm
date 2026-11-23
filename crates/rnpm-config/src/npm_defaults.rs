@@ -214,7 +214,7 @@ pub fn npm_default(key: &str) -> Option<String> {
             if windows {
                 env("ComSpec").unwrap_or_else(|| "cmd.exe".into())
             } else {
-                env("SHELL").unwrap_or_else(|| "/bin/sh".into())
+                env("SHELL").unwrap_or_else(|| "sh".into())
             }
         }
         "editor" => env("EDITOR").or_else(|| env("VISUAL")).unwrap_or_else(|| {

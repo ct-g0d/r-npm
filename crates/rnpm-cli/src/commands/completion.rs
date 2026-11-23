@@ -291,68 +291,75 @@ fn compute_completions(
     results
 }
 
-const BASH_ZSH_INIT_SCRIPT: &str = r#"###-begin-rnpm-completion-###
-#
-# rnpm command completion script
-#
-# Installation: rnpm completion >> ~/.bashrc  (or ~/.zshrc)
-# Or, maybe: rnpm completion > /usr/local/etc/bash_completion.d/rnpm
-#
-
-if type complete &>/dev/null; then
-  _rnpm_completion () {
-    local words cword
-    if type _get_comp_words_by_ref &>/dev/null; then
-      _get_comp_words_by_ref -n = -n @ -n : -w words -c cword
-    else
-      cword="$COMP_CWORD"
-      words=("${COMP_WORDS[@]}")
-    fi
-
-    local si="$IFS"
-    IFS=$'\n' COMPREPLY=($(COMP_CWORD="$cword" \
-                           COMP_LINE="$COMP_LINE" \
-                           COMP_POINT="$COMP_POINT" \
-                           rnpm completion -- "${words[@]}" \
-                           2>/dev/null)) || return $?
-    IFS="$si"
-    if [ "$COMPREPLY" = "" ]; then
-      _filedir
-    fi
-    return 0
-  }
-  complete -o default -F _rnpm_completion rnpm
-elif type compdef &>/dev/null; then
-  _rnpm_completion() {
-    local si=$IFS
-    compadd -- $(COMP_CWORD=$((CURRENT-1)) \
-                 COMP_LINE=$BUFFER \
-                 COMP_POINT=$CURSOR \
-                 rnpm completion -- "${words[@]}" \
-                 2>/dev/null)
-    IFS=$si
-  }
-  compdef _rnpm_completion rnpm
-elif type compctl &>/dev/null; then
-  _rnpm_completion () {
-    local cword line point words si
-    read -Ac words
-    read -cn cword
-    let cword-=1
-    read -l line
-    read -ln point
-    si="$IFS"
-    IFS=$'\n' reply=($(COMP_CWORD="$cword" \
-                       COMP_LINE="$line" \
-                       COMP_POINT="$point" \
-                       rnpm completion -- "${words[@]}" \
-                       2>/dev/null)) || return $?
-    IFS="$si"
-  }
-  compctl -K _npm_completion rnpm
-fi
-###-end-rnpm-completion-###
-"#;
+const BASH_ZSH_INIT_SCRIPT: &str = "###-begin-npm-completion-###\n\
+#\n\
+# npm command completion script\n\
+#\n\
+# Installation: npm completion >> ~/.bashrc  (or ~/.zshrc)\n\
+# Or, maybe: npm completion > /usr/local/etc/bash_completion.d/npm\n\
+#\n\
+\n\
+if type complete &>/dev/null; then\n\
+  _npm_completion () {\n\
+    local words cword\n\
+    if type _get_comp_words_by_ref &>/dev/null; then\n\
+      _get_comp_words_by_ref -n = -n @ -n : -w words -i cword\n\
+    else\n\
+      cword=\"$COMP_CWORD\"\n\
+      words=(\"${COMP_WORDS[@]}\")\n\
+    fi\n\
+\n\
+    local si=\"$IFS\"\n\
+    if ! IFS=$'\\n' COMPREPLY=($(COMP_CWORD=\"$cword\" \\\n\
+                           COMP_LINE=\"$COMP_LINE\" \\\n\
+                           COMP_POINT=\"$COMP_POINT\" \\\n\
+                           npm completion -- \"${words[@]}\" \\\n\
+                           2>/dev/null)); then\n\
+      local ret=$?\n\
+      IFS=\"$si\"\n\
+      return $ret\n\
+    fi\n\
+    IFS=\"$si\"\n\
+    if type __ltrim_colon_completions &>/dev/null; then\n\
+      __ltrim_colon_completions \"${words[cword]}\"\n\
+    fi\n\
+  }\n\
+  complete -o default -F _npm_completion npm\n\
+elif type compdef &>/dev/null; then\n\
+  _npm_completion() {\n\
+    local si=$IFS\n\
+    compadd -- $(COMP_CWORD=$((CURRENT-1)) \\\n\
+                 COMP_LINE=$BUFFER \\\n\
+                 COMP_POINT=0 \\\n\
+                 npm completion -- \"${words[@]}\" \\\n\
+                 2>/dev/null)\n\
+    IFS=$si\n\
+  }\n\
+  compdef _npm_completion npm\n\
+elif type compctl &>/dev/null; then\n\
+  _npm_completion () {\n\
+    local cword line point words si\n\
+    read -Ac words\n\
+    read -cn cword\n\
+    let cword-=1\n\
+    read -l line\n\
+    read -ln point\n\
+    si=\"$IFS\"\n\
+    if ! IFS=$'\\n' reply=($(COMP_CWORD=\"$cword\" \\\n\
+                       COMP_LINE=\"$line\" \\\n\
+                       COMP_POINT=\"$point\" \\\n\
+                       npm completion -- \"${words[@]}\" \\\n\
+                       2>/dev/null)); then\n\
+\n\
+      local ret=$?\n\
+      IFS=\"$si\"\n\
+      return $ret\n\
+    fi\n\
+    IFS=\"$si\"\n\
+  }\n\
+  compctl -K _npm_completion npm\n\
+fi\n\
+###-end-npm-completion-###\n";
 
 fn print_init_script(shell: Option<&str>) {
     match shell.unwrap_or("bash") {

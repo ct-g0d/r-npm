@@ -149,9 +149,9 @@ fn test_completion_script_generation() {
     let out_default = run_cmd(root, &["completion"], &[("MSYSTEM", "MINGW64")]);
     assert!(out_default.status.success());
     let stdout = String::from_utf8_lossy(&out_default.stdout);
-    assert!(stdout.contains("###-begin-rnpm-completion-###"));
-    assert!(stdout.contains("_rnpm_completion"));
-    assert!(stdout.contains("complete -o default -F _rnpm_completion rnpm"));
+    assert!(stdout.contains("###-begin-npm-completion-###"));
+    assert!(stdout.contains("_npm_completion"));
+    assert!(stdout.contains("complete -o default -F _npm_completion npm"));
 
     #[cfg(windows)]
     {
