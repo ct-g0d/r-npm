@@ -1342,24 +1342,39 @@ impl LockfileV3 {
     }
 
     fn version_matches_target(ver_str: &str, target: &PackageTarget) -> bool {
-        let Ok(v) = Version::parse(ver_str) else {
-            return false;
-        };
         match target {
-            PackageTarget::Version(expected) => &v == expected,
-            PackageTarget::Range(range) => range.satisfies(&v),
-            PackageTarget::Tag(_) => true,
-            PackageTarget::File(_) => true,
-            PackageTarget::Git { .. } => true,
-            PackageTarget::Url(_) => true,
+            PackageTarget::Tag(_)
+            | PackageTarget::File(_)
+            | PackageTarget::Git { .. }
+            | PackageTarget::Url(_) => true,
+            PackageTarget::Version(expected) => {
+                let Ok(v) = Version::parse(ver_str) else {
+                    return false;
+                };
+                &v == expected
+            }
+            PackageTarget::Range(range) => {
+                let Ok(v) = Version::parse(ver_str) else {
+                    return false;
+                };
+                range.satisfies(&v)
+            }
             PackageTarget::Workspace(ws_spec) => {
                 let s = ws_spec.trim();
                 if s == "*" || s == "^" || s == "~" || s.is_empty() {
                     true
                 } else if let Ok(range) = rnpm_core::semver::Range::parse(s) {
-                    range.satisfies(&v)
+                    if let Ok(v) = Version::parse(ver_str) {
+                        range.satisfies(&v)
+                    } else {
+                        false
+                    }
                 } else if let Ok(expected) = Version::parse(s) {
-                    v == expected
+                    if let Ok(v) = Version::parse(ver_str) {
+                        v == expected
+                    } else {
+                        false
+                    }
                 } else {
                     true
                 }
@@ -1795,11 +1810,15 @@ impl LockfileV3 {
     }
 
     fn to_legacy_dependencies(&self) -> serde_json::Value {
-        fn package_value(package: &LockfilePackage) -> serde_json::Value {
+        fn package_value(dep_name: &str, package: &LockfilePackage) -> serde_json::Value {
             let mut value = serde_json::Map::new();
             if let Some(v) = &package.version {
                 let ver_str = if let Some(real_name) = &package.name {
-                    format!("npm:{real_name}@{v}")
+                    if real_name != dep_name {
+                        format!("npm:{real_name}@{v}")
+                    } else {
+                        v.clone()
+                    }
                 } else {
                     v.clone()
                 };
@@ -1864,7 +1883,7 @@ impl LockfileV3 {
             }
             let name = segments[0];
             if segments.len() == 1 {
-                root.insert(name.to_string(), package_value(package));
+                root.insert(name.to_string(), package_value(name, package));
                 return;
             }
             let entry = root

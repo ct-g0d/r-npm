@@ -20,11 +20,31 @@ where
         serde_json::Value::Number(n) => {
             if let Some(u) = n.as_u64() {
                 u32::try_from(u).map_err(serde::de::Error::custom)
+            } else if let Some(f) = n.as_f64() {
+                if f.is_finite() && f.fract() == 0.0 && f >= 0.0 && f <= (u32::MAX as f64) {
+                    Ok(f as u32)
+                } else {
+                    Err(serde::de::Error::custom(
+                        "lockfileVersion float must be a non-negative whole integer within u32 range",
+                    ))
+                }
             } else {
                 Err(serde::de::Error::custom("invalid lockfileVersion number"))
             }
         }
-        serde_json::Value::String(s) => s.parse::<u32>().map_err(serde::de::Error::custom),
+        serde_json::Value::String(s) => {
+            if let Ok(u) = s.parse::<u32>() {
+                Ok(u)
+            } else if let Ok(f) = s.parse::<f64>() {
+                if f.is_finite() && f.fract() == 0.0 && f >= 0.0 && f <= (u32::MAX as f64) {
+                    Ok(f as u32)
+                } else {
+                    Err(serde::de::Error::custom("invalid lockfileVersion string"))
+                }
+            } else {
+                Err(serde::de::Error::custom("invalid lockfileVersion string"))
+            }
+        }
         serde_json::Value::Null => Ok(1),
         _ => Err(serde::de::Error::custom(
             "lockfileVersion must be a number or string",
@@ -87,7 +107,7 @@ pub struct AnyLockfile {
 }
 
 fn parse_legacy_version_and_name(
-    _dep_name: &str,
+    dep_name: &str,
     dep_version: &str,
     explicit_name: Option<&str>,
 ) -> (Option<String>, Option<String>) {
@@ -97,7 +117,11 @@ fn parse_legacy_version_and_name(
                 let name = &alias_part[..at_idx];
                 let ver = &alias_part[at_idx + 1..];
                 return (
-                    Some(name.to_string()),
+                    if name != dep_name {
+                        Some(name.to_string())
+                    } else {
+                        None
+                    },
                     if ver.is_empty() {
                         None
                     } else {
@@ -107,11 +131,21 @@ fn parse_legacy_version_and_name(
             }
         }
         (
-            Some(alias_part.to_string()),
+            if alias_part != dep_name {
+                Some(alias_part.to_string())
+            } else {
+                None
+            },
             None,
         )
     } else {
-        let name = explicit_name.map(str::to_string);
+        let name = explicit_name.and_then(|n| {
+            if n != dep_name {
+                Some(n.to_string())
+            } else {
+                None
+            }
+        });
         let ver = if dep_version.is_empty() {
             None
         } else {

@@ -919,3 +919,177 @@ fn test_matches_manifest_ext_non_registry_and_alias_spec_drift() {
         "alias package name drift must be detected"
     );
 }
+
+// =========================================================================
+// 7. Round 2 Regression Tests
+// =========================================================================
+
+#[test]
+fn test_non_aliased_legacy_package_not_turned_into_alias_on_export() {
+    // Legacy dependency has explicit name equal to its map key ("foo": { "name": "foo", "version": "1.0.0" })
+    let v1_json = r#"{
+        "name": "non-alias-test",
+        "lockfileVersion": 1,
+        "dependencies": {
+            "foo": {
+                "name": "foo",
+                "version": "1.0.0",
+                "resolved": "https://registry.npmjs.org/foo/-/foo-1.0.0.tgz"
+            },
+            "my-chalk": {
+                "name": "chalk",
+                "version": "5.0.0",
+                "resolved": "https://registry.npmjs.org/chalk/-/chalk-5.0.0.tgz"
+            }
+        }
+    }"#;
+
+    let v3 = parse_and_migrate(v1_json).expect("migration must succeed");
+    // foo should not have name: Some("foo") because it is not an alias
+    let foo_pkg = v3.packages.get("node_modules/foo").unwrap();
+    assert_eq!(
+        foo_pkg.name, None,
+        "non-aliased package must have name: None"
+    );
+
+    // my-chalk MUST have name: Some("chalk") because it is an alias
+    let chalk_pkg = v3.packages.get("node_modules/my-chalk").unwrap();
+    assert_eq!(
+        chalk_pkg.name.as_deref(),
+        Some("chalk"),
+        "aliased package must have name: Some(\"chalk\")"
+    );
+
+    // Now test export back to v2 legacy dependencies:
+    let v2_json = v3.to_json_string_version(2).unwrap();
+    let val: serde_json::Value = serde_json::from_str(&v2_json).unwrap();
+
+    assert_eq!(
+        val["dependencies"]["foo"]["version"], "1.0.0",
+        "non-aliased package must export version: 1.0.0, NOT npm:foo@1.0.0"
+    );
+    assert_eq!(
+        val["dependencies"]["my-chalk"]["version"], "npm:chalk@5.0.0",
+        "aliased package must export version: npm:chalk@5.0.0"
+    );
+
+    // Also verify if a v3 package explicitly has name: Some("bar") where key is node_modules/bar
+    let mut lock = LockfileV3::new("roundtrip-check", Some("1.0.0".to_string()));
+    lock.insert_package(
+        "node_modules/bar",
+        LockfilePackage {
+            name: Some("bar".to_string()),
+            version: Some("2.0.0".to_string()),
+            ..Default::default()
+        },
+    );
+    let v2_roundtrip = lock.to_json_string_version(2).unwrap();
+    let val_rt: serde_json::Value = serde_json::from_str(&v2_roundtrip).unwrap();
+    assert_eq!(
+        val_rt["dependencies"]["bar"]["version"], "2.0.0",
+        "to_legacy_dependencies must not emit npm: prefix when name == dep_name"
+    );
+}
+
+#[test]
+fn test_version_matches_target_non_semver_for_file_git_url() {
+    // 1. Git dependency with a commit hash as version
+    let git_pkg = LockfilePackage {
+        version: Some("abcd1234ef567890abcd1234ef567890abcd1234".to_string()),
+        resolved: Some("git+https://github.com/foo/bar.git#abcd1234".to_string()),
+        ..Default::default()
+    };
+    assert!(
+        LockfileV3::package_satisfies_spec(
+            "git-dep",
+            &git_pkg,
+            "git+https://github.com/foo/bar.git#main"
+        ),
+        "package_satisfies_spec must accept non-semver git versions"
+    );
+
+    // 2. File dependency with a local path as version
+    let file_pkg = LockfilePackage {
+        version: Some("file:../my-local-dep".to_string()),
+        resolved: Some("file:../my-local-dep".to_string()),
+        ..Default::default()
+    };
+    assert!(
+        LockfileV3::package_satisfies_spec(
+            "file-dep",
+            &file_pkg,
+            "file:../my-local-dep"
+        ),
+        "package_satisfies_spec must accept non-semver file versions"
+    );
+
+    // 3. URL dependency with a tarball URL as version
+    let url_pkg = LockfilePackage {
+        version: Some("https://example.com/archive.tgz".to_string()),
+        resolved: Some("https://example.com/archive.tgz".to_string()),
+        ..Default::default()
+    };
+    assert!(
+        LockfileV3::package_satisfies_spec(
+            "url-dep",
+            &url_pkg,
+            "https://example.com/archive.tgz"
+        ),
+        "package_satisfies_spec must accept non-semver URL versions"
+    );
+
+    // 4. Tag target with non-semver version
+    assert!(
+        LockfileV3::package_satisfies_spec("tag-dep", &url_pkg, "latest"),
+        "package_satisfies_spec must accept non-semver versions for Tag targets"
+    );
+
+    // 5. Version/Range target with non-semver version MUST still fail cleanly
+    assert!(
+        !LockfileV3::package_satisfies_spec("semver-dep", &url_pkg, "^1.0.0"),
+        "package_satisfies_spec must reject non-semver version for Range targets"
+    );
+}
+
+#[test]
+fn test_deserialize_lockfile_version_integral_floats_and_rejections() {
+    // Float 2.0
+    let json_f2 = r#"{"name": "f2", "lockfileVersion": 2.0, "packages": { "": {} }}"#;
+    let lf_f2 = LockfileV3::from_json_str(json_f2).expect("lockfileVersion 2.0 must parse");
+    assert_eq!(lf_f2.lockfile_version, 2);
+
+    // Float 3.0
+    let json_f3 = r#"{"name": "f3", "lockfileVersion": 3.0, "packages": { "": {} }}"#;
+    let lf_f3 = LockfileV3::from_json_str(json_f3).expect("lockfileVersion 3.0 must parse");
+    assert_eq!(lf_f3.lockfile_version, 3);
+
+    // String float "2.0" and "3.0"
+    let json_s2 = r#"{"name": "s2", "lockfileVersion": "2.0", "packages": { "": {} }}"#;
+    let lf_s2 = LockfileV3::from_json_str(json_s2).expect("lockfileVersion '2.0' must parse");
+    assert_eq!(lf_s2.lockfile_version, 2);
+
+    let json_s3 = r#"{"name": "s3", "lockfileVersion": "3.0", "packages": { "": {} }}"#;
+    let lf_s3 = LockfileV3::from_json_str(json_s3).expect("lockfileVersion '3.0' must parse");
+    assert_eq!(lf_s3.lockfile_version, 3);
+
+    // Rejection 1: Fractional float 2.5
+    let json_fract = r#"{"name": "fract", "lockfileVersion": 2.5, "packages": { "": {} }}"#;
+    assert!(
+        LockfileV3::from_json_str(json_fract).is_err(),
+        "fractional lockfileVersion 2.5 must be rejected"
+    );
+
+    // Rejection 2: Negative number -1
+    let json_neg = r#"{"name": "neg", "lockfileVersion": -1, "packages": { "": {} }}"#;
+    assert!(
+        LockfileV3::from_json_str(json_neg).is_err(),
+        "negative lockfileVersion -1 must be rejected"
+    );
+
+    // Rejection 3: Negative float -2.0
+    let json_neg_f = r#"{"name": "neg-f", "lockfileVersion": -2.0, "packages": { "": {} }}"#;
+    assert!(
+        LockfileV3::from_json_str(json_neg_f).is_err(),
+        "negative lockfileVersion -2.0 must be rejected"
+    );
+}
