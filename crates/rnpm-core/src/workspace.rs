@@ -413,7 +413,7 @@ pub fn path_matches_workspace_patterns(path: &str, patterns: &[String]) -> bool 
         let posix_neg = neg_clean.replace('\\', "/");
         let posix_neg = posix_neg.trim_end_matches('/');
 
-        if matches_neg_pattern(&posix_neg, &clean_path) {
+        if matches_neg_pattern(posix_neg, clean_path) {
             return false;
         }
 
