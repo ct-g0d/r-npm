@@ -16,6 +16,15 @@ fn test_special_characters_in_shim_targets() {
     let target = "my pkg (v1) & test%20 'quotes' ; semi $dollar #hash 中文_🚀/bin/cli.js";
     let bin_name = "special-tool";
 
+    // Pre-create target script so Unix create_shims does not skip linking
+    let target_file = dir.path().join("node_modules").join(target);
+    fs::create_dir_all(target_file.parent().unwrap()).unwrap();
+    fs::write(
+        &target_file,
+        b"#!/usr/bin/env node\nconsole.log('special');\n",
+    )
+    .unwrap();
+
     create_shims(&bin_dir, bin_name, target).unwrap();
 
     #[cfg(not(unix))]
@@ -60,6 +69,12 @@ fn test_special_characters_in_shim_targets() {
     {
         let sh_path = bin_dir.join(bin_name);
         assert!(sh_path.exists());
+        assert!(sh_path.is_symlink());
+        let sym_dest = fs::read_link(&sh_path).unwrap();
+        assert_eq!(
+            sym_dest,
+            std::path::PathBuf::from(format!("../{target}"))
+        );
     }
 }
 
@@ -72,6 +87,15 @@ fn test_overwrite_readonly_shims() {
     let bin_name = "readonly-cli";
     let target1 = "pkg1/bin/cli.js";
     let target2 = "pkg1/bin/cli-v2.js";
+
+    // Pre-create target scripts so Unix create_shims does not skip linking
+    let t1_path = dir.path().join("node_modules").join(target1);
+    fs::create_dir_all(t1_path.parent().unwrap()).unwrap();
+    fs::write(&t1_path, b"#!/usr/bin/env node\nconsole.log('v1');\n").unwrap();
+
+    let t2_path = dir.path().join("node_modules").join(target2);
+    fs::create_dir_all(t2_path.parent().unwrap()).unwrap();
+    fs::write(&t2_path, b"#!/usr/bin/env node\nconsole.log('v2');\n").unwrap();
 
     // 1. First creation
     create_shims(&bin_dir, bin_name, target1).unwrap();
@@ -92,7 +116,7 @@ fn test_overwrite_readonly_shims() {
     #[cfg(unix)]
     {
         let sh_path = bin_dir.join(bin_name);
-        let mut perms = fs::metadata(&sh_path).unwrap().permissions();
+        let mut perms = fs::symlink_metadata(&sh_path).unwrap().permissions();
         perms.set_readonly(true);
         fs::set_permissions(&sh_path, perms).unwrap();
     }
@@ -105,6 +129,14 @@ fn test_overwrite_readonly_shims() {
         let cmd_path = bin_dir.join(format!("{bin_name}.cmd"));
         let content = fs::read_to_string(cmd_path).unwrap();
         assert!(content.contains("cli-v2.js"));
+    }
+
+    #[cfg(unix)]
+    {
+        let sh_path = bin_dir.join(bin_name);
+        assert!(sh_path.is_symlink());
+        let sym_dest = fs::read_link(&sh_path).unwrap();
+        assert_eq!(sym_dest, std::path::PathBuf::from("../pkg1/bin/cli-v2.js"));
     }
 }
 
@@ -203,6 +235,12 @@ fn test_parse_shim_target_and_pkg_scoped() {
     fs::create_dir_all(&bin_dir).unwrap();
 
     let target = "@my-org/my-pkg/bin/run.js";
+
+    // Pre-create target script so Unix create_shims creates the symlink
+    let target_file = dir.path().join("node_modules").join(target);
+    fs::create_dir_all(target_file.parent().unwrap()).unwrap();
+    fs::write(&target_file, b"#!/usr/bin/env node\nconsole.log('run');\n").unwrap();
+
     create_shims(&bin_dir, "my-pkg-cli", target).unwrap();
 
     #[cfg(not(unix))]
@@ -213,6 +251,23 @@ fn test_parse_shim_target_and_pkg_scoped() {
         assert!(parsed_target.contains("@my-org/my-pkg/bin/run.js"));
         assert_eq!(parsed_pkg.as_deref(), Some("@my-org/my-pkg"));
     }
+
+    #[cfg(unix)]
+    {
+        let link_path = bin_dir.join("my-pkg-cli");
+        assert!(link_path.is_symlink());
+        let sym_dest = fs::read_link(&link_path).unwrap();
+        assert_eq!(sym_dest, std::path::PathBuf::from("../@my-org/my-pkg/bin/run.js"));
+        let pkg = rnpm_shim::extract_package_name(&sym_dest.to_string_lossy());
+        assert_eq!(pkg.as_deref(), Some("@my-org/my-pkg"));
+    }
+
+    // Cross-platform: directly test parse_shim_target_and_pkg against generated POSIX shims on all platforms
+    let posix_content = rnpm_shim::generate_posix_shim(target);
+    let (parsed_posix_target, parsed_posix_pkg) =
+        parse_shim_target_and_pkg(&posix_content).expect("Failed to parse generated POSIX shim");
+    assert!(parsed_posix_target.contains("@my-org/my-pkg/bin/run.js"));
+    assert_eq!(parsed_posix_pkg.as_deref(), Some("@my-org/my-pkg"));
 }
 
 #[test]
