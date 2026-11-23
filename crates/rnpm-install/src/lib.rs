@@ -459,6 +459,10 @@ pub struct RegistryPackageProvider {
     /// a local/custom package with the same name and version never overwrites registry metadata or
     /// `dist-tags` (e.g. `dep: file:dep.tgz` alongside `npm:dep@latest`).
     custom_metadata_cache: Arc<std::sync::Mutex<HashMap<String, PackageMetadata>>>,
+    /// Separate metadata cache for already-installed global packages on disk.
+    /// Reused only for unnamed installed packages whose disk version satisfies the requested range,
+    /// so global upgrades (e.g. `rnpm install -g dep@2.0.0`) always query the registry.
+    global_disk_metadata_cache: Arc<std::sync::Mutex<HashMap<String, PackageMetadata>>>,
     cache: Cache,
     offline: bool,
     prefer_offline: bool,
@@ -1311,6 +1315,27 @@ impl PackageMetadataProvider for RegistryPackageProvider {
             }
         }
 
+        if !self.named_packages.contains(name) {
+            if let Ok(disk) = self.global_disk_metadata_cache.lock() {
+                if let Some(meta) = disk.get(name) {
+                    let range_satisfied = if range.is_empty() || range == "*" {
+                        true
+                    } else if let Ok(parsed_range) = rnpm_core::Range::parse(range) {
+                        meta.versions.keys().any(|v| {
+                            rnpm_core::Version::parse(v)
+                                .map(|pv| parsed_range.satisfies(&pv))
+                                .unwrap_or(false)
+                        })
+                    } else {
+                        meta.versions.contains_key(range)
+                    };
+                    if range_satisfied {
+                        return Ok(Some(meta.clone()));
+                    }
+                }
+            }
+        }
+
         match self.fetch_or_revalidate_packument(name, reg_is_root) {
             Ok(meta) => {
                 if let Ok(mut cache) = self.metadata_cache.lock() {
@@ -1360,9 +1385,14 @@ impl PackageMetadataProvider for RegistryPackageProvider {
                 Ok(c) => c,
                 Err(_) => return,
             };
+            let disk = self.global_disk_metadata_cache.lock().ok();
             names
                 .iter()
-                .filter(|n| !cache.contains_key(**n))
+                .filter(|n| {
+                    !cache.contains_key(**n)
+                        && (self.named_packages.contains(**n)
+                            || !disk.as_ref().is_some_and(|d| d.contains_key(**n)))
+                })
                 .map(|n| n.to_string())
                 .collect()
         };
@@ -3803,9 +3833,10 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
             self.options.project_dir.clone()
         };
 
+        let global_disk_metadata_cache = Arc::new(std::sync::Mutex::new(HashMap::new()));
         if self.options.is_global {
             let global_nm = rnpm_config::find_global_node_modules(&self.options.project_dir);
-            populate_global_disk_metadata(&global_nm, &metadata_cache);
+            populate_global_disk_metadata(&global_nm, &global_disk_metadata_cache);
         }
 
         let lockfile_path = project_lockfile_path(&self.options.project_dir);
@@ -3870,6 +3901,7 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
             handle,
             metadata_cache,
             custom_metadata_cache,
+            global_disk_metadata_cache,
             cache: self.cache.clone(),
             offline: self.options.offline,
             prefer_offline,
