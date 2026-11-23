@@ -132,18 +132,175 @@ where
     deserializer.deserialize_any(EnginesVisitor)
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Sanitizes a bin key according to npm-normalize-package-bin:
+/// Replaces `\` and `:` with `/`, extracts basename (after last `/`),
+/// and normalizes relative to root: path.join('/', basename).slice(1).
+/// Drops empty, ".", "..", and root paths.
+pub fn clean_bin_key(key: &str) -> String {
+    let unixified = key.replace(['\\', ':'], "/");
+    let base = match unixified.rfind('/') {
+        Some(idx) => &unixified[idx + 1..],
+        None => &unixified,
+    };
+    let mut segments = Vec::new();
+    for seg in base.split('/') {
+        match seg {
+            "" | "." => continue,
+            ".." => {
+                segments.pop();
+            }
+            other => segments.push(other),
+        }
+    }
+    segments.join("/")
+}
+
+/// Sanitizes a bin target script path according to npm-normalize-package-bin:
+/// Replaces `\` with `/`, normalizes relative to root (preventing path traversal `..`),
+/// and strips leading `/`. Preserves leading `./` if originally relative.
+pub fn clean_bin_target(target: &str) -> String {
+    let unixified = target.replace('\\', "/");
+    let had_dot_slash = unixified.starts_with("./");
+    let mut segments = Vec::new();
+    for seg in unixified.split('/') {
+        match seg {
+            "" | "." => continue,
+            ".." => {
+                segments.pop();
+            }
+            other => segments.push(other),
+        }
+    }
+    if segments.is_empty() {
+        String::new()
+    } else {
+        let joined = segments.join("/");
+        if had_dot_slash {
+            format!("./{joined}")
+        } else {
+            joined
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(untagged)]
 pub enum PackageBin {
     Single(String),
     Map(BTreeMap<String, String>),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+impl<'de> Deserialize<'de> for PackageBin {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct PackageBinVisitor;
+
+        impl<'de> Visitor<'de> for PackageBinVisitor {
+            type Value = PackageBin;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("a string, an array of strings, or a map of strings")
+            }
+
+            fn visit_str<E>(self, v: &str) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                Ok(PackageBin::Single(v.to_string()))
+            }
+
+            fn visit_string<E>(self, v: String) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                Ok(PackageBin::Single(v))
+            }
+
+            fn visit_seq<S>(self, mut seq: S) -> Result<Self::Value, S::Error>
+            where
+                S: SeqAccess<'de>,
+            {
+                let mut map = BTreeMap::new();
+                while let Some(elem) = seq.next_element::<String>()? {
+                    let key = clean_bin_key(&elem);
+                    if !key.is_empty() {
+                        map.insert(key, elem);
+                    }
+                }
+                Ok(PackageBin::Map(map))
+            }
+
+            fn visit_map<M>(self, mut access: M) -> Result<Self::Value, M::Error>
+            where
+                M: MapAccess<'de>,
+            {
+                let mut map = BTreeMap::new();
+                while let Some((k, v)) = access.next_entry::<String, String>()? {
+                    map.insert(k, v);
+                }
+                Ok(PackageBin::Map(map))
+            }
+        }
+
+        deserializer.deserialize_any(PackageBinVisitor)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(untagged)]
 pub enum BundledDependencies {
     Boolean(bool),
     List(Vec<String>),
+}
+
+impl<'de> Deserialize<'de> for BundledDependencies {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct BundledVisitor;
+
+        impl<'de> Visitor<'de> for BundledVisitor {
+            type Value = BundledDependencies;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("a boolean, a list of package names, or a map")
+            }
+
+            fn visit_bool<E>(self, v: bool) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                Ok(BundledDependencies::Boolean(v))
+            }
+
+            fn visit_seq<S>(self, mut seq: S) -> Result<Self::Value, S::Error>
+            where
+                S: SeqAccess<'de>,
+            {
+                let mut list = Vec::new();
+                while let Some(elem) = seq.next_element::<String>()? {
+                    list.push(elem);
+                }
+                Ok(BundledDependencies::List(list))
+            }
+
+            fn visit_map<M>(self, mut access: M) -> Result<Self::Value, M::Error>
+            where
+                M: MapAccess<'de>,
+            {
+                let mut list = Vec::new();
+                while let Some((k, _v)) = access.next_entry::<String, serde_json::Value>()? {
+                    list.push(k);
+                }
+                Ok(BundledDependencies::List(list))
+            }
+        }
+
+        deserializer.deserialize_any(BundledVisitor)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -450,27 +607,35 @@ impl Manifest {
         self.optional_dependency_order = collect("optionalDependencies");
     }
 
-    /// Returns list of (binary_name, script_path) defined in manifest.
+    /// Returns list of (binary_name, script_path) defined in manifest, sanitized according to npm 11.20.0.
     pub fn bin_entries(&self) -> Vec<(String, String)> {
         match &self.bin {
             None => Vec::new(),
             Some(PackageBin::Single(script_path)) => {
-                // If package name is "@scope/foo", binary name is "foo"
-                let bin_name = self
-                    .name
-                    .as_deref()
-                    .map(|n| {
-                        if let Some(slash_idx) = n.find('/') {
-                            &n[slash_idx + 1..]
-                        } else {
-                            n
-                        }
-                    })
-                    .unwrap_or("app")
-                    .to_string();
-                vec![(bin_name, script_path.clone())]
+                // If package name is missing or empty, npm removes the bin
+                let Some(pkg_name) = self.name.as_deref().filter(|n| !n.trim().is_empty()) else {
+                    return Vec::new();
+                };
+                let bin_name = clean_bin_key(pkg_name);
+                let bin_target = clean_bin_target(script_path);
+                if !bin_name.is_empty() && !bin_target.is_empty() {
+                    vec![(bin_name, bin_target)]
+                } else {
+                    Vec::new()
+                }
             }
-            Some(PackageBin::Map(map)) => map.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+            Some(PackageBin::Map(map)) => {
+                let mut entries = Vec::new();
+                for (k, v) in map {
+                    let bin_name = clean_bin_key(k);
+                    let bin_target = clean_bin_target(v);
+                    if !bin_name.is_empty() && !bin_target.is_empty() {
+                        entries.push((bin_name, bin_target));
+                    }
+                }
+                entries.sort_by(|a, b| a.0.cmp(&b.0));
+                entries
+            }
         }
     }
 

@@ -44,6 +44,12 @@ impl Range {
         let trimmed = input.trim();
         let raw = trimmed.to_string();
 
+        if trimmed.len() > 65536 {
+            return Err(SemverError::InvalidRange(
+                "Range string exceeds maximum length".to_string(),
+            ));
+        }
+
         if trimmed.is_empty() || trimmed == "*" || trimmed == "x" || trimmed == "X" {
             // Matches any version >= 0.0.0
             return Ok(Self {
@@ -57,19 +63,41 @@ impl Range {
         // Sets are separated by '||'
         let or_parts: Vec<&str> = trimmed.split("||").collect();
         let mut sets = Vec::new();
+        let mut has_wildcard_set = false;
 
         for or_part in or_parts {
             let set_str = or_part.trim();
             if set_str.is_empty() {
+                // In node-semver, an empty set in an || union represents a wildcard >=0.0.0
+                sets.push(ComparatorSet {
+                    comparators: vec![Comparator::new(Op::Gte, Version::new(0, 0, 0))],
+                });
+                has_wildcard_set = true;
                 continue;
             }
 
             let comparators = parse_comparator_set(set_str)?;
+            if comparators.len() == 1
+                && comparators[0].op == Op::Gte
+                && comparators[0].version.major == 0
+                && comparators[0].version.minor == 0
+                && comparators[0].version.patch == 0
+                && comparators[0].version.prerelease.is_empty()
+            {
+                has_wildcard_set = true;
+            }
             sets.push(ComparatorSet { comparators });
         }
 
         if sets.is_empty() {
             return Err(SemverError::InvalidRange(input.to_string()));
+        }
+
+        // If any set in the || union is a wildcard (>=0.0.0), node-semver collapses to a single wildcard set
+        if has_wildcard_set && sets.len() > 1 {
+            sets = vec![ComparatorSet {
+                comparators: vec![Comparator::new(Op::Gte, Version::new(0, 0, 0))],
+            }];
         }
 
         Ok(Self { raw, sets })
@@ -115,8 +143,18 @@ fn parse_partial_version(input: &str) -> Result<PartialVersion, SemverError> {
         });
     }
 
-    // Split off build metadata (ignored in range comparison)
+    // Split off build metadata (ignored in range comparison, but validated)
     let s = if let Some(idx) = s.find('+') {
+        let b_str = &s[idx + 1..];
+        if b_str.is_empty() {
+            return Err(SemverError::InvalidRange(input.to_string()));
+        }
+        for part in b_str.split('.') {
+            let part = part.trim();
+            if part.is_empty() || !part.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+                return Err(SemverError::InvalidRange(input.to_string()));
+            }
+        }
         &s[..idx]
     } else {
         s
@@ -131,19 +169,20 @@ fn parse_partial_version(input: &str) -> Result<PartialVersion, SemverError> {
         let mut pres = Vec::new();
         for part in p_str.split('.') {
             let part = part.trim();
-            if part.is_empty() {
+            if part.is_empty() || !part.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
                 return Err(SemverError::InvalidRange(input.to_string()));
             }
-            if part.chars().all(|c| c.is_ascii_digit())
-                && !part.is_empty()
-                && (part.len() == 1 || !part.starts_with('0'))
-            {
-                if let Ok(n) = part.parse::<u64>() {
-                    pres.push(PrereleaseId::Numeric(n));
-                    continue;
+            if part.chars().all(|c| c.is_ascii_digit()) {
+                if part.len() > 1 && part.starts_with('0') {
+                    return Err(SemverError::InvalidRange(input.to_string()));
                 }
+                let n = part
+                    .parse::<u64>()
+                    .map_err(|_| SemverError::InvalidRange(input.to_string()))?;
+                pres.push(PrereleaseId::Numeric(n));
+            } else {
+                pres.push(PrereleaseId::Alpha(part.to_string()));
             }
-            pres.push(PrereleaseId::Alpha(part.to_string()));
         }
         (&s[..idx], pres)
     } else {
@@ -155,37 +194,43 @@ fn parse_partial_version(input: &str) -> Result<PartialVersion, SemverError> {
         return Err(SemverError::InvalidRange(input.to_string()));
     }
 
-    let major = if is_wildcard(parts[0].trim()) {
-        None
-    } else {
-        Some(
-            parts[0]
-                .trim()
-                .parse::<u64>()
-                .map_err(|_| SemverError::InvalidRange(input.to_string()))?,
-        )
+    // SemVer 2.0.0 / node-semver rule:
+    // Prereleases on partial versions (e.g. 1.2-alpha, ^1.2-alpha, 1.x-alpha) are invalid ranges
+    if !prerelease.is_empty()
+        && (parts.len() < 3
+            || is_wildcard(parts[0].trim())
+            || is_wildcard(parts[1].trim())
+            || is_wildcard(parts[2].trim()))
+    {
+        return Err(SemverError::InvalidRange(input.to_string()));
+    }
+
+    let parse_segment = |part: &str| -> Result<Option<u64>, SemverError> {
+        let p = part.trim();
+        if is_wildcard(p) {
+            return Ok(None);
+        }
+        if p.is_empty() || !p.chars().all(|c| c.is_ascii_digit()) {
+            return Err(SemverError::InvalidRange(input.to_string()));
+        }
+        if p.len() > 1 && p.starts_with('0') {
+            return Err(SemverError::InvalidRange(input.to_string()));
+        }
+        p.parse::<u64>()
+            .map(Some)
+            .map_err(|_| SemverError::InvalidRange(input.to_string()))
     };
 
-    let minor = if parts.len() < 2 || is_wildcard(parts[1].trim()) {
-        None
+    let major = parse_segment(parts[0])?;
+    let minor = if parts.len() > 1 {
+        parse_segment(parts[1])?
     } else {
-        Some(
-            parts[1]
-                .trim()
-                .parse::<u64>()
-                .map_err(|_| SemverError::InvalidRange(input.to_string()))?,
-        )
+        None
     };
-
-    let patch = if parts.len() < 3 || is_wildcard(parts[2].trim()) {
-        None
+    let patch = if parts.len() > 2 {
+        parse_segment(parts[2])?
     } else {
-        Some(
-            parts[2]
-                .trim()
-                .parse::<u64>()
-                .map_err(|_| SemverError::InvalidRange(input.to_string()))?,
-        )
+        None
     };
 
     Ok(PartialVersion {
@@ -231,13 +276,15 @@ fn parse_comparator_set(input: &str) -> Result<Vec<Comparator>, SemverError> {
             let to = parse_partial_version(&tokens[i + 2])?;
 
             // Lower bound: >= from
-            let from_ver = make_version_with_pre(
-                from.major.unwrap_or(0),
-                from.minor.unwrap_or(0),
-                from.patch.unwrap_or(0),
-                from.prerelease,
-            );
-            comparators.push(Comparator::new(Op::Gte, from_ver));
+            if from.major.is_some() {
+                let from_ver = make_version_with_pre(
+                    from.major.unwrap(),
+                    from.minor.unwrap_or(0),
+                    from.patch.unwrap_or(0),
+                    from.prerelease,
+                );
+                comparators.push(Comparator::new(Op::Gte, from_ver));
+            }
 
             // Upper bound:
             // If `to.patch` is specified: <= to
@@ -308,8 +355,6 @@ fn tokenize_set(input: &str) -> Vec<String> {
             || part == "~"
             || part == "^"
             || part == "~>"
-            || part == "v"
-            || part == "V"
         {
             op = part.to_string();
             consumed = 1;
@@ -545,9 +590,13 @@ fn expand_token(input: &str) -> Result<Vec<Comparator>, SemverError> {
             Ok(vec![Comparator::new(Op::Gte, v)])
         }
         Some(Op::Gt) => {
+            if p.major.is_none() {
+                // > * is impossible range (<0.0.0-0)
+                return Ok(vec![Comparator::new(Op::Lt, upper_bound_version(0, 0, 0))]);
+            }
             if p.minor.is_none() {
                 // >1.x -> >=2.0.0
-                let major = p.major.unwrap_or(0);
+                let major = p.major.unwrap();
                 let next_major = major.checked_add(1).ok_or_else(|| {
                     SemverError::InvalidRange(format!("Version number overflow: {input}"))
                 })?;
@@ -557,7 +606,7 @@ fn expand_token(input: &str) -> Result<Vec<Comparator>, SemverError> {
                 )])
             } else if p.patch.is_none() {
                 // >1.2.x -> >=1.3.0
-                let major = p.major.unwrap_or(0);
+                let major = p.major.unwrap();
                 let minor = p.minor.unwrap();
                 let next_minor = minor.checked_add(1).ok_or_else(|| {
                     SemverError::InvalidRange(format!("Version number overflow: {input}"))
@@ -568,7 +617,7 @@ fn expand_token(input: &str) -> Result<Vec<Comparator>, SemverError> {
                 )])
             } else {
                 let v = make_version_with_pre(
-                    p.major.unwrap_or(0),
+                    p.major.unwrap(),
                     p.minor.unwrap(),
                     p.patch.unwrap(),
                     p.prerelease,
@@ -577,16 +626,20 @@ fn expand_token(input: &str) -> Result<Vec<Comparator>, SemverError> {
             }
         }
         Some(Op::Lt) => {
+            if p.major.is_none() {
+                // < * is impossible range (<0.0.0-0)
+                return Ok(vec![Comparator::new(Op::Lt, upper_bound_version(0, 0, 0))]);
+            }
             if p.minor.is_none() {
                 // <1.x -> <1.0.0-0
-                let major = p.major.unwrap_or(0);
+                let major = p.major.unwrap();
                 Ok(vec![Comparator::new(
                     Op::Lt,
                     upper_bound_version(major, 0, 0),
                 )])
             } else if p.patch.is_none() {
                 // <1.2.x -> <1.2.0-0
-                let major = p.major.unwrap_or(0);
+                let major = p.major.unwrap();
                 let minor = p.minor.unwrap();
                 Ok(vec![Comparator::new(
                     Op::Lt,
@@ -594,7 +647,7 @@ fn expand_token(input: &str) -> Result<Vec<Comparator>, SemverError> {
                 )])
             } else {
                 let v = make_version_with_pre(
-                    p.major.unwrap_or(0),
+                    p.major.unwrap(),
                     p.minor.unwrap(),
                     p.patch.unwrap(),
                     p.prerelease,
