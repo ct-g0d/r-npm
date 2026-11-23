@@ -698,24 +698,44 @@ fn test_shim_exit_code_fidelity_all_codes() {
             }
         }
 
-        // POSIX shim exit code fidelity if sh is available
-        let bash_paths = [
-            std::path::PathBuf::from("C:\\Program Files\\Git\\bin\\sh.exe"),
-            std::path::PathBuf::from("sh"),
-        ];
-        for sh in &bash_paths {
-            if sh.exists() || which_tool(sh.to_str().unwrap_or_default()).is_ok() {
-                let mut cmd = std::process::Command::new(sh);
-                cmd.current_dir(&bin_dir);
-                cmd.stdin(std::process::Stdio::null());
-                let status = cmd.arg(format!("./{bin_name}")).status();
-                if let Ok(st) = status {
-                    assert_eq!(
-                        st.code(),
-                        Some(code),
-                        "POSIX shim must faithfully exit with code {code}"
-                    );
-                    break;
+        // On Unix, bin links are direct POSIX symlinks to the executable script (matching npm bin-links).
+        #[cfg(unix)]
+        {
+            let link = bin_dir.join(&bin_name);
+            assert!(link.is_symlink(), "POSIX bin link must be a symlink");
+            let status = std::process::Command::new(&link)
+                .current_dir(&bin_dir)
+                .stdin(std::process::Stdio::null())
+                .status()
+                .expect("Failed to execute POSIX bin symlink");
+            assert_eq!(
+                status.code(),
+                Some(code),
+                "POSIX bin symlink must faithfully exit with code {code}"
+            );
+        }
+
+        // On Windows, verify the generated POSIX shell wrapper via Git Bash / sh if available.
+        #[cfg(not(unix))]
+        {
+            let bash_paths = [
+                std::path::PathBuf::from("C:\\Program Files\\Git\\bin\\sh.exe"),
+                std::path::PathBuf::from("sh"),
+            ];
+            for sh in &bash_paths {
+                if sh.exists() || which_tool(sh.to_str().unwrap_or_default()).is_ok() {
+                    let mut cmd = std::process::Command::new(sh);
+                    cmd.current_dir(&bin_dir);
+                    cmd.stdin(std::process::Stdio::null());
+                    let status = cmd.arg(format!("./{bin_name}")).status();
+                    if let Ok(st) = status {
+                        assert_eq!(
+                            st.code(),
+                            Some(code),
+                            "POSIX shim must faithfully exit with code {code}"
+                        );
+                        break;
+                    }
                 }
             }
         }
