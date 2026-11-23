@@ -76,6 +76,9 @@ pub const DEFAULT_INITIAL_RETRY_BACKOFF_MS: u64 = 100;
 /// Default maximum retry backoff duration in seconds.
 pub const DEFAULT_MAX_RETRY_BACKOFF_SECS: u64 = 5;
 
+/// Default retry backoff multiplier factor.
+pub const DEFAULT_RETRY_FACTOR: f64 = 2.0;
+
 /// Default maximum package size allowed for tarball downloads (512 MB).
 pub const DEFAULT_MAX_PACKAGE_SIZE: u64 = 512 * 1024 * 1024;
 
@@ -312,6 +315,7 @@ pub struct RegistryClientConfig {
     pub tcp_keepalive: Duration,
     pub pool_idle_timeout: Duration,
     pub max_retries: usize,
+    pub retry_factor: f64,
     pub initial_retry_backoff: Duration,
     pub max_retry_backoff: Duration,
     pub retry_on_status: HashSet<u16>,
@@ -334,6 +338,7 @@ pub struct RegistryClientConfig {
     pub cert: Option<String>,
     pub key: Option<String>,
     pub strict_ssl: bool,
+    pub maxsockets: Option<usize>,
 }
 
 impl Default for RegistryClientConfig {
@@ -362,6 +367,7 @@ impl Default for RegistryClientConfig {
             tcp_keepalive: Duration::from_secs(DEFAULT_TCP_KEEPALIVE_SECS),
             pool_idle_timeout: Duration::from_secs(DEFAULT_POOL_IDLE_TIMEOUT_SECS),
             max_retries: DEFAULT_MAX_RETRIES,
+            retry_factor: DEFAULT_RETRY_FACTOR,
             initial_retry_backoff: Duration::from_millis(DEFAULT_INITIAL_RETRY_BACKOFF_MS),
             max_retry_backoff: Duration::from_secs(DEFAULT_MAX_RETRY_BACKOFF_SECS),
             retry_on_status,
@@ -383,7 +389,45 @@ impl Default for RegistryClientConfig {
             cert: None,
             key: None,
             strict_ssl: true,
+            maxsockets: None,
         }
+    }
+}
+
+/// Computes the exponential retry backoff duration for a given attempt index (0-based)
+/// honoring initial backoff, max backoff, and retry factor.
+pub fn calculate_retry_backoff(
+    initial: Duration,
+    max: Duration,
+    factor: f64,
+    attempt: usize,
+) -> Duration {
+    let factor = if factor <= 0.0 || factor.is_nan() {
+        DEFAULT_RETRY_FACTOR
+    } else {
+        factor
+    };
+    let multiplier = factor.powi(attempt as i32);
+    if multiplier <= 0.0 || multiplier.is_nan() {
+        return initial.min(max);
+    }
+    let delay_secs = initial.as_secs_f64() * multiplier;
+    if delay_secs.is_nan() || delay_secs >= max.as_secs_f64() {
+        max
+    } else {
+        Duration::from_secs_f64(delay_secs).min(max)
+    }
+}
+
+impl RegistryClientConfig {
+    /// Calculate backoff duration for a given retry attempt index (0-based).
+    pub fn calculate_backoff(&self, attempt: usize) -> Duration {
+        calculate_retry_backoff(
+            self.initial_retry_backoff,
+            self.max_retry_backoff,
+            self.retry_factor,
+            attempt,
+        )
     }
 }
 
@@ -607,6 +651,7 @@ pub fn parse_retry_after_str(s: &str) -> Option<u64> {
 pub struct RegistryClient {
     client: Client,
     config: RegistryClientConfig,
+    user_agent: HeaderValue,
     semaphore: std::sync::Arc<tokio::sync::Semaphore>,
     circuit_breaker: CircuitBreaker,
     http_requests: std::sync::Arc<std::sync::atomic::AtomicU64>,
@@ -627,10 +672,8 @@ impl RegistryClient {
             .filter(|_| config.user_agent == default_user_agent())
             .map(|(_, agent)| agent.as_str())
             .unwrap_or(&config.user_agent);
-        headers.insert(
-            USER_AGENT,
-            HeaderValue::from_str(agent).map_err(|e| RegistryError::Other(e.to_string()))?,
-        );
+        let user_agent =
+            HeaderValue::from_str(agent).map_err(|e| RegistryError::Other(e.to_string()))?;
         if let Some((command, _)) = cli_context {
             headers.insert(
                 "npm-command",
@@ -639,7 +682,13 @@ impl RegistryClient {
         }
         headers.insert(CONNECTION, HeaderValue::from_static("keep-alive"));
 
-        let max_idle = if config.pool_max_idle_per_host == 0 {
+        let max_idle = if let Some(sockets) = config.maxsockets {
+            if sockets == 0 {
+                DEFAULT_POOL_MAX_IDLE_PER_HOST
+            } else {
+                sockets
+            }
+        } else if config.pool_max_idle_per_host == 0 {
             DEFAULT_POOL_MAX_IDLE_PER_HOST
         } else {
             config.pool_max_idle_per_host
@@ -675,7 +724,7 @@ impl RegistryClient {
                         .filter(|v| !v.is_empty())
                 };
                 let https = env("https_proxy");
-                let http = https.clone().or_else(|| env("http_proxy")).or_else(|| env("proxy"));
+                let http = env("http_proxy").or_else(|| env("proxy"));
                 (https, http)
             } else {
                 (None, None)
@@ -708,14 +757,30 @@ impl RegistryClient {
                 .collect();
             let https = env_https_proxy.and_then(|u| reqwest::Url::parse(&u).ok());
             let http = env_http_proxy.and_then(|u| reqwest::Url::parse(&u).ok());
-            builder = builder.proxy(reqwest::Proxy::custom(move |url| {
-                let proxy = if url.scheme() == "https" { https.as_ref() } else { http.as_ref() }?;
+            let https_p = https.clone();
+            let http_p = http.clone();
+            let mut custom_proxy = reqwest::Proxy::custom(move |url| {
+                let proxy = if url.scheme() == "https" { https_p.as_ref() } else { http_p.as_ref() }?;
                 let host: Vec<&str> = url.host_str()?.split('.').rev().collect();
                 let bypass = no_proxy
                     .iter()
                     .any(|entry| entry.iter().enumerate().all(|(i, s)| host.get(i) == Some(&s.as_str())));
                 (!bypass).then(|| proxy.clone())
-            }));
+            });
+            if let Some(https_u) = &https {
+                if let (Some(u), Some(p)) = (Some(https_u.username()), https_u.password()) {
+                    if !u.is_empty() {
+                        custom_proxy = custom_proxy.basic_auth(u, p);
+                    }
+                }
+            } else if let Some(http_u) = &http {
+                if let (Some(u), Some(p)) = (Some(http_u.username()), http_u.password()) {
+                    if !u.is_empty() {
+                        custom_proxy = custom_proxy.basic_auth(u, p);
+                    }
+                }
+            }
+            builder = builder.proxy(custom_proxy);
         }
 
         if let Some(https_proxy) = &config.https_proxy {
@@ -834,7 +899,13 @@ impl RegistryClient {
 
         let client = builder.build()?;
 
-        let max_concurrency = if config.max_concurrent_requests == 0 {
+        let max_concurrency = if let Some(sockets) = config.maxsockets {
+            if sockets == 0 {
+                DEFAULT_MAX_CONCURRENT_REQUESTS
+            } else {
+                sockets
+            }
+        } else if config.max_concurrent_requests == 0 {
             DEFAULT_MAX_CONCURRENT_REQUESTS
         } else {
             config.max_concurrent_requests
@@ -852,11 +923,17 @@ impl RegistryClient {
         Ok(Self {
             client,
             config,
+            user_agent,
             semaphore,
             circuit_breaker,
             http_requests: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             http_304s: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
         })
+    }
+
+    /// Calculate backoff duration for a given retry attempt index (0-based).
+    pub fn calculate_backoff(&self, attempt: usize) -> Duration {
+        self.config.calculate_backoff(attempt)
     }
 
     /// Access the client configuration.
@@ -1203,7 +1280,10 @@ impl RegistryClient {
             seen_redirect_urls.insert(current_url.clone());
 
             let response_result: Result<Response, RegistryError> = loop {
-                let mut req = self.client.request(method.clone(), current_url.clone());
+                let mut req = self
+                    .client
+                    .request(method.clone(), current_url.clone())
+                    .header(USER_AGENT, self.user_agent.clone());
 
                 if let Some(accept) = accept_header {
                     req = req.header(ACCEPT, accept);
@@ -1313,9 +1393,7 @@ impl RegistryClient {
                             let delay = if let Some(secs) = retry_after_secs {
                                 Duration::from_secs(secs)
                             } else {
-                                (self.config.initial_retry_backoff
-                                    * 2u32.saturating_pow(attempt as u32))
-                                .min(self.config.max_retry_backoff)
+                                self.calculate_backoff(attempt)
                             };
                             debug!(
                                 "HTTP 429 Rate limited for {}, retrying in {:?} (attempt {}/{})",
@@ -1348,9 +1426,7 @@ impl RegistryClient {
                             let delay = if let Some(secs) = retry_after_secs {
                                 Duration::from_secs(secs)
                             } else {
-                                (self.config.initial_retry_backoff
-                                    * 2u32.saturating_pow(attempt as u32))
-                                .min(self.config.max_retry_backoff)
+                                self.calculate_backoff(attempt)
                             };
                             debug!(
                                 "HTTP {} on {}, retrying in {:?} (attempt {}/{})",
@@ -1379,9 +1455,7 @@ impl RegistryClient {
                 Err(err) => {
                     // Check if network error is transient and retryable
                     if err.is_transient() && attempt < self.config.max_retries {
-                        let delay = (self.config.initial_retry_backoff
-                            * 2u32.saturating_pow(attempt as u32))
-                        .min(self.config.max_retry_backoff);
+                        let delay = self.calculate_backoff(attempt);
                         debug!(
                             "Request error {:?} for {}, retrying in {:?} (attempt {}/{})",
                             err,
@@ -1439,7 +1513,10 @@ impl RegistryClient {
             seen_redirect_urls.insert(current_url.clone());
 
             let response_result: Result<Response, RegistryError> = loop {
-                let mut req = self.client.request(method.clone(), current_url.clone());
+                let mut req = self
+                    .client
+                    .request(method.clone(), current_url.clone())
+                    .header(USER_AGENT, self.user_agent.clone());
 
                 if let Some(ct) = content_type {
                     req = req.header(CONTENT_TYPE, ct);
@@ -1554,9 +1631,7 @@ impl RegistryClient {
                             let delay = if let Some(secs) = retry_after_secs {
                                 Duration::from_secs(secs)
                             } else {
-                                (self.config.initial_retry_backoff
-                                    * 2u32.saturating_pow(attempt as u32))
-                                .min(self.config.max_retry_backoff)
+                                self.calculate_backoff(attempt)
                             };
                             debug!(
                                 "HTTP 429 Rate limited for {}, retrying in {:?} (attempt {}/{})",
@@ -1589,9 +1664,7 @@ impl RegistryClient {
                             let delay = if let Some(secs) = retry_after_secs {
                                 Duration::from_secs(secs)
                             } else {
-                                (self.config.initial_retry_backoff
-                                    * 2u32.saturating_pow(attempt as u32))
-                                .min(self.config.max_retry_backoff)
+                                self.calculate_backoff(attempt)
                             };
                             debug!(
                                 "HTTP {} on {}, retrying in {:?} (attempt {}/{})",
@@ -1619,9 +1692,7 @@ impl RegistryClient {
                 }
                 Err(err) => {
                     if err.is_transient() && attempt < self.config.max_retries {
-                        let delay = (self.config.initial_retry_backoff
-                            * 2u32.saturating_pow(attempt as u32))
-                        .min(self.config.max_retry_backoff);
+                        let delay = self.calculate_backoff(attempt);
                         debug!(
                             "Request error {:?} for {}, retrying in {:?} (attempt {}/{})",
                             err,
@@ -1908,9 +1979,7 @@ impl RegistryClient {
 
             if let Some(err) = stream_err {
                 if err.is_transient() && stream_attempt < self.config.max_retries {
-                    let delay = (self.config.initial_retry_backoff
-                        * 2u32.saturating_pow(stream_attempt as u32))
-                    .min(self.config.max_retry_backoff);
+                    let delay = self.calculate_backoff(stream_attempt);
                     debug!(
                     "Stream metadata error {:?} for {}, retrying stream in {:?} (attempt {}/{})",
                     err, url, delay, stream_attempt + 1, self.config.max_retries
@@ -1933,9 +2002,7 @@ impl RegistryClient {
                         actual: bytes.len() as u64,
                     };
                     if mismatch_err.is_transient() && stream_attempt < self.config.max_retries {
-                        let delay = (self.config.initial_retry_backoff
-                            * 2u32.saturating_pow(stream_attempt as u32))
-                        .min(self.config.max_retry_backoff);
+                        let delay = self.calculate_backoff(stream_attempt);
                         tokio::time::sleep(delay).await;
                         stream_attempt += 1;
                         continue;
@@ -2354,9 +2421,7 @@ impl RegistryClient {
 
             if let Some(err) = stream_err {
                 if err.is_transient() && stream_attempt < self.config.max_retries {
-                    let delay = (self.config.initial_retry_backoff
-                        * 2u32.saturating_pow(stream_attempt as u32))
-                    .min(self.config.max_retry_backoff);
+                    let delay = self.calculate_backoff(stream_attempt);
                     debug!(
                         "Stream download error {:?} for {}, retrying stream in {:?} (attempt {}/{})",
                         err, url, delay, stream_attempt + 1, self.config.max_retries
@@ -2566,9 +2631,7 @@ impl RegistryClient {
                 let _ = tokio::fs::remove_file(&temp_path).await;
 
                 if err.is_transient() && stream_attempt < self.config.max_retries {
-                    let delay = (self.config.initial_retry_backoff
-                        * 2u32.saturating_pow(stream_attempt as u32))
-                    .min(self.config.max_retry_backoff);
+                    let delay = self.calculate_backoff(stream_attempt);
                     debug!(
                         "Stream download to file error {:?} for {}, retrying stream in {:?} (attempt {}/{})",
                         err, url, delay, stream_attempt + 1, self.config.max_retries
@@ -3926,6 +3989,8 @@ mod tests {
             Duration::from_secs(DEFAULT_CONNECT_TIMEOUT_SECS)
         );
         assert_eq!(config.max_retries, DEFAULT_MAX_RETRIES);
+        assert!((config.retry_factor - DEFAULT_RETRY_FACTOR).abs() < f64::EPSILON);
+        assert_eq!(config.maxsockets, None);
         assert!(config.retry_on_status.contains(&429));
         assert!(config.retry_on_status.contains(&503));
     }
@@ -4032,5 +4097,111 @@ mod tests {
         };
         let result = RegistryClient::with_config(config_missing_ca);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_calculate_retry_backoff_progression() {
+        let initial = Duration::from_millis(100);
+        let max = Duration::from_secs(5);
+
+        // Default factor (2.0)
+        assert_eq!(
+            calculate_retry_backoff(initial, max, 2.0, 0),
+            Duration::from_millis(100)
+        );
+        assert_eq!(
+            calculate_retry_backoff(initial, max, 2.0, 1),
+            Duration::from_millis(200)
+        );
+        assert_eq!(
+            calculate_retry_backoff(initial, max, 2.0, 2),
+            Duration::from_millis(400)
+        );
+        assert_eq!(
+            calculate_retry_backoff(initial, max, 2.0, 3),
+            Duration::from_millis(800)
+        );
+        assert_eq!(
+            calculate_retry_backoff(initial, max, 2.0, 10),
+            Duration::from_secs(5)
+        );
+
+        // Custom npm retry factor (10.0) with custom mintimeout (10ms) and maxtimeout (1000ms)
+        let custom_min = Duration::from_millis(10);
+        let custom_max = Duration::from_millis(1000);
+        assert_eq!(
+            calculate_retry_backoff(custom_min, custom_max, 10.0, 0),
+            Duration::from_millis(10)
+        );
+        assert_eq!(
+            calculate_retry_backoff(custom_min, custom_max, 10.0, 1),
+            Duration::from_millis(100)
+        );
+        assert_eq!(
+            calculate_retry_backoff(custom_min, custom_max, 10.0, 2),
+            Duration::from_millis(1000)
+        );
+        assert_eq!(
+            calculate_retry_backoff(custom_min, custom_max, 10.0, 3),
+            Duration::from_millis(1000) // capped at custom_max
+        );
+
+        // Non-positive or NaN factor falls back to DEFAULT_RETRY_FACTOR
+        assert_eq!(
+            calculate_retry_backoff(initial, max, 0.0, 1),
+            Duration::from_millis(200)
+        );
+        assert_eq!(
+            calculate_retry_backoff(initial, max, f64::NAN, 1),
+            Duration::from_millis(200)
+        );
+    }
+
+    #[test]
+    fn test_registry_client_with_config_honors_maxsockets() {
+        // When maxsockets is set, semaphore available permits must equal maxsockets
+        let config = RegistryClientConfig {
+            maxsockets: Some(15),
+            ..Default::default()
+        };
+        let client = RegistryClient::with_config(config).unwrap();
+        assert_eq!(client.semaphore().available_permits(), 15);
+
+        // When maxsockets is set to a custom small value
+        let config_small = RegistryClientConfig {
+            maxsockets: Some(4),
+            ..Default::default()
+        };
+        let client_small = RegistryClient::with_config(config_small).unwrap();
+        assert_eq!(client_small.semaphore().available_permits(), 4);
+
+        // When maxsockets is None, fallback to max_concurrent_requests
+        let config_fallback = RegistryClientConfig {
+            maxsockets: None,
+            max_concurrent_requests: 32,
+            ..Default::default()
+        };
+        let client_fallback = RegistryClient::with_config(config_fallback).unwrap();
+        assert_eq!(client_fallback.semaphore().available_permits(), 32);
+    }
+
+    #[test]
+    fn test_registry_client_custom_retry_configuration() {
+        let config = RegistryClientConfig {
+            max_retries: 5,
+            retry_factor: 3.0,
+            initial_retry_backoff: Duration::from_millis(50),
+            max_retry_backoff: Duration::from_millis(2000),
+            ..Default::default()
+        };
+        let client = RegistryClient::with_config(config).unwrap();
+
+        assert_eq!(client.config().max_retries, 5);
+        assert!((client.config().retry_factor - 3.0).abs() < f64::EPSILON);
+        assert_eq!(client.calculate_backoff(0), Duration::from_millis(50));
+        assert_eq!(client.calculate_backoff(1), Duration::from_millis(150));
+        assert_eq!(client.calculate_backoff(2), Duration::from_millis(450));
+        assert_eq!(client.calculate_backoff(3), Duration::from_millis(1350));
+        assert_eq!(client.calculate_backoff(4), Duration::from_millis(2000)); // capped
     }
 }

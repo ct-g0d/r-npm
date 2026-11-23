@@ -296,6 +296,114 @@ mod worker_tests {
     }
 }
 
+#[cfg(test)]
+mod spawn_for_hint_tests {
+    use super::*;
+
+    static ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    struct EnvGuard {
+        key: &'static str,
+        prev: Option<String>,
+    }
+
+    impl EnvGuard {
+        fn set(key: &'static str, val: &str) -> Self {
+            let prev = std::env::var(key).ok();
+            std::env::set_var(key, val);
+            Self { key, prev }
+        }
+
+        fn remove(key: &'static str) -> Self {
+            let prev = std::env::var(key).ok();
+            std::env::remove_var(key);
+            Self { key, prev }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            if let Some(ref prev) = self.prev {
+                std::env::set_var(self.key, prev);
+            } else {
+                std::env::remove_var(self.key);
+            }
+        }
+    }
+
+    #[test]
+    fn spawn_for_hint_small_selects_rust() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let _guard = EnvGuard::remove("RNPM_WRITER");
+        let writer = AsyncFileWriter::spawn_for_hint(3).expect("spawn_for_hint(3) failed");
+        assert!(matches!(writer, AsyncFileWriter::Rust(_)));
+        writer.finish().expect("finish failed");
+    }
+
+    #[test]
+    fn spawn_for_hint_large_selects_node_when_available() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let _guard = EnvGuard::remove("RNPM_WRITER");
+        let node_available = Command::new("node")
+            .arg("--version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if node_available {
+            let writer = AsyncFileWriter::spawn_for_hint(50).expect("spawn_for_hint(50) failed");
+            assert!(matches!(writer, AsyncFileWriter::Node(_)));
+            writer.finish().expect("finish failed");
+        }
+    }
+
+    #[test]
+    fn spawn_for_hint_node_env_overrides_small_hint() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let _guard = EnvGuard::set("RNPM_WRITER", "node");
+        let node_available = Command::new("node")
+            .arg("--version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if node_available {
+            let writer = AsyncFileWriter::spawn_for_hint(3)
+                .expect("spawn_for_hint(3) with RNPM_WRITER=node failed");
+            assert!(matches!(writer, AsyncFileWriter::Node(_)));
+            writer.finish().expect("finish failed");
+        }
+    }
+
+    #[test]
+    fn spawn_for_hint_rust_env_overrides_large_hint() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let _guard = EnvGuard::set("RNPM_WRITER", "rust");
+        let writer = AsyncFileWriter::spawn_for_hint(50)
+            .expect("spawn_for_hint(50) with RNPM_WRITER=rust failed");
+        assert!(matches!(writer, AsyncFileWriter::Rust(_)));
+        writer.finish().expect("finish failed");
+    }
+
+    #[test]
+    fn spawn_for_hint_boundary_values() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let _guard = EnvGuard::remove("RNPM_WRITER");
+        let w8 = AsyncFileWriter::spawn_for_hint(8).expect("spawn_for_hint(8) failed");
+        assert!(matches!(w8, AsyncFileWriter::Rust(_)));
+        w8.finish().expect("finish failed");
+
+        let node_available = Command::new("node")
+            .arg("--version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if node_available {
+            let w9 = AsyncFileWriter::spawn_for_hint(9).expect("spawn_for_hint(9) failed");
+            assert!(matches!(w9, AsyncFileWriter::Node(_)));
+            w9.finish().expect("finish failed");
+        }
+    }
+}
+
 pub enum NodeWriterMsg {
     File {
         path: String,
@@ -695,11 +803,20 @@ pub enum AsyncFileWriter {
 }
 
 impl AsyncFileWriter {
-    /// Spawns the async file writer. Respects `RNPM_WRITER=rust` or `RNPM_WRITER=node` overrides.
-    /// Defaults to `NodeWriter` if available, falling back to `RustWriterPool`.
-    pub fn spawn() -> Result<Self, std::io::Error> {
+    /// Spawns the async file writer taking an estimated package count into account.
+    /// Respects `RNPM_WRITER=rust` or `RNPM_WRITER=node` overrides strictly.
+    /// If `estimated_packages <= 8`, spawns `RustWriterPool` to avoid the startup cost of `node.exe`.
+    /// Otherwise defaults to `NodeWriter` if available, falling back to `RustWriterPool`.
+    pub fn spawn_for_hint(estimated_packages: usize) -> Result<Self, std::io::Error> {
         let pref = std::env::var("RNPM_WRITER").unwrap_or_default();
         if pref.eq_ignore_ascii_case("rust") {
+            return Ok(Self::Rust(RustWriterPool::spawn(16, 4096)?));
+        }
+        if pref.eq_ignore_ascii_case("node") {
+            return NodeWriter::spawn().map(Self::Node);
+        }
+
+        if estimated_packages <= 8 {
             return Ok(Self::Rust(RustWriterPool::spawn(16, 4096)?));
         }
 
@@ -707,14 +824,19 @@ impl AsyncFileWriter {
         match NodeWriter::spawn() {
             Ok(nw) => Ok(Self::Node(nw)),
             Err(e) => {
-                if e.kind() == std::io::ErrorKind::InvalidInput || pref.eq_ignore_ascii_case("node")
-                {
+                if e.kind() == std::io::ErrorKind::InvalidInput {
                     return Err(e);
                 }
                 // Fall back to dedicated Rust thread pool
                 Ok(Self::Rust(RustWriterPool::spawn(16, 4096)?))
             }
         }
+    }
+
+    /// Spawns the async file writer. Respects `RNPM_WRITER=rust` or `RNPM_WRITER=node` overrides.
+    /// Defaults to `NodeWriter` if available, falling back to `RustWriterPool`.
+    pub fn spawn() -> Result<Self, std::io::Error> {
+        Self::spawn_for_hint(usize::MAX)
     }
 
     /// Obtains a cloned sender for distributing write tasks.

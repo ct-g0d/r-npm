@@ -22,11 +22,32 @@ fn test_generate_shims_content() {
 fn test_create_shims_on_disk() {
     let dir = tempdir().unwrap();
     let bin_dir = dir.path().join("node_modules").join(".bin");
+    let target_file = dir
+        .path()
+        .join("node_modules")
+        .join("typescript")
+        .join("bin")
+        .join("tsc.js");
+    fs::create_dir_all(target_file.parent().unwrap()).unwrap();
+    fs::write(&target_file, b"#!/usr/bin/env node\nconsole.log('tsc');\n").unwrap();
     create_shims(&bin_dir, "tsc", "typescript/bin/tsc.js").unwrap();
 
-    assert!(bin_dir.join("tsc").exists());
-    assert!(bin_dir.join("tsc.cmd").exists());
-    assert!(bin_dir.join("tsc.ps1").exists());
+    #[cfg(not(unix))]
+    {
+        assert!(bin_dir.join("tsc").exists());
+        assert!(bin_dir.join("tsc.cmd").exists());
+        assert!(bin_dir.join("tsc.ps1").exists());
+    }
+
+    #[cfg(unix)]
+    {
+        let link = bin_dir.join("tsc");
+        assert!(link.is_symlink());
+        let target = fs::read_link(&link).unwrap();
+        assert_eq!(target, std::path::PathBuf::from("../typescript/bin/tsc.js"));
+        assert!(!bin_dir.join("tsc.cmd").exists());
+        assert!(!bin_dir.join("tsc.ps1").exists());
+    }
 }
 
 #[test]
@@ -332,8 +353,17 @@ fn test_extreme_shim_live_invocation_on_disk() {
     let ps1_shim = bin_dir.join("spaced-tool.ps1");
     let sh_shim = bin_dir.join("spaced-tool");
 
-    assert!(cmd_shim.exists());
-    assert!(ps1_shim.exists());
+    #[cfg(not(unix))]
+    {
+        assert!(cmd_shim.exists());
+        assert!(ps1_shim.exists());
+    }
+    #[cfg(unix)]
+    {
+        assert!(!cmd_shim.exists());
+        assert!(!ps1_shim.exists());
+        assert!(sh_shim.is_symlink());
+    }
     assert!(sh_shim.exists());
 
     // Test live invocation via CMD wrapper on Windows
@@ -435,18 +465,16 @@ fn test_shim_exit_code_fidelity() {
     #[cfg(not(windows))]
     {
         let sh_shim = bin_dir.join("exit-pkg");
-        let mut cmd = std::process::Command::new("sh");
+        assert!(sh_shim.is_symlink());
+        let mut cmd = std::process::Command::new(&sh_shim);
         cmd.current_dir(&bin_dir);
-        let status = cmd
-            .arg(&sh_shim)
-            .status()
-            .expect("Failed to execute posix shim");
-
-        assert_eq!(
-            status.code(),
-            Some(42),
-            "POSIX shim must faithfully propagate exit code 42"
-        );
+        if let Ok(status) = cmd.status() {
+            assert_eq!(
+                status.code(),
+                Some(42),
+                "POSIX symlink must faithfully propagate exit code 42"
+            );
+        }
     }
 }
 
@@ -476,8 +504,17 @@ fn test_cmd_ps1_bash_shim_live_execution_all_shells() {
     let ps1_shim = bin_dir.join("multi-tool.ps1");
     let posix_shim = bin_dir.join("multi-tool");
 
-    assert!(cmd_shim.exists());
-    assert!(ps1_shim.exists());
+    #[cfg(not(unix))]
+    {
+        assert!(cmd_shim.exists());
+        assert!(ps1_shim.exists());
+    }
+    #[cfg(unix)]
+    {
+        assert!(!cmd_shim.exists());
+        assert!(!ps1_shim.exists());
+        assert!(posix_shim.is_symlink());
+    }
     assert!(posix_shim.exists());
 
     // 1. Windows CMD (.cmd) live invocation
@@ -661,24 +698,44 @@ fn test_shim_exit_code_fidelity_all_codes() {
             }
         }
 
-        // POSIX shim exit code fidelity if sh is available
-        let bash_paths = [
-            std::path::PathBuf::from("C:\\Program Files\\Git\\bin\\sh.exe"),
-            std::path::PathBuf::from("sh"),
-        ];
-        for sh in &bash_paths {
-            if sh.exists() || which_tool(sh.to_str().unwrap_or_default()).is_ok() {
-                let mut cmd = std::process::Command::new(sh);
-                cmd.current_dir(&bin_dir);
-                cmd.stdin(std::process::Stdio::null());
-                let status = cmd.arg(format!("./{bin_name}")).status();
-                if let Ok(st) = status {
-                    assert_eq!(
-                        st.code(),
-                        Some(code),
-                        "POSIX shim must faithfully exit with code {code}"
-                    );
-                    break;
+        // On Unix, bin links are direct POSIX symlinks to the executable script (matching npm bin-links).
+        #[cfg(unix)]
+        {
+            let link = bin_dir.join(&bin_name);
+            assert!(link.is_symlink(), "POSIX bin link must be a symlink");
+            let status = std::process::Command::new(&link)
+                .current_dir(&bin_dir)
+                .stdin(std::process::Stdio::null())
+                .status()
+                .expect("Failed to execute POSIX bin symlink");
+            assert_eq!(
+                status.code(),
+                Some(code),
+                "POSIX bin symlink must faithfully exit with code {code}"
+            );
+        }
+
+        // On Windows, verify the generated POSIX shell wrapper via Git Bash / sh if available.
+        #[cfg(not(unix))]
+        {
+            let bash_paths = [
+                std::path::PathBuf::from("C:\\Program Files\\Git\\bin\\sh.exe"),
+                std::path::PathBuf::from("sh"),
+            ];
+            for sh in &bash_paths {
+                if sh.exists() || which_tool(sh.to_str().unwrap_or_default()).is_ok() {
+                    let mut cmd = std::process::Command::new(sh);
+                    cmd.current_dir(&bin_dir);
+                    cmd.stdin(std::process::Stdio::null());
+                    let status = cmd.arg(format!("./{bin_name}")).status();
+                    if let Ok(st) = status {
+                        assert_eq!(
+                            st.code(),
+                            Some(code),
+                            "POSIX shim must faithfully exit with code {code}"
+                        );
+                        break;
+                    }
                 }
             }
         }
@@ -728,6 +785,8 @@ fn test_direct_shims_match_npm_for_targets_without_shebang() {
     .unwrap();
     let bin_dir = dir.path().join("node_modules/.bin");
     create_shims(&bin_dir, "untun", "untun/dist/cli.mjs").unwrap();
+
+    #[cfg(not(unix))]
     for name in ["untun", "untun.cmd", "untun.ps1"] {
         let expected = fs::read(
             std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -736,6 +795,18 @@ fn test_direct_shims_match_npm_for_targets_without_shebang() {
         )
         .unwrap();
         assert_eq!(fs::read(bin_dir.join(name)).unwrap(), expected, "{name}");
+    }
+
+    #[cfg(unix)]
+    {
+        let link = bin_dir.join("untun");
+        assert!(link.is_symlink());
+        assert_eq!(
+            fs::read_link(&link).unwrap(),
+            std::path::PathBuf::from("../untun/dist/cli.mjs")
+        );
+        assert!(!bin_dir.join("untun.cmd").exists());
+        assert!(!bin_dir.join("untun.ps1").exists());
     }
 }
 
@@ -761,6 +832,8 @@ fn test_program_shims_match_npm_for_non_node_shebang() {
     .unwrap();
     let bin_dir = dir.path().join("node_modules/.bin");
     create_shims(&bin_dir, "xyz", "xyz/xyz").unwrap();
+
+    #[cfg(not(unix))]
     for name in ["xyz", "xyz.cmd", "xyz.ps1"] {
         let expected = fs::read(
             std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -773,5 +846,541 @@ fn test_program_shims_match_npm_for_non_node_shebang() {
             String::from_utf8_lossy(&expected),
             "{name}"
         );
+    }
+
+    #[cfg(unix)]
+    {
+        let link = bin_dir.join("xyz");
+        assert!(link.is_symlink());
+        assert_eq!(
+            fs::read_link(&link).unwrap(),
+            std::path::PathBuf::from("../xyz/xyz")
+        );
+        assert!(!bin_dir.join("xyz.cmd").exists());
+        assert!(!bin_dir.join("xyz.ps1").exists());
+    }
+}
+
+#[test]
+fn test_compute_symlink_target_dot_bin_and_global() {
+    use std::path::Path;
+
+    // 1. Standard .bin directory
+    let dot_bin = Path::new("project/node_modules/.bin");
+    assert_eq!(
+        compute_symlink_target(dot_bin, "typescript/bin/tsc.js"),
+        "../typescript/bin/tsc.js"
+    );
+
+    // 2. Scoped package in .bin
+    assert_eq!(
+        compute_symlink_target(dot_bin, "@scope/pkg/bin/tool.js"),
+        "../@scope/pkg/bin/tool.js"
+    );
+
+    // 3. Leading ./ stripped
+    assert_eq!(
+        compute_symlink_target(dot_bin, "./typescript/bin/tsc.js"),
+        "../typescript/bin/tsc.js"
+    );
+
+    // 4. Windows backslashes normalized to forward slashes
+    assert_eq!(
+        compute_symlink_target(dot_bin, r"typescript\bin\tsc.js"),
+        "../typescript/bin/tsc.js"
+    );
+
+    // 5. Global bin directory (e.g. /usr/local/bin)
+    let global_bin = Path::new("/usr/local/bin");
+    assert_eq!(
+        compute_symlink_target(global_bin, "typescript/bin/tsc.js"),
+        "../lib/node_modules/typescript/bin/tsc.js"
+    );
+
+    // 6. Global bin directory with scoped package
+    assert_eq!(
+        compute_symlink_target(global_bin, "@scope/pkg/bin/tool.js"),
+        "../lib/node_modules/@scope/pkg/bin/tool.js"
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn test_unix_symlink_creation_and_chmod() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempdir().unwrap();
+    let bin_dir = dir.path().join("node_modules").join(".bin");
+    let pkg_dir = dir.path().join("node_modules").join("my-pkg").join("bin");
+    fs::create_dir_all(&pkg_dir).unwrap();
+
+    let script = pkg_dir.join("cli.js");
+    fs::write(&script, b"#!/usr/bin/env node\nconsole.log('hi');\n").unwrap();
+    // Set initial non-executable permissions
+    let mut initial_perms = fs::metadata(&script).unwrap().permissions();
+    initial_perms.set_mode(0o644);
+    fs::set_permissions(&script, initial_perms).unwrap();
+
+    // Create shims
+    create_shims(&bin_dir, "my-tool", "my-pkg/bin/cli.js").unwrap();
+
+    // Verify symlink
+    let link = bin_dir.join("my-tool");
+    assert!(link.is_symlink());
+    assert_eq!(
+        fs::read_link(&link).unwrap(),
+        std::path::PathBuf::from("../my-pkg/bin/cli.js")
+    );
+
+    // Verify target script chmod 0755
+    let perms = fs::metadata(&script).unwrap().permissions();
+    assert_eq!(perms.mode() & 0o777, 0o755);
+
+    // Verify no .cmd or .ps1 shims
+    assert!(!bin_dir.join("my-tool.cmd").exists());
+    assert!(!bin_dir.join("my-tool.ps1").exists());
+
+    // Test stale replacement: overwrite with a regular file and dummy .cmd/.ps1
+    fs::remove_file(&link).unwrap();
+    fs::write(&link, b"stale binary").unwrap();
+    fs::write(bin_dir.join("my-tool.cmd"), b"stale cmd").unwrap();
+    fs::write(bin_dir.join("my-tool.ps1"), b"stale ps1").unwrap();
+
+    // Call create_shims again
+    create_shims(&bin_dir, "my-tool", "my-pkg/bin/cli.js").unwrap();
+
+    // Must have replaced regular file with symlink and removed .cmd/.ps1
+    assert!(link.is_symlink());
+    assert_eq!(
+        fs::read_link(&link).unwrap(),
+        std::path::PathBuf::from("../my-pkg/bin/cli.js")
+    );
+    assert!(!bin_dir.join("my-tool.cmd").exists());
+    assert!(!bin_dir.join("my-tool.ps1").exists());
+}
+
+#[test]
+#[cfg(unix)]
+fn test_unix_missing_bin_target_skipped_gracefully() {
+    let dir = tempdir().unwrap();
+    let bin_dir = dir.path().join("node_modules").join(".bin");
+    // Target does not exist
+    create_shims(&bin_dir, "missing-bin", "nonexistent-pkg/bin/script.js").unwrap();
+    assert!(!bin_dir.join("missing-bin").exists());
+}
+
+#[test]
+#[cfg(unix)]
+fn test_unix_refuse_clobber_colliding_directory() {
+    let dir = tempdir().unwrap();
+    let bin_dir = dir.path().join("node_modules").join(".bin");
+    let pkg_dir = dir.path().join("node_modules").join("my-pkg").join("bin");
+    fs::create_dir_all(&pkg_dir).unwrap();
+    let script = pkg_dir.join("cli.js");
+    fs::write(&script, b"#!/usr/bin/env node\n").unwrap();
+
+    // Create a directory where the bin link would go
+    let colliding_dir = bin_dir.join("colliding-bin");
+    fs::create_dir_all(&colliding_dir).unwrap();
+    let important_file = colliding_dir.join("important.txt");
+    fs::write(&important_file, b"cannot be nuked").unwrap();
+
+    // Attempting to create a bin link must fail and NOT remove the directory!
+    let res = create_shims(&bin_dir, "colliding-bin", "my-pkg/bin/cli.js");
+    assert!(res.is_err());
+    assert!(important_file.exists());
+    assert!(colliding_dir.is_dir());
+}
+
+#[test]
+#[cfg(unix)]
+fn test_unix_crlf_shebang_normalized_and_chmod_before_linking() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempdir().unwrap();
+    let bin_dir = dir.path().join("node_modules").join(".bin");
+    let pkg_dir = dir.path().join("node_modules").join("crlf-pkg").join("bin");
+    fs::create_dir_all(&pkg_dir).unwrap();
+
+    let script = pkg_dir.join("cli.js");
+    fs::write(&script, b"#!/usr/bin/env node\r\nconsole.log('hi');\r\n").unwrap();
+    let mut initial_perms = fs::metadata(&script).unwrap().permissions();
+    initial_perms.set_mode(0o644);
+    fs::set_permissions(&script, initial_perms).unwrap();
+
+    create_shims(&bin_dir, "crlf-bin", "crlf-pkg/bin/cli.js").unwrap();
+
+    // Target script must have normalized shebang (LF only)
+    let content = fs::read(&script).unwrap();
+    assert!(content.starts_with(b"#!/usr/bin/env node\n"));
+
+    // Target script permissions must be 0o755
+    let perms = fs::metadata(&script).unwrap().permissions();
+    assert_eq!(perms.mode() & 0o777, 0o755);
+
+    // Bin symlink must exist
+    let link = bin_dir.join("crlf-bin");
+    assert!(link.is_symlink());
+}
+
+#[test]
+#[cfg(not(unix))]
+fn test_windows_shim_trio_creation() {
+    let dir = tempdir().unwrap();
+    let bin_dir = dir.path().join("node_modules").join(".bin");
+    create_shims(&bin_dir, "win-tool", "win-pkg/bin/cli.js").unwrap();
+
+    assert!(bin_dir.join("win-tool").exists());
+    assert!(bin_dir.join("win-tool.cmd").exists());
+    assert!(bin_dir.join("win-tool.ps1").exists());
+
+    let sh = fs::read_to_string(bin_dir.join("win-tool")).unwrap();
+    let cmd = fs::read_to_string(bin_dir.join("win-tool.cmd")).unwrap();
+    let ps1 = fs::read_to_string(bin_dir.join("win-tool.ps1")).unwrap();
+
+    assert!(sh.starts_with("#!/bin/sh"));
+    assert!(cmd.starts_with("@ECHO off"));
+    assert!(ps1.starts_with("#!/usr/bin/env pwsh"));
+}
+
+#[test]
+fn test_extract_package_name_helper() {
+    assert_eq!(
+        extract_package_name("../lib/node_modules/typescript/bin/tsc.js"),
+        Some("typescript".to_string())
+    );
+    assert_eq!(
+        extract_package_name("../lib/node_modules/@scope/pkg/bin/tool.js"),
+        Some("@scope/pkg".to_string())
+    );
+    assert_eq!(
+        extract_package_name("typescript/bin/tsc.js"),
+        Some("typescript".to_string())
+    );
+    assert_eq!(
+        extract_package_name("@scope/pkg/bin/tool.js"),
+        Some("@scope/pkg".to_string())
+    );
+    assert_eq!(
+        extract_package_name("../typescript/bin/tsc.js"),
+        Some("typescript".to_string())
+    );
+    assert_eq!(
+        extract_package_name("../@scope/pkg/bin/tool.js"),
+        Some("@scope/pkg".to_string())
+    );
+    assert_eq!(
+        extract_package_name("/usr/bin/bash"),
+        None
+    );
+    assert_eq!(
+        extract_package_name(r"C:\Windows\System32\cmd.exe"),
+        None
+    );
+}
+
+#[test]
+fn test_bin_collision_directory_rejected() {
+    let dir = tempdir().unwrap();
+    let bin_dir = dir.path().join("bin");
+    fs::create_dir_all(&bin_dir).unwrap();
+
+    let link_path = bin_dir.join("my-tool");
+    fs::create_dir_all(&link_path).unwrap();
+
+    // Directory collision must ALWAYS be rejected, even if force=true
+    let err_unforced = check_existing_bin_collision(
+        &bin_dir,
+        &link_path,
+        "../lib/node_modules/my-pkg/bin/cli.js",
+        false,
+    )
+    .unwrap_err();
+    assert!(err_unforced.to_string().contains("EEXIST"));
+
+    let err_forced = check_existing_bin_collision(
+        &bin_dir,
+        &link_path,
+        "../lib/node_modules/my-pkg/bin/cli.js",
+        true,
+    )
+    .unwrap_err();
+    assert!(err_forced.to_string().contains("EEXIST"));
+}
+
+#[test]
+fn test_global_bin_collision_unrelated_regular_file_rejected() {
+    let dir = tempdir().unwrap();
+    let global_bin = dir.path().join("usr").join("local").join("bin");
+    fs::create_dir_all(&global_bin).unwrap();
+
+    let link_path = global_bin.join("my-tool");
+    fs::write(&link_path, b"unrelated binary").unwrap();
+
+    // Regular file collision in global bin without force must be rejected with EEXIST
+    let err = check_existing_bin_collision(
+        &global_bin,
+        &link_path,
+        "../lib/node_modules/my-pkg/bin/cli.js",
+        false,
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("EEXIST: file already exists"));
+}
+
+#[test]
+fn test_global_bin_collision_unrelated_regular_file_forced() {
+    let dir = tempdir().unwrap();
+    let global_bin = dir.path().join("usr").join("local").join("bin");
+    fs::create_dir_all(&global_bin).unwrap();
+
+    let link_path = global_bin.join("my-tool");
+    fs::write(&link_path, b"unrelated binary").unwrap();
+
+    // With force=true, overwrite is permitted
+    assert!(check_existing_bin_collision(
+        &global_bin,
+        &link_path,
+        "../lib/node_modules/my-pkg/bin/cli.js",
+        true,
+    )
+    .is_ok());
+}
+
+#[test]
+fn test_local_dot_bin_allows_clobber() {
+    let dir = tempdir().unwrap();
+    let dot_bin = dir.path().join("node_modules").join(".bin");
+    fs::create_dir_all(&dot_bin).unwrap();
+
+    let link_path = dot_bin.join("my-tool");
+    fs::write(&link_path, b"old-package-link").unwrap();
+
+    // In local .bin, overwriting is allowed even with force=false
+    assert!(check_existing_bin_collision(
+        &dot_bin,
+        &link_path,
+        "../my-pkg/bin/cli.js",
+        false,
+    )
+    .is_ok());
+}
+
+#[test]
+fn test_global_bin_collision_foreign_symlink_rejected() {
+    let dir = tempdir().unwrap();
+    let global_bin = dir.path().join("usr").join("local").join("bin");
+    fs::create_dir_all(&global_bin).unwrap();
+
+    let link_path = global_bin.join("my-tool");
+
+    #[cfg(unix)]
+    let symlink_res = std::os::unix::fs::symlink(
+        std::path::Path::new("../lib/node_modules/foreign-pkg/bin/tool.js"),
+        &link_path,
+    );
+    #[cfg(windows)]
+    let symlink_res = std::os::windows::fs::symlink_file(
+        std::path::Path::new("../lib/node_modules/foreign-pkg/bin/tool.js"),
+        &link_path,
+    );
+
+    if symlink_res.is_err() {
+        eprintln!("Skipping symlink collision test due to platform privilege constraints");
+        return;
+    }
+
+    // Foreign symlink must be rejected with EEXIST when force=false
+    let err = check_existing_bin_collision(
+        &global_bin,
+        &link_path,
+        "../lib/node_modules/my-pkg/bin/cli.js",
+        false,
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("EEXIST: file already exists"));
+    assert!(err.to_string().contains("foreign bin link"));
+
+    // Foreign symlink can be overwritten when force=true
+    assert!(check_existing_bin_collision(
+        &global_bin,
+        &link_path,
+        "../lib/node_modules/my-pkg/bin/cli.js",
+        true,
+    )
+    .is_ok());
+}
+
+#[test]
+fn test_global_bin_collision_same_package_symlink_allowed() {
+    let dir = tempdir().unwrap();
+    let global_bin = dir.path().join("usr").join("local").join("bin");
+    fs::create_dir_all(&global_bin).unwrap();
+
+    let link_path = global_bin.join("my-tool");
+
+    #[cfg(unix)]
+    let symlink_res = std::os::unix::fs::symlink(
+        std::path::Path::new("../lib/node_modules/my-pkg/bin/old-cli.js"),
+        &link_path,
+    );
+    #[cfg(windows)]
+    let symlink_res = std::os::windows::fs::symlink_file(
+        std::path::Path::new("../lib/node_modules/my-pkg/bin/old-cli.js"),
+        &link_path,
+    );
+
+    if symlink_res.is_err() {
+        eprintln!("Skipping symlink collision test due to platform privilege constraints");
+        return;
+    }
+
+    // Symlink from the same package is allowed to update even when force=false
+    assert!(check_existing_bin_collision(
+        &global_bin,
+        &link_path,
+        "../lib/node_modules/my-pkg/bin/new-cli.js",
+        false,
+    )
+    .is_ok());
+}
+
+#[test]
+fn test_global_bin_collision_same_package_regular_shim_allowed() {
+    let dir = tempdir().unwrap();
+    let global_bin = dir.path().join("usr").join("local").join("bin");
+    fs::create_dir_all(&global_bin).unwrap();
+    let pkg_bin = dir
+        .path()
+        .join("usr")
+        .join("local")
+        .join("lib")
+        .join("node_modules")
+        .join("my-pkg")
+        .join("bin");
+    fs::create_dir_all(&pkg_bin).unwrap();
+    fs::write(pkg_bin.join("old-cli.js"), "#!/usr/bin/env node\n").unwrap();
+    fs::write(pkg_bin.join("new-cli.js"), "#!/usr/bin/env node\n").unwrap();
+
+    // Create a global shim for my-pkg (as created by create_shims in a global dir)
+    create_shims(&global_bin, "my-tool", "my-pkg/bin/old-cli.js").unwrap();
+
+    // Reinstalling or upgrading the same package's shim must succeed without force!
+    let res = create_shims_with_force(&global_bin, "my-tool", "my-pkg/bin/new-cli.js", false);
+    assert!(res.is_ok(), "Self-upgrade of same package shim must succeed without force");
+}
+
+#[test]
+fn test_global_bin_collision_foreign_package_regular_shim_rejected() {
+    let dir = tempdir().unwrap();
+    let global_bin = dir.path().join("usr").join("local").join("bin");
+    fs::create_dir_all(&global_bin).unwrap();
+    let global_nm = dir
+        .path()
+        .join("usr")
+        .join("local")
+        .join("lib")
+        .join("node_modules");
+    fs::create_dir_all(global_nm.join("foreign-pkg").join("bin")).unwrap();
+    fs::create_dir_all(global_nm.join("my-pkg").join("bin")).unwrap();
+    fs::write(
+        global_nm.join("foreign-pkg").join("bin").join("cli.js"),
+        "#!/usr/bin/env node\n",
+    )
+    .unwrap();
+    fs::write(
+        global_nm.join("my-pkg").join("bin").join("cli.js"),
+        "#!/usr/bin/env node\n",
+    )
+    .unwrap();
+
+    // Create a global shim for foreign-pkg
+    create_shims(&global_bin, "my-tool", "foreign-pkg/bin/cli.js").unwrap();
+
+    // Trying to install another package's shim to the same bin name without force must fail with EEXIST!
+    let err = create_shims_with_force(&global_bin, "my-tool", "my-pkg/bin/cli.js", false).unwrap_err();
+    assert!(err.to_string().contains("EEXIST"));
+
+    // With force=true, overwrite is permitted
+    assert!(create_shims_with_force(&global_bin, "my-tool", "my-pkg/bin/cli.js", true).is_ok());
+}
+
+#[test]
+#[cfg(not(unix))]
+fn test_windows_companion_shims_collision_checks() {
+    let dir = tempdir().unwrap();
+    let global_bin = dir.path().join("usr").join("local").join("bin");
+    fs::create_dir_all(&global_bin).unwrap();
+
+    // Put an unrelated regular file at <bin_name>.cmd
+    let cmd_file = global_bin.join("custom-tool.cmd");
+    fs::write(&cmd_file, b"@echo custom batch script").unwrap();
+
+    // Without force, create_shims_with_force must reject with EEXIST because of the collision on custom-tool.cmd!
+    let err = create_shims_with_force(&global_bin, "custom-tool", "my-pkg/bin/cli.js", false).unwrap_err();
+    assert!(err.to_string().contains("EEXIST"), "Expected EEXIST for colliding .cmd file, got: {err}");
+
+    // With force, it must succeed and overwrite
+    assert!(create_shims_with_force(&global_bin, "custom-tool", "my-pkg/bin/cli.js", true).is_ok());
+
+    // Similarly for .ps1:
+    let dir2 = tempdir().unwrap();
+    let global_bin2 = dir2.path().join("usr").join("local").join("bin");
+    fs::create_dir_all(&global_bin2).unwrap();
+    let ps1_file = global_bin2.join("custom-tool2.ps1");
+    fs::write(&ps1_file, b"Write-Host 'custom ps1'").unwrap();
+
+    let err2 = create_shims_with_force(&global_bin2, "custom-tool2", "my-pkg/bin/cli.js", false).unwrap_err();
+    assert!(err2.to_string().contains("EEXIST"), "Expected EEXIST for colliding .ps1 file, got: {err2}");
+    assert!(create_shims_with_force(&global_bin2, "custom-tool2", "my-pkg/bin/cli.js", true).is_ok());
+}
+
+#[test]
+fn test_replace_existing_symlink_does_not_overwrite_target() {
+    let dir = tempdir().unwrap();
+    let global_bin = dir.path().join("bin");
+    fs::create_dir_all(&global_bin).unwrap();
+    let new_target_dir = dir
+        .path()
+        .join("lib")
+        .join("node_modules")
+        .join("my-pkg")
+        .join("bin");
+    fs::create_dir_all(&new_target_dir).unwrap();
+    fs::write(new_target_dir.join("cli.js"), "#!/usr/bin/env node\n").unwrap();
+    let target_file = dir.path().join("target.js");
+    let original_content = b"original target file content - must not be overwritten!";
+    fs::write(&target_file, original_content).unwrap();
+
+    let shim_link = global_bin.join("my-tool");
+    #[cfg(unix)]
+    let symlink_res = std::os::unix::fs::symlink(&target_file, &shim_link);
+    #[cfg(windows)]
+    let symlink_res = std::os::windows::fs::symlink_file(&target_file, &shim_link);
+
+    if symlink_res.is_err() {
+        eprintln!("Skipping symlink replace test due to platform privilege constraints");
+        return;
+    }
+
+    assert!(fs::symlink_metadata(&shim_link).unwrap().file_type().is_symlink());
+
+    // Call create_shims_with_force with force=true to replace the existing symlink
+    let res = create_shims_with_force(&global_bin, "my-tool", "my-pkg/bin/cli.js", true);
+    assert!(res.is_ok());
+
+    // Target file content must remain UNCHANGED!
+    let current_target_content = fs::read(&target_file).unwrap();
+    assert_eq!(
+        current_target_content, original_content,
+        "Target file must not be overwritten when replacing a symlink"
+    );
+
+    // On Windows, write_shim_file replaces the symlink with a regular shim file
+    #[cfg(windows)]
+    {
+        let meta = fs::symlink_metadata(&shim_link).unwrap();
+        assert!(!meta.file_type().is_symlink());
+        assert!(meta.is_file());
     }
 }

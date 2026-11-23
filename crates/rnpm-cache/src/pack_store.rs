@@ -528,44 +528,32 @@ impl PackagePack {
             #[cfg(not(windows))]
             let src_h = None;
 
-            let mut copied = false;
-            if !can_block_clone {
+            if entry.cas_verified {
                 if let Some(ref cas_path) = entry.cas_path {
-                    let cas_valid = entry.cas_verified
-                        && cas_path
-                            .metadata()
-                            .map(|metadata| {
-                                metadata.len() == entry.size
-                                    && entry
-                                        .cas_mtime
-                                        .is_none_or(|m| mtime_to_timestamp(&metadata) == Some(m))
-                            })
-                            .unwrap_or(false);
-                    if cas_valid && rnpm_fs::copy_file_fast(cas_path, &full_path).is_ok() {
-                        copied = true;
-                        rnpm_fs::record_file_created(entry.size);
-                    } else {
-                        // Stale or corrupted CAS entry on disk: rebuild safely via temp file + atomic rename
+                    let is_corrupted = cas_path
+                        .metadata()
+                        .map(|metadata| {
+                            metadata.len() != entry.size
+                                || (entry.cas_mtime.is_some()
+                                    && mtime_to_timestamp(&metadata) != entry.cas_mtime)
+                        })
+                        .unwrap_or(false);
+                    if is_corrupted {
                         let _ = PackStore::write_cas_file_safe(cas_path, slice);
-                        if rnpm_fs::copy_file_fast(cas_path, &full_path).is_ok() {
-                            copied = true;
-                            rnpm_fs::record_file_created(entry.size);
-                        }
                     }
                 }
             }
-            if !copied {
-                clone_or_write_pack_file(
-                    src_h,
-                    &full_path,
-                    slice,
-                    entry.offset,
-                    entry.size,
-                    entry.mode,
-                    prealloc_thresh,
-                )
-                .map_err(CacheError::Io)?;
-            }
+
+            clone_or_write_pack_file(
+                src_h,
+                &full_path,
+                slice,
+                entry.offset,
+                entry.size,
+                entry.mode,
+                prealloc_thresh,
+            )
+            .map_err(CacheError::Io)?;
         }
 
         // 3. Recreate symlinks if any
@@ -852,7 +840,27 @@ impl PackStore {
                         break;
                     }
                     let (src, dst) = &files[idx];
-                    let _ = rnpm_fs::copy_file_fast(src, dst);
+                    let expected_len = match src.metadata() {
+                        Ok(m) => m.len(),
+                        Err(_) => continue,
+                    };
+                    let dst_valid = dst
+                        .metadata()
+                        .ok()
+                        .map(|d_meta| d_meta.len() == expected_len)
+                        .unwrap_or(false);
+                    if !dst_valid {
+                        let count = TMP_COUNTER.fetch_add(1, Ordering::SeqCst);
+                        let pid = std::process::id();
+                        let tmp_path = dst.with_extension(format!("tmp_{pid}_{count}"));
+                        if rnpm_fs::copy_file_fast(src, &tmp_path).is_ok() {
+                            if rename_atomic_cas(&tmp_path, dst, expected_len).is_err() {
+                                let _ = fs::remove_file(&tmp_path);
+                            }
+                        } else {
+                            let _ = fs::remove_file(&tmp_path);
+                        }
+                    }
                 });
             }
         });
@@ -2289,12 +2297,98 @@ fn rename_atomic(from: &Path, to: &Path) -> std::io::Result<()> {
     }
 }
 
+/// Atomically renames a temporary file into a CAS destination with Windows retry support.
+///
+/// If `to` already exists and has the expected length, another thread concurrently wrote it;
+/// this is treated as a success, and `from` is cleaned up.
+/// If `to` exists but does not match `expected_len` (e.g. truncated or corrupted), `to` is
+/// replaced atomically without removing it first.
+/// On failure or exhaustion of retries, `from` is cleaned up to prevent leftover temp files.
+fn rename_atomic_cas(from: &Path, to: &Path, expected_len: u64) -> std::io::Result<()> {
+    if let Ok(m) = to.metadata() {
+        if m.len() == expected_len {
+            let _ = fs::remove_file(from);
+            return Ok(());
+        }
+    }
+    if fs::rename(from, to).is_ok() {
+        return Ok(());
+    }
+    let mut attempts = 0;
+    let mut delay = Duration::from_millis(5);
+    loop {
+        attempts += 1;
+        if let Some(parent) = to.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        if let Ok(m) = to.metadata() {
+            if m.len() == expected_len {
+                let _ = fs::remove_file(from);
+                return Ok(());
+            }
+        }
+        match fs::rename(from, to) {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                if let Ok(m) = to.metadata() {
+                    if m.len() == expected_len {
+                        let _ = fs::remove_file(from);
+                        return Ok(());
+                    }
+                }
+
+                if attempts >= 10 {
+                    if let Ok(m) = to.metadata() {
+                        if m.len() == expected_len {
+                            let _ = fs::remove_file(from);
+                            return Ok(());
+                        }
+                    }
+                    let _ = fs::remove_file(from);
+                    return Err(e);
+                }
+
+                let jitter = (attempts as u64 * 3) % 7;
+                sleep(delay + Duration::from_millis(jitter));
+                delay = delay.saturating_mul(2).min(Duration::from_millis(200));
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use flate2::write::GzEncoder;
     use flate2::Compression;
     use tempfile::tempdir;
+
+    #[test]
+    fn test_rename_atomic_cas_cases() {
+        let dir = tempdir().unwrap();
+        let from = dir.path().join("temp.dat");
+        let to = dir.path().join("final.dat");
+
+        // 1. Rename into non-existing destination
+        fs::write(&from, b"content-1234").unwrap();
+        rename_atomic_cas(&from, &to, 12).unwrap();
+        assert_eq!(fs::read(&to).unwrap(), b"content-1234");
+        assert!(!from.exists());
+
+        // 2. Destination exists with matching expected length: treated as concurrent success
+        fs::write(&from, b"content-5678").unwrap();
+        rename_atomic_cas(&from, &to, 12).unwrap();
+        // Destination preserved, from cleaned up
+        assert_eq!(fs::read(&to).unwrap(), b"content-1234");
+        assert!(!from.exists());
+
+        // 3. Destination exists with mismatched length (e.g. truncated/corrupted):
+        // Atomically replaced with new content
+        fs::write(&from, b"new-longer-content").unwrap();
+        rename_atomic_cas(&from, &to, 18).unwrap();
+        assert_eq!(fs::read(&to).unwrap(), b"new-longer-content");
+        assert!(!from.exists());
+    }
 
     #[test]
     fn test_4k_alignment_and_index_serialization() {
@@ -3315,5 +3409,294 @@ mod tests {
             fs::read_to_string(external.join("keep.txt")).unwrap(),
             "keep"
         );
+    }
+
+    #[test]
+    fn test_ntfs_warm_materialize_skips_cas_disk_indirection_and_double_write() {
+        let dir = tempdir().unwrap();
+        let store = PackStore::new(dir.path()).unwrap();
+        let integrity = "sha512-skipcasdoublewrite12345==";
+
+        let files = [
+            PackInputFile::new("index.js", 0o644, b"console.log('hello world');"),
+            PackInputFile::new(
+                "package.json",
+                0o644,
+                b"{\"name\": \"test-pkg\", \"version\": \"1.0.0\"}",
+            ),
+            PackInputFile::new(
+                "lib/util.js",
+                0o644,
+                b"module.exports = { add: (a, b) => a + b };",
+            ),
+        ];
+
+        // Create pack using deferred CAS mode (simulating cold install where CAS writes are deferred)
+        let index = store.put_package_pack_deferred(integrity, &files).unwrap();
+        assert_eq!(index.files.len(), 3);
+
+        // Verify that store-v1/cas is completely empty (no CAS blobs on disk)
+        let cas_dir = store.cas_dir();
+        let cas_entries: Vec<_> = fs::read_dir(&cas_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .collect();
+        assert!(
+            cas_entries.is_empty(),
+            "CAS directory must be empty initially"
+        );
+
+        // Clear in-memory cache to force loading from disk on warm materialize
+        store.clear_mmap_cache();
+
+        // Warm materialize into target destination
+        let target = tempdir().unwrap();
+        let summary = store
+            .materialize_pack(integrity, target.path(), None)
+            .unwrap();
+
+        assert_eq!(summary.entries_extracted, 3);
+        assert_eq!(
+            fs::read(target.path().join("index.js")).unwrap(),
+            b"console.log('hello world');"
+        );
+        assert_eq!(
+            fs::read(target.path().join("package.json")).unwrap(),
+            b"{\"name\": \"test-pkg\", \"version\": \"1.0.0\"}"
+        );
+        assert_eq!(
+            fs::read(target.path().join("lib/util.js")).unwrap(),
+            b"module.exports = { add: (a, b) => a + b };"
+        );
+
+        // Verify that warm materialize did NOT redundantly create CAS blobs on disk!
+        // Materialization should write directly from the in-memory pack buffer without CAS indirection.
+        let cas_entries_after: Vec<_> = fs::read_dir(&cas_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .collect();
+        assert!(
+            cas_entries_after.is_empty(),
+            "CAS directory must remain empty: warm materialize must NOT double-write into CAS!"
+        );
+    }
+
+    #[test]
+    fn test_warm_materialize_repairs_corrupted_cas_blob_and_materializes_pristine_files() {
+        let dir = tempdir().unwrap();
+        let store = PackStore::new(dir.path()).unwrap();
+        let integrity = "sha512-casrepairmtimeandsize777==";
+
+        let original_data1 = b"export const alpha = 1;";
+        let original_data2 = b"export const beta = 2;";
+        let files = [
+            PackInputFile::new("file1.js", 0o644, original_data1),
+            PackInputFile::new("file2.js", 0o644, original_data2),
+        ];
+
+        // Create pack with CAS files populated
+        let index = store.put_package_pack(integrity, &files).unwrap();
+        let cas_path1 = index.files[0].cas_path.clone().unwrap();
+        let cas_path2 = index.files[1].cas_path.clone().unwrap();
+
+        assert!(cas_path1.is_file());
+        assert!(cas_path2.is_file());
+
+        // Corrupt file1 with size mismatch
+        fs::write(&cas_path1, b"corrupted-size").unwrap();
+
+        // Corrupt file2 with same size but altered content & mtime
+        sleep(Duration::from_millis(25));
+        let mut corrupted_data2 = original_data2.to_vec();
+        corrupted_data2[0] ^= 0x42;
+        fs::write(&cas_path2, &corrupted_data2).unwrap();
+
+        // Clear in-memory mmap cache to simulate warm verification in a fresh process
+        store.clear_mmap_cache();
+
+        let target = tempdir().unwrap();
+        let summary = store
+            .materialize_pack(integrity, target.path(), None)
+            .unwrap();
+
+        assert_eq!(summary.entries_extracted, 2);
+
+        // Verify target files are pristine directly from pack
+        assert_eq!(
+            fs::read(target.path().join("file1.js")).unwrap(),
+            original_data1
+        );
+        assert_eq!(
+            fs::read(target.path().join("file2.js")).unwrap(),
+            original_data2
+        );
+
+        // Verify corrupted CAS blobs on disk were repaired
+        assert_eq!(
+            fs::read(&cas_path1).unwrap(),
+            original_data1,
+            "Corrupted size CAS blob must be repaired"
+        );
+        assert_eq!(
+            fs::read(&cas_path2).unwrap(),
+            original_data2,
+            "Corrupted mtime CAS blob must be repaired"
+        );
+    }
+
+    #[test]
+    fn test_ntfs_materialize_speed_fast_path_vs_cas_indirection() {
+        let dir = tempdir().unwrap();
+        let store = PackStore::new(dir.path()).unwrap();
+        let integrity = "sha512-benchmaterialize999==";
+
+        // Generate 100 files of 4 KiB each
+        let file_data = vec![0xABu8; 4096];
+        let mut files = Vec::new();
+        let mut file_names = Vec::new();
+        for i in 0..100 {
+            file_names.push(format!("sub/file_{i}.dat"));
+        }
+        for name in &file_names {
+            files.push(PackInputFile::new(name, 0o644, &file_data));
+        }
+
+        store.put_package_pack_deferred(integrity, &files).unwrap();
+
+        let target_direct = tempdir().unwrap();
+        let t_start_direct = std::time::Instant::now();
+        let sum_direct = store
+            .materialize_pack(integrity, target_direct.path(), None)
+            .unwrap();
+        let duration_direct = t_start_direct.elapsed();
+        assert_eq!(sum_direct.entries_extracted, 100);
+
+        for name in &file_names {
+            assert_eq!(
+                fs::read(target_direct.path().join(name)).unwrap(),
+                file_data
+            );
+        }
+
+        // Verify zero CAS files created during direct materialization
+        let cas_entries: Vec<_> = fs::read_dir(store.cas_dir())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .collect();
+        assert!(
+            cas_entries.is_empty(),
+            "Zero CAS files should be created during direct materialize"
+        );
+
+        // For comparison, measure how long writing CAS + CopyFileExW would take for 100 files
+        let cas_sim_dir = tempdir().unwrap();
+        let target_cas = tempdir().unwrap();
+        let t_start_cas = std::time::Instant::now();
+        for name in &file_names {
+            let cas_file = cas_sim_dir.path().join(format!("cas_{name}.tmp"));
+            PackStore::write_cas_file_safe(&cas_file, &file_data).unwrap();
+            let dst = target_cas.path().join(name);
+            if let Some(p) = dst.parent() {
+                let _ = fs::create_dir_all(p);
+            }
+            rnpm_fs::copy_file_fast(&cas_file, &dst).unwrap();
+        }
+        let duration_cas = t_start_cas.elapsed();
+
+        eprintln!(
+            "Benchmark timing: Direct materialize = {:?}, CAS double-write indirection = {:?}",
+            duration_direct, duration_cas
+        );
+    }
+
+    #[test]
+    fn test_populate_cas_from_installed_overwrites_zero_byte_or_truncated_file() {
+        let temp = tempdir().unwrap();
+        let store = PackStore::new(temp.path().join("store")).unwrap();
+        let source_dir = temp.path().join("node_modules/pkg");
+        fs::create_dir_all(&source_dir).unwrap();
+
+        let src_file = source_dir.join("index.js");
+        let content = b"console.log('repaired');";
+        fs::write(&src_file, content).unwrap();
+
+        let cas_dst = store.cas_dir().join("ab").join("abcdef123456");
+        if let Some(p) = cas_dst.parent() {
+            fs::create_dir_all(p).unwrap();
+        }
+        // Create a truncated 0-byte CAS file
+        fs::write(&cas_dst, b"").unwrap();
+        assert_eq!(fs::metadata(&cas_dst).unwrap().len(), 0);
+
+        // Run populate_cas_from_installed: 0-byte CAS file must be repaired/overwritten
+        store.populate_cas_from_installed(&[(src_file.clone(), cas_dst.clone())]);
+
+        // Verify the 0-byte CAS file was overwritten with valid content
+        assert_eq!(fs::read(&cas_dst).unwrap(), content);
+
+        // Running it again with matching size should succeed idempotently
+        store.populate_cas_from_installed(&[(src_file, cas_dst.clone())]);
+        assert_eq!(fs::read(&cas_dst).unwrap(), content);
+    }
+
+    #[test]
+    fn test_populate_cas_from_installed_atomic_no_leftover_temp_and_repairs_truncated() {
+        let temp = tempdir().unwrap();
+        let store = PackStore::new(temp.path().join("store")).unwrap();
+        let source_dir = temp.path().join("node_modules/my-pkg");
+        fs::create_dir_all(&source_dir).unwrap();
+
+        let src_file = source_dir.join("main.js");
+        let full_content = b"const msg = 'hello world from complete file payload!';\nexport default msg;\n";
+        fs::write(&src_file, full_content).unwrap();
+
+        let cas_dst = store.cas_file_path("abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789");
+        let cas_parent = cas_dst.parent().unwrap();
+        fs::create_dir_all(cas_parent).unwrap();
+
+        // 1. Partial/truncated write: simulate a truncated CAS file (e.g. 10 bytes)
+        fs::write(&cas_dst, &full_content[..10]).unwrap();
+        assert_eq!(fs::metadata(&cas_dst).unwrap().len(), 10);
+
+        // 2. Run populate_cas_from_installed: must atomically repair the truncated file
+        store.populate_cas_from_installed(&[(src_file.clone(), cas_dst.clone())]);
+
+        // 3. Verify destination has the complete valid content
+        assert_eq!(fs::read(&cas_dst).unwrap(), full_content);
+
+        // 4. Verify no leftover temp files exist in cas directory
+        let mut temp_files = Vec::new();
+        for entry in fs::read_dir(cas_parent).unwrap() {
+            let entry = entry.unwrap();
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.contains("tmp") {
+                temp_files.push(name);
+            }
+        }
+        assert!(
+            temp_files.is_empty(),
+            "Found leftover temporary files in CAS dir: {:?}",
+            temp_files
+        );
+
+        // 5. Concurrent / multi-threaded run on multiple files
+        let mut batch = Vec::new();
+        for i in 0..20 {
+            let src = source_dir.join(format!("file_{i}.js"));
+            let content = format!("console.log('file payload {i}');");
+            fs::write(&src, content.as_bytes()).unwrap();
+            let dst = store.cas_dir().join(format!("c{i}")).join(format!("{i:064x}"));
+            batch.push((src, dst));
+        }
+        store.populate_cas_from_installed(&batch);
+
+        for (src, dst) in &batch {
+            assert_eq!(fs::read(dst).unwrap(), fs::read(src).unwrap());
+            let parent = dst.parent().unwrap();
+            for entry in fs::read_dir(parent).unwrap() {
+                let name = entry.unwrap().file_name().to_string_lossy().to_string();
+                assert!(!name.contains("tmp"), "Leftover temp file: {name}");
+            }
+        }
     }
 }

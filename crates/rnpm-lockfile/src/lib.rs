@@ -21,6 +21,7 @@ pub use migration::{
     load_and_migrate, migrate_to_v3, parse_and_migrate, AnyLockfile, LegacyDependency,
 };
 pub use model::{
+    get_format_package_lock, reset_format_package_lock, set_format_package_lock,
     set_omit_registry_resolved, LockfilePackage, LockfileV3, PackageBin, PackageEngines,
 };
 pub use rnpm_core::manifest::BundledDependencies;
@@ -433,6 +434,66 @@ mod tests {
             !lockfile.matches_manifest(&m5, true),
             "Optional dependency removal must be detected"
         );
+    }
+
+    #[test]
+    fn test_matches_manifest_for_ci_validates_dev_dependencies() {
+        use rnpm_core::Manifest;
+
+        let mut lockfile = LockfileV3::new("ci-app", Some("1.0.0".to_string()));
+        let mut deps = BTreeMap::new();
+        deps.insert("chalk".to_string(), "^5.0.0".to_string());
+        let mut dev_deps = BTreeMap::new();
+        dev_deps.insert("typescript".to_string(), "^5.0.0".to_string());
+
+        if let Some(root) = lockfile.root_package_mut() {
+            root.dependencies = Some(deps.clone());
+            root.dev_dependencies = Some(dev_deps.clone());
+        }
+
+        lockfile.insert_package(
+            "node_modules/chalk",
+            LockfilePackage {
+                version: Some("5.3.0".to_string()),
+                ..Default::default()
+            },
+        );
+        lockfile.insert_package(
+            "node_modules/typescript",
+            LockfilePackage {
+                version: Some("5.4.2".to_string()),
+                dev: Some(true),
+                ..Default::default()
+            },
+        );
+
+        let mut manifest = Manifest::default();
+        manifest.name = Some("ci-app".to_string());
+        manifest.version = Some("1.0.0".to_string());
+        manifest.dependencies = deps;
+        manifest.dev_dependencies = dev_deps;
+
+        // In CI, when in sync, matches_manifest_for_ci validates dev dependencies
+        assert!(lockfile.matches_manifest_for_ci(&manifest, true));
+
+        // When devDependency is mutated in package.json, CI validation fails
+        let mut dev_mutated = manifest.clone();
+        dev_mutated
+            .dev_dependencies
+            .insert("typescript".to_string(), "^6.0.0".to_string());
+        assert!(!lockfile.matches_manifest_for_ci(&dev_mutated, true));
+
+        // When a new devDependency is added to package.json, CI validation fails
+        let mut dev_added = manifest.clone();
+        dev_added
+            .dev_dependencies
+            .insert("eslint".to_string(), "^9.0.0".to_string());
+        assert!(!lockfile.matches_manifest_for_ci(&dev_added, true));
+
+        // When devDependency is deleted from package.json, CI allows extra lockfile deps
+        let mut dev_deleted = manifest.clone();
+        dev_deleted.dev_dependencies.remove("typescript");
+        assert!(lockfile.matches_manifest_for_ci(&dev_deleted, true));
     }
 
     #[test]
@@ -1865,5 +1926,75 @@ mod tests {
         assert_eq!(reparsed_fsevents.optional, Some(true));
         assert_eq!(reparsed_fsevents.dev_optional, None);
         assert_eq!(parsed, reparsed);
+    }
+
+    #[test]
+    fn test_format_package_lock_false_compact_serialization() {
+        let mut lockfile = LockfileV3::new("test-compact", Some("1.0.0".to_string()));
+        lockfile.insert_package(
+            "node_modules/foo",
+            LockfilePackage {
+                version: Some("1.2.3".to_string()),
+                resolved: Some("https://registry.npmjs.org/foo/-/foo-1.2.3.tgz".to_string()),
+                integrity: Some(VALID_SHA512.to_string()),
+                ..Default::default()
+            },
+        );
+
+        let compact_v3 = lockfile.to_json_string_compact().unwrap();
+        assert!(!compact_v3.contains('\n'), "compact v3 must be a single line without newlines");
+        assert!(!compact_v3.ends_with('\n'), "compact v3 must not have a trailing newline");
+        assert!(compact_v3.starts_with('{') && compact_v3.ends_with('}'));
+
+        let parsed_v3 = LockfileV3::from_json_str(&compact_v3).unwrap();
+        assert_eq!(parsed_v3.name, "test-compact");
+        assert_eq!(parsed_v3.version, Some("1.0.0".to_string()));
+        assert!(parsed_v3.packages.contains_key("node_modules/foo"));
+
+        let compact_v1 = lockfile.to_json_string_version_compact(1).unwrap();
+        assert!(!compact_v1.contains('\n'), "compact v1 must be a single line without newlines");
+        assert!(compact_v1.contains("\"lockfileVersion\":1"));
+
+        let compact_v2 = lockfile.to_json_string_version_compact(2).unwrap();
+        assert!(!compact_v2.contains('\n'), "compact v2 must be a single line without newlines");
+        assert!(compact_v2.contains("\"lockfileVersion\":2"));
+    }
+
+    #[test]
+    fn test_format_package_lock_save_to_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project_dir = tmp.path();
+        let lock_path = project_dir.join("package-lock.json");
+
+        let mut lockfile = LockfileV3::new("test-save", Some("1.0.0".to_string()));
+        lockfile.insert_package(
+            "node_modules/bar",
+            LockfilePackage {
+                version: Some("2.0.0".to_string()),
+                ..Default::default()
+            },
+        );
+
+        // Default formatting: pretty-printed with multiple lines
+        reset_format_package_lock();
+        lockfile.save_to_file(&lock_path).unwrap();
+        let content_default = std::fs::read_to_string(&lock_path).unwrap();
+        assert!(content_default.lines().count() > 1, "default lockfile must be multi-line");
+        assert!(content_default.ends_with('\n'), "default lockfile must have trailing newline");
+
+        // Explicit format_package_lock = false option
+        lockfile
+            .save_to_file_version_formatted_option(&lock_path, 3, false)
+            .unwrap();
+        let content_compact = std::fs::read_to_string(&lock_path).unwrap();
+        assert_eq!(content_compact.lines().count(), 1, "compact lockfile must be a single line");
+        assert!(!content_compact.ends_with('\n'), "compact lockfile must not end with newline");
+
+        // .npmrc with format-package-lock = false
+        std::fs::write(project_dir.join(".npmrc"), "format-package-lock = false\n").unwrap();
+        reset_format_package_lock();
+        lockfile.save_to_file(&lock_path).unwrap();
+        let content_npmrc = std::fs::read_to_string(&lock_path).unwrap();
+        assert_eq!(content_npmrc.lines().count(), 1, "lockfile saved with format-package-lock=false in .npmrc must be single line");
     }
 }

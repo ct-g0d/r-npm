@@ -19,17 +19,28 @@ pub(crate) struct VersionCommandArgs {
 
 pub(crate) async fn run(args: VersionCommandArgs, current_dir: PathBuf) -> Result<()> {
     let config = rnpm_config::Config::load(Some(&current_dir))?;
+    let commit_hooks = if args.no_commit_hooks {
+        false
+    } else {
+        config.get_bool("commit-hooks").unwrap_or(true)
+    };
+    let tag_version_prefix = config
+        .get("tag-version-prefix")
+        .unwrap_or("v")
+        .to_string();
+
     let options = crate::version::VersionOptions {
         newversion: args.newversion,
         preid: args.preid,
         message: args.message,
         allow_same_version: args.allow_same_version,
         git_tag_version: !args.no_git_tag_version,
-        commit_hooks: !args.no_commit_hooks,
+        commit_hooks,
         sign_git_tag: args.sign_git_tag,
         force: args.force,
         ignore_scripts: args.ignore_scripts || config.get_bool("ignore-scripts").unwrap_or(false),
         json: args.json,
+        tag_version_prefix,
     };
 
     let has_ws = args.workspaces || !args.workspace.is_empty();

@@ -1,6 +1,8 @@
 #![allow(clippy::field_reassign_with_default)]
 #![allow(clippy::too_many_arguments)]
 
+use sha2::Digest;
+
 mod audit;
 mod audit_dry_run;
 mod audit_signatures;
@@ -14,6 +16,7 @@ pub mod init;
 pub mod inspect_tree;
 pub mod json_errors;
 pub mod list;
+pub(crate) mod npx;
 pub mod outdated;
 pub mod query;
 mod reify_output;
@@ -116,6 +119,14 @@ pub(crate) enum Commands {
         /// Do not read or write package-lock.json
         #[arg(long = "no-package-lock")]
         no_package_lock: bool,
+
+        /// Format package-lock.json as human readable file
+        #[arg(long = "no-format-package-lock")]
+        no_format_package_lock: bool,
+
+        /// Format package-lock.json as human readable file
+        #[arg(long = "format-package-lock", num_args = 0..=1, default_missing_value = "true")]
+        format_package_lock: Option<bool>,
 
         /// Write package-lock.json using npm's legacy format (1, 2, or 3)
         #[arg(long = "lockfile-version", value_parser = clap::value_parser!(u32).range(1..=3))]
@@ -224,6 +235,14 @@ pub(crate) enum Commands {
         /// Output JSON summary instead of text
         #[arg(long)]
         json: bool,
+
+        /// Suppress binary shim creation in node_modules/.bin
+        #[arg(long = "no-bin-links")]
+        no_bin_links: bool,
+
+        /// Toggle binary shim creation in node_modules/.bin
+        #[arg(long = "bin-links", num_args = 0..=1, default_missing_value = "true")]
+        bin_links: Option<bool>,
     },
 
     /// Install dependencies directly from package-lock.json (clean slate)
@@ -285,6 +304,14 @@ pub(crate) enum Commands {
         /// Do not read or write package-lock.json
         #[arg(long = "no-package-lock")]
         no_package_lock: bool,
+
+        /// Format package-lock.json as human readable file
+        #[arg(long = "no-format-package-lock")]
+        no_format_package_lock: bool,
+
+        /// Format package-lock.json as human readable file
+        #[arg(long = "format-package-lock", num_args = 0..=1, default_missing_value = "true")]
+        format_package_lock: Option<bool>,
 
         /// Select package-lock.json serialization format (1, 2, or 3)
         #[arg(long = "lockfile-version", value_parser = clap::value_parser!(u32).range(1..=3))]
@@ -357,6 +384,14 @@ pub(crate) enum Commands {
         /// Output JSON summary instead of text
         #[arg(long)]
         json: bool,
+
+        /// Suppress binary shim creation in node_modules/.bin
+        #[arg(long = "no-bin-links")]
+        no_bin_links: bool,
+
+        /// Toggle binary shim creation in node_modules/.bin
+        #[arg(long = "bin-links", num_args = 0..=1, default_missing_value = "true")]
+        bin_links: Option<bool>,
     },
 
     /// Run package test script
@@ -453,6 +488,10 @@ pub(crate) enum Commands {
         /// Automatically say yes to installation prompts
         #[arg(short = 'y', long = "yes")]
         yes: bool,
+
+        /// Automatically say no to installation prompts
+        #[arg(long = "no-yes")]
+        no_yes: bool,
 
         /// Package to install for the command
         #[arg(short = 'p', long = "package")]
@@ -610,6 +649,26 @@ pub(crate) enum Commands {
         /// Disable funding messages
         #[arg(long = "no-fund")]
         no_fund: bool,
+
+        /// Suppress binary shim creation in node_modules/.bin
+        #[arg(long = "no-bin-links")]
+        no_bin_links: bool,
+
+        /// Toggle binary shim creation in node_modules/.bin
+        #[arg(long = "bin-links", num_args = 0..=1, default_missing_value = "true")]
+        bin_links: Option<bool>,
+
+        /// Run against workspace root in addition to specified workspaces
+        #[arg(long = "workspace-root", alias = "include-workspace-root")]
+        workspace_root: bool,
+
+        /// Specific workspace(s) to target
+        #[arg(long = "workspace", short = 'w')]
+        workspace: Vec<String>,
+
+        /// Run across all workspaces
+        #[arg(long = "workspaces")]
+        workspaces: bool,
     },
 
     /// Perform a security audit of dependency vulnerabilities
@@ -637,6 +696,30 @@ pub(crate) enum Commands {
         /// Force audit fix with potential breaking changes
         #[arg(long)]
         force: bool,
+
+        /// Resolve and write package-lock.json without extracting or modifying node_modules
+        #[arg(long = "package-lock-only")]
+        package_lock_only: bool,
+
+        /// Dependency types to omit (dev, optional, peer)
+        #[arg(long, value_delimiter = ',')]
+        omit: Vec<String>,
+
+        /// Dependency types to include (dev, prod, optional, peer)
+        #[arg(long, value_delimiter = ',')]
+        include: Vec<String>,
+
+        /// Bypass peer dependency installation conflicts
+        #[arg(long = "legacy-peer-deps")]
+        legacy_peer_deps: bool,
+
+        /// Fail installation if any peer dependencies are missing or invalid
+        #[arg(long = "strict-peer-deps")]
+        strict_peer_deps: bool,
+
+        /// Installation layout strategy: hoisted, nested, shallow, linked
+        #[arg(long = "install-strategy")]
+        install_strategy: Option<String>,
     },
 
     /// Remove extraneous packages from node_modules
@@ -660,6 +743,18 @@ pub(crate) enum Commands {
         /// Output report in JSON format
         #[arg(long)]
         json: bool,
+
+        /// Run against workspace root in addition to specified workspaces
+        #[arg(long = "workspace-root", alias = "include-workspace-root")]
+        workspace_root: bool,
+
+        /// Specific workspace(s) to target
+        #[arg(long = "workspace", short = 'w')]
+        workspace: Vec<String>,
+
+        /// Run across all workspaces
+        #[arg(long = "workspaces")]
+        workspaces: bool,
     },
 
     /// Reduce duplication in node_modules and package-lock.json
@@ -753,6 +848,18 @@ pub(crate) enum Commands {
         /// Offline mode (only use cache)
         #[arg(long)]
         offline: bool,
+
+        /// Specific workspace(s) to target
+        #[arg(short = 'w', long = "workspace")]
+        workspace: Vec<String>,
+
+        /// Run across all workspaces
+        #[arg(long = "workspaces")]
+        workspaces: bool,
+
+        /// Run against workspace root in addition to specified workspaces
+        #[arg(long = "workspace-root", alias = "include-workspace-root")]
+        workspace_root: bool,
     },
 
     /// Manage the package cache
@@ -1129,7 +1236,11 @@ pub(crate) enum Commands {
         json: bool,
     },
     /// Generate shell completion scripts.
-    Completion { shell: Option<String> },
+    #[command(trailing_var_arg = true)]
+    Completion {
+        #[arg(allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
     /// Manage package distribution tags.
     #[command(alias = "dist-tags")]
     DistTag {
@@ -1311,6 +1422,18 @@ pub(crate) enum Commands {
         registry: Option<String>,
         #[arg(long)]
         dry_run: bool,
+        #[arg(long = "package-lock-only")]
+        package_lock_only: bool,
+        #[arg(long, value_delimiter = ',')]
+        omit: Vec<String>,
+        #[arg(long, value_delimiter = ',')]
+        include: Vec<String>,
+        #[arg(long = "legacy-peer-deps")]
+        legacy_peer_deps: bool,
+        #[arg(long = "strict-peer-deps")]
+        strict_peer_deps: bool,
+        #[arg(long = "install-strategy")]
+        install_strategy: Option<String>,
     },
     /// Show package bug tracker URL.
     #[command(alias = "issues")]
@@ -1476,12 +1599,52 @@ pub(crate) enum Commands {
     Link {
         /// Package name to link from global prefix into local node_modules
         package: Option<String>,
+
+        /// Specific workspace(s) to target
+        #[arg(short = 'w', long = "workspace")]
+        workspace: Vec<String>,
+
+        /// Run across all workspaces
+        #[arg(long = "workspaces")]
+        workspaces: bool,
+
+        /// Save link to dependencies in package.json
+        #[arg(long = "save")]
+        save: bool,
+
+        /// Save link to devDependencies
+        #[arg(short = 'D', long = "save-dev")]
+        save_dev: bool,
+
+        /// Save link to optionalDependencies
+        #[arg(short = 'O', long = "save-optional")]
+        save_optional: bool,
+
+        /// Save link to peerDependencies
+        #[arg(long = "save-peer")]
+        save_peer: bool,
+
+        /// Save link to prodDependencies
+        #[arg(short = 'P', long = "save-prod")]
+        save_prod: bool,
+
+        /// Do not save link to dependencies
+        #[arg(long = "no-save")]
+        no_save: bool,
     },
 
     /// Unlink a package locally or globally
     Unlink {
         /// Package name to unlink from local node_modules
         package: Option<String>,
+
+        /// Specific workspace(s) to target
+        #[arg(short = 'w', long = "workspace")]
+        workspace: Vec<String>,
+
+        /// Run across all workspaces
+        #[arg(long = "workspaces")]
+        workspaces: bool,
     },
 
     /// Display npm prefix
@@ -1585,9 +1748,26 @@ pub(crate) enum ConfigAction {
         long: bool,
     },
     /// Open the config file in an editor
-    Edit,
+    Edit {
+        /// The editor to use
+        #[arg(long)]
+        editor: Option<String>,
+        /// Open global configuration file
+        #[arg(short = 'g', long = "global")]
+        global: bool,
+        /// Configuration location (global, user, project)
+        #[arg(long)]
+        location: Option<String>,
+    },
     /// Repair or normalize configuration
-    Fix,
+    Fix {
+        /// Fix global configuration
+        #[arg(short = 'g', long = "global")]
+        global: bool,
+        /// Configuration location (global, user, project)
+        #[arg(long)]
+        location: Option<String>,
+    },
 }
 
 #[derive(Subcommand, Debug, Clone)]
@@ -1613,7 +1793,7 @@ pub(crate) enum PkgAction {
     Fix,
 }
 
-#[derive(Subcommand, Debug)]
+#[derive(Subcommand, Debug, Clone)]
 pub(crate) enum CacheAction {
     /// Add the specified package or tarball to the local cache
     Add {
@@ -1648,6 +1828,62 @@ pub(crate) enum CacheAction {
 
     /// Verify the contents of the cache folder, garbage collect unneeded data, and validate integrity
     Verify {
+        /// Custom cache directory path
+        #[arg(long)]
+        cache: Option<PathBuf>,
+    },
+
+    /// Manipulate npx cache
+    Npx {
+        #[command(subcommand)]
+        action: CacheNpxAction,
+
+        /// Custom cache directory path
+        #[arg(long)]
+        cache: Option<PathBuf>,
+
+        /// Force operation without warning
+        #[arg(long, short = 'f')]
+        force: bool,
+
+        /// Simulate operation without modifying filesystem
+        #[arg(long)]
+        dry_run: bool,
+    },
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub(crate) enum CacheNpxAction {
+    /// List entries in the npx cache
+    Ls {
+        /// Custom cache directory path
+        #[arg(long)]
+        cache: Option<PathBuf>,
+    },
+
+    /// Remove entries from the npx cache
+    Rm {
+        /// Entry keys to remove
+        keys: Vec<String>,
+
+        /// Force removal of entire npx cache if no keys specified
+        #[arg(long, short = 'f')]
+        force: bool,
+
+        /// Custom cache directory path
+        #[arg(long)]
+        cache: Option<PathBuf>,
+
+        /// Simulate removal without modifying filesystem
+        #[arg(long)]
+        dry_run: bool,
+    },
+
+    /// Show details of npx cache entries
+    Info {
+        /// Entry keys to inspect
+        keys: Vec<String>,
+
         /// Custom cache directory path
         #[arg(long)]
         cache: Option<PathBuf>,
@@ -2100,7 +2336,7 @@ pub(crate) async fn execute_run(
     }
 }
 
-fn select_workspace_members(
+pub(crate) fn select_workspace_members(
     root: &Path,
     filters: &[String],
     include_root: bool,
@@ -2371,7 +2607,7 @@ fn extract_config_flag(
                 "npm warn Unknown cli config \"--{raw_key}\". This will stop working in the next major version of npm."
             );
         }
-        if !(key == "ca" || key == "cafile") {
+        if !(key == "ca" || key == "cafile" || key == "allow-registry") {
             overrides.insert(key, "false".to_string());
         }
         return Some(1);
@@ -2387,7 +2623,19 @@ fn extract_config_flag(
                 );
             }
             if !((key == "ca" || key == "cafile") && (val == "true" || val == "false")) {
-                overrides.insert(key, val.to_string());
+                let clean_key = key.strip_suffix("[]").unwrap_or(&key);
+                if clean_key == "min-release-age-exclude" {
+                    if let Some(existing) = overrides.get_mut("min-release-age-exclude") {
+                        if !existing.is_empty() {
+                            existing.push(',');
+                        }
+                        existing.push_str(val);
+                    } else {
+                        overrides.insert("min-release-age-exclude".to_string(), val.to_string());
+                    }
+                } else if clean_key != "allow-registry" {
+                    overrides.insert(key, val.to_string());
+                }
             }
             return Some(1);
         } else {
@@ -2413,13 +2661,25 @@ fn extract_config_flag(
                         if !((key == "ca" || key == "cafile")
                             && (next == "true" || next == "false"))
                         {
-                            overrides.insert(key, next.to_string());
+                            let clean_key = key.strip_suffix("[]").unwrap_or(&key);
+                            if clean_key == "min-release-age-exclude" {
+                                if let Some(existing) = overrides.get_mut("min-release-age-exclude") {
+                                    if !existing.is_empty() {
+                                        existing.push(',');
+                                    }
+                                    existing.push_str(next);
+                                } else {
+                                    overrides.insert("min-release-age-exclude".to_string(), next.to_string());
+                                }
+                            } else {
+                                overrides.insert(key, next.to_string());
+                            }
                         }
                         return Some(2);
                     }
                 }
             }
-            if !(key == "ca" || key == "cafile") {
+            if !(key == "ca" || key == "cafile" || key == "allow-registry") {
                 overrides.insert(key, "true".to_string());
             }
             return Some(1);
@@ -2465,8 +2725,42 @@ fn preprocess_exec_args(
         }
 
         if token == "-y" || token == "--yes" {
+            clap_flags.retain(|f| f != "--no-yes");
             clap_flags.push(token.clone());
             overrides.insert("yes".into(), "true".into());
+            i += 1;
+            continue;
+        }
+        if token == "--no" || token == "--no-yes" || token == "--no-install" || token == "--yes=false" {
+            clap_flags.retain(|f| f != "--yes" && f != "-y");
+            clap_flags.push("--no-yes".into());
+            overrides.insert("yes".into(), "false".into());
+            i += 1;
+            continue;
+        }
+        if let Some(val) = token.strip_prefix("--yes=") {
+            if val == "false" || val == "0" || val == "no" || val == "off" {
+                clap_flags.retain(|f| f != "--yes" && f != "-y");
+                clap_flags.push("--no-yes".into());
+                overrides.insert("yes".into(), "false".into());
+            } else if val == "true" || val == "1" || val == "yes" || val == "on" {
+                clap_flags.retain(|f| f != "--no-yes");
+                clap_flags.push("--yes".into());
+                overrides.insert("yes".into(), "true".into());
+            }
+            i += 1;
+            continue;
+        }
+        if let Some(val) = token.strip_prefix("-y=") {
+            if val == "false" || val == "0" || val == "no" || val == "off" {
+                clap_flags.retain(|f| f != "--yes" && f != "-y");
+                clap_flags.push("--no-yes".into());
+                overrides.insert("yes".into(), "false".into());
+            } else if val == "true" || val == "1" || val == "yes" || val == "on" {
+                clap_flags.retain(|f| f != "--no-yes");
+                clap_flags.push("-y".into());
+                overrides.insert("yes".into(), "true".into());
+            }
             i += 1;
             continue;
         }
@@ -2639,6 +2933,33 @@ fn preprocess_init_args(
             || token.starts_with("--registry=")
             || token.starts_with("--cache=")
         {
+            clap_flags.push(token.clone());
+            i += 1;
+            continue;
+        }
+        if token == "-w" || token == "--workspace" {
+            clap_flags.push(token.clone());
+            if let Some(next) = next_token {
+                if !next.starts_with('-') {
+                    clap_flags.push(next.to_string());
+                    i += 2;
+                    continue;
+                }
+            }
+            i += 1;
+            continue;
+        }
+        if token.starts_with("--workspace=") {
+            clap_flags.push(token.clone());
+            i += 1;
+            continue;
+        }
+        if token == "--workspaces" || token == "-ws" {
+            clap_flags.push(token.clone());
+            i += 1;
+            continue;
+        }
+        if token == "--include-workspace-root" || token == "--workspace-root" {
             clap_flags.push(token.clone());
             i += 1;
             continue;
@@ -3122,7 +3443,7 @@ where
     result
 }
 
-fn parse_package_spec(spec: &str) -> (String, String) {
+pub(crate) fn parse_package_spec(spec: &str) -> (String, String) {
     if let Some(stripped) = spec.strip_prefix('@') {
         if let Some(idx) = stripped.find('@') {
             (
@@ -3139,12 +3460,119 @@ fn parse_package_spec(spec: &str) -> (String, String) {
     }
 }
 
+pub(crate) fn resolve_npx_consent(
+    project_dir: &Path,
+    cli_yes: bool,
+    cli_no_yes: bool,
+) -> Option<bool> {
+    if cli_no_yes {
+        return Some(false);
+    }
+    if cli_yes {
+        return Some(true);
+    }
+    let config = rnpm_config::Config::load(Some(project_dir)).unwrap_or_default();
+    config.get_bool("yes")
+}
+
+fn is_ci_environment() -> bool {
+    std::env::var_os("CI").is_some()
+        || std::env::var_os("CONTINUOUS_INTEGRATION").is_some()
+        || std::env::var_os("BUILD_NUMBER").is_some()
+        || std::env::var_os("GITHUB_ACTIONS").is_some()
+        || std::env::var_os("GITLAB_CI").is_some()
+        || std::env::var_os("CIRCLECI").is_some()
+        || std::env::var_os("TRAVIS").is_some()
+}
+
+pub(crate) fn prompt_npx_consent<R: std::io::BufRead, W: std::io::Write>(
+    add_list: &[String],
+    reader: &mut R,
+    writer: &mut W,
+) -> anyhow::Result<()> {
+    write!(
+        writer,
+        "Need to install the following packages:\n{}\nOk to proceed? (y) ",
+        add_list.join("\n")
+    )?;
+    writer.flush()?;
+    let mut line = String::new();
+    if reader.read_line(&mut line)? == 0 {
+        anyhow::bail!("npm error canceled");
+    }
+    let trimmed = line.trim();
+    let accepted = if trimmed.is_empty() {
+        true
+    } else {
+        trimmed.to_ascii_lowercase().starts_with('y')
+    };
+    if !accepted {
+        anyhow::bail!("npm error canceled");
+    }
+    Ok(())
+}
+
+pub(crate) fn check_npx_consent(
+    project_dir: &Path,
+    specs: &[String],
+    consent: Option<bool>,
+) -> anyhow::Result<()> {
+    if specs.is_empty() {
+        return Ok(());
+    }
+    let add_list: Vec<String> = specs
+        .iter()
+        .map(|s| s.strip_suffix('@').unwrap_or(s).to_string())
+        .collect();
+
+    match consent {
+        Some(true) => Ok(()),
+        Some(false) => {
+            let json_list = serde_json::to_string(&add_list)?;
+            anyhow::bail!(
+                "npm error npx canceled due to missing packages and no YES option: {json_list}"
+            );
+        }
+        None => {
+            use std::io::IsTerminal;
+            let is_interactive = std::io::stdin().is_terminal() && !is_ci_environment();
+            if is_interactive {
+                let stdin = std::io::stdin();
+                let mut stdin_lock = stdin.lock();
+                let stdout = std::io::stdout();
+                let mut stdout_lock = stdout.lock();
+                prompt_npx_consent(&add_list, &mut stdin_lock, &mut stdout_lock)
+            } else {
+                let silent = is_loglevel_silent(project_dir);
+                let config = rnpm_config::Config::load(Some(project_dir)).unwrap_or_default();
+                let loglevel = config.get("loglevel").unwrap_or("notice");
+                if !silent && loglevel != "error" {
+                    if add_list.len() == 1 {
+                        eprintln!(
+                            "npm warn exec The following package was not found and will be installed: {}",
+                            add_list[0]
+                        );
+                    } else {
+                        eprintln!(
+                            "npm warn exec The following packages were not found and will be installed: {}",
+                            add_list.join(", ")
+                        );
+                    }
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
 /// Install `specs` into a cached npx environment and return its directory.
 pub(crate) async fn ensure_npx_environment(
+    project_dir: &Path,
     specs: &[String],
     registry: Option<String>,
     cache: Option<PathBuf>,
     offline: bool,
+    consent: Option<bool>,
 ) -> anyhow::Result<PathBuf> {
     let cache_path = cache
         .or_else(|| {
@@ -3176,12 +3604,19 @@ pub(crate) async fn ensure_npx_environment(
         let (name, req) = parse_package_spec(spec);
         deps.insert(name, serde_json::Value::String(req));
     }
-    let manifest =
-        serde_json::json!({ "name": "rnpm-exec-env", "version": "1.0.0", "dependencies": deps });
+    let manifest = serde_json::json!({
+        "name": "rnpm-exec-env",
+        "version": "1.0.0",
+        "dependencies": deps,
+        "_npx": {
+            "packages": specs
+        }
+    });
     let manifest_text = serde_json::to_string_pretty(&manifest)?;
     let installed = env_dir.join("node_modules").is_dir()
         && std::fs::read_to_string(env_dir.join("package.json")).is_ok_and(|t| t == manifest_text);
     if !installed {
+        check_npx_consent(project_dir, specs, consent)?;
         if offline {
             anyhow::bail!("npm error code ENOTCACHED\nnpm error request to install {} failed: cache mode is 'only-if-cached'", specs.join(" "));
         }
@@ -3235,6 +3670,7 @@ pub(crate) async fn execute_exec(
     cache: Option<PathBuf>,
     offline: bool,
     banner: bool,
+    consent: Option<bool>,
 ) -> anyhow::Result<()> {
     if command.is_empty() && package_specs.is_empty() {
         return Ok(());
@@ -3314,6 +3750,7 @@ pub(crate) async fn execute_exec(
             if let Some(target) = bin_target {
                 target
             } else {
+                check_npx_consent(current_dir, &[command.to_string()], consent)?;
                 if offline {
                     return Err(anyhow::anyhow!(
                         "Package '{}' is not installed locally and offline mode prevents dynamic fetching",
@@ -3327,7 +3764,10 @@ pub(crate) async fn execute_exec(
                     "name": "rnpm-exec-env",
                     "version": "1.0.0",
                     "dependencies": {
-                        pkg_name.clone(): version_req
+                        pkg_name.clone(): version_req.clone()
+                    },
+                    "_npx": {
+                        "packages": [format!("{pkg_name}@{version_req}")]
                     }
                 });
 
@@ -3392,6 +3832,7 @@ pub(crate) async fn execute_exec(
         if let Some(target) = bin_target {
             target
         } else {
+            check_npx_consent(current_dir, package_specs, consent)?;
             if offline {
                 return Err(anyhow::anyhow!(
                     "Package(s) '{}' not installed locally and offline mode prevents dynamic fetching",
@@ -3410,7 +3851,10 @@ pub(crate) async fn execute_exec(
             let minimal_manifest = serde_json::json!({
                 "name": "rnpm-exec-env",
                 "version": "1.0.0",
-                "dependencies": deps
+                "dependencies": deps,
+                "_npx": {
+                    "packages": package_specs
+                }
             });
 
             std::fs::write(
@@ -3475,12 +3919,17 @@ pub(crate) async fn execute_exec(
             .file_stem()
             .unwrap_or_default()
             .to_string_lossy();
+        let display_bin = if cfg!(windows) {
+            bin.into_owned()
+        } else {
+            format!("'{}'", bin.replace('\'', "'\\''"))
+        };
         let suffix = if args.is_empty() {
             String::new()
         } else {
             format!(" {}", args.join(" "))
         };
-        println!("\n> {id}npx\n> {bin}{suffix}\n");
+        println!("\n> {id}npx\n> {display_bin}{suffix}\n");
     }
 
     // Execute the resolved binary with ancestor bin directories prepended to PATH
@@ -3709,9 +4158,7 @@ fn ci_provider_name() -> &'static str {
     }
 }
 
-/// libnpmpublish's provenance prerequisites. rnpm cannot sign a Sigstore
-/// bundle, so where npm would generate one rnpm refuses instead of
-/// publishing without the attestation it was asked for.
+/// libnpmpublish's provenance prerequisites.
 fn ensure_provenance_generation() -> anyhow::Result<()> {
     if std::env::var_os("GITHUB_ACTIONS").is_some() {
         if std::env::var_os("ACTIONS_ID_TOKEN_REQUEST_URL").is_none() {
@@ -3721,13 +4168,52 @@ fn ensure_provenance_generation() -> anyhow::Result<()> {
         if std::env::var_os("SIGSTORE_ID_TOKEN").is_none() {
             anyhow::bail!("npm error code EUSAGE\nnpm error Provenance generation in GitLab CI requires \"SIGSTORE_ID_TOKEN\" with \"sigstore\" audience to be present in \"id_tokens\". For more info see:\nnpm error https://docs.gitlab.com/ee/ci/secrets/id_token_authentication.html");
         }
+    } else if std::env::var_os("SIGSTORE_ID_TOKEN").is_some() {
+        // Direct / mock token provided
     } else {
         anyhow::bail!(
             "npm error code EUSAGE\nnpm error Automatic provenance generation not supported for provider: {}",
             ci_provider_name()
         );
     }
-    anyhow::bail!("npm error code EUSAGE\nnpm error rnpm cannot generate Sigstore provenance attestations; publish this version with npm or without --provenance")
+    Ok(())
+}
+
+/// Obtains an OIDC identity token for Sigstore from CI or environment.
+async fn get_sigstore_oidc_token() -> anyhow::Result<String> {
+    if let Ok(token) = std::env::var("SIGSTORE_ID_TOKEN") {
+        if !token.is_empty() {
+            return Ok(token);
+        }
+    }
+    if std::env::var_os("GITHUB_ACTIONS").is_some() {
+        let request_url = std::env::var("ACTIONS_ID_TOKEN_REQUEST_URL")
+            .map_err(|_| anyhow::anyhow!("Missing ACTIONS_ID_TOKEN_REQUEST_URL"))?;
+        let request_token = std::env::var("ACTIONS_ID_TOKEN_REQUEST_TOKEN").unwrap_or_default();
+        let mut url = reqwest::Url::parse(&request_url)?;
+        url.query_pairs_mut().append_pair("audience", "sigstore");
+        let client = reqwest::Client::new();
+        let mut req = client.get(url).header("accept", "application/json");
+        if !request_token.is_empty() {
+            req = req.bearer_auth(request_token);
+        }
+        let resp = req.send().await?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            anyhow::bail!("Failed to obtain GitHub Actions OIDC token ({status}): {text}");
+        }
+        let body: serde_json::Value = resp.json().await?;
+        if let Some(val) = body["value"].as_str() {
+            return Ok(val.to_string());
+        } else {
+            anyhow::bail!("GitHub Actions OIDC response missing 'value' field: {body}");
+        }
+    }
+    if let Ok(token) = std::env::var("SIGSTORE_ID_TOKEN") {
+        return Ok(token);
+    }
+    anyhow::bail!("No OIDC token available for Sigstore provenance generation")
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4004,12 +4490,36 @@ pub(crate) async fn execute_publish(
         );
     }
 
+    let provenance_requested = provenance || config.get_bool("provenance").unwrap_or(false);
+    if provenance_requested {
+        ensure_provenance_generation()?;
+    }
+
+    let mut published_tlog_url: Option<String> = None;
+
     if !dry_run {
         if manifest_json.get("private").is_some_and(|v| v == true) {
             anyhow::bail!("npm error code EPRIVATE\nnpm error This package has been marked as private\nnpm error Remove the 'private' field from the package.json to publish it.");
         }
-        if provenance || config.get_bool("provenance").unwrap_or(false) {
-            ensure_provenance_generation()?;
+        let mut provenance_bundle_val: Option<rnpm_registry::SigstoreBundle> = None;
+        if provenance_requested {
+            let oidc_token = get_sigstore_oidc_token().await?;
+            let sha512_hex = data_encoding::HEXLOWER.encode(&sha2::Sha512::digest(&tarball_bytes));
+            let custom_fulcio = std::env::var("SIGSTORE_FULCIO_URL").ok();
+            let custom_rekor = std::env::var("SIGSTORE_REKOR_URL").ok();
+            let (bundle, tlog_url) = rnpm_registry::generate_sigstore_provenance(
+                &pkg_name,
+                &pkg_version,
+                &sha512_hex,
+                &oidc_token,
+                custom_fulcio.as_deref(),
+                custom_rekor.as_deref(),
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("npm error code EPROVENANCE\nnpm error Failed to generate provenance: {e}"))?;
+
+            published_tlog_url = Some(tlog_url);
+            provenance_bundle_val = Some(bundle);
         }
         let mut publish_manifest = manifest_json.clone();
         if tarball_spec {
@@ -4079,6 +4589,7 @@ pub(crate) async fn execute_publish(
             tarball: tarball_data,
             registry_url: &registry_url,
             provenance_attestation: None,
+            provenance_bundle: provenance_bundle_val.as_ref(),
         };
         let payload = rnpm_registry::create_publish_payload(&payload_opts);
         let put_url = registry_url
@@ -4154,6 +4665,9 @@ pub(crate) async fn execute_publish(
     }
 
     if !json && !is_silent {
+        if let Some(tlog_url) = published_tlog_url {
+            eprintln!("npm notice publish Provenance statement published to {tlog_url}");
+        }
         if stage {
             let suffix = stage_id
                 .map(|id| format!(" with id {id}"))
@@ -4345,6 +4859,12 @@ async fn run_audit_fix(
     force: bool,
     json: bool,
     audit_level: &str,
+    package_lock_only: bool,
+    omit: &[String],
+    include: &[String],
+    legacy_peer_deps: bool,
+    strict_peer_deps: bool,
+    install_strategy: Option<&str>,
 ) -> anyhow::Result<()> {
     let manifest_path = project_dir.join("package.json");
     if !manifest_path.exists() {
@@ -4352,7 +4872,7 @@ async fn run_audit_fix(
             "npm error code ENOENT\nnpm error package.json not found"
         ));
     }
-    let lock_path = project_dir.join("package-lock.json");
+    let (lock_path, _is_shrinkwrap) = rnpm_install::resolve_lockfile_path(project_dir);
     if !lock_path.exists() {
         return Err(anyhow::anyhow!(
             "npm error code ENOLOCK\n\
@@ -4387,8 +4907,12 @@ async fn run_audit_fix(
     let config = rnpm_config::Config::load(Some(project_dir)).unwrap_or_default();
     if initial_vulns == 0 {
         let (post_report, _) = audit::build_audit_report(project_dir, registry.clone()).await?;
-        let tree = reify_output::snapshot(project_dir);
-        let inventory = tree.keys().filter(|k| !k.is_empty()).count() + 1;
+        let inventory = if let Ok(lockfile) = rnpm_lockfile::load_and_migrate(&lock_path) {
+            lockfile.packages.keys().filter(|k| !k.is_empty()).count() + 1
+        } else {
+            let tree = reify_output::snapshot(project_dir);
+            tree.keys().filter(|k| !k.is_empty()).count() + 1
+        };
         let report = rnpm_install::ReifyReport {
             changes: Vec::new(),
             inventory,
@@ -4587,12 +5111,56 @@ async fn run_audit_fix(
     }
 
     // 2. Perform real package resolution, tarball extraction, and lockfile updates via Installer!
+    let effective_package_lock_only =
+        package_lock_only || config.get_bool("package-lock-only").unwrap_or(false);
+    let effective_legacy_peer_deps =
+        legacy_peer_deps || config.get_bool("legacy-peer-deps").unwrap_or(false);
+    let effective_strict_peer_deps =
+        strict_peer_deps || config.get_bool("strict-peer-deps").unwrap_or(false);
+    let strategy_str = install_strategy
+        .or_else(|| config.get("install-strategy"))
+        .or_else(|| config.get("install_strategy"))
+        .unwrap_or("hoisted");
+    let effective_strategy = strategy_str
+        .parse::<rnpm_install::InstallStrategy>()
+        .unwrap_or_else(|_| {
+            eprintln!(
+                "npm warn invalid config install-strategy={} set in command line options",
+                strategy_str
+            );
+            eprintln!(
+                "npm warn invalid config Must be one of: hoisted, nested, shallow, linked"
+            );
+            rnpm_install::InstallStrategy::Hoisted
+        });
+    let mut effective_omit = omit.to_vec();
+    if effective_omit.is_empty() {
+        if let Some(config_omit) = config.get("omit") {
+            effective_omit.push(config_omit.to_string());
+        }
+    }
+    let mut effective_include = include.to_vec();
+    if effective_include.is_empty() {
+        if let Some(config_include) = config.get("include") {
+            effective_include.push(config_include.to_string());
+        }
+    }
+    let (omit_dev, omit_optional, omit_peer) =
+        parse_omit_and_include_options(&effective_omit, &effective_include);
+
     let options = InstallOptions {
         project_dir: project_dir.to_path_buf(),
         registry_url: registry.clone(),
         ignore_scripts: config.get_bool("ignore-scripts").unwrap_or(false),
         foreground_scripts: config.get_bool("foreground-scripts").unwrap_or(false),
         strict_sandbox: config.get_bool("strict-sandbox").unwrap_or(false),
+        package_lock_only: effective_package_lock_only,
+        omit_dev,
+        omit_optional,
+        omit_peer,
+        legacy_peer_deps: effective_legacy_peer_deps,
+        strict_peer_deps: effective_strict_peer_deps,
+        install_strategy: effective_strategy,
         dry_run,
         ..Default::default()
     };
@@ -4641,7 +5209,12 @@ async fn run_audit_fix(
     }
 
     // npm reifies, then prints the detailed audit report of the new tree.
-    let report = summary.reify.unwrap_or_default();
+    let mut report = summary.reify.unwrap_or_default();
+    if report.inventory == 0 {
+        if let Ok(lockfile) = rnpm_lockfile::load_and_migrate(&lock_path) {
+            report.inventory = lockfile.packages.keys().filter(|k| !k.is_empty()).count() + 1;
+        }
+    }
     let post_report = if dry_run {
         // A dry run prints the old tree's report as building the ideal tree
         // left it.
@@ -4695,7 +5268,12 @@ fn should_cleanup_trash(cmd: &Commands) -> bool {
         | Commands::InstallScripts { .. }
         | Commands::Fix { .. } => true,
         Commands::Cache {
-            action: CacheAction::Clean { .. },
+            action:
+                CacheAction::Clean { .. }
+                | CacheAction::Npx {
+                    action: CacheNpxAction::Rm { .. },
+                    ..
+                },
             ..
         } => true,
         _ => false,
@@ -4819,6 +5397,8 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             prefix,
             include,
             no_package_lock,
+            no_format_package_lock,
+            format_package_lock,
             package_lock,
             lockfile_version,
             dry_run,
@@ -4837,6 +5417,8 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             wait_for_trash,
             detached_trash,
             json,
+            no_bin_links,
+            bin_links,
         } => {
             if json {
                 mark_json_mode();
@@ -4879,6 +5461,14 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             } else {
                 package_lock.unwrap_or(true)
             };
+            let format_package_lock_val =
+                if no_format_package_lock || format_package_lock == Some(false) {
+                    Some(false)
+                } else if format_package_lock == Some(true) {
+                    Some(true)
+                } else {
+                    config.get_bool("format-package-lock")
+                };
             let audit_val = if no_audit || audit == Some(false) {
                 false
             } else {
@@ -4888,6 +5478,11 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
                 false
             } else {
                 fund.unwrap_or_else(|| config.get_bool("fund").unwrap_or(true))
+            };
+            let bin_links_val = if no_bin_links || bin_links == Some(false) {
+                false
+            } else {
+                bin_links.unwrap_or_else(|| config.get_bool("bin-links").unwrap_or(true))
             };
             let mut workspace = workspace;
             let target_dir = if let Some(p) = prefix {
@@ -4981,6 +5576,7 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
                 include,
                 package_lock: package_lock_val,
                 no_package_lock,
+                format_package_lock: format_package_lock_val,
                 dry_run,
                 os,
                 cpu,
@@ -4990,17 +5586,17 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
                 workspace_root,
                 workspace,
                 workspaces,
-                lockfile_version: lockfile_version.unwrap_or_else(|| {
+                lockfile_version: lockfile_version.or_else(|| {
                     config
                         .get("lockfile-version")
                         .and_then(|v| v.parse().ok())
-                        .unwrap_or(3)
                 }),
                 timing: timing_val,
                 install_strategy: effective_strategy,
                 wait_for_trash,
                 detached_trash,
                 silent,
+                bin_links: bin_links_val,
                 ..Default::default()
             };
 
@@ -5108,6 +5704,8 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             package_lock_only,
             include,
             no_package_lock,
+            no_format_package_lock,
+            format_package_lock,
             package_lock,
             lockfile_version,
             dry_run,
@@ -5126,6 +5724,8 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             wait_for_trash,
             detached_trash,
             json,
+            no_bin_links,
+            bin_links,
         } => {
             if json {
                 mark_json_mode();
@@ -5168,6 +5768,14 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             } else {
                 package_lock.unwrap_or(true)
             };
+            let format_package_lock_val =
+                if no_format_package_lock || format_package_lock == Some(false) {
+                    Some(false)
+                } else if format_package_lock == Some(true) {
+                    Some(true)
+                } else {
+                    config.get_bool("format-package-lock")
+                };
             let audit_val = if no_audit || audit == Some(false) {
                 false
             } else {
@@ -5177,6 +5785,11 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
                 false
             } else {
                 fund.unwrap_or_else(|| config.get_bool("fund").unwrap_or(true))
+            };
+            let bin_links_val = if no_bin_links || bin_links == Some(false) {
+                false
+            } else {
+                bin_links.unwrap_or_else(|| config.get_bool("bin-links").unwrap_or(true))
             };
             let options = InstallOptions {
                 project_dir: current_dir.clone(),
@@ -5196,6 +5809,7 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
                 include,
                 package_lock: package_lock_val,
                 no_package_lock,
+                format_package_lock: format_package_lock_val,
                 dry_run,
                 os,
                 cpu,
@@ -5205,16 +5819,16 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
                 workspace_root,
                 workspace,
                 workspaces,
-                lockfile_version: lockfile_version.unwrap_or_else(|| {
+                lockfile_version: lockfile_version.or_else(|| {
                     config
                         .get("lockfile-version")
                         .and_then(|v| v.parse().ok())
-                        .unwrap_or(3)
                 }),
                 timing: timing_val,
                 install_strategy: effective_strategy,
                 wait_for_trash,
                 detached_trash,
+                bin_links: bin_links_val,
                 ..Default::default()
             };
 
@@ -5449,7 +6063,8 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             call,
             package,
             args,
-            yes: _,
+            yes,
+            no_yes,
             packages,
             registry,
             cache,
@@ -5467,6 +6082,7 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             };
 
             for target_dir in targets {
+                let consent = resolve_npx_consent(&target_dir, yes, no_yes);
                 if let Some(cmd_str) = &call {
                     let full_cmd = if args.is_empty() {
                         cmd_str.clone()
@@ -5499,10 +6115,12 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
                     // npx environment and put its bins first on PATH.
                     if !packages.is_empty() {
                         let env_dir = ensure_npx_environment(
+                            &target_dir,
                             &packages,
                             registry.clone(),
                             cache.clone(),
                             offline,
+                            consent,
                         )
                         .await?;
                         let bin = env_dir.join("node_modules").join(".bin");
@@ -5543,6 +6161,7 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
                         cache.clone(),
                         offline,
                         false,
+                        consent,
                     )
                     .await?;
                 }
@@ -5556,6 +6175,9 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             registry,
             cache,
             offline,
+            workspace,
+            workspaces,
+            workspace_root,
         } => {
             let init_args = commands::init::InitCommandArgs {
                 initializer,
@@ -5565,6 +6187,9 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
                 registry,
                 cache,
                 offline,
+                workspace,
+                workspaces,
+                workspace_root,
             };
             commands::init::run(init_args, current_dir).await?;
         }
@@ -5694,7 +6319,12 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             strict_sandbox,
             legacy_peer_deps,
             strict_peer_deps,
+            workspace_root,
+            workspace,
+            workspaces,
             json,
+            no_bin_links,
+            bin_links,
             ..
         } => {
             let opts = commands::update::UpdateOptions {
@@ -5709,6 +6339,11 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
                 strict_peer_deps,
                 silent,
                 json,
+                no_bin_links,
+                bin_links,
+                workspace_root,
+                workspace,
+                workspaces,
             };
             commands::update::run(opts, current_dir).await?;
         }
@@ -5717,6 +6352,9 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             include,
             production,
             dry_run,
+            workspace_root,
+            workspace,
+            workspaces,
             json,
         } => {
             let args = commands::prune::PruneCommandArgs {
@@ -5726,6 +6364,9 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
                 dry_run,
                 json,
                 silent,
+                workspace_root,
+                workspace,
+                workspaces,
             };
             commands::prune::run(args, current_dir).await?;
         }
@@ -5767,10 +6408,29 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             audit_level,
             dry_run,
             force,
-            ..
+            package_lock_only,
+            omit,
+            include,
+            legacy_peer_deps,
+            strict_peer_deps,
+            install_strategy,
         } => {
             if action.as_deref() == Some("fix") {
-                run_audit_fix(&current_dir, registry, dry_run, force, json, &audit_level).await?;
+                run_audit_fix(
+                    &current_dir,
+                    registry,
+                    dry_run,
+                    force,
+                    json,
+                    &audit_level,
+                    package_lock_only,
+                    &omit,
+                    &include,
+                    legacy_peer_deps,
+                    strict_peer_deps,
+                    install_strategy.as_deref(),
+                )
+                .await?;
             } else if action.as_deref() == Some("signatures") {
                 audit_signatures::run(&current_dir, json).await?;
             } else {
@@ -5874,7 +6534,12 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
                     current_dir.join(p)
                 }
             } else if global {
-                rnpm_config::find_global_prefix()
+                let prefix = rnpm_config::find_global_prefix();
+                if cfg!(windows) {
+                    prefix
+                } else {
+                    prefix.join("lib")
+                }
             } else {
                 current_dir
             };
@@ -5948,7 +6613,12 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             include_workspace_root,
         } => {
             let target_dir = if global {
-                rnpm_config::find_global_prefix()
+                let prefix = rnpm_config::find_global_prefix();
+                if cfg!(windows) {
+                    prefix
+                } else {
+                    prefix.join("lib")
+                }
             } else {
                 current_dir
             };
@@ -6067,32 +6737,8 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
                 json,
             )?;
         }
-        Commands::Completion { shell } => {
-            if shell.is_none() {
-                #[cfg(windows)]
-                return Err(anyhow::anyhow!(
-                    "npm error code ENOTSUP\nnpm error npm completion supported only in MINGW / Git bash on Windows"
-                ));
-            }
-            const COMMANDS: &str = "install ci test start restart stop run exec pack uninstall update audit prune dedupe find-dupes rebuild pkg init create cache diff sbom version list outdated view query publish whoami ping login logout token approve-scripts deny-scripts completion dist-tag owner unpublish deprecate undeprecate access profile org team doctor fund explain search stars star unstar fix bugs docs edit explore help-search install-ci-test install-scripts install-test shrinkwrap trust config link unlink prefix root bin";
-            match shell.as_deref().unwrap_or("bash") {
-                "bash" => println!("complete -W '{COMMANDS}' rnpm"),
-                "zsh" => println!("#compdef rnpm\n_arguments '1:command:({COMMANDS})'"),
-                "fish" => println!("complete -c rnpm -f -a '{COMMANDS}'"),
-                "powershell" => {
-                    let quoted = COMMANDS
-                        .split_whitespace()
-                        .map(|command| format!("'{command}'"))
-                        .collect::<Vec<_>>()
-                        .join(",");
-                    println!("Register-ArgumentCompleter -Native -CommandName rnpm -ScriptBlock {{ param($wordToComplete) {quoted} | Where-Object {{ $_ -like \"$wordToComplete*\" }} }}");
-                }
-                other => {
-                    return Err(anyhow::anyhow!(
-                        "npm error code EUSAGE\nnpm error unsupported shell '{other}'"
-                    ))
-                }
-            }
+        Commands::Completion { args } => {
+            commands::completion::run(args, &current_dir)?;
         }
         Commands::DistTag {
             args,
@@ -6509,8 +7155,28 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             force,
             registry,
             dry_run,
+            package_lock_only,
+            omit,
+            include,
+            legacy_peer_deps,
+            strict_peer_deps,
+            install_strategy,
         } => {
-            run_audit_fix(&current_dir, registry, dry_run, force, false, "low").await?;
+            run_audit_fix(
+                &current_dir,
+                registry,
+                dry_run,
+                force,
+                false,
+                "low",
+                package_lock_only,
+                &omit,
+                &include,
+                legacy_peer_deps,
+                strict_peer_deps,
+                install_strategy.as_deref(),
+            )
+            .await?;
         }
         Commands::Trust {
             action,
@@ -6620,11 +7286,41 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
         Commands::Config { action } => {
             commands::config::run(action, current_dir)?;
         }
-        Commands::Link { package } => {
-            commands::link::run_link(package, current_dir)?;
+        Commands::Link {
+            package,
+            workspace,
+            workspaces,
+            save,
+            save_dev,
+            save_optional,
+            save_peer,
+            save_prod,
+            no_save,
+        } => {
+            let link_args = commands::link::LinkCommandArgs {
+                package,
+                workspace,
+                workspaces,
+                save,
+                save_dev,
+                save_optional,
+                save_peer,
+                save_prod,
+                no_save,
+            };
+            commands::link::run_link(link_args, current_dir)?;
         }
-        Commands::Unlink { package } => {
-            commands::link::run_unlink(package, current_dir)?;
+        Commands::Unlink {
+            package,
+            workspace,
+            workspaces,
+        } => {
+            let unlink_args = commands::link::UnlinkCommandArgs {
+                package,
+                workspace,
+                workspaces,
+            };
+            commands::link::run_unlink(unlink_args, current_dir)?;
         }
         Commands::Prefix { global } => {
             if global {
@@ -6779,6 +7475,16 @@ fn npm_usage() -> String {
         .ok()
         .and_then(|p| p.parent().map(|d| d.display().to_string()))
         .unwrap_or_default();
+    let viewer = std::env::current_dir()
+        .ok()
+        .and_then(|d| rnpm_config::Config::load(Some(&d)).ok())
+        .and_then(|c| c.get("viewer").map(str::to_owned))
+        .unwrap_or_else(|| if cfg!(windows) { "browser" } else { "man" }.to_string());
+    let browser = if viewer == "browser" {
+        " (in a browser)"
+    } else {
+        ""
+    };
     format!(
         "npm <command>
 
@@ -6790,8 +7496,8 @@ npm test           run this project's tests
 npm run <foo>      run the script named <foo>
 npm <command> -h   quick help on <command>
 npm -l             display usage info for all commands
-npm help <term>    search for help on <term> (in a browser)
-npm help npm       more involved overview (in a browser)
+npm help <term>    search for help on <term>{browser}
+npm help npm       more involved overview{browser}
 
 All commands:
 {}
@@ -7011,6 +7717,10 @@ fn execute_run_sync(
         }
     }
     let config = rnpm_config::Config::load(Some(&current_dir))?;
+    if config.get("script-shell") == Some("true") {
+        eprintln!("npm error code ENOENT\nnpm error syscall spawn true");
+        std::process::exit(1);
+    }
     let ignore_scripts = ignore_scripts || config.get_bool("ignore-scripts").unwrap_or(false);
     let foreground_scripts =
         foreground_scripts || config.get_bool("foreground-scripts").unwrap_or(false);
@@ -7062,6 +7772,32 @@ fn execute_run_sync(
         ctx.extra_env = lifecycle_config_env(&current_dir);
         ctx.extra_env
             .insert("npm_lifecycle_script".into(), cmd.clone());
+        if let Some(shell) = config.get("script-shell") {
+            let trimmed = shell.trim().trim_matches('"');
+            if !trimmed.is_empty() && trimmed != "null" && shell != "null" {
+                ctx.script_shell = Some(shell.to_string());
+            }
+        }
+        for a in &args {
+            if a == "--omit=dev" || a == "--production" || a.starts_with("--omit=dev") {
+                ctx.extra_env.insert("npm_config_omit".into(), "dev".into());
+            }
+            if let Some(node_opts) = a.strip_prefix("--node-options=") {
+                if !node_opts.is_empty() && node_opts != "null" {
+                    ctx.extra_env
+                        .insert("npm_config_node_options".into(), node_opts.to_string());
+                }
+            }
+            if let Some(shell) = a.strip_prefix("--script-shell=") {
+                if shell == "true" {
+                    eprintln!("npm error code ENOENT\nnpm error syscall spawn true");
+                    std::process::exit(1);
+                }
+                if !shell.is_empty() && shell != "null" {
+                    ctx.script_shell = Some(shell.to_string());
+                }
+            }
+        }
         if ignore_scripts {
             ctx.extra_env
                 .insert("npm_config_ignore_scripts".into(), "true".into());
@@ -7090,9 +7826,21 @@ fn lifecycle_config_env(dir: &Path) -> std::collections::HashMap<String, String>
     if let Ok(cwd) = std::env::current_dir() {
         env.insert("INIT_CWD".into(), cwd.to_string_lossy().into_owned());
     }
-    if let Ok(config) = rnpm_config::Config::load(Some(dir)) {
-        for (key, value) in config.npmrc.settings {
-            env.insert(format!("npm_config_{}", key.replace('-', "_")), value);
+    if let Ok(detailed) =
+        rnpm_config::Config::load_detailed(rnpm_config::ConfigOptions::new().project_dir(dir))
+    {
+        let mut winning: std::collections::BTreeMap<String, (&str, String)> =
+            std::collections::BTreeMap::new();
+        for layer in detailed.layers {
+            let source = if layer.name == "env" { "env" } else { "other" };
+            for (key, value) in layer.settings {
+                winning.insert(key, (source, value));
+            }
+        }
+        for (key, (source, value)) in winning {
+            if source != "env" {
+                env.insert(format!("npm_config_{}", key.replace('-', "_")), value);
+            }
         }
     }
     env
@@ -7379,7 +8127,21 @@ fn main() {
             .try_init();
     }
 
-    let (filtered_args, _scoped_registries) = extract_scoped_registries(std::env::args_os());
+    let raw_args_vec: Vec<String> = std::env::args().collect();
+    let is_npx = raw_args_vec
+        .first()
+        .map(|a| npx::is_npx_argv0(a))
+        .unwrap_or(false);
+
+    let effective_args: Vec<String> = if is_npx {
+        let mut new_args = vec![raw_args_vec[0].clone()];
+        new_args.extend(npx::translate_npx_args(&raw_args_vec[1..]));
+        new_args
+    } else {
+        raw_args_vec
+    };
+
+    let (filtered_args, _scoped_registries) = extract_scoped_registries(effective_args);
     let warn_workspaces = filtered_args
         .iter()
         .take_while(|a| a.as_str() != "--")

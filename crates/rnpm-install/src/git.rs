@@ -55,9 +55,15 @@ impl GitFetcher {
         let commit_sha = self
             .resolve_commit_sha(&remote_dir, committish, &clone_url, offline)
             .await?;
-        let checkout_dir = self
+        let root_checkout_dir = self
             .checkout_tree(&remote_dir, &commit_sha, &clone_url)
             .await?;
+
+        let checkout_dir = if let Some(subdir) = target.git_subdir() {
+            resolve_git_subdir(&root_checkout_dir, subdir)?
+        } else {
+            root_checkout_dir
+        };
 
         let manifest_path = checkout_dir.join("package.json");
         if !manifest_path.exists() {
@@ -101,9 +107,15 @@ impl GitFetcher {
         let commit_sha = self
             .resolve_commit_sha(&remote_dir, committish, &clone_url, offline)
             .await?;
-        let checkout_dir = self
+        let root_checkout_dir = self
             .checkout_tree(&remote_dir, &commit_sha, &clone_url)
             .await?;
+
+        let checkout_dir = if let Some(subdir) = target.git_subdir() {
+            resolve_git_subdir(&root_checkout_dir, subdir)?
+        } else {
+            root_checkout_dir
+        };
 
         let manifest_path = checkout_dir.join("package.json");
         if !manifest_path.exists() {
@@ -427,8 +439,28 @@ impl GitFetcher {
         clone_url: &str,
     ) -> Result<PathBuf> {
         let checkout_dir = self.checkout_cache_dir(clone_url, commit_sha);
+        let marker_file = checkout_marker_file(&checkout_dir);
+        let done_marker = checkout_dir.with_extension("done");
+        let legacy_marker = checkout_dir.join(".rnpm_checkout_done");
 
-        if checkout_dir.join("package.json").exists() {
+        if (marker_file.exists()
+            || done_marker.exists()
+            || checkout_dir.join("package.json").exists())
+            && !checkout_dir.join(".gitmodules").is_file()
+        {
+            if legacy_marker.exists() {
+                let _ = std::fs::remove_file(&legacy_marker);
+            }
+            debug!(
+                "Reusing existing checkout for commit {} at '{}'",
+                commit_sha,
+                checkout_dir.display()
+            );
+            return Ok(checkout_dir);
+        } else if marker_file.exists() || done_marker.exists() {
+            if legacy_marker.exists() {
+                let _ = std::fs::remove_file(&legacy_marker);
+            }
             debug!(
                 "Reusing existing checkout for commit {} at '{}'",
                 commit_sha,
@@ -444,57 +476,213 @@ impl GitFetcher {
             )
         })?;
 
+        let is_file_proto = clone_url.starts_with("file:")
+            || clone_url.starts_with("git+file:")
+            || Path::new(clone_url).is_absolute()
+            || clone_url.contains("file://")
+            || (clone_url.len() >= 2 && clone_url.as_bytes()[1] == b':');
+
         // 1. Preferred method: git archive (clean, fast, no .git directory overhead)
         let archive_bytes = run_git_archive(remote_dir, commit_sha).await;
         if let Ok(bytes) = archive_bytes {
             let mut archive = tar::Archive::new(std::io::Cursor::new(bytes));
-            if archive.unpack(&checkout_dir).is_ok() && checkout_dir.join("package.json").exists() {
+            if archive.unpack(&checkout_dir).is_ok()
+                && !checkout_dir.join(".gitmodules").is_file()
+                && checkout_dir.join("package.json").exists()
+            {
+                let _ = remove_all_git_metadata(&checkout_dir);
+                let _ = std::fs::File::create(&marker_file);
+                let _ = std::fs::remove_file(checkout_dir.join(".rnpm_checkout_done"));
                 return Ok(checkout_dir);
             }
         }
 
-        // 2. Fallback method: work-tree checkout
+        // If submodules are present or archive failed, do clone/checkout
+        let _ = safe_remove_dir_all(&checkout_dir);
+        std::fs::create_dir_all(&checkout_dir)?;
+
         let remote_dir_str = remote_dir.to_string_lossy();
         let checkout_dir_str = checkout_dir.to_string_lossy();
-        let (checkout_ok, _, checkout_err) = run_git_cmd(
-            &[
-                "-c",
-                "core.bare=false",
-                "--git-dir",
-                &remote_dir_str,
-                "--work-tree",
-                &checkout_dir_str,
-                "checkout",
-                "-f",
-                commit_sha,
-            ],
-            None,
-        )
-        .await?;
 
-        if !checkout_ok {
-            let _ = safe_remove_dir_all(&checkout_dir);
-            return Err(anyhow!(
-                "Failed to checkout git commit '{}' from '{}': {}",
-                commit_sha,
-                clone_url,
-                checkout_err
-            ));
+        let mut clone_args = vec!["-c", "core.longpaths=true"];
+        if is_file_proto {
+            clone_args.push("-c");
+            clone_args.push("protocol.file.allow=always");
+        }
+        clone_args.extend_from_slice(&[
+            "clone",
+            "--shared",
+            &remote_dir_str,
+            &checkout_dir_str,
+        ]);
+
+        let (clone_ok, _, _clone_err) = run_git_cmd(&clone_args, None).await?;
+        if !clone_ok {
+            // Fallback to work-tree checkout if clone --shared fails
+            let (checkout_ok, _, checkout_err) = run_git_cmd(
+                &[
+                    "-c",
+                    "core.bare=false",
+                    "--git-dir",
+                    &remote_dir_str,
+                    "--work-tree",
+                    &checkout_dir_str,
+                    "checkout",
+                    "-f",
+                    commit_sha,
+                ],
+                None,
+            )
+            .await?;
+
+            if !checkout_ok {
+                let _ = safe_remove_dir_all(&checkout_dir);
+                let _ = std::fs::remove_file(&marker_file);
+                return Err(anyhow!(
+                    "Failed to checkout git commit '{}' from '{}': {}",
+                    commit_sha,
+                    clone_url,
+                    checkout_err
+                ));
+            }
+        } else {
+            let (co_ok, _, co_err) = run_git_cmd(
+                &["checkout", "-f", commit_sha],
+                Some(&checkout_dir),
+            )
+            .await?;
+            if !co_ok {
+                let _ = safe_remove_dir_all(&checkout_dir);
+                let _ = std::fs::remove_file(&marker_file);
+                return Err(anyhow!(
+                    "Failed to checkout commit '{}' in '{}': {}",
+                    commit_sha,
+                    clone_url,
+                    co_err
+                ));
+            }
         }
 
-        let git_file = checkout_dir.join(".git");
-        if git_file.exists() {
-            let _ = std::fs::remove_file(&git_file);
-            let _ = safe_remove_dir_all(&git_file);
+        // Initialize and update submodules recursively if .gitmodules exists
+        if checkout_dir.join(".gitmodules").is_file() {
+            let mut subm_args = Vec::new();
+            if is_file_proto {
+                subm_args.push("-c");
+                subm_args.push("protocol.file.allow=always");
+            }
+            subm_args.extend_from_slice(&[
+                "submodule",
+                "update",
+                "--init",
+                "--recursive",
+            ]);
+
+            let (subm_ok, _, subm_err) = run_git_cmd(&subm_args, Some(&checkout_dir)).await?;
+            if !subm_ok {
+                if subm_err.contains("protocol") || subm_err.contains("transport 'file'") {
+                    let (retry_ok, _, retry_err) = run_git_cmd(
+                        &[
+                            "-c",
+                            "protocol.file.allow=always",
+                            "submodule",
+                            "update",
+                            "--init",
+                            "--recursive",
+                        ],
+                        Some(&checkout_dir),
+                    )
+                    .await?;
+                    if !retry_ok {
+                        let _ = safe_remove_dir_all(&checkout_dir);
+                        let _ = std::fs::remove_file(&marker_file);
+                        return Err(anyhow!(
+                            "Failed to update git submodules for '{}' at commit '{}': {}",
+                            clone_url,
+                            commit_sha,
+                            retry_err
+                        ));
+                    }
+                } else {
+                    let _ = safe_remove_dir_all(&checkout_dir);
+                    let _ = std::fs::remove_file(&marker_file);
+                    return Err(anyhow!(
+                        "Failed to update git submodules for '{}' at commit '{}': {}",
+                        clone_url,
+                        commit_sha,
+                        subm_err
+                    ));
+                }
+            }
         }
+
+        // Clean all .git metadata from checkout tree so none leaks into node_modules
+        remove_all_git_metadata(&checkout_dir)?;
+
+        // Mark checkout complete outside the package tree
+        let _ = std::fs::File::create(&marker_file);
+        let _ = std::fs::remove_file(checkout_dir.join(".rnpm_checkout_done"));
 
         Ok(checkout_dir)
     }
 }
 
+/// Validates that a git dependency subdir stays inside the checkout root
+/// (rejecting `..` or absolute path traversal), and returns the resolved directory path.
+pub fn resolve_git_subdir(root: &Path, subdir: &str) -> Result<PathBuf> {
+    let trimmed = subdir.trim();
+    if trimmed.is_empty() {
+        return Ok(root.to_path_buf());
+    }
+
+    let normalized_str = trimmed.replace('\\', "/");
+    let clean_str = normalized_str.trim_matches('/');
+
+    let subpath = Path::new(clean_str);
+    if subpath.is_absolute()
+        || normalized_str.starts_with('/')
+        || normalized_str.starts_with('\\')
+        || (normalized_str.len() >= 2 && normalized_str.as_bytes()[1] == b':')
+    {
+        return Err(anyhow!(
+            "Path traversal rejected: git subdir '{}' is an absolute path",
+            subdir
+        ));
+    }
+
+    for component in subpath.components() {
+        match component {
+            std::path::Component::ParentDir => {
+                return Err(anyhow!(
+                    "Path traversal rejected: git subdir '{}' contains directory traversal ('..')",
+                    subdir
+                ));
+            }
+            std::path::Component::RootDir | std::path::Component::Prefix(_) => {
+                return Err(anyhow!(
+                    "Path traversal rejected: git subdir '{}' is an absolute path",
+                    subdir
+                ));
+            }
+            _ => {}
+        }
+    }
+
+    let target_path = root.join(subpath);
+    let cleaned_target = path_clean::clean(&target_path);
+    let cleaned_root = path_clean::clean(root);
+    if !cleaned_target.starts_with(&cleaned_root) {
+        return Err(anyhow!(
+            "Path traversal rejected: git subdir '{}' escapes checkout root",
+            subdir
+        ));
+    }
+
+    Ok(target_path)
+}
+
 /// Formats canonical locked resolved URL for lockfile v3.
 pub fn format_git_resolved_url(target: &PackageTarget, commit_sha: &str) -> String {
-    match target {
+    let base = match target {
         PackageTarget::Git { url, .. } => {
             if let Some(rest) = url.strip_prefix("github:") {
                 let repo = rest.trim_end_matches(".git");
@@ -517,6 +705,11 @@ pub fn format_git_resolved_url(target: &PackageTarget, commit_sha: &str) -> Stri
             }
         }
         _ => format!("git#{commit_sha}"),
+    };
+    if let Some(subdir) = target.git_subdir() {
+        format!("{base}::path:{subdir}")
+    } else {
+        base
     }
 }
 
@@ -556,45 +749,65 @@ pub fn normalize_clone_url_for_git(url: &str) -> String {
     url.to_string()
 }
 
-pub fn copy_dir_all(src: &Path, dst: &Path) -> Result<()> {
-    std::fs::create_dir_all(dst)
-        .with_context(|| format!("Failed to create directory '{}'", dst.display()))?;
+/// Path to the checkout marker file, placed as a sibling to the checkout directory
+/// so that it never leaks into the checked-out package contents.
+pub fn checkout_marker_file(checkout_dir: &Path) -> PathBuf {
+    if let (Some(parent), Some(name)) = (checkout_dir.parent(), checkout_dir.file_name()) {
+        parent.join(format!("{}.rnpm_checkout_done", name.to_string_lossy()))
+    } else {
+        checkout_dir.with_extension("rnpm_checkout_done")
+    }
+}
 
-    let manifest_path = src.join("package.json");
-    if manifest_path.is_file() {
-        if let Ok(manifest) = Manifest::from_file(&manifest_path) {
-            if let Ok(files) = rnpm_fs::collect_pack_files(src, &manifest) {
-                for (rel, file_path) in files {
-                    let to = dst.join(&rel);
-                    if let Some(p) = to.parent() {
-                        let _ = std::fs::create_dir_all(p);
+/// Recursively removes all `.git` directories and `.git` files (such as those created by git submodules)
+/// and any internal checkout markers from a checkout tree.
+pub fn remove_all_git_metadata(root: &Path) -> Result<()> {
+    if !root.exists() {
+        return Ok(());
+    }
+    let mut dirs_to_visit = vec![root.to_path_buf()];
+    while let Some(current) = dirs_to_visit.pop() {
+        if let Ok(entries) = std::fs::read_dir(&current) {
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let path = entry.path();
+                if name == ".git" {
+                    if path.is_dir() {
+                        let _ = safe_remove_dir_all(&path);
+                    } else {
+                        let _ = std::fs::remove_file(&path);
                     }
-                    std::fs::copy(&file_path, &to).with_context(|| {
-                        format!(
-                            "Failed to copy '{}' -> '{}'",
-                            file_path.display(),
-                            to.display()
-                        )
-                    })?;
+                } else if name == ".rnpm_checkout_done" {
+                    let _ = std::fs::remove_file(&path);
+                } else if let Ok(ft) = entry.file_type() {
+                    if ft.is_dir() {
+                        dirs_to_visit.push(path);
+                    }
                 }
-                return Ok(());
             }
         }
     }
+    Ok(())
+}
+
+/// Raw recursive directory copy that skips `.git` files/directories and `.rnpm_checkout_done`.
+pub fn copy_dir_all_raw(src: &Path, dst: &Path) -> Result<()> {
+    std::fs::create_dir_all(dst)
+        .with_context(|| format!("Failed to create directory '{}'", dst.display()))?;
 
     for entry in std::fs::read_dir(src)
         .with_context(|| format!("Failed to read directory '{}'", src.display()))?
     {
         let entry = entry?;
         let file_name = entry.file_name();
-        if file_name == ".git" {
+        if file_name == ".git" || file_name == ".rnpm_checkout_done" {
             continue;
         }
         let ty = entry.file_type()?;
         let from = entry.path();
         let to = dst.join(&file_name);
         if ty.is_dir() {
-            copy_dir_all(&from, &to)?;
+            copy_dir_all_raw(&from, &to)?;
         } else if ty.is_symlink() {
             #[cfg(unix)]
             {
@@ -612,6 +825,389 @@ pub fn copy_dir_all(src: &Path, dst: &Path) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn copy_pack_files_to_dest(source_dir: &Path, manifest: &Manifest, dst: &Path) -> Result<()> {
+    if let Ok(files) = rnpm_fs::collect_pack_files(source_dir, manifest) {
+        for (rel, file_path) in files {
+            if rel == ".rnpm_checkout_done"
+                || rel.ends_with("/.rnpm_checkout_done")
+                || rel.ends_with("\\.rnpm_checkout_done")
+                || file_path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    == Some(".rnpm_checkout_done")
+                || rel == ".git"
+                || rel.starts_with(".git/")
+                || rel.starts_with(".git\\")
+                || rel == "node_modules"
+                || rel.starts_with("node_modules/")
+                || rel.starts_with("node_modules\\")
+            {
+                continue;
+            }
+            let to = dst.join(&rel);
+            if let Some(p) = to.parent() {
+                let _ = std::fs::create_dir_all(p);
+            }
+            std::fs::copy(&file_path, &to).with_context(|| {
+                format!(
+                    "Failed to copy '{}' -> '{}'",
+                    file_path.display(),
+                    to.display()
+                )
+            })?;
+        }
+        return Ok(());
+    }
+
+    copy_dir_all_raw_pack(source_dir, dst)
+}
+
+/// Raw recursive directory copy for packing fallback that strictly skips:
+/// `.git`, `.rnpm_checkout_done`, and `node_modules`.
+pub fn copy_dir_all_raw_pack(src: &Path, dst: &Path) -> Result<()> {
+    std::fs::create_dir_all(dst)
+        .with_context(|| format!("Failed to create directory '{}'", dst.display()))?;
+
+    for entry in std::fs::read_dir(src)
+        .with_context(|| format!("Failed to read directory '{}'", src.display()))?
+    {
+        let entry = entry?;
+        let file_name = entry.file_name();
+        let name_str = file_name.to_string_lossy();
+        if name_str == ".git" || name_str == ".rnpm_checkout_done" || name_str == "node_modules" {
+            continue;
+        }
+        let ty = entry.file_type()?;
+        let from = entry.path();
+        let to = dst.join(&file_name);
+        if ty.is_dir() {
+            copy_dir_all_raw_pack(&from, &to)?;
+        } else if ty.is_symlink() {
+            #[cfg(unix)]
+            {
+                let link_target = std::fs::read_link(&from)?;
+                let _ = std::os::unix::fs::symlink(&link_target, &to);
+            }
+            #[cfg(windows)]
+            {
+                let _ = std::fs::copy(&from, &to);
+            }
+        } else {
+            std::fs::copy(&from, &to).with_context(|| {
+                format!("Failed to copy '{}' -> '{}'", from.display(), to.display())
+            })?;
+        }
+    }
+    Ok(())
+}
+
+/// Options for materializing git dependencies into node_modules.
+#[derive(Debug, Clone, Default)]
+pub struct GitMaterializeOptions {
+    pub ignore_scripts: bool,
+    pub foreground_scripts: bool,
+    pub registry_url: Option<String>,
+    pub cache_dir: Option<PathBuf>,
+    pub offline: bool,
+    pub prefer_offline: bool,
+    pub prefer_online: bool,
+    pub strict_sandbox: bool,
+    pub git_no_prepare: Vec<String>,
+    pub git_prepare_depth: usize,
+    pub source_policy_override: Option<crate::policy::SourcePolicy>,
+    pub force_non_root_policy: bool,
+    pub before_cutoff: Option<i64>,
+    pub min_release_age_exclude: Vec<String>,
+    pub config_override: Option<rnpm_config::Config>,
+}
+
+/// Materializes a git dependency into the destination folder in node_modules,
+/// executing the `prepare`-then-`pack` build flow matching npm pacote:
+/// 1. Check `package.json` in the checked-out git dependency.
+/// 2. If the git package defines `prepare` (or `prepack`/`postpack`) AND `ignore_scripts` is false:
+///    - Check recursion depth and visited guards to prevent cyclic/infinite loops.
+///    - If `dependencies` or `devDependencies` are declared, install them into the staging directory's
+///      `node_modules` using the configured cache/registry/offline settings.
+///    - Run `prepack` (if present) and `prepare` (if present) with `PATH` including `<staging>/node_modules/.bin`.
+///    - Collect/pack package files (respecting `files`, `.npmignore`, strictly excluding `.git`,
+///      `.rnpm_checkout_done`, and `node_modules`) into `dst`.
+///    - Run `postpack` (if present) after collection/packing.
+/// 3. If no prepare scripts or ignore_scripts is true, directly collect/pack files to `dst`.
+pub async fn materialize_git_dependency_with_options(
+    src: &Path,
+    dst: &Path,
+    options: &GitMaterializeOptions,
+) -> Result<()> {
+    std::fs::create_dir_all(dst)
+        .with_context(|| format!("Failed to create directory '{}'", dst.display()))?;
+
+    let manifest_path = src.join("package.json");
+    if !manifest_path.is_file() {
+        return copy_dir_all_raw_pack(src, dst);
+    }
+
+    let manifest = Manifest::from_file(&manifest_path).with_context(|| {
+        format!("Failed to parse package.json from '{}'", manifest_path.display())
+    })?;
+
+    // Check if the package defines prepare, prepack, or postpack scripts (matching pacote's prepare detection)
+    let has_prepare = manifest.scripts.contains_key("prepare")
+        || manifest.scripts.contains_key("prepack")
+        || manifest.scripts.contains_key("postpack");
+
+    if has_prepare && !options.ignore_scripts {
+        let no_prepare_env = std::env::var("_RNPM_NO_PREPARE_").unwrap_or_default();
+        let canonical_src = src.canonicalize().unwrap_or_else(|_| src.to_path_buf());
+        let src_key = canonical_src.to_string_lossy().to_string();
+
+        // Recursion depth guard to prevent runaway git dependency chains
+        const MAX_GIT_PREPARE_DEPTH: usize = 10;
+        let env_depth: usize = std::env::var("_RNPM_PREPARE_DEPTH_")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        let current_depth = std::cmp::max(options.git_prepare_depth, env_depth);
+
+        if current_depth >= MAX_GIT_PREPARE_DEPTH {
+            warn!(
+                "Max git dependency prepare recursion depth ({}) reached, skipping prepare for '{}'",
+                current_depth, src_key
+            );
+            return copy_pack_files_to_dest(src, &manifest, dst);
+        }
+
+        // Visited set guard to prevent cyclic git dependency loops
+        if options.git_no_prepare.iter().any(|s| s == &src_key)
+            || no_prepare_env.split('\n').any(|s| s == src_key)
+        {
+            debug!(
+                "Skipping prepare for git dependency '{}', already seen in no_prepare",
+                src_key
+            );
+            return copy_pack_files_to_dest(src, &manifest, dst);
+        }
+
+        let staging_parent = src.parent().unwrap_or(src);
+        let staging_dir = tempfile::Builder::new()
+            .prefix("rnpm-git-prepare-")
+            .tempdir_in(staging_parent)
+            .or_else(|_| tempfile::tempdir())?;
+
+        copy_dir_all_raw_pack(src, staging_dir.path())?;
+
+        let trusted_config = options
+            .config_override
+            .clone()
+            .unwrap_or_else(|| rnpm_config::Config::load(None).unwrap_or_default());
+
+        let new_no_prepare = if no_prepare_env.is_empty() {
+            src_key.clone()
+        } else {
+            format!("{no_prepare_env}\n{src_key}")
+        };
+
+        let mut next_no_prepare = options.git_no_prepare.clone();
+        if !next_no_prepare.iter().any(|s| s == &src_key) {
+            next_no_prepare.push(src_key.clone());
+        }
+
+        let staging_manifest_path = staging_dir.path().join("package.json");
+        let staging_manifest = if staging_manifest_path.is_file() {
+            Manifest::from_file(&staging_manifest_path).unwrap_or_else(|_| manifest.clone())
+        } else {
+            manifest.clone()
+        };
+
+        // 1. Install preparation dependencies in staging if declared
+        let has_deps = !staging_manifest.dependencies.is_empty()
+            || !staging_manifest.dev_dependencies.is_empty();
+
+        if has_deps {
+            debug!(
+                "Installing build dependencies in staging directory '{}' for git dependency '{}'",
+                staging_dir.path().display(),
+                src_key
+            );
+
+            let staging_options = crate::InstallOptions {
+                project_dir: staging_dir.path().to_path_buf(),
+                cache_dir: options.cache_dir.clone(),
+                registry_url: options.registry_url.clone(),
+                offline: options.offline,
+                prefer_offline: options.prefer_offline,
+                prefer_online: options.prefer_online,
+                strict_sandbox: options.strict_sandbox,
+                foreground_scripts: options.foreground_scripts,
+                ignore_scripts: options.ignore_scripts,
+                bin_links: true,
+                no_package_lock: true,
+                package_lock: false,
+                audit: false,
+                fund: false,
+                silent: true,
+                git_no_prepare: next_no_prepare.clone(),
+                git_prepare_depth: current_depth + 1,
+                source_policy_override: options.source_policy_override.clone(),
+                force_non_root_policy: true,
+                before_cutoff: options.before_cutoff,
+                min_release_age_exclude: options.min_release_age_exclude.clone(),
+                config_override: Some(trusted_config.clone()),
+                ..Default::default()
+            };
+
+            let mut installer = crate::Installer::new(staging_options).map_err(|e| {
+                anyhow!(
+                    "Failed to initialize installer for staging directory of git dependency '{src_key}': {e:#}"
+                )
+            })?;
+            let install_fut: std::pin::Pin<
+                Box<dyn std::future::Future<Output = Result<crate::InstallSummary>>>,
+            > = Box::pin(installer.install());
+            install_fut.await.map_err(|e| {
+                anyhow!(
+                    "Failed to install build dependencies in staging directory for git dependency '{src_key}': {e:#}"
+                )
+            })?;
+        }
+
+        // Construct PATH with <staging>/node_modules/.bin at front
+        let staging_bin = staging_dir.path().join("node_modules").join(".bin");
+        let inherited_path = std::env::var_os("PATH")
+            .or_else(|| std::env::var_os("Path"))
+            .unwrap_or_default();
+        let mut paths = vec![staging_bin];
+        paths.extend(std::env::split_paths(&inherited_path));
+        let staging_path_env = std::env::join_paths(paths)
+            .ok()
+            .map(|p| p.to_string_lossy().to_string());
+
+        // 2. Run prepack (if present) and prepare (if present) BEFORE collecting/packing files
+        for &hook in &["prepack", "prepare"] {
+            let current_manifest = if staging_manifest_path.is_file() {
+                Manifest::from_file(&staging_manifest_path)
+                    .unwrap_or_else(|_| staging_manifest.clone())
+            } else {
+                staging_manifest.clone()
+            };
+
+            if let Some(cmd) = current_manifest.scripts.get(hook) {
+                let mut ctx = rnpm_lifecycle::LifecycleContext::new_with_config(
+                    staging_dir.path(),
+                    staging_dir.path(),
+                    current_manifest.name.as_deref().unwrap_or("git-pkg"),
+                    hook,
+                    cmd,
+                    trusted_config.clone(),
+                );
+                ctx.package_version = current_manifest.version.clone();
+                ctx.foreground_scripts = options.foreground_scripts;
+                ctx.extra_env.insert("_RNPM_NO_PREPARE_".to_string(), new_no_prepare.clone());
+                ctx.extra_env.insert(
+                    "_RNPM_PREPARE_DEPTH_".to_string(),
+                    (current_depth + 1).to_string(),
+                );
+                if let Some(ref path_val) = staging_path_env {
+                    ctx.extra_env.insert("PATH".to_string(), path_val.clone());
+                    #[cfg(windows)]
+                    ctx.extra_env.insert("Path".to_string(), path_val.clone());
+                }
+
+                let status = rnpm_lifecycle::execute_lifecycle_script(&ctx).with_context(|| {
+                    format!("Failed to execute '{}' script for git dependency '{}'", hook, src_key)
+                })?;
+
+                if !status.success() {
+                    return Err(anyhow!(
+                        "Git dependency preparation failed: script '{}' exited with code {:?}",
+                        hook,
+                        status.code()
+                    ));
+                }
+            }
+        }
+
+        // 3. Read effective manifest after prepack and prepare
+        let effective_manifest = if staging_manifest_path.is_file() {
+            Manifest::from_file(&staging_manifest_path)
+                .unwrap_or_else(|_| staging_manifest.clone())
+        } else {
+            staging_manifest
+        };
+
+        // 4. Collect/pack the package files into dst BEFORE running postpack
+        copy_pack_files_to_dest(staging_dir.path(), &effective_manifest, dst)?;
+
+        // 5. Run postpack (if present) AFTER collection/packing
+        if let Some(cmd) = effective_manifest.scripts.get("postpack") {
+            let mut ctx = rnpm_lifecycle::LifecycleContext::new_with_config(
+                staging_dir.path(),
+                staging_dir.path(),
+                effective_manifest.name.as_deref().unwrap_or("git-pkg"),
+                "postpack",
+                cmd,
+                trusted_config.clone(),
+            );
+            ctx.package_version = effective_manifest.version.clone();
+            ctx.foreground_scripts = options.foreground_scripts;
+            ctx.extra_env.insert("_RNPM_NO_PREPARE_".to_string(), new_no_prepare.clone());
+            ctx.extra_env.insert(
+                "_RNPM_PREPARE_DEPTH_".to_string(),
+                (current_depth + 1).to_string(),
+            );
+            if let Some(ref path_val) = staging_path_env {
+                ctx.extra_env.insert("PATH".to_string(), path_val.clone());
+                #[cfg(windows)]
+                ctx.extra_env.insert("Path".to_string(), path_val.clone());
+            }
+
+            let status = rnpm_lifecycle::execute_lifecycle_script(&ctx).with_context(|| {
+                format!("Failed to execute 'postpack' script for git dependency '{}'", src_key)
+            })?;
+
+            if !status.success() {
+                return Err(anyhow!(
+                    "Git dependency preparation failed: script 'postpack' exited with code {:?}",
+                    status.code()
+                ));
+            }
+        }
+
+        return Ok(());
+    }
+
+    copy_pack_files_to_dest(src, &manifest, dst)
+}
+
+pub async fn materialize_git_dependency(
+    src: &Path,
+    dst: &Path,
+    ignore_scripts: bool,
+    foreground_scripts: bool,
+) -> Result<()> {
+    materialize_git_dependency_with_options(
+        src,
+        dst,
+        &GitMaterializeOptions {
+            ignore_scripts,
+            foreground_scripts,
+            ..Default::default()
+        },
+    )
+    .await
+}
+
+pub fn copy_dir_all(src: &Path, dst: &Path) -> Result<()> {
+    let manifest_path = src.join("package.json");
+    if !manifest_path.is_file() {
+        return copy_dir_all_raw_pack(src, dst);
+    }
+    if let Ok(manifest) = Manifest::from_file(&manifest_path) {
+        copy_pack_files_to_dest(src, &manifest, dst)
+    } else {
+        copy_dir_all_raw_pack(src, dst)
+    }
 }
 
 /// Safely removes a directory tree, clearing Windows read-only flags and handling long paths if necessary.
@@ -724,6 +1320,43 @@ mod tests {
             format_git_resolved_url(&t5, "feedfacefeedfacefeedfacefeedfacefeedface"),
             "git+git://github.com/user/repo.git#feedfacefeedfacefeedfacefeedfacefeedface"
         );
+
+        let t6 = PackageTarget::parse("github:user/repo#path:packages/foo").unwrap();
+        assert_eq!(
+            format_git_resolved_url(&t6, "1234567890abcdef1234567890abcdef12345678"),
+            "git+ssh://git@github.com/user/repo.git#1234567890abcdef1234567890abcdef12345678::path:packages/foo"
+        );
+
+        let t7 = PackageTarget::parse(
+            "git+https://github.com/user/repo.git#v1.0.0::path:packages/bar",
+        )
+        .unwrap();
+        assert_eq!(
+            format_git_resolved_url(&t7, "abcdef1234567890abcdef1234567890abcdef12"),
+            "git+ssh://git@github.com/user/repo.git#abcdef1234567890abcdef1234567890abcdef12::path:packages/bar"
+        );
+    }
+
+    #[test]
+    fn test_resolve_git_subdir_safety() {
+        let root = Path::new("/fake/checkout");
+        assert_eq!(
+            resolve_git_subdir(root, "packages/foo").unwrap(),
+            root.join("packages/foo")
+        );
+        assert_eq!(
+            resolve_git_subdir(root, "./packages/bar/").unwrap(),
+            root.join("packages/bar")
+        );
+
+        // Reject traversal
+        assert!(resolve_git_subdir(root, "../escape").is_err());
+        assert!(resolve_git_subdir(root, "packages/../../escape").is_err());
+        assert!(resolve_git_subdir(root, "/absolute/path").is_err());
+        #[cfg(windows)]
+        {
+            assert!(resolve_git_subdir(root, "C:\\Windows").is_err());
+        }
     }
 
     #[test]
@@ -787,5 +1420,51 @@ mod tests {
         let checkout_commit = checkout_p.file_name().unwrap().to_str().unwrap();
         assert_eq!(checkout_commit.len(), 16);
         assert_eq!(checkout_commit, &commit[..16]);
+    }
+
+    #[test]
+    fn test_git_checkout_marker_not_leaked_into_package() {
+        use tempfile::tempdir;
+
+        // 1. Verify marker file path is a sibling outside checkout_dir
+        let cache_dir = Path::new("C:/fake/cache/_git-checkouts/hash123/commit456");
+        let marker = checkout_marker_file(cache_dir);
+        assert_ne!(marker, cache_dir.join(".rnpm_checkout_done"));
+        assert_eq!(marker.parent(), cache_dir.parent());
+        assert_eq!(
+            marker.file_name().unwrap().to_string_lossy(),
+            "commit456.rnpm_checkout_done"
+        );
+
+        // 2. Verify copy_dir_all skips .rnpm_checkout_done (with package.json manifest)
+        let tmp = tempdir().unwrap();
+        let src_with_manifest = tmp.path().join("src_manifest");
+        let dst_with_manifest = tmp.path().join("dst_manifest");
+        std::fs::create_dir_all(&src_with_manifest).unwrap();
+        std::fs::write(
+            src_with_manifest.join("package.json"),
+            r#"{"name":"test-git-pkg","version":"1.0.0"}"#,
+        )
+        .unwrap();
+        std::fs::write(src_with_manifest.join("index.js"), "module.exports = 42;").unwrap();
+        std::fs::write(src_with_manifest.join(".rnpm_checkout_done"), "").unwrap();
+        std::fs::write(src_with_manifest.join(".git"), "gitdir: ...").unwrap();
+
+        copy_dir_all(&src_with_manifest, &dst_with_manifest).unwrap();
+        assert!(dst_with_manifest.join("package.json").exists());
+        assert!(dst_with_manifest.join("index.js").exists());
+        assert!(!dst_with_manifest.join(".rnpm_checkout_done").exists());
+        assert!(!dst_with_manifest.join(".git").exists());
+
+        // 3. Verify copy_dir_all skips .rnpm_checkout_done (without package.json manifest fallback)
+        let src_no_manifest = tmp.path().join("src_no_manifest");
+        let dst_no_manifest = tmp.path().join("dst_no_manifest");
+        std::fs::create_dir_all(&src_no_manifest).unwrap();
+        std::fs::write(src_no_manifest.join("data.txt"), "hello").unwrap();
+        std::fs::write(src_no_manifest.join(".rnpm_checkout_done"), "").unwrap();
+
+        copy_dir_all(&src_no_manifest, &dst_no_manifest).unwrap();
+        assert!(dst_no_manifest.join("data.txt").exists());
+        assert!(!dst_no_manifest.join(".rnpm_checkout_done").exists());
     }
 }

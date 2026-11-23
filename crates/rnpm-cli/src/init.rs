@@ -223,11 +223,17 @@ pub fn run_init<R: BufRead, W: Write>(
         name_with_scope
     };
 
+    let config = rnpm_config::Config::load(Some(&options.directory)).unwrap_or_default();
+
+    let config_version = config
+        .get("init-version")
+        .or_else(|| config.get("init.version"));
     let default_version = existing_val
         .as_ref()
         .and_then(|ext| ext.get("version").and_then(|v| v.as_str()))
-        .unwrap_or("1.0.0")
-        .to_string();
+        .map(|s| s.to_string())
+        .or_else(|| config_version.map(|s| s.to_string()))
+        .unwrap_or_else(|| "1.0.0".to_string());
 
     let default_description = existing_val
         .as_ref()
@@ -235,11 +241,15 @@ pub fn run_init<R: BufRead, W: Write>(
         .unwrap_or("")
         .to_string();
 
+    let config_module = config
+        .get("init-module")
+        .or_else(|| config.get("init.module"));
     let default_main = existing_val
         .as_ref()
         .and_then(|ext| ext.get("main").and_then(|v| v.as_str()))
-        .unwrap_or("index.js")
-        .to_string();
+        .map(|s| s.to_string())
+        .or_else(|| config_module.map(|s| s.to_string()))
+        .unwrap_or_else(|| "index.js".to_string());
 
     let default_test = existing_val
         .as_ref()
@@ -279,6 +289,38 @@ pub fn run_init<R: BufRead, W: Write>(
         })
         .unwrap_or_default();
 
+    let author_name = config
+        .get("init-author-name")
+        .or_else(|| config.get("init.author.name"))
+        .unwrap_or("")
+        .trim();
+    let author_email = config
+        .get("init-author-email")
+        .or_else(|| config.get("init.author.email"))
+        .unwrap_or("")
+        .trim();
+    let author_url = config
+        .get("init-author-url")
+        .or_else(|| config.get("init.author.url"))
+        .unwrap_or("")
+        .trim();
+
+    let mut author_parts = Vec::new();
+    if !author_name.is_empty() {
+        author_parts.push(author_name.to_string());
+    }
+    if !author_email.is_empty() {
+        author_parts.push(format!("<{author_email}>"));
+    }
+    if !author_url.is_empty() {
+        author_parts.push(format!("({author_url})"));
+    }
+    let configured_author = if author_parts.is_empty() {
+        None
+    } else {
+        Some(author_parts.join(" "))
+    };
+
     let default_author = existing_val
         .as_ref()
         .and_then(|ext| {
@@ -290,13 +332,29 @@ pub fn run_init<R: BufRead, W: Write>(
                 }
             })
         })
+        .or(configured_author)
         .unwrap_or_default();
 
+    let config_license = config
+        .get("init-license")
+        .or_else(|| config.get("init.license"));
     let default_license = existing_val
         .as_ref()
         .and_then(|ext| ext.get("license").and_then(|v| v.as_str()))
-        .unwrap_or("ISC")
-        .to_string();
+        .map(|s| s.to_string())
+        .or_else(|| config_license.map(|s| s.to_string()))
+        .unwrap_or_else(|| "ISC".to_string());
+
+    let config_type = config
+        .get("init-type")
+        .or_else(|| config.get("init.type"))
+        .unwrap_or("")
+        .trim();
+    let default_type = if !config_type.is_empty() {
+        config_type.to_string()
+    } else {
+        "commonjs".to_string()
+    };
 
     if options.yes {
         // Non-interactive generation with npm defaults
@@ -305,9 +363,9 @@ pub fn run_init<R: BufRead, W: Write>(
         } else {
             let mut fresh = OrderedJsonMap::new();
             fresh.insert("name".to_string(), Value::String(default_name.clone()));
-            fresh.insert("version".to_string(), Value::String("1.0.0".to_string()));
+            fresh.insert("version".to_string(), Value::String(default_version.clone()));
             fresh.insert("description".to_string(), Value::String("".to_string()));
-            fresh.insert("main".to_string(), Value::String("index.js".to_string()));
+            fresh.insert("main".to_string(), Value::String(default_main.clone()));
 
             let mut scripts = OrderedJsonMap::new();
             scripts.insert(
@@ -316,8 +374,9 @@ pub fn run_init<R: BufRead, W: Write>(
             );
             fresh.insert("scripts".to_string(), Value::Object(scripts));
             fresh.insert("keywords".to_string(), Value::Array(Vec::new()));
-            fresh.insert("author".to_string(), Value::String("".to_string()));
-            fresh.insert("license".to_string(), Value::String("ISC".to_string()));
+            fresh.insert("author".to_string(), Value::String(default_author.clone()));
+            fresh.insert("license".to_string(), Value::String(default_license.clone()));
+            fresh.insert("type".to_string(), Value::String(default_type.clone()));
             fresh
         };
 
@@ -329,13 +388,13 @@ pub fn run_init<R: BufRead, W: Write>(
             }
         }
         if !map.contains_key("version") {
-            map.insert("version".to_string(), Value::String("1.0.0".to_string()));
+            map.insert("version".to_string(), Value::String(default_version));
         }
         if !map.contains_key("description") {
             map.insert("description".to_string(), Value::String("".to_string()));
         }
         if !map.contains_key("main") {
-            map.insert("main".to_string(), Value::String("index.js".to_string()));
+            map.insert("main".to_string(), Value::String(default_main));
         }
         if !map.contains_key("scripts") {
             let mut scripts = OrderedJsonMap::new();
@@ -356,13 +415,13 @@ pub fn run_init<R: BufRead, W: Write>(
             map.insert("keywords".to_string(), Value::Array(Vec::new()));
         }
         if !map.contains_key("author") {
-            map.insert("author".to_string(), Value::String("".to_string()));
+            map.insert("author".to_string(), Value::String(default_author));
         }
         if !map.contains_key("license") {
-            map.insert("license".to_string(), Value::String("ISC".to_string()));
+            map.insert("license".to_string(), Value::String(default_license));
         }
         if !map.contains_key("type") {
-            map.insert("type".to_string(), Value::String("commonjs".to_string()));
+            map.insert("type".to_string(), Value::String(default_type));
         }
 
         let mut formatted = serde_json::to_string_pretty(&Value::Object(map))?;
@@ -461,6 +520,9 @@ pub fn run_init<R: BufRead, W: Write>(
 
     map.insert("author".to_string(), Value::String(author));
     map.insert("license".to_string(), Value::String(license));
+    if !config_type.is_empty() && !map.contains_key("type") {
+        map.insert("type".to_string(), Value::String(config_type.to_string()));
+    }
 
     let mut formatted = serde_json::to_string_pretty(&Value::Object(map))?;
     formatted.push('\n');

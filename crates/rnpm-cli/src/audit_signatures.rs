@@ -37,6 +37,15 @@ struct RegistryKey {
     expires: Option<String>,
 }
 
+struct VerifiedPkg {
+    name: String,
+    version: String,
+    location: String,
+    registry: String,
+    has_signature: bool,
+    has_attestation: bool,
+}
+
 struct Package {
     name: String,
     version: String,
@@ -172,15 +181,13 @@ pub async fn run(project_dir: &Path, json_output: bool) -> anyhow::Result<()> {
     }
 
     let mut audited = 0usize;
-    let mut verified = 0usize;
+    let mut verified_signatures = 0usize;
+    let mut verified_attestations = 0usize;
+    let mut verified_pkgs: Vec<VerifiedPkg> = Vec::new();
     let mut invalid: Vec<Value> = Vec::new();
     let mut missing: Vec<Value> = Vec::new();
     let mut packuments: HashMap<String, AbbreviatedPackageMetadata> = HashMap::new();
     for pkg in &packages {
-        let registry_keys = keys.get(&pkg.registry).map(Vec::as_slice).unwrap_or_default();
-        if !registry_keys.is_empty() {
-            audited += 1;
-        }
         if !packuments.contains_key(&pkg.name) {
             let packument = client.get_package_metadata_full(&pkg.name).await?;
             packuments.insert(pkg.name.clone(), packument);
@@ -193,6 +200,10 @@ pub async fn run(project_dir: &Path, json_output: bool) -> anyhow::Result<()> {
                 pkg.version
             ));
         };
+        let registry_keys = keys.get(&pkg.registry).map(Vec::as_slice).unwrap_or_default();
+        if !registry_keys.is_empty() || manifest.dist.attestations.is_some() {
+            audited += 1;
+        }
         let integrity = manifest.dist.integrity.clone().or_else(|| {
             let hex = manifest.dist.shasum.as_deref()?;
             let bytes = data_encoding::HEXLOWER_PERMISSIVE.decode(hex.as_bytes()).ok()?;
@@ -219,7 +230,10 @@ pub async fn run(project_dir: &Path, json_output: bool) -> anyhow::Result<()> {
                 ));
             };
             if let Some(expires) = key.expires.as_deref() {
-                if rnpm_config::date::parse_js_date(expires).is_some_and(|end| published >= end) {
+                let is_valid = rnpm_config::date::parse_js_date(expires)
+                    .map(|end| published < end)
+                    .unwrap_or(false);
+                if !is_valid {
                     return Err(anyhow!(
                         "npm error code EEXPIREDSIGNATUREKEY\nnpm error {id} has a registry signature with keyid: {} but the corresponding public key has expired {expires}",
                         signature.keyid
@@ -232,6 +246,7 @@ pub async fn run(project_dir: &Path, json_output: bool) -> anyhow::Result<()> {
                 break;
             }
         }
+        let mut has_verified_sig = false;
         if let Some((keyid, sig)) = bad {
             invalid.push(json!({
                 "code": "EINTEGRITYSIGNATURE",
@@ -247,7 +262,8 @@ pub async fn run(project_dir: &Path, json_output: bool) -> anyhow::Result<()> {
                 "version": pkg.version,
             }));
         } else if !signatures.is_empty() {
-            verified += 1;
+            verified_signatures += 1;
+            has_verified_sig = true;
         } else if !registry_keys.is_empty() {
             let mut entry = serde_json::Map::new();
             if let Some(integrity) = &integrity {
@@ -259,6 +275,144 @@ pub async fn run(project_dir: &Path, json_output: bool) -> anyhow::Result<()> {
             entry.insert("resolved".into(), json!(resolved));
             entry.insert("version".into(), json!(pkg.version));
             missing.push(Value::Object(entry));
+        }
+
+        let mut has_verified_att = false;
+        if let Some(att) = &manifest.dist.attestations {
+            let mut bundles: Vec<(Option<String>, rnpm_registry::SigstoreBundle)> = Vec::new();
+            if let Some(bundle_val) = &att.bundle {
+                if let Ok(b) = serde_json::from_value::<rnpm_registry::SigstoreBundle>(bundle_val.clone()) {
+                    bundles.push((att.provenance.as_ref().and_then(|p| p.predicate_type.clone()), b));
+                }
+            } else if let Some(att_url_str) = &att.url {
+                let fetch_url = if let Ok(u) = reqwest::Url::parse(att_url_str) {
+                    Some(u)
+                } else if let Ok(base) = reqwest::Url::parse(&pkg.registry) {
+                    base.join(att_url_str).ok()
+                } else {
+                    None
+                };
+                if let Some(url) = fetch_url {
+                    let fetch_res = client
+                        .execute_with_permit(reqwest::Method::GET, url, Some("application/json"), None)
+                        .await;
+                    match fetch_res {
+                        Ok((resp, _permit)) if resp.status().is_success() => {
+                            if let Ok(text) = resp.text().await {
+                                if let Ok(resp_doc) = serde_json::from_str::<rnpm_registry::AttestationResponse>(&text) {
+                                    for item in resp_doc.attestations {
+                                        if let Some(b) = item.bundle {
+                                            bundles.push((item.predicate_type, b));
+                                        }
+                                    }
+                                } else if let Ok(single) = serde_json::from_str::<rnpm_registry::SigstoreBundle>(&text) {
+                                    bundles.push((None, single));
+                                } else if let Ok(single) = rnpm_registry::SigstoreBundle::from_json(&text) {
+                                    bundles.push((None, single));
+                                }
+                            }
+                        }
+                        Ok((resp, _permit)) => {
+                            invalid.push(json!({
+                                "code": "EINTEGRITYATTESTATION",
+                                "message": format!("{id} failed to fetch attestation from {att_url_str}: HTTP {}", resp.status()),
+                                "integrity": integrity,
+                                "location": pkg.location,
+                                "name": pkg.name,
+                                "registry": pkg.registry,
+                                "resolved": resolved,
+                                "type": pkg.edge_type,
+                                "version": pkg.version,
+                            }));
+                        }
+                        Err(e) => {
+                            invalid.push(json!({
+                                "code": "EINTEGRITYATTESTATION",
+                                "message": format!("{id} failed to fetch attestation from {att_url_str}: {e}"),
+                                "integrity": integrity,
+                                "location": pkg.location,
+                                "name": pkg.name,
+                                "registry": pkg.registry,
+                                "resolved": resolved,
+                                "type": pkg.edge_type,
+                                "version": pkg.version,
+                            }));
+                        }
+                    }
+                }
+            }
+
+            if !bundles.is_empty() {
+                let mut reg_keys = HashMap::new();
+                let mut reg_key_expiries = HashMap::new();
+                if let Some(rkeys) = keys.get(&pkg.registry) {
+                    for k in rkeys {
+                        if let Some(expires_str) = &k.expires {
+                            match rnpm_config::date::parse_js_date(expires_str) {
+                                Some(exp) => {
+                                    reg_key_expiries.insert(k.keyid.clone(), (expires_str.clone(), exp));
+                                }
+                                None => {
+                                    // Non-null unparseable date is treated as expired (invalid)
+                                    reg_key_expiries.insert(k.keyid.clone(), (expires_str.clone(), i64::MIN));
+                                }
+                            }
+                        }
+                        reg_keys.insert(k.keyid.clone(), k.spki.clone());
+                    }
+                }
+
+                let mut verifier = rnpm_registry::ProvenanceVerifier::new(rnpm_registry::ProvenancePolicy::AllowAny)
+                    .with_registry_keys(reg_keys)
+                    .with_registry_key_expiries(reg_key_expiries);
+
+                if let Ok(path) = std::env::var("SIGSTORE_ROOT_CERT") {
+                    if let Ok(bytes) = std::fs::read(&path) {
+                        verifier = verifier.with_fulcio_root_cert(bytes);
+                    }
+                }
+                if let Ok(key_b64) = std::env::var("SIGSTORE_REKOR_KEY") {
+                    if let Ok(bytes) = rnpm_registry::provenance::decode_base64(&key_b64) {
+                        verifier = verifier.with_rekor_public_key(bytes);
+                    }
+                }
+
+                let mut att_err = None;
+                for (pred_type, bundle) in &bundles {
+                    if let Err(e) = verifier.verify_package(&pkg.name, Some(&pkg.version), bundle, integrity.as_deref(), None) {
+                        att_err = Some((pred_type.clone(), e.to_string()));
+                        break;
+                    }
+                }
+                if let Some((pred_type, err_msg)) = att_err {
+                    invalid.push(json!({
+                        "code": "EINTEGRITYATTESTATION",
+                        "message": format!("{id} has an invalid attestation: {err_msg}"),
+                        "integrity": integrity,
+                        "predicateType": pred_type,
+                        "location": pkg.location,
+                        "name": pkg.name,
+                        "registry": pkg.registry,
+                        "resolved": resolved,
+                        "type": pkg.edge_type,
+                        "version": pkg.version,
+                    }));
+                } else {
+                    verified_attestations += 1;
+                    has_verified_att = true;
+                }
+            }
+        }
+
+        if has_verified_sig || has_verified_att {
+            verified_pkgs.push(VerifiedPkg {
+                name: pkg.name.clone(),
+                version: pkg.version.clone(),
+                location: pkg.location.clone(),
+                registry: pkg.registry.clone(),
+                has_signature: has_verified_sig,
+                has_attestation: has_verified_att,
+            });
         }
     }
     if audited == 0 {
@@ -280,11 +434,33 @@ pub async fn run(project_dir: &Path, json_output: bool) -> anyhow::Result<()> {
         out.insert("invalid".into(), Value::Array(invalid));
         out.insert("missing".into(), Value::Array(missing));
         if config.get_bool("include-attestations") == Some(true) {
-            out.insert("verified".into(), json!([]));
+            out.insert("verified_signatures".into(), json!(verified_signatures));
+            out.insert("verified_attestations".into(), json!(verified_attestations));
+            let verified_list: Vec<Value> = verified_pkgs
+                .into_iter()
+                .map(|p| {
+                    json!({
+                        "name": p.name,
+                        "version": p.version,
+                        "location": p.location,
+                        "registry": p.registry,
+                        "has_signature": p.has_signature,
+                        "has_attestation": p.has_attestation,
+                    })
+                })
+                .collect();
+            out.insert("verified".into(), Value::Array(verified_list));
         }
         println!("{}", serde_json::to_string_pretty(&Value::Object(out))?);
     } else {
-        print_report(audited, verified, &invalid, &missing, start);
+        print_report(
+            audited,
+            verified_signatures,
+            verified_attestations,
+            &invalid,
+            &missing,
+            start,
+        );
     }
     if failed {
         return Err(SignaturesFailed.into());
@@ -292,16 +468,28 @@ pub async fn run(project_dir: &Path, json_output: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn print_report(audited: usize, verified: usize, invalid: &[Value], missing: &[Value], start: Instant) {
+fn print_report(
+    audited: usize,
+    verified_signatures: usize,
+    verified_attestations: usize,
+    invalid: &[Value],
+    missing: &[Value],
+    start: Instant,
+) {
     let plural = if audited > 1 { "s" } else { "" };
     println!(
         "audited {audited} package{plural} in {}s\n",
         start.elapsed().as_secs()
     );
-    if verified == 1 {
+    if verified_signatures == 1 {
         println!("1 package has a verified registry signature\n");
-    } else if verified > 1 {
-        println!("{verified} packages have verified registry signatures\n");
+    } else if verified_signatures > 1 {
+        println!("{verified_signatures} packages have verified registry signatures\n");
+    }
+    if verified_attestations == 1 {
+        println!("1 package has a verified attestation\n");
+    } else if verified_attestations > 1 {
+        println!("{verified_attestations} packages have verified attestations\n");
     }
     let id = |v: &Value| {
         format!(
@@ -328,15 +516,39 @@ fn print_report(audited: usize, verified: usize, invalid: &[Value], missing: &[V
         if !missing.is_empty() {
             println!();
         }
-        if invalid.len() == 1 {
-            println!("1 package has an invalid registry signature:\n");
-        } else {
-            println!("{} packages have invalid registry signatures:\n", invalid.len());
+        let sig_invalid: Vec<&Value> = invalid
+            .iter()
+            .filter(|i| i["code"].as_str() == Some("EINTEGRITYSIGNATURE"))
+            .collect();
+        let att_invalid: Vec<&Value> = invalid
+            .iter()
+            .filter(|i| i["code"].as_str() == Some("EINTEGRITYATTESTATION"))
+            .collect();
+
+        if !sig_invalid.is_empty() {
+            if sig_invalid.len() == 1 {
+                println!("1 package has an invalid registry signature:\n");
+            } else {
+                println!("{} packages have invalid registry signatures:\n", sig_invalid.len());
+            }
+            for i in &sig_invalid {
+                println!("{}", id(i));
+            }
+            println!();
         }
-        for i in invalid {
-            println!("{}", id(i));
+
+        if !att_invalid.is_empty() {
+            if att_invalid.len() == 1 {
+                println!("1 package has an invalid attestation:\n");
+            } else {
+                println!("{} packages have invalid attestations:\n", att_invalid.len());
+            }
+            for i in &att_invalid {
+                println!("{}", id(i));
+            }
+            println!();
         }
-        println!();
+
         if invalid.len() == 1 {
             println!("Someone might have tampered with this package since it was published on the registry!\n");
         } else {
@@ -395,10 +607,14 @@ async fn fetch_keys(
         .into_iter()
         .flatten()
         .filter_map(|k| {
+            let keyid = k["keyid"].as_str().or_else(|| k["keyId"].as_str())?.to_string();
+            let spki_b64 = k["key"].as_str().or_else(|| k["publicKey"]["rawBytes"].as_str())?;
+            let spki = data_encoding::BASE64.decode(spki_b64.as_bytes()).ok()?;
+            let expires = k["expires"].as_str().or_else(|| k["publicKey"]["validFor"]["end"].as_str()).map(str::to_string);
             Some(RegistryKey {
-                keyid: k["keyid"].as_str()?.to_string(),
-                spki: data_encoding::BASE64.decode(k["key"].as_str()?.as_bytes()).ok()?,
-                expires: k["expires"].as_str().map(str::to_string),
+                keyid,
+                spki,
+                expires,
             })
         })
         .collect();

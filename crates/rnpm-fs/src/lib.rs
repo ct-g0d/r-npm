@@ -38,10 +38,10 @@ pub use parallel::{extract_batch_parallel, BatchExtractionItem};
 pub use path::{strip_verbatim_prefix, to_verbatim_path};
 pub use tarball::{
     bytes_written, collect_pack_files, compute_tarball_filename, extract_tar_gz, files_created,
-    pack_directory, read_tarball_text, record_file_created, record_files_created_batch,
-    reset_fs_counters, strip_package_prefix, summarize_tarball, validate_entry_path,
-    ExtractionSummary, PackSummary, PackedFileEntry, TarLimits, NPM_DEFAULT_FILE_MODE,
-    NPM_EXECUTABLE_FILE_MODE, NPM_PACK_EPOCH_MTIME,
+    pack_directory, pure_rust_gzip, read_tarball_text, record_file_created,
+    record_files_created_batch, reset_fs_counters, rust_gzip, strip_package_prefix,
+    summarize_tarball, validate_entry_path, ExtractionSummary, PackSummary, PackedFileEntry,
+    TarLimits, NPM_DEFAULT_FILE_MODE, NPM_EXECUTABLE_FILE_MODE, NPM_PACK_EPOCH_MTIME,
 };
 pub use writer::{
     copy_file_fast, decode_tar_entries, detect_seek_penalty, determine_writer_config,

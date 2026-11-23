@@ -100,6 +100,8 @@ async fn test_optional_lifecycle_script_failure_isolation() {
         foreground_scripts: false,
         timeout: None,
         sandbox_policy: ScriptSandboxPolicy::default(),
+        node_gyp: None,
+        offline: false,
     };
 
     // When optional is true, script failure is isolated and does NOT fail execution
@@ -304,6 +306,8 @@ async fn test_topological_dependency_cycle_prevention() {
         foreground_scripts: false,
         timeout: None,
         sandbox_policy: ScriptSandboxPolicy::default(),
+        node_gyp: None,
+        offline: false,
     };
 
     // Cyclic dependency should NOT overflow the stack and should successfully execute
@@ -358,6 +362,8 @@ async fn test_optional_dependency_disk_removal_on_failure() {
         foreground_scripts: false,
         timeout: None,
         sandbox_policy: ScriptSandboxPolicy::default(),
+        node_gyp: None,
+        offline: false,
     };
 
     let res = execute_topological(&[node], &root_manifest, &opts).await;
@@ -876,6 +882,8 @@ async fn test_lifecycle_topological_stress_50_plus_packages() {
         foreground_scripts: false,
         timeout: None,
         sandbox_policy: ScriptSandboxPolicy::default(),
+        node_gyp: None,
+        offline: false,
     };
 
     let res = execute_topological(&nodes, &root_manifest, &opts).await;
@@ -2659,4 +2667,1858 @@ fn test_npm_package_environment_variables_flattening() {
         env.get("npm_package_scripts_build").map(|s| s.as_str()),
         Some("echo building")
     );
+}
+
+#[test]
+fn test_script_shell_context_populated_from_npmrc() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(temp.path().join(".npmrc"), "script-shell = /bin/bash\n").unwrap();
+
+    let ctx = LifecycleContext::new(
+        temp.path(),
+        temp.path(),
+        "test-pkg",
+        "test-event",
+        "echo 1",
+    );
+    assert_eq!(ctx.script_shell.as_deref(), Some("/bin/bash"));
+}
+
+#[test]
+fn test_script_shell_null_or_empty_ignored() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(temp.path().join(".npmrc"), "script-shell = null\n").unwrap();
+
+    let ctx = LifecycleContext::new(
+        temp.path(),
+        temp.path(),
+        "test-pkg",
+        "test-event",
+        "echo 1",
+    );
+    assert_eq!(ctx.script_shell, None);
+
+    let temp2 = tempfile::tempdir().unwrap();
+    std::fs::write(temp2.path().join(".npmrc"), "script-shell = \"\"\n").unwrap();
+
+    let ctx2 = LifecycleContext::new(
+        temp2.path(),
+        temp2.path(),
+        "test-pkg",
+        "test-event",
+        "echo 1",
+    );
+    assert_eq!(ctx2.script_shell, None);
+}
+
+#[test]
+fn test_is_cmd_shell_variants() {
+    assert!(is_cmd_shell("cmd"));
+    assert!(is_cmd_shell("cmd.exe"));
+    assert!(is_cmd_shell("CMD.EXE"));
+    assert!(is_cmd_shell(r"C:\Windows\System32\cmd.exe"));
+    assert!(is_cmd_shell(r#""C:\Windows\System32\cmd.exe""#));
+    assert!(!is_cmd_shell("cmd.bat"));
+    assert!(!is_cmd_shell("/bin/sh"));
+    assert!(!is_cmd_shell("bash"));
+    assert!(!is_cmd_shell("powershell"));
+    assert!(!is_cmd_shell("true"));
+}
+
+#[test]
+fn test_script_shell_execution_sync() {
+    let temp = tempfile::tempdir().unwrap();
+    let shell = if cfg!(windows) { "cmd.exe" } else { "/bin/sh" };
+    let mut ctx = LifecycleContext::new(
+        temp.path(),
+        temp.path(),
+        "test-pkg",
+        "test-event",
+        "node -e \"process.exit(0)\"",
+    );
+    ctx.script_shell = Some(shell.to_string());
+    let status = execute_lifecycle_script(&ctx).unwrap();
+    assert!(status.success());
+}
+
+#[test]
+fn test_script_shell_nonexistent_fails() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut ctx = LifecycleContext::new(
+        temp.path(),
+        temp.path(),
+        "test-pkg",
+        "test-event",
+        "echo 1",
+    );
+    ctx.script_shell = Some("nonexistent_shell_binary_98765".to_string());
+    let res = execute_lifecycle_script(&ctx);
+    assert!(res.is_err(), "Spawning nonexistent shell must fail");
+}
+
+#[test]
+fn test_node_options_injected_when_empty() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut ctx = LifecycleContext::new(
+        temp.path(),
+        temp.path(),
+        "test-pkg",
+        "test-event",
+        "echo 1",
+    );
+    ctx.extra_env.insert(
+        "npm_config_node_options".to_string(),
+        "--max-old-space-size=4096".to_string(),
+    );
+    let env = build_lifecycle_env(&ctx);
+    assert_eq!(
+        env.get("NODE_OPTIONS").map(|s| s.as_str()),
+        Some("--max-old-space-size=4096")
+    );
+}
+
+#[test]
+fn test_node_options_appended_when_existing() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut ctx = LifecycleContext::new(
+        temp.path(),
+        temp.path(),
+        "test-pkg",
+        "test-event",
+        "echo 1",
+    );
+    ctx.extra_env.insert(
+        "NODE_OPTIONS".to_string(),
+        "--trace-warnings".to_string(),
+    );
+    ctx.extra_env.insert(
+        "npm_config_node_options".to_string(),
+        "--max-old-space-size=4096".to_string(),
+    );
+    let env = build_lifecycle_env(&ctx);
+    assert_eq!(
+        env.get("NODE_OPTIONS").map(|s| s.as_str()),
+        Some("--trace-warnings --max-old-space-size=4096")
+    );
+}
+
+#[test]
+fn test_node_options_ignored_when_null_or_empty() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut ctx = LifecycleContext::new(
+        temp.path(),
+        temp.path(),
+        "test-pkg",
+        "test-event",
+        "echo 1",
+    );
+    ctx.extra_env.insert(
+        "npm_config_node_options".to_string(),
+        "null".to_string(),
+    );
+    let env = build_lifecycle_env(&ctx);
+    assert_eq!(env.get("NODE_OPTIONS"), None);
+
+    let mut ctx2 = LifecycleContext::new(
+        temp.path(),
+        temp.path(),
+        "test-pkg",
+        "test-event",
+        "echo 1",
+    );
+    ctx2.extra_env.insert(
+        "npm_config_node_options".to_string(),
+        "".to_string(),
+    );
+    let env2 = build_lifecycle_env(&ctx2);
+    assert_eq!(env2.get("NODE_OPTIONS"), None);
+}
+
+#[test]
+fn test_node_env_production_set_when_omit_dev() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut ctx = LifecycleContext::new(
+        temp.path(),
+        temp.path(),
+        "test-pkg",
+        "test-event",
+        "echo 1",
+    );
+    ctx.extra_env.insert(
+        "npm_config_omit".to_string(),
+        "dev".to_string(),
+    );
+    let env = build_lifecycle_env(&ctx);
+    assert_eq!(
+        env.get("NODE_ENV").map(|s| s.as_str()),
+        Some("production")
+    );
+}
+
+#[test]
+fn test_node_env_production_set_when_production_flag() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut ctx = LifecycleContext::new(
+        temp.path(),
+        temp.path(),
+        "test-pkg",
+        "test-event",
+        "echo 1",
+    );
+    ctx.extra_env.insert(
+        "npm_config_production".to_string(),
+        "true".to_string(),
+    );
+    let env = build_lifecycle_env(&ctx);
+    assert_eq!(
+        env.get("NODE_ENV").map(|s| s.as_str()),
+        Some("production")
+    );
+}
+
+#[test]
+fn test_node_env_not_overwritten_if_already_set() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut ctx = LifecycleContext::new(
+        temp.path(),
+        temp.path(),
+        "test-pkg",
+        "test-event",
+        "echo 1",
+    );
+    ctx.extra_env.insert(
+        "NODE_ENV".to_string(),
+        "development".to_string(),
+    );
+    ctx.extra_env.insert(
+        "npm_config_omit".to_string(),
+        "dev".to_string(),
+    );
+    let env = build_lifecycle_env(&ctx);
+    assert_eq!(
+        env.get("NODE_ENV").map(|s| s.as_str()),
+        Some("development")
+    );
+}
+
+#[test]
+fn test_node_env_not_set_for_other_omit() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut ctx = LifecycleContext::new(
+        temp.path(),
+        temp.path(),
+        "test-pkg",
+        "test-event",
+        "echo 1",
+    );
+    ctx.extra_env.insert(
+        "npm_config_omit".to_string(),
+        "optional".to_string(),
+    );
+    let env = build_lifecycle_env(&ctx);
+    assert_ne!(
+        env.get("NODE_ENV").map(|s| s.as_str()),
+        Some("production")
+    );
+}
+
+#[test]
+fn test_node_env_not_set_when_include_dev_overrides() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut ctx = LifecycleContext::new(
+        temp.path(),
+        temp.path(),
+        "test-pkg",
+        "test-event",
+        "echo 1",
+    );
+    ctx.extra_env.insert(
+        "npm_config_omit".to_string(),
+        "dev".to_string(),
+    );
+    ctx.extra_env.insert(
+        "npm_config_include".to_string(),
+        "dev".to_string(),
+    );
+    let env = build_lifecycle_env(&ctx);
+    assert_ne!(
+        env.get("NODE_ENV").map(|s| s.as_str()),
+        Some("production")
+    );
+}
+
+#[test]
+fn test_node_gyp_explicit_config_precedence() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("proj");
+    std::fs::create_dir_all(&root).unwrap();
+
+    // 1. Setup local project node_modules/.bin/node-gyp and node_modules/node-gyp/bin/node-gyp.js
+    let local_bin = root.join("node_modules").join(".bin");
+    std::fs::create_dir_all(&local_bin).unwrap();
+    let local_sh = local_bin.join("node-gyp");
+    std::fs::write(&local_sh, "#!/bin/sh\nexit 0\n").unwrap();
+
+    let local_js_dir = root.join("node_modules").join("node-gyp").join("bin");
+    std::fs::create_dir_all(&local_js_dir).unwrap();
+    let local_js = local_js_dir.join("node-gyp.js");
+    std::fs::write(&local_js, "console.log('local');").unwrap();
+
+    // 2. Setup cached standalone node-gyp
+    let cache_dir = temp.path().join("cache");
+    let cached_js_dir = cache_dir.join("node-gyp").join("current").join("bin");
+    std::fs::create_dir_all(&cached_js_dir).unwrap();
+    let cached_js = cached_js_dir.join("node-gyp.js");
+    std::fs::write(&cached_js, "console.log('cached');").unwrap();
+
+    let mut config = rnpm_config::Config::default();
+    config.npmrc.settings.insert(
+        "cache".to_string(),
+        cache_dir.to_string_lossy().to_string(),
+    );
+
+    // Verify without explicit override, local project node_modules takes precedence
+    let local_resolved = find_node_gyp(&root, &root, &config, None).unwrap();
+    assert!(
+        local_resolved == local_sh || local_resolved == local_js || local_resolved.starts_with(&root),
+        "Local node-gyp must take precedence over cache when no explicit config is set: {}",
+        local_resolved.display()
+    );
+
+    // 3. Explicit config override (explicit option) takes precedence over EVERYTHING
+    let explicit_path = temp.path().join("custom-gyp").join("node-gyp.js");
+    let resolved_explicit = find_node_gyp(&root, &root, &config, Some(&explicit_path)).unwrap();
+    assert_eq!(
+        resolved_explicit, explicit_path,
+        "Explicit option must override local and cached node-gyp"
+    );
+
+    // 4. Explicit config via .npmrc (node-gyp = <path>) takes precedence over local & cached
+    let rc_path = temp.path().join("rc-custom-gyp").join("node-gyp.js");
+    let mut config_rc = config.clone();
+    config_rc.npmrc.settings.insert(
+        "node-gyp".to_string(),
+        rc_path.to_string_lossy().to_string(),
+    );
+    let resolved_rc = find_node_gyp(&root, &root, &config_rc, None).unwrap();
+    assert_eq!(
+        resolved_rc, rc_path,
+        ".npmrc node-gyp setting must override local and cached node-gyp"
+    );
+
+    // 5. Verify LifecycleOptions and LifecycleContext wiring
+    let ctx = LifecycleContext::new(&root, &root, "test-native", "install", "node-gyp rebuild")
+        .with_node_gyp(&explicit_path);
+    let env = build_lifecycle_env(&ctx);
+    assert_eq!(
+        env.get("npm_config_node_gyp").map(|s| s.as_str()),
+        Some(explicit_path.to_str().unwrap()),
+        "npm_config_node_gyp must match the explicit override"
+    );
+}
+
+#[test]
+fn test_node_gyp_cached_standalone_without_npm() {
+    let temp = tempfile::tempdir().unwrap();
+    let project_dir = temp.path().join("pkg");
+    std::fs::create_dir_all(&project_dir).unwrap();
+
+    // Write binding.gyp to indicate a native package
+    std::fs::write(project_dir.join("binding.gyp"), "{}").unwrap();
+    std::fs::write(
+        project_dir.join("package.json"),
+        r#"{"name": "native-test-pkg", "version": "1.0.0"}"#,
+    )
+    .unwrap();
+
+    // Create standalone cached node-gyp in <cache>/node-gyp/current/bin/node-gyp.js
+    let cache_dir = temp.path().join("cache");
+    let cached_bin = cache_dir.join("node-gyp").join("current").join("bin");
+    std::fs::create_dir_all(&cached_bin).unwrap();
+    let marker_file = project_dir.join("cached-build.marker");
+    let marker_escaped = marker_file.to_string_lossy().replace('\\', "/");
+    let node_gyp_content = format!(
+        "const fs = require('fs'); fs.writeFileSync('{}', 'cached node-gyp executed'); process.exit(0);",
+        marker_escaped
+    );
+    std::fs::write(cached_bin.join("node-gyp.js"), &node_gyp_content).unwrap();
+
+    let mut ctx = LifecycleContext::new(
+        &project_dir,
+        &project_dir,
+        "native-test-pkg",
+        "install",
+        "node-gyp rebuild",
+    );
+    ctx.extra_env.insert(
+        "npm_config_cache".to_string(),
+        cache_dir.to_string_lossy().to_string(),
+    );
+    ctx.extra_env.insert(
+        "npm_config_node_gyp_fallback_npm".to_string(),
+        "false".to_string(),
+    );
+
+    let status = execute_lifecycle_script(&ctx).expect("Execution with standalone cached node-gyp must succeed");
+    assert!(status.success(), "Lifecycle script must exit successfully");
+    assert!(
+        marker_file.is_file(),
+        "Cached standalone node-gyp.js must be executed and create marker file"
+    );
+    let content = std::fs::read_to_string(&marker_file).unwrap();
+    assert_eq!(content, "cached node-gyp executed");
+}
+
+#[test]
+fn test_node_gyp_offline_error_when_absent() {
+    let temp = tempfile::tempdir().unwrap();
+    let project_dir = temp.path().join("pkg");
+    std::fs::create_dir_all(&project_dir).unwrap();
+
+    std::fs::write(project_dir.join("binding.gyp"), "{}").unwrap();
+    std::fs::write(
+        project_dir.join("package.json"),
+        r#"{"name": "offline-native-pkg", "version": "1.0.0"}"#,
+    )
+    .unwrap();
+
+    // Point cache to an empty directory
+    let empty_cache = temp.path().join("empty_cache");
+    std::fs::create_dir_all(&empty_cache).unwrap();
+
+    let mut config = rnpm_config::Config::default();
+    config.npmrc.settings.insert(
+        "cache".to_string(),
+        empty_cache.to_string_lossy().to_string(),
+    );
+    config.npmrc.settings.insert(
+        "node-gyp-fallback-npm".to_string(),
+        "false".to_string(),
+    );
+
+    // Call ensure_node_gyp in offline mode
+    let err = ensure_node_gyp(
+        &project_dir,
+        &project_dir,
+        &config,
+        None,
+        true, // offline = true
+        "offline-native-pkg",
+    )
+    .expect_err("ensure_node_gyp must fail in offline mode when node-gyp is absent");
+
+    let err_str = err.to_string();
+    assert!(
+        err_str.contains("offline-native-pkg"),
+        "Error message must name the affected package: {err_str}"
+    );
+    assert!(
+        err_str.contains("offline mode") || err_str.contains("In offline mode"),
+        "Error message must mention offline mode: {err_str}"
+    );
+    assert!(
+        err_str.contains("npm_config_node_gyp") || err_str.contains(".npmrc") || err_str.contains("node-gyp=<path>"),
+        "Error message must provide actionable instructions on how to configure node-gyp: {err_str}"
+    );
+}
+
+fn create_mock_node_gyp_tarball(marker_file: &str, marker_content: &str) -> Vec<u8> {
+    let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    {
+        let mut builder = tar::Builder::new(&mut gz);
+
+        // package/package.json
+        let pkg_json = r#"{"name":"node-gyp","version":"10.0.0","bin":{"node-gyp":"bin/node-gyp.js"}}"#;
+        let mut header = tar::Header::new_gnu();
+        header.set_path("package/package.json").unwrap();
+        header.set_size(pkg_json.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        builder.append(&header, pkg_json.as_bytes()).unwrap();
+
+        // package/bin/node-gyp.js
+        let js_script = format!(
+            "const fs = require('fs'); fs.writeFileSync('{}', '{}'); process.exit(0);",
+            marker_file.replace('\\', "/"),
+            marker_content
+        );
+        let mut header_js = tar::Header::new_gnu();
+        header_js.set_path("package/bin/node-gyp.js").unwrap();
+        header_js.set_size(js_script.len() as u64);
+        header_js.set_mode(0o755);
+        header_js.set_cksum();
+        builder.append(&header_js, js_script.as_bytes()).unwrap();
+
+        builder.finish().unwrap();
+    }
+    gz.finish().unwrap()
+}
+
+#[test]
+fn test_node_gyp_mock_registry_on_demand_bootstrap() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    let temp = tempfile::tempdir().unwrap();
+    let project_dir = temp.path().join("pkg");
+    std::fs::create_dir_all(&project_dir).unwrap();
+
+    let marker_file = project_dir.join("bootstrap-build.marker");
+    let marker_escaped = marker_file.to_string_lossy().replace('\\', "/");
+    let tarball_bytes = create_mock_node_gyp_tarball(&marker_escaped, "bootstrap node-gyp built package");
+    let integrity = rnpm_core::Integrity::from_bytes(&tarball_bytes, rnpm_core::Algorithm::Sha512).to_string();
+
+    // Start mock HTTP registry server
+    let listener = TcpListener::bind("127.0.0.1:0").expect("Failed to bind mock registry listener");
+    let port = listener.local_addr().unwrap().port();
+    let tb_clone = tarball_bytes.clone();
+    let integrity_clone = integrity.clone();
+
+    let server_handle = std::thread::spawn(move || {
+        for mut stream in listener.incoming().flatten() {
+            let mut buf = [0u8; 4096];
+            let n = stream.read(&mut buf).unwrap_or(0);
+            let req = String::from_utf8_lossy(&buf[..n]);
+            if req.contains("GET /node-gyp") {
+                let body = format!(
+                    r#"{{"name":"node-gyp","dist-tags":{{"latest":"10.0.0"}},"versions":{{"10.0.0":{{"dist":{{"tarball":"http://127.0.0.1:{}/tarballs/node-gyp.tgz","integrity":"{}"}}}}}}}}"#,
+                    port,
+                    integrity_clone
+                );
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(resp.as_bytes());
+                let _ = stream.flush();
+            } else if req.contains("GET /tarballs/node-gyp.tgz") {
+                let resp_head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    tb_clone.len()
+                );
+                let _ = stream.write_all(resp_head.as_bytes());
+                let _ = stream.write_all(&tb_clone);
+                let _ = stream.flush();
+                break;
+            }
+        }
+    });
+
+    std::fs::write(project_dir.join("binding.gyp"), "{}").unwrap();
+    std::fs::write(
+        project_dir.join("package.json"),
+        r#"{"name": "mock-native-pkg", "version": "1.0.0"}"#,
+    )
+    .unwrap();
+
+    let cache_dir = temp.path().join("cache");
+    let mut ctx = LifecycleContext::new(
+        &project_dir,
+        &project_dir,
+        "mock-native-pkg",
+        "install",
+        "node-gyp rebuild",
+    );
+    ctx.extra_env.insert(
+        "npm_config_cache".to_string(),
+        cache_dir.to_string_lossy().to_string(),
+    );
+    ctx.extra_env.insert(
+        "npm_config_registry".to_string(),
+        format!("http://127.0.0.1:{}/", port),
+    );
+    ctx.extra_env.insert(
+        "npm_config_node_gyp_fallback_npm".to_string(),
+        "false".to_string(),
+    );
+
+    let status = execute_lifecycle_script(&ctx).expect("execute_lifecycle_script with bootstrap should succeed");
+    assert!(status.success(), "Lifecycle script must exit successfully");
+
+    // Verify downloaded & unpacked node-gyp.js in cache
+    let cached_js = cache_dir.join("node-gyp").join("current").join("bin").join("node-gyp.js");
+    assert!(
+        cached_js.is_file(),
+        "Bootstrap must unpack node-gyp into cache directory: {}",
+        cached_js.display()
+    );
+
+    // Verify dummy package was built
+    assert!(
+        marker_file.is_file(),
+        "Dummy native package must have been built by bootstrapped node-gyp"
+    );
+    let marker_content = std::fs::read_to_string(&marker_file).unwrap();
+    assert_eq!(marker_content, "bootstrap node-gyp built package");
+
+    let _ = server_handle.join();
+}
+
+fn create_tarball_with_files(files: &[(&str, &[u8])]) -> Vec<u8> {
+    let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    {
+        let mut builder = tar::Builder::new(&mut gz);
+        for &(path, content) in files {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(content.len() as u64);
+            header.set_mode(0o755);
+            let path_bytes = path.as_bytes();
+            if path_bytes.len() <= 100 {
+                header.as_mut_bytes()[..path_bytes.len()].copy_from_slice(path_bytes);
+                header.set_cksum();
+                builder.append(&header, content).unwrap();
+            } else {
+                header.set_path(path).unwrap();
+                header.set_cksum();
+                builder.append(&header, content).unwrap();
+            }
+        }
+        builder.finish().unwrap();
+    }
+    gz.finish().unwrap()
+}
+
+#[test]
+fn test_node_gyp_tampered_integrity_rejected_live_cache_not_created() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    let temp = tempfile::tempdir().unwrap();
+    let cache_dir = temp.path().join("cache");
+    let project_dir = temp.path().join("pkg");
+    std::fs::create_dir_all(&project_dir).unwrap();
+
+    let valid_tarball = create_tarball_with_files(&[
+        ("package/package.json", br#"{"name":"node-gyp","version":"10.0.0","bin":{"node-gyp":"bin/node-gyp.js"}}"#),
+        ("package/bin/node-gyp.js", b"process.exit(0);"),
+    ]);
+
+    // Compute legitimate integrity of the original tarball
+    let legitimate_integrity = rnpm_core::Integrity::from_bytes(&valid_tarball, rnpm_core::Algorithm::Sha512).to_string();
+
+    // Tampered tarball that does NOT match the integrity
+    let tampered_tarball = create_tarball_with_files(&[
+        ("package/package.json", br#"{"name":"node-gyp","version":"10.0.0","bin":{"node-gyp":"bin/node-gyp.js"}}"#),
+        ("package/bin/node-gyp.js", b"console.log('tampered payload'); process.exit(1);"),
+    ]);
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("Failed to bind mock registry listener");
+    let port = listener.local_addr().unwrap().port();
+    let tampered_clone = tampered_tarball.clone();
+    let integrity_clone = legitimate_integrity.clone();
+
+    let server_handle = std::thread::spawn(move || {
+        for mut stream in listener.incoming().flatten() {
+            let mut buf = [0u8; 4096];
+            let n = stream.read(&mut buf).unwrap_or(0);
+            let req = String::from_utf8_lossy(&buf[..n]);
+            if req.contains("GET /node-gyp") {
+                let body = format!(
+                    r#"{{"name":"node-gyp","dist-tags":{{"latest":"10.0.0"}},"versions":{{"10.0.0":{{"dist":{{"tarball":"http://127.0.0.1:{}/tarballs/node-gyp.tgz","integrity":"{}"}}}}}}}}"#,
+                    port,
+                    integrity_clone
+                );
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(resp.as_bytes());
+                let _ = stream.flush();
+            } else if req.contains("GET /tarballs/node-gyp.tgz") {
+                let resp_head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    tampered_clone.len()
+                );
+                let _ = stream.write_all(resp_head.as_bytes());
+                let _ = stream.write_all(&tampered_clone);
+                let _ = stream.flush();
+                break;
+            }
+        }
+    });
+
+    let mut config = rnpm_config::Config::default();
+    config.npmrc.settings.insert("cache".to_string(), cache_dir.to_string_lossy().to_string());
+    config.npmrc.settings.insert("registry".to_string(), format!("http://127.0.0.1:{}/", port));
+    config.npmrc.settings.insert("node-gyp-fallback-npm".to_string(), "false".to_string());
+
+    let res = crate::node_gyp::ensure_node_gyp(
+        &project_dir,
+        &project_dir,
+        &config,
+        None,
+        false,
+        "test-tampered-pkg",
+    );
+
+    assert!(res.is_err(), "ensure_node_gyp must fail when tarball integrity check fails");
+    let err_str = res.unwrap_err().to_string();
+    assert!(
+        err_str.contains("integrity mismatch") || err_str.contains("integrity check failed"),
+        "Error message should mention integrity mismatch: {err_str}"
+    );
+
+    // Live cache directory MUST NOT exist
+    let live_current = cache_dir.join("node-gyp").join("current");
+    assert!(!live_current.exists(), "Live cache directory must not be created on integrity mismatch");
+
+    // No partial .tmp-* staging directory should remain
+    let node_gyp_dir = cache_dir.join("node-gyp");
+    if node_gyp_dir.exists() {
+        let entries = std::fs::read_dir(&node_gyp_dir).unwrap();
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            assert!(
+                !name.starts_with(".tmp-"),
+                "Staging directory must be cleaned up on failure: {name}"
+            );
+        }
+    }
+
+    let _ = server_handle.join();
+}
+
+#[test]
+fn test_node_gyp_malicious_path_traversal_tarball_rejected() {
+    let temp = tempfile::tempdir().unwrap();
+    let staging_dir = temp.path().join("staging");
+    let canary_file = temp.path().join("escape.txt");
+
+    // Construct tarball with ../../escape.txt
+    let malicious_bytes = create_tarball_with_files(&[
+        ("package/../../escape.txt", b"evil traversal payload"),
+    ]);
+
+    let res = crate::node_gyp::unpack_tarball(&malicious_bytes, &staging_dir);
+    assert!(res.is_err(), "unpack_tarball must reject archive with path traversal");
+
+    assert!(
+        !canary_file.exists(),
+        "Canary file must NOT be written outside staging directory"
+    );
+
+    // Direct traversal without package/ prefix
+    let malicious_direct = create_tarball_with_files(&[
+        ("../../escape2.txt", b"evil direct traversal"),
+    ]);
+    let canary2 = temp.path().join("escape2.txt");
+    let res2 = crate::node_gyp::unpack_tarball(&malicious_direct, &staging_dir);
+    assert!(res2.is_err(), "unpack_tarball must reject direct traversal");
+    assert!(!canary2.exists(), "Canary 2 must not exist");
+}
+
+#[test]
+fn test_node_gyp_bootstrap_multi_package_transitive_deps_end_to_end() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    let temp = tempfile::tempdir().unwrap();
+    let project_dir = temp.path().join("pkg");
+    let cache_dir = temp.path().join("cache");
+    std::fs::create_dir_all(&project_dir).unwrap();
+
+    let marker_file = project_dir.join("multi-dep-build.marker");
+    let marker_escaped = marker_file.to_string_lossy().replace('\\', "/");
+
+    // 1. Mock node-gyp depending on dep-a
+    let node_gyp_pkg_json = r#"{"name":"node-gyp","version":"10.0.0","bin":{"node-gyp":"bin/node-gyp.js"},"dependencies":{"dep-a":"^1.0.0"}}"#;
+    let node_gyp_bin_js = "const depA = require('dep-a'); depA.run();";
+    let node_gyp_tb = create_tarball_with_files(&[
+        ("package/package.json", node_gyp_pkg_json.as_bytes()),
+        ("package/bin/node-gyp.js", node_gyp_bin_js.as_bytes()),
+    ]);
+    let node_gyp_integrity = rnpm_core::Integrity::from_bytes(&node_gyp_tb, rnpm_core::Algorithm::Sha512).to_string();
+
+    // 2. Mock dep-a depending on @scope/dep-b
+    let dep_a_pkg_json = r#"{"name":"dep-a","version":"1.0.0","main":"index.js","dependencies":{"@scope/dep-b":"^1.0.0"}}"#;
+    let dep_a_index_js = "const depB = require('@scope/dep-b'); module.exports = { run: function() { depB.run(); } };";
+    let dep_a_tb = create_tarball_with_files(&[
+        ("package/package.json", dep_a_pkg_json.as_bytes()),
+        ("package/index.js", dep_a_index_js.as_bytes()),
+    ]);
+    let dep_a_integrity = rnpm_core::Integrity::from_bytes(&dep_a_tb, rnpm_core::Algorithm::Sha512).to_string();
+
+    // 3. Mock @scope/dep-b writing the marker
+    let dep_b_pkg_json = r#"{"name":"@scope/dep-b","version":"1.0.0","main":"index.js"}"#;
+    let dep_b_index_js = format!(
+        "const fs = require('fs'); module.exports = {{ run: function() {{ fs.writeFileSync('{}', 'multi-dep-success'); process.exit(0); }} }};",
+        marker_escaped
+    );
+    let dep_b_tb = create_tarball_with_files(&[
+        ("package/package.json", dep_b_pkg_json.as_bytes()),
+        ("package/index.js", dep_b_index_js.as_bytes()),
+    ]);
+    let dep_b_integrity = rnpm_core::Integrity::from_bytes(&dep_b_tb, rnpm_core::Algorithm::Sha512).to_string();
+
+    // Start mock HTTP registry server
+    let listener = TcpListener::bind("127.0.0.1:0").expect("Failed to bind mock registry listener");
+    listener.set_nonblocking(true).unwrap();
+    let port = listener.local_addr().unwrap().port();
+
+    let running = Arc::new(AtomicBool::new(true));
+    let r_clone = Arc::clone(&running);
+
+    let ng_tb_clone = node_gyp_tb.clone();
+    let ng_int_clone = node_gyp_integrity.clone();
+    let da_tb_clone = dep_a_tb.clone();
+    let da_int_clone = dep_a_integrity.clone();
+    let db_tb_clone = dep_b_tb.clone();
+    let db_int_clone = dep_b_integrity.clone();
+
+    let server_handle = std::thread::spawn(move || {
+        while r_clone.load(Ordering::Relaxed) {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    let _ = stream.set_nonblocking(false);
+                    let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(5)));
+                    let mut buf = [0u8; 4096];
+                    let n = stream.read(&mut buf).unwrap_or(0);
+                    if n == 0 {
+                        continue;
+                    }
+                    let req = String::from_utf8_lossy(&buf[..n]);
+
+                    let (status, content_type, body_bytes) = if req.contains("GET /node-gyp") {
+                        let json = format!(
+                            r#"{{"name":"node-gyp","dist-tags":{{"latest":"10.0.0"}},"versions":{{"10.0.0":{{"name":"node-gyp","version":"10.0.0","dependencies":{{"dep-a":"^1.0.0"}},"dist":{{"tarball":"http://127.0.0.1:{}/tarballs/node-gyp.tgz","integrity":"{}"}}}}}}}}"#,
+                            port, ng_int_clone
+                        );
+                        ("200 OK", "application/json", json.into_bytes())
+                    } else if req.contains("GET /tarballs/node-gyp.tgz") {
+                        ("200 OK", "application/octet-stream", ng_tb_clone.clone())
+                    } else if req.contains("GET /dep-a") {
+                        let json = format!(
+                            r#"{{"name":"dep-a","dist-tags":{{"latest":"1.0.0"}},"versions":{{"1.0.0":{{"name":"dep-a","version":"1.0.0","dependencies":{{"@scope/dep-b":"^1.0.0"}},"dist":{{"tarball":"http://127.0.0.1:{}/tarballs/dep-a.tgz","integrity":"{}"}}}}}}}}"#,
+                            port, da_int_clone
+                        );
+                        ("200 OK", "application/json", json.into_bytes())
+                    } else if req.contains("GET /tarballs/dep-a.tgz") {
+                        ("200 OK", "application/octet-stream", da_tb_clone.clone())
+                    } else if req.contains("GET /@scope") {
+                        let json = format!(
+                            r#"{{"name":"@scope/dep-b","dist-tags":{{"latest":"1.0.0"}},"versions":{{"1.0.0":{{"name":"@scope/dep-b","version":"1.0.0","dist":{{"tarball":"http://127.0.0.1:{}/tarballs/dep-b.tgz","integrity":"{}"}}}}}}}}"#,
+                            port, db_int_clone
+                        );
+                        ("200 OK", "application/json", json.into_bytes())
+                    } else if req.contains("GET /tarballs/dep-b.tgz") {
+                        ("200 OK", "application/octet-stream", db_tb_clone.clone())
+                    } else {
+                        ("404 Not Found", "text/plain", b"Not found".to_vec())
+                    };
+
+                    let resp_header = format!(
+                        "HTTP/1.1 {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        status,
+                        content_type,
+                        body_bytes.len()
+                    );
+                    let _ = stream.write_all(resp_header.as_bytes());
+                    let _ = stream.write_all(&body_bytes);
+                    let _ = stream.flush();
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    std::fs::write(project_dir.join("binding.gyp"), "{}").unwrap();
+    std::fs::write(
+        project_dir.join("package.json"),
+        r#"{"name": "mock-multi-dep-pkg", "version": "1.0.0"}"#,
+    )
+    .unwrap();
+
+    let mut ctx = LifecycleContext::new(
+        &project_dir,
+        &project_dir,
+        "mock-multi-dep-pkg",
+        "install",
+        "node-gyp rebuild",
+    );
+    ctx.extra_env.insert(
+        "npm_config_cache".to_string(),
+        cache_dir.to_string_lossy().to_string(),
+    );
+    ctx.extra_env.insert(
+        "npm_config_registry".to_string(),
+        format!("http://127.0.0.1:{}/", port),
+    );
+    ctx.extra_env.insert(
+        "npm_config_node_gyp_fallback_npm".to_string(),
+        "false".to_string(),
+    );
+
+    let status = execute_lifecycle_script(&ctx)
+        .expect("Lifecycle script execution with multi-package dependencies must succeed");
+    assert!(status.success(), "Lifecycle script must exit successfully");
+
+    // Stop mock server
+    running.store(false, Ordering::Relaxed);
+    let _ = server_handle.join();
+
+    // Verify file structure
+    let current_dir = cache_dir.join("node-gyp").join("current");
+    assert!(current_dir.join("bin").join("node-gyp.js").is_file());
+    assert!(current_dir.join("node_modules").join("dep-a").join("index.js").is_file());
+    assert!(current_dir.join("node_modules").join("@scope").join("dep-b").join("index.js").is_file());
+
+    // Verify that the marker was written by real node executing node-gyp -> dep-a -> @scope/dep-b
+    assert!(
+        marker_file.is_file(),
+        "Transitive dependency @scope/dep-b must have executed and created marker file"
+    );
+    let content = std::fs::read_to_string(&marker_file).unwrap();
+    assert_eq!(content, "multi-dep-success");
+}
+
+#[test]
+fn test_node_gyp_staging_cleanup_on_failure() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    let temp = tempfile::tempdir().unwrap();
+    let cache_dir = temp.path().join("cache");
+    let project_dir = temp.path().join("pkg");
+    std::fs::create_dir_all(&project_dir).unwrap();
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("Failed to bind mock registry listener");
+    let port = listener.local_addr().unwrap().port();
+
+    let server_handle = std::thread::spawn(move || {
+        for mut stream in listener.incoming().flatten() {
+            let mut buf = [0u8; 4096];
+            let n = stream.read(&mut buf).unwrap_or(0);
+            let req = String::from_utf8_lossy(&buf[..n]);
+            if req.contains("GET /node-gyp") {
+                // Invalid SRI format in metadata
+                let body = format!(
+                    r#"{{"name":"node-gyp","dist-tags":{{"latest":"10.0.0"}},"versions":{{"10.0.0":{{"dist":{{"tarball":"http://127.0.0.1:{}/tarballs/node-gyp.tgz","integrity":"sha512-invalid@format!"}}}}}}}}"#,
+                    port
+                );
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(resp.as_bytes());
+                let _ = stream.flush();
+            } else if req.contains("GET /tarballs/node-gyp.tgz") {
+                let bytes = b"dummy tarball content";
+                let resp_head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    bytes.len()
+                );
+                let _ = stream.write_all(resp_head.as_bytes());
+                let _ = stream.write_all(bytes);
+                let _ = stream.flush();
+                break;
+            }
+        }
+    });
+
+    let mut config = rnpm_config::Config::default();
+    config.npmrc.settings.insert("cache".to_string(), cache_dir.to_string_lossy().to_string());
+    config.npmrc.settings.insert("registry".to_string(), format!("http://127.0.0.1:{}/", port));
+    config.npmrc.settings.insert("node-gyp-fallback-npm".to_string(), "false".to_string());
+
+    let res = crate::node_gyp::bootstrap_node_gyp(&project_dir, &config);
+    assert!(res.is_err(), "bootstrap_node_gyp must fail on invalid integrity");
+
+    // Live cache directory must NOT exist
+    assert!(!cache_dir.join("node-gyp").join("current").exists());
+
+    // Verify all .tmp-* directories are cleaned up
+    let node_gyp_dir = cache_dir.join("node-gyp");
+    if node_gyp_dir.exists() {
+        for entry in std::fs::read_dir(&node_gyp_dir).unwrap().flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            assert!(!name.starts_with(".tmp-"), "Leftover staging dir found: {name}");
+        }
+    }
+
+    let _ = server_handle.join();
+}
+
+#[test]
+fn test_node_gyp_shasum_fallback_behavior() {
+    let payload = b"hello node-gyp integrity verification payload";
+    let sha512_sri = rnpm_core::Integrity::from_bytes(payload, rnpm_core::Algorithm::Sha512).to_string();
+    let sha256_sri = rnpm_core::Integrity::from_bytes(payload, rnpm_core::Algorithm::Sha256).to_string();
+    let sha1_sri = rnpm_core::Integrity::from_bytes(payload, rnpm_core::Algorithm::Sha1).to_string();
+
+    let sha1_digest = rnpm_core::Algorithm::Sha1.compute_digest(payload);
+    let sha1_hex: String = sha1_digest.iter().map(|b| format!("{:02x}", b)).collect();
+
+    // 1. Valid SRI verification
+    assert!(crate::node_gyp::verify_tarball_integrity(payload, Some(&sha512_sri), None).is_ok());
+    assert!(crate::node_gyp::verify_tarball_integrity(payload, Some(&sha256_sri), None).is_ok());
+    assert!(crate::node_gyp::verify_tarball_integrity(payload, Some(&sha1_sri), None).is_ok());
+
+    // 2. Mismatching SRI verification
+    let different_payload = b"different data";
+    assert!(crate::node_gyp::verify_tarball_integrity(different_payload, Some(&sha512_sri), None).is_err());
+
+    // 3. Fallback to dist.shasum ONLY when integrity is absent
+    assert!(crate::node_gyp::verify_tarball_integrity(payload, None, Some(&sha1_hex)).is_ok());
+    assert!(crate::node_gyp::verify_tarball_integrity(different_payload, None, Some(&sha1_hex)).is_err());
+
+    // 4. When integrity is present but invalid SRI format, MUST FAIL and not fall back to shasum
+    assert!(
+        crate::node_gyp::verify_tarball_integrity(payload, Some("invalid-sri-format"), Some(&sha1_hex)).is_err(),
+        "Must fail when integrity is invalid SRI even if shasum matches"
+    );
+
+    // 5. When both are absent, MUST FAIL
+    assert!(crate::node_gyp::verify_tarball_integrity(payload, None, None).is_err());
+}
+
+#[test]
+fn test_node_gyp_malicious_dependency_name_rejected() {
+    let temp = tempfile::tempdir().unwrap();
+    let nm = temp.path().join("node_modules");
+
+    // 1. Malicious traversal names
+    let bad_names = [
+        "../../escape",
+        "@scope/../../escape",
+        "@../escape",
+        ".",
+        "..",
+        ".hidden",
+        "_private",
+        "foo/bar/baz",
+        "foo\\bar",
+        "foo:bar",
+        "foo\0bar",
+        "foo|bar",
+        "",
+        "   ",
+    ];
+
+    for name in bad_names {
+        assert!(
+            crate::node_gyp::validate_package_name(name).is_err(),
+            "validate_package_name must reject malicious or invalid name: '{name}'"
+        );
+        assert!(
+            crate::node_gyp::package_dir_in_node_modules(&nm, name).is_err(),
+            "package_dir_in_node_modules must reject malicious name: '{name}'"
+        );
+    }
+
+    // 2. Valid package names must succeed and be contained within node_modules
+    let good_names = [
+        "dep-a",
+        "dep_b",
+        "dep.c",
+        "dep123",
+        "@scope/dep-b",
+        "@my-org/core.utils",
+    ];
+
+    for name in good_names {
+        assert!(
+            crate::node_gyp::validate_package_name(name).is_ok(),
+            "validate_package_name must accept valid name: '{name}'"
+        );
+        let path = crate::node_gyp::package_dir_in_node_modules(&nm, name).unwrap();
+        assert!(
+            path.starts_with(&nm),
+            "Package path must stay strictly inside node_modules: {}",
+            path.display()
+        );
+    }
+}
+
+#[test]
+fn test_node_gyp_pick_matching_version_no_silent_fallback_on_unsatisfiable_semver() {
+    let mut versions = serde_json::Map::new();
+    versions.insert("1.0.0".to_string(), serde_json::json!({ "version": "1.0.0" }));
+    versions.insert("1.1.0".to_string(), serde_json::json!({ "version": "1.1.0" }));
+    versions.insert("1.2.0".to_string(), serde_json::json!({ "version": "1.2.0" }));
+
+    let dist_tags = serde_json::json!({ "latest": "1.2.0" });
+
+    // 1. Unsatisfiable semver ranges MUST return None, NOT silently fall back to latest or highest!
+    assert!(
+        crate::node_gyp::pick_matching_version(&versions, Some(&dist_tags), "^2.0.0").is_none(),
+        "Must return None for unsatisfiable semver range ^2.0.0"
+    );
+    assert!(
+        crate::node_gyp::pick_matching_version(&versions, Some(&dist_tags), ">=3.0.0").is_none(),
+        "Must return None for unsatisfiable semver range >=3.0.0"
+    );
+    assert!(
+        crate::node_gyp::pick_matching_version(&versions, Some(&dist_tags), "~0.9.0").is_none(),
+        "Must return None for unsatisfiable semver range ~0.9.0"
+    );
+
+    // 2. Satisfiable ranges must pick highest matching version
+    let match_caret = crate::node_gyp::pick_matching_version(&versions, Some(&dist_tags), "^1.0.0");
+    assert_eq!(match_caret.map(|(v, _)| v), Some("1.2.0"));
+
+    let match_tilde = crate::node_gyp::pick_matching_version(&versions, Some(&dist_tags), "~1.0.0");
+    assert_eq!(match_tilde.map(|(v, _)| v), Some("1.0.0"));
+
+    // 3. Explicit "latest" or "*" returns dist-tags.latest
+    let match_latest = crate::node_gyp::pick_matching_version(&versions, Some(&dist_tags), "latest");
+    assert_eq!(match_latest.map(|(v, _)| v), Some("1.2.0"));
+
+    let match_star = crate::node_gyp::pick_matching_version(&versions, Some(&dist_tags), "*");
+    assert_eq!(match_star.map(|(v, _)| v), Some("1.2.0"));
+}
+
+#[test]
+fn test_node_gyp_single_version_packument_spec_validation_rejected_on_mismatch() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    let temp = tempfile::tempdir().unwrap();
+    let cache_dir = temp.path().join("cache");
+    let project_dir = temp.path().join("pkg");
+    std::fs::create_dir_all(&project_dir).unwrap();
+
+    // 1. Mock node-gyp depends on "dep-single": "^2.0.0"
+    let node_gyp_pkg_json = r#"{"name":"node-gyp","version":"10.0.0","bin":{"node-gyp":"bin/node-gyp.js"},"dependencies":{"dep-single":"^2.0.0"}}"#;
+    let node_gyp_tb = create_tarball_with_files(&[
+        ("package/package.json", node_gyp_pkg_json.as_bytes()),
+        ("package/bin/node-gyp.js", b"process.exit(0);"),
+    ]);
+    let node_gyp_integrity = rnpm_core::Integrity::from_bytes(&node_gyp_tb, rnpm_core::Algorithm::Sha512).to_string();
+
+    // 2. Mock dep-single tarball (version 1.0.0)
+    let dep_single_tb = create_tarball_with_files(&[
+        ("package/package.json", br#"{"name":"dep-single","version":"1.0.0"}"#),
+    ]);
+    let dep_single_integrity = rnpm_core::Integrity::from_bytes(&dep_single_tb, rnpm_core::Algorithm::Sha512).to_string();
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("Failed to bind mock registry listener");
+    listener.set_nonblocking(true).unwrap();
+    let port = listener.local_addr().unwrap().port();
+
+    let running = Arc::new(AtomicBool::new(true));
+    let r_clone = Arc::clone(&running);
+
+    let server_handle = std::thread::spawn(move || {
+        while r_clone.load(Ordering::Relaxed) {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    let _ = stream.set_nonblocking(false);
+                    let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(5)));
+                    let mut buf = [0u8; 4096];
+                    let n = stream.read(&mut buf).unwrap_or(0);
+                    if n == 0 {
+                        continue;
+                    }
+                    let req = String::from_utf8_lossy(&buf[..n]);
+
+                    let (status, content_type, body_bytes) = if req.contains("GET /node-gyp") {
+                        let json = format!(
+                            r#"{{"name":"node-gyp","dist-tags":{{"latest":"10.0.0"}},"versions":{{"10.0.0":{{"name":"node-gyp","version":"10.0.0","dependencies":{{"dep-single":"^2.0.0"}},"dist":{{"tarball":"http://127.0.0.1:{}/tarballs/node-gyp.tgz","integrity":"{}"}}}}}}}}"#,
+                            port, node_gyp_integrity
+                        );
+                        ("200 OK", "application/json", json.into_bytes())
+                    } else if req.contains("GET /tarballs/node-gyp.tgz") {
+                        ("200 OK", "application/octet-stream", node_gyp_tb.clone())
+                    } else if req.contains("GET /dep-single") {
+                        // Single-version packument response (no "versions" map, top-level "dist" and "version")
+                        // returning version "1.0.0" when "^2.0.0" was requested!
+                        let json = format!(
+                            r#"{{"name":"dep-single","version":"1.0.0","dist":{{"tarball":"http://127.0.0.1:{}/tarballs/dep-single.tgz","integrity":"{}"}}}}"#,
+                            port, dep_single_integrity
+                        );
+                        ("200 OK", "application/json", json.into_bytes())
+                    } else if req.contains("GET /tarballs/dep-single.tgz") {
+                        ("200 OK", "application/octet-stream", dep_single_tb.clone())
+                    } else {
+                        ("404 Not Found", "text/plain", b"Not found".to_vec())
+                    };
+
+                    let resp_header = format!(
+                        "HTTP/1.1 {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        status,
+                        content_type,
+                        body_bytes.len()
+                    );
+                    let _ = stream.write_all(resp_header.as_bytes());
+                    let _ = stream.write_all(&body_bytes);
+                    let _ = stream.flush();
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    let mut config = rnpm_config::Config::default();
+    config.npmrc.settings.insert("cache".to_string(), cache_dir.to_string_lossy().to_string());
+    config.npmrc.settings.insert("registry".to_string(), format!("http://127.0.0.1:{}/", port));
+    config.npmrc.settings.insert("node-gyp-fallback-npm".to_string(), "false".to_string());
+
+    let res = crate::node_gyp::bootstrap_node_gyp(&project_dir, &config);
+
+    // Stop mock server
+    running.store(false, Ordering::Relaxed);
+    let _ = server_handle.join();
+
+    // Verify rejection!
+    assert!(res.is_err(), "Single-version packument returning 1.0.0 for ^2.0.0 MUST be rejected");
+    let err_msg = res.unwrap_err().to_string();
+    assert!(
+        err_msg.contains("dep-single") && (err_msg.contains("1.0.0") || err_msg.contains("^2.0.0")),
+        "Error message must specify version mismatch: {err_msg}"
+    );
+
+    // Verify live cache directory was not created on rejection
+    assert!(
+        !cache_dir.join("node-gyp").join("current").exists(),
+        "Live cache directory must not be created on spec validation failure"
+    );
+}
+
+#[test]
+fn test_node_gyp_cyclic_conflicting_nested_dependencies_terminates_cleanly() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    let temp = tempfile::tempdir().unwrap();
+    let cache_dir = temp.path().join("cache");
+    let project_dir = temp.path().join("pkg");
+    std::fs::create_dir_all(&project_dir).unwrap();
+
+    // Dependency graph:
+    // root (node-gyp) -> pkg-a@^1.0.0, pkg-b@^1.0.0
+    // pkg-a@1.0.0 (no deps)
+    // pkg-b@1.0.0 -> pkg-a@^2.0.0
+    // pkg-a@2.0.0 -> pkg-b@^2.0.0
+    // pkg-b@2.0.0 -> pkg-a@^2.0.0 (cycle back to pkg-a@^2.0.0!)
+
+    // 1. Mock node-gyp
+    let ng_pkg_json = r#"{"name":"node-gyp","version":"10.0.0","bin":{"node-gyp":"bin/node-gyp.js"},"dependencies":{"pkg-a":"^1.0.0","pkg-b":"^1.0.0"}}"#;
+    let ng_tb = create_tarball_with_files(&[
+        ("package/package.json", ng_pkg_json.as_bytes()),
+        ("package/bin/node-gyp.js", b"process.exit(0);"),
+    ]);
+    let ng_int = rnpm_core::Integrity::from_bytes(&ng_tb, rnpm_core::Algorithm::Sha512).to_string();
+
+    // 2. pkg-a@1.0.0
+    let a1_pkg_json = r#"{"name":"pkg-a","version":"1.0.0"}"#;
+    let a1_tb = create_tarball_with_files(&[("package/package.json", a1_pkg_json.as_bytes())]);
+    let a1_int = rnpm_core::Integrity::from_bytes(&a1_tb, rnpm_core::Algorithm::Sha512).to_string();
+
+    // 3. pkg-b@1.0.0 -> pkg-a@^2.0.0
+    let b1_pkg_json = r#"{"name":"pkg-b","version":"1.0.0","dependencies":{"pkg-a":"^2.0.0"}}"#;
+    let b1_tb = create_tarball_with_files(&[("package/package.json", b1_pkg_json.as_bytes())]);
+    let b1_int = rnpm_core::Integrity::from_bytes(&b1_tb, rnpm_core::Algorithm::Sha512).to_string();
+
+    // 4. pkg-a@2.0.0 -> pkg-b@^2.0.0
+    let a2_pkg_json = r#"{"name":"pkg-a","version":"2.0.0","dependencies":{"pkg-b":"^2.0.0"}}"#;
+    let a2_tb = create_tarball_with_files(&[("package/package.json", a2_pkg_json.as_bytes())]);
+    let a2_int = rnpm_core::Integrity::from_bytes(&a2_tb, rnpm_core::Algorithm::Sha512).to_string();
+
+    // 5. pkg-b@2.0.0 -> pkg-a@^2.0.0 (cyclic dependency!)
+    let b2_pkg_json = r#"{"name":"pkg-b","version":"2.0.0","dependencies":{"pkg-a":"^2.0.0"}}"#;
+    let b2_tb = create_tarball_with_files(&[("package/package.json", b2_pkg_json.as_bytes())]);
+    let b2_int = rnpm_core::Integrity::from_bytes(&b2_tb, rnpm_core::Algorithm::Sha512).to_string();
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("Failed to bind mock registry listener");
+    listener.set_nonblocking(true).unwrap();
+    let port = listener.local_addr().unwrap().port();
+
+    let running = Arc::new(AtomicBool::new(true));
+    let r_clone = Arc::clone(&running);
+
+    let ng_tb_c = ng_tb.clone();
+    let a1_tb_c = a1_tb.clone();
+    let b1_tb_c = b1_tb.clone();
+    let a2_tb_c = a2_tb.clone();
+    let b2_tb_c = b2_tb.clone();
+
+    let server_handle = std::thread::spawn(move || {
+        while r_clone.load(Ordering::Relaxed) {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    let _ = stream.set_nonblocking(false);
+                    let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(5)));
+                    let mut buf = [0u8; 4096];
+                    let n = stream.read(&mut buf).unwrap_or(0);
+                    if n == 0 {
+                        continue;
+                    }
+                    let req = String::from_utf8_lossy(&buf[..n]);
+
+                    let (status, content_type, body_bytes) = if req.contains("GET /node-gyp") {
+                        let json = format!(
+                            r#"{{"name":"node-gyp","dist-tags":{{"latest":"10.0.0"}},"versions":{{"10.0.0":{{"name":"node-gyp","version":"10.0.0","dependencies":{{"pkg-a":"^1.0.0","pkg-b":"^1.0.0"}},"dist":{{"tarball":"http://127.0.0.1:{}/tarballs/node-gyp.tgz","integrity":"{}"}}}}}}}}"#,
+                            port, ng_int
+                        );
+                        ("200 OK", "application/json", json.into_bytes())
+                    } else if req.contains("GET /tarballs/node-gyp.tgz") {
+                        ("200 OK", "application/octet-stream", ng_tb_c.clone())
+                    } else if req.contains("GET /pkg-a") {
+                        let json = format!(
+                            r#"{{"name":"pkg-a","dist-tags":{{"latest":"2.0.0"}},"versions":{{"1.0.0":{{"name":"pkg-a","version":"1.0.0","dist":{{"tarball":"http://127.0.0.1:{}/tarballs/pkg-a-1.tgz","integrity":"{}"}}}},"2.0.0":{{"name":"pkg-a","version":"2.0.0","dependencies":{{"pkg-b":"^2.0.0"}},"dist":{{"tarball":"http://127.0.0.1:{}/tarballs/pkg-a-2.tgz","integrity":"{}"}}}}}}}}"#,
+                            port, a1_int, port, a2_int
+                        );
+                        ("200 OK", "application/json", json.into_bytes())
+                    } else if req.contains("GET /tarballs/pkg-a-1.tgz") {
+                        ("200 OK", "application/octet-stream", a1_tb_c.clone())
+                    } else if req.contains("GET /tarballs/pkg-a-2.tgz") {
+                        ("200 OK", "application/octet-stream", a2_tb_c.clone())
+                    } else if req.contains("GET /pkg-b") {
+                        let json = format!(
+                            r#"{{"name":"pkg-b","dist-tags":{{"latest":"2.0.0"}},"versions":{{"1.0.0":{{"name":"pkg-b","version":"1.0.0","dependencies":{{"pkg-a":"^2.0.0"}},"dist":{{"tarball":"http://127.0.0.1:{}/tarballs/pkg-b-1.tgz","integrity":"{}"}}}},"2.0.0":{{"name":"pkg-b","version":"2.0.0","dependencies":{{"pkg-a":"^2.0.0"}},"dist":{{"tarball":"http://127.0.0.1:{}/tarballs/pkg-b-2.tgz","integrity":"{}"}}}}}}}}"#,
+                            port, b1_int, port, b2_int
+                        );
+                        ("200 OK", "application/json", json.into_bytes())
+                    } else if req.contains("GET /tarballs/pkg-b-1.tgz") {
+                        ("200 OK", "application/octet-stream", b1_tb_c.clone())
+                    } else if req.contains("GET /tarballs/pkg-b-2.tgz") {
+                        ("200 OK", "application/octet-stream", b2_tb_c.clone())
+                    } else {
+                        ("404 Not Found", "text/plain", b"Not found".to_vec())
+                    };
+
+                    let resp_header = format!(
+                        "HTTP/1.1 {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        status,
+                        content_type,
+                        body_bytes.len()
+                    );
+                    let _ = stream.write_all(resp_header.as_bytes());
+                    let _ = stream.write_all(&body_bytes);
+                    let _ = stream.flush();
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    let mut config = rnpm_config::Config::default();
+    config.npmrc.settings.insert("cache".to_string(), cache_dir.to_string_lossy().to_string());
+    config.npmrc.settings.insert("registry".to_string(), format!("http://127.0.0.1:{}/", port));
+    config.npmrc.settings.insert("node-gyp-fallback-npm".to_string(), "false".to_string());
+
+    let res = crate::node_gyp::bootstrap_node_gyp(&project_dir, &config);
+
+    // Stop mock server
+    running.store(false, Ordering::Relaxed);
+    let _ = server_handle.join();
+
+    // Verify bootstrap terminated successfully
+    res.expect("Bootstrap must terminate cleanly without infinite nesting when cyclic dependencies occur");
+
+    let current_dir = cache_dir.join("node-gyp").join("current");
+    assert!(current_dir.join("bin").join("node-gyp.js").is_file());
+
+    // Top-level packages
+    let top_a = current_dir.join("node_modules").join("pkg-a");
+    let top_b = current_dir.join("node_modules").join("pkg-b");
+    assert!(top_a.join("package.json").is_file());
+    assert!(top_b.join("package.json").is_file());
+
+    let a1_json: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(top_a.join("package.json")).unwrap()).unwrap();
+    assert_eq!(a1_json["version"], "1.0.0");
+
+    let b1_json: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(top_b.join("package.json")).unwrap()).unwrap();
+    assert_eq!(b1_json["version"], "1.0.0");
+
+    // Nested pkg-a@2.0.0 inside pkg-b
+    let nested_a2 = top_b.join("node_modules").join("pkg-a");
+    assert!(nested_a2.join("package.json").is_file());
+    let a2_json: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(nested_a2.join("package.json")).unwrap()).unwrap();
+    assert_eq!(a2_json["version"], "2.0.0");
+
+    // Nested pkg-b@2.0.0 inside nested pkg-a@2.0.0
+    let nested_b2 = nested_a2.join("node_modules").join("pkg-b");
+    assert!(nested_b2.join("package.json").is_file());
+    let b2_json: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(nested_b2.join("package.json")).unwrap()).unwrap();
+    assert_eq!(b2_json["version"], "2.0.0");
+
+    // CRITICAL: pkg-b@2.0.0's dependency on pkg-a@^2.0.0 MUST reuse the ancestor pkg-a@2.0.0
+    // and MUST NOT nest deeper into pkg-b@2/node_modules/pkg-a!
+    let infinite_nested_a = nested_b2.join("node_modules").join("pkg-a");
+    assert!(
+        !infinite_nested_a.exists(),
+        "Infinite nesting detected! pkg-a should have been reused from ancestor but was nested at {}",
+        infinite_nested_a.display()
+    );
+}
+
+#[test]
+fn test_node_gyp_nesting_depth_guard_and_ancestor_resolution_unit() {
+    let temp = tempfile::tempdir().unwrap();
+    let staging = temp.path().join("staging");
+    std::fs::create_dir_all(&staging).unwrap();
+
+    // 1. Test count_node_modules_depth
+    assert_eq!(crate::node_gyp::count_node_modules_depth(&staging, &staging), 0);
+    let l1 = staging.join("node_modules").join("pkg-a");
+    assert_eq!(crate::node_gyp::count_node_modules_depth(&l1, &staging), 1);
+    let l2 = l1.join("node_modules").join("pkg-b");
+    assert_eq!(crate::node_gyp::count_node_modules_depth(&l2, &staging), 2);
+    let l3 = l2.join("node_modules").join("@scope").join("pkg-c");
+    assert_eq!(crate::node_gyp::count_node_modules_depth(&l3, &staging), 3);
+
+    // Deep path exceeding MAX_NESTING_DEPTH
+    let mut deep_path = staging.clone();
+    for i in 0..17 {
+        deep_path = deep_path.join("node_modules").join(format!("pkg-{}", i));
+    }
+    assert_eq!(crate::node_gyp::count_node_modules_depth(&deep_path, &staging), 17);
+    assert!(crate::node_gyp::count_node_modules_depth(&deep_path, &staging) > crate::node_gyp::MAX_NESTING_DEPTH);
+
+    // 2. Test is_ancestor_satisfied with ancestor package directory check (direct/mutual cycle)
+    // Setup: staging/node_modules/pkg-a (v2.0.0) -> staging/node_modules/pkg-a/node_modules/pkg-b (v2.0.0)
+    let pkg_a_dir = staging.join("node_modules").join("pkg-a");
+    let pkg_b_dir = pkg_a_dir.join("node_modules").join("pkg-b");
+    std::fs::create_dir_all(&pkg_b_dir).unwrap();
+    std::fs::write(pkg_a_dir.join("package.json"), r#"{"name":"pkg-a","version":"2.0.0"}"#).unwrap();
+    std::fs::write(pkg_b_dir.join("package.json"), r#"{"name":"pkg-b","version":"2.0.0"}"#).unwrap();
+
+    // When pkg-b asks for pkg-a@^2.0.0, ancestor pkg-a is satisfied!
+    let satisfied = crate::node_gyp::is_ancestor_satisfied("pkg-a", "^2.0.0", &pkg_b_dir, &staging).unwrap();
+    assert!(satisfied, "Ancestor pkg-a@2.0.0 must satisfy ^2.0.0");
+
+    // When pkg-b asks for pkg-a@^3.0.0, neither ancestor matches
+    let unsatisfied = crate::node_gyp::is_ancestor_satisfied("pkg-a", "^3.0.0", &pkg_b_dir, &staging).unwrap();
+    assert!(!unsatisfied, "Ancestor pkg-a@2.0.0 must NOT satisfy ^3.0.0");
+
+    // Self-dependency: when pkg-b asks for pkg-b@^2.0.0 from pkg-b itself
+    let self_satisfied = crate::node_gyp::is_ancestor_satisfied("pkg-b", "^2.0.0", &pkg_b_dir, &staging).unwrap();
+    assert!(self_satisfied, "Self package directory pkg-b@2.0.0 must satisfy ^2.0.0");
+}
+
+#[test]
+fn test_node_gyp_single_version_missing_version_rejected_even_for_wildcard() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    let temp = tempfile::tempdir().unwrap();
+    let cache_dir = temp.path().join("cache");
+    let project_dir = temp.path().join("pkg");
+    std::fs::create_dir_all(&project_dir).unwrap();
+
+    // 1. Mock node-gyp depends on "dep-no-ver": "*"
+    let node_gyp_pkg_json = r#"{"name":"node-gyp","version":"10.0.0","bin":{"node-gyp":"bin/node-gyp.js"},"dependencies":{"dep-no-ver":"*"}}"#;
+    let node_gyp_tb = create_tarball_with_files(&[
+        ("package/package.json", node_gyp_pkg_json.as_bytes()),
+        ("package/bin/node-gyp.js", b"process.exit(0);"),
+    ]);
+    let node_gyp_integrity = rnpm_core::Integrity::from_bytes(&node_gyp_tb, rnpm_core::Algorithm::Sha512).to_string();
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("Failed to bind mock registry listener");
+    listener.set_nonblocking(true).unwrap();
+    let port = listener.local_addr().unwrap().port();
+
+    let running = Arc::new(AtomicBool::new(true));
+    let r_clone = Arc::clone(&running);
+
+    let server_handle = std::thread::spawn(move || {
+        while r_clone.load(Ordering::Relaxed) {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    let _ = stream.set_nonblocking(false);
+                    let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(5)));
+                    let mut buf = [0u8; 4096];
+                    let n = stream.read(&mut buf).unwrap_or(0);
+                    if n == 0 {
+                        continue;
+                    }
+                    let req = String::from_utf8_lossy(&buf[..n]);
+
+                    let (status, content_type, body_bytes) = if req.contains("GET /node-gyp") {
+                        let json = format!(
+                            r#"{{"name":"node-gyp","dist-tags":{{"latest":"10.0.0"}},"versions":{{"10.0.0":{{"name":"node-gyp","version":"10.0.0","dependencies":{{"dep-no-ver":"*"}},"dist":{{"tarball":"http://127.0.0.1:{}/tarballs/node-gyp.tgz","integrity":"{}"}}}}}}}}"#,
+                            port, node_gyp_integrity
+                        );
+                        ("200 OK", "application/json", json.into_bytes())
+                    } else if req.contains("GET /tarballs/node-gyp.tgz") {
+                        ("200 OK", "application/octet-stream", node_gyp_tb.clone())
+                    } else if req.contains("GET /dep-no-ver") {
+                        // Single-version packument response with top-level "dist" but MISSING "version" field!
+                        let json = format!(
+                            r#"{{"name":"dep-no-ver","dist":{{"tarball":"http://127.0.0.1:{}/tarballs/dep-no-ver.tgz","integrity":"sha512-placeholder"}}}}"#,
+                            port
+                        );
+                        ("200 OK", "application/json", json.into_bytes())
+                    } else {
+                        ("404 Not Found", "text/plain", b"Not found".to_vec())
+                    };
+
+                    let resp_header = format!(
+                        "HTTP/1.1 {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        status,
+                        content_type,
+                        body_bytes.len()
+                    );
+                    let _ = stream.write_all(resp_header.as_bytes());
+                    let _ = stream.write_all(&body_bytes);
+                    let _ = stream.flush();
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    let mut config = rnpm_config::Config::default();
+    config.npmrc.settings.insert("cache".to_string(), cache_dir.to_string_lossy().to_string());
+    config.npmrc.settings.insert("registry".to_string(), format!("http://127.0.0.1:{}/", port));
+    config.npmrc.settings.insert("node-gyp-fallback-npm".to_string(), "false".to_string());
+
+    let res = crate::node_gyp::bootstrap_node_gyp(&project_dir, &config);
+
+    // Stop mock server
+    running.store(false, Ordering::Relaxed);
+    let _ = server_handle.join();
+
+    // Verify rejection even when spec is "*"
+    assert!(res.is_err(), "Single-version packument with missing version field MUST be rejected even for '*'");
+    let err_msg = res.unwrap_err().to_string();
+    assert!(
+        err_msg.contains("missing a valid 'version' field") || err_msg.contains("dep-no-ver"),
+        "Error message must indicate missing version field: {err_msg}"
+    );
+
+    assert!(
+        !cache_dir.join("node-gyp").join("current").exists(),
+        "Live cache directory must not be created when version field is missing"
+    );
+}
+
+#[test]
+fn test_node_gyp_ancestor_resolution_nested_node_modules_shadows_self() {
+    let temp = tempfile::tempdir().unwrap();
+    let staging = temp.path().join("staging");
+    std::fs::create_dir_all(&staging).unwrap();
+
+    // Directory structure:
+    // staging/node_modules/pkg-a (v1.0.0)
+    // staging/node_modules/pkg-a/node_modules/pkg-a (v2.0.0)
+    let parent_pkg_a = staging.join("node_modules").join("pkg-a");
+    let nested_pkg_a = parent_pkg_a.join("node_modules").join("pkg-a");
+    std::fs::create_dir_all(&nested_pkg_a).unwrap();
+
+    std::fs::write(parent_pkg_a.join("package.json"), r#"{"name":"pkg-a","version":"1.0.0"}"#).unwrap();
+    std::fs::write(nested_pkg_a.join("package.json"), r#"{"name":"pkg-a","version":"2.0.0"}"#).unwrap();
+
+    // 1. From parent_pkg_a, when resolving "pkg-a" for ^2.0.0:
+    // In Node.js resolution, parent_pkg_a/node_modules/pkg-a (v2.0.0) is checked first and satisfies ^2.0.0!
+    let satisfied_v2 = crate::node_gyp::is_ancestor_satisfied("pkg-a", "^2.0.0", &parent_pkg_a, &staging).unwrap();
+    assert!(satisfied_v2, "Nested node_modules/pkg-a@2.0.0 must satisfy ^2.0.0");
+
+    // 2. From parent_pkg_a, when resolving "pkg-a" for ^1.0.0:
+    // parent_pkg_a itself is v1.0.0, BUT parent_pkg_a/node_modules/pkg-a (v2.0.0) shadows it!
+    // In Node.js resolution, require('pkg-a') will find parent_pkg_a/node_modules/pkg-a (v2.0.0), NOT v1.0.0!
+    // Because it exists but does not satisfy ^1.0.0, it must shadow and return false (NOT satisfy via self).
+    let satisfied_v1 = crate::node_gyp::is_ancestor_satisfied("pkg-a", "^1.0.0", &parent_pkg_a, &staging).unwrap();
+    assert!(!satisfied_v1, "Nested node_modules/pkg-a@2.0.0 must shadow parent package v1.0.0 when spec is ^1.0.0");
+}
+
+#[test]
+fn test_node_gyp_version_matches_spec_semver_validation() {
+    use crate::node_gyp::version_matches_spec;
+
+    // Must return false if version_str fails semver parsing, even for wildcard or latest
+    assert!(!version_matches_spec("not-a-semver", "*"), "version_matches_spec(\"not-a-semver\", \"*\") == false");
+    assert!(!version_matches_spec("not-a-semver", "latest"), "version_matches_spec(\"not-a-semver\", \"latest\") == false");
+    assert!(!version_matches_spec("not-a-semver", ""), "version_matches_spec(\"not-a-semver\", \"\") == false");
+    assert!(!version_matches_spec("1.2", "*"), "version_matches_spec(\"1.2\", \"*\") == false");
+    assert!(!version_matches_spec("1.2", "latest"), "version_matches_spec(\"1.2\", \"latest\") == false");
+    assert!(!version_matches_spec("1.2", ""), "version_matches_spec(\"1.2\", \"\") == false");
+    assert!(!version_matches_spec("../../evil", "*"), "version_matches_spec(\"../../evil\", \"*\") == false");
+
+    // Valid semver strings must still match appropriately
+    assert!(version_matches_spec("1.2.3", "*"));
+    assert!(version_matches_spec("1.2.3", "latest"));
+    assert!(version_matches_spec("1.2.3", ""));
+    assert!(version_matches_spec("1.2.3", "^1.0.0"));
+    assert!(!version_matches_spec("1.2.3", "^2.0.0"));
+}
+
+#[test]
+fn test_node_gyp_pick_matching_version_rejects_non_semver_keys_and_values() {
+    let mut versions = serde_json::Map::new();
+    versions.insert("not-a-semver".to_string(), serde_json::json!({ "version": "not-a-semver" }));
+    versions.insert("1.2".to_string(), serde_json::json!({ "version": "1.2" }));
+    versions.insert("../../evil".to_string(), serde_json::json!({ "version": "../../evil" }));
+
+    let dist_tags_invalid = serde_json::json!({ "latest": "not-a-semver" });
+
+    // When all versions are invalid semver, pick_matching_version must return None
+    assert!(crate::node_gyp::pick_matching_version(&versions, Some(&dist_tags_invalid), "*").is_none());
+    assert!(crate::node_gyp::pick_matching_version(&versions, Some(&dist_tags_invalid), "latest").is_none());
+    assert!(crate::node_gyp::pick_matching_version(&versions, Some(&dist_tags_invalid), "").is_none());
+    assert!(crate::node_gyp::pick_matching_version(&versions, None, "not-a-semver").is_none());
+    assert!(crate::node_gyp::pick_matching_version(&versions, None, "^1.0.0").is_none());
+
+    // When valid semver exists alongside invalid ones, it must pick only valid semver
+    versions.insert("1.0.0".to_string(), serde_json::json!({ "version": "1.0.0" }));
+    let dist_tags_valid = serde_json::json!({ "latest": "1.0.0" });
+    let matched = crate::node_gyp::pick_matching_version(&versions, Some(&dist_tags_valid), "*");
+    assert_eq!(matched.map(|(v, _)| v), Some("1.0.0"));
+
+    // If dist-tags.latest points to invalid version but valid version exists, falls back to highest valid semver
+    let dist_tags_bad_latest = serde_json::json!({ "latest": "not-a-semver" });
+    let matched_fallback = crate::node_gyp::pick_matching_version(&versions, Some(&dist_tags_bad_latest), "*");
+    assert_eq!(matched_fallback.map(|(v, _)| v), Some("1.0.0"));
+
+    // If version object contains mismatched or invalid version field
+    let mut bad_obj_versions = serde_json::Map::new();
+    bad_obj_versions.insert("2.0.0".to_string(), serde_json::json!({ "version": "not-a-semver" }));
+    assert!(crate::node_gyp::pick_matching_version(&bad_obj_versions, None, "*").is_none());
+}
+
+#[test]
+fn test_node_gyp_single_version_not_a_semver_rejected_for_wildcard() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    let temp = tempfile::tempdir().unwrap();
+    let cache_dir = temp.path().join("cache");
+    let project_dir = temp.path().join("pkg");
+    std::fs::create_dir_all(&project_dir).unwrap();
+
+    // 1. Mock node-gyp depends on "dep-bad-ver": "*"
+    let node_gyp_pkg_json = r#"{"name":"node-gyp","version":"10.0.0","bin":{"node-gyp":"bin/node-gyp.js"},"dependencies":{"dep-bad-ver":"*"}}"#;
+    let node_gyp_tb = create_tarball_with_files(&[
+        ("package/package.json", node_gyp_pkg_json.as_bytes()),
+        ("package/bin/node-gyp.js", b"process.exit(0);"),
+    ]);
+    let node_gyp_integrity = rnpm_core::Integrity::from_bytes(&node_gyp_tb, rnpm_core::Algorithm::Sha512).to_string();
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("Failed to bind mock registry listener");
+    listener.set_nonblocking(true).unwrap();
+    let port = listener.local_addr().unwrap().port();
+
+    let running = Arc::new(AtomicBool::new(true));
+    let r_clone = Arc::clone(&running);
+
+    let server_handle = std::thread::spawn(move || {
+        while r_clone.load(Ordering::Relaxed) {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    let _ = stream.set_nonblocking(false);
+                    let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(5)));
+                    let mut buf = [0u8; 4096];
+                    let n = stream.read(&mut buf).unwrap_or(0);
+                    if n == 0 {
+                        continue;
+                    }
+                    let req = String::from_utf8_lossy(&buf[..n]);
+
+                    let (status, content_type, body_bytes) = if req.contains("GET /node-gyp") {
+                        let json = format!(
+                            r#"{{"name":"node-gyp","dist-tags":{{"latest":"10.0.0"}},"versions":{{"10.0.0":{{"name":"node-gyp","version":"10.0.0","dependencies":{{"dep-bad-ver":"*"}},"dist":{{"tarball":"http://127.0.0.1:{}/tarballs/node-gyp.tgz","integrity":"{}"}}}}}}}}"#,
+                            port, node_gyp_integrity
+                        );
+                        ("200 OK", "application/json", json.into_bytes())
+                    } else if req.contains("GET /tarballs/node-gyp.tgz") {
+                        ("200 OK", "application/octet-stream", node_gyp_tb.clone())
+                    } else if req.contains("GET /dep-bad-ver") {
+                        // Single-version packument response returning "version": "not-a-semver"
+                        let json = format!(
+                            r#"{{"name":"dep-bad-ver","version":"not-a-semver","dist":{{"tarball":"http://127.0.0.1:{}/tarballs/dep-bad-ver.tgz","integrity":"sha512-placeholder"}}}}"#,
+                            port
+                        );
+                        ("200 OK", "application/json", json.into_bytes())
+                    } else {
+                        ("404 Not Found", "text/plain", b"Not found".to_vec())
+                    };
+
+                    let resp_header = format!(
+                        "HTTP/1.1 {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        status,
+                        content_type,
+                        body_bytes.len()
+                    );
+                    let _ = stream.write_all(resp_header.as_bytes());
+                    let _ = stream.write_all(&body_bytes);
+                    let _ = stream.flush();
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    let mut config = rnpm_config::Config::default();
+    config.npmrc.settings.insert("cache".to_string(), cache_dir.to_string_lossy().to_string());
+    config.npmrc.settings.insert("registry".to_string(), format!("http://127.0.0.1:{}/", port));
+    config.npmrc.settings.insert("node-gyp-fallback-npm".to_string(), "false".to_string());
+
+    let res = crate::node_gyp::bootstrap_node_gyp(&project_dir, &config);
+
+    // Stop mock server
+    running.store(false, Ordering::Relaxed);
+    let _ = server_handle.join();
+
+    // Verify rejection when spec is "*" and version is "not-a-semver"
+    assert!(res.is_err(), "Single-version packument with 'version': 'not-a-semver' MUST be rejected for '*'");
+    let err_msg = res.unwrap_err().to_string();
+    assert!(
+        err_msg.contains("not-a-semver") || err_msg.contains("does not satisfy"),
+        "Error message must indicate version rejection: {err_msg}"
+    );
+
+    assert!(
+        !cache_dir.join("node-gyp").join("current").exists(),
+        "Live cache directory must not be created when version is not-a-semver"
+    );
+}
+
+#[test]
+fn test_node_gyp_single_version_not_a_semver_rejected_for_latest() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    let temp = tempfile::tempdir().unwrap();
+    let cache_dir = temp.path().join("cache");
+    let project_dir = temp.path().join("pkg");
+    std::fs::create_dir_all(&project_dir).unwrap();
+
+    // 1. Mock node-gyp depends on "dep-bad-latest": "latest"
+    let node_gyp_pkg_json = r#"{"name":"node-gyp","version":"10.0.0","bin":{"node-gyp":"bin/node-gyp.js"},"dependencies":{"dep-bad-latest":"latest"}}"#;
+    let node_gyp_tb = create_tarball_with_files(&[
+        ("package/package.json", node_gyp_pkg_json.as_bytes()),
+        ("package/bin/node-gyp.js", b"process.exit(0);"),
+    ]);
+    let node_gyp_integrity = rnpm_core::Integrity::from_bytes(&node_gyp_tb, rnpm_core::Algorithm::Sha512).to_string();
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("Failed to bind mock registry listener");
+    listener.set_nonblocking(true).unwrap();
+    let port = listener.local_addr().unwrap().port();
+
+    let running = Arc::new(AtomicBool::new(true));
+    let r_clone = Arc::clone(&running);
+
+    let server_handle = std::thread::spawn(move || {
+        while r_clone.load(Ordering::Relaxed) {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    let _ = stream.set_nonblocking(false);
+                    let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(5)));
+                    let mut buf = [0u8; 4096];
+                    let n = stream.read(&mut buf).unwrap_or(0);
+                    if n == 0 {
+                        continue;
+                    }
+                    let req = String::from_utf8_lossy(&buf[..n]);
+
+                    let (status, content_type, body_bytes) = if req.contains("GET /node-gyp") {
+                        let json = format!(
+                            r#"{{"name":"node-gyp","dist-tags":{{"latest":"10.0.0"}},"versions":{{"10.0.0":{{"name":"node-gyp","version":"10.0.0","dependencies":{{"dep-bad-latest":"latest"}},"dist":{{"tarball":"http://127.0.0.1:{}/tarballs/node-gyp.tgz","integrity":"{}"}}}}}}}}"#,
+                            port, node_gyp_integrity
+                        );
+                        ("200 OK", "application/json", json.into_bytes())
+                    } else if req.contains("GET /tarballs/node-gyp.tgz") {
+                        ("200 OK", "application/octet-stream", node_gyp_tb.clone())
+                    } else if req.contains("GET /dep-bad-latest") {
+                        // Single-version packument response returning "version": "not-a-semver"
+                        let json = format!(
+                            r#"{{"name":"dep-bad-latest","version":"not-a-semver","dist":{{"tarball":"http://127.0.0.1:{}/tarballs/dep-bad-latest.tgz","integrity":"sha512-placeholder"}}}}"#,
+                            port
+                        );
+                        ("200 OK", "application/json", json.into_bytes())
+                    } else {
+                        ("404 Not Found", "text/plain", b"Not found".to_vec())
+                    };
+
+                    let resp_header = format!(
+                        "HTTP/1.1 {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        status,
+                        content_type,
+                        body_bytes.len()
+                    );
+                    let _ = stream.write_all(resp_header.as_bytes());
+                    let _ = stream.write_all(&body_bytes);
+                    let _ = stream.flush();
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    let mut config = rnpm_config::Config::default();
+    config.npmrc.settings.insert("cache".to_string(), cache_dir.to_string_lossy().to_string());
+    config.npmrc.settings.insert("registry".to_string(), format!("http://127.0.0.1:{}/", port));
+    config.npmrc.settings.insert("node-gyp-fallback-npm".to_string(), "false".to_string());
+
+    let res = crate::node_gyp::bootstrap_node_gyp(&project_dir, &config);
+
+    // Stop mock server
+    running.store(false, Ordering::Relaxed);
+    let _ = server_handle.join();
+
+    // Verify rejection when spec is "latest" and version is "not-a-semver"
+    assert!(res.is_err(), "Single-version packument with 'version': 'not-a-semver' MUST be rejected for 'latest'");
+    let err_msg = res.unwrap_err().to_string();
+    assert!(
+        err_msg.contains("not-a-semver") || err_msg.contains("does not satisfy"),
+        "Error message must indicate version rejection: {err_msg}"
+    );
+
+    assert!(
+        !cache_dir.join("node-gyp").join("current").exists(),
+        "Live cache directory must not be created when version is not-a-semver"
+    );
+}
+
+#[test]
+fn test_github_actions_sub_ci_tokens() {
+    assert_eq!(
+        github_actions_sub_ci("https://github.com", "github-hosted"),
+        Some("dotcom-hosted")
+    );
+    assert_eq!(
+        github_actions_sub_ci("https://github.com", "self-hosted"),
+        Some("dotcom-selfhosted")
+    );
+    assert_eq!(
+        github_actions_sub_ci("https://github.com", ""),
+        Some("dotcom")
+    );
+    assert_eq!(
+        github_actions_sub_ci("https://acme.ghe.com", "github-hosted"),
+        Some("ghecom")
+    );
+    assert_eq!(
+        github_actions_sub_ci("https://ghe.com", ""),
+        Some("ghecom")
+    );
+    assert_eq!(
+        github_actions_sub_ci("https://github.internal.corp:8443/org", ""),
+        Some("ghes")
+    );
+    assert_eq!(github_actions_sub_ci("", "github-hosted"), None);
 }

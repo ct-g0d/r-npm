@@ -9,6 +9,9 @@ pub(crate) struct PruneCommandArgs {
     pub dry_run: bool,
     pub json: bool,
     pub silent: bool,
+    pub workspace_root: bool,
+    pub workspace: Vec<String>,
+    pub workspaces: bool,
 }
 
 pub(crate) async fn run(args: PruneCommandArgs, current_dir: PathBuf) -> Result<()> {
@@ -37,6 +40,9 @@ pub(crate) async fn run(args: PruneCommandArgs, current_dir: PathBuf) -> Result<
         omit_optional,
         omit_peer,
         dry_run: args.dry_run,
+        workspace_root: args.workspace_root,
+        workspace: args.workspace,
+        workspaces: args.workspaces,
         ..Default::default()
     };
 

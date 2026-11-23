@@ -9,7 +9,7 @@ use tempfile::tempdir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
-use crate::{InstallOptions, Installer, UninstallOptions};
+use crate::{detect_lockfile_version, InstallOptions, Installer, UninstallOptions};
 use rnpm_core::integrity::{Algorithm, Integrity};
 use rnpm_core::manifest::{Manifest, PackageBin};
 use rnpm_fs::junction::{create_junction, is_junction};
@@ -225,17 +225,31 @@ fn test_link_tree_bins_ansi_html() {
         &nm,
         true,
         None,
-    );
+        false,
+    )
+    .unwrap();
 
     assert!(bin.join("ansi-html").exists(), "bin/ansi-html exists");
-    assert!(
-        bin.join("ansi-html.cmd").exists(),
-        "bin/ansi-html.cmd exists"
-    );
-    assert!(
-        bin.join("ansi-html.ps1").exists(),
-        "bin/ansi-html.ps1 exists"
-    );
+    #[cfg(unix)]
+    {
+        assert!(
+            bin.join("ansi-html").is_symlink(),
+            "bin/ansi-html is a POSIX symlink on Unix"
+        );
+        assert!(!bin.join("ansi-html.cmd").exists());
+        assert!(!bin.join("ansi-html.ps1").exists());
+    }
+    #[cfg(not(unix))]
+    {
+        assert!(
+            bin.join("ansi-html.cmd").exists(),
+            "bin/ansi-html.cmd exists"
+        );
+        assert!(
+            bin.join("ansi-html.ps1").exists(),
+            "bin/ansi-html.ps1 exists"
+        );
+    }
 }
 
 #[test]
@@ -2130,6 +2144,230 @@ async fn test_ci_drift_detection_dev_dependencies_mutated() {
 }
 
 #[tokio::test]
+async fn test_ci_omit_dev_drift_detection_dev_dependencies_mutated() {
+    let tmp = tempdir().unwrap();
+    let project_dir = tmp.path();
+
+    // 1. Initial package.json with devDependencies
+    let mut manifest = Manifest::default();
+    manifest.name = Some("dev-drift-app".to_string());
+    manifest.version = Some("1.0.0".to_string());
+    manifest
+        .dev_dependencies
+        .insert("dev-tool".to_string(), "^1.0.0".to_string());
+    manifest
+        .save_to_file(project_dir.join("package.json"))
+        .unwrap();
+
+    // 2. Matching lockfile
+    let mut lockfile = LockfileV3::new("dev-drift-app", Some("1.0.0".to_string()));
+    let mut dev_deps = BTreeMap::new();
+    dev_deps.insert("dev-tool".to_string(), "^1.0.0".to_string());
+    lockfile.root_package_mut().unwrap().dev_dependencies = Some(dev_deps);
+    lockfile.insert_package(
+        "node_modules/dev-tool",
+        LockfilePackage {
+            version: Some("1.0.0".to_string()),
+            resolved: Some("https://registry.npmjs.org/dev-tool/-/dev-tool-1.0.0.tgz".to_string()),
+            integrity: Some("sha512-validhash".to_string()),
+            dev: Some(true),
+            ..Default::default()
+        },
+    );
+    lockfile
+        .save_to_file(&project_dir.join("package-lock.json"))
+        .unwrap();
+
+    // 3. Mutate devDependencies in package.json to ^2.0.0
+    manifest
+        .dev_dependencies
+        .insert("dev-tool".to_string(), "^2.0.0".to_string());
+    manifest
+        .save_to_file(project_dir.join("package.json"))
+        .unwrap();
+
+    let mut installer = Installer::new(InstallOptions {
+        project_dir: project_dir.to_path_buf(),
+        offline: true,
+        omit_dev: true,
+        ..Default::default()
+    })
+    .unwrap();
+
+    let res = installer.run_ci().await;
+    assert!(
+        res.is_err(),
+        "run_ci with omit_dev must fail when devDependencies mutated in package.json"
+    );
+    let err_msg = res.unwrap_err().to_string();
+    assert!(
+        err_msg.contains("ELOCKFILE_DRIFT"),
+        "Error must contain ELOCKFILE_DRIFT: {err_msg}"
+    );
+    assert!(
+        err_msg.contains("EUSAGE"),
+        "Error must contain EUSAGE: {err_msg}"
+    );
+    assert!(
+        err_msg.contains("dev-tool"),
+        "Error must mention drifted package: {err_msg}"
+    );
+}
+
+#[tokio::test]
+async fn test_ci_omit_dev_drift_detection_dev_dependencies_added() {
+    let tmp = tempdir().unwrap();
+    let project_dir = tmp.path();
+
+    // 1. Initial package.json and lockfile without devDependencies
+    let mut manifest = Manifest::default();
+    manifest.name = Some("dev-add-app".to_string());
+    manifest.version = Some("1.0.0".to_string());
+    manifest
+        .dependencies
+        .insert("prod-pkg".to_string(), "^1.0.0".to_string());
+    manifest
+        .save_to_file(project_dir.join("package.json"))
+        .unwrap();
+
+    let mut lockfile = LockfileV3::new("dev-add-app", Some("1.0.0".to_string()));
+    let mut deps = BTreeMap::new();
+    deps.insert("prod-pkg".to_string(), "^1.0.0".to_string());
+    lockfile.root_package_mut().unwrap().dependencies = Some(deps);
+    lockfile.insert_package(
+        "node_modules/prod-pkg",
+        LockfilePackage {
+            version: Some("1.0.0".to_string()),
+            resolved: Some("https://registry.npmjs.org/prod-pkg/-/prod-pkg-1.0.0.tgz".to_string()),
+            integrity: Some("sha512-validhash".to_string()),
+            ..Default::default()
+        },
+    );
+    lockfile
+        .save_to_file(&project_dir.join("package-lock.json"))
+        .unwrap();
+
+    // 2. Add a new devDependency to package.json without updating lockfile
+    manifest
+        .dev_dependencies
+        .insert("new-dev-tool".to_string(), "^1.0.0".to_string());
+    manifest
+        .save_to_file(project_dir.join("package.json"))
+        .unwrap();
+
+    let mut installer = Installer::new(InstallOptions {
+        project_dir: project_dir.to_path_buf(),
+        offline: true,
+        omit_dev: true,
+        ..Default::default()
+    })
+    .unwrap();
+
+    let res = installer.run_ci().await;
+    assert!(
+        res.is_err(),
+        "run_ci with omit_dev must fail when devDependencies added to package.json without updating lockfile"
+    );
+    let err_msg = res.unwrap_err().to_string();
+    assert!(
+        err_msg.contains("ELOCKFILE_DRIFT"),
+        "Error must contain ELOCKFILE_DRIFT: {err_msg}"
+    );
+    assert!(
+        err_msg.contains("EUSAGE"),
+        "Error must contain EUSAGE: {err_msg}"
+    );
+    assert!(
+        err_msg.contains("new-dev-tool"),
+        "Error must mention drifted package: {err_msg}"
+    );
+}
+
+#[tokio::test]
+async fn test_ci_omit_dev_succeeds_and_omits_dev_when_in_sync() {
+    let tmp = tempdir().unwrap();
+    let project_dir = tmp.path();
+
+    let prod_tar = make_tarball("prod-pkg", "1.0.0", &[]);
+    let prod_integrity = Integrity::from_bytes(&prod_tar, Algorithm::Sha512).to_string();
+    let dev_tar = make_tarball("dev-pkg", "1.0.0", &[]);
+    let dev_integrity = Integrity::from_bytes(&dev_tar, Algorithm::Sha512).to_string();
+
+    let pkgs_dir = project_dir.join("pkgs");
+    fs::create_dir_all(&pkgs_dir).unwrap();
+    fs::write(pkgs_dir.join("prod-pkg-1.0.0.tgz"), &prod_tar).unwrap();
+    fs::write(pkgs_dir.join("dev-pkg-1.0.0.tgz"), &dev_tar).unwrap();
+
+    let mut lockfile = LockfileV3::new("sync-omit-app", Some("1.0.0".to_string()));
+    let mut deps = BTreeMap::new();
+    deps.insert(
+        "prod-pkg".to_string(),
+        "file:./pkgs/prod-pkg-1.0.0.tgz".to_string(),
+    );
+    let mut dev_deps = BTreeMap::new();
+    dev_deps.insert(
+        "dev-pkg".to_string(),
+        "file:./pkgs/dev-pkg-1.0.0.tgz".to_string(),
+    );
+    lockfile.root_package_mut().unwrap().dependencies = Some(deps.clone());
+    lockfile.root_package_mut().unwrap().dev_dependencies = Some(dev_deps.clone());
+    lockfile.insert_package(
+        "node_modules/prod-pkg",
+        LockfilePackage {
+            version: Some("1.0.0".to_string()),
+            resolved: Some("file:./pkgs/prod-pkg-1.0.0.tgz".to_string()),
+            integrity: Some(prod_integrity),
+            ..Default::default()
+        },
+    );
+    lockfile.insert_package(
+        "node_modules/dev-pkg",
+        LockfilePackage {
+            version: Some("1.0.0".to_string()),
+            resolved: Some("file:./pkgs/dev-pkg-1.0.0.tgz".to_string()),
+            integrity: Some(dev_integrity),
+            dev: Some(true),
+            ..Default::default()
+        },
+    );
+    lockfile
+        .save_to_file(&project_dir.join("package-lock.json"))
+        .unwrap();
+
+    let mut manifest = Manifest::default();
+    manifest.name = Some("sync-omit-app".to_string());
+    manifest.version = Some("1.0.0".to_string());
+    manifest.dependencies = deps;
+    manifest.dev_dependencies = dev_deps;
+    manifest
+        .save_to_file(project_dir.join("package.json"))
+        .unwrap();
+
+    let mut installer = Installer::new(InstallOptions {
+        project_dir: project_dir.to_path_buf(),
+        offline: true,
+        omit_dev: true,
+        ..Default::default()
+    })
+    .unwrap();
+
+    let res = installer.run_ci().await;
+    assert!(
+        res.is_ok(),
+        "ci --omit=dev must succeed when lockfile is in sync: {:?}",
+        res.err()
+    );
+    assert!(
+        project_dir.join("node_modules/prod-pkg/package.json").is_file(),
+        "Production dependency must be installed in node_modules"
+    );
+    assert!(
+        !project_dir.join("node_modules/dev-pkg").exists(),
+        "Dev dependency must be omitted from node_modules when omit_dev is true"
+    );
+}
+
+#[tokio::test]
 async fn test_ci_drift_detection_dependency_deleted_from_manifest() {
     let tmp = tempdir().unwrap();
     let project_dir = tmp.path();
@@ -2649,6 +2887,90 @@ fn test_apply_npmrc_to_client_config() {
     assert_eq!(client_config.key.as_deref(), Some("test/client.key"));
     assert_eq!(client_config.timeout, Duration::from_millis(45000));
     assert_eq!(client_config.connect_timeout, Duration::from_millis(12000));
+}
+
+#[test]
+fn test_apply_config_to_client_config_wires_retry_and_socket_keys() {
+    use crate::apply_config_to_client_config;
+    use rnpm_config::Config;
+    use rnpm_registry::client::RegistryClientConfig;
+    use std::time::Duration;
+
+    let mut config = Config::new();
+    config.npmrc.set("fetch-retries", "5").unwrap();
+    config.npmrc.set("fetch-retry-factor", "4.5").unwrap();
+    config.npmrc.set("fetch-retry-mintimeout", "250").unwrap();
+    config.npmrc.set("fetch-retry-maxtimeout", "8000").unwrap();
+    config.npmrc.set("maxsockets", "10").unwrap();
+
+    let mut client_config = RegistryClientConfig::default();
+    apply_config_to_client_config(&mut client_config, &config);
+
+    assert_eq!(client_config.max_retries, 5);
+    assert!((client_config.retry_factor - 4.5).abs() < f64::EPSILON);
+    assert_eq!(
+        client_config.initial_retry_backoff,
+        Duration::from_millis(250)
+    );
+    assert_eq!(
+        client_config.max_retry_backoff,
+        Duration::from_millis(8000)
+    );
+    assert_eq!(client_config.maxsockets, Some(10));
+    assert_eq!(client_config.max_concurrent_requests, 10);
+    assert_eq!(client_config.pool_max_idle_per_host, 10);
+
+    let client = rnpm_registry::client::RegistryClient::with_config(client_config).unwrap();
+    assert_eq!(client.semaphore().available_permits(), 10);
+    assert_eq!(client.config().max_retries, 5);
+    assert_eq!(
+        client.calculate_backoff(0),
+        Duration::from_millis(250)
+    );
+    assert_eq!(
+        client.calculate_backoff(1),
+        Duration::from_millis(1125)
+    );
+    assert_eq!(
+        client.calculate_backoff(2),
+        Duration::from_micros(5_062_500)
+    );
+    assert_eq!(
+        client.calculate_backoff(3),
+        Duration::from_millis(8000)
+    );
+}
+
+#[test]
+fn test_apply_npmrc_to_client_config_retry_and_socket_snake_case_aliases() {
+    use crate::apply_npmrc_to_client_config;
+    use rnpm_config::Npmrc;
+    use rnpm_registry::client::RegistryClientConfig;
+    use std::time::Duration;
+
+    let mut npmrc = Npmrc::new();
+    npmrc.set("fetch_retries", "4").unwrap();
+    npmrc.set("fetch_retry_factor", "2.5").unwrap();
+    npmrc.set("fetch_retry_mintimeout", "300").unwrap();
+    npmrc.set("fetch_retry_maxtimeout", "9000").unwrap();
+    npmrc.set("max_sockets", "12").unwrap();
+
+    let mut client_config = RegistryClientConfig::default();
+    apply_npmrc_to_client_config(&mut client_config, &npmrc);
+
+    assert_eq!(client_config.max_retries, 4);
+    assert!((client_config.retry_factor - 2.5).abs() < f64::EPSILON);
+    assert_eq!(
+        client_config.initial_retry_backoff,
+        Duration::from_millis(300)
+    );
+    assert_eq!(
+        client_config.max_retry_backoff,
+        Duration::from_millis(9000)
+    );
+    assert_eq!(client_config.maxsockets, Some(12));
+    assert_eq!(client_config.max_concurrent_requests, 12);
+    assert_eq!(client_config.pool_max_idle_per_host, 12);
 }
 
 #[tokio::test]
@@ -4011,12 +4333,20 @@ async fn test_upgrade_bin_shim_overwritten() {
     installer.install().await.unwrap();
 
     let bin_dir = project_dir.join("node_modules/.bin");
-    let cmd_file = bin_dir.join("tool.cmd");
-    assert!(
-        cmd_file.exists(),
-        ".bin/tool.cmd must exist after v1 install"
-    );
-    let content_v1 = fs::read_to_string(&cmd_file).unwrap();
+    #[cfg(unix)]
+    let read_bin_target = |name: &str| -> String {
+        let link = bin_dir.join(name);
+        assert!(link.is_symlink(), ".bin/{name} symlink must exist");
+        fs::read_link(&link).unwrap().to_string_lossy().into_owned()
+    };
+    #[cfg(not(unix))]
+    let read_bin_target = |name: &str| -> String {
+        let cmd_file = bin_dir.join(format!("{name}.cmd"));
+        assert!(cmd_file.exists(), ".bin/{name}.cmd must exist");
+        fs::read_to_string(&cmd_file).unwrap()
+    };
+
+    let content_v1 = read_bin_target("tool");
     assert!(
         content_v1.contains("old.js"),
         "v1 shim must point to old.js, got:\n{content_v1}"
@@ -4057,11 +4387,7 @@ async fn test_upgrade_bin_shim_overwritten() {
 
     installer2.install().await.unwrap();
 
-    assert!(
-        cmd_file.exists(),
-        ".bin/tool.cmd must exist after v2 upgrade"
-    );
-    let content_v2 = fs::read_to_string(&cmd_file).unwrap();
+    let content_v2 = read_bin_target("tool");
     assert!(
         content_v2.contains("new.js"),
         "v2 shim must point to new.js, got:\n{content_v2}"
@@ -4130,9 +4456,18 @@ async fn test_scoped_bin_conflict_precedence() {
     installer.install().await.unwrap();
 
     let bin_dir = project_dir.join("node_modules/.bin");
-    let cmd_file = bin_dir.join("tool.cmd");
-    assert!(cmd_file.exists());
-    let content = fs::read_to_string(&cmd_file).unwrap();
+    #[cfg(unix)]
+    let content = {
+        let link = bin_dir.join("tool");
+        assert!(link.is_symlink(), ".bin/tool symlink must exist");
+        fs::read_link(&link).unwrap().to_string_lossy().into_owned()
+    };
+    #[cfg(not(unix))]
+    let content = {
+        let cmd_file = bin_dir.join("tool.cmd");
+        assert!(cmd_file.exists());
+        fs::read_to_string(&cmd_file).unwrap()
+    };
     assert!(
         content.contains("@aa/tool") || content.contains(r"@aa\tool"),
         "@aa/tool must win bin conflict over zz-tool, got:\n{content}"
@@ -4184,8 +4519,16 @@ async fn test_stale_shim_removed_on_upgrade() {
     installer.install().await.unwrap();
 
     let bin_dir = project_dir.join("node_modules/.bin");
-    assert!(bin_dir.join("tool1.cmd").exists());
-    assert!(bin_dir.join("tool2.cmd").exists());
+    #[cfg(unix)]
+    {
+        assert!(bin_dir.join("tool1").is_symlink());
+        assert!(bin_dir.join("tool2").is_symlink());
+    }
+    #[cfg(not(unix))]
+    {
+        assert!(bin_dir.join("tool1.cmd").exists());
+        assert!(bin_dir.join("tool2.cmd").exists());
+    }
 
     // v2 only has "tool1", "tool2" removed
     let local_a_v2 = tmp.path().join("pkg_a_v2");
@@ -4218,6 +4561,12 @@ async fn test_stale_shim_removed_on_upgrade() {
 
     installer2.install().await.unwrap();
 
+    #[cfg(unix)]
+    assert!(
+        bin_dir.join("tool1").is_symlink(),
+        "tool1 symlink must be preserved"
+    );
+    #[cfg(not(unix))]
     assert!(
         bin_dir.join("tool1.cmd").exists(),
         "tool1 shim must be preserved"
@@ -4231,7 +4580,7 @@ async fn test_stale_shim_removed_on_upgrade() {
         "stale tool2.ps1 shim must be removed"
     );
     assert!(
-        !bin_dir.join("tool2").exists(),
+        !bin_dir.join("tool2").exists() && fs::symlink_metadata(bin_dir.join("tool2")).is_err(),
         "stale tool2 POSIX shim must be removed"
     );
 }
@@ -4554,4 +4903,645 @@ async fn test_ci_empty_lockfile_leaves_no_node_modules() {
         !root.join("node_modules").exists(),
         "Empty lockfile CI must not leave empty node_modules on disk"
     );
+}
+
+#[test]
+fn test_detect_lockfile_version() {
+    assert_eq!(detect_lockfile_version(r#"{"lockfileVersion": 1}"#), Some(1));
+    assert_eq!(detect_lockfile_version(r#"{"lockfileVersion": 2}"#), Some(2));
+    assert_eq!(detect_lockfile_version(r#"{"lockfileVersion": 3}"#), Some(3));
+    assert_eq!(detect_lockfile_version(r#"{"lockfileVersion": "2"}"#), Some(2));
+    assert_eq!(detect_lockfile_version(r#"{"name": "foo"}"#), None);
+    assert_eq!(detect_lockfile_version(r#"not json"#), None);
+}
+
+#[test]
+fn test_effective_lockfile_version_precedence() {
+    let tmp = tempdir().unwrap();
+    let root = tmp.path().join("proj");
+    fs::create_dir_all(&root).unwrap();
+
+    // 1. Fresh project with no lockfile defaults to 3
+    let opts = InstallOptions {
+        project_dir: root.clone(),
+        ..Default::default()
+    };
+    assert_eq!(opts.effective_lockfile_version(), 3);
+
+    // 2. Explicit flag overrides anything
+    let opts_explicit = InstallOptions {
+        project_dir: root.clone(),
+        lockfile_version: Some(2),
+        ..Default::default()
+    };
+    assert_eq!(opts_explicit.effective_lockfile_version(), 2);
+
+    // 3. Existing v2 lockfile is preserved when not explicitly configured
+    fs::write(
+        root.join("package-lock.json"),
+        r#"{"name":"test","lockfileVersion":2,"requires":true,"packages":{},"dependencies":{}}"#,
+    )
+    .unwrap();
+    let opts_v2 = InstallOptions {
+        project_dir: root.clone(),
+        ..Default::default()
+    };
+    assert_eq!(opts_v2.effective_lockfile_version(), 2);
+
+    // 4. Existing v2 lockfile overridden by explicit lockfile_version = Some(3)
+    let opts_v2_override = InstallOptions {
+        project_dir: root.clone(),
+        lockfile_version: Some(3),
+        ..Default::default()
+    };
+    assert_eq!(opts_v2_override.effective_lockfile_version(), 3);
+
+    // 5. Existing v1 lockfile upgraded to v3 when not explicitly configured
+    fs::write(
+        root.join("package-lock.json"),
+        r#"{"name":"test","lockfileVersion":1,"dependencies":{}}"#,
+    )
+    .unwrap();
+    let opts_v1 = InstallOptions {
+        project_dir: root.clone(),
+        ..Default::default()
+    };
+    assert_eq!(opts_v1.effective_lockfile_version(), 3);
+
+    // 6. Existing v3 lockfile stays v3
+    fs::write(
+        root.join("package-lock.json"),
+        r#"{"name":"test","lockfileVersion":3,"packages":{}}"#,
+    )
+    .unwrap();
+    let opts_v3 = InstallOptions {
+        project_dir: root.clone(),
+        ..Default::default()
+    };
+    assert_eq!(opts_v3.effective_lockfile_version(), 3);
+
+    // 7. Existing v2 npm-shrinkwrap.json is preserved
+    fs::remove_file(root.join("package-lock.json")).unwrap();
+    fs::write(
+        root.join("npm-shrinkwrap.json"),
+        r#"{"name":"test","lockfileVersion":2,"requires":true,"packages":{},"dependencies":{}}"#,
+    )
+    .unwrap();
+    let opts_sw_v2 = InstallOptions {
+        project_dir: root.clone(),
+        ..Default::default()
+    };
+    assert_eq!(opts_sw_v2.effective_lockfile_version(), 2);
+}
+
+#[tokio::test]
+async fn test_install_preserves_existing_v2_lockfile() {
+    let tmp = tempdir().unwrap();
+    let root = tmp.path().join("proj");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(
+        root.join("package.json"),
+        r#"{"name":"v2-proj","version":"1.0.0"}"#,
+    )
+    .unwrap();
+    fs::write(
+        root.join("package-lock.json"),
+        r#"{
+  "name": "v2-proj",
+  "version": "1.0.0",
+  "lockfileVersion": 2,
+  "requires": true,
+  "packages": {
+    "": {
+      "name": "v2-proj",
+      "version": "1.0.0"
+    }
+  },
+  "dependencies": {}
+}
+"#,
+    )
+    .unwrap();
+
+    let options = InstallOptions {
+        project_dir: root.clone(),
+        package_lock_only: true,
+        offline: true,
+        ..Default::default()
+    };
+    let mut installer = Installer::new(options).unwrap();
+    installer.run().await.unwrap();
+
+    let content = fs::read_to_string(root.join("package-lock.json")).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&content).unwrap();
+    assert_eq!(json["lockfileVersion"], 2, "lockfileVersion: 2 must be preserved");
+    assert!(json.get("packages").is_some(), "v2 must have packages map");
+    assert!(json.get("dependencies").is_some(), "v2 must have dependencies map");
+}
+
+#[tokio::test]
+async fn test_install_overrides_existing_v2_with_cli_flag() {
+    let tmp = tempdir().unwrap();
+    let root = tmp.path().join("proj");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(
+        root.join("package.json"),
+        r#"{"name":"v2-proj","version":"1.0.0"}"#,
+    )
+    .unwrap();
+    fs::write(
+        root.join("package-lock.json"),
+        r#"{
+  "name": "v2-proj",
+  "version": "1.0.0",
+  "lockfileVersion": 2,
+  "requires": true,
+  "packages": {
+    "": {
+      "name": "v2-proj",
+      "version": "1.0.0"
+    }
+  },
+  "dependencies": {}
+}
+"#,
+    )
+    .unwrap();
+
+    let options = InstallOptions {
+        project_dir: root.clone(),
+        lockfile_version: Some(3),
+        package_lock_only: true,
+        offline: true,
+        ..Default::default()
+    };
+    let mut installer = Installer::new(options).unwrap();
+    installer.run().await.unwrap();
+
+    let content = fs::read_to_string(root.join("package-lock.json")).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&content).unwrap();
+    assert_eq!(json["lockfileVersion"], 3, "explicit --lockfile-version=3 must upgrade v2 to v3");
+    assert!(json.get("dependencies").is_none(), "v3 must not have dependencies block");
+}
+
+#[tokio::test]
+async fn test_install_upgrades_existing_v1_to_v3() {
+    let tmp = tempdir().unwrap();
+    let root = tmp.path().join("proj");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(
+        root.join("package.json"),
+        r#"{"name":"v1-proj","version":"1.0.0"}"#,
+    )
+    .unwrap();
+    fs::write(
+        root.join("package-lock.json"),
+        r#"{
+  "name": "v1-proj",
+  "version": "1.0.0",
+  "lockfileVersion": 1,
+  "dependencies": {}
+}
+"#,
+    )
+    .unwrap();
+
+    let options = InstallOptions {
+        project_dir: root.clone(),
+        package_lock_only: true,
+        offline: true,
+        ..Default::default()
+    };
+    let mut installer = Installer::new(options).unwrap();
+    installer.run().await.unwrap();
+
+    let content = fs::read_to_string(root.join("package-lock.json")).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&content).unwrap();
+    assert_eq!(json["lockfileVersion"], 3, "v1 lockfile must be upgraded to v3");
+}
+
+#[tokio::test]
+async fn test_install_fresh_project_defaults_to_v3() {
+    let tmp = tempdir().unwrap();
+    let root = tmp.path().join("proj");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(
+        root.join("package.json"),
+        r#"{"name":"fresh-proj","version":"1.0.0"}"#,
+    )
+    .unwrap();
+
+    let options = InstallOptions {
+        project_dir: root.clone(),
+        package_lock_only: true,
+        offline: true,
+        ..Default::default()
+    };
+    let mut installer = Installer::new(options).unwrap();
+    installer.run().await.unwrap();
+
+    let content = fs::read_to_string(root.join("package-lock.json")).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&content).unwrap();
+    assert_eq!(json["lockfileVersion"], 3, "fresh project must default to v3");
+}
+
+#[tokio::test]
+async fn test_install_preserves_existing_v2_shrinkwrap() {
+    let tmp = tempdir().unwrap();
+    let root = tmp.path().join("proj");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(
+        root.join("package.json"),
+        r#"{"name":"sw-proj","version":"1.0.0"}"#,
+    )
+    .unwrap();
+    fs::write(
+        root.join("npm-shrinkwrap.json"),
+        r#"{
+  "name": "sw-proj",
+  "version": "1.0.0",
+  "lockfileVersion": 2,
+  "requires": true,
+  "packages": {
+    "": {
+      "name": "sw-proj",
+      "version": "1.0.0"
+    }
+  },
+  "dependencies": {}
+}
+"#,
+    )
+    .unwrap();
+
+    let options = InstallOptions {
+        project_dir: root.clone(),
+        package_lock_only: true,
+        offline: true,
+        ..Default::default()
+    };
+    let mut installer = Installer::new(options).unwrap();
+    installer.run().await.unwrap();
+
+    let content = fs::read_to_string(root.join("npm-shrinkwrap.json")).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&content).unwrap();
+    assert_eq!(json["lockfileVersion"], 2, "v2 npm-shrinkwrap.json must be preserved");
+}
+
+#[tokio::test]
+async fn test_install_npmrc_lockfile_version_override() {
+    let tmp = tempdir().unwrap();
+    let root = tmp.path().join("proj");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(
+        root.join("package.json"),
+        r#"{"name":"npmrc-proj","version":"1.0.0"}"#,
+    )
+    .unwrap();
+    fs::write(root.join(".npmrc"), "lockfile-version = 2\n").unwrap();
+
+    let options = InstallOptions {
+        project_dir: root.clone(),
+        package_lock_only: true,
+        offline: true,
+        ..Default::default()
+    };
+    let mut installer = Installer::new(options).unwrap();
+    installer.run().await.unwrap();
+
+    let content = fs::read_to_string(root.join("package-lock.json")).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&content).unwrap();
+    assert_eq!(json["lockfileVersion"], 2, "npmrc lockfile-version = 2 must produce v2 lockfile");
+}
+
+fn create_test_bin_tarball(pkg_name: &str, version: &str, bin_name: &str) -> Vec<u8> {
+    use flate2::Compression;
+    use std::io::Cursor;
+    use tar::{Builder, Header};
+
+    let manifest_json = serde_json::json!({
+        "name": pkg_name,
+        "version": version,
+        "bin": {
+            bin_name: "./bin/cli.js"
+        }
+    });
+    let manifest_bytes = serde_json::to_vec_pretty(&manifest_json).unwrap();
+    let bin_content = b"#!/usr/bin/env node\nconsole.log('hello');\n";
+
+    let mut gz = GzEncoder::new(Vec::new(), Compression::default());
+    {
+        let mut builder = Builder::new(&mut gz);
+
+        let mut header = Header::new_gnu();
+        header.set_size(manifest_bytes.len() as u64);
+        header.set_mode(0o644);
+        let path = "package/package.json";
+        header.as_mut_bytes()[..path.len()].copy_from_slice(path.as_bytes());
+        header.set_cksum();
+        builder
+            .append(&header, Cursor::new(manifest_bytes))
+            .unwrap();
+
+        let mut bin_header = Header::new_gnu();
+        bin_header.set_size(bin_content.len() as u64);
+        bin_header.set_mode(0o755);
+        let bin_path = "package/bin/cli.js";
+        bin_header.as_mut_bytes()[..bin_path.len()].copy_from_slice(bin_path.as_bytes());
+        bin_header.set_cksum();
+        builder
+            .append(&bin_header, Cursor::new(bin_content))
+            .unwrap();
+
+        builder.finish().unwrap();
+    }
+    gz.finish().unwrap()
+}
+
+#[tokio::test]
+async fn test_no_bin_links_hoisted_and_fast_path_toggle() {
+    let tmp = tempdir().unwrap();
+    let root = tmp.path().join("project");
+    fs::create_dir_all(&root).unwrap();
+
+    let pkg_a_dir = tmp.path().join("pkg-a");
+    fs::create_dir_all(pkg_a_dir.join("bin")).unwrap();
+    fs::write(
+        pkg_a_dir.join("package.json"),
+        serde_json::json!({
+            "name": "pkg-a",
+            "version": "1.0.0",
+            "bin": {
+                "my-cli": "./bin/cli.js"
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+    fs::write(
+        pkg_a_dir.join("bin/cli.js"),
+        "#!/usr/bin/env node\nconsole.log('hello');\n",
+    )
+    .unwrap();
+
+    let pkg_a_uri = format!("file:{}", pkg_a_dir.display().to_string().replace('\\', "/"));
+    fs::write(
+        root.join("package.json"),
+        serde_json::json!({
+            "name": "my-app",
+            "version": "1.0.0",
+            "dependencies": {
+                "pkg-a": pkg_a_uri
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    // 1. Initial install with bin_links: false
+    let options_no_bin = InstallOptions {
+        project_dir: root.clone(),
+        bin_links: false,
+        ..Default::default()
+    };
+    let mut installer1 = Installer::new(options_no_bin).unwrap();
+    installer1.install().await.unwrap();
+
+    let bin_dir = root.join("node_modules/.bin");
+    let file_count_1 = if bin_dir.exists() {
+        fs::read_dir(&bin_dir).unwrap().count()
+    } else {
+        0
+    };
+    assert_eq!(
+        file_count_1, 0,
+        "bin_links=false must create 0 files in node_modules/.bin"
+    );
+
+    // 2. Switch back to bin_links: true without stale fast-path hit
+    let options_with_bin = InstallOptions {
+        project_dir: root.clone(),
+        bin_links: true,
+        ..Default::default()
+    };
+    let mut installer2 = Installer::new(options_with_bin).unwrap();
+    installer2.install().await.unwrap();
+
+    assert!(
+        bin_dir.exists(),
+        "node_modules/.bin must exist after switching to bin_links=true"
+    );
+    let file_count_2 = fs::read_dir(&bin_dir).unwrap().count();
+    assert!(
+        file_count_2 > 0,
+        "node_modules/.bin must have shims created when bin_links=true"
+    );
+    #[cfg(windows)]
+    assert!(
+        bin_dir.join("my-cli.cmd").exists(),
+        "my-cli.cmd must exist on Windows"
+    );
+
+    // 3. Switch back to bin_links: false -> stale shims must be removed and 0 files in .bin
+    let options_no_bin_again = InstallOptions {
+        project_dir: root.clone(),
+        bin_links: false,
+        ..Default::default()
+    };
+    let mut installer3 = Installer::new(options_no_bin_again).unwrap();
+    installer3.install().await.unwrap();
+
+    let file_count_3 = if bin_dir.exists() {
+        fs::read_dir(&bin_dir).unwrap().count()
+    } else {
+        0
+    };
+    assert_eq!(
+        file_count_3, 0,
+        "switching from bin_links=true to false must remove stale shims, leaving 0 files in .bin"
+    );
+}
+
+#[tokio::test]
+async fn test_no_bin_links_linked_strategy() {
+    let tmp = tempdir().unwrap();
+    let root = tmp.path().join("project");
+    fs::create_dir_all(&root).unwrap();
+
+    let tarball_bytes = create_test_bin_tarball("pkg-a", "1.0.0", "my-cli");
+    let tgz_path = root.join("pkg-a-1.0.0.tgz");
+    fs::write(&tgz_path, &tarball_bytes).unwrap();
+
+    fs::write(
+        root.join("package.json"),
+        serde_json::json!({
+            "name": "my-app",
+            "version": "1.0.0",
+            "dependencies": {
+                "pkg-a": "file:./pkg-a-1.0.0.tgz"
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    // 1. Linked install with bin_links: false
+    let options_no_bin = InstallOptions {
+        project_dir: root.clone(),
+        bin_links: false,
+        install_strategy: crate::InstallStrategy::Linked,
+        ..Default::default()
+    };
+    let mut installer1 = Installer::new(options_no_bin).unwrap();
+    installer1.install().await.unwrap();
+
+    let bin_dir = root.join("node_modules/.bin");
+    let file_count_1 = if bin_dir.exists() {
+        fs::read_dir(&bin_dir).unwrap().count()
+    } else {
+        0
+    };
+    assert_eq!(
+        file_count_1, 0,
+        "linked install with bin_links=false must create 0 files in node_modules/.bin"
+    );
+
+    // 2. Switch back to bin_links: true
+    let options_with_bin = InstallOptions {
+        project_dir: root.clone(),
+        bin_links: true,
+        install_strategy: crate::InstallStrategy::Linked,
+        ..Default::default()
+    };
+    let mut installer2 = Installer::new(options_with_bin).unwrap();
+    installer2.install().await.unwrap();
+
+    assert!(
+        bin_dir.exists(),
+        "node_modules/.bin must exist after switching to bin_links=true in linked install"
+    );
+    let file_count_2 = fs::read_dir(&bin_dir).unwrap().count();
+    assert!(
+        file_count_2 > 0,
+        "node_modules/.bin must have shims created in linked install"
+    );
+
+    // 3. Switch back to bin_links: false
+    let options_no_bin_again = InstallOptions {
+        project_dir: root.clone(),
+        bin_links: false,
+        install_strategy: crate::InstallStrategy::Linked,
+        ..Default::default()
+    };
+    let mut installer3 = Installer::new(options_no_bin_again).unwrap();
+    installer3.install().await.unwrap();
+
+    let file_count_3 = if bin_dir.exists() {
+        fs::read_dir(&bin_dir).unwrap().count()
+    } else {
+        0
+    };
+    assert_eq!(
+        file_count_3, 0,
+        "switching to bin_links=false in linked install must remove stale shims, leaving 0 files in .bin"
+    );
+}
+
+#[tokio::test]
+async fn test_no_bin_links_ci() {
+    let tmp = tempdir().unwrap();
+    let root = tmp.path().join("project");
+    fs::create_dir_all(&root).unwrap();
+
+    let pkg_a_dir = tmp.path().join("pkg-a");
+    fs::create_dir_all(pkg_a_dir.join("bin")).unwrap();
+    fs::write(
+        pkg_a_dir.join("package.json"),
+        serde_json::json!({
+            "name": "pkg-a",
+            "version": "1.0.0",
+            "bin": {
+                "my-cli": "./bin/cli.js"
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+    fs::write(
+        pkg_a_dir.join("bin/cli.js"),
+        "#!/usr/bin/env node\nconsole.log('hello');\n",
+    )
+    .unwrap();
+
+    let pkg_a_uri = format!("file:{}", pkg_a_dir.display().to_string().replace('\\', "/"));
+    fs::write(
+        root.join("package.json"),
+        serde_json::json!({
+            "name": "my-app",
+            "version": "1.0.0",
+            "dependencies": {
+                "pkg-a": pkg_a_uri
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    // Generate package-lock.json first
+    let mut setup_installer = Installer::new(InstallOptions {
+        project_dir: root.clone(),
+        bin_links: true,
+        ..Default::default()
+    })
+    .unwrap();
+    setup_installer.install().await.unwrap();
+
+    // Now run CI with bin_links: false
+    let mut ci_installer = Installer::new(InstallOptions {
+        project_dir: root.clone(),
+        bin_links: false,
+        ..Default::default()
+    })
+    .unwrap();
+    ci_installer.run_ci().await.unwrap();
+
+    let bin_dir = root.join("node_modules/.bin");
+    let file_count = if bin_dir.exists() {
+        fs::read_dir(&bin_dir).unwrap().count()
+    } else {
+        0
+    };
+    assert_eq!(
+        file_count, 0,
+        "CI with bin_links=false must create 0 files in node_modules/.bin"
+    );
+}
+
+#[test]
+fn test_prefer_dedupe_config_wiring() {
+    let tmp = tempdir().unwrap();
+    let root = tmp.path().join("project");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(
+        root.join("package.json"),
+        r#"{"name":"test-prefer-dedupe","version":"1.0.0"}"#,
+    )
+    .unwrap();
+
+    // Default: prefer-dedupe is false
+    let options = InstallOptions {
+        project_dir: root.clone(),
+        ..Default::default()
+    };
+    let installer = Installer::new(options).unwrap();
+    assert!(!installer.options.prefer_dedupe);
+
+    // With prefer-dedupe = true in .npmrc
+    fs::write(root.join(".npmrc"), "prefer-dedupe=true\n").unwrap();
+    let options2 = InstallOptions {
+        project_dir: root.clone(),
+        ..Default::default()
+    };
+    let installer2 = Installer::new(options2).unwrap();
+    assert!(installer2.options.prefer_dedupe);
 }

@@ -586,19 +586,7 @@ impl crate::Installer {
         if self.options.ignore_scripts {
             return Ok(());
         }
-        let opts = rnpm_lifecycle::LifecycleOptions {
-            root_dir: self.options.project_dir.clone(),
-            init_cwd: self.options.project_dir.clone(),
-            ignore_scripts: false,
-            capture_output: !self.options.foreground_scripts,
-            foreground_scripts: self.options.foreground_scripts,
-            timeout: None,
-            sandbox_policy: if self.options.strict_sandbox {
-                rnpm_lifecycle::ScriptSandboxPolicy::restricted()
-            } else {
-                rnpm_lifecycle::ScriptSandboxPolicy::permissive()
-            },
-        };
+        let opts = self.lifecycle_options();
         rnpm_lifecycle::execute_root_hooks(manifest, &opts).await
     }
 
@@ -666,10 +654,13 @@ impl crate::Installer {
 
         // Remove what the isolated tree does not hold: a hoisted layout left
         // behind, and store folders for other trees.
-        let mut keep: HashSet<String> = [".bin", ".store", ".package-lock.json"]
+        let mut keep: HashSet<String> = [".store", ".package-lock.json"]
             .into_iter()
             .map(str::to_string)
             .collect();
+        if self.options.bin_links {
+            keep.insert(".bin".to_string());
+        }
         for link in &plan.links {
             if let Some(rest) = link.location.strip_prefix("node_modules/") {
                 if !rest.starts_with(".store/") {
@@ -773,55 +764,52 @@ impl crate::Installer {
         }
 
         // Bins go in the `.bin` beside each package and each link.
-        let bins_of: HashMap<String, Vec<(String, String)>> = plan
-            .store
-            .iter()
-            .map(|e| (e.location.clone(), e.bin.clone()))
-            .chain(plan.local_dirs.iter().map(|d| {
-                let bins = lock
-                    .packages
-                    .get(d)
-                    .map(|p| bin_entries(p, p.name.as_deref().unwrap_or(d)))
-                    .unwrap_or_default();
-                (d.clone(), bins)
-            }))
-            .collect();
-        let placed = plan
-            .store
-            .iter()
-            .map(|e| (e.location.clone(), e.location.clone()))
-            .chain(plan.links.iter().map(|l| (l.location.clone(), l.target.clone())));
-        for (location, target) in placed {
-            let Some(bins) = bins_of.get(&target).filter(|b| !b.is_empty()) else {
-                continue;
-            };
-            let Some((folder, name)) = location.rsplit_once("/node_modules/").or_else(|| {
-                location.strip_prefix("node_modules/").map(|n| ("", n))
-            }) else {
-                continue;
-            };
-            let bin_dir = project.join(join(folder, "node_modules")).join(".bin");
-            for (bin_name, script) in bins {
-                let script = script.trim_start_matches("./");
-                let _ = rnpm_shim::normalize_shebang(&project.join(&target).join(script));
-                rnpm_shim::create_shims(&bin_dir, bin_name, &format!("{name}/{script}"))?;
+        if self.options.bin_links {
+            let bins_of: HashMap<String, Vec<(String, String)>> = plan
+                .store
+                .iter()
+                .map(|e| (e.location.clone(), e.bin.clone()))
+                .chain(plan.local_dirs.iter().map(|d| {
+                    let bins = lock
+                        .packages
+                        .get(d)
+                        .map(|p| bin_entries(p, p.name.as_deref().unwrap_or(d)))
+                        .unwrap_or_default();
+                    (d.clone(), bins)
+                }))
+                .collect();
+            let placed = plan
+                .store
+                .iter()
+                .map(|e| (e.location.clone(), e.location.clone()))
+                .chain(plan.links.iter().map(|l| (l.location.clone(), l.target.clone())));
+            for (location, target) in placed {
+                let Some(bins) = bins_of.get(&target).filter(|b| !b.is_empty()) else {
+                    continue;
+                };
+                let Some((folder, name)) = location.rsplit_once("/node_modules/").or_else(|| {
+                    location.strip_prefix("node_modules/").map(|n| ("", n))
+                }) else {
+                    continue;
+                };
+                let bin_dir = project.join(join(folder, "node_modules")).join(".bin");
+                for (bin_name, script) in bins {
+                    let script = script.trim_start_matches("./");
+                    let _ = rnpm_shim::normalize_shebang(&project.join(&target).join(script));
+                    rnpm_shim::create_shims_with_force(
+                        &bin_dir,
+                        bin_name,
+                        &format!("{name}/{script}"),
+                        self.options.force,
+                    )?;
+                }
             }
+        } else {
+            crate::link::remove_all_bin_dirs(&nm);
         }
 
         if !self.options.ignore_scripts && !lifecycle_nodes.is_empty() {
-            let opts = rnpm_lifecycle::LifecycleOptions {
-                root_dir: project.clone(),
-                init_cwd: project.clone(),
-                ignore_scripts: false,
-                capture_output: !self.options.foreground_scripts,
-                foreground_scripts: self.options.foreground_scripts,
-                timeout: None,
-                sandbox_policy: if self.options.strict_sandbox {
-                    rnpm_lifecycle::ScriptSandboxPolicy::restricted()
-                } else {
-                    rnpm_lifecycle::ScriptSandboxPolicy::permissive()
-                },
-            };
+            let opts = self.lifecycle_options();
             rnpm_lifecycle::execute_dependency_hooks(&lifecycle_nodes, &opts).await?;
         }
 

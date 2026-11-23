@@ -6,20 +6,75 @@ import http from 'node:http';
 import { gunzipSync } from 'node:zlib';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { createHash, createSign, generateKeyPairSync } from 'node:crypto';
-import { execFileSync, spawn } from 'node:child_process';
+import { execFileSync, execSync, spawn } from 'node:child_process';
 const repo = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const cli = process.argv.slice(2);
 const option = (name, fallback) => cli.includes(name) ? cli[cli.indexOf(name) + 1] : fallback;
 const caseFilters = cli.flatMap((arg, index) => arg === '--case' ? [cli[index + 1]] : []);
 const matchesCase = name => !caseFilters.length || caseFilters.some(filter => name.includes(filter));
-const binary = path.resolve(option('--binary', path.join(repo, 'target/release', process.platform === 'win32' ? 'rnpm.exe' : 'rnpm')));
+const defaultTargetDir = process.env.CARGO_TARGET_DIR && fs.existsSync(path.join(process.env.CARGO_TARGET_DIR, 'release', process.platform === 'win32' ? 'rnpm.exe' : 'rnpm'))
+  ? process.env.CARGO_TARGET_DIR
+  : path.join(repo, 'target');
+const defaultBinary = path.join(defaultTargetDir, 'release', process.platform === 'win32' ? 'rnpm.exe' : 'rnpm');
+const binary = path.resolve(option('--binary', defaultBinary));
 const output = path.resolve(option('--output', path.join(repo, 'target/npm-replacement-smoke.json')));
 // Long real path: npm compares realpaths, so an 8.3 short temp path would
 // make npm's own path-keyed policies miss.
 const root = fs.mkdtempSync(path.join(fs.realpathSync.native(os.tmpdir()), 'rnpm-replacement-'));
 console.log(`Fixtures and raw logs: ${root}`);
-const npmCli = path.join(path.dirname(process.execPath), 'node_modules/npm/bin/npm-cli.js');
-const baseEnv = Object.fromEntries(Object.entries(process.env).filter(([k]) => !/^(npm_config_|rnpm_|npm_token$|node_auth_token$)/i.test(k)));
+
+function resolveNpmCli() {
+  const cliOption = option('--npm-cli', null);
+  const candidates = [];
+  if (cliOption) {
+    candidates.push(path.resolve(cliOption));
+  }
+  try {
+    const globalRoot = execSync('npm root -g', { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], windowsHide: true }).trim();
+    if (globalRoot) {
+      candidates.push(path.join(globalRoot, 'npm/bin/npm-cli.js'));
+    }
+  } catch {
+    // fallback if npm command fails
+  }
+  const nodeDir = path.dirname(process.execPath);
+  candidates.push(path.resolve(nodeDir, '../lib/node_modules/npm/bin/npm-cli.js'));
+  candidates.push(path.resolve(nodeDir, 'node_modules/npm/bin/npm-cli.js'));
+
+  let foundCandidate = null;
+  let foundVersion = null;
+  let foundPkgPath = null;
+
+  for (const candidate of candidates) {
+    if (fs.existsSync(candidate)) {
+      const pkgPath = path.resolve(path.dirname(candidate), '../package.json');
+      if (fs.existsSync(pkgPath)) {
+        try {
+          const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8'));
+          if (pkg.version === '11.20.0') {
+            console.log(`Resolved npm: ${candidate} (v${pkg.version})`);
+            return candidate;
+          }
+          if (!foundCandidate) {
+            foundCandidate = candidate;
+            foundVersion = pkg.version;
+            foundPkgPath = pkgPath;
+          }
+        } catch {
+          // ignore parse error
+        }
+      }
+    }
+  }
+
+  if (foundCandidate) {
+    throw new Error(`Expected resolved npm version 11.20.0, found ${foundVersion} at ${foundPkgPath}`);
+  }
+  throw new Error(`Cannot locate npm-cli.js in candidates: ${candidates.join(', ')}`);
+}
+
+const npmCli = resolveNpmCli();
+const baseEnv = Object.fromEntries(Object.entries(process.env).filter(([k]) => !/^(npm_config_|rnpm_|npm_token$|node_auth_token$|https?_proxy$|all_proxy$)/i.test(k)));
 const write = (dir, name, value) => { const p=path.join(dir,name); fs.mkdirSync(path.dirname(p),{recursive:true}); fs.writeFileSync(p,typeof value==='string'||Buffer.isBuffer(value)?value:JSON.stringify(value,null,2)+'\n'); };
 const manifest = (dir, fields={}) => write(dir,'package.json',{name:'readiness-case',version:'1.0.0',...fields});
 const edit = (dir, fn) => { const p=JSON.parse(fs.readFileSync(path.join(dir,'package.json'))); fn(p); write(dir,'package.json',p); };
@@ -158,7 +213,7 @@ for(const [name,flags]of [['global',['-g']],['workspace',['-w','a']],['workspace
   manifest(dir,{workspaces:['modules/*']});
   for(const [member,dep]of [['a','dep'],['b','parent']])manifest(path.join(dir,'modules',member),{name:member,dependencies:{[dep]:'^1.0.0'}});
   for(const dep of ['dep','parent'])manifest(path.join(dir,'node_modules',dep),{name:dep});
-},{before:async ctx=>{if(name==='global')manifest(path.join(ctx.env.NPM_CONFIG_PREFIX,'node_modules/dep'),{name:'dep'});}});
+},{before:async ctx=>{if(name==='global')manifest(path.join(ctx.env.NPM_CONFIG_PREFIX,process.platform==='win32'?'node_modules/dep':'lib/node_modules/dep'),{name:'dep'});}});
 const packArgs=['pack','--dry-run','--json','--ignore-scripts'];
 for(const [name,fields,files] of [
   ['pack-explicit-file-vs-root-ignore',{files:['keep.js']},{'keep.js':'hello','.npmignore':'keep.js\n'}],
@@ -455,8 +510,8 @@ const cliWorkspaceTree=dir=>{
   manifest(path.join(dir,'node_modules/parent'),{name:'parent'});
   for(const name of ['a','b'])fs.symlinkSync(path.join(dir,'modules',name),path.join(dir,'node_modules',name),'junction');
 };
-for(const [name,args] of [['workspace',['ls','-w','a']],['workspace-json',['ls','-w','a','--json']],['global',['ls','-g']]])add(`cli-ls-${name}`,'ls',args,cliWorkspaceTree,{before:async ctx=>{if(args.includes('-g'))manifest(path.join(ctx.env.NPM_CONFIG_PREFIX,'node_modules/dep'),{name:'dep'});}});
-for(const [name,args] of [['workspace',['outdated','-w','a']],['workspace-json',['outdated','-w','a','--json']],['global',['outdated','-g']],['global-json',['outdated','-g','--json']]])add(`cli-outdated-${name}`,'outdated',args,cliWorkspaceTree,{before:async ctx=>{if(args.includes('-g'))manifest(path.join(ctx.env.NPM_CONFIG_PREFIX,'node_modules/dep'),{name:'dep'});}});
+for(const [name,args] of [['workspace',['ls','-w','a']],['workspace-json',['ls','-w','a','--json']],['global',['ls','-g']]])add(`cli-ls-${name}`,'ls',args,cliWorkspaceTree,{before:async ctx=>{if(args.includes('-g'))manifest(path.join(ctx.env.NPM_CONFIG_PREFIX,process.platform==='win32'?'node_modules/dep':'lib/node_modules/dep'),{name:'dep'});}});
+for(const [name,args] of [['workspace',['outdated','-w','a']],['workspace-json',['outdated','-w','a','--json']],['global',['outdated','-g']],['global-json',['outdated','-g','--json']]])add(`cli-outdated-${name}`,'outdated',args,cliWorkspaceTree,{before:async ctx=>{if(args.includes('-g'))manifest(path.join(ctx.env.NPM_CONFIG_PREFIX,process.platform==='win32'?'node_modules/dep':'lib/node_modules/dep'),{name:'dep'});}});
 for(const [name,selector] of [['workspace','.workspace'],['private',':private'],['is',':is(.workspace, #dep)'],['attribute','[name|=readiness]'],['array','[keywords~=tool]']])add(`cli-query-${name}`,'query',['query',selector],dir=>{cliWorkspaceTree(dir);edit(path.join(dir,'node_modules/dep'),p=>{p.keywords=['build','tool'];});});
 for(const [name,flags] of [['list',[]],['json',['--json']],['long',['-l']]])add(`cli-config-${name}`,'config',['config','list',...flags],dir=>{manifest(dir);write(dir,'.npmrc','save-prefix=~\n');});
 
@@ -938,7 +993,7 @@ for(const c of cases){
     write(path.join(root,'logs'),`${c.name}-${tool}.stdout`,p.stdout);write(path.join(root,'logs'),`${c.name}-${tool}.stderr`,p.stderr);
     const files=snapshot(dir,config);
     files['<userconfig>']=fs.existsSync(path.join(config,'user.npmrc'))?normalize(fs.readFileSync(path.join(config,'user.npmrc'),'utf8'),dir,config):null;
-    if(c.command==='link')files['<global-prefix>']=JSON.parse(normalize(JSON.stringify(snapshot(path.join(config,'prefix'),config)),dir,config));
+    if(c.command==='link')files['<global-prefix>']=JSON.parse(normalize(JSON.stringify(snapshot(path.join(config,'prefix'),config)),dir,config).replaceAll(`/${c.name}/${tool}/project`,`/${c.name}/<tool>/project`));
     result[tool]={exit:p.exit,execution_error:p.error,stdout:normalize(p.stdout,dir,config),stderr:normalize(p.stderr,dir,config),files,requests:requests.slice(start)};
     if(c.observe)result[tool].observation=c.observe({dir,env,requests:requests.slice(start)});
   }
@@ -959,5 +1014,25 @@ for(const c of cases){
 const git=(...args)=>execFileSync('git',args,{cwd:repo,encoding:'utf8'}).trim();
 const expectedCases=cases.filter(c=>matchesCase(c.name)).length;
 write(path.dirname(output),path.basename(output),{head:git('rev-parse','HEAD'),binary_revision:option('--binary-revision',null),source_dirty:git('status','--porcelain','--untracked-files=no')!=='',binary_sha256:createHash('sha256').update(fs.readFileSync(binary)).digest('hex'),node:process.version,npm:execFileSync(process.execPath,[npmCli,'--version'],{env:oracleEnv,encoding:'utf8'}).trim(),platform:process.platform,root,expected_cases:expectedCases,normalization:'Fixture/config paths (including JSON escaping), loopback registry origin, CRLF, elapsed summary/ping times, and diagnostic log timestamps. JSON file key order ignored; all fields retained. Full normalized stream hashes retained; streams over 16KB truncated in this report, with complete raw streams in root/logs. Only npm/Node internal JavaScript stack frames removed; error messages and properties retained.',results});
+const diffs=results.filter(r=>!r.match);
+if(diffs.length>0){
+  console.log(`--- DIFF SUMMARY (${diffs.length}) ---`);
+  for(const d of diffs){
+    const cmp=d.comparison||{};
+    const reasons=[];
+    if(cmp.exit===false)reasons.push(`exit npm=${d.npm?.exit} rnpm=${d.rnpm?.exit}`);
+    if(cmp.stdout===false)reasons.push(`stdout npm=${JSON.stringify((d.npm?.stdout||'').slice(0,160))} rnpm=${JSON.stringify((d.rnpm?.stdout||'').slice(0,160))}`);
+    if(cmp.stderr===false)reasons.push(`stderr npm=${JSON.stringify((d.npm?.stderr||'').slice(0,160))} rnpm=${JSON.stringify((d.rnpm?.stderr||'').slice(0,160))}`);
+    if(cmp.files===false){
+      const af=d.npm?.files||{},bf=d.rnpm?.files||{};
+      const keys=[...new Set([...Object.keys(af),...Object.keys(bf)])].sort();
+      const bad=keys.filter(k=>stable(af[k])!==stable(bf[k])).slice(0,3);
+      reasons.push(`files[${bad.join(', ')}] npm=${JSON.stringify(af[bad[0]])?.slice(0,120)} rnpm=${JSON.stringify(bf[bad[0]])?.slice(0,120)}`);
+    }
+    if(cmp.mutations===false)reasons.push('mutations mismatch');
+    if(cmp.observation===false)reasons.push(`obs npm=${JSON.stringify(d.npm?.observation)?.slice(0,120)} rnpm=${JSON.stringify(d.rnpm?.observation)?.slice(0,120)}`);
+    console.log(`FAIL ${d.name} ${JSON.stringify(cmp)} | ${reasons.join(' ; ')}`);
+  }
+}
 console.log(`Evidence: ${output}; ${results.filter(r=>r.match).length}/${results.length} match`);
 process.exitCode=results.length>0&&results.length===expectedCases&&results.every(r=>r.match)?0:1;

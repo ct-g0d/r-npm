@@ -597,3 +597,288 @@ fn test_audit_fix_reifies_real_package_files_and_lockfile_ci() {
         );
     }
 }
+
+#[test]
+fn test_audit_fix_shrinkwrap_only_project() {
+    let rnpm_bin = env!("CARGO_BIN_EXE_rnpm");
+    let tmp = tempdir().unwrap();
+    let project_dir = tmp.path();
+
+    let pkg_json = serde_json::json!({
+        "name": "test-shrinkwrap-fix",
+        "version": "1.0.0",
+        "dependencies": {
+            "lodash": "^4.17.15"
+        }
+    });
+    fs::write(
+        project_dir.join("package.json"),
+        serde_json::to_string_pretty(&pkg_json).unwrap(),
+    )
+    .unwrap();
+
+    let shrinkwrap_json = serde_json::json!({
+        "name": "test-shrinkwrap-fix",
+        "version": "1.0.0",
+        "lockfileVersion": 3,
+        "packages": {
+            "": {
+                "name": "test-shrinkwrap-fix",
+                "version": "1.0.0",
+                "dependencies": {
+                    "lodash": "^4.17.15"
+                }
+            },
+            "node_modules/lodash": {
+                "version": "4.17.15",
+                "resolved": "https://registry.npmjs.org/lodash/-/lodash-4.17.15.tgz"
+            }
+        }
+    });
+    fs::write(
+        project_dir.join("npm-shrinkwrap.json"),
+        serde_json::to_string_pretty(&shrinkwrap_json).unwrap(),
+    )
+    .unwrap();
+
+    let advisories_json = serde_json::json!({
+        "lodash": [
+            {
+                "id": 1065,
+                "name": "lodash",
+                "severity": "high",
+                "vulnerable_versions": "<4.17.21",
+                "title": "Prototype Pollution in lodash",
+                "url": "https://github.com/advisories/GHSA-p6mc-m468-83gw"
+            }
+        ]
+    });
+    fs::write(
+        project_dir.join("advisories.json"),
+        serde_json::to_string_pretty(&advisories_json).unwrap(),
+    )
+    .unwrap();
+
+    let output = Command::new(rnpm_bin)
+        .args(["audit", "fix"])
+        .env("RNPM_TEST_MOCK_ADVISORIES", "1")
+        .current_dir(project_dir)
+        .output()
+        .expect("Failed to execute rnpm audit fix");
+
+    assert!(
+        output.status.success(),
+        "audit fix must succeed on shrinkwrap-only project: {:?}",
+        output
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("found 0 vulnerabilities"),
+        "stdout must report 0 vulnerabilities, got:\n{stdout}"
+    );
+
+    // npm-shrinkwrap.json must be updated with the fix
+    let updated_shrinkwrap = fs::read_to_string(project_dir.join("npm-shrinkwrap.json")).unwrap();
+    assert!(
+        updated_shrinkwrap.contains("\"version\": \"4.18.1\"")
+            || updated_shrinkwrap.contains("\"version\": \"4.17.21\""),
+        "npm-shrinkwrap.json must be updated to fixed version, got:\n{updated_shrinkwrap}"
+    );
+
+    // package-lock.json must NOT be created
+    assert!(
+        !project_dir.join("package-lock.json").exists(),
+        "package-lock.json must not be created when npm-shrinkwrap.json is present"
+    );
+}
+
+#[test]
+fn test_audit_fix_package_lock_only_without_node_modules() {
+    let rnpm_bin = env!("CARGO_BIN_EXE_rnpm");
+    let tmp = tempdir().unwrap();
+    let project_dir = tmp.path();
+
+    let pkg_json = serde_json::json!({
+        "name": "test-lock-only-fix",
+        "version": "1.0.0",
+        "dependencies": {
+            "lodash": "^4.17.15"
+        }
+    });
+    fs::write(
+        project_dir.join("package.json"),
+        serde_json::to_string_pretty(&pkg_json).unwrap(),
+    )
+    .unwrap();
+
+    let lockfile_json = serde_json::json!({
+        "name": "test-lock-only-fix",
+        "version": "1.0.0",
+        "lockfileVersion": 3,
+        "packages": {
+            "": {
+                "name": "test-lock-only-fix",
+                "version": "1.0.0",
+                "dependencies": {
+                    "lodash": "^4.17.15"
+                }
+            },
+            "node_modules/lodash": {
+                "version": "4.17.15",
+                "resolved": "https://registry.npmjs.org/lodash/-/lodash-4.17.15.tgz"
+            }
+        }
+    });
+    fs::write(
+        project_dir.join("package-lock.json"),
+        serde_json::to_string_pretty(&lockfile_json).unwrap(),
+    )
+    .unwrap();
+
+    let advisories_json = serde_json::json!({
+        "lodash": [
+            {
+                "id": 1065,
+                "name": "lodash",
+                "severity": "high",
+                "vulnerable_versions": "<4.17.21",
+                "title": "Prototype Pollution in lodash",
+                "url": "https://github.com/advisories/GHSA-p6mc-m468-83gw"
+            }
+        ]
+    });
+    fs::write(
+        project_dir.join("advisories.json"),
+        serde_json::to_string_pretty(&advisories_json).unwrap(),
+    )
+    .unwrap();
+
+    // Ensure node_modules does not exist prior to audit fix
+    assert!(!project_dir.join("node_modules").exists());
+
+    let output = Command::new(rnpm_bin)
+        .args(["audit", "fix", "--package-lock-only"])
+        .env("RNPM_TEST_MOCK_ADVISORIES", "1")
+        .current_dir(project_dir)
+        .output()
+        .expect("Failed to execute rnpm audit fix --package-lock-only");
+
+    assert!(
+        output.status.success(),
+        "audit fix --package-lock-only must succeed: {:?}",
+        output
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("found 0 vulnerabilities"),
+        "stdout must report 0 vulnerabilities, got:\n{stdout}"
+    );
+
+    // Verify package-lock.json was updated with the fixed version
+    let updated_lock = fs::read_to_string(project_dir.join("package-lock.json")).unwrap();
+    assert!(
+        updated_lock.contains("\"version\": \"4.18.1\"")
+            || updated_lock.contains("\"version\": \"4.17.21\""),
+        "package-lock.json must be updated to fixed version, got:\n{updated_lock}"
+    );
+
+    // Verify node_modules was NOT created
+    assert!(
+        !project_dir.join("node_modules").exists(),
+        "node_modules must not be created when --package-lock-only is used"
+    );
+}
+
+#[test]
+fn test_audit_fix_package_lock_only_from_npmrc() {
+    let rnpm_bin = env!("CARGO_BIN_EXE_rnpm");
+    let tmp = tempdir().unwrap();
+    let project_dir = tmp.path();
+
+    let pkg_json = serde_json::json!({
+        "name": "test-npmrc-lock-only-fix",
+        "version": "1.0.0",
+        "dependencies": {
+            "lodash": "^4.17.15"
+        }
+    });
+    fs::write(
+        project_dir.join("package.json"),
+        serde_json::to_string_pretty(&pkg_json).unwrap(),
+    )
+    .unwrap();
+
+    let lockfile_json = serde_json::json!({
+        "name": "test-npmrc-lock-only-fix",
+        "version": "1.0.0",
+        "lockfileVersion": 3,
+        "packages": {
+            "": {
+                "name": "test-npmrc-lock-only-fix",
+                "version": "1.0.0",
+                "dependencies": {
+                    "lodash": "^4.17.15"
+                }
+            },
+            "node_modules/lodash": {
+                "version": "4.17.15",
+                "resolved": "https://registry.npmjs.org/lodash/-/lodash-4.17.15.tgz"
+            }
+        }
+    });
+    fs::write(
+        project_dir.join("package-lock.json"),
+        serde_json::to_string_pretty(&lockfile_json).unwrap(),
+    )
+    .unwrap();
+
+    // Configure package-lock-only in .npmrc
+    fs::write(project_dir.join(".npmrc"), "package-lock-only=true\n").unwrap();
+
+    let advisories_json = serde_json::json!({
+        "lodash": [
+            {
+                "id": 1065,
+                "name": "lodash",
+                "severity": "high",
+                "vulnerable_versions": "<4.17.21",
+                "title": "Prototype Pollution in lodash",
+                "url": "https://github.com/advisories/GHSA-p6mc-m468-83gw"
+            }
+        ]
+    });
+    fs::write(
+        project_dir.join("advisories.json"),
+        serde_json::to_string_pretty(&advisories_json).unwrap(),
+    )
+    .unwrap();
+
+    assert!(!project_dir.join("node_modules").exists());
+
+    let output = Command::new(rnpm_bin)
+        .args(["audit", "fix"])
+        .env("RNPM_TEST_MOCK_ADVISORIES", "1")
+        .current_dir(project_dir)
+        .output()
+        .expect("Failed to execute rnpm audit fix with .npmrc package-lock-only");
+
+    assert!(
+        output.status.success(),
+        "audit fix with .npmrc package-lock-only must succeed: {:?}",
+        output
+    );
+
+    // Verify package-lock.json was updated
+    let updated_lock = fs::read_to_string(project_dir.join("package-lock.json")).unwrap();
+    assert!(
+        updated_lock.contains("\"version\": \"4.18.1\"")
+            || updated_lock.contains("\"version\": \"4.17.21\""),
+        "package-lock.json must be updated to fixed version, got:\n{updated_lock}"
+    );
+
+    // Verify node_modules was NOT created
+    assert!(
+        !project_dir.join("node_modules").exists(),
+        "node_modules must not be created when package-lock-only=true in .npmrc"
+    );
+}

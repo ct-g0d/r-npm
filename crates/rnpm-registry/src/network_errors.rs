@@ -91,6 +91,15 @@ pub fn format_http(error: &reqwest::Error) -> String {
     if let Some((code, message)) = diagnostic(error) {
         format!("npm error code {code}\nnpm error {message}")
     } else {
-        format!("HTTP error: {error}")
+        let mut msg = format!("HTTP error: {error}");
+        let mut source = error.source();
+        while let Some(cause) = source {
+            let cause_str = cause.to_string();
+            if !cause_str.is_empty() && !msg.contains(&cause_str) {
+                msg.push_str(&format!(": {cause_str}"));
+            }
+            source = cause.source();
+        }
+        msg
     }
 }

@@ -204,6 +204,52 @@ impl Npmrc {
             return Ok(());
         }
 
+        // Array key notation (e.g. "min-release-age-exclude[]" or any "key[]")
+        if let Some(base_key) = key_trimmed.strip_suffix("[]") {
+            let base_key = base_key.trim();
+            if let Some(existing) = self.settings.get_mut(base_key) {
+                if !existing.is_empty() {
+                    existing.push(',');
+                }
+                existing.push_str(value_trimmed);
+            } else {
+                self.settings
+                    .insert(base_key.to_string(), value_trimmed.to_string());
+            }
+            if let Some(existing) = self.settings.get_mut(key_trimmed) {
+                if !existing.is_empty() {
+                    existing.push(',');
+                }
+                existing.push_str(value_trimmed);
+            } else {
+                self.settings
+                    .insert(key_trimmed.to_string(), value_trimmed.to_string());
+            }
+            return Ok(());
+        }
+
+        // Multiple min-release-age-exclude lines without brackets append as comma-separated
+        if key_trimmed == "min-release-age-exclude" || key_trimmed == "min_release_age_exclude" {
+            let alt_key = if key_trimmed == "min-release-age-exclude" {
+                "min_release_age_exclude"
+            } else {
+                "min-release-age-exclude"
+            };
+            if let Some(existing) = self.settings.get_mut(key_trimmed) {
+                if !existing.is_empty() {
+                    existing.push(',');
+                }
+                existing.push_str(value_trimmed);
+                return Ok(());
+            } else if let Some(existing) = self.settings.get_mut(alt_key) {
+                if !existing.is_empty() {
+                    existing.push(',');
+                }
+                existing.push_str(value_trimmed);
+                return Ok(());
+            }
+        }
+
         // Fallback: general setting
         self.settings
             .insert(key_trimmed.to_string(), value_trimmed.to_string());

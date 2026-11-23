@@ -1432,6 +1432,7 @@ fn is_strictly_excluded(rel_path: &str, is_dir: bool) -> bool {
         || filename == ".gitignore"
         || filename == ".npmignore"
         || filename == ".npmrc"
+        || filename == ".rnpm_checkout_done"
         || rel_path == "node_modules"
         || rel_path.starts_with("node_modules/")
         || filename == "package-lock.json"
@@ -2000,7 +2001,13 @@ fn npm_gzip(input: &[u8]) -> Result<Vec<u8>, FsError> {
         use std::os::windows::process::CommandExt;
         command.creation_flags(0x08000000);
     }
-    let mut child = command.spawn().map_err(FsError::Io)?;
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return pure_rust_gzip(input);
+        }
+        Err(err) => return Err(FsError::Io(err)),
+    };
     let mut stdin = child.stdin.take().expect("piped child stdin");
     let (output, written) = std::thread::scope(|scope| {
         // Drain stdout while feeding stdin so large archives cannot deadlock
@@ -2020,6 +2027,27 @@ fn npm_gzip(input: &[u8]) -> Result<Vec<u8>, FsError> {
         .map_err(|_| FsError::Io(std::io::Error::other("gzip input writer panicked")))?
         .map_err(FsError::Io)?;
     Ok(output.stdout)
+}
+
+/// Pure-Rust gzip fallback when `node` is unavailable.
+/// Uses `flate2::write::GzEncoder` at compression level 9 with OS header byte (byte 9)
+/// set to 255 (0xFF), matching npm's gzip header formatting.
+pub fn pure_rust_gzip(input: &[u8]) -> Result<Vec<u8>, FsError> {
+    use flate2::write::GzEncoder;
+    use flate2::Compression;
+
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::new(9));
+    encoder.write_all(input).map_err(FsError::Io)?;
+    let mut output = encoder.finish().map_err(FsError::Io)?;
+    if output.len() >= 10 {
+        output[9] = 255;
+    }
+    Ok(output)
+}
+
+/// Pure-Rust gzip helper alias for `pure_rust_gzip`.
+pub fn rust_gzip(input: &[u8]) -> Result<Vec<u8>, FsError> {
+    pure_rust_gzip(input)
 }
 
 fn is_file_executable(path: &Path) -> bool {
@@ -2080,5 +2108,63 @@ mod glob_tests {
             "secrets/prod",
             "secrets/production/key.pem"
         ));
+    }
+}
+
+#[cfg(test)]
+mod gzip_tests {
+    use super::{pure_rust_gzip, rust_gzip};
+    use flate2::read::GzDecoder;
+    use std::io::Read;
+
+    #[test]
+    fn test_pure_rust_gzip_os_byte_and_roundtrip() {
+        let test_inputs: Vec<&[u8]> = vec![
+            b"",
+            b"hello world",
+            b"The quick brown fox jumps over the lazy dog",
+            &[0u8; 10000],
+            b"Lorem ipsum dolor sit amet, consectetur adipiscing elit. Sed do eiusmod tempor incididunt ut labore et dolore magna aliqua.",
+        ];
+
+        for input in test_inputs {
+            let compressed = pure_rust_gzip(input).expect("pure_rust_gzip should succeed");
+
+            // Verify valid gzip header
+            assert!(
+                compressed.len() >= 10,
+                "gzip output must have header of at least 10 bytes"
+            );
+            assert_eq!(compressed[0], 0x1f, "gzip magic byte 1");
+            assert_eq!(compressed[1], 0x8b, "gzip magic byte 2");
+            assert_eq!(compressed[2], 0x08, "gzip compression method (deflate)");
+
+            // Verify OS byte (byte 9) is 255 (0xFF)
+            assert_eq!(
+                compressed[9], 255,
+                "gzip header byte 9 (OS flag) must be 255 (0xFF)"
+            );
+
+            // Verify round-trip decompression
+            let mut decoder = GzDecoder::new(&compressed[..]);
+            let mut decompressed = Vec::new();
+            decoder
+                .read_to_end(&mut decompressed)
+                .expect("decompression must succeed");
+            assert_eq!(
+                decompressed, input,
+                "round-trip decompressed bytes must match original input"
+            );
+
+            // Also test rust_gzip alias
+            let compressed_alias = rust_gzip(input).expect("rust_gzip alias should succeed");
+            assert_eq!(compressed_alias[9], 255);
+            let mut decoder2 = GzDecoder::new(&compressed_alias[..]);
+            let mut decompressed2 = Vec::new();
+            decoder2
+                .read_to_end(&mut decompressed2)
+                .expect("decompression must succeed");
+            assert_eq!(decompressed2, input);
+        }
     }
 }

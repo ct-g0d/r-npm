@@ -56,16 +56,16 @@ pub fn compute_save_spec(
             let clean = s.strip_prefix("./").unwrap_or(&s);
             format!("file:{clean}")
         }
-        PackageTarget::Git { url, committish } => {
-            format!(
-                "{}{}",
-                url,
-                committish
-                    .as_ref()
-                    .map(|c| format!("#{c}"))
-                    .unwrap_or_default()
-            )
-        }
+        PackageTarget::Git {
+            url,
+            committish,
+            subdir,
+        } => match (committish, subdir) {
+            (Some(c), Some(s)) => format!("{url}#{c}::path:{s}"),
+            (Some(c), None) => format!("{url}#{c}"),
+            (None, Some(s)) => format!("{url}#path:{s}"),
+            (None, None) => url.clone(),
+        },
         PackageTarget::Workspace(ws) => format!("workspace:{}", ws),
         PackageTarget::Url(u) => u.to_string(),
         PackageTarget::Alias {

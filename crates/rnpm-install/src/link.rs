@@ -3,7 +3,7 @@ use rnpm_config::{find_global_bin_dir, find_global_node_modules};
 use rnpm_core::manifest::Manifest;
 use rnpm_fs::junction::{create_junction, is_junction, remove_dir_all_safe, remove_junction};
 use rnpm_shim::generator::create_shim_trio;
-use rnpm_shim::{create_shims, normalize_shebang};
+use rnpm_shim::{create_shims_with_force, normalize_shebang};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use tracing::debug;
@@ -394,16 +394,69 @@ pub(crate) fn clean_empty_bin_dir_at(bin_dir: &Path) {
     }
 }
 
+/// Removes all `.bin` directories and any shims inside them under `node_modules` (including nested `node_modules` and root `.bin`).
+pub(crate) fn remove_all_bin_dirs(root_nm: &Path) {
+    if !root_nm.is_dir() {
+        return;
+    }
+    if root_nm.file_name().map(|n| n == ".bin").unwrap_or(false) {
+        if rnpm_fs::junction::is_junction(root_nm).unwrap_or(false) {
+            let _ = rnpm_fs::junction::remove_junction(root_nm);
+        } else {
+            let _ = remove_dir_all_safe(root_nm);
+        }
+        return;
+    }
+    fn visit(dir: &Path) {
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    let file_name = entry.file_name();
+                    if file_name == ".bin" {
+                        if rnpm_fs::junction::is_junction(&path).unwrap_or(false) {
+                            let _ = rnpm_fs::junction::remove_junction(&path);
+                        } else {
+                            let _ = remove_dir_all_safe(&path);
+                        }
+                    } else if file_name == "node_modules" {
+                        visit(&path);
+                    } else if file_name.to_string_lossy().starts_with('@') {
+                        if let Ok(scoped_entries) = std::fs::read_dir(&path) {
+                            for scoped_entry in scoped_entries.flatten() {
+                                let scoped_pkg_path = scoped_entry.path();
+                                if scoped_pkg_path.is_dir() {
+                                    let nested_nm = scoped_pkg_path.join("node_modules");
+                                    if nested_nm.is_dir() {
+                                        visit(&nested_nm);
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        let nested_nm = path.join("node_modules");
+                        if nested_nm.is_dir() {
+                            visit(&nested_nm);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    visit(root_nm);
+}
+
 pub(crate) fn link_single_pkg_bin(
     target_path: &Path,
     pkg_bin_dir: &Path,
     bin_name: &str,
     script_rel: &str,
     source_script_path: &Path,
-) {
+    force: bool,
+) -> Result<()> {
     let target_rel = compute_bin_target_rel(target_path, pkg_bin_dir, script_rel);
     let _ = normalize_shebang(source_script_path);
-    let _ = create_shims(pkg_bin_dir, bin_name, &target_rel);
+    create_shims_with_force(pkg_bin_dir, bin_name, &target_rel, force)
 }
 
 pub(crate) fn package_name_from_loc(loc: &str) -> &str {
@@ -492,6 +545,7 @@ pub(crate) fn sort_packages_for_bin_linking(packages: &mut [CiPackage]) {
     packages.sort_by(|a, b| bin_package_order_cmp(&a.0, &b.0));
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn link_tree_bins(
     mut package_locs: Vec<String>,
     known_bins: Option<&HashMap<String, Vec<(String, String)>>>,
@@ -500,7 +554,8 @@ pub(crate) fn link_tree_bins(
     node_modules_dir: &Path,
     is_clean_install: bool,
     collector: Option<&TimingCollector>,
-) {
+    force: bool,
+) -> Result<()> {
     let t_bins = std::time::Instant::now();
 
     // 1. If known_bins is provided, filter package_locs to only packages that actually have bins in memory!
@@ -587,14 +642,15 @@ pub(crate) fn link_tree_bins(
 
     if shims_to_link.len() <= 2 {
         for (target_path, pkg_bin_dir, bin_name, script_rel, script_path) in &shims_to_link {
-            link_single_pkg_bin(target_path, pkg_bin_dir, bin_name, script_rel, script_path);
+            link_single_pkg_bin(target_path, pkg_bin_dir, bin_name, script_rel, script_path, force)?;
         }
     } else {
         let num_threads = 16.min(shims_to_link.len());
         let chunk_size = shims_to_link.len().div_ceil(num_threads);
         std::thread::scope(|scope| {
+            let mut handles = Vec::new();
             for chunk in shims_to_link.chunks(chunk_size) {
-                scope.spawn(move || {
+                handles.push(scope.spawn(move || {
                     for (target_path, pkg_bin_dir, bin_name, script_rel, script_path) in chunk {
                         link_single_pkg_bin(
                             target_path,
@@ -602,11 +658,17 @@ pub(crate) fn link_tree_bins(
                             bin_name,
                             script_rel,
                             script_path,
-                        );
+                            force,
+                        )?;
                     }
-                });
+                    Ok::<(), anyhow::Error>(())
+                }));
             }
-        });
+            for handle in handles {
+                handle.join().map_err(|_| anyhow!("Bin linking thread panicked"))??;
+            }
+            Ok::<(), anyhow::Error>(())
+        })?;
     }
 
     // 4. Clean up stale shims: remove any shims in .bin that are not owned by any package in the new tree's wanted bin set.
@@ -617,4 +679,6 @@ pub(crate) fn link_tree_bins(
     if let Some(c) = collector {
         c.record_phase(Phase::Bins, t_bins.elapsed());
     }
+
+    Ok(())
 }

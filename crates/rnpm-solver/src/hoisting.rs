@@ -61,15 +61,17 @@ pub fn version_satisfies_target(version_str: &str, target: &PackageTarget) -> bo
             let expected = format!("file:{}", rnpm_core::to_posix_path(&p.to_string_lossy()));
             version_str == expected
         }
-        PackageTarget::Git { url, committish } => {
-            let expected = format!(
-                "{}{}",
-                url,
-                committish
-                    .as_ref()
-                    .map(|c| format!("#{c}"))
-                    .unwrap_or_default()
-            );
+        PackageTarget::Git {
+            url,
+            committish,
+            subdir,
+        } => {
+            let expected = match (committish, subdir) {
+                (Some(c), Some(s)) => format!("{url}#{c}::path:{s}"),
+                (Some(c), None) => format!("{url}#{c}"),
+                (None, Some(s)) => format!("{url}#path:{s}"),
+                (None, None) => url.clone(),
+            };
             version_str == expected
                 || git_target_matches_resolved(url, committish.as_deref(), version_str)
                 || committish
@@ -193,7 +195,9 @@ pub fn node_satisfies_target(node: &crate::graph::Node, target: &PackageTarget) 
                 .as_deref()
                 .is_some_and(|resolved| file_target_matches_resolved(p, resolved));
         }
-        PackageTarget::Git { url, committish } => {
+        PackageTarget::Git {
+            url, committish, ..
+        } => {
             return node
                 .resolved
                 .as_deref()

@@ -39,6 +39,8 @@ pub struct ResolverOptions {
     pub force: bool,
     /// npm's `install-strategy` for PlaceDep's target walk.
     pub install_strategy: crate::hoisting::PlacementStrategy,
+    /// When true, prefer an already-placed/deduplicatable compatible version in the tree over a newer version when resolving a range.
+    pub prefer_dedupe: bool,
 }
 
 impl Default for ResolverOptions {
@@ -55,6 +57,7 @@ impl Default for ResolverOptions {
             vulnerability_constraints: std::collections::HashMap::new(),
             force: false,
             install_strategy: crate::hoisting::PlacementStrategy::Hoisted,
+            prefer_dedupe: false,
         }
     }
 }
@@ -81,6 +84,7 @@ struct ResolveTask {
     /// arborist's nodeFromEdge(parentEdge, parent, secondEdge) does.
     advisory: Option<String>,
     is_mine: bool,
+    is_root: bool,
 }
 
 /// Main solver coordinator for building the dependency graph.
@@ -194,6 +198,7 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
             parent_location.matches("node_modules").count()
         };
         let is_mine = !parent_location.contains("node_modules");
+        let is_root = !parent_location.contains("node_modules");
         self.push_task(ResolveTask {
             parent_location,
             parent_package_name,
@@ -204,6 +209,7 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
             ancestors,
             advisory: None,
             is_mine,
+            is_root,
         });
     }
 
@@ -481,8 +487,23 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
             }
         }
 
-        let root_names: Vec<&str> = root_deps.keys().map(|k| k.as_str()).collect();
-        self.provider.prefetch_packages(&root_names);
+        let mut root_targets = Vec::new();
+        for (name, (spec, _)) in &root_deps {
+            let Ok(dep_spec) = DependencySpec::parse(name, spec) else {
+                continue;
+            };
+            if matches!(
+                dep_spec.target,
+                PackageTarget::Range(_) | PackageTarget::Version(_) | PackageTarget::Tag(_)
+            ) {
+                root_targets.push(dep_spec);
+            }
+        }
+        let root_edges: Vec<(&str, bool)> = root_targets
+            .iter()
+            .map(|t| (t.package_name.as_str(), true))
+            .collect();
+        self.provider.prefetch_packages_for_edge(&root_edges);
         if self.options.lockfile.is_none() {
             self.prefetch_closure(&root_deps);
         }
@@ -520,6 +541,7 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                         ancestors: root_ancestors.clone(),
                         advisory: None,
                         is_mine: true,
+                        is_root: true,
                     });
                 }
             };
@@ -902,7 +924,11 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
         }
 
         // 4. Resolve package metadata and choose matching version
-        let pkg_meta_opt = self.provider.get_package(&dep_spec.package_name)?;
+        let pkg_meta_opt = self.provider.get_package_for_edge(
+            &dep_spec.package_name,
+            &effective_spec,
+            task.is_root,
+        )?;
         let Some(pkg_meta) = pkg_meta_opt else {
             if task.dep_type == DependencyType::Optional
                 || task.dep_type == DependencyType::PeerOptional
@@ -1568,6 +1594,7 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                             ancestors: child_ancestors.clone(),
                             advisory: None,
                             is_mine: child_is_mine,
+                            is_root: false,
                         }
                     })
                     .collect::<Vec<_>>();
@@ -1576,11 +1603,23 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                 // placement pass and lets a later direct dependency claim a
                 // compatible root slot before an earlier sibling's nested
                 // subtree is expanded.
-                let child_names: Vec<&str> = child_tasks
+                let mut child_targets = Vec::new();
+                for t in &child_tasks {
+                    let Ok(c_dep) = DependencySpec::parse(&t.install_name, &t.raw_spec) else {
+                        continue;
+                    };
+                    if matches!(
+                        c_dep.target,
+                        PackageTarget::Range(_) | PackageTarget::Version(_) | PackageTarget::Tag(_)
+                    ) {
+                        child_targets.push(c_dep);
+                    }
+                }
+                let child_edges: Vec<(&str, bool)> = child_targets
                     .iter()
-                    .map(|t| t.install_name.as_str())
+                    .map(|t| (t.package_name.as_str(), false))
                     .collect();
-                self.provider.prefetch_packages(&child_names);
+                self.provider.prefetch_packages_for_edge(&child_edges);
                 let mut peer_tasks = Vec::new();
                 for child_task in child_tasks {
                     // PlaceDep places a candidate together with its required
@@ -1667,6 +1706,7 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                                     .map(|s| (s.clone(), DependencyType::Peer))
                             });
                         if let Some((raw_spec, dep_type)) = parent_edge {
+                            let is_peer_scope_root = !peer_scope.contains("node_modules");
                             let root_task = ResolveTask {
                                 parent_location: peer_scope.to_string(),
                                 parent_package_name: parent.name.clone(),
@@ -1685,6 +1725,7 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                                 }),
                                 advisory: Some(child_task.raw_spec.clone()),
                                 is_mine: true,
+                                is_root: is_peer_scope_root,
                             };
                             let preplaced_key = if peer_scope.is_empty() {
                                 name
@@ -1998,7 +2039,7 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
             // Metadata failures belong to placement, which reports them in order.
             let Some(meta) = self
                 .provider
-                .get_package(&dep_spec.package_name)
+                .get_package_for_edge(&dep_spec.package_name, spec, true)
                 .ok()
                 .flatten()
             else {
@@ -2041,7 +2082,12 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                 {
                     continue;
                 }
-                let Some(peer_meta) = self.provider.get_package(peer).ok().flatten() else {
+                let Some(peer_meta) = self
+                    .provider
+                    .get_package_for_edge(peer, root_spec, true)
+                    .ok()
+                    .flatten()
+                else {
                     continue;
                 };
                 // nodeFromEdge(parentEdge, ..., peerEdge): the root's choice,
@@ -2183,8 +2229,9 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
 
     /// The version npm would pick for the conflicting peer.
     fn candidate_version(&self, parent_location: &str, dep_spec: &DependencySpec) -> String {
+        let is_root = !parent_location.contains("node_modules");
         self.provider
-            .get_package(&dep_spec.package_name)
+            .get_package_for_edge(&dep_spec.package_name, &dep_spec.raw_spec, is_root)
             .ok()
             .flatten()
             .and_then(|meta| {
@@ -2315,7 +2362,7 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
         // fetched as soon as it arrives, so one slow request no longer holds
         // back every package at the next depth.
         struct Work {
-            queue: Vec<(String, String)>,
+            queue: Vec<(String, String, bool)>,
             in_flight: usize,
             seen: std::collections::HashSet<String>,
         }
@@ -2324,7 +2371,7 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
             queue: root_deps
                 .iter()
                 .filter(|(_, (_, dep_type))| *dep_type != DependencyType::PeerOptional)
-                .map(|(name, (spec, _))| (name.clone(), spec.clone()))
+                .map(|(name, (spec, _))| (name.clone(), spec.clone(), true))
                 .collect(),
             in_flight: 0,
             seen: root_deps.keys().cloned().collect(),
@@ -2359,9 +2406,9 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                     };
                     let children = self.closure_children(&batch);
                     let Ok(mut state) = work.lock() else { return };
-                    for (child, spec) in children {
+                    for (child, spec, is_root) in children {
                         if state.seen.insert(child.clone()) {
-                            state.queue.push((child, spec));
+                            state.queue.push((child, spec, is_root));
                         }
                     }
                     state.in_flight -= 1;
@@ -2373,9 +2420,9 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
 
     /// Prefetches one batch of the closure and returns the edges placement
     /// would follow from the versions it picks.
-    fn closure_children(&self, batch: &[(String, String)]) -> Vec<(String, String)> {
+    fn closure_children(&self, batch: &[(String, String, bool)]) -> Vec<(String, String, bool)> {
         let mut targets = Vec::new();
-        for (name, spec) in batch {
+        for (name, spec, is_root) in batch {
             let Ok(dep_spec) = DependencySpec::parse(name, spec) else {
                 continue;
             };
@@ -2383,13 +2430,16 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                 dep_spec.target,
                 PackageTarget::Range(_) | PackageTarget::Version(_) | PackageTarget::Tag(_)
             ) {
-                targets.push(dep_spec);
+                targets.push((dep_spec, *is_root));
             }
         }
-        let names: Vec<&str> = targets.iter().map(|t| t.package_name.as_str()).collect();
-        self.provider.prefetch_packages(&names);
+        let edges: Vec<(&str, bool)> = targets
+            .iter()
+            .map(|(t, is_root)| (t.package_name.as_str(), *is_root))
+            .collect();
+        self.provider.prefetch_packages_for_edge(&edges);
         let mut out = Vec::new();
-        for dep_spec in &targets {
+        for (dep_spec, _) in &targets {
             // Only what the prefetch brought in: a failed prefetch is not
             // retried here, placement looks it up again.
             let Some(meta) = self.provider.cached_package(&dep_spec.package_name) else {
@@ -2437,7 +2487,7 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                 if bundled.contains(&child.as_str()) || self.overrides.mentions(child) {
                     continue;
                 }
-                out.push((child.clone(), child_spec.clone()));
+                out.push((child.clone(), child_spec.clone(), false));
             }
         }
         out
@@ -2520,6 +2570,91 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                         true
                     }
                 };
+
+                if self.options.prefer_dedupe {
+                    let mut scope_buf = String::new();
+                    if let Some(loc) = DependencyGraph::find_in_scope_hierarchy(
+                        &self.graph.nodes,
+                        parent_location,
+                        pkg_name,
+                        &mut scope_buf,
+                    ) {
+                        if let Some(existing_node) = self.graph.nodes.get(loc) {
+                            if existing_node.name == pkg_name {
+                                if let Ok(parsed) = Version::parse(&existing_node.version) {
+                                    if range.satisfies(&parsed)
+                                        && is_safe(&parsed)
+                                        && advisories.iter().all(|target| {
+                                            crate::hoisting::version_satisfies_target(
+                                                &existing_node.version,
+                                                target,
+                                            )
+                                        })
+                                    {
+                                        if let Some(v_meta) = meta.versions.get(&existing_node.version) {
+                                            if v_meta.deprecated.is_none() {
+                                                return Some(v_meta);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    let mut best_placed_undeprecated: Option<(&'b PackageVersionMetadata, Version)> =
+                        None;
+                    let mut best_placed: Option<(&'b PackageVersionMetadata, Version)> = None;
+
+                    for node in self.graph.nodes.values() {
+                        if node.name == pkg_name {
+                            if let Ok(parsed) = Version::parse(&node.version) {
+                                if range.satisfies(&parsed)
+                                    && is_safe(&parsed)
+                                    && advisories.iter().all(|target| {
+                                        crate::hoisting::version_satisfies_target(
+                                            &node.version,
+                                            target,
+                                        )
+                                    })
+                                {
+                                    if let Some(v_meta) = meta.versions.get(&node.version) {
+                                        if v_meta.deprecated.is_none() {
+                                            match &best_placed_undeprecated {
+                                                Some((_, best_v)) => {
+                                                    if &parsed > best_v {
+                                                        best_placed_undeprecated =
+                                                            Some((v_meta, parsed.clone()));
+                                                    }
+                                                }
+                                                None => {
+                                                    best_placed_undeprecated =
+                                                        Some((v_meta, parsed.clone()));
+                                                }
+                                            }
+                                        }
+                                        match &best_placed {
+                                            Some((_, best_v)) => {
+                                                if &parsed > best_v {
+                                                    best_placed = Some((v_meta, parsed));
+                                                }
+                                            }
+                                            None => {
+                                                best_placed = Some((v_meta, parsed));
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    if let Some((v_meta, _)) = best_placed_undeprecated {
+                        return Some(v_meta);
+                    } else if let Some((v_meta, _)) = best_placed {
+                        return Some(v_meta);
+                    }
+                }
 
                 // npm resolves registry ranges through the `latest` dist-tag
                 // when that tagged version satisfies the requested range. This
@@ -2636,7 +2771,9 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                         None
                     }
                 }),
-            PackageTarget::Git { url, committish } => meta
+            PackageTarget::Git {
+                url, committish, ..
+            } => meta
                 .versions
                 .values()
                 .find(|v| {

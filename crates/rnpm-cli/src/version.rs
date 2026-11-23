@@ -1,5 +1,5 @@
 /// npm release whose behavior rnpm emulates.
-pub(crate) const NPM_VERSION: &str = "11.20.0";
+pub const NPM_VERSION: &str = "11.20.0";
 
 use anyhow::{Context, Result};
 use rnpm_core::semver::Version;
@@ -8,7 +8,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::process::Command;
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct VersionOptions {
     pub newversion: Option<String>,
     pub preid: Option<String>,
@@ -20,6 +20,25 @@ pub struct VersionOptions {
     pub force: bool,
     pub ignore_scripts: bool,
     pub json: bool,
+    pub tag_version_prefix: String,
+}
+
+impl Default for VersionOptions {
+    fn default() -> Self {
+        Self {
+            newversion: None,
+            preid: None,
+            message: None,
+            allow_same_version: false,
+            git_tag_version: true,
+            commit_hooks: true,
+            sign_git_tag: false,
+            force: false,
+            ignore_scripts: false,
+            json: false,
+            tag_version_prefix: "v".to_string(),
+        }
+    }
 }
 
 pub async fn execute_version(project_dir: &Path, options: VersionOptions) -> Result<()> {
@@ -311,7 +330,8 @@ async fn execute_version_bump(
             ));
         }
 
-        let tag_name = format!("v{new_version}");
+        let prefix = &options.tag_version_prefix;
+        let tag_name = format!("{prefix}{new_version}");
         let mut tag_args = vec!["tag".to_string()];
         if options.sign_git_tag {
             tag_args.push("-s".to_string());
@@ -355,7 +375,8 @@ async fn execute_version_bump(
     }
 
     // 5. Prints the new version tag (e.g. v1.2.4) to stdout
-    println!("v{new_version}");
+    let prefix = &options.tag_version_prefix;
+    println!("{prefix}{new_version}");
 
     Ok(())
 }

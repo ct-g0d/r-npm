@@ -15,6 +15,11 @@ pub(crate) struct UpdateOptions {
     pub strict_peer_deps: bool,
     pub silent: bool,
     pub json: bool,
+    pub no_bin_links: bool,
+    pub bin_links: Option<bool>,
+    pub workspace_root: bool,
+    pub workspace: Vec<String>,
+    pub workspaces: bool,
 }
 
 pub(crate) async fn run(opts: UpdateOptions, current_dir: PathBuf) -> Result<()> {
@@ -42,6 +47,12 @@ pub(crate) async fn run(opts: UpdateOptions, current_dir: PathBuf) -> Result<()>
         }
     }
 
+    let bin_links_val = if opts.no_bin_links || opts.bin_links == Some(false) {
+        false
+    } else {
+        opts.bin_links.unwrap_or_else(|| config.get_bool("bin-links").unwrap_or(true))
+    };
+
     let options = InstallOptions {
         project_dir: current_dir.clone(),
         registry_url: opts.registry,
@@ -55,6 +66,10 @@ pub(crate) async fn run(opts: UpdateOptions, current_dir: PathBuf) -> Result<()>
         dry_run,
         silent: opts.silent,
         unlocked_packages,
+        bin_links: bin_links_val,
+        workspace_root: opts.workspace_root,
+        workspace: opts.workspace,
+        workspaces: opts.workspaces,
         ..Default::default()
     };
 

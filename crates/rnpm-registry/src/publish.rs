@@ -23,6 +23,7 @@ pub struct PublishPayloadOptions<'a> {
     pub tarball: PublishTarballData<'a>,
     pub registry_url: &'a Url,
     pub provenance_attestation: Option<&'a serde_json::Value>,
+    pub provenance_bundle: Option<&'a crate::provenance::SigstoreBundle>,
 }
 
 /// CouchDB/npm registry attachment format.
@@ -78,9 +79,6 @@ pub fn create_publish_payload(opts: &PublishPayloadOptions) -> serde_json::Value
     );
     dist.insert("shasum".into(), serde_json::json!(opts.tarball.shasum));
     dist.insert("tarball".into(), serde_json::json!(tarball_url));
-    if let Some(attestation) = opts.provenance_attestation {
-        dist.insert("attestations".into(), attestation.clone());
-    }
 
     let mut manifest = match opts.manifest {
         serde_json::Value::Object(map) => map.clone(),
@@ -91,6 +89,50 @@ pub fn create_publish_payload(opts: &PublishPayloadOptions) -> serde_json::Value
         serde_json::json!(format!("{}@{}", opts.name, opts.version)),
     );
     manifest.insert("dist".into(), serde_json::Value::Object(dist));
+
+    let mut attachments = serde_json::Map::new();
+    attachments.insert(
+        tarball_name,
+        serde_json::json!({
+            "content_type": "application/octet-stream",
+            "data": BASE64.encode(opts.tarball.bytes),
+            "length": opts.tarball.bytes.len(),
+        }),
+    );
+
+    let provenance_bundle_name = format!("{}-{}.sigstore", opts.name, opts.version);
+    if let Some(bundle) = opts.provenance_bundle {
+        let serialized = serde_json::to_string(bundle).unwrap_or_default();
+        let content_type = bundle
+            .media_type
+            .as_deref()
+            .unwrap_or("application/vnd.sigstore.bundle+json;version=0.1");
+        let length = serialized.len();
+        attachments.insert(
+            provenance_bundle_name,
+            serde_json::json!({
+                "content_type": content_type,
+                "data": serialized,
+                "length": length,
+            }),
+        );
+    } else if let Some(att_val) = opts.provenance_attestation {
+        let bundle_val = att_val.get("bundle").unwrap_or(att_val);
+        let serialized = serde_json::to_string(bundle_val).unwrap_or_default();
+        let content_type = bundle_val
+            .get("mediaType")
+            .and_then(|m| m.as_str())
+            .unwrap_or("application/vnd.sigstore.bundle+json;version=0.1");
+        let length = serialized.len();
+        attachments.insert(
+            provenance_bundle_name,
+            serde_json::json!({
+                "content_type": content_type,
+                "data": serialized,
+                "length": length,
+            }),
+        );
+    }
 
     let mut doc = serde_json::Map::new();
     doc.insert("_id".into(), serde_json::json!(opts.name));
@@ -112,16 +154,7 @@ pub fn create_publish_payload(opts: &PublishPayloadOptions) -> serde_json::Value
             .map(serde_json::Value::from)
             .unwrap_or(serde_json::Value::Null),
     );
-    doc.insert(
-        "_attachments".into(),
-        serde_json::json!({
-            tarball_name: {
-                "content_type": "application/octet-stream",
-                "data": BASE64.encode(opts.tarball.bytes),
-                "length": opts.tarball.bytes.len(),
-            }
-        }),
-    );
+    doc.insert("_attachments".into(), serde_json::Value::Object(attachments));
     serde_json::Value::Object(doc)
 }
 
@@ -157,6 +190,7 @@ mod tests {
             tarball,
             registry_url: &registry_url,
             provenance_attestation: None,
+            provenance_bundle: None,
         };
 
         let payload = create_publish_payload(&opts);
@@ -218,6 +252,7 @@ mod tests {
             tarball,
             registry_url: &registry_url,
             provenance_attestation: None,
+            provenance_bundle: None,
         };
 
         let payload = create_publish_payload(&opts);

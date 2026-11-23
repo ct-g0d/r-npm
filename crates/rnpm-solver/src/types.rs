@@ -124,6 +124,25 @@ pub trait PackageMetadataProvider: Send + Sync {
     fn cached_package(&self, name: &str) -> Option<PackageMetadata> {
         self.get_package(name).ok().flatten()
     }
+
+    /// Retrieve package metadata for a specific dependency edge.
+    /// `is_root` indicates whether the dependency originates directly from the
+    /// root project or a workspace member package (`true`) vs a transitive dependency (`false`).
+    fn get_package_for_edge(
+        &self,
+        name: &str,
+        _range: &str,
+        _is_root: bool,
+    ) -> Result<Option<PackageMetadata>, SolverError> {
+        self.get_package(name)
+    }
+
+    /// Prefetch package metadata for dependency edges.
+    /// Each element is `(package_name, is_root)`.
+    fn prefetch_packages_for_edge(&self, edges: &[(&str, bool)]) {
+        let names: Vec<&str> = edges.iter().map(|(n, _)| *n).collect();
+        self.prefetch_packages(&names);
+    }
 }
 
 /// In-memory package provider convenient for unit tests, fixtures, and synthetic graph creation.

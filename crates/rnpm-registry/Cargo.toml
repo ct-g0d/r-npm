@@ -19,6 +19,7 @@ tracing = { workspace = true }
 bytes = "1"
 data-encoding = { workspace = true }
 sha2 = { workspace = true }
+ring = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

@@ -30,6 +30,13 @@ pub enum LifecycleError {
         timeout: std::time::Duration,
     },
 
+    #[error(
+        "node-gyp is required to build native add-on '{package}', but was not found. Cannot download node-gyp in offline mode. Please configure node-gyp via 'npm_config_node_gyp' or '.npmrc' ('node-gyp=<path>'), or run online once to cache it."
+    )]
+    NodeGypOfflineAbsent {
+        package: String,
+    },
+
     #[error("Script execution failed: {0}")]
     ExecutionFailed(String),
 

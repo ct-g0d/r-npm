@@ -358,11 +358,23 @@ async fn test_nested_node_modules_bin_shortcuts_install_and_ci() {
             "Nested CMD shim must point to ..\\tool-pkg\\bin\\cli.js, got:\n{cmd_content}"
         );
     }
-    let posix_content = std::fs::read_to_string(nested_bin.join("tool-cli")).unwrap();
-    assert!(
-        posix_content.contains("../tool-pkg/bin/cli.js"),
-        "Nested POSIX shim must point to ../tool-pkg/bin/cli.js, got:\n{posix_content}"
-    );
+    #[cfg(unix)]
+    {
+        let link_target = std::fs::read_link(nested_bin.join("tool-cli")).unwrap();
+        assert_eq!(
+            link_target.to_string_lossy(),
+            "../tool-pkg/bin/cli.js",
+            "Nested POSIX bin symlink must point to ../tool-pkg/bin/cli.js"
+        );
+    }
+    #[cfg(not(unix))]
+    {
+        let posix_content = std::fs::read_to_string(nested_bin.join("tool-cli")).unwrap();
+        assert!(
+            posix_content.contains("../tool-pkg/bin/cli.js"),
+            "Nested POSIX shim must point to ../tool-pkg/bin/cli.js, got:\n{posix_content}"
+        );
+    }
 
     // 2. Wipe node_modules and run CI install (run_ci)
     std::fs::remove_dir_all(&node_modules).unwrap();

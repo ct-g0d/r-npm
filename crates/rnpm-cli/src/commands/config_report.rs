@@ -62,7 +62,16 @@ fn private(key: &str) -> bool {
 pub(super) fn run(json: bool, long: bool, dir: &Path) -> Result<()> {
     let node = rnpm_lifecycle::node_executable().unwrap_or_else(|| PathBuf::from("node"));
     let node_dir = node.parent().unwrap_or(Path::new("."));
-    let npm_dir = node_dir.join("node_modules").join("npm");
+    let node_prefix = if cfg!(windows) {
+        node_dir.to_path_buf()
+    } else {
+        node_dir.parent().unwrap_or(node_dir).to_path_buf()
+    };
+    let npm_dir = if cfg!(windows) {
+        node_prefix.join("node_modules").join("npm")
+    } else {
+        node_prefix.join("lib").join("node_modules").join("npm")
+    };
     let home =
         std::env::var(if cfg!(windows) { "USERPROFILE" } else { "HOME" }).unwrap_or_default();
     let mut defaults: Map = serde_json::from_str::<Value>(include_str!("config_defaults.json"))?
@@ -74,7 +83,7 @@ pub(super) fn run(json: bool, long: bool, dir: &Path) -> Result<()> {
             continue;
         }
         let dynamic = match key.as_str() {
-            "prefix" => node_dir.display().to_string(),
+            "prefix" => node_prefix.display().to_string(),
             "globalconfig" => rnpm_config::get_process_globalconfig()
                 .map(|p| p.display().to_string())
                 .or_else(|| std::env::var("NPM_CONFIG_GLOBALCONFIG").ok())
@@ -154,15 +163,50 @@ pub(super) fn run(json: bool, long: bool, dir: &Path) -> Result<()> {
                     "command line options".into()
                 }
             });
-        let data = layer
-            .settings
-            .into_iter()
-            .filter(|(k, _)| k != "globalconfig")
-            .map(|(k, v)| {
+        let data: Map = if layer.name == "env" {
+            // Preserve OS environment insertion order (matching Node's Object.entries(process.env))
+            // so `npm config list --json` key order matches on Linux, macOS, and Windows.
+            let mut ordered = Map::new();
+            let mut remaining = layer.settings;
+            remaining.remove("globalconfig");
+            for (env_k, _) in std::env::vars() {
+                if env_k.len() > 11 && env_k[..11].eq_ignore_ascii_case("npm_config_") {
+                    let raw = &env_k[11..];
+                    let norm = if raw.starts_with("//") {
+                        raw.to_string()
+                    } else {
+                        let mut chars = raw.chars();
+                        let first = chars.next().map(|c| c.to_ascii_lowercase());
+                        let rest: String = chars
+                            .map(|c| if c == '_' { '-' } else { c.to_ascii_lowercase() })
+                            .collect();
+                        match first {
+                            Some(f) => format!("{f}{rest}"),
+                            None => String::new(),
+                        }
+                    };
+                    if let Some(v) = remaining.remove(&norm) {
+                        let value = typed(&norm, &v, &defaults);
+                        ordered.insert(norm, value);
+                    }
+                }
+            }
+            for (k, v) in remaining {
                 let value = typed(&k, &v, &defaults);
-                (k, value)
-            })
-            .collect();
+                ordered.insert(k, value);
+            }
+            ordered
+        } else {
+            layer
+                .settings
+                .into_iter()
+                .filter(|(k, _)| k != "globalconfig")
+                .map(|(k, v)| {
+                    let value = typed(&k, &v, &defaults);
+                    (k, value)
+                })
+                .collect()
+        };
         layers.push(Layer {
             name: layer.name,
             source,

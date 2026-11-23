@@ -67,7 +67,7 @@ impl SourcePolicy {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SourceKind {
+pub enum SourceKind {
     Git,
     Remote,
     Registry,
@@ -76,7 +76,7 @@ enum SourceKind {
 }
 
 impl SourceKind {
-    fn label(self) -> &'static str {
+    pub fn label(self) -> &'static str {
         match self {
             SourceKind::Git => "git",
             SourceKind::Remote => "remote",
@@ -87,7 +87,7 @@ impl SourceKind {
     }
 }
 
-fn is_registry_tarball(resolved: &str) -> bool {
+pub fn is_registry_tarball(resolved: &str) -> bool {
     // `<scheme>://<host>/<name>/-/<file>-<digit>...`, as arborist checks.
     let Some(rest) = resolved
         .strip_prefix("https://")
@@ -128,6 +128,44 @@ fn is_git_spec(spec: &str) -> bool {
     .any(|p| spec.starts_with(p))
 }
 
+/// Classify a dependency spec string into its `SourceKind`.
+pub fn parse_source_kind(spec: &str) -> SourceKind {
+    let spec = spec.trim();
+    let spec = if let Some(sub) = spec.strip_prefix("npm:") {
+        if let Some(at_idx) = sub.rfind('@') {
+            let slash_idx = sub.find('/').unwrap_or(0);
+            if at_idx > slash_idx {
+                sub[at_idx + 1..].trim()
+            } else {
+                sub.trim()
+            }
+        } else {
+            sub.trim()
+        }
+    } else {
+        spec
+    };
+
+    if is_git_spec(spec) {
+        return SourceKind::Git;
+    }
+    if spec.starts_with("http://") || spec.starts_with("https://") {
+        return SourceKind::Remote;
+    }
+    if spec.starts_with("file:") {
+        let lower = spec.to_ascii_lowercase();
+        return if lower.ends_with(".tgz") || lower.ends_with(".tar.gz") || lower.ends_with(".tar") {
+            SourceKind::File
+        } else {
+            SourceKind::Directory
+        };
+    }
+    if spec.ends_with(".tgz") || spec.ends_with(".tar.gz") || spec.ends_with(".tar") {
+        return SourceKind::File;
+    }
+    SourceKind::Registry
+}
+
 fn classify(pkg: &LockfilePackage) -> SourceKind {
     let resolved = pkg.resolved.as_deref().unwrap_or("");
     if pkg.link == Some(true) {
@@ -150,10 +188,112 @@ fn classify(pkg: &LockfilePackage) -> SourceKind {
     SourceKind::Remote
 }
 
-/// Name a top-level `node_modules/<name>` location refers to.
-fn top_level_name(location: &str) -> Option<&str> {
-    let rest = location.strip_prefix("node_modules/")?;
-    (!rest.contains("/node_modules/")).then_some(rest)
+fn split_parent_and_name(location: &str) -> Option<(&str, &str)> {
+    if let Some(idx) = location.rfind("/node_modules/") {
+        let parent = &location[..idx];
+        let name = &location[idx + "/node_modules/".len()..];
+        if !name.contains("/node_modules/") {
+            return Some((parent, name));
+        }
+    } else if let Some(name) = location.strip_prefix("node_modules/") {
+        if !name.contains("/node_modules/") {
+            return Some(("", name));
+        }
+    }
+    None
+}
+
+fn is_direct_root_dep(
+    location: &str,
+    packages: &std::collections::BTreeMap<String, LockfilePackage>,
+    workspace_paths: &HashSet<String>,
+    kind: SourceKind,
+) -> bool {
+    let Some((parent, name)) = split_parent_and_name(location) else {
+        return false;
+    };
+    let is_root_or_ws = parent.is_empty() || workspace_paths.contains(parent);
+    if !is_root_or_ws {
+        return false;
+    }
+    let check_pkg = |pkg: &LockfilePackage| -> bool {
+        for map in [
+            &pkg.dependencies,
+            &pkg.dev_dependencies,
+            &pkg.optional_dependencies,
+            &pkg.peer_dependencies,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if let Some(spec) = map.get(name) {
+                let spec_kind = parse_source_kind(spec);
+                if spec_kind == kind {
+                    return true;
+                }
+            }
+        }
+        false
+    };
+
+    if parent.is_empty() {
+        if let Some(root_pkg) = packages.get("") {
+            if check_pkg(root_pkg) {
+                return true;
+            }
+        }
+        for ws in workspace_paths {
+            if let Some(ws_pkg) = packages.get(ws) {
+                if check_pkg(ws_pkg) {
+                    return true;
+                }
+            }
+        }
+    } else if let Some(parent_pkg) = packages.get(parent) {
+        if check_pkg(parent_pkg) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Reject a single dependency source if disabled by `allow-*` source policy.
+///
+/// `is_root` is true if the package is declared directly by the root project,
+/// workspaces, or explicit command-line package arguments.
+pub fn check_source_gate(
+    policy: &SourcePolicy,
+    kind: SourceKind,
+    is_root: bool,
+) -> Result<()> {
+    if policy.is_unrestricted() {
+        return Ok(());
+    }
+    let mode = match kind {
+        SourceKind::Git => policy.git,
+        SourceKind::Remote => policy.remote,
+        SourceKind::Registry => policy.registry,
+        SourceKind::File => policy.file,
+        SourceKind::Directory => policy.directory,
+    };
+    let allowed = match mode {
+        AllowMode::All => true,
+        AllowMode::Root => is_root,
+        AllowMode::None => false,
+    };
+    if !allowed {
+        let qualifier = if mode == AllowMode::Root {
+            " non-root"
+        } else {
+            ""
+        };
+        return Err(anyhow!(
+            "npm error code EALLOW{}\nnpm error Fetching{qualifier} packages of type \"{}\" have been disabled",
+            kind.label().to_ascii_uppercase(),
+            kind.label()
+        ));
+    }
+    Ok(())
 }
 
 /// Reject sources disabled by `allow-*`, as pacote does while fetching.
@@ -165,9 +305,76 @@ pub fn check_sources(
     workspace_paths: &HashSet<String>,
     policy: &SourcePolicy,
 ) -> Result<()> {
+    check_sources_with_root_context(lockfile, root_declared, workspace_paths, policy, false)
+}
+
+/// Reject sources disabled by `allow-*`, with optional forced non-root context
+/// (e.g. for staging dependency preparation of git dependencies).
+pub fn check_sources_with_root_context(
+    lockfile: &LockfileV3,
+    root_declared: &HashSet<String>,
+    workspace_paths: &HashSet<String>,
+    policy: &SourcePolicy,
+    force_non_root: bool,
+) -> Result<()> {
     if policy.is_unrestricted() {
         return Ok(());
     }
+
+    // 1. Collect all explicit remote URLs from root_declared and lockfile specs.
+    let mut explicit_remote_specs = HashSet::new();
+    if !force_non_root {
+        for item in root_declared {
+            let trimmed = item.trim();
+            if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+                explicit_remote_specs.insert(trimmed.to_string());
+            }
+        }
+    }
+    for pkg in lockfile.packages.values() {
+        for map in [
+            &pkg.dependencies,
+            &pkg.dev_dependencies,
+            &pkg.optional_dependencies,
+            &pkg.peer_dependencies,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            for spec in map.values() {
+                let trimmed = spec.trim();
+                if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+                    explicit_remote_specs.insert(trimmed.to_string());
+                }
+            }
+        }
+    }
+
+    // 2. Gate every original dependency edge by (parsed_source_kind, is_actual_root_or_workspace_edge).
+    for (requester_loc, pkg) in &lockfile.packages {
+        let is_root_edge = if force_non_root {
+            false
+        } else {
+            requester_loc.is_empty() || workspace_paths.contains(requester_loc)
+        };
+        for map in [
+            &pkg.dependencies,
+            &pkg.dev_dependencies,
+            &pkg.optional_dependencies,
+            &pkg.peer_dependencies,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            for spec in map.values() {
+                let kind = parse_source_kind(spec);
+                check_source_gate(policy, kind, is_root_edge)?;
+            }
+        }
+    }
+
+    // 3. Gate every placed package node in lockfile.packages.
+    let explicit_refs: HashSet<&str> = explicit_remote_specs.iter().map(|s| s.as_str()).collect();
     for (location, pkg) in &lockfile.packages {
         if location.is_empty() || !location.contains("node_modules/") {
             continue;
@@ -180,32 +387,21 @@ pub fn check_sources(
         {
             continue;
         }
-        let kind = classify(pkg);
-        let mode = match kind {
-            SourceKind::Git => policy.git,
-            SourceKind::Remote => policy.remote,
-            SourceKind::Registry => policy.registry,
-            SourceKind::File => policy.file,
-            SourceKind::Directory => policy.directory,
+        let is_explicit_remote = pkg
+            .resolved
+            .as_deref()
+            .is_some_and(|r| explicit_refs.contains(r));
+        let kind = if is_explicit_remote {
+            SourceKind::Remote
+        } else {
+            classify(pkg)
         };
-        let is_root = top_level_name(location).is_some_and(|n| root_declared.contains(n));
-        let allowed = match mode {
-            AllowMode::All => true,
-            AllowMode::Root => is_root,
-            AllowMode::None => false,
+        let is_root = if force_non_root {
+            false
+        } else {
+            is_direct_root_dep(location, &lockfile.packages, workspace_paths, kind)
         };
-        if !allowed {
-            let qualifier = if mode == AllowMode::Root {
-                " non-root"
-            } else {
-                ""
-            };
-            return Err(anyhow!(
-                "npm error code EALLOW{}\nnpm error Fetching{qualifier} packages of type \"{}\" have been disabled",
-                kind.label().to_ascii_uppercase(),
-                kind.label()
-            ));
-        }
+        check_source_gate(policy, kind, is_root)?;
     }
     Ok(())
 }
@@ -1306,5 +1502,126 @@ mod tests {
         ));
         assert!(!is_registry_tarball("https://evil.com/-/a-1.0.0.tgz"));
         assert!(!is_registry_tarball("https://example.com/a.tgz"));
+    }
+
+    #[test]
+    fn hoisted_workspace_dep_allowed_under_allow_root_while_transitive_fails() {
+        use rnpm_lockfile::{LockfilePackage, LockfileV3};
+        use std::collections::{BTreeMap, HashSet};
+
+        let mut workspace_paths = HashSet::new();
+        workspace_paths.insert("packages/a".to_string());
+
+        let mut root_declared = HashSet::new();
+        root_declared.insert("workspace-a".to_string());
+        root_declared.insert("packages/a".to_string());
+        root_declared.insert("direct-remote".to_string());
+
+        let mut packages = BTreeMap::new();
+
+        // 1. Root package
+        let mut root_deps = BTreeMap::new();
+        root_deps.insert("workspace-a".to_string(), "file:packages/a".to_string());
+        packages.insert(
+            String::new(),
+            LockfilePackage {
+                dependencies: Some(root_deps),
+                ..Default::default()
+            },
+        );
+
+        // 2. Workspace member packages/a
+        let mut ws_deps = BTreeMap::new();
+        ws_deps.insert(
+            "direct-remote".to_string(),
+            "http://example.com/direct-remote.tgz".to_string(),
+        );
+        ws_deps.insert(
+            "transitive-holder".to_string(),
+            "^1.0.0".to_string(),
+        );
+        packages.insert(
+            "packages/a".to_string(),
+            LockfilePackage {
+                dependencies: Some(ws_deps),
+                ..Default::default()
+            },
+        );
+
+        // 3. Hoisted direct workspace dep at top-level node_modules/direct-remote
+        packages.insert(
+            "node_modules/direct-remote".to_string(),
+            LockfilePackage {
+                resolved: Some("http://example.com/direct-remote.tgz".to_string()),
+                ..Default::default()
+            },
+        );
+
+        // 4. Transitive holder at top-level node_modules/transitive-holder
+        let mut holder_deps = BTreeMap::new();
+        holder_deps.insert(
+            "transitive-remote".to_string(),
+            "http://example.com/transitive-remote.tgz".to_string(),
+        );
+        packages.insert(
+            "node_modules/transitive-holder".to_string(),
+            LockfilePackage {
+                resolved: Some("https://registry.npmjs.org/transitive-holder/-/transitive-holder-1.0.0.tgz".to_string()),
+                dependencies: Some(holder_deps),
+                ..Default::default()
+            },
+        );
+
+        // 5. Hoisted transitive remote at top-level node_modules/transitive-remote
+        packages.insert(
+            "node_modules/transitive-remote".to_string(),
+            LockfilePackage {
+                resolved: Some("http://example.com/transitive-remote.tgz".to_string()),
+                ..Default::default()
+            },
+        );
+
+        let lockfile = LockfileV3 {
+            name: "test".to_string(),
+            version: None,
+            lockfile_version: 3,
+            requires: None,
+            packages,
+        };
+
+        let policy = SourcePolicy {
+            remote: AllowMode::Root,
+            ..Default::default()
+        };
+
+        // Must FAIL because node_modules/transitive-remote is a non-root transitive remote dep!
+        let res = check_sources(&lockfile, &root_declared, &workspace_paths, &policy);
+        assert!(res.is_err(), "Expected transitive remote dep to fail under allow-remote=root");
+        let err = res.unwrap_err().to_string();
+        assert!(err.contains("EALLOWREMOTE"), "Expected EALLOWREMOTE, got: {err}");
+        assert!(err.contains("non-root"), "Expected non-root in error message, got: {err}");
+
+        // Now remove the transitive remote package:
+        let mut clean_packages = lockfile.packages.clone();
+        clean_packages.remove("node_modules/transitive-remote");
+        // Also remove from holder's deps so edge check passes
+        if let Some(h) = clean_packages.get_mut("node_modules/transitive-holder") {
+            h.dependencies = None;
+        }
+        let clean_lockfile = LockfileV3 {
+            name: "test".to_string(),
+            version: None,
+            lockfile_version: 3,
+            requires: None,
+            packages: clean_packages,
+        };
+
+        // Must PASS: direct-remote hoisted to node_modules/direct-remote is declared by workspace packages/a!
+        let clean_res = check_sources(&clean_lockfile, &root_declared, &workspace_paths, &policy);
+        assert!(
+            clean_res.is_ok(),
+            "Hoisted workspace direct-remote dep must pass allow-remote=root, but failed: {:?}",
+            clean_res.err()
+        );
     }
 }

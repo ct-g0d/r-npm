@@ -17,7 +17,7 @@ use serde::Deserialize;
 #[derive(Deserialize)]
 struct Header {
     #[serde(rename = "lockfileVersion")]
-    lockfile_version: Option<u64>,
+    lockfile_version: Option<serde_json::Value>,
     #[serde(default)]
     requires: Option<serde_json::Value>,
 }
@@ -26,25 +26,31 @@ fn header(raw: &str) -> Option<Header> {
     serde_json::from_str(raw).ok()
 }
 
+/// Extract `lockfileVersion` from raw lockfile JSON text.
+pub fn detect_lockfile_version(raw: &str) -> Option<u32> {
+    header(raw).and_then(|h| match h.lockfile_version? {
+        serde_json::Value::Number(n) => n.as_u64().and_then(|v| u32::try_from(v).ok()),
+        serde_json::Value::String(s) => s.parse::<u32>().ok(),
+        _ => None,
+    })
+}
+
 /// True when the raw lockfile text predates lockfileVersion 2.
 pub(crate) fn is_old_lockfile(raw: &str) -> bool {
-    header(raw)
-        .and_then(|h| h.lockfile_version)
-        .is_some_and(|v| v < 2)
+    detect_lockfile_version(raw).is_some_and(|v| v < 2)
 }
 
 /// Shrinkwrap's `ancientLockfile`: a pre-v2 lock whose `requires` is falsy.
 pub(crate) fn is_ancient_lockfile(raw: &str) -> bool {
-    header(raw).is_some_and(|h| {
-        let truthy = match h.requires {
-            None | Some(serde_json::Value::Null) => false,
-            Some(serde_json::Value::Bool(b)) => b,
-            Some(serde_json::Value::Number(n)) => n.as_f64().is_some_and(|f| f != 0.0),
-            Some(serde_json::Value::String(s)) => !s.is_empty(),
-            Some(_) => true,
-        };
-        h.lockfile_version.is_some_and(|v| v < 2) && !truthy
-    })
+    let Some(h) = header(raw) else { return false; };
+    let truthy = match h.requires {
+        None | Some(serde_json::Value::Null) => false,
+        Some(serde_json::Value::Bool(b)) => b,
+        Some(serde_json::Value::Number(n)) => n.as_f64().is_some_and(|f| f != 0.0),
+        Some(serde_json::Value::String(s)) => !s.is_empty(),
+        Some(_) => true,
+    };
+    detect_lockfile_version(raw).is_some_and(|v| v < 2) && !truthy
 }
 
 /// npm's warning before inflating an old lock. Shrinkwrap's

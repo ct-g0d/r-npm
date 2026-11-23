@@ -699,3 +699,114 @@ async fn test_git_dependency_runs_prepare_lifecycle() {
     let content = std::fs::read_to_string(&marker_path).unwrap();
     assert_eq!(content, "git prepare ran");
 }
+
+#[tokio::test]
+async fn test_git_install_path_subdir_and_reject_escape() {
+    let repo_dir = tempdir().unwrap();
+    let repo_path = repo_dir.path();
+    std::fs::create_dir_all(repo_path).unwrap();
+    run_git(repo_path, &["init"]);
+    run_git(repo_path, &["config", "user.name", "Tester"]);
+    run_git(repo_path, &["config", "user.email", "test@example.com"]);
+
+    // Create a sub-package inside packages/sub-pkg
+    let sub_pkg_dir = repo_path.join("packages").join("sub-pkg");
+    std::fs::create_dir_all(&sub_pkg_dir).unwrap();
+    let sub_manifest = serde_json::json!({
+        "name": "sub-pkg",
+        "version": "1.0.0",
+        "description": "sub package in git mono repo",
+        "main": "index.js"
+    });
+    std::fs::write(sub_pkg_dir.join("package.json"), sub_manifest.to_string()).unwrap();
+    std::fs::write(sub_pkg_dir.join("index.js"), "module.exports = 'sub-pkg';\n").unwrap();
+
+    run_git(repo_path, &["add", "."]);
+    run_git(repo_path, &["commit", "-m", "Initial monorepo commit"]);
+
+    let path_str = repo_path.to_str().unwrap().replace('\\', "/");
+    let git_url = format!("git+file://{path_str}");
+
+    // Test 1: install dependency specifying #path:packages/sub-pkg
+    let proj_dir = tempdir().unwrap();
+    let cache_dir = tempdir().unwrap();
+
+    let consumer_manifest = serde_json::json!({
+        "name": "consumer-subdir",
+        "version": "1.0.0",
+        "dependencies": {
+            "sub-pkg": format!("{git_url}#path:packages/sub-pkg")
+        }
+    });
+    std::fs::write(
+        proj_dir.path().join("package.json"),
+        consumer_manifest.to_string(),
+    )
+    .unwrap();
+
+    let mut installer = Installer::new(InstallOptions {
+        project_dir: proj_dir.path().to_path_buf(),
+        cache_dir: Some(cache_dir.path().to_path_buf()),
+        ..Default::default()
+    })
+    .unwrap();
+
+    let summary = installer
+        .install()
+        .await
+        .expect("Install failed for #path:packages/sub-pkg");
+    assert_eq!(summary.packages_installed, 1);
+
+    // Verify sub-package is installed in node_modules/sub-pkg
+    let installed_pkg_json = proj_dir.path().join("node_modules/sub-pkg/package.json");
+    assert!(
+        installed_pkg_json.exists(),
+        "node_modules/sub-pkg/package.json must exist"
+    );
+    let installed_json: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&installed_pkg_json).unwrap()).unwrap();
+    assert_eq!(installed_json["name"], "sub-pkg");
+    assert_eq!(installed_json["version"], "1.0.0");
+
+    // Verify lockfile resolved URL contains ::path:packages/sub-pkg
+    let lockfile = LockfileV3::load_from_file(&proj_dir.path().join("package-lock.json")).unwrap();
+    let lock_entry = lockfile
+        .get_package("node_modules/sub-pkg")
+        .expect("Missing lock entry for sub-pkg");
+    let resolved = lock_entry.resolved.as_ref().expect("Missing resolved URL");
+    assert!(
+        resolved.contains("::path:packages/sub-pkg"),
+        "Resolved URL '{resolved}' must contain '::path:packages/sub-pkg'"
+    );
+
+    // Test 2: Also verify GitFetcher directly for #HEAD::path:packages/sub-pkg
+    let git_fetcher = rnpm_install::git::GitFetcher::new(cache_dir.path());
+    let target_committish =
+        PackageTarget::parse(&format!("{git_url}#HEAD::path:packages/sub-pkg")).unwrap();
+    let res = git_fetcher
+        .resolve_git_dependency(&target_committish, false)
+        .await
+        .expect("resolve with #committish::path: failed");
+    assert_eq!(res.manifest.name.as_deref(), Some("sub-pkg"));
+    assert!(res
+        .checkout_dir
+        .ends_with(Path::new("packages").join("sub-pkg")));
+
+    // Test 3: Reject path traversal #path:../escape
+    let escape_target = PackageTarget::parse(&format!("{git_url}#path:../escape")).unwrap();
+    let err = git_fetcher
+        .resolve_git_dependency(&escape_target, false)
+        .await;
+    assert!(
+        err.is_err(),
+        "resolve_git_dependency must reject #path:../escape path traversal"
+    );
+
+    let err_checkout = git_fetcher
+        .checkout_git_dependency(&escape_target, false)
+        .await;
+    assert!(
+        err_checkout.is_err(),
+        "checkout_git_dependency must reject #path:../escape path traversal"
+    );
+}

@@ -105,6 +105,7 @@ impl<'a> ConfigOptions<'a> {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Config {
     pub npmrc: Npmrc,
+    pub layers: Vec<ConfigLayer>,
 }
 
 impl Config {
@@ -135,10 +136,159 @@ impl Config {
             })
     }
 
-    /// npm's `before`: resolve only versions published on or before this
-    /// instant (milliseconds since the epoch).
+    /// Parse `min-release-age` config (in days) into a UTC cutoff timestamp
+    /// (milliseconds since epoch), computed relative to `now_ms`.
+    ///
+    /// In npm 11.20.0, `min-release-age` accepts a relative number of days (`<days>`).
+    /// The cutoff timestamp is `now - (86400000 * age)`.
+    /// If age is 0 or non-positive, no cutoff applies (`None`).
+    pub fn min_release_age_cutoff_at(&self, now_ms: i64) -> Option<i64> {
+        let val_str = self
+            .get("min-release-age")
+            .or_else(|| self.get("min_release_age"))?;
+        let trimmed = val_str.trim();
+        if trimmed.eq_ignore_ascii_case("null") || trimmed.is_empty() {
+            return None;
+        }
+        let days = trimmed.parse::<f64>().ok()?;
+        if days <= 0.0 || !days.is_finite() {
+            return None;
+        }
+        let delta_ms = (days * 86_400_000.0).round() as i64;
+        Some(now_ms.saturating_sub(delta_ms))
+    }
+
+    /// Parse `min-release-age` config into a UTC cutoff timestamp (milliseconds
+    /// since epoch) relative to the current system time.
+    pub fn min_release_age_cutoff(&self) -> Option<i64> {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        self.min_release_age_cutoff_at(now_ms)
+    }
+
+    /// npm's `before` / `min-release-age`: resolve only versions published on
+    /// or before this instant (milliseconds since the epoch).
+    ///
+    /// Matching npm 11.20.0 semantics:
+    /// - `before` accepts an exact JS date/timestamp.
+    /// - `min-release-age` accepts a relative number of days.
+    /// - When both apply within config, `before` wins (an explicit date overrides a relative window).
+    /// - When `before` is explicitly set to `"null"` or empty, it disables the cutoff.
     pub fn before_cutoff(&self) -> Option<i64> {
-        self.get("before").and_then(crate::date::parse_js_date)
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        self.before_cutoff_at(now_ms)
+    }
+
+    /// npm's `before` / `min-release-age` cutoff computed relative to `now_ms`.
+    ///
+    /// Precedence follows npm 11.20.0 across configuration layers:
+    /// CLI > env > project `.npmrc` > workspace `.npmrc` > user `.npmrc` > global `.npmrc` > default.
+    /// The highest-priority layer specifying either `before` or `min-release-age` wins.
+    /// If both `before` and `min-release-age` appear in the same layer, `before` wins as tie-breaker.
+    pub fn before_cutoff_at(&self, now_ms: i64) -> Option<i64> {
+        let parse_before_val = |val: &str| -> Option<i64> {
+            let trimmed = val.trim();
+            if trimmed.eq_ignore_ascii_case("null") || trimmed.is_empty() {
+                return None;
+            }
+            crate::date::parse_js_date(trimmed)
+        };
+
+        let parse_age_val = |val: &str| -> Option<i64> {
+            let trimmed = val.trim();
+            if trimmed.eq_ignore_ascii_case("null") || trimmed.is_empty() {
+                return None;
+            }
+            let days = trimmed.parse::<f64>().ok()?;
+            if days <= 0.0 || !days.is_finite() {
+                return None;
+            }
+            let delta_ms = (days * 86_400_000.0).round() as i64;
+            Some(now_ms.saturating_sub(delta_ms))
+        };
+
+        let layer_lookup = |settings: &BTreeMap<String, String>, key: &str| -> Option<String> {
+            let key_lower = key.to_ascii_lowercase();
+            let dashed = key_lower.replace('_', "-");
+            let underscored = key_lower.replace('-', "_");
+            settings
+                .get(key)
+                .or_else(|| settings.get(&key_lower))
+                .or_else(|| settings.get(&dashed))
+                .or_else(|| settings.get(&underscored))
+                .cloned()
+        };
+
+        if !self.layers.is_empty() {
+            let layer_priority = |name: &str| -> u8 {
+                match name.to_ascii_lowercase().as_str() {
+                    "cli" => 6,
+                    "env" => 5,
+                    "project" => 4,
+                    "workspace" => 3,
+                    "user" => 2,
+                    "global" => 1,
+                    _ => 0,
+                }
+            };
+
+            let mut sorted_layers: Vec<&ConfigLayer> = self.layers.iter().collect();
+            sorted_layers.sort_by_key(|a| std::cmp::Reverse(layer_priority(&a.name)));
+
+            for layer in sorted_layers {
+                let before_opt = layer_lookup(&layer.settings, "before");
+                let age_opt = layer_lookup(&layer.settings, "min-release-age");
+
+                if before_opt.is_some() || age_opt.is_some() {
+                    if let Some(b_val) = before_opt {
+                        return parse_before_val(&b_val);
+                    } else if let Some(a_val) = age_opt {
+                        return parse_age_val(&a_val);
+                    }
+                }
+            }
+            return None;
+        }
+
+        if let Some(before_str) = self.get("before") {
+            let trimmed = before_str.trim();
+            if trimmed.eq_ignore_ascii_case("null") || trimmed.is_empty() {
+                return None;
+            }
+            if let Some(cutoff) = crate::date::parse_js_date(trimmed) {
+                return Some(cutoff);
+            }
+            return None;
+        }
+        self.min_release_age_cutoff_at(now_ms)
+    }
+
+    /// npm's `min-release-age-exclude`: list of package names or `minimatch` glob patterns
+    /// that are exempt from the `min-release-age` and `before` release-age filter.
+    pub fn min_release_age_exclude(&self) -> Vec<String> {
+        let mut list = Vec::new();
+        let keys = [
+            "min-release-age-exclude",
+            "min-release-age-exclude[]",
+            "min_release_age_exclude",
+            "min_release_age_exclude[]",
+        ];
+        for k in keys {
+            if let Some(val) = self.get(k) {
+                for item in val.split(',') {
+                    let trimmed = item.trim();
+                    if !trimmed.is_empty() && !list.contains(&trimmed.to_string()) {
+                        list.push(trimmed.to_string());
+                    }
+                }
+            }
+        }
+        list
     }
 
     pub fn load(project_dir: Option<&Path>) -> Result<Self, ConfigError> {
@@ -169,6 +319,7 @@ impl Config {
         };
 
         let cli_map_opt = options.cli_overrides.or_else(get_process_cli_overrides);
+        let mut layers = Vec::new();
         let mut base_npmrc = Npmrc::default();
 
         let disable_global = options
@@ -204,6 +355,11 @@ impl Config {
         if let Some(path) = global_config_path {
             if path.as_os_str() != "false" && !path.as_os_str().is_empty() && path.exists() {
                 let global_config = Npmrc::from_file(&path)?;
+                layers.push(ConfigLayer {
+                    name: "global".to_string(),
+                    source: Some(path),
+                    settings: global_config.scrubbed_settings(),
+                });
                 base_npmrc.merge(global_config);
             }
         }
@@ -242,168 +398,9 @@ impl Config {
         if let Some(path) = user_config_path {
             if path.as_os_str() != "false" && !path.as_os_str().is_empty() && path.exists() {
                 let user_config = Npmrc::from_file(&path)?;
-                base_npmrc.merge(user_config);
-            }
-        }
-
-        let ws_root = options
-            .workspace_root
-            .map(|path| path.to_path_buf())
-            .or_else(|| options.project_dir.and_then(find_workspace_root));
-
-        if let Some(ws_path) = ws_root {
-            let ws_npmrc_path = ws_path.join(".npmrc");
-            if ws_npmrc_path.exists() {
-                let ws_config = Npmrc::from_file(&ws_npmrc_path)?;
-                base_npmrc.merge(ws_config);
-            }
-        }
-
-        if let Some(dir) = options.project_dir {
-            let project_npmrc_path = dir.join(".npmrc");
-            if project_npmrc_path.exists() {
-                let project_config = Npmrc::from_file(&project_npmrc_path)?;
-                base_npmrc.merge(project_config);
-            }
-        }
-
-        let all_env: BTreeMap<String, String> = if let Some(map) = options.env_vars {
-            map
-        } else {
-            env::vars().collect()
-        };
-
-        for (raw_key, value) in all_env {
-            let lower_key = raw_key.to_ascii_lowercase();
-            if let Some(rest) = lower_key.strip_prefix("npm_config_") {
-                if rest.is_empty() {
-                    continue;
-                }
-                let (prefix, body) = if rest.starts_with('_') {
-                    ("_", &rest[1..])
-                } else {
-                    ("", rest)
-                };
-                let dashed = format!("{prefix}{}", body.replace('_', "-"));
-                base_npmrc.set(&dashed, &value)?;
-                if dashed != rest {
-                    let _ = base_npmrc.set(rest, &value);
-                }
-            }
-        }
-
-        if let Some(cli_map) = cli_map_opt {
-            for (key, value) in cli_map {
-                let clean_key = key.strip_prefix("--").unwrap_or(&key);
-                let lower_clean = clean_key.to_ascii_lowercase();
-                let (prefix, body) = if lower_clean.starts_with('_') {
-                    ("_", &lower_clean[1..])
-                } else {
-                    ("", lower_clean.as_str())
-                };
-                let dashed = format!("{prefix}{}", body.replace('_', "-"));
-                base_npmrc.set(clean_key, &value)?;
-                if clean_key != dashed {
-                    let _ = base_npmrc.set(&dashed, &value);
-                }
-            }
-        }
-
-        Ok(Self { npmrc: base_npmrc })
-    }
-
-    pub fn load_detailed(options: ConfigOptions<'_>) -> Result<ConfigDetailed, ConfigError> {
-        let env_lookup = |var_name: &str| -> Option<String> {
-            if let Some(ref map) = options.env_vars {
-                map.get(var_name).cloned()
-            } else {
-                env::var(var_name).ok()
-            }
-        };
-
-        let cli_map_opt = options.cli_overrides.or_else(get_process_cli_overrides);
-        let mut layers = Vec::new();
-        let mut base_npmrc = Npmrc::default();
-
-        let disable_global = options
-            .globalconfig
-            .as_ref()
-            .map(|p| p.as_os_str() == "false")
-            .unwrap_or(false)
-            || cli_map_opt
-                .as_ref()
-                .and_then(|cli| cli.get("globalconfig").map(|v| v == "false"))
-                .unwrap_or(false);
-
-        let global_config_path = if disable_global {
-            None
-        } else {
-            options
-                .globalconfig
-                .clone()
-                .or_else(get_process_globalconfig)
-                .or_else(|| {
-                    cli_map_opt
-                        .as_ref()
-                        .and_then(|cli| cli.get("globalconfig").map(PathBuf::from))
-                })
-                .or_else(|| {
-                    env_lookup("NPM_CONFIG_GLOBALCONFIG")
-                        .or_else(|| env_lookup("npm_config_globalconfig"))
-                        .map(PathBuf::from)
-                })
-                .or_else(|| find_global_npmrc_with_env(env_lookup))
-        };
-
-        if let Some(path) = &global_config_path {
-            if path.as_os_str() != "false" && !path.as_os_str().is_empty() && path.exists() {
-                let global_config = Npmrc::from_file(path)?;
-                layers.push(ConfigLayer {
-                    name: "global".to_string(),
-                    source: Some(path.clone()),
-                    settings: global_config.scrubbed_settings(),
-                });
-                base_npmrc.merge(global_config);
-            }
-        }
-
-        let disable_user = options
-            .userconfig
-            .as_ref()
-            .map(|p| p.as_os_str() == "false")
-            .unwrap_or(false)
-            || cli_map_opt
-                .as_ref()
-                .and_then(|cli| cli.get("userconfig").map(|v| v == "false"))
-                .unwrap_or(false);
-
-        let user_config_path = if disable_user {
-            None
-        } else {
-            options
-                .userconfig
-                .clone()
-                .or_else(get_process_userconfig)
-                .or_else(|| {
-                    cli_map_opt
-                        .as_ref()
-                        .and_then(|cli| cli.get("userconfig").map(PathBuf::from))
-                })
-                .or_else(|| {
-                    env_lookup("npm_config_userconfig")
-                        .or_else(|| env_lookup("NPM_CONFIG_USERCONFIG"))
-                        .map(PathBuf::from)
-                })
-                .or_else(|| base_npmrc.settings.get("userconfig").map(PathBuf::from))
-                .or_else(|| find_user_npmrc_with_env(env_lookup))
-        };
-
-        if let Some(path) = &user_config_path {
-            if path.as_os_str() != "false" && !path.as_os_str().is_empty() && path.exists() {
-                let user_config = Npmrc::from_file(path)?;
                 layers.push(ConfigLayer {
                     name: "user".to_string(),
-                    source: Some(path.clone()),
+                    source: Some(path),
                     settings: user_config.scrubbed_settings(),
                 });
                 base_npmrc.merge(user_config);
@@ -415,7 +412,7 @@ impl Config {
             .map(|path| path.to_path_buf())
             .or_else(|| options.project_dir.and_then(find_workspace_root));
 
-        if let Some(ws_path) = &ws_root {
+        if let Some(ws_path) = ws_root {
             let ws_npmrc_path = ws_path.join(".npmrc");
             if ws_npmrc_path.exists() {
                 let ws_config = Npmrc::from_file(&ws_npmrc_path)?;
@@ -497,7 +494,10 @@ impl Config {
                 } else {
                     value.clone()
                 };
-                cli_layer_settings.insert(clean_key.to_string(), val_display);
+                cli_layer_settings.insert(clean_key.to_string(), val_display.clone());
+                if clean_key != dashed {
+                    cli_layer_settings.insert(dashed.clone(), val_display);
+                }
                 base_npmrc.set(clean_key, &value)?;
                 if clean_key != dashed {
                     let _ = base_npmrc.set(&dashed, &value);
@@ -512,6 +512,21 @@ impl Config {
             }
         }
 
+        Ok(Self {
+            npmrc: base_npmrc,
+            layers,
+        })
+    }
+
+    pub fn load_detailed(options: ConfigOptions<'_>) -> Result<ConfigDetailed, ConfigError> {
+        let env_lookup = |var_name: &str| -> Option<String> {
+            if let Some(ref map) = options.env_vars {
+                map.get(var_name).cloned()
+            } else {
+                env::var(var_name).ok()
+            }
+        };
+
         let global_prefix = find_global_prefix_with_env(env_lookup);
         let local_prefix = options
             .project_dir
@@ -522,10 +537,11 @@ impl Config {
                     .unwrap_or_else(|_| PathBuf::from("."))
             });
 
-        let effective = base_npmrc.scrubbed_settings();
+        let config = Self::load_with_options(options)?;
+        let effective = config.npmrc.scrubbed_settings();
 
         Ok(ConfigDetailed {
-            layers,
+            layers: config.layers,
             effective,
             global_prefix,
             local_prefix,
@@ -777,6 +793,13 @@ pub fn get_default_user_npmrc() -> PathBuf {
     if let Some(userconfig) = get_process_userconfig() {
         return userconfig;
     }
+    if let Some(overrides) = get_process_cli_overrides() {
+        if let Some(val) = overrides.get("userconfig").or_else(|| overrides.get("user-config")) {
+            if val != "false" && !val.is_empty() {
+                return PathBuf::from(val);
+            }
+        }
+    }
     if let Some(user) = find_user_npmrc() {
         return user;
     }
@@ -902,4 +925,203 @@ pub fn delete_config_value_from_file(path: &Path, key: &str) -> Result<bool, Con
     }
 
     Ok(deleted)
+}
+
+/// Repairs legacy unscoped auth keys and deprecated config keys in .npmrc content.
+/// Returns the repaired content and a list of formatted summary messages.
+pub fn fix_npmrc_content(
+    content: &str,
+    where_name: &str,
+    nerfed_registry: &str,
+) -> (String, Vec<String>) {
+    // 1. Scan for unscoped username and _password to know if both or only one exist
+    let mut has_unscoped_username = false;
+    let mut has_unscoped_password = false;
+
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('#') || trimmed.starts_with(';') || trimmed.is_empty() {
+            continue;
+        }
+        let key = if let Some(idx) = trimmed.find('=') {
+            trimmed[..idx].trim()
+        } else {
+            trimmed
+        };
+        if key == "username" {
+            has_unscoped_username = true;
+        } else if key == "_password" {
+            has_unscoped_password = true;
+        }
+    }
+
+    let nerfed = if nerfed_registry.ends_with(':') {
+        nerfed_registry.to_string()
+    } else {
+        format!("{nerfed_registry}:")
+    };
+
+    let mut fixed_lines = Vec::new();
+    let mut summaries = Vec::new();
+
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('#') || trimmed.starts_with(';') || trimmed.is_empty() {
+            fixed_lines.push(line.to_string());
+            continue;
+        }
+
+        let (key, val, has_val) = if let Some(idx) = trimmed.find('=') {
+            (trimmed[..idx].trim(), trimmed[idx + 1..].trim(), true)
+        } else {
+            (trimmed, "", false)
+        };
+
+        // Check rules
+        if key == "_authtoken" || key == "-authtoken" {
+            summaries.push(format!("- `{key}` deleted from {where_name} config"));
+            continue;
+        }
+
+        if key == "_authToken" || key == "_auth" || key == "email" {
+            let new_key = format!("{nerfed}{key}");
+            let new_line = if has_val {
+                format!("{new_key}={val}")
+            } else {
+                new_key.clone()
+            };
+            fixed_lines.push(new_line);
+            summaries.push(format!("~ `{key}` renamed to `{new_key}` in {where_name} config"));
+            continue;
+        }
+
+        if key == "username" {
+            if has_unscoped_password {
+                let new_key = format!("{nerfed}username");
+                let new_line = if has_val {
+                    format!("{new_key}={val}")
+                } else {
+                    new_key.clone()
+                };
+                fixed_lines.push(new_line);
+                summaries.push(format!("~ `username` renamed to `{new_key}` in {where_name} config"));
+            } else {
+                summaries.push(format!("- `username` deleted from {where_name} config"));
+            }
+            continue;
+        }
+
+        if key == "_password" {
+            if has_unscoped_username {
+                let new_key = format!("{nerfed}_password");
+                let new_line = if has_val {
+                    format!("{new_key}={val}")
+                } else {
+                    new_key.clone()
+                };
+                fixed_lines.push(new_line);
+                summaries.push(format!("~ `_password` renamed to `{new_key}` in {where_name} config"));
+            } else {
+                summaries.push(format!("- `_password` deleted from {where_name} config"));
+            }
+            continue;
+        }
+
+        // Deprecated keys
+        if key == "global-style" {
+            fixed_lines.push("install-strategy=shallow".to_string());
+            summaries.push(format!("~ `global-style` renamed to `install-strategy=shallow` in {where_name} config"));
+            continue;
+        }
+
+        if key == "legacy-bundling" {
+            fixed_lines.push("install-strategy=nested".to_string());
+            summaries.push(format!("~ `legacy-bundling` renamed to `install-strategy=nested` in {where_name} config"));
+            continue;
+        }
+
+        if key == "only" {
+            if val.eq_ignore_ascii_case("prod") || val.eq_ignore_ascii_case("production") {
+                fixed_lines.push("omit=dev".to_string());
+                summaries.push(format!("~ `only` renamed to `omit=dev` in {where_name} config"));
+            } else if val.eq_ignore_ascii_case("dev") || val.eq_ignore_ascii_case("development") {
+                fixed_lines.push("include=dev".to_string());
+                summaries.push(format!("~ `only` renamed to `include=dev` in {where_name} config"));
+            } else {
+                fixed_lines.push(line.to_string());
+            }
+            continue;
+        }
+
+        if key == "production" {
+            if val.is_empty() || val.eq_ignore_ascii_case("true") {
+                fixed_lines.push("omit=dev".to_string());
+                summaries.push(format!("~ `production` renamed to `omit=dev` in {where_name} config"));
+            } else if val.eq_ignore_ascii_case("false") {
+                summaries.push(format!("- `production` deleted from {where_name} config"));
+            } else {
+                fixed_lines.push(line.to_string());
+            }
+            continue;
+        }
+
+        if key == "shrinkwrap" {
+            if val.eq_ignore_ascii_case("false") {
+                fixed_lines.push("package-lock=false".to_string());
+            } else {
+                fixed_lines.push("package-lock=true".to_string());
+            }
+            summaries.push(format!("~ `shrinkwrap` renamed to `package-lock` in {where_name} config"));
+            continue;
+        }
+
+        if key == "also"
+            && (val.eq_ignore_ascii_case("dev") || val.eq_ignore_ascii_case("development"))
+        {
+            fixed_lines.push("include=dev".to_string());
+            summaries.push(format!("~ `also` renamed to `include=dev` in {where_name} config"));
+            continue;
+        }
+
+        if key == "dev" && (val.is_empty() || val.eq_ignore_ascii_case("true")) {
+            fixed_lines.push("include=dev".to_string());
+            summaries.push(format!("~ `dev` renamed to `include=dev` in {where_name} config"));
+            continue;
+        }
+
+        if key == "optional" {
+            if val.eq_ignore_ascii_case("false") {
+                fixed_lines.push("omit=optional".to_string());
+                summaries.push(format!("~ `optional` renamed to `omit=optional` in {where_name} config"));
+                continue;
+            } else if val.eq_ignore_ascii_case("true") {
+                fixed_lines.push("include=optional".to_string());
+                summaries.push(format!("~ `optional` renamed to `include=optional` in {where_name} config"));
+                continue;
+            }
+        }
+
+        if let Some(rest) = key.strip_prefix("init.") {
+            let normalized_rest = rest.replace('.', "-");
+            let new_key = format!("init-{normalized_rest}");
+            let new_line = if has_val {
+                format!("{new_key}={val}")
+            } else {
+                new_key.clone()
+            };
+            fixed_lines.push(new_line);
+            summaries.push(format!("~ `{key}` renamed to `{new_key}` in {where_name} config"));
+            continue;
+        }
+
+        // Unmodified line
+        fixed_lines.push(line.to_string());
+    }
+
+    let mut out_str = fixed_lines.join("\n");
+    if !fixed_lines.is_empty() && (content.ends_with('\n') || content.ends_with("\r\n")) {
+        out_str.push('\n');
+    }
+
+    (out_str, summaries)
 }

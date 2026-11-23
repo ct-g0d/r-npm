@@ -140,6 +140,8 @@ pub async fn run(
         .to_string();
 
     let new_path = build_explore_path(&pkg_dir);
+    let config = rnpm_config::Config::load(Some(&current_dir)).unwrap_or_default();
+    let configured_shell = shell_opt.or_else(|| config.get("shell").map(String::from));
 
     // Determine command to run
     let is_interactive = args.is_empty();
@@ -151,16 +153,26 @@ pub async fn run(
 
         #[cfg(windows)]
         {
-            let sh = shell_opt
+            let sh = configured_shell
                 .or_else(|| std::env::var("ComSpec").ok())
                 .unwrap_or_else(|| "cmd.exe".into());
-            let display = format!("{sh} /K");
-            (sh, vec!["/K".to_string()], String::new(), display)
+            let is_cmd = sh.to_ascii_lowercase().contains("cmd");
+            let display = if is_cmd {
+                format!("{sh} /K")
+            } else {
+                sh.clone()
+            };
+            let cmd_args = if is_cmd {
+                vec!["/K".to_string()]
+            } else {
+                Vec::new()
+            };
+            (sh, cmd_args, String::new(), display)
         }
 
         #[cfg(not(windows))]
         {
-            let sh = shell_opt
+            let sh = configured_shell
                 .or_else(|| std::env::var("SHELL").ok())
                 .unwrap_or_else(|| "/bin/sh".into());
             let display = sh.clone();
@@ -171,19 +183,45 @@ pub async fn run(
 
         #[cfg(windows)]
         {
-            let sh = std::env::var("ComSpec").unwrap_or_else(|_| "cmd.exe".into());
-            let display = format!("{sh} /d /s /c {script}");
-            (
-                sh,
-                vec!["/d".into(), "/s".into(), "/c".into(), script.clone()],
-                script,
-                display,
-            )
+            let sh = configured_shell
+                .or_else(|| std::env::var("ComSpec").ok())
+                .unwrap_or_else(|| "cmd.exe".into());
+            let lower = sh.to_ascii_lowercase();
+            if lower.contains("cmd") {
+                let display = format!("{sh} /d /s /c {script}");
+                (
+                    sh,
+                    vec!["/d".into(), "/s".into(), "/c".into(), script.clone()],
+                    script,
+                    display,
+                )
+            } else if lower.contains("powershell")
+                || lower.ends_with("pwsh")
+                || lower.ends_with("pwsh.exe")
+            {
+                let display = format!("{sh} -Command {script}");
+                (
+                    sh,
+                    vec!["-Command".into(), script.clone()],
+                    script,
+                    display,
+                )
+            } else {
+                let display = format!("{sh} -c {script}");
+                (
+                    sh,
+                    vec!["-c".into(), script.clone()],
+                    script,
+                    display,
+                )
+            }
         }
 
         #[cfg(not(windows))]
         {
-            let sh = "/bin/sh".to_string();
+            let sh = configured_shell
+                .or_else(|| std::env::var("SHELL").ok())
+                .unwrap_or_else(|| "/bin/sh".into());
             let display = format!("{sh} -c {script}");
             (sh, vec!["-c".into(), script.clone()], script, display)
         }
