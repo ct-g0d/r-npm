@@ -244,3 +244,9 @@ impl SolverError {
         }
     }
 }
+
+impl From<rnpm_core::error::OverrideError> for SolverError {
+    fn from(e: rnpm_core::error::OverrideError) -> Self {
+        SolverError::InvalidOverride(e.to_string())
+    }
+}

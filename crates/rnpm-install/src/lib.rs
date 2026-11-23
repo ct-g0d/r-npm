@@ -6078,6 +6078,7 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                 continue;
             }
             if let Some(deps) = &pkg_info.dependencies {
+                let caller_specs = pkg_info.all_dependency_specs();
                 for (dep_name, range_str) in deps {
                     let effective_range = if let Some(ref ov) = overrides {
                         let mut ancestors: Vec<String> = Vec::new();
@@ -6086,10 +6087,15 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                             let clean_p = p.strip_prefix("node_modules/").unwrap_or(p);
                             ancestors.push(clean_p.to_string());
                         }
-                        ov.resolve_override_strings(dep_name, range_str, &ancestors)
-                            .ok()
-                            .flatten()
-                            .unwrap_or_else(|| range_str.clone())
+                        ov.resolve_override_with_caller(
+                            dep_name,
+                            range_str,
+                            &ancestors,
+                            Some(&caller_specs),
+                        )
+                        .ok()
+                        .flatten()
+                        .unwrap_or_else(|| range_str.clone())
                     } else {
                         range_str.clone()
                     };

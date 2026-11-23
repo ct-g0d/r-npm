@@ -478,6 +478,28 @@ impl LockfilePackage {
         self.dev = if val { Some(true) } else { None };
     }
 
+    /// `$name` override references of this package, in arborist's edge.js
+    /// lookup order: dev, optional, dependencies, peer. The first non-empty
+    /// spec wins (an empty string is falsy in arborist).
+    pub fn all_dependency_specs(&self) -> BTreeMap<String, String> {
+        let mut specs = BTreeMap::new();
+        for section in [
+            &self.peer_dependencies,
+            &self.dependencies,
+            &self.optional_dependencies,
+            &self.dev_dependencies,
+        ] {
+            if let Some(map) = section {
+                for (name, spec) in map {
+                    if !spec.is_empty() {
+                        specs.insert(name.clone(), spec.clone());
+                    }
+                }
+            }
+        }
+        specs
+    }
+
     pub fn with_dev(mut self, val: bool) -> Self {
         self.set_dev(val);
         self
@@ -1218,12 +1240,32 @@ impl LockfileV3 {
         }
 
         // Check direct overrides
-        if let Some(overrides_obj) = manifest.extra.get("overrides").and_then(|o| o.as_object()) {
-            for (dep, ov_val) in overrides_obj {
-                if let Some(ov_spec) = ov_val.as_str() {
-                    let key = format!("node_modules/{dep}");
-                    if let Some(pkg) = self.packages.get(&key) {
-                        if !Self::package_satisfies_spec(dep, pkg, ov_spec) {
+        let overrides = rnpm_core::overrides::Overrides::from_manifest(manifest).ok();
+
+        if let Some(ref ov) = overrides {
+            for (rule_key, _) in &ov.rules {
+                let dep_name = rule_key
+                    .split_once('@')
+                    .map(|(name, _)| {
+                        if name.is_empty() && rule_key.starts_with('@') {
+                            if let Some((sub_name, _)) = rule_key[1..].split_once('@') {
+                                format!("@{sub_name}")
+                            } else {
+                                rule_key.clone()
+                            }
+                        } else if name.is_empty() {
+                            rule_key.clone()
+                        } else {
+                            name.to_string()
+                        }
+                    })
+                    .unwrap_or_else(|| rule_key.clone());
+
+                let key = format!("node_modules/{dep_name}");
+                if let Some(pkg) = self.packages.get(&key) {
+                    let req_spec = pkg.version.as_deref().unwrap_or("*");
+                    if let Ok(Some(eff_spec)) = ov.resolve_override(&dep_name, req_spec, &[]) {
+                        if !Self::package_satisfies_spec(&dep_name, pkg, &eff_spec) {
                             return false;
                         }
                     }
@@ -1231,20 +1273,6 @@ impl LockfileV3 {
             }
         }
 
-        fn get_effective_spec<'a>(
-            manifest: &'a rnpm_core::manifest::Manifest,
-            dep: &str,
-            declared_spec: &'a str,
-        ) -> &'a str {
-            if let Some(overrides_obj) =
-                manifest.extra.get("overrides").and_then(|o| o.as_object())
-            {
-                if let Some(ov_spec) = overrides_obj.get(dep).and_then(|v| v.as_str()) {
-                    return ov_spec;
-                }
-            }
-            declared_spec
-        }
 
         // 7. Verify direct dependencies exist in packages map and satisfy specs
         for (dep, spec) in &manifest.dependencies {
@@ -1255,8 +1283,15 @@ impl LockfileV3 {
             let Some(pkg) = self.packages.get(&key) else {
                 return false;
             };
-            let eff_spec = get_effective_spec(manifest, dep, spec);
-            if !Self::package_satisfies_spec(dep, pkg, eff_spec) {
+            let eff_spec = if let Some(ref ov) = overrides {
+                ov.resolve_override(dep, spec, &[])
+                    .ok()
+                    .flatten()
+                    .unwrap_or_else(|| spec.clone())
+            } else {
+                spec.clone()
+            };
+            if !Self::package_satisfies_spec(dep, pkg, &eff_spec) {
                 return false;
             }
         }
@@ -1268,8 +1303,15 @@ impl LockfileV3 {
                 let Some(pkg) = self.packages.get(&key) else {
                     return false;
                 };
-                let eff_spec = get_effective_spec(manifest, dep, spec);
-                if !Self::package_satisfies_spec(dep, pkg, eff_spec) {
+                let eff_spec = if let Some(ref ov) = overrides {
+                    ov.resolve_override(dep, spec, &[])
+                        .ok()
+                        .flatten()
+                        .unwrap_or_else(|| spec.clone())
+                } else {
+                    spec.clone()
+                };
+                if !Self::package_satisfies_spec(dep, pkg, &eff_spec) {
                     return false;
                 }
             }
@@ -1279,8 +1321,15 @@ impl LockfileV3 {
         for (dep, spec) in &manifest.optional_dependencies {
             let key = format!("node_modules/{dep}");
             if let Some(pkg) = self.packages.get(&key) {
-                let eff_spec = get_effective_spec(manifest, dep, spec);
-                if !Self::package_satisfies_spec(dep, pkg, eff_spec) {
+                let eff_spec = if let Some(ref ov) = overrides {
+                    ov.resolve_override(dep, spec, &[])
+                        .ok()
+                        .flatten()
+                        .unwrap_or_else(|| spec.clone())
+                } else {
+                    spec.clone()
+                };
+                if !Self::package_satisfies_spec(dep, pkg, &eff_spec) {
                     return false;
                 }
             }
@@ -1295,9 +1344,16 @@ impl LockfileV3 {
                 .unwrap_or_else(|| root_pkg.is_peer_dep_optional(dep));
 
             let key = format!("node_modules/{dep}");
+            let eff_spec = if let Some(ref ov) = overrides {
+                ov.resolve_override(dep, spec, &[])
+                    .ok()
+                    .flatten()
+                    .unwrap_or_else(|| spec.clone())
+            } else {
+                spec.clone()
+            };
             if let Some(pkg) = self.packages.get(&key) {
-                let eff_spec = get_effective_spec(manifest, dep, spec);
-                if !Self::package_satisfies_spec(dep, pkg, eff_spec) {
+                if !Self::package_satisfies_spec(dep, pkg, &eff_spec) {
                     return false;
                 }
             } else if !is_optional {

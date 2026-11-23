@@ -517,3 +517,107 @@ async fn test_ci_omit_dev_with_shared_prod_and_dev_deps() {
         "pure-dev-dep MUST be omitted from node_modules when omit_dev: true"
     );
 }
+
+#[tokio::test]
+async fn test_ci_accepts_referential_overrides_demo() {
+    let tmp = tempdir().unwrap();
+    let project_dir = tmp.path();
+
+    let demo_tar = create_tarball(&[(
+        "package.json",
+        br#"{"name":"demo","version":"1.2.0"}"#,
+    )]);
+    let integrity = compute_sha512_integrity(&demo_tar);
+    let tar_path = project_dir.join("demo-1.2.0.tgz");
+    fs::write(&tar_path, &demo_tar).unwrap();
+
+    let tar_url = "file:./demo-1.2.0.tgz".to_string();
+
+    // 1. package.json with dependencies: {"demo": "^1.0.0"} and overrides: {"demo": "$demo"}
+    let mut manifest = Manifest::default();
+    manifest.name = Some("referential-override-ci-app".to_string());
+    manifest.version = Some("1.0.0".to_string());
+    manifest
+        .dependencies
+        .insert("demo".to_string(), "^1.0.0".to_string());
+    manifest.extra.insert(
+        "overrides".to_string(),
+        serde_json::json!({ "demo": "$demo" }),
+    );
+    manifest
+        .save_to_file(project_dir.join("package.json"))
+        .unwrap();
+
+    // 2. package-lock.json with root package and node_modules/demo @ 1.2.0
+    let mut lockfile = LockfileV3::new("referential-override-ci-app", Some("1.0.0".to_string()));
+    let mut prod_deps = BTreeMap::new();
+    prod_deps.insert("demo".to_string(), "^1.0.0".to_string());
+    let mut root_extra = BTreeMap::new();
+    root_extra.insert(
+        "overrides".to_string(),
+        serde_json::json!({ "demo": "$demo" }),
+    );
+
+    let root = lockfile.root_package_mut().unwrap();
+    root.dependencies = Some(prod_deps);
+    root.extra = root_extra;
+
+    lockfile.insert_package(
+        "node_modules/demo",
+        LockfilePackage {
+            version: Some("1.2.0".to_string()),
+            resolved: Some(tar_url),
+            integrity: Some(integrity),
+            ..Default::default()
+        },
+    );
+    lockfile
+        .save_to_file(&project_dir.join("package-lock.json"))
+        .unwrap();
+
+    // 3. Run rnpm ci
+    let mut installer = Installer::new(InstallOptions {
+        project_dir: project_dir.to_path_buf(),
+        offline: true,
+        ..Default::default()
+    })
+    .unwrap();
+
+    let res = installer.run_ci().await;
+    assert!(
+        res.is_ok(),
+        "run_ci must succeed when overrides contain referential '$demo' matching lockfile: {:?}",
+        res.err()
+    );
+
+    // Verify demo installed on disk
+    let demo_pkg_json = project_dir.join("node_modules/demo/package.json");
+    assert!(
+        demo_pkg_json.exists(),
+        "node_modules/demo/package.json must exist after successful rnpm ci"
+    );
+    let installed_json: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&demo_pkg_json).unwrap()).unwrap();
+    assert_eq!(installed_json["version"], "1.2.0");
+
+    // 4. Verify drift detection: if manifest changes demo spec to ^2.0.0, CI must reject
+    manifest
+        .dependencies
+        .insert("demo".to_string(), "^2.0.0".to_string());
+    manifest
+        .save_to_file(project_dir.join("package.json"))
+        .unwrap();
+
+    let mut drifted_installer = Installer::new(InstallOptions {
+        project_dir: project_dir.to_path_buf(),
+        offline: true,
+        ..Default::default()
+    })
+    .unwrap();
+
+    let drift_res = drifted_installer.run_ci().await;
+    assert!(
+        drift_res.is_err(),
+        "run_ci must reject lockfile when demo spec drifts to ^2.0.0 while lockfile has 1.2.0"
+    );
+}

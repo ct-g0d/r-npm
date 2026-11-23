@@ -835,6 +835,62 @@ fn test_matches_manifest_ext_overrides_drift() {
 }
 
 #[test]
+fn test_matches_manifest_ext_referential_override_demo() {
+    let mut manifest = Manifest {
+        name: Some("referential-override-demo-app".to_string()),
+        version: Some("1.0.0".to_string()),
+        dependencies: {
+            let mut m = BTreeMap::new();
+            m.insert("demo".to_string(), "^1.0.0".to_string());
+            m
+        },
+        ..Default::default()
+    };
+
+    // npm-style referential override: {"demo": "$demo"}
+    manifest.extra.insert(
+        "overrides".to_string(),
+        serde_json::json!({ "demo": "$demo" }),
+    );
+
+    let mut lockfile = LockfileV3::from_manifest(&manifest);
+    lockfile.insert_package(
+        "node_modules/demo",
+        LockfilePackage {
+            version: Some("1.2.0".to_string()),
+            ..Default::default()
+        },
+    );
+
+    // 1. Direct referential override: $demo resolves to root's ^1.0.0 and must match lockfile 1.2.0
+    assert!(
+        lockfile.matches_manifest_ext(&manifest, true, false),
+        "referential override $demo should resolve to root's ^1.0.0 and match lockfile 1.2.0"
+    );
+    assert!(
+        lockfile.matches_manifest_for_ci(&manifest, true),
+        "matches_manifest_for_ci must accept referential override $demo matching lockfile"
+    );
+
+    // 2. If lockfile package does not satisfy ^1.0.0, drift should be detected
+    lockfile.insert_package(
+        "node_modules/demo",
+        LockfilePackage {
+            version: Some("2.0.0".to_string()),
+            ..Default::default()
+        },
+    );
+    assert!(
+        !lockfile.matches_manifest_ext(&manifest, true, false),
+        "referential override $demo must reject lockfile version 2.0.0 not satisfying ^1.0.0"
+    );
+    assert!(
+        !lockfile.matches_manifest_for_ci(&manifest, true),
+        "matches_manifest_for_ci must reject lockfile version 2.0.0 not satisfying ^1.0.0"
+    );
+}
+
+#[test]
 fn test_matches_manifest_ext_non_registry_and_alias_spec_drift() {
     let manifest = Manifest {
         name: Some("spec-app".to_string()),

@@ -8,19 +8,23 @@ pub mod error;
 pub mod integrity;
 pub mod manifest;
 pub mod ordered_json;
+pub mod overrides;
 pub mod pkg;
 pub mod platform_list;
 pub mod semver;
 pub mod spec;
 pub mod workspace;
 
-pub use error::{CoreError, IntegrityError, ManifestError, SemverError, SpecError, WorkspaceError};
+pub use error::{
+    CoreError, IntegrityError, ManifestError, OverrideError, SemverError, SpecError, WorkspaceError,
+};
 pub use integrity::{Algorithm, Integrity, IntegrityEntry};
 pub use manifest::{
     BundledDependencies, Manifest, ManifestFormat, PackageBin, PackageWorkspaces,
     PeerDependencyMeta,
 };
 pub use ordered_json::{OrderedJsonMap, OrderedJsonValue};
+pub use overrides::{OverrideValue, Overrides};
 pub use pkg::{
     coerce_value, delete_value, get_value_at_path, parse_path, pkg_delete, pkg_fix, pkg_get,
     pkg_get_value, pkg_get_workspaces, pkg_set, resolve_manifest_path, set_value, PathSegment,
