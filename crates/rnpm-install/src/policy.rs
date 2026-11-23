@@ -92,14 +92,10 @@ impl SourceKind {
 
 pub fn is_registry_tarball(resolved: &str) -> bool {
     let resolved = resolved.trim();
-    let rest = if let Some(rest) = resolved.strip_prefix("https://") {
-        rest
-    } else if let Some(rest) = resolved.strip_prefix("http://") {
-        rest
-    } else if let Some(rest) = resolved.strip_prefix("HTTPS://") {
-        rest
-    } else if let Some(rest) = resolved.strip_prefix("HTTP://") {
-        rest
+    let rest = if resolved.get(..8).is_some_and(|p| p.eq_ignore_ascii_case("https://")) {
+        &resolved[8..]
+    } else if resolved.get(..7).is_some_and(|p| p.eq_ignore_ascii_case("http://")) {
+        &resolved[7..]
     } else {
         return false;
     };
@@ -113,7 +109,10 @@ pub fn is_registry_tarball(resolved: &str) -> bool {
         return false;
     }
     let before = &path[..idx];
-    let name_part = before.replace("%2f", "/").replace("%2F", "/");
+    let name_part = before
+        .replace("%2f", "/")
+        .replace("%2F", "/")
+        .replace("%40", "@");
     let segs: Vec<&str> = name_part.split('/').filter(|s| !s.is_empty()).collect();
     let name = match segs.as_slice() {
         [.., scope, n] if scope.starts_with('@') => format!("{scope}/{n}"),
@@ -1068,6 +1067,15 @@ mod tests {
     fn registry_url_shape_matches_arborist() {
         assert!(is_registry_tarball(
             "https://registry.npmjs.org/a/-/a-1.0.0.tgz"
+        ));
+        assert!(is_registry_tarball(
+            "Https://registry.npmjs.org/a/-/a-1.0.0.tgz"
+        ));
+        assert!(is_registry_tarball(
+            "Http://registry.npmjs.org/a/-/a-1.0.0.tgz"
+        ));
+        assert!(is_registry_tarball(
+            "https://registry.npmjs.org/%40scope%2Fpkg/-/pkg-1.0.0.tgz"
         ));
         assert!(!is_registry_tarball("https://evil.com/-/a-1.0.0.tgz"));
         assert!(!is_registry_tarball("https://example.com/a.tgz"));

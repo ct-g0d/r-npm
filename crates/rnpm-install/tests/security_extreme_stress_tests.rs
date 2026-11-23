@@ -1033,3 +1033,171 @@ async fn test_rebuild_interaction_with_ignore_scripts() {
         "execute_rebuild with ignore_scripts: true must not rebuild any package"
     );
 }
+
+// =========================================================================
+// 7. Round 2 Regression Tests: Committish Collision, Mixed-Case, %40, Git Shorthand, Windows Paths
+// =========================================================================
+
+#[test]
+fn test_git_committish_prefix_collision_prevention() {
+    let temp = tempdir().unwrap();
+
+    // 1. #main must NOT match #main-exploit
+    let node_main_exploit = ScriptNode {
+        location: "node_modules/git-dep",
+        resolved: Some("git+https://github.com/user/repo.git#main-exploit"),
+        lock_name: None,
+        in_bundle: false,
+        link: false,
+        project_dir: temp.path(),
+    };
+    assert!(!node_main_exploit.matches("github:user/repo#main", false));
+
+    // 2. #v1 must NOT match #v10.0.0
+    let node_v10 = ScriptNode {
+        location: "node_modules/git-dep",
+        resolved: Some("git+https://github.com/user/repo.git#v10.0.0"),
+        lock_name: None,
+        in_bundle: false,
+        link: false,
+        project_dir: temp.path(),
+    };
+    assert!(!node_v10.matches("github:user/repo#v1", false));
+
+    // 3. Exact non-hex ref MUST match
+    let node_main_exact = ScriptNode {
+        location: "node_modules/git-dep",
+        resolved: Some("git+https://github.com/user/repo.git#main"),
+        lock_name: None,
+        in_bundle: false,
+        link: false,
+        project_dir: temp.path(),
+    };
+    assert!(node_main_exact.matches("github:user/repo#main", false));
+
+    // 4. Valid hex SHA prefix (>= 7 chars) MUST match full 40-char SHA
+    let full_sha = "7b3f12a0123456789abcdef0123456789abcdef";
+    let node_sha = ScriptNode {
+        location: "node_modules/git-dep",
+        resolved: Some(&format!("git+https://github.com/user/repo.git#{full_sha}")),
+        lock_name: None,
+        in_bundle: false,
+        link: false,
+        project_dir: temp.path(),
+    };
+    assert!(node_sha.matches("github:user/repo#7b3f12a", false));
+    assert!(!node_sha.matches("github:user/repo#7b3f12b", false)); // different SHA prefix
+
+    // 5. Short hex ref (< 7 chars) requires exact equality
+    assert!(!node_sha.matches("github:user/repo#7b3f12", false));
+}
+
+#[test]
+fn test_mixed_case_url_schemes_in_is_registry_tarball() {
+    assert!(is_registry_tarball("Https://registry.npmjs.org/foo/-/foo-1.0.0.tgz"));
+    assert!(is_registry_tarball("Http://127.0.0.1:4873/foo/-/foo-1.0.0.tgz"));
+    assert!(is_registry_tarball("hTtPs://registry.npmjs.org/foo/-/foo-1.0.0.tgz"));
+    assert!(is_registry_tarball("hTtP://127.0.0.1:4873/foo/-/foo-1.0.0.tgz"));
+    assert!(is_registry_tarball("HTTPS://registry.npmjs.org/foo/-/foo-1.0.0.tgz"));
+    assert!(is_registry_tarball("HTTP://registry.npmjs.org/foo/-/foo-1.0.0.tgz"));
+    assert!(is_registry_tarball("https://registry.npmjs.org/foo/-/foo-1.0.0.tgz"));
+    assert!(is_registry_tarball("http://registry.npmjs.org/foo/-/foo-1.0.0.tgz"));
+}
+
+#[test]
+fn test_percent_40_scope_decoding_in_registry_identity() {
+    let temp = tempdir().unwrap();
+    let url = "https://registry.npmjs.org/%40scope%2Fpkg/-/pkg-1.0.0.tgz";
+    assert!(is_registry_tarball(url));
+
+    let node = ScriptNode {
+        location: "node_modules/@scope/pkg",
+        resolved: Some(url),
+        lock_name: None,
+        in_bundle: false,
+        link: false,
+        project_dir: temp.path(),
+    };
+
+    assert_eq!(
+        node.registry_identity(),
+        Some(("@scope/pkg".to_string(), Some("1.0.0".to_string())))
+    );
+
+    // Matching against @scope/pkg policy must succeed
+    assert!(node.matches("@scope/pkg", false));
+    assert!(node.matches("@scope/pkg@1.0.0", false));
+}
+
+#[test]
+fn test_git_shorthand_case_insensitivity() {
+    let temp = tempdir().unwrap();
+
+    let (repo, committish) = git_identity("GitHub:user/repo#main").unwrap();
+    assert_eq!(repo, "github.com/user/repo");
+    assert_eq!(committish, "main");
+
+    let (repo_upper, _) = git_identity("GITHUB:user/repo").unwrap();
+    assert_eq!(repo_upper, "github.com/user/repo");
+
+    let (repo_gitlab, _) = git_identity("GitLab:user/repo").unwrap();
+    assert_eq!(repo_gitlab, "gitlab.com/user/repo");
+
+    let (repo_bb, _) = git_identity("BitBucket:user/repo").unwrap();
+    assert_eq!(repo_bb, "bitbucket.org/user/repo");
+
+    let (repo_gist, _) = git_identity("Gist:1234567").unwrap();
+    assert_eq!(repo_gist, "gist.github.com/1234567");
+
+    let node = ScriptNode {
+        location: "node_modules/my-repo",
+        resolved: Some("git+https://github.com/user/repo.git#main"),
+        lock_name: None,
+        in_bundle: false,
+        link: false,
+        project_dir: temp.path(),
+    };
+
+    assert!(node.matches("GitHub:user/repo#main", false));
+    assert!(node.matches("GITHUB:user/repo", false));
+}
+
+#[test]
+fn test_lexical_path_fallback_and_windows_workspace_backslash() {
+    let temp = tempdir().unwrap();
+
+    // 1. Lexical normalization matches non-existent path: ./nonexistent/pkg vs nonexistent/pkg
+    let p1 = temp.path().join("./nonexistent/pkg");
+    let p2 = temp.path().join("nonexistent/pkg");
+    assert_eq!(normalize_path(&p1), normalize_path(&p2));
+
+    // 2. Windows backslash in workspace resolved symlink
+    let mut packages = BTreeMap::new();
+    packages.insert(
+        "node_modules/ws-link".to_string(),
+        LockfilePackage {
+            link: Some(true),
+            resolved: Some("packages\\my-ws".to_string()),
+            ..Default::default()
+        },
+    );
+
+    let lockfile = LockfileV3 {
+        name: "test".to_string(),
+        version: None,
+        lockfile_version: 3,
+        requires: None,
+        packages,
+    };
+
+    let mut workspace_paths = HashSet::new();
+    workspace_paths.insert("packages/my-ws".to_string());
+
+    let mut config = Config::default();
+    config.npmrc.set("strict-allow-scripts", "true").unwrap();
+    let policy = ScriptPolicy::load(temp.path(), &config, false);
+
+    // strict_preflight MUST recognize "packages\\my-ws" as in workspace_paths and skip checking it as an external package
+    assert!(strict_preflight(&lockfile, temp.path(), &workspace_paths, &policy, false).is_ok());
+    assert!(unreviewed_scripts_warning(&lockfile, temp.path(), &workspace_paths, &policy, false).is_none());
+}

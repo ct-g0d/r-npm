@@ -191,7 +191,7 @@ pub struct ScriptNode<'a> {
 }
 
 pub fn normalize_path(path: &Path) -> String {
-    let p = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let p = std::fs::canonicalize(path).unwrap_or_else(|_| path_clean::clean(path));
     let s = p.to_string_lossy().replace('\\', "/");
     let s = s.strip_prefix("//?/").unwrap_or(&s).to_string();
     if cfg!(windows) {
@@ -213,12 +213,14 @@ pub fn git_identity(spec: &str) -> Option<(String, String)> {
             break;
         }
     }
-    let body = if let Some(rest) = body.strip_prefix("github:") {
-        format!("github.com/{rest}")
-    } else if let Some(rest) = body.strip_prefix("gitlab:") {
-        format!("gitlab.com/{rest}")
-    } else if let Some(rest) = body.strip_prefix("bitbucket:") {
-        format!("bitbucket.org/{rest}")
+    let body = if body.len() >= 7 && body[..7].eq_ignore_ascii_case("github:") {
+        format!("github.com/{}", &body[7..])
+    } else if body.len() >= 7 && body[..7].eq_ignore_ascii_case("gitlab:") {
+        format!("gitlab.com/{}", &body[7..])
+    } else if body.len() >= 10 && body[..10].eq_ignore_ascii_case("bitbucket:") {
+        format!("bitbucket.org/{}", &body[10..])
+    } else if body.len() >= 5 && body[..5].eq_ignore_ascii_case("gist:") {
+        format!("gist.github.com/{}", &body[5..])
     } else {
         body.replacen(':', "/", 1)
     };
@@ -243,7 +245,10 @@ impl ScriptNode<'_> {
                 let before = &resolved[..idx];
                 let path = before.split_once("://").map(|(_, r)| r).unwrap_or(before);
                 let name_part = path.split_once('/').map(|(_, n)| n).unwrap_or("");
-                let name = name_part.replace("%2f", "/").replace("%2F", "/");
+                let name = name_part
+                    .replace("%2f", "/")
+                    .replace("%2F", "/")
+                    .replace("%40", "@");
                 // The registry path may carry a prefix (e.g. a proxy path);
                 // keep the trailing `name` or `@scope/name`.
                 let segs: Vec<&str> = name.split('/').filter(|s| !s.is_empty()).collect();
@@ -283,7 +288,17 @@ impl ScriptNode<'_> {
             let Some((node_repo, node_ref)) = git_identity(resolved) else {
                 return false;
             };
-            return key_repo == node_repo && (key_ref.is_empty() || node_ref.starts_with(&key_ref));
+            let ref_matches = if key_ref.is_empty() {
+                true
+            } else if key_ref.len() >= 7
+                && key_ref.chars().all(|c| c.is_ascii_hexdigit())
+                && node_ref.chars().all(|c| c.is_ascii_hexdigit())
+            {
+                node_ref.starts_with(&key_ref)
+            } else {
+                node_ref == key_ref
+            };
+            return key_repo == node_repo && ref_matches;
         }
         let key_lower = key.to_ascii_lowercase();
         if key_lower.starts_with("http://") || key_lower.starts_with("https://") {
@@ -457,7 +472,7 @@ pub fn strict_preflight(
             .filter(|d| d.is_dir());
         let dir: PathBuf = if pkg.link == Some(true) {
             match pkg.resolved.as_deref() {
-                Some(target) if !workspace_paths.contains(target) => base_dir.join(target),
+                Some(target) if !workspace_paths.contains(&target.replace('\\', "/")) => base_dir.join(target),
                 _ => continue,
             }
         } else if let Some(local) = local_dir {
@@ -563,7 +578,7 @@ pub fn unreviewed_scripts_warning(
         // A link stands for its target directory; workspaces are skipped.
         let dir: PathBuf = if pkg.link == Some(true) {
             match pkg.resolved.as_deref() {
-                Some(target) if !workspace_paths.contains(target) => base_dir.join(target),
+                Some(target) if !workspace_paths.contains(&target.replace('\\', "/")) => base_dir.join(target),
                 _ => continue,
             }
         } else {
