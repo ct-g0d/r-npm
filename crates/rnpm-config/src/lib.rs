@@ -26,7 +26,7 @@ pub use error::ConfigError;
 pub use npm_defaults::npm_default;
 pub use npmrc::{
     encode_package_name, interpolate_env, is_sensitive_credential_key, mask_credential,
-    scrub_credentials, validate_package_name, Npmrc, DEFAULT_REGISTRY,
+    scrub_credentials, validate_package_name, NoProxyMatcher, NoProxyRule, Npmrc, DEFAULT_REGISTRY,
 };
 pub use release_age::{is_release_age_excluded, match_package_pattern};
 

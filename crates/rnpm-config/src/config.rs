@@ -136,6 +136,50 @@ impl Config {
             })
     }
 
+    pub fn proxy(&self) -> Option<&str> {
+        self.get("proxy").filter(|s| !s.is_empty() && *s != "null")
+    }
+
+    pub fn https_proxy(&self) -> Option<&str> {
+        self.get("https-proxy")
+            .or_else(|| self.get("https_proxy"))
+            .filter(|s| !s.is_empty() && *s != "null")
+    }
+
+    pub fn http_proxy(&self) -> Option<&str> {
+        self.get("http-proxy")
+            .or_else(|| self.get("http_proxy"))
+            .filter(|s| !s.is_empty() && *s != "null")
+    }
+
+    pub fn no_proxy(&self) -> Option<&str> {
+        self.get("noproxy")
+            .or_else(|| self.get("no-proxy"))
+            .or_else(|| self.get("no_proxy"))
+            .filter(|s| !s.is_empty() && *s != "null")
+    }
+
+    pub fn no_proxy_matcher(&self) -> crate::npmrc::NoProxyMatcher {
+        let val = self.no_proxy().unwrap_or_default();
+        crate::npmrc::NoProxyMatcher::parse(val)
+    }
+
+    pub fn should_bypass_proxy(&self, url: &url::Url) -> bool {
+        let host = match url.host_str() {
+            Some(h) => h,
+            None => return false,
+        };
+        if host == "localhost"
+            || host == "127.0.0.1"
+            || host == "::1"
+            || host.ends_with(".localhost")
+        {
+            return true;
+        }
+        let port = url.port_or_known_default();
+        self.no_proxy_matcher().matches(host, port)
+    }
+
     /// Parse `min-release-age` config (in days) into a UTC cutoff timestamp
     /// (milliseconds since epoch), computed relative to `now_ms`.
     ///

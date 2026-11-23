@@ -1091,3 +1091,201 @@ fn test_layer_aware_before_vs_min_release_age_precedence() {
         "User .npmrc before must beat user .npmrc min-release-age (tie-breaker in same layer)"
     );
 }
+
+#[test]
+fn test_nested_env_interpolation_edge_cases() {
+    let mut env_map = HashMap::new();
+    env_map.insert("BAR".to_string(), "bar_val".to_string());
+    env_map.insert("INNER".to_string(), "inner_val".to_string());
+    env_map.insert("PRIMARY".to_string(), "primary_val".to_string());
+    let lookup = |var: &str| env_map.get(var).cloned();
+
+    // Nested braces fallback: FOO is unset, BAR is set
+    assert_eq!(
+        interpolate_env("val=${FOO:-${BAR}}", &lookup),
+        "val=bar_val"
+    );
+
+    // Deeply nested fallback: A and B are unset, fallback is literal
+    assert_eq!(
+        interpolate_env("val=${A:-${B:-fallback_val}}", &lookup),
+        "val=fallback_val"
+    );
+
+    // Nested variable inside default prefix/suffix
+    assert_eq!(
+        interpolate_env("val=${UNSET:-prefix_${INNER}_suffix}", &lookup),
+        "val=prefix_inner_val_suffix"
+    );
+
+    // Unclosed brace should be left untouched
+    assert_eq!(
+        interpolate_env("val=${UNCLOSED", &lookup),
+        "val=${UNCLOSED"
+    );
+
+    // Primary variable is set: default is ignored
+    assert_eq!(
+        interpolate_env("val=${PRIMARY:-${IGNORED:-fallback}}", &lookup),
+        "val=primary_val"
+    );
+}
+
+#[test]
+fn test_scoped_registry_auth_token_subpath_matching() {
+    let content = r#"
+    //registry.corp.com/api/npm/:_authToken = token_subpath
+    //registry.corp.com/:_authToken = token_root
+    _authToken = token_global
+    "#;
+    let npmrc = Npmrc::parse(content).unwrap();
+
+    // 1. Matches subpath token because URL has /api/npm/virtual/
+    let subpath_url = Url::parse("https://registry.corp.com/api/npm/virtual/@scope/pkg").unwrap();
+    assert_eq!(
+        npmrc.get_auth_token(&subpath_url),
+        Some("token_subpath")
+    );
+
+    // 2. Matches root token because URL path is /other/path
+    let root_url = Url::parse("https://registry.corp.com/other/path/@scope/pkg").unwrap();
+    assert_eq!(
+        npmrc.get_auth_token(&root_url),
+        Some("token_root")
+    );
+
+    // 3. Different host falls back to global token
+    let other_host_url = Url::parse("https://other.domain.com/pkg").unwrap();
+    assert_eq!(
+        npmrc.get_auth_token(&other_host_url),
+        Some("token_global")
+    );
+}
+
+#[test]
+fn test_scoped_registry_basic_auth_resolution() {
+    let content = r#"
+    //registry.corp.com/private/:_auth = cHJpdmF0ZV91c2VyOnBhc3M=
+    //other.org/:username = myuser
+    //other.org/:_password = mypass
+    _auth = Z2xvYmFsOnBhc3M=
+    "#;
+    let npmrc = Npmrc::parse(content).unwrap();
+
+    // 1. Scoped _auth on subpath
+    let priv_url = Url::parse("https://registry.corp.com/private/sub/pkg").unwrap();
+    assert_eq!(
+        npmrc.get_basic_auth(&priv_url),
+        Some("cHJpdmF0ZV91c2VyOnBhc3M=".to_string())
+    );
+
+    // 2. Scoped username + password
+    let other_url = Url::parse("https://other.org/pkg").unwrap();
+    let expected_b64 = data_encoding::BASE64.encode(b"myuser:mypass");
+    assert_eq!(
+        npmrc.get_basic_auth(&other_url),
+        Some(expected_b64)
+    );
+
+    // 3. Fallback to global _auth
+    let unauth_url = Url::parse("https://unknown.net/pkg").unwrap();
+    assert_eq!(
+        npmrc.get_basic_auth(&unauth_url),
+        Some("Z2xvYmFsOnBhc3M=".to_string())
+    );
+}
+
+#[test]
+fn test_no_proxy_matcher_extreme_cases() {
+    use crate::npmrc::NoProxyMatcher;
+
+    // Wildcard matches everything
+    let star_matcher = NoProxyMatcher::parse("*");
+    assert!(star_matcher.matches("example.com", Some(80)));
+    assert!(star_matcher.matches("192.168.1.1", Some(443)));
+    assert!(star_matcher.matches("fe80::1", Some(8080)));
+    assert!(star_matcher.matches("anything", None));
+
+    // IPv4 CIDR, IPv6 CIDR, domains, port-specific
+    let rules = "10.0.0.0/8, 192.168.1.0/24, fd00::/8, 127.0.0.1, .internal.net, corp.com:8443";
+    let matcher = NoProxyMatcher::parse(rules);
+
+    // IPv4 CIDR matching
+    assert!(matcher.matches("10.254.1.2", Some(80)));
+    assert!(matcher.matches("192.168.1.55", Some(443)));
+    assert!(!matcher.matches("192.168.2.1", Some(80)));
+    assert!(!matcher.matches("172.16.0.1", Some(80)));
+
+    // IPv6 CIDR matching
+    assert!(matcher.matches("fd00::1", Some(80)));
+    assert!(matcher.matches("fd12:3456:789a::1", Some(443)));
+    assert!(!matcher.matches("fe80::1", Some(80)));
+
+    // Exact IP matching
+    assert!(matcher.matches("127.0.0.1", Some(80)));
+    assert!(matcher.matches("127.0.0.1", Some(9999)));
+    assert!(!matcher.matches("127.0.0.2", Some(80)));
+
+    // Domain matching (.internal.net matches any subdomain or exact)
+    assert!(matcher.matches("api.internal.net", Some(443)));
+    assert!(matcher.matches("sub.dev.internal.net", Some(80)));
+    assert!(matcher.matches("internal.net", Some(80)));
+    assert!(!matcher.matches("external.net", Some(80)));
+
+    // Port-specific host matching
+    assert!(matcher.matches("corp.com", Some(8443)));
+    assert!(!matcher.matches("corp.com", Some(80)));
+    assert!(!matcher.matches("corp.com", Some(443)));
+    assert!(!matcher.matches("corp.com", None));
+}
+
+#[test]
+fn test_config_proxy_and_no_proxy_helpers() {
+    let mut opts = ConfigOptions::new();
+    opts = opts.with_cli("https-proxy", "http://corporate-proxy:8080");
+    opts = opts.with_cli("no-proxy", "localhost,127.0.0.1,10.0.0.0/8,*.corp.internal");
+    let cfg = Config::load_with_options(opts).unwrap();
+
+    assert_eq!(cfg.https_proxy(), Some("http://corporate-proxy:8080"));
+
+    let local_url = Url::parse("https://localhost:3000/pkg").unwrap();
+    assert!(cfg.should_bypass_proxy(&local_url));
+
+    let corp_url = Url::parse("https://registry.corp.internal/pkg").unwrap();
+    assert!(cfg.should_bypass_proxy(&corp_url));
+
+    let private_ip_url = Url::parse("https://10.5.20.1/pkg").unwrap();
+    assert!(cfg.should_bypass_proxy(&private_ip_url));
+
+    let external_url = Url::parse("https://registry.npmjs.org/pkg").unwrap();
+    assert!(!cfg.should_bypass_proxy(&external_url));
+}
+
+#[test]
+fn test_credential_scrubbing_edge_cases() {
+    use crate::npmrc::scrub_credentials;
+
+    let raw = r#"
+    //registry.npmjs.org/:_authToken=npm_secret_12345
+    _auth = dXNlcjpwYXNzd29yZA==
+    password: my_super_secret_password
+    proxy = http://proxyuser:proxypass@proxy.corp.com:8080
+    normal_key = normal_value
+    "#;
+
+    let scrubbed = scrub_credentials(raw);
+    assert!(!scrubbed.contains("npm_secret_12345"));
+    assert!(!scrubbed.contains("dXNlcjpwYXNzd29yZA=="));
+    assert!(!scrubbed.contains("my_super_secret_password"));
+    assert!(!scrubbed.contains("proxyuser:proxypass"));
+    assert!(scrubbed.contains("normal_key = normal_value"));
+}
+
+#[test]
+fn test_malformed_npmrc_lines_and_null_bytes() {
+    // Missing key
+    assert!(Npmrc::parse("=some_value").is_err());
+
+    // Null byte in content
+    assert!(Npmrc::parse("key=val\0ue").is_err());
+}
