@@ -488,12 +488,13 @@ impl LockfilePackage {
             &self.dependencies,
             &self.optional_dependencies,
             &self.dev_dependencies,
-        ] {
-            if let Some(map) = section {
-                for (name, spec) in map {
-                    if !spec.is_empty() {
-                        specs.insert(name.clone(), spec.clone());
-                    }
+        ]
+        .into_iter()
+        .flatten()
+        {
+            for (name, spec) in section {
+                if !spec.is_empty() {
+                    specs.insert(name.clone(), spec.clone());
                 }
             }
         }
@@ -1356,15 +1357,13 @@ impl LockfileV3 {
                     return false;
                 }
             }
-        } else if !manifest_has_ws && !root_has_ws {
-            if !allow_extra_lock_deps {
-                let has_lockfile_members = self
-                    .packages
-                    .keys()
-                    .any(|k| !k.is_empty() && !k.split(['/', '\\']).any(|seg| seg == "node_modules"));
-                if has_lockfile_members {
-                    return false;
-                }
+        } else if !manifest_has_ws && !root_has_ws && !allow_extra_lock_deps {
+            let has_lockfile_members = self
+                .packages
+                .keys()
+                .any(|k| !k.is_empty() && !k.split(['/', '\\']).any(|seg| seg == "node_modules"));
+            if has_lockfile_members {
+                return false;
             }
         }
 
@@ -1372,7 +1371,7 @@ impl LockfileV3 {
         let overrides = rnpm_core::overrides::Overrides::from_manifest(manifest).ok();
 
         if let Some(ref ov) = overrides {
-            for (rule_key, _) in &ov.rules {
+            for rule_key in ov.rules.keys() {
                 let dep_name = rule_key
                     .split_once('@')
                     .map(|(name, _)| {

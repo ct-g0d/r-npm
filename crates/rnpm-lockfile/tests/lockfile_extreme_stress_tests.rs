@@ -1156,7 +1156,7 @@ fn test_deserialize_lockfile_version_integral_floats_and_rejections() {
 
 #[test]
 fn test_matches_manifest_ext_absent_root_workspace_metadata_v3_omission() {
-    let mut manifest = Manifest {
+    let manifest = Manifest {
         name: Some("ws-monorepo".to_string()),
         version: Some("1.0.0".to_string()),
         workspaces: Some(rnpm_core::manifest::PackageWorkspaces::List(vec![
@@ -1364,7 +1364,7 @@ fn test_matches_manifest_ext_workspace_drift_discovered_disk_members_differentia
     )
     .unwrap();
 
-    let manifest = Manifest::from_file(&root_path.join("package.json")).unwrap();
+    let manifest = Manifest::from_file(root_path.join("package.json")).unwrap();
 
     // Lockfile with absent root workspaces metadata but matching members
     let mut lockfile = LockfileV3::new("disk-ws-test", Some("1.0.0".to_string()));
