@@ -526,25 +526,37 @@ async fn test_lifecycle_timeout_and_exit_code_fidelity() {
         elapsed
     );
 
-    // Verify child process was terminated by ProcessTreeGuard
-    if child_pid_file.exists() {
-        if let Ok(pid_str) = std::fs::read_to_string(&child_pid_file) {
-            if let Ok(child_pid) = pid_str.trim().parse::<u32>() {
-                if child_pid > 0 {
-                    let mut is_running = true;
-                    for _ in 0..60 {
-                        if !rnpm_lifecycle::process_guard::is_process_running(child_pid) {
-                            is_running = false;
-                            break;
-                        }
-                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    // Verify child process was terminated by ProcessTreeGuard.
+    // Explicitly require child PID evidence so the termination assertion cannot silently skip.
+    let mut child_pid_opt = None;
+    for _ in 0..20 {
+        if child_pid_file.exists() {
+            if let Ok(pid_str) = std::fs::read_to_string(&child_pid_file) {
+                if let Ok(pid) = pid_str.trim().parse::<u32>() {
+                    if pid > 0 {
+                        child_pid_opt = Some(pid);
+                        break;
                     }
-                    assert!(
-                        !is_running,
-                        "Child process {child_pid} must be terminated by ProcessTreeGuard on timeout"
-                    );
                 }
             }
         }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
+
+    let child_pid = child_pid_opt.expect(
+        "child PID evidence must exist and be valid so termination assertion cannot silently skip"
+    );
+
+    let mut is_running = true;
+    for _ in 0..60 {
+        if !rnpm_lifecycle::process_guard::is_process_running(child_pid) {
+            is_running = false;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(
+        !is_running,
+        "Child process {child_pid} must be terminated by ProcessTreeGuard on timeout"
+    );
 }
