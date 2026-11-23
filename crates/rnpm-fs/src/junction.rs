@@ -20,7 +20,70 @@ pub fn reset_junctions_created() {
     JUNCTIONS_CREATED.store(0, Ordering::Relaxed);
 }
 
-/// Create a non-admin directory junction on Windows, or a symlink on Unix.
+#[cfg(not(windows))]
+fn normalize_abs_with_existing_ancestor(path: &Path) -> std::path::PathBuf {
+    let abs = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
+    let mut clean = std::path::PathBuf::new();
+    for comp in abs.components() {
+        match comp {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                clean.pop();
+            }
+            other => clean.push(other.as_os_str()),
+        }
+    }
+    let mut existing = clean.as_path();
+    let mut suffix: Vec<std::ffi::OsString> = Vec::new();
+    loop {
+        if let Ok(canon) = fs::canonicalize(existing) {
+            let mut resolved = canon;
+            for part in suffix.into_iter().rev() {
+                resolved.push(part);
+            }
+            return resolved;
+        }
+        match (existing.parent(), existing.file_name()) {
+            (Some(parent), Some(name)) => {
+                suffix.push(name.to_os_string());
+                existing = parent;
+            }
+            _ => return clean,
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn compute_relative_symlink_target(from_dir: &Path, target: &Path) -> Option<std::path::PathBuf> {
+    let from_abs = normalize_abs_with_existing_ancestor(from_dir);
+    let to_abs = normalize_abs_with_existing_ancestor(target);
+    let from_comps: Vec<_> = from_abs.components().collect();
+    let to_comps: Vec<_> = to_abs.components().collect();
+    let mut common = 0;
+    while common < from_comps.len()
+        && common < to_comps.len()
+        && from_comps[common] == to_comps[common]
+    {
+        common += 1;
+    }
+    if common == 0 {
+        return None;
+    }
+    let mut rel = std::path::PathBuf::new();
+    for _ in common..from_comps.len() {
+        rel.push("..");
+    }
+    for comp in &to_comps[common..] {
+        rel.push(comp.as_os_str());
+    }
+    if rel.as_os_str().is_empty() {
+        rel.push(".");
+    }
+    Some(rel)
+}
+
+/// Create a non-admin directory junction on Windows, or a relative POSIX symlink on Unix
+/// (matching npm's `@npmcli/arborist` `symlink(relative(dirname(link), target), link, 'junction')`).
 pub fn create_junction(link: &Path, target: &Path) -> Result<(), FsError> {
     if let Some(parent) = link.parent() {
         let _ = fs::create_dir_all(parent);
@@ -36,7 +99,11 @@ pub fn create_junction(link: &Path, target: &Path) -> Result<(), FsError> {
 
         #[cfg(not(windows))]
         {
-            std::os::unix::fs::symlink(&target_v, &link_v).map_err(FsError::Io)
+            let link_target = link
+                .parent()
+                .and_then(|parent| compute_relative_symlink_target(parent, target))
+                .unwrap_or_else(|| target_v.clone());
+            std::os::unix::fs::symlink(&link_target, &link_v).map_err(FsError::Io)
         }
     };
     if res.is_ok() {
@@ -559,9 +626,15 @@ pub fn junction_points_to(link: &Path, expected_target: &Path) -> bool {
     if !is_junction(link).unwrap_or(false) {
         return false;
     }
-    let actual = match read_junction_target(link) {
+    let raw_actual = match read_junction_target(link) {
         Ok(t) => t,
         Err(_) => return false,
+    };
+    let actual = if raw_actual.is_relative() {
+        link.parent()
+            .map_or_else(|| raw_actual.clone(), |p| p.join(&raw_actual))
+    } else {
+        raw_actual
     };
     let clean_expected = crate::path::strip_verbatim_prefix(expected_target);
 
@@ -613,5 +686,28 @@ mod directory_link_tests {
             std::fs::read_to_string(target.join("value")).unwrap(),
             "kept"
         );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn unix_junction_creates_relative_symlink_matching_arborist() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws_target = dir.path().join("packages").join("w");
+        std::fs::create_dir_all(&ws_target).unwrap();
+        let ws_link = dir.path().join("node_modules").join("w");
+        super::create_junction(&ws_link, &ws_target).unwrap();
+        assert_eq!(
+            std::fs::read_link(&ws_link).unwrap(),
+            std::path::PathBuf::from("../packages/w")
+        );
+        assert!(super::junction_points_to(&ws_link, &ws_target));
+
+        let self_link = dir.path().join("node_modules").join("self");
+        super::create_junction(&self_link, dir.path()).unwrap();
+        assert_eq!(
+            std::fs::read_link(&self_link).unwrap(),
+            std::path::PathBuf::from("..")
+        );
+        assert!(super::junction_points_to(&self_link, dir.path()));
     }
 }

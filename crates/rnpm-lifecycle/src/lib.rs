@@ -1006,6 +1006,40 @@ pub fn node_version() -> String {
         .clone()
 }
 
+/// Extract the lowercase ASCII hostname from an HTTP(S) URL string.
+fn url_hostname(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    let after_scheme = trimmed.split_once("://")?.1;
+    let authority = after_scheme.split(['/', '?', '#']).next()?;
+    let host_port = authority.rsplit('@').next()?;
+    let host = if let Some(rest) = host_port.strip_prefix('[') {
+        rest.split(']').next()?
+    } else {
+        host_port.split(':').next()?
+    };
+    if host.is_empty() {
+        None
+    } else {
+        Some(host.to_ascii_lowercase())
+    }
+}
+
+/// Map GitHub Actions server URL + runner environment to npm's sub-CI token
+/// (`dotcom-hosted`, `dotcom-selfhosted`, `dotcom`, `ghecom`, `ghes`).
+fn github_actions_sub_ci(server_url: &str, runner_env: &str) -> Option<&'static str> {
+    let runner_env = runner_env.trim();
+    match url_hostname(server_url).as_deref() {
+        Some("github.com") => match runner_env {
+            "github-hosted" => Some("dotcom-hosted"),
+            "self-hosted" => Some("dotcom-selfhosted"),
+            _ => Some("dotcom"),
+        },
+        Some(host) if host == "ghe.com" || host.ends_with(".ghe.com") => Some("ghecom"),
+        Some(_) => Some("ghes"),
+        None => None,
+    }
+}
+
 /// npm's default `user-agent`:
 /// `npm/{npm-version} node/{node-version} {platform} {arch} workspaces/{bool} {ci}`.
 pub fn npm_user_agent() -> String {
@@ -1020,18 +1054,33 @@ pub fn npm_user_agent() -> String {
         "x86" => "ia32",
         other => other,
     };
-    let ci = [
-        ("GITHUB_ACTIONS", "github-actions"),
-        ("GITLAB_CI", "gitlab-ci"),
-        ("CIRCLECI", "circleci"),
-        ("TRAVIS", "travis-ci"),
-        ("BUILDKITE", "buildkite"),
-        ("TF_BUILD", "azure-pipelines"),
-    ]
-    .iter()
-    .find(|(var, _)| std::env::var_os(var).is_some())
-    .map(|(_, name)| format!(" ci/{name}"))
-    .unwrap_or_default();
+    let is_github_actions = std::env::var_os("GITHUB_ACTIONS").is_some_and(|v| !v.is_empty());
+    let ci_name = if is_github_actions {
+        Some("github-actions")
+    } else {
+        [
+            ("GITLAB_CI", "gitlab-ci"),
+            ("CIRCLECI", "circleci"),
+            ("TRAVIS", "travis-ci"),
+            ("BUILDKITE", "buildkite"),
+            ("TF_BUILD", "azure-pipelines"),
+        ]
+        .iter()
+        .find(|(var, _)| std::env::var_os(var).is_some_and(|v| !v.is_empty()))
+        .map(|(_, name)| *name)
+    };
+    let sub_ci_name = if is_github_actions {
+        let server_url = std::env::var("GITHUB_SERVER_URL").unwrap_or_default();
+        let runner_env = std::env::var("RUNNER_ENVIRONMENT").unwrap_or_default();
+        github_actions_sub_ci(&server_url, &runner_env)
+    } else {
+        None
+    };
+    let ci = match (ci_name, sub_ci_name) {
+        (Some(name), Some(sub)) => format!(" ci/{name}/{sub}"),
+        (Some(name), None) => format!(" ci/{name}"),
+        (None, _) => String::new(),
+    };
     format!(
         "npm/{NPM_VERSION} node/{} {platform} {arch} workspaces/false{ci}",
         node_version()

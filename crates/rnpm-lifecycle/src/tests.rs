@@ -4493,3 +4493,32 @@ fn test_node_gyp_single_version_not_a_semver_rejected_for_latest() {
         "Live cache directory must not be created when version is not-a-semver"
     );
 }
+
+#[test]
+fn test_github_actions_sub_ci_tokens() {
+    assert_eq!(
+        github_actions_sub_ci("https://github.com", "github-hosted"),
+        Some("dotcom-hosted")
+    );
+    assert_eq!(
+        github_actions_sub_ci("https://github.com", "self-hosted"),
+        Some("dotcom-selfhosted")
+    );
+    assert_eq!(
+        github_actions_sub_ci("https://github.com", ""),
+        Some("dotcom")
+    );
+    assert_eq!(
+        github_actions_sub_ci("https://acme.ghe.com", "github-hosted"),
+        Some("ghecom")
+    );
+    assert_eq!(
+        github_actions_sub_ci("https://ghe.com", ""),
+        Some("ghecom")
+    );
+    assert_eq!(
+        github_actions_sub_ci("https://github.internal.corp:8443/org", ""),
+        Some("ghes")
+    );
+    assert_eq!(github_actions_sub_ci("", "github-hosted"), None);
+}

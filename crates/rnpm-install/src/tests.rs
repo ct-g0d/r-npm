@@ -230,14 +230,26 @@ fn test_link_tree_bins_ansi_html() {
     .unwrap();
 
     assert!(bin.join("ansi-html").exists(), "bin/ansi-html exists");
-    assert!(
-        bin.join("ansi-html.cmd").exists(),
-        "bin/ansi-html.cmd exists"
-    );
-    assert!(
-        bin.join("ansi-html.ps1").exists(),
-        "bin/ansi-html.ps1 exists"
-    );
+    #[cfg(unix)]
+    {
+        assert!(
+            bin.join("ansi-html").is_symlink(),
+            "bin/ansi-html is a POSIX symlink on Unix"
+        );
+        assert!(!bin.join("ansi-html.cmd").exists());
+        assert!(!bin.join("ansi-html.ps1").exists());
+    }
+    #[cfg(not(unix))]
+    {
+        assert!(
+            bin.join("ansi-html.cmd").exists(),
+            "bin/ansi-html.cmd exists"
+        );
+        assert!(
+            bin.join("ansi-html.ps1").exists(),
+            "bin/ansi-html.ps1 exists"
+        );
+    }
 }
 
 #[test]
@@ -4321,12 +4333,20 @@ async fn test_upgrade_bin_shim_overwritten() {
     installer.install().await.unwrap();
 
     let bin_dir = project_dir.join("node_modules/.bin");
-    let cmd_file = bin_dir.join("tool.cmd");
-    assert!(
-        cmd_file.exists(),
-        ".bin/tool.cmd must exist after v1 install"
-    );
-    let content_v1 = fs::read_to_string(&cmd_file).unwrap();
+    #[cfg(unix)]
+    let read_bin_target = |name: &str| -> String {
+        let link = bin_dir.join(name);
+        assert!(link.is_symlink(), ".bin/{name} symlink must exist");
+        fs::read_link(&link).unwrap().to_string_lossy().into_owned()
+    };
+    #[cfg(not(unix))]
+    let read_bin_target = |name: &str| -> String {
+        let cmd_file = bin_dir.join(format!("{name}.cmd"));
+        assert!(cmd_file.exists(), ".bin/{name}.cmd must exist");
+        fs::read_to_string(&cmd_file).unwrap()
+    };
+
+    let content_v1 = read_bin_target("tool");
     assert!(
         content_v1.contains("old.js"),
         "v1 shim must point to old.js, got:\n{content_v1}"
@@ -4367,11 +4387,7 @@ async fn test_upgrade_bin_shim_overwritten() {
 
     installer2.install().await.unwrap();
 
-    assert!(
-        cmd_file.exists(),
-        ".bin/tool.cmd must exist after v2 upgrade"
-    );
-    let content_v2 = fs::read_to_string(&cmd_file).unwrap();
+    let content_v2 = read_bin_target("tool");
     assert!(
         content_v2.contains("new.js"),
         "v2 shim must point to new.js, got:\n{content_v2}"
@@ -4440,9 +4456,18 @@ async fn test_scoped_bin_conflict_precedence() {
     installer.install().await.unwrap();
 
     let bin_dir = project_dir.join("node_modules/.bin");
-    let cmd_file = bin_dir.join("tool.cmd");
-    assert!(cmd_file.exists());
-    let content = fs::read_to_string(&cmd_file).unwrap();
+    #[cfg(unix)]
+    let content = {
+        let link = bin_dir.join("tool");
+        assert!(link.is_symlink(), ".bin/tool symlink must exist");
+        fs::read_link(&link).unwrap().to_string_lossy().into_owned()
+    };
+    #[cfg(not(unix))]
+    let content = {
+        let cmd_file = bin_dir.join("tool.cmd");
+        assert!(cmd_file.exists());
+        fs::read_to_string(&cmd_file).unwrap()
+    };
     assert!(
         content.contains("@aa/tool") || content.contains(r"@aa\tool"),
         "@aa/tool must win bin conflict over zz-tool, got:\n{content}"
@@ -4494,8 +4519,16 @@ async fn test_stale_shim_removed_on_upgrade() {
     installer.install().await.unwrap();
 
     let bin_dir = project_dir.join("node_modules/.bin");
-    assert!(bin_dir.join("tool1.cmd").exists());
-    assert!(bin_dir.join("tool2.cmd").exists());
+    #[cfg(unix)]
+    {
+        assert!(bin_dir.join("tool1").is_symlink());
+        assert!(bin_dir.join("tool2").is_symlink());
+    }
+    #[cfg(not(unix))]
+    {
+        assert!(bin_dir.join("tool1.cmd").exists());
+        assert!(bin_dir.join("tool2.cmd").exists());
+    }
 
     // v2 only has "tool1", "tool2" removed
     let local_a_v2 = tmp.path().join("pkg_a_v2");
@@ -4528,6 +4561,12 @@ async fn test_stale_shim_removed_on_upgrade() {
 
     installer2.install().await.unwrap();
 
+    #[cfg(unix)]
+    assert!(
+        bin_dir.join("tool1").is_symlink(),
+        "tool1 symlink must be preserved"
+    );
+    #[cfg(not(unix))]
     assert!(
         bin_dir.join("tool1.cmd").exists(),
         "tool1 shim must be preserved"
@@ -4541,7 +4580,7 @@ async fn test_stale_shim_removed_on_upgrade() {
         "stale tool2.ps1 shim must be removed"
     );
     assert!(
-        !bin_dir.join("tool2").exists(),
+        !bin_dir.join("tool2").exists() && fs::symlink_metadata(bin_dir.join("tool2")).is_err(),
         "stale tool2 POSIX shim must be removed"
     );
 }

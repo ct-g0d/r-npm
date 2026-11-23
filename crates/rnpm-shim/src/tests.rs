@@ -1230,6 +1230,17 @@ fn test_global_bin_collision_same_package_regular_shim_allowed() {
     let dir = tempdir().unwrap();
     let global_bin = dir.path().join("usr").join("local").join("bin");
     fs::create_dir_all(&global_bin).unwrap();
+    let pkg_bin = dir
+        .path()
+        .join("usr")
+        .join("local")
+        .join("lib")
+        .join("node_modules")
+        .join("my-pkg")
+        .join("bin");
+    fs::create_dir_all(&pkg_bin).unwrap();
+    fs::write(pkg_bin.join("old-cli.js"), "#!/usr/bin/env node\n").unwrap();
+    fs::write(pkg_bin.join("new-cli.js"), "#!/usr/bin/env node\n").unwrap();
 
     // Create a global shim for my-pkg (as created by create_shims in a global dir)
     create_shims(&global_bin, "my-tool", "my-pkg/bin/old-cli.js").unwrap();
@@ -1244,6 +1255,24 @@ fn test_global_bin_collision_foreign_package_regular_shim_rejected() {
     let dir = tempdir().unwrap();
     let global_bin = dir.path().join("usr").join("local").join("bin");
     fs::create_dir_all(&global_bin).unwrap();
+    let global_nm = dir
+        .path()
+        .join("usr")
+        .join("local")
+        .join("lib")
+        .join("node_modules");
+    fs::create_dir_all(global_nm.join("foreign-pkg").join("bin")).unwrap();
+    fs::create_dir_all(global_nm.join("my-pkg").join("bin")).unwrap();
+    fs::write(
+        global_nm.join("foreign-pkg").join("bin").join("cli.js"),
+        "#!/usr/bin/env node\n",
+    )
+    .unwrap();
+    fs::write(
+        global_nm.join("my-pkg").join("bin").join("cli.js"),
+        "#!/usr/bin/env node\n",
+    )
+    .unwrap();
 
     // Create a global shim for foreign-pkg
     create_shims(&global_bin, "my-tool", "foreign-pkg/bin/cli.js").unwrap();
@@ -1257,6 +1286,7 @@ fn test_global_bin_collision_foreign_package_regular_shim_rejected() {
 }
 
 #[test]
+#[cfg(not(unix))]
 fn test_windows_companion_shims_collision_checks() {
     let dir = tempdir().unwrap();
     let global_bin = dir.path().join("usr").join("local").join("bin");
@@ -1290,6 +1320,14 @@ fn test_replace_existing_symlink_does_not_overwrite_target() {
     let dir = tempdir().unwrap();
     let global_bin = dir.path().join("bin");
     fs::create_dir_all(&global_bin).unwrap();
+    let new_target_dir = dir
+        .path()
+        .join("lib")
+        .join("node_modules")
+        .join("my-pkg")
+        .join("bin");
+    fs::create_dir_all(&new_target_dir).unwrap();
+    fs::write(new_target_dir.join("cli.js"), "#!/usr/bin/env node\n").unwrap();
     let target_file = dir.path().join("target.js");
     let original_content = b"original target file content - must not be overwritten!";
     fs::write(&target_file, original_content).unwrap();

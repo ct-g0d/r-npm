@@ -250,10 +250,16 @@ fn test_source_map_11_cmd_shim() {
     assert!(manifest.bin.is_some());
 
     let temp = tempfile::tempdir().unwrap();
-    let bin_dir = temp.path().join("bin");
+    let bin_dir = temp.path().join("node_modules").join(".bin");
     fs::create_dir_all(&bin_dir).unwrap();
 
-    let target_js = temp.path().join("my-cli.js");
+    let target_js = temp
+        .path()
+        .join("node_modules")
+        .join("my-package")
+        .join("bin")
+        .join("my-cli.js");
+    fs::create_dir_all(target_js.parent().unwrap()).unwrap();
     fs::write(&target_js, "#!/usr/bin/env node\nconsole.log('hi');").unwrap();
 
     create_shims(&bin_dir, "my-cli", "my-package/bin/my-cli.js").unwrap();
@@ -261,6 +267,10 @@ fn test_source_map_11_cmd_shim() {
     {
         let meta = fs::symlink_metadata(bin_dir.join("my-cli")).unwrap();
         assert!(meta.file_type().is_symlink());
+        assert_eq!(
+            fs::read_link(bin_dir.join("my-cli")).unwrap(),
+            PathBuf::from("../my-package/bin/my-cli.js")
+        );
         assert!(!bin_dir.join("my-cli.cmd").exists());
         assert!(!bin_dir.join("my-cli.ps1").exists());
     }
