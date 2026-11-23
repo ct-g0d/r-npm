@@ -1636,7 +1636,7 @@ pub fn execute_lifecycle_script(ctx: &LifecycleContext) -> Result<ExitStatus> {
 
     let mut env = build_process_env(ctx);
 
-    if ctx.package_dir.join("binding.gyp").is_file() || ctx.script_cmd.contains("node-gyp") {
+    if ctx.script_cmd.contains("node-gyp") {
         let config = load_config_for_context(ctx);
         let gyp_path = ensure_node_gyp(
             &ctx.project_root,
@@ -1819,7 +1819,7 @@ where
 
     let mut env = build_process_env(ctx);
 
-    if ctx.package_dir.join("binding.gyp").is_file() || ctx.script_cmd.contains("node-gyp") {
+    if ctx.script_cmd.contains("node-gyp") {
         let config = load_config_for_context(ctx);
         let gyp_path = ensure_node_gyp(
             &ctx.project_root,

@@ -338,12 +338,13 @@ pub fn bootstrap_node_gyp(
     // to guarantee no nested block_on conflicts with existing tokio runtimes.
     let staging_clone = staging_dir.clone();
     let reg_clone = registry.clone();
+    let config_clone = config.clone();
     std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()?;
         rt.block_on(async move {
-            download_and_unpack_node_gyp(&reg_clone, &staging_clone).await
+            download_and_unpack_node_gyp_with_config(&reg_clone, &staging_clone, &config_clone).await
         })
     })
     .join()
@@ -365,17 +366,116 @@ pub fn bootstrap_node_gyp(
     Ok(candidate1)
 }
 
-/// Downloads, integrity-verifies, and unpacks `node-gyp` and its transitive production dependencies
-/// into `staging_dir`.
-pub async fn download_and_unpack_node_gyp(registry: &str, staging_dir: &Path) -> anyhow::Result<()> {
+fn build_bootstrap_client(
+    registry: &str,
+    config: &rnpm_config::Config,
+) -> anyhow::Result<reqwest::Client> {
     let mut builder = reqwest::Client::builder();
     if registry.contains("127.0.0.1") || registry.contains("localhost") {
         builder = builder.no_proxy();
     }
-    let client = builder.build()?;
+    if config.get_bool("strict-ssl") == Some(false) {
+        builder = builder.danger_accept_invalid_certs(true);
+    }
+    if let Some(cafile) = config
+        .get("cafile")
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && *s != "null")
+    {
+        let pem = std::fs::read(cafile)
+            .map_err(|e| anyhow::anyhow!("Failed to read cafile '{cafile}': {e}"))?;
+        for cert in reqwest::Certificate::from_pem_bundle(&pem)
+            .map_err(|e| anyhow::anyhow!("Invalid PEM certificate in cafile '{cafile}': {e}"))?
+        {
+            builder = builder.add_root_certificate(cert);
+        }
+    }
+    if let Some(ca_pem) = config
+        .get("ca")
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && *s != "null")
+    {
+        let normalized = ca_pem.replace("\\n", "\n");
+        if let Ok(certs) = reqwest::Certificate::from_pem_bundle(normalized.as_bytes()) {
+            for cert in certs {
+                builder = builder.add_root_certificate(cert);
+            }
+        }
+    }
+    Ok(builder.build()?)
+}
+
+fn registry_auth_header(registry: &str, config: &rnpm_config::Config) -> Option<String> {
+    let url = reqwest::Url::parse(registry).ok()?;
+    if let Some(token) = config.npmrc.get_auth_token(&url) {
+        return Some(format!("Bearer {token}"));
+    }
+    let host = url.host_str()?.to_ascii_lowercase();
+    let port_part = url.port().map(|p| format!(":{p}")).unwrap_or_default();
+    let path = url.path();
+    let norm_path = if path.ends_with('/') {
+        path.to_string()
+    } else {
+        format!("{path}/")
+    };
+    let basic_auths = config.npmrc.basic_auths();
+    for key in [
+        format!("//{host}{port_part}{norm_path}"),
+        format!("//{host}{port_part}{path}"),
+        format!("//{host}{port_part}/"),
+        format!("//{host}/"),
+    ] {
+        if let Some(basic) = basic_auths.get(&key) {
+            return Some(format!("Basic {basic}"));
+        }
+    }
+    None
+}
+
+fn same_origin(a: &str, b: &str) -> bool {
+    match (reqwest::Url::parse(a), reqwest::Url::parse(b)) {
+        (Ok(ua), Ok(ub)) => {
+            ua.scheme() == ub.scheme()
+                && ua.host_str() == ub.host_str()
+                && ua.port_or_known_default() == ub.port_or_known_default()
+        }
+        _ => false,
+    }
+}
+
+fn get_with_registry_auth(
+    client: &reqwest::Client,
+    url: &str,
+    registry: &str,
+    auth_header: Option<&str>,
+) -> reqwest::RequestBuilder {
+    let mut req = client.get(url);
+    if let Some(auth) = auth_header {
+        if same_origin(url, registry) {
+            req = req.header(reqwest::header::AUTHORIZATION, auth);
+        }
+    }
+    req
+}
+
+/// Downloads, integrity-verifies, and unpacks `node-gyp` and its transitive production dependencies
+/// into `staging_dir`.
+pub async fn download_and_unpack_node_gyp(registry: &str, staging_dir: &Path) -> anyhow::Result<()> {
+    download_and_unpack_node_gyp_with_config(registry, staging_dir, &rnpm_config::Config::default()).await
+}
+
+/// Downloads, integrity-verifies, and unpacks `node-gyp` and its transitive production dependencies
+/// into `staging_dir`, preserving registry authentication, CA certificates, and TLS settings from `config`.
+pub async fn download_and_unpack_node_gyp_with_config(
+    registry: &str,
+    staging_dir: &Path,
+    config: &rnpm_config::Config,
+) -> anyhow::Result<()> {
+    let client = build_bootstrap_client(registry, config)?;
+    let auth_header = registry_auth_header(registry, config);
 
     // 1. Fetch metadata for node-gyp
-    let packument = fetch_packument(&client, registry, "node-gyp").await?;
+    let packument = fetch_packument(&client, registry, "node-gyp", auth_header.as_deref()).await?;
 
     let (chosen_version, version_obj) = if let Some(versions) = packument.get("versions").and_then(|v| v.as_object()) {
         pick_matching_version(versions, packument.get("dist-tags"), "latest")
@@ -411,7 +511,9 @@ pub async fn download_and_unpack_node_gyp(registry: &str, staging_dir: &Path) ->
     let shasum_opt = dist.get("shasum").and_then(|s| s.as_str());
 
     info!("Downloading node-gyp@{} tarball from '{}'...", chosen_version, full_tb_url);
-    let tb_resp = client.get(&full_tb_url).send().await?;
+    let tb_resp = get_with_registry_auth(&client, &full_tb_url, registry, auth_header.as_deref())
+        .send()
+        .await?;
     if !tb_resp.status().is_success() {
         anyhow::bail!("Failed to download node-gyp tarball from '{}': HTTP {}", full_tb_url, tb_resp.status());
     }
@@ -446,7 +548,14 @@ pub async fn download_and_unpack_node_gyp(registry: &str, staging_dir: &Path) ->
 
     if !root_deps.is_empty() {
         info!("Installing {} production dependencies for standalone node-gyp...", root_deps.len());
-        install_production_dependencies(&client, registry, staging_dir, root_deps).await?;
+        install_production_dependencies_with_auth(
+        &client,
+        registry,
+        staging_dir,
+        root_deps,
+        auth_header.as_deref(),
+    )
+    .await?;
     }
 
     let c1 = staging_dir.join("bin").join("node-gyp.js");
@@ -581,6 +690,16 @@ pub async fn install_production_dependencies(
     staging_dir: &Path,
     root_deps: Vec<(String, String)>,
 ) -> anyhow::Result<()> {
+    install_production_dependencies_with_auth(client, registry, staging_dir, root_deps, None).await
+}
+
+async fn install_production_dependencies_with_auth(
+    client: &reqwest::Client,
+    registry: &str,
+    staging_dir: &Path,
+    root_deps: Vec<(String, String)>,
+    auth_header: Option<&str>,
+) -> anyhow::Result<()> {
     struct DepJob {
         name: String,
         spec: String,
@@ -641,7 +760,7 @@ pub async fn install_production_dependencies(
         let packument = if let Some(cached) = packument_cache.get(&job.name) {
             cached.clone()
         } else {
-            let fetched = fetch_packument(client, registry, &job.name).await?;
+            let fetched = fetch_packument(client, registry, &job.name, auth_header).await?;
             packument_cache.insert(job.name.clone(), fetched.clone());
             fetched
         };
@@ -683,7 +802,9 @@ pub async fn install_production_dependencies(
         let shasum_opt = dist.get("shasum").and_then(|s| s.as_str());
 
         debug!("Downloading dependency '{}@{}' from '{}'...", job.name, chosen_version, full_tb_url);
-        let tb_resp = client.get(&full_tb_url).send().await?;
+        let tb_resp = get_with_registry_auth(client, &full_tb_url, registry, auth_header)
+            .send()
+            .await?;
         if !tb_resp.status().is_success() {
             anyhow::bail!(
                 "Failed to download tarball for '{}@{}' from '{}': HTTP {}",
@@ -735,15 +856,22 @@ async fn fetch_packument(
     client: &reqwest::Client,
     registry: &str,
     pkg_name: &str,
+    auth_header: Option<&str>,
 ) -> anyhow::Result<serde_json::Value> {
     let reg_trimmed = registry.trim_end_matches('/');
     let encoded = rnpm_config::encode_package_name(pkg_name);
     let primary_url = format!("{reg_trimmed}/{encoded}");
 
-    let mut resp = client.get(&primary_url).send().await?;
+    let mut resp = get_with_registry_auth(client, &primary_url, registry, auth_header)
+        .send()
+        .await?;
     if !resp.status().is_success() && pkg_name.contains('/') {
         let fallback_url = format!("{reg_trimmed}/{pkg_name}");
-        if let Ok(fallback_resp) = client.get(&fallback_url).send().await {
+        if let Ok(fallback_resp) =
+            get_with_registry_auth(client, &fallback_url, registry, auth_header)
+                .send()
+                .await
+        {
             if fallback_resp.status().is_success() {
                 resp = fallback_resp;
             }
@@ -751,7 +879,11 @@ async fn fetch_packument(
     }
     if !resp.status().is_success() {
         let latest_url = format!("{reg_trimmed}/{encoded}/latest");
-        if let Ok(latest_resp) = client.get(&latest_url).send().await {
+        if let Ok(latest_resp) =
+            get_with_registry_auth(client, &latest_url, registry, auth_header)
+                .send()
+                .await
+        {
             if latest_resp.status().is_success() {
                 resp = latest_resp;
             }
@@ -1037,33 +1169,62 @@ pub fn unpack_tarball(tarball_bytes: &[u8], target_dir: &Path) -> anyhow::Result
     Ok(())
 }
 
-/// Prepares and returns a dedicated directory containing standalone `node-gyp` shims
+/// Prepares and returns a dedicated privately-owned directory containing standalone `node-gyp` shims
 /// (`node-gyp.cmd` on Windows and `node-gyp` on Unix) that forward to `%npm_config_node_gyp%`.
 pub fn node_gyp_bin_dir() -> Option<PathBuf> {
-    static BIN_DIR: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+    static BIN_DIR: std::sync::OnceLock<Option<tempfile::TempDir>> = std::sync::OnceLock::new();
     BIN_DIR
         .get_or_init(|| {
-            let dir = std::env::temp_dir().join("rnpm").join("node-gyp-bin");
-            if let Err(e) = std::fs::create_dir_all(&dir) {
-                warn!("Failed to create node-gyp-bin directory: {}", e);
-                return None;
-            }
-
-            let cmd_path = dir.join("node-gyp.cmd");
-            let cmd_script = "@ECHO off\r\nIF NOT DEFINED npm_config_node_gyp GOTO no_gyp\r\nSET \"GYP_PATH=%npm_config_node_gyp:\"=%\"\r\nIF /I \"%GYP_PATH:~-3%\"==\".js\" GOTO run_js\r\n\"%GYP_PATH%\" %*\r\nEXIT /B %ERRORLEVEL%\r\n:run_js\r\nnode \"%GYP_PATH%\" %*\r\nEXIT /B %ERRORLEVEL%\r\n:no_gyp\r\nnode \"%~dp0node-gyp.js\" %*\r\nEXIT /B %ERRORLEVEL%\r\n";
-            let _ = std::fs::write(&cmd_path, cmd_script);
-
-            let sh_path = dir.join("node-gyp");
-            let sh_script = "#!/usr/bin/env sh\nif [ -z \"$npm_config_node_gyp\" ]; then\n  exec node \"$(dirname \"$0\")/node-gyp.js\" \"$@\"\nelse\n  case \"$npm_config_node_gyp\" in\n    *.js) exec node \"$npm_config_node_gyp\" \"$@\" ;;\n    *) exec \"$npm_config_node_gyp\" \"$@\" ;;\n  esac\nfi\n";
-            let _ = std::fs::write(&sh_path, sh_script);
+            let tmp_dir = match tempfile::Builder::new()
+                .prefix("rnpm-node-gyp-bin-")
+                .tempdir()
+            {
+                Ok(d) => d,
+                Err(e) => {
+                    warn!("Failed to create private node-gyp-bin directory: {}", e);
+                    return None;
+                }
+            };
+            let dir = tmp_dir.path();
 
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
-                let _ = std::fs::set_permissions(&sh_path, std::fs::Permissions::from_mode(0o755));
+                if let Err(e) =
+                    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+                {
+                    warn!("Failed to set permissions on node-gyp-bin directory: {}", e);
+                    return None;
+                }
             }
 
-            Some(dir)
+            let cmd_path = dir.join("node-gyp.cmd");
+            let cmd_script = "@ECHO off\r\nIF NOT DEFINED npm_config_node_gyp GOTO no_gyp\r\nSET \"GYP_PATH=%npm_config_node_gyp:\"=%\"\r\nIF /I \"%GYP_PATH:~-3%\"==\".js\" GOTO run_js\r\n\"%GYP_PATH%\" %*\r\nEXIT /B %ERRORLEVEL%\r\n:run_js\r\nnode \"%GYP_PATH%\" %*\r\nEXIT /B %ERRORLEVEL%\r\n:no_gyp\r\nnode \"%~dp0node-gyp.js\" %*\r\nEXIT /B %ERRORLEVEL%\r\n";
+            if let Err(e) = std::fs::write(&cmd_path, cmd_script) {
+                warn!("Failed to write node-gyp.cmd shim: {}", e);
+                return None;
+            }
+
+            let sh_path = dir.join("node-gyp");
+            let sh_script = "#!/usr/bin/env sh\nif [ -z \"$npm_config_node_gyp\" ]; then\n  exec node \"$(dirname \"$0\")/node-gyp.js\" \"$@\"\nelse\n  case \"$npm_config_node_gyp\" in\n    *.js) exec node \"$npm_config_node_gyp\" \"$@\" ;;\n    *) exec \"$npm_config_node_gyp\" \"$@\" ;;\n  esac\nfi\n";
+            if let Err(e) = std::fs::write(&sh_path, sh_script) {
+                warn!("Failed to write node-gyp POSIX shim: {}", e);
+                return None;
+            }
+
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                if let Err(e) =
+                    std::fs::set_permissions(&sh_path, std::fs::Permissions::from_mode(0o755))
+                {
+                    warn!("Failed to chmod node-gyp POSIX shim: {}", e);
+                    return None;
+                }
+            }
+
+            Some(tmp_dir)
         })
-        .clone()
+        .as_ref()
+        .map(|d| d.path().to_path_buf())
 }
