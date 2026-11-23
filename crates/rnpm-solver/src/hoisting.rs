@@ -556,6 +556,18 @@ fn candidate_shadows_ancestor_dep(
     false
 }
 
+#[inline]
+fn is_in_scope_subtree(loc: &str, scope: &str) -> bool {
+    if loc == scope {
+        return false;
+    }
+    if scope.is_empty() {
+        loc.starts_with("node_modules/")
+    } else {
+        iter_ancestor_scopes(loc).any(|s| s == scope)
+    }
+}
+
 // CanPlaceDep.checkCanPlaceNoCurrent: introducing a node in an empty slot
 // must not intercept a valid descendant edge that currently resolves above
 // this scope. Otherwise a later sibling silently breaks an earlier branch.
@@ -568,18 +580,13 @@ fn candidate_shadows_descendant_dep(
     let Some(version) = resolved_version else {
         return false;
     };
-    let prefix = if scope.is_empty() {
-        "node_modules/".to_string()
-    } else {
-        format!("{scope}/node_modules/")
-    };
     // Arborist attaches edgesOut when a node enters the tree, before that
     // node's turn in depsQueue. Our graph.edges only contains processed
     // tasks, so also inspect pending edges from the manifest.
     if graph
         .nodes
         .values()
-        .filter(|node| node.location.starts_with(&prefix))
+        .filter(|node| is_in_scope_subtree(&node.location, scope))
         .any(|node| {
             let Some(spec) = node
                 .optional_dependencies
@@ -593,7 +600,7 @@ fn candidate_shadows_descendant_dep(
                 return false;
             };
             find_visible_node(graph, &node.location, install_name).is_some_and(|current| {
-                !current.location.starts_with(&prefix)
+                !is_in_scope_subtree(&current.location, scope)
                     && node_satisfies_target(current, &target)
                     && !version_satisfies_target(version, &target)
             })
@@ -603,8 +610,8 @@ fn candidate_shadows_descendant_dep(
     }
     graph.edges.iter().any(|edge| {
         if edge.install_name != install_name
-            || !edge.from_location.starts_with(&prefix)
-            || edge.to_location.starts_with(&prefix)
+            || !is_in_scope_subtree(&edge.from_location, scope)
+            || is_in_scope_subtree(&edge.to_location, scope)
         {
             return false;
         }
@@ -768,9 +775,7 @@ fn is_shadowed_by_incompatible_between(
         candidate_buf.push_str("/node_modules/");
         candidate_buf.push_str(install_name);
         if let Some(node) = graph.nodes.get(&candidate_buf) {
-            if !node_satisfies_target(node, target) {
-                return true;
-            }
+            return !node_satisfies_target(node, target);
         }
         current = match parent_scope(current) {
             Some(p) => p,
@@ -1296,5 +1301,95 @@ mod tests {
 
         let empty_scopes: Vec<&str> = iter_ancestor_scopes("").collect();
         assert_eq!(empty_scopes, vec![""]);
+    }
+
+    #[test]
+    fn test_candidate_shadows_descendant_in_nested_workspace() {
+        use crate::graph::{DependencyEdge, DependencyType};
+
+        let mut graph = DependencyGraph::new();
+        // A node inside nested workspace packages/parent/nested
+        let nested_dep = make_test_node(
+            "packages/parent/nested/node_modules/leaf",
+            "leaf",
+            "1.0.0",
+        );
+        graph.nodes.insert(
+            "packages/parent/nested/node_modules/leaf".to_string(),
+            nested_dep,
+        );
+
+        // Outside dependency at root node_modules/shared-pkg@1.0.0
+        let root_dep = make_test_node("node_modules/shared-pkg", "shared-pkg", "1.0.0");
+        graph
+            .nodes
+            .insert("node_modules/shared-pkg".to_string(), root_dep);
+
+        // Edge from leaf in nested workspace pointing to root shared-pkg
+        graph.edges.push(DependencyEdge {
+            from_location: "packages/parent/nested/node_modules/leaf".to_string(),
+            to_location: "node_modules/shared-pkg".to_string(),
+            install_name: "shared-pkg".to_string(),
+            package_name: "shared-pkg".to_string(),
+            spec: "^1.0.0".to_string(),
+            dep_type: DependencyType::Prod,
+        });
+
+        // Introducing incompatible shared-pkg@2.0.0 at intermediate ancestor scope "packages/parent"
+        // must be detected as shadowing descendant leaf's dependency!
+        assert!(candidate_shadows_descendant_dep(
+            &graph,
+            "packages/parent",
+            "shared-pkg",
+            Some("2.0.0"),
+        ));
+
+        // Introducing compatible shared-pkg@1.5.0 at "packages/parent" does not shadow
+        assert!(!candidate_shadows_descendant_dep(
+            &graph,
+            "packages/parent",
+            "shared-pkg",
+            Some("1.5.0"),
+        ));
+    }
+
+    #[test]
+    fn test_nearest_shadowing_intermediate_scopes() {
+        let mut graph = DependencyGraph::new();
+        // Nearest intermediate node at packages/parent/node_modules/pkg has compatible 1.0.0
+        graph.nodes.insert(
+            "packages/parent/node_modules/pkg".to_string(),
+            make_test_node("packages/parent/node_modules/pkg", "pkg", "1.0.0"),
+        );
+        // Higher intermediate node at packages/node_modules/pkg has incompatible 2.0.0
+        graph.nodes.insert(
+            "packages/node_modules/pkg".to_string(),
+            make_test_node("packages/node_modules/pkg", "pkg", "2.0.0"),
+        );
+
+        let target = PackageTarget::Range(Range::parse("^1.0.0").unwrap());
+
+        // Nearest intermediate node is 1.0.0 which satisfies ^1.0.0,
+        // so it shadows the higher 2.0.0 and returns false (not shadowed by incompatible)
+        assert!(!is_shadowed_by_incompatible_between(
+            &graph,
+            "packages/parent/nested",
+            "",
+            "pkg",
+            &target,
+        ));
+
+        // If nearest intermediate node is 0.5.0 (incompatible), it returns true
+        graph.nodes.insert(
+            "packages/parent/node_modules/pkg".to_string(),
+            make_test_node("packages/parent/node_modules/pkg", "pkg", "0.5.0"),
+        );
+        assert!(is_shadowed_by_incompatible_between(
+            &graph,
+            "packages/parent/nested",
+            "",
+            "pkg",
+            &target,
+        ));
     }
 }

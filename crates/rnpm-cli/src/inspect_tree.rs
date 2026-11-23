@@ -467,25 +467,16 @@ fn load_package_manifest(dir: &Path) -> (Option<Manifest>, Option<Value>, Option
 /// Candidate locations in resolution order: from most nested to root node_modules.
 pub fn candidate_locations(current_loc: &str, dep_name: &str) -> Vec<String> {
     let mut candidates = Vec::new();
-    if current_loc.is_empty() {
-        candidates.push(format!("node_modules/{dep_name}"));
-        return candidates;
+    for scope in rnpm_solver::hoisting::iter_ancestor_scopes(current_loc) {
+        let candidate = if scope.is_empty() {
+            format!("node_modules/{dep_name}")
+        } else {
+            format!("{scope}/node_modules/{dep_name}")
+        };
+        if !candidates.contains(&candidate) {
+            candidates.push(candidate);
+        }
     }
-
-    candidates.push(format!("{current_loc}/node_modules/{dep_name}"));
-
-    let mut curr = current_loc;
-    while let Some(idx) = curr.rfind("/node_modules/") {
-        let ancestor = &curr[..idx];
-        candidates.push(format!("{ancestor}/node_modules/{dep_name}"));
-        curr = ancestor;
-    }
-
-    let root_cand = format!("node_modules/{dep_name}");
-    if !candidates.contains(&root_cand) {
-        candidates.push(root_cand);
-    }
-
     candidates
 }
 

@@ -3047,15 +3047,9 @@ fn validate_fast_path_dep(
     } else {
         let mut ancestors = Vec::new();
         if !from_loc.is_empty() {
-            let mut curr = from_loc;
-            while !curr.is_empty() {
-                if let Some(n) = graph.nodes.get(curr) {
+            for scope in crate::hoisting::iter_ancestor_scopes(from_loc) {
+                if let Some(n) = graph.nodes.get(scope) {
                     ancestors.push(n.name.as_str());
-                }
-                if let Some(idx) = curr.rfind("/node_modules/") {
-                    curr = &curr[..idx];
-                } else {
-                    break;
                 }
             }
             ancestors.reverse();

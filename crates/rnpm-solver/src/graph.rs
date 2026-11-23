@@ -974,42 +974,20 @@ impl DependencyGraph {
         dep_name: &str,
         buf: &mut String,
     ) -> Option<&'a str> {
-        if from_loc.is_empty() {
+        for scope in crate::hoisting::iter_ancestor_scopes(from_loc) {
             buf.clear();
-            buf.push_str("node_modules/");
-            buf.push_str(dep_name);
-            return nodes.get_key_value(buf.as_str()).map(|(k, _)| k.as_str());
-        }
-
-        // 1. Closest scope: under from_loc
-        buf.clear();
-        buf.push_str(from_loc);
-        buf.push_str("/node_modules/");
-        buf.push_str(dep_name);
-        if let Some((k, _)) = nodes.get_key_value(buf.as_str()) {
-            return Some(k.as_str());
-        }
-
-        // 2. Ancestor scopes: from closest ancestor up to root
-        let mut curr = from_loc;
-        while let Some(idx) = curr.rfind("/node_modules/") {
-            curr = &curr[..idx];
-            if !curr.is_empty() {
-                buf.clear();
-                buf.push_str(curr);
+            if scope.is_empty() {
+                buf.push_str("node_modules/");
+            } else {
+                buf.push_str(scope);
                 buf.push_str("/node_modules/");
-                buf.push_str(dep_name);
-                if let Some((k, _)) = nodes.get_key_value(buf.as_str()) {
-                    return Some(k.as_str());
-                }
+            }
+            buf.push_str(dep_name);
+            if let Some((k, _)) = nodes.get_key_value(buf.as_str()) {
+                return Some(k.as_str());
             }
         }
-
-        // 3. Root scope
-        buf.clear();
-        buf.push_str("node_modules/");
-        buf.push_str(dep_name);
-        nodes.get_key_value(buf.as_str()).map(|(k, _)| k.as_str())
+        None
     }
 }
 

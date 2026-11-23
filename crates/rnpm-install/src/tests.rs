@@ -5659,3 +5659,246 @@ async fn test_run_ci_nested_workspace_ancestor_hoisting() {
         res.err()
     );
 }
+
+#[tokio::test]
+async fn test_run_ci_nested_workspace_ancestor_hoisting_scoped_package() {
+    let tmp = tempdir().unwrap();
+    let root = tmp.path().join("workspace-root");
+    fs::create_dir_all(root.join("packages/parent/nested")).unwrap();
+
+    // 1. Root package.json
+    let mut root_manifest = Manifest::default();
+    root_manifest.name = Some("workspace-root".to_string());
+    root_manifest.version = Some("1.0.0".to_string());
+    root_manifest.workspaces = Some(rnpm_core::manifest::PackageWorkspaces::List(vec![
+        "packages/parent".to_string(),
+        "packages/parent/nested".to_string(),
+    ]));
+    root_manifest
+        .dependencies
+        .insert("@scope/dep".to_string(), "2.0.0".to_string());
+    root_manifest
+        .save_to_file(root.join("package.json"))
+        .unwrap();
+
+    // 2. Parent workspace package.json
+    let mut parent_manifest = Manifest::default();
+    parent_manifest.name = Some("parent-ws".to_string());
+    parent_manifest.version = Some("1.0.0".to_string());
+    parent_manifest
+        .save_to_file(root.join("packages/parent/package.json"))
+        .unwrap();
+
+    // 3. Nested workspace package.json requiring scoped package @scope/dep ^1.0.0
+    let mut nested_manifest = Manifest::default();
+    nested_manifest.name = Some("nested-ws".to_string());
+    nested_manifest.version = Some("1.0.0".to_string());
+    nested_manifest
+        .dependencies
+        .insert("@scope/dep".to_string(), "^1.0.0".to_string());
+    nested_manifest
+        .save_to_file(root.join("packages/parent/nested/package.json"))
+        .unwrap();
+
+    // 4. Lockfile v3 where:
+    // - root node_modules has @scope/dep@2.0.0
+    // - parent workspace has @scope/dep@1.0.0 hoisted under packages/parent/node_modules/@scope/dep
+    // - nested workspace depends on @scope/dep@^1.0.0
+    let mut lock = LockfileV3::new("workspace-root", Some("1.0.0".to_string()));
+    if let Some(root_pkg) = lock.root_package_mut() {
+        let mut deps = BTreeMap::new();
+        deps.insert("@scope/dep".to_string(), "2.0.0".to_string());
+        root_pkg.dependencies = Some(deps);
+        root_pkg.workspaces = Some(vec![
+            "packages/parent".to_string(),
+            "packages/parent/nested".to_string(),
+        ]);
+    }
+    lock.insert_package(
+        "node_modules/@scope/dep",
+        LockfilePackage {
+            version: Some("2.0.0".to_string()),
+            ..Default::default()
+        },
+    );
+    lock.insert_package(
+        "packages/parent",
+        LockfilePackage {
+            version: Some("1.0.0".to_string()),
+            ..Default::default()
+        },
+    );
+    lock.insert_package(
+        "packages/parent/node_modules/@scope/dep",
+        LockfilePackage {
+            version: Some("1.0.0".to_string()),
+            ..Default::default()
+        },
+    );
+    let mut nested_deps = BTreeMap::new();
+    nested_deps.insert("@scope/dep".to_string(), "^1.0.0".to_string());
+    lock.insert_package(
+        "packages/parent/nested",
+        LockfilePackage {
+            version: Some("1.0.0".to_string()),
+            dependencies: Some(nested_deps),
+            ..Default::default()
+        },
+    );
+    lock.save_to_file(&root.join("package-lock.json")).unwrap();
+
+    // Verify resolve_lockfile_dependency_path finds scoped package in ancestor workspace
+    let resolved_path = crate::resolve_lockfile_dependency_path(
+        &lock,
+        "packages/parent/nested",
+        "@scope/dep",
+    );
+    assert_eq!(
+        resolved_path.as_deref(),
+        Some("packages/parent/node_modules/@scope/dep")
+    );
+
+    // Verify prune candidate paths include ancestor workspace for scoped package
+    let candidate_paths = crate::prune::get_candidate_paths("packages/parent/nested", "@scope/dep");
+    assert!(
+        candidate_paths.contains(&"packages/parent/node_modules/@scope/dep".to_string()),
+        "candidate_paths must include parent workspace node_modules: {:?}",
+        candidate_paths
+    );
+
+    // Verify linked lookup finds ancestor workspace for scoped package
+    let linked_res = crate::linked::resolve_lockfile_dep(&lock, "packages/parent/nested", "@scope/dep");
+    assert_eq!(
+        linked_res.as_ref().map(|(loc, _)| loc.as_str()),
+        Some("packages/parent/node_modules/@scope/dep")
+    );
+
+    // Verify graph ingestion from lockfile wires edge to intermediate ancestor workspace
+    let graph = rnpm_solver::DependencyGraph::from_lockfile_v3(&lock);
+    let edge = graph.edges.iter().find(|e| {
+        e.from_location == "packages/parent/nested" && e.install_name == "@scope/dep"
+    });
+    assert!(
+        edge.is_some(),
+        "from_lockfile_v3 must wire edge from nested workspace to hoisted scoped package"
+    );
+    assert_eq!(
+        edge.unwrap().to_location,
+        "packages/parent/node_modules/@scope/dep"
+    );
+
+    // Verify rnpm ci validation succeeds for scoped package
+    let options = InstallOptions {
+        project_dir: root.clone(),
+        offline: true,
+        dry_run: true,
+        ..Default::default()
+    };
+    let mut installer = Installer::new(options).unwrap();
+    let res = installer.run_ci().await;
+    assert!(
+        res.is_ok(),
+        "run_ci must succeed for scoped package satisfied by intermediate ancestor workspace: {:?}",
+        res.err()
+    );
+}
+
+#[tokio::test]
+async fn test_run_ci_nested_workspace_incompatible_intermediate_fails() {
+    let tmp = tempdir().unwrap();
+    let root = tmp.path().join("workspace-root");
+    fs::create_dir_all(root.join("packages/parent/nested")).unwrap();
+
+    let mut root_manifest = Manifest::default();
+    root_manifest.name = Some("workspace-root".to_string());
+    root_manifest.version = Some("1.0.0".to_string());
+    root_manifest.workspaces = Some(rnpm_core::manifest::PackageWorkspaces::List(vec![
+        "packages/parent".to_string(),
+        "packages/parent/nested".to_string(),
+    ]));
+    root_manifest
+        .dependencies
+        .insert("@scope/dep".to_string(), "0.1.0".to_string());
+    root_manifest
+        .save_to_file(root.join("package.json"))
+        .unwrap();
+
+    let mut parent_manifest = Manifest::default();
+    parent_manifest.name = Some("parent-ws".to_string());
+    parent_manifest.version = Some("1.0.0".to_string());
+    parent_manifest
+        .save_to_file(root.join("packages/parent/package.json"))
+        .unwrap();
+
+    let mut nested_manifest = Manifest::default();
+    nested_manifest.name = Some("nested-ws".to_string());
+    nested_manifest.version = Some("1.0.0".to_string());
+    nested_manifest
+        .dependencies
+        .insert("@scope/dep".to_string(), "^1.0.0".to_string());
+    nested_manifest
+        .save_to_file(root.join("packages/parent/nested/package.json"))
+        .unwrap();
+
+    // Lockfile where intermediate ancestor has incompatible version 0.5.0
+    let mut lock = LockfileV3::new("workspace-root", Some("1.0.0".to_string()));
+    if let Some(root_pkg) = lock.root_package_mut() {
+        let mut deps = BTreeMap::new();
+        deps.insert("@scope/dep".to_string(), "0.1.0".to_string());
+        root_pkg.dependencies = Some(deps);
+        root_pkg.workspaces = Some(vec![
+            "packages/parent".to_string(),
+            "packages/parent/nested".to_string(),
+        ]);
+    }
+    lock.insert_package(
+        "node_modules/@scope/dep",
+        LockfilePackage {
+            version: Some("0.1.0".to_string()),
+            ..Default::default()
+        },
+    );
+    lock.insert_package(
+        "packages/parent",
+        LockfilePackage {
+            version: Some("1.0.0".to_string()),
+            ..Default::default()
+        },
+    );
+    lock.insert_package(
+        "packages/parent/node_modules/@scope/dep",
+        LockfilePackage {
+            version: Some("0.5.0".to_string()),
+            ..Default::default()
+        },
+    );
+    let mut nested_deps = BTreeMap::new();
+    nested_deps.insert("@scope/dep".to_string(), "^1.0.0".to_string());
+    lock.insert_package(
+        "packages/parent/nested",
+        LockfilePackage {
+            version: Some("1.0.0".to_string()),
+            dependencies: Some(nested_deps),
+            ..Default::default()
+        },
+    );
+    lock.save_to_file(&root.join("package-lock.json")).unwrap();
+
+    let options = InstallOptions {
+        project_dir: root.clone(),
+        offline: true,
+        dry_run: true,
+        ..Default::default()
+    };
+    let mut installer = Installer::new(options).unwrap();
+    let res = installer.run_ci().await;
+    assert!(
+        res.is_err(),
+        "run_ci must fail when intermediate ancestor package does not satisfy range"
+    );
+    let err_msg = res.unwrap_err().to_string();
+    assert!(
+        err_msg.contains("Missing: @scope/dep@^1.0.0 from lock file"),
+        "error message must report missing incompatible dependency: {err_msg}"
+    );
+}

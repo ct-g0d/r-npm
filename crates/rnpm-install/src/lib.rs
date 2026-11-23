@@ -2173,16 +2173,15 @@ fn peer_graph_from_lockfile(lockfile: &LockfileV3, manifest: &Manifest) -> Depen
     }
     if let Ok(overrides) = rnpm_solver::Overrides::from_manifest(manifest) {
         for edge in &mut graph.edges {
-            let ancestors = edge
-                .from_location
-                .split("/node_modules/")
-                .filter(|part| !part.is_empty())
-                .map(|part| {
-                    part.strip_prefix("node_modules/")
-                        .unwrap_or(part)
-                        .to_string()
-                })
-                .collect::<Vec<_>>();
+            let mut ancestors = Vec::new();
+            for scope in rnpm_solver::hoisting::iter_ancestor_scopes(&edge.from_location) {
+                if let Some(n) = graph.nodes.get(scope) {
+                    ancestors.push(n.name.clone());
+                } else if scope.is_empty() {
+                    ancestors.push(manifest.name.clone().unwrap_or_default());
+                }
+            }
+            ancestors.reverse();
             if let Ok(Some(spec)) =
                 overrides.resolve_override_strings(&edge.install_name, &edge.spec, &ancestors)
             {
@@ -6082,11 +6081,18 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                 for (dep_name, range_str) in deps {
                     let effective_range = if let Some(ref ov) = overrides {
                         let mut ancestors: Vec<String> = Vec::new();
-                        let parts = pkg_key.split("/node_modules/").filter(|p| !p.is_empty());
-                        for p in parts {
-                            let clean_p = p.strip_prefix("node_modules/").unwrap_or(p);
-                            ancestors.push(clean_p.to_string());
+                        for scope in rnpm_solver::hoisting::iter_ancestor_scopes(pkg_key) {
+                            if let Some(pkg) = lockfile.packages.get(scope) {
+                                if let Some(ref name) = pkg.name {
+                                    ancestors.push(name.clone());
+                                } else if scope.is_empty() {
+                                    ancestors.push(lockfile.name.clone());
+                                }
+                            } else if scope.is_empty() {
+                                ancestors.push(lockfile.name.clone());
+                            }
                         }
+                        ancestors.reverse();
                         ov.resolve_override_with_caller(
                             dep_name,
                             range_str,
