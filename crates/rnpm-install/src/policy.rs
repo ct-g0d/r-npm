@@ -185,7 +185,10 @@ pub(crate) fn is_git_spec(spec: &str) -> bool {
 /// Classify a dependency spec string into its `SourceKind`.
 pub fn parse_source_kind(spec: &str) -> SourceKind {
     let spec = spec.trim();
-    let spec = if spec.len() >= 4 && spec[..4].eq_ignore_ascii_case("npm:") {
+    let spec = if spec
+        .get(..4)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("npm:"))
+     {
         let sub = spec[4..].trim();
         if sub.starts_with('@') {
             if let Some(slash_idx) = sub.find('/') {

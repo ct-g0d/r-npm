@@ -257,8 +257,8 @@ pub fn verify_signature(
         return Err(RegistryError::InvalidSignature("Empty signature".into()));
     }
 
-    // 1. If public key is SPKI DER sequence (starts with 0x30)
-    if public_key.first() == Some(&0x30) {
+    // Raw Ed25519 keys may start with the DER sequence tag.
+    if public_key.len() != 32 && public_key.first() == Some(&0x30) {
         let (algo_oid, curve_oid, pk_bytes) = parse_spki(public_key)?;
         if algo_oid == crate::asn1::OID_EC_PUBLIC_KEY {
             if curve_oid.as_deref() == Some(crate::asn1::OID_EC_P256) {
