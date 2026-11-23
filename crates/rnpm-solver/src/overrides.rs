@@ -292,7 +292,7 @@ fn split_arrow_key(key: &str) -> Vec<String> {
 
     while i < chars.len() {
         if chars[i] == '>' {
-            let is_comparator = is_comparator_gt(&chars, i);
+            let is_comparator = is_comparator_gt(&chars, i, last_idx);
             if !is_comparator {
                 let part: String = chars[last_idx..i].iter().collect();
                 let trimmed = part.trim();
@@ -320,28 +320,59 @@ fn split_arrow_key(key: &str) -> Vec<String> {
 
 /// Checks whether a `>` character at index `i` is a semver comparator (e.g. `>=1.0.0`, `>1.0.0`, `@ > 1.0.0`)
 /// rather than an override arrow separator `>`.
-fn is_comparator_gt(chars: &[char], i: usize) -> bool {
+fn is_comparator_gt(chars: &[char], i: usize, segment_start: usize) -> bool {
+    // 1. Always treat `>=` as a comparator
     if i + 1 < chars.len() && chars[i + 1] == '=' {
         return true;
     }
-    let prev_non_ws = (0..i).rev().find(|&k| !chars[k].is_whitespace());
-    if let Some(prev) = prev_non_ws {
-        if chars[prev] == '@' {
+
+    // 2. Must be in a version context (after a version '@')
+    if !has_version_context(chars, segment_start, i) {
+        return false;
+    }
+
+    // 3. In a version context, '>' followed by a digit or 'v' + digit is a comparator (e.g. `>1.0.0`, `> 1.0.0`)
+    let next_non_ws = (i + 1..chars.len()).find(|&k| !chars[k].is_whitespace());
+    if let Some(next) = next_non_ws {
+        if chars[next].is_ascii_digit() {
             return true;
         }
-    }
-    let next_non_ws = (i + 1..chars.len()).find(|&k| !chars[k].is_whitespace());
-    if let (Some(prev), Some(next)) = (prev_non_ws, next_non_ws) {
-        let prev_has_at = (0..=prev)
-            .rev()
-            .find(|&k| !chars[k].is_whitespace())
-            .is_some_and(|k| chars[k] == '@');
-        let next_is_ver = chars[next].is_ascii_digit() || chars[next] == 'v';
-        if prev_has_at && next_is_ver {
+        if (chars[next] == 'v' || chars[next] == 'V')
+            && next + 1 < chars.len()
+            && chars[next + 1].is_ascii_digit()
+        {
             return true;
         }
     }
     false
+}
+
+/// Checks whether there is a version specifier '@' within `chars[start..end]`.
+/// A leading '@' (e.g. `@scope/pkg`) is a package scope prefix, not a version specifier.
+fn has_version_context(chars: &[char], start: usize, end: usize) -> bool {
+    let mut at_count = 0;
+    let mut first_non_ws_is_at = false;
+    let mut found_first_non_ws = false;
+
+    for &ch in &chars[start..end] {
+        if !found_first_non_ws && !ch.is_whitespace() {
+            found_first_non_ws = true;
+            if ch == '@' {
+                first_non_ws_is_at = true;
+            }
+        }
+        if ch == '@' {
+            at_count += 1;
+        }
+    }
+
+    if at_count == 0 {
+        false
+    } else if first_non_ws_is_at {
+        at_count > 1
+    } else {
+        true
+    }
 }
 
 /// Inserts a multi-hop override path into a nested `BTreeMap<String, OverrideValue>`.
@@ -712,6 +743,52 @@ mod tests {
         assert_eq!(
             overrides.resolve_override("shared", "workspace:*", &[]).unwrap(),
             Some("2.0.0".to_string())
+        );
+    }
+
+    #[test]
+    fn test_arrow_syntax_advanced_comparators() {
+        // Direct testing of split_arrow_key for complex semver comparator patterns
+        assert_eq!(
+            split_arrow_key("foo@>=1.0.0 > bar"),
+            vec!["foo@>=1.0.0", "bar"]
+        );
+        assert_eq!(
+            split_arrow_key("foo@ >1.0.0 > bar"),
+            vec!["foo@ >1.0.0", "bar"]
+        );
+        assert_eq!(
+            split_arrow_key("foo@<2.0.0 >1.0.0 > bar"),
+            vec!["foo@<2.0.0 >1.0.0", "bar"]
+        );
+        assert_eq!(
+            split_arrow_key("foo@1.0.0 || >2.0.0 > bar"),
+            vec!["foo@1.0.0 || >2.0.0", "bar"]
+        );
+
+        // Verification through full Overrides resolution
+        let json = serde_json::json!({
+            "foo@>=1.0.0 > bar": "2.0.0",
+            "alpha@ >1.0.0 > beta": "3.0.0",
+            "gamma@<2.0.0 >1.0.0 > delta": "4.0.0",
+            "epsilon@1.0.0 || >2.0.0 > zeta": "5.0.0"
+        });
+        let overrides = Overrides::from_json_value(Some(&json), BTreeMap::new());
+        assert_eq!(
+            overrides.resolve_override("bar", "*", &["foo"]).unwrap(),
+            Some("2.0.0".to_string())
+        );
+        assert_eq!(
+            overrides.resolve_override("beta", "*", &["alpha"]).unwrap(),
+            Some("3.0.0".to_string())
+        );
+        assert_eq!(
+            overrides.resolve_override("delta", "*", &["gamma"]).unwrap(),
+            Some("4.0.0".to_string())
+        );
+        assert_eq!(
+            overrides.resolve_override("zeta", "*", &["epsilon"]).unwrap(),
+            Some("5.0.0".to_string())
         );
     }
 }

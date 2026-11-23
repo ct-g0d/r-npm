@@ -21,8 +21,6 @@ pub enum PlacementStrategy {
     Nested,
     /// `shallow` (`--global-style`): never hoist above a top-level node.
     Shallow,
-    /// `linked`: build hoisted resolution graph for symlinking.
-    Linked,
 }
 
 /// A peer provider cannot nest inside a package that itself peers on that name.
@@ -1056,5 +1054,188 @@ mod tests {
         // When resolved matches exactly
         node.resolved = Some("https://example.com/test-1.0.0.tgz".to_string());
         assert!(node_satisfies_target(&node, &url_target));
+    }
+
+    #[test]
+    fn test_nested_workspace_intermediate_ancestor_scope_traversal() {
+        let mut graph = DependencyGraph::new();
+        // Root has conflicting lib@2.0.0
+        graph.nodes.insert(
+            "node_modules/lib".to_string(),
+            make_test_node("node_modules/lib", "lib", "2.0.0"),
+        );
+        // Parent workspace node
+        graph.nodes.insert(
+            "packages/parent".to_string(),
+            make_test_node("packages/parent", "parent-ws", "1.0.0"),
+        );
+        // Nested workspace node
+        graph.nodes.insert(
+            "packages/parent/nested".to_string(),
+            make_test_node("packages/parent/nested", "nested-ws", "1.0.0"),
+        );
+
+        let target = PackageTarget::Range(Range::parse("^1.0.0").unwrap());
+        // Vacant intermediate scope in parent workspace is chosen over nesting inside nested workspace
+        let decision = determine_placement(
+            &graph,
+            "packages/parent/nested",
+            "lib",
+            "lib",
+            &target,
+        );
+        assert_eq!(
+            decision,
+            PlacementDecision::PlaceNew("packages/parent/node_modules/lib".to_string())
+        );
+
+        // If parent workspace already has a compatible lib@1.2.0, it is reused
+        graph.nodes.insert(
+            "packages/parent/node_modules/lib".to_string(),
+            make_test_node("packages/parent/node_modules/lib", "lib", "1.2.0"),
+        );
+        let decision_reuse = determine_placement(
+            &graph,
+            "packages/parent/nested",
+            "lib",
+            "lib",
+            &target,
+        );
+        assert_eq!(
+            decision_reuse,
+            PlacementDecision::Reuse("packages/parent/node_modules/lib".to_string())
+        );
+    }
+
+    #[test]
+    fn test_candidate_shadows_ancestor_dev_and_peer_dependencies() {
+        let mut graph = DependencyGraph::new();
+        let mut ancestor_node = make_test_node("node_modules/parent", "parent", "1.0.0");
+        ancestor_node
+            .dev_dependencies
+            .insert("dev-dep".to_string(), "^1.0.0".to_string());
+        ancestor_node
+            .peer_dependencies
+            .insert("peer-dep".to_string(), "^1.0.0".to_string());
+        graph
+            .nodes
+            .insert("node_modules/parent".to_string(), ancestor_node);
+
+        let target_v2 = PackageTarget::Range(Range::parse("^2.0.0").unwrap());
+        let target_v1 = PackageTarget::Range(Range::parse("^1.0.0").unwrap());
+
+        // devDependencies shadowing guard
+        assert!(candidate_shadows_ancestor_dep(
+            &graph,
+            "node_modules/parent",
+            "dev-dep",
+            "dev-dep",
+            &target_v2,
+            Some("2.0.0"),
+        ));
+        assert!(!candidate_shadows_ancestor_dep(
+            &graph,
+            "node_modules/parent",
+            "dev-dep",
+            "dev-dep",
+            &target_v1,
+            Some("1.1.0"),
+        ));
+
+        // peerDependencies shadowing guard
+        assert!(candidate_shadows_ancestor_dep(
+            &graph,
+            "node_modules/parent",
+            "peer-dep",
+            "peer-dep",
+            &target_v2,
+            Some("2.0.0"),
+        ));
+        assert!(!candidate_shadows_ancestor_dep(
+            &graph,
+            "node_modules/parent",
+            "peer-dep",
+            "peer-dep",
+            &target_v1,
+            Some("1.5.0"),
+        ));
+    }
+
+    #[test]
+    fn test_candidate_shadows_descendant_dep_root_empty_scope() {
+        use crate::graph::{DependencyEdge, DependencyType};
+
+        let mut graph = DependencyGraph::new();
+        let child_node =
+            make_test_node("node_modules/parent/node_modules/child", "child", "1.0.0");
+        graph.nodes.insert(
+            "node_modules/parent/node_modules/child".to_string(),
+            child_node,
+        );
+
+        // Workspace package outside node_modules (e.g. packages/shared-lib@1.0.0)
+        let ws_node = make_test_node("packages/shared-lib", "shared-lib", "1.0.0");
+        graph
+            .nodes
+            .insert("packages/shared-lib".to_string(), ws_node);
+
+        // Edge from descendant child pointing to workspace package outside node_modules
+        graph.edges.push(DependencyEdge {
+            from_location: "node_modules/parent/node_modules/child".to_string(),
+            to_location: "packages/shared-lib".to_string(),
+            install_name: "shared-lib".to_string(),
+            package_name: "shared-lib".to_string(),
+            spec: "^1.0.0".to_string(),
+            dep_type: DependencyType::Prod,
+        });
+
+        // When placing at root scope "" (prefix "node_modules/"):
+        // Introducing shared-lib@2.0.0 shadows child's requirement ^1.0.0 -> returns true
+        assert!(candidate_shadows_descendant_dep(
+            &graph,
+            "",
+            "shared-lib",
+            Some("2.0.0"),
+        ));
+
+        // Introducing shared-lib@1.2.0 is compatible -> returns false
+        assert!(!candidate_shadows_descendant_dep(
+            &graph,
+            "",
+            "shared-lib",
+            Some("1.2.0"),
+        ));
+    }
+
+    #[test]
+    fn test_is_shadowed_by_incompatible_between_nested_workspace_boundaries() {
+        let mut graph = DependencyGraph::new();
+        // Intermediate node at packages/parent/node_modules/pkg has version 2.0.0
+        graph.nodes.insert(
+            "packages/parent/node_modules/pkg".to_string(),
+            make_test_node("packages/parent/node_modules/pkg", "pkg", "2.0.0"),
+        );
+
+        let target_v1 = PackageTarget::Range(Range::parse("^1.0.0").unwrap());
+        let target_v2 = PackageTarget::Range(Range::parse("^2.0.0").unwrap());
+
+        // From packages/parent/nested to root "": traverses through packages/parent
+        // Finds incompatible pkg@2.0.0 when target is ^1.0.0
+        assert!(is_shadowed_by_incompatible_between(
+            &graph,
+            "packages/parent/nested",
+            "",
+            "pkg",
+            &target_v1,
+        ));
+
+        // When target is ^2.0.0, pkg@2.0.0 satisfies target -> not shadowed by incompatible
+        assert!(!is_shadowed_by_incompatible_between(
+            &graph,
+            "packages/parent/nested",
+            "",
+            "pkg",
+            &target_v2,
+        ));
     }
 }

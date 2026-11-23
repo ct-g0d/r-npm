@@ -19,7 +19,6 @@ use tokio::net::TcpListener;
 
 use rnpm_install::{InstallOptions, InstallStrategy, Installer};
 use rnpm_lockfile::LockfileV3;
-use rnpm_solver::hoisting::PlacementStrategy;
 use rnpm_solver::overrides::Overrides;
 use rnpm_solver::peer::PeerContext;
 
@@ -158,15 +157,36 @@ async fn test_workspace_deep_diamond_version_conflict_across_three_workspaces() 
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path();
 
-    // Create external file: packages representing shared-pkg v1.0.0 and v2.0.0
-    let pkgs_dir = root.join("external_pkgs");
-    let shared_v1_dir = pkgs_dir.join("shared-v1");
-    let shared_v2_dir = pkgs_dir.join("shared-v2");
-    create_file_package(&shared_v1_dir, "shared-pkg", "1.0.0", "");
-    create_file_package(&shared_v2_dir, "shared-pkg", "2.0.0", "");
+    // Create tarballs for shared-pkg v1.0.0 and v2.0.0
+    let shared_v1_tarball = create_test_tarball(&[(
+        "package.json",
+        br#"{"name":"shared-pkg","version":"1.0.0"}"#,
+    )]);
+    let shared_v2_tarball = create_test_tarball(&[(
+        "package.json",
+        br#"{"name":"shared-pkg","version":"2.0.0"}"#,
+    )]);
 
-    let shared_v1_posix = rnpm_core::to_posix_path(&shared_v1_dir.to_string_lossy());
-    let shared_v2_posix = rnpm_core::to_posix_path(&shared_v2_dir.to_string_lossy());
+    let v1_ssri = compute_ssri(&shared_v1_tarball);
+    let v2_ssri = compute_ssri(&shared_v2_tarball);
+
+    let server = TestRegistryServer::start(move |path, base_url| {
+        if path == "/shared-pkg" {
+            let body = format!(
+                r#"{{"name":"shared-pkg","dist-tags":{{"latest":"2.0.0"}},"versions":{{
+                    "1.0.0":{{"name":"shared-pkg","version":"1.0.0","dist":{{"tarball":"{base_url}/tarballs/shared-pkg-1.0.0.tgz","integrity":"{v1_ssri}"}}}},
+                    "2.0.0":{{"name":"shared-pkg","version":"2.0.0","dist":{{"tarball":"{base_url}/tarballs/shared-pkg-2.0.0.tgz","integrity":"{v2_ssri}"}}}}
+                }}}}"#
+            );
+            Some((200, vec![("Content-Type", "application/json".to_string())], body.into_bytes()))
+        } else if path == "/tarballs/shared-pkg-1.0.0.tgz" {
+            Some((200, vec![("Content-Type", "application/octet-stream".to_string())], shared_v1_tarball.clone()))
+        } else if path == "/tarballs/shared-pkg-2.0.0.tgz" {
+            Some((200, vec![("Content-Type", "application/octet-stream".to_string())], shared_v2_tarball.clone()))
+        } else {
+            None
+        }
+    }).await;
 
     // Root package.json defining 3 workspaces: ws-alpha, ws-beta, ws-gamma
     std::fs::write(
@@ -184,33 +204,34 @@ async fn test_workspace_deep_diamond_version_conflict_across_three_workspaces() 
     let ws_beta = packages_dir.join("ws-beta");
     let ws_gamma = packages_dir.join("ws-gamma");
 
-    // ws-alpha depends on shared-pkg 1.0.0
+    // ws-alpha depends on shared-pkg ^1.0.0
     create_file_package(
         &ws_alpha,
         "ws-alpha",
         "1.0.0",
-        &format!(r#","dependencies": {{ "shared-pkg": "file:{shared_v1_posix}" }}"#),
+        r#","dependencies": { "shared-pkg": "^1.0.0" }"#,
     );
 
-    // ws-beta depends on shared-pkg 2.0.0 (conflicts with alpha and gamma)
+    // ws-beta depends on shared-pkg ^2.0.0 (conflicts with alpha and gamma)
     create_file_package(
         &ws_beta,
         "ws-beta",
         "1.0.0",
-        &format!(r#","dependencies": {{ "shared-pkg": "file:{shared_v2_posix}" }}"#),
+        r#","dependencies": { "shared-pkg": "^2.0.0" }"#,
     );
 
-    // ws-gamma depends on shared-pkg 1.0.0 (shares same version as alpha)
+    // ws-gamma depends on shared-pkg ^1.0.0 (shares same version as alpha)
     create_file_package(
         &ws_gamma,
         "ws-gamma",
         "1.0.0",
-        &format!(r#","dependencies": {{ "shared-pkg": "file:{shared_v1_posix}" }}"#),
+        r#","dependencies": { "shared-pkg": "^1.0.0" }"#,
     );
 
     let options = InstallOptions {
         project_dir: root.to_path_buf(),
-        offline: true,
+        registry_url: Some(server.url()),
+        offline: false,
         ..Default::default()
     };
 
@@ -226,16 +247,34 @@ async fn test_workspace_deep_diamond_version_conflict_across_three_workspaces() 
     assert!(root.join("node_modules").join("ws-beta").exists());
     assert!(root.join("node_modules").join("ws-gamma").exists());
 
-    // Either root has shared-pkg v1.0.0 hoisted and ws-beta has v2.0.0 nested,
-    // or root has v2.0.0 and alpha/gamma nest v1.0.0. Both versions must exist in the tree!
     let root_shared = root.join("node_modules").join("shared-pkg");
     let beta_nested_shared = ws_beta.join("node_modules").join("shared-pkg");
-    let alpha_nested_shared = ws_alpha.join("node_modules").join("shared-pkg");
 
     assert!(root_shared.exists(), "shared-pkg should be hoisted to root node_modules");
     assert!(
-        beta_nested_shared.exists() || alpha_nested_shared.exists(),
-        "The conflicting diamond version must be cleanly nested under its workspace"
+        beta_nested_shared.exists(),
+        "The conflicting diamond version must be cleanly nested under ws-beta"
+    );
+
+    // Exact version validations reading each installed package.json
+    let root_pkg_json: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(root_shared.join("package.json"))
+            .expect("root shared-pkg package.json must exist"),
+    )
+    .unwrap();
+    assert_eq!(
+        root_pkg_json["version"], "1.0.0",
+        "Hoisted root shared-pkg must be version 1.0.0"
+    );
+
+    let beta_pkg_json: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(beta_nested_shared.join("package.json"))
+            .expect("ws-beta nested shared-pkg package.json must exist"),
+    )
+    .unwrap();
+    assert_eq!(
+        beta_pkg_json["version"], "2.0.0",
+        "Nested ws-beta shared-pkg must be version 2.0.0"
     );
 
     // Verify lockfile was generated and valid
@@ -245,6 +284,8 @@ async fn test_workspace_deep_diamond_version_conflict_across_three_workspaces() 
     assert!(lockfile.packages.contains_key("node_modules/ws-alpha"));
     assert!(lockfile.packages.contains_key("node_modules/ws-beta"));
     assert!(lockfile.packages.contains_key("node_modules/ws-gamma"));
+    assert!(lockfile.packages.contains_key("node_modules/shared-pkg"));
+    assert!(lockfile.packages.contains_key("packages/ws-beta/node_modules/shared-pkg"));
 }
 
 // =========================================================================
@@ -677,11 +718,12 @@ async fn test_workspace_duplicate_names_returns_error() {
         ..Default::default()
     };
 
-    let installer_res = Installer::new(options);
-    if let Ok(mut installer) = installer_res {
-        let run_res = installer.run().await;
-        assert!(run_res.is_err(), "Duplicate workspace package name must return error");
-    }
+    let mut installer = Installer::new(options).expect("Installer creation should succeed");
+    let err = installer.run().await.unwrap_err();
+    assert!(
+        err.to_string().to_lowercase().contains("duplicate"),
+        "Error message should mention duplicate package name: {err}"
+    );
 }
 
 // =========================================================================
@@ -739,11 +781,50 @@ async fn test_workspace_install_strategies_and_omit_dev() {
     assert!(root.join("node_modules").join("prod-dep").exists());
     assert!(!root.join("node_modules").join("dev-dep").exists());
 
-    // Test 2: Verify PlacementStrategy enum supports Linked variant
-    assert_eq!(PlacementStrategy::default(), PlacementStrategy::Hoisted);
-    let linked = PlacementStrategy::Linked;
-    assert_ne!(linked, PlacementStrategy::Nested);
-    assert_ne!(linked, PlacementStrategy::Shallow);
+    // Test 2: Verify InstallStrategy::Linked end-to-end installation
+    let temp_linked = tempfile::tempdir().unwrap();
+    let root_linked = temp_linked.path();
+    let tarball_bytes = create_test_tarball(&[(
+        "package.json",
+        br#"{"name":"linked-dep","version":"1.0.0"}"#,
+    )]);
+    let tgz_path = root_linked.join("linked-dep-1.0.0.tgz");
+    std::fs::write(&tgz_path, tarball_bytes).unwrap();
+    let tgz_posix = rnpm_core::to_posix_path(&tgz_path.to_string_lossy());
+
+    let ws_linked = root_linked.join("packages").join("app-linked");
+    create_file_package(
+        &ws_linked,
+        "app-linked",
+        "1.0.0",
+        &format!(r#","dependencies": {{ "linked-dep": "file:{tgz_posix}" }}"#),
+    );
+
+    std::fs::write(
+        root_linked.join("package.json"),
+        r#"{
+            "name": "linked-strategy-root",
+            "version": "1.0.0",
+            "workspaces": ["packages/*"]
+        }"#,
+    )
+    .unwrap();
+
+    let options_linked = InstallOptions {
+        project_dir: root_linked.to_path_buf(),
+        offline: true,
+        install_strategy: InstallStrategy::Linked,
+        ..Default::default()
+    };
+
+    let mut installer_linked = Installer::new(options_linked).unwrap();
+    let summary_linked = installer_linked
+        .run()
+        .await
+        .expect("Linked strategy install should succeed");
+    assert!(summary_linked.packages_installed >= 1);
+    assert!(root_linked.join("node_modules").join(".store").exists());
+    assert!(root_linked.join("package-lock.json").exists());
 }
 
 // =========================================================================
@@ -770,9 +851,17 @@ fn test_peer_context_cycle_detection_extreme_depth() {
     assert!(!ctx.is_cycle("z", "a"));
     assert!(!ctx.is_cycle("a", "x"));
 
-    // Alias peer cycle detection
-    ctx.enter_with_alias("react-dom", Some("rd"), "my-react", Some("react"));
-    assert!(ctx.is_cycle_with_alias("react", Some("my-react"), "react-dom", Some("rd")));
+    // Alias peer cycle detection using real methods: enter, leave, is_cycle_with_alias, find_cycle_path_with_alias
+    ctx.enter("react-dom", "my-react");
+    assert!(ctx.is_cycle_with_alias("my-react", Some("react"), "react-dom", Some("rd")));
+    let alias_path = ctx
+        .find_cycle_path_with_alias("my-react", Some("react"), "react-dom", Some("rd"))
+        .unwrap();
+    assert_eq!(alias_path, vec!["my-react", "react-dom", "my-react"]);
+
+    // Test leave unwinds cleanly
+    ctx.leave("react-dom", "my-react");
+    assert!(!ctx.is_cycle_with_alias("my-react", Some("react"), "react-dom", Some("rd")));
 
     // Self cycle
     assert!(ctx.is_cycle("z", "z"));
