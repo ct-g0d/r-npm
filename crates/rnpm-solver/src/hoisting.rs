@@ -233,6 +233,38 @@ pub fn node_satisfies_target(node: &crate::graph::Node, target: &PackageTarget) 
     }
 }
 
+/// Returns the next ancestor scope in the node_modules directory hierarchy,
+/// walking from `scope` towards the project root `""`.
+///
+/// For packages nested under node_modules (e.g. `packages/a/node_modules/b` or `node_modules/a/node_modules/b`),
+/// the ancestor is the enclosing package scope (`packages/a` or `node_modules/a`).
+/// For packages directly under root node_modules (e.g. `node_modules/a` or `node_modules/@scope/a`),
+/// the ancestor is `""` (the root).
+/// For workspace packages (e.g. `packages/parent/nested`), the ancestor is the parent
+/// directory `packages/parent`, then `packages`, then `""`.
+/// Returns `None` once `scope` is already the root `""`.
+#[inline]
+pub fn parent_scope(scope: &str) -> Option<&str> {
+    if scope.is_empty() {
+        return None;
+    }
+    if let Some(idx) = scope.rfind("/node_modules/") {
+        Some(&scope[..idx])
+    } else if scope.starts_with("node_modules/") {
+        Some("")
+    } else if let Some(idx) = scope.rfind('/') {
+        Some(&scope[..idx])
+    } else {
+        Some("")
+    }
+}
+
+/// Returns an iterator over ancestor scopes starting from `from_scope` up to and including root `""`.
+#[inline]
+pub fn iter_ancestor_scopes(from_scope: &str) -> impl Iterator<Item = &str> {
+    std::iter::successors(Some(from_scope), |&s| parent_scope(s))
+}
+
 /// Determines the tree placement for a dependency according to npm/Arborist hoisting rules:
 /// 1. Top-Level Hoisting: Try to place at root `node_modules/<install_name>`.
 /// 2. Deduplication: If already occupied by a compatible version, reuse the existing node.
@@ -390,20 +422,17 @@ pub fn determine_placement_with_peers(
     // Attempt 2: Check intermediate ancestor scopes from root towards parent
     let mut ancestors = Vec::new();
     let mut curr = parent_location;
-    while !curr.is_empty() {
-        if let Some(idx) = curr.rfind("/node_modules/") {
-            curr = &curr[..idx];
-            if !curr.is_empty() {
-                ancestors.push(curr);
-            }
-        } else if let Some(idx) = curr.rfind('/') {
-            curr = &curr[..idx];
-            if !curr.is_empty() && graph.nodes.contains_key(curr) {
-                ancestors.push(curr);
-            }
-        } else {
+    while let Some(next) = parent_scope(curr) {
+        if next.is_empty() {
             break;
         }
+        if next.contains("/node_modules/")
+            || next.starts_with("node_modules/")
+            || graph.nodes.contains_key(next)
+        {
+            ancestors.push(next);
+        }
+        curr = next;
     }
 
     for ancestor in ancestors.into_iter().rev() {
@@ -743,13 +772,10 @@ fn is_shadowed_by_incompatible_between(
                 return true;
             }
         }
-        if let Some(idx) = current.rfind("/node_modules/") {
-            current = &current[..idx];
-        } else if let Some(idx) = current.rfind('/') {
-            current = &current[..idx];
-        } else {
-            break;
-        }
+        current = match parent_scope(current) {
+            Some(p) => p,
+            None => break,
+        };
     }
     false
 }
@@ -808,14 +834,10 @@ pub fn find_visible_peer_node<'a>(
         // `@typescript/native` -> typescript is never `typescript`'s peer.
 
         // Ascend one directory level in node_modules hierarchy
-        if let Some(idx) = current.rfind("/node_modules/") {
-            current = &current[..idx];
-        } else if let Some(idx) = current.rfind('/') {
-            // For workspace packages like "packages/app", ascend to parent directory
-            current = &current[..idx];
-        } else {
-            break;
-        }
+        current = match parent_scope(current) {
+            Some(p) if !p.is_empty() => p,
+            _ => break,
+        };
     }
 
     // Finally, check root scope ("")
@@ -1237,5 +1259,42 @@ mod tests {
             "pkg",
             &target_v2,
         ));
+    }
+
+    #[test]
+    fn test_parent_scope_and_iter_ancestor_scopes() {
+        assert_eq!(parent_scope(""), None);
+        assert_eq!(parent_scope("node_modules/foo"), Some(""));
+        assert_eq!(parent_scope("node_modules/@scope/pkg"), Some(""));
+        assert_eq!(
+            parent_scope("node_modules/foo/node_modules/bar"),
+            Some("node_modules/foo")
+        );
+        assert_eq!(
+            parent_scope("packages/parent/nested"),
+            Some("packages/parent")
+        );
+        assert_eq!(parent_scope("packages/parent"), Some("packages"));
+        assert_eq!(parent_scope("packages"), Some(""));
+        assert_eq!(
+            parent_scope("packages/parent/nested/node_modules/dep"),
+            Some("packages/parent/nested")
+        );
+        assert_eq!(
+            parent_scope("packages/parent/nested/node_modules/@scope/dep"),
+            Some("packages/parent/nested")
+        );
+
+        let scopes: Vec<&str> = iter_ancestor_scopes("packages/parent/nested").collect();
+        assert_eq!(
+            scopes,
+            vec!["packages/parent/nested", "packages/parent", "packages", ""]
+        );
+
+        let root_scopes: Vec<&str> = iter_ancestor_scopes("node_modules/foo").collect();
+        assert_eq!(root_scopes, vec!["node_modules/foo", ""]);
+
+        let empty_scopes: Vec<&str> = iter_ancestor_scopes("").collect();
+        assert_eq!(empty_scopes, vec![""]);
     }
 }

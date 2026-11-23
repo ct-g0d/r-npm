@@ -6101,24 +6101,15 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                     };
 
                     let mut found_node: Option<&LockfilePackage> = None;
-                    let mut curr = pkg_key.as_str();
-                    loop {
-                        let candidate_key = if curr.is_empty() {
+                    for scope in rnpm_solver::hoisting::iter_ancestor_scopes(pkg_key) {
+                        let candidate_key = if scope.is_empty() {
                             format!("node_modules/{dep_name}")
                         } else {
-                            format!("{curr}/node_modules/{dep_name}")
+                            format!("{scope}/node_modules/{dep_name}")
                         };
                         if let Some(p) = lockfile.packages.get(&candidate_key) {
                             found_node = Some(p);
                             break;
-                        }
-                        if curr.is_empty() {
-                            break;
-                        }
-                        if let Some(idx) = curr.rfind("/node_modules/") {
-                            curr = &curr[..idx];
-                        } else {
-                            curr = "";
                         }
                     }
 
@@ -10069,8 +10060,7 @@ pub fn resolve_lockfile_dependency_path(
     parent_key: &str,
     dependency_name: &str,
 ) -> Option<String> {
-    let mut scope = parent_key.to_string();
-    loop {
+    for scope in rnpm_solver::hoisting::iter_ancestor_scopes(parent_key) {
         let candidate = if scope.is_empty() {
             format!("node_modules/{dependency_name}")
         } else {
@@ -10079,19 +10069,8 @@ pub fn resolve_lockfile_dependency_path(
         if lockfile.packages.contains_key(&candidate) {
             return Some(candidate);
         }
-        if scope.is_empty() {
-            return None;
-        }
-        if let Some(index) = scope.rfind("/node_modules/") {
-            scope.truncate(index);
-        } else if scope.starts_with("node_modules/") {
-            scope.clear();
-        } else if let Some(index) = scope.rfind('/') {
-            scope.truncate(index);
-        } else {
-            scope.clear();
-        }
     }
+    None
 }
 
 /// Prunes unreferenced packages from lockfile based on reachability from manifest direct dependencies.
@@ -10152,30 +10131,7 @@ pub fn prune_lockfile(lockfile: &mut LockfileV3, manifest: &Manifest) -> HashSet
 
             for dep_name in all_deps {
                 // Resolution in node_modules tree: check closest scope up through parent ancestors to root
-                let mut target_key = None;
-                let nested_key = format!("{current_key}/node_modules/{dep_name}");
-                if lockfile.packages.contains_key(&nested_key) {
-                    target_key = Some(nested_key);
-                } else {
-                    let mut curr = current_key.as_str();
-                    while let Some(idx) = curr.rfind("/node_modules/") {
-                        curr = &curr[..idx];
-                        if !curr.is_empty() {
-                            let candidate = format!("{curr}/node_modules/{dep_name}");
-                            if lockfile.packages.contains_key(&candidate) {
-                                target_key = Some(candidate);
-                                break;
-                            }
-                        }
-                    }
-                    if target_key.is_none() {
-                        let root_key = format!("node_modules/{dep_name}");
-                        if lockfile.packages.contains_key(&root_key) {
-                            target_key = Some(root_key);
-                        }
-                    }
-                }
-
+                let target_key = resolve_lockfile_dependency_path(lockfile, &current_key, &dep_name);
                 if let Some(k) = target_key {
                     if !reachable_keys.contains(&k) {
                         reachable_keys.insert(k.clone());

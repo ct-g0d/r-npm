@@ -1280,27 +1280,18 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
 
         if !is_unlocked {
             if let Some(ref lockfile) = self.options.lockfile {
-                let mut curr = task.parent_location.as_str();
                 let mut found_loc = None;
-                loop {
-                    let cand = if curr.is_empty() {
+                for scope in crate::hoisting::iter_ancestor_scopes(&task.parent_location) {
+                    let cand = if scope.is_empty() {
                         format!("node_modules/{}", dep_spec.install_name)
                     } else {
-                        format!("{curr}/node_modules/{}", dep_spec.install_name)
+                        format!("{scope}/node_modules/{}", dep_spec.install_name)
                     };
                     if let Some(pkg) = lockfile.packages.get(&cand) {
                         if pkg.version.as_deref() == Some(&chosen_version.version) {
                             found_loc = Some(cand);
                             break;
                         }
-                    }
-                    if curr.is_empty() {
-                        break;
-                    }
-                    if let Some(idx) = curr.rfind("/node_modules/") {
-                        curr = &curr[..idx];
-                    } else {
-                        curr = "";
                     }
                 }
                 if let Some(loc) = found_loc {
@@ -2528,13 +2519,12 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                 .contains_key(pkg_name);
         if !is_unlocked {
             if let Some(ref lockfile) = self.options.lockfile {
-                let mut curr = parent_location;
                 let mut found_pkg = None;
-                loop {
-                    let cand = if curr.is_empty() {
+                for scope in crate::hoisting::iter_ancestor_scopes(parent_location) {
+                    let cand = if scope.is_empty() {
                         format!("node_modules/{install_name}")
                     } else {
-                        format!("{curr}/node_modules/{install_name}")
+                        format!("{scope}/node_modules/{install_name}")
                     };
                     if let Some(pkg) = lockfile.packages.get(&cand) {
                         let entry_name = pkg.name.as_deref().unwrap_or(install_name);
@@ -2542,14 +2532,6 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                             found_pkg = Some(pkg);
                             break;
                         }
-                    }
-                    if curr.is_empty() {
-                        break;
-                    }
-                    if let Some(idx) = curr.rfind("/node_modules/") {
-                        curr = &curr[..idx];
-                    } else {
-                        curr = "";
                     }
                 }
                 if let Some(pkg) = found_pkg {

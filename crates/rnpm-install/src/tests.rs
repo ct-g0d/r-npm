@@ -5545,3 +5545,117 @@ fn test_prefer_dedupe_config_wiring() {
     let installer2 = Installer::new(options2).unwrap();
     assert!(installer2.options.prefer_dedupe);
 }
+
+#[tokio::test]
+async fn test_run_ci_nested_workspace_ancestor_hoisting() {
+    let tmp = tempdir().unwrap();
+    let root = tmp.path().join("workspace-root");
+    fs::create_dir_all(root.join("packages/parent/nested")).unwrap();
+
+    // 1. Root package.json
+    let mut root_manifest = Manifest::default();
+    root_manifest.name = Some("workspace-root".to_string());
+    root_manifest.version = Some("1.0.0".to_string());
+    root_manifest.workspaces = Some(rnpm_core::manifest::PackageWorkspaces::List(vec![
+        "packages/parent".to_string(),
+        "packages/parent/nested".to_string(),
+    ]));
+    root_manifest
+        .dependencies
+        .insert("conflicting-lib".to_string(), "2.0.0".to_string());
+    root_manifest
+        .save_to_file(root.join("package.json"))
+        .unwrap();
+
+    // 2. Parent workspace package.json
+    let mut parent_manifest = Manifest::default();
+    parent_manifest.name = Some("parent-ws".to_string());
+    parent_manifest.version = Some("1.0.0".to_string());
+    parent_manifest
+        .save_to_file(root.join("packages/parent/package.json"))
+        .unwrap();
+
+    // 3. Nested workspace package.json requiring conflicting-lib ^1.0.0
+    let mut nested_manifest = Manifest::default();
+    nested_manifest.name = Some("nested-ws".to_string());
+    nested_manifest.version = Some("1.0.0".to_string());
+    nested_manifest
+        .dependencies
+        .insert("conflicting-lib".to_string(), "^1.0.0".to_string());
+    nested_manifest
+        .save_to_file(root.join("packages/parent/nested/package.json"))
+        .unwrap();
+
+    // 4. Lockfile v3 where:
+    // - root node_modules has conflicting-lib@2.0.0
+    // - parent workspace has conflicting-lib@1.0.0 hoisted under packages/parent/node_modules/conflicting-lib
+    // - nested workspace depends on conflicting-lib@^1.0.0
+    let mut lock = LockfileV3::new("workspace-root", Some("1.0.0".to_string()));
+    if let Some(root_pkg) = lock.root_package_mut() {
+        let mut deps = BTreeMap::new();
+        deps.insert("conflicting-lib".to_string(), "2.0.0".to_string());
+        root_pkg.dependencies = Some(deps);
+        root_pkg.workspaces = Some(vec![
+            "packages/parent".to_string(),
+            "packages/parent/nested".to_string(),
+        ]);
+    }
+    lock.insert_package(
+        "node_modules/conflicting-lib",
+        LockfilePackage {
+            version: Some("2.0.0".to_string()),
+            ..Default::default()
+        },
+    );
+    lock.insert_package(
+        "packages/parent",
+        LockfilePackage {
+            version: Some("1.0.0".to_string()),
+            ..Default::default()
+        },
+    );
+    lock.insert_package(
+        "packages/parent/node_modules/conflicting-lib",
+        LockfilePackage {
+            version: Some("1.0.0".to_string()),
+            ..Default::default()
+        },
+    );
+    let mut nested_deps = BTreeMap::new();
+    nested_deps.insert("conflicting-lib".to_string(), "^1.0.0".to_string());
+    lock.insert_package(
+        "packages/parent/nested",
+        LockfilePackage {
+            version: Some("1.0.0".to_string()),
+            dependencies: Some(nested_deps),
+            ..Default::default()
+        },
+    );
+    lock.save_to_file(&root.join("package-lock.json")).unwrap();
+
+    // Verify resolve_lockfile_dependency_path finds ancestor workspace placement
+    let resolved_path = crate::resolve_lockfile_dependency_path(
+        &lock,
+        "packages/parent/nested",
+        "conflicting-lib",
+    );
+    assert_eq!(
+        resolved_path.as_deref(),
+        Some("packages/parent/node_modules/conflicting-lib")
+    );
+
+    // Verify rnpm ci validation succeeds and does not declare conflicting-lib missing
+    let options = InstallOptions {
+        project_dir: root.clone(),
+        offline: true,
+        dry_run: true,
+        ..Default::default()
+    };
+    let mut installer = Installer::new(options).unwrap();
+    let res = installer.run_ci().await;
+    assert!(
+        res.is_ok(),
+        "run_ci must succeed when dependency is satisfied by intermediate ancestor workspace node_modules: {:?}",
+        res.err()
+    );
+}
