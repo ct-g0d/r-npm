@@ -1603,9 +1603,21 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                 // placement pass and lets a later direct dependency claim a
                 // compatible root slot before an earlier sibling's nested
                 // subtree is expanded.
-                let child_edges: Vec<(&str, bool)> = child_tasks
+                let mut child_targets = Vec::new();
+                for t in &child_tasks {
+                    let Ok(c_dep) = DependencySpec::parse(&t.install_name, &t.raw_spec) else {
+                        continue;
+                    };
+                    if matches!(
+                        c_dep.target,
+                        PackageTarget::Range(_) | PackageTarget::Version(_) | PackageTarget::Tag(_)
+                    ) {
+                        child_targets.push(c_dep);
+                    }
+                }
+                let child_edges: Vec<(&str, bool)> = child_targets
                     .iter()
-                    .map(|t| (t.install_name.as_str(), false))
+                    .map(|t| (t.package_name.as_str(), false))
                     .collect();
                 self.provider.prefetch_packages_for_edge(&child_edges);
                 let mut peer_tasks = Vec::new();
