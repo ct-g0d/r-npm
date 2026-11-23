@@ -1201,3 +1201,47 @@ fn test_lexical_path_fallback_and_windows_workspace_backslash() {
     assert!(strict_preflight(&lockfile, temp.path(), &workspace_paths, &policy, false).is_ok());
     assert!(unreviewed_scripts_warning(&lockfile, temp.path(), &workspace_paths, &policy, false).is_none());
 }
+
+#[test]
+fn test_git_identity_non_ascii_prefix_boundary_safety() {
+    let temp = tempdir().unwrap();
+
+    // 1. Multi-byte UTF-8 character where byte 5, 7, or 10 lands mid-codepoint.
+    // "你好世界" is 12 bytes: [0..3, 3..6, 6..9, 9..12]. Byte 7 is inside '世' (6..9).
+    let (repo_zh, committish_zh) = git_identity("你好世界/repo#main").unwrap();
+    assert_eq!(repo_zh, "你好世界/repo");
+    assert_eq!(committish_zh, "main");
+
+    // 2. 4-byte UTF-8 emoji "🦀" (bytes 0..4). Byte 5 or 7 lands on boundary or inside.
+    let (repo_crab, committish_crab) = git_identity("🦀/repo#feat").unwrap();
+    assert_eq!(repo_crab, "🦀/repo");
+    assert_eq!(committish_crab, "feat");
+
+    // 3. Accented character "é" (2 bytes).
+    let (repo_accent, _) = git_identity("école/projet").unwrap();
+    assert_eq!(repo_accent, "école/projet");
+
+    // 4. Multiple emojis with byte length > 10, crossing 5, 7, and 10 byte boundaries.
+    let (repo_multi, _) = git_identity("🚀🎉🔥/tools").unwrap();
+    assert_eq!(repo_multi, "🚀🎉🔥/tools");
+
+    // 5. Cyrillic text with 2-byte characters.
+    let (repo_cyr, committish_cyr) = git_identity("git+https://example.com/пользователь/проект#v1.0").unwrap();
+    assert_eq!(repo_cyr, "example.com/пользователь/проект");
+    assert_eq!(committish_cyr, "v1.0");
+
+    let (repo_git_at, _) = git_identity("git@example.com:пользователь/проект").unwrap();
+    assert_eq!(repo_git_at, "example.com/пользователь/проект");
+
+    // 6. ScriptNode matching with non-ASCII git spec
+    let node = ScriptNode {
+        location: "node_modules/unicode-dep",
+        resolved: Some("git+https://github.com/用户/仓库.git#main"),
+        lock_name: None,
+        in_bundle: false,
+        link: false,
+        project_dir: temp.path(),
+    };
+    assert!(node.matches("github:用户/仓库#main", false));
+    assert!(node.matches("git+https://github.com/用户/仓库.git#main", false));
+}

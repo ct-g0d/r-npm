@@ -213,13 +213,13 @@ pub fn git_identity(spec: &str) -> Option<(String, String)> {
             break;
         }
     }
-    let body = if body.len() >= 7 && body[..7].eq_ignore_ascii_case("github:") {
+    let body = if body.get(..7).is_some_and(|p| p.eq_ignore_ascii_case("github:")) {
         format!("github.com/{}", &body[7..])
-    } else if body.len() >= 7 && body[..7].eq_ignore_ascii_case("gitlab:") {
+    } else if body.get(..7).is_some_and(|p| p.eq_ignore_ascii_case("gitlab:")) {
         format!("gitlab.com/{}", &body[7..])
-    } else if body.len() >= 10 && body[..10].eq_ignore_ascii_case("bitbucket:") {
+    } else if body.get(..10).is_some_and(|p| p.eq_ignore_ascii_case("bitbucket:")) {
         format!("bitbucket.org/{}", &body[10..])
-    } else if body.len() >= 5 && body[..5].eq_ignore_ascii_case("gist:") {
+    } else if body.get(..5).is_some_and(|p| p.eq_ignore_ascii_case("gist:")) {
         format!("gist.github.com/{}", &body[5..])
     } else {
         body.replacen(':', "/", 1)
@@ -308,7 +308,7 @@ impl ScriptNode<'_> {
             });
         }
         if is_path_spec(key) {
-            let key_path = if key.len() >= 5 && key[..5].eq_ignore_ascii_case("file:") {
+            let key_path = if key.get(..5).is_some_and(|p| p.eq_ignore_ascii_case("file:")) {
                 &key[5..]
             } else {
                 key
@@ -318,7 +318,7 @@ impl ScriptNode<'_> {
                 .resolved
                 .map(|r| {
                     let r = r.trim();
-                    if r.len() >= 5 && r[..5].eq_ignore_ascii_case("file:") {
+                    if r.get(..5).is_some_and(|p| p.eq_ignore_ascii_case("file:")) {
                         &r[5..]
                     } else {
                         r
@@ -462,7 +462,7 @@ pub fn strict_preflight(
             .as_deref()
             .and_then(|r| {
                 let r = r.trim();
-                if r.len() >= 5 && r[..5].eq_ignore_ascii_case("file:") {
+                if r.get(..5).is_some_and(|p| p.eq_ignore_ascii_case("file:")) {
                     Some(&r[5..])
                 } else {
                     None
