@@ -1550,14 +1550,25 @@ fn build_process_env(ctx: &LifecycleContext) -> HashMap<String, String> {
             }
         }
     }
-    let config_res = if let Some(ref config) = ctx.config {
-        Ok(config.clone())
-    } else {
-        rnpm_config::Config::load(Some(&ctx.package_dir))
-    };
-    if let Ok(config) = config_res {
-        for (key, value) in config.npmrc.settings {
-            if !is_sensitive_credential_key(&key) {
+    if let Some(ref config) = ctx.config {
+        for (key, value) in &config.npmrc.settings {
+            if !is_sensitive_credential_key(key) {
+                env.insert(format!("npm_config_{}", key.replace('-', "_")), value.clone());
+            }
+        }
+    } else if let Ok(detailed) = rnpm_config::Config::load_detailed(
+        rnpm_config::ConfigOptions::new().project_dir(&ctx.package_dir),
+    ) {
+        let mut winning: std::collections::BTreeMap<String, (&str, String)> =
+            std::collections::BTreeMap::new();
+        for layer in detailed.layers {
+            let source = if layer.name == "env" { "env" } else { "other" };
+            for (key, value) in layer.settings {
+                winning.insert(key, (source, value));
+            }
+        }
+        for (key, (source, value)) in winning {
+            if source != "env" && !is_sensitive_credential_key(&key) {
                 env.insert(format!("npm_config_{}", key.replace('-', "_")), value);
             }
         }
