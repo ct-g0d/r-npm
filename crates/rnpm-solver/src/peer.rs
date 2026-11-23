@@ -129,6 +129,9 @@ impl PeerContext {
                 break;
             }
         }
+        if curr != peer && (peer_alias != Some(curr)) {
+            return None;
+        }
         path.reverse();
 
         // Cycle path starts at `dependent`, goes through `path`, and ends at `target`
@@ -178,12 +181,52 @@ impl PeerContext {
             .insert(peer.to_string());
     }
 
+    /// Mark a peer edge as actively being resolved, considering optional aliases.
+    pub fn enter_with_alias(
+        &mut self,
+        dependent: &str,
+        dep_alias: Option<&str>,
+        peer: &str,
+        peer_alias: Option<&str>,
+    ) {
+        self.enter(dependent, peer);
+        if let Some(da) = dep_alias {
+            self.enter(da, peer);
+        }
+        if let Some(pa) = peer_alias {
+            self.enter(dependent, pa);
+            if let Some(da) = dep_alias {
+                self.enter(da, pa);
+            }
+        }
+    }
+
     /// Mark a peer edge as finished.
     pub fn leave(&mut self, dependent: &str, peer: &str) {
         if let Some(set) = self.active_graph.get_mut(dependent) {
             set.remove(peer);
             if set.is_empty() {
                 self.active_graph.remove(dependent);
+            }
+        }
+    }
+
+    /// Mark a peer edge as finished, considering optional aliases.
+    pub fn leave_with_alias(
+        &mut self,
+        dependent: &str,
+        dep_alias: Option<&str>,
+        peer: &str,
+        peer_alias: Option<&str>,
+    ) {
+        self.leave(dependent, peer);
+        if let Some(da) = dep_alias {
+            self.leave(da, peer);
+        }
+        if let Some(pa) = peer_alias {
+            self.leave(dependent, pa);
+            if let Some(da) = dep_alias {
+                self.leave(da, pa);
             }
         }
     }

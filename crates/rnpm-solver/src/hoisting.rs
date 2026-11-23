@@ -21,6 +21,8 @@ pub enum PlacementStrategy {
     Nested,
     /// `shallow` (`--global-style`): never hoist above a top-level node.
     Shallow,
+    /// `linked`: build hoisted resolution graph for symlinking.
+    Linked,
 }
 
 /// A peer provider cannot nest inside a package that itself peers on that name.
@@ -390,10 +392,19 @@ pub fn determine_placement_with_peers(
     // Attempt 2: Check intermediate ancestor scopes from root towards parent
     let mut ancestors = Vec::new();
     let mut curr = parent_location;
-    while let Some(idx) = curr.rfind("/node_modules/") {
-        curr = &curr[..idx];
-        if !curr.is_empty() {
-            ancestors.push(curr);
+    while !curr.is_empty() {
+        if let Some(idx) = curr.rfind("/node_modules/") {
+            curr = &curr[..idx];
+            if !curr.is_empty() {
+                ancestors.push(curr);
+            }
+        } else if let Some(idx) = curr.rfind('/') {
+            curr = &curr[..idx];
+            if !curr.is_empty() && graph.nodes.contains_key(curr) {
+                ancestors.push(curr);
+            }
+        } else {
+            break;
         }
     }
 
@@ -478,7 +489,11 @@ fn candidate_shadows_ancestor_dep(
         .get(install_name)
         .or_else(|| ancestor_node.dependencies.get(package_name))
         .or_else(|| ancestor_node.optional_dependencies.get(install_name))
-        .or_else(|| ancestor_node.optional_dependencies.get(package_name));
+        .or_else(|| ancestor_node.optional_dependencies.get(package_name))
+        .or_else(|| ancestor_node.dev_dependencies.get(install_name))
+        .or_else(|| ancestor_node.dev_dependencies.get(package_name))
+        .or_else(|| ancestor_node.peer_dependencies.get(install_name))
+        .or_else(|| ancestor_node.peer_dependencies.get(package_name));
 
     let Some(spec) = dep_spec else {
         return false;
@@ -526,7 +541,11 @@ fn candidate_shadows_descendant_dep(
     let Some(version) = resolved_version else {
         return false;
     };
-    let prefix = format!("{scope}/node_modules/");
+    let prefix = if scope.is_empty() {
+        "node_modules/".to_string()
+    } else {
+        format!("{scope}/node_modules/")
+    };
     // Arborist attaches edgesOut when a node enters the tree, before that
     // node's turn in depsQueue. Our graph.edges only contains processed
     // tasks, so also inspect pending edges from the manifest.
@@ -727,6 +746,8 @@ fn is_shadowed_by_incompatible_between(
             }
         }
         if let Some(idx) = current.rfind("/node_modules/") {
+            current = &current[..idx];
+        } else if let Some(idx) = current.rfind('/') {
             current = &current[..idx];
         } else {
             break;

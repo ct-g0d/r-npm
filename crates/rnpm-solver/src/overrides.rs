@@ -279,7 +279,7 @@ fn parse_overrides_into_map(val: &serde_json::Value, rules: &mut BTreeMap<String
     }
 }
 
-/// Splits an override key on arrow `>` separators, preserving `@` scopes and `>=` comparators.
+/// Splits an override key on arrow `>` separators, preserving `@` scopes and `>=`/`>` comparators.
 fn split_arrow_key(key: &str) -> Vec<String> {
     if !key.contains('>') {
         return vec![key.trim().to_string()];
@@ -292,11 +292,7 @@ fn split_arrow_key(key: &str) -> Vec<String> {
 
     while i < chars.len() {
         if chars[i] == '>' {
-            // Check if this '>' is a comparator rather than an arrow separator:
-            // 1. Followed by '=' (e.g. '>=')
-            // 2. Preceded by '@' (e.g. '@>')
-            let is_comparator =
-                (i + 1 < chars.len() && chars[i + 1] == '=') || (i > 0 && chars[i - 1] == '@');
+            let is_comparator = is_comparator_gt(&chars, i);
             if !is_comparator {
                 let part: String = chars[last_idx..i].iter().collect();
                 let trimmed = part.trim();
@@ -320,6 +316,32 @@ fn split_arrow_key(key: &str) -> Vec<String> {
     } else {
         parts
     }
+}
+
+/// Checks whether a `>` character at index `i` is a semver comparator (e.g. `>=1.0.0`, `>1.0.0`, `@ > 1.0.0`)
+/// rather than an override arrow separator `>`.
+fn is_comparator_gt(chars: &[char], i: usize) -> bool {
+    if i + 1 < chars.len() && chars[i + 1] == '=' {
+        return true;
+    }
+    let prev_non_ws = (0..i).rev().find(|&k| !chars[k].is_whitespace());
+    if let Some(prev) = prev_non_ws {
+        if chars[prev] == '@' {
+            return true;
+        }
+    }
+    let next_non_ws = (i + 1..chars.len()).find(|&k| !chars[k].is_whitespace());
+    if let (Some(prev), Some(next)) = (prev_non_ws, next_non_ws) {
+        let prev_has_at = (0..=prev)
+            .rev()
+            .find(|&k| !chars[k].is_whitespace())
+            .is_some_and(|k| chars[k] == '@');
+        let next_is_ver = chars[next].is_ascii_digit() || chars[next] == 'v';
+        if prev_has_at && next_is_ver {
+            return true;
+        }
+    }
+    false
 }
 
 /// Inserts a multi-hop override path into a nested `BTreeMap<String, OverrideValue>`.
@@ -403,10 +425,10 @@ fn parse_key_and_spec(key: &str) -> Option<(&str, &str)> {
         let after_slash = &key[slash + 1..];
         let at = after_slash.find('@')?;
         let split_idx = slash + 1 + at;
-        Some((&key[..split_idx], &key[split_idx + 1..]))
+        Some((key[..split_idx].trim(), key[split_idx + 1..].trim()))
     } else {
         let at = key.find('@')?;
-        Some((&key[..at], &key[at + 1..]))
+        Some((key[..at].trim(), key[at + 1..].trim()))
     }
 }
 
@@ -418,18 +440,29 @@ fn spec_matches(pattern_spec: &str, requested_spec: &str) -> bool {
         return true;
     }
 
+    // Strip workspace: prefix if present, e.g. workspace:^1.0.0 -> ^1.0.0
+    let r_clean = r.strip_prefix("workspace:").unwrap_or(r).trim();
+    let r_clean = if r_clean == "*" || r_clean == "^" || r_clean == "~" || r_clean.is_empty() {
+        "*"
+    } else {
+        r_clean
+    };
+    if p == r_clean {
+        return true;
+    }
+
     // Wildcards: "*" or "x" or "X" match anything
     if p == "*" || p.eq_ignore_ascii_case("x") {
         return true;
     }
 
     // Try semver range matching if requested_spec is an exact version
-    if let (Ok(p_range), Ok(r_ver)) = (Range::parse(p), Version::parse(r)) {
+    if let (Ok(p_range), Ok(r_ver)) = (Range::parse(p), Version::parse(r_clean)) {
         return p_range.satisfies(&r_ver);
     }
 
     // If both can be parsed as ranges, check if requested range's lower bound satisfies pattern range
-    if let (Ok(p_range), Ok(r_range)) = (Range::parse(p), Range::parse(r)) {
+    if let (Ok(p_range), Ok(r_range)) = (Range::parse(p), Range::parse(r_clean)) {
         if let Some(first_set) = r_range.sets.first() {
             if let Some(first_comp) = first_set.comparators.first() {
                 if p_range.satisfies(&first_comp.version) {
@@ -628,6 +661,57 @@ mod tests {
         assert_eq!(
             overrides.resolve_override("bar", "^1.0.0", &[]).unwrap(),
             None
+        );
+    }
+
+    #[test]
+    fn test_arrow_syntax_with_comparators_and_spaces() {
+        let json = serde_json::json!({
+            "foo@ >= 1.0.0 > bar": "2.0.0",
+            "foo@ >1.0.0 > baz": "3.0.0",
+            "foo@> 1.0.0 > qux": "4.0.0",
+            "target@>=2.0.0": "2.5.0",
+            "@scope/pkg @ ^1.0.0 > child": "1.2.3"
+        });
+        let overrides = Overrides::from_json_value(Some(&json), BTreeMap::new());
+
+        assert_eq!(
+            overrides.resolve_override("bar", "^1.0.0", &["foo"]).unwrap(),
+            Some("2.0.0".to_string())
+        );
+        assert_eq!(
+            overrides.resolve_override("baz", "^1.0.0", &["foo"]).unwrap(),
+            Some("3.0.0".to_string())
+        );
+        assert_eq!(
+            overrides.resolve_override("qux", "^1.0.0", &["foo"]).unwrap(),
+            Some("4.0.0".to_string())
+        );
+        assert_eq!(
+            overrides.resolve_override("child", "*", &["@scope/pkg"]).unwrap(),
+            Some("1.2.3".to_string())
+        );
+        assert_eq!(
+            overrides.resolve_override("target", "2.1.0", &[]).unwrap(),
+            Some("2.5.0".to_string())
+        );
+    }
+
+    #[test]
+    fn test_workspace_spec_matches_override() {
+        let json = serde_json::json!({
+            "dep@^1.0.0": "1.9.9",
+            "shared@*": "2.0.0"
+        });
+        let overrides = Overrides::from_json_value(Some(&json), BTreeMap::new());
+
+        assert_eq!(
+            overrides.resolve_override("dep", "workspace:^1.2.0", &[]).unwrap(),
+            Some("1.9.9".to_string())
+        );
+        assert_eq!(
+            overrides.resolve_override("shared", "workspace:*", &[]).unwrap(),
+            Some("2.0.0".to_string())
         );
     }
 }
