@@ -714,4 +714,77 @@ async fn test_ci_workspace_absent_root_metadata_differential() {
         err_msg.contains("ELOCKFILE_DRIFT"),
         "error must be ELOCKFILE_DRIFT: {err_msg}"
     );
+
+    // 6. Update lockfile with member-b AND an unhoisted workspace dependency
+    let dep_tar = create_tarball(&[(
+        "package.json",
+        br#"{"name":"nested-dep","version":"1.0.0"}"#,
+    )]);
+    let dep_integrity = compute_sha512_integrity(&dep_tar);
+    let dep_tar_path = project_dir.join("nested-dep-1.0.0.tgz");
+    fs::write(&dep_tar_path, &dep_tar).unwrap();
+
+    lockfile.insert_package(
+        "packages/member-b",
+        LockfilePackage {
+            name: Some("member-b".to_string()),
+            version: Some("1.0.0".to_string()),
+            ..Default::default()
+        },
+    );
+    lockfile.insert_package(
+        "node_modules/member-b",
+        LockfilePackage {
+            resolved: Some("packages/member-b".to_string()),
+            link: Some(true),
+            ..Default::default()
+        },
+    );
+    // Unhoisted dependency inside packages/member-a/node_modules/nested-dep (Round 1 Finding 1 regression)
+    lockfile.insert_package(
+        "packages/member-a/node_modules/nested-dep",
+        LockfilePackage {
+            version: Some("1.0.0".to_string()),
+            resolved: Some("file:./nested-dep-1.0.0.tgz".to_string()),
+            integrity: Some(dep_integrity),
+            ..Default::default()
+        },
+    );
+    lockfile
+        .save_to_file(&project_dir.join("package-lock.json"))
+        .unwrap();
+
+    let mut installer3 = Installer::new(InstallOptions {
+        project_dir: project_dir.to_path_buf(),
+        offline: true,
+        ..Default::default()
+    })
+    .unwrap();
+    let res3 = installer3.run_ci().await;
+    assert!(
+        res3.is_ok(),
+        "run_ci must succeed with unhoisted workspace dependencies: {:?}",
+        res3.err()
+    );
+
+    // 7. Delete all members from disk while workspaces field remains in package.json (Round 1 Finding 2 regression)
+    fs::remove_dir_all(project_dir.join("packages/member-a")).unwrap();
+    fs::remove_dir_all(project_dir.join("packages/member-b")).unwrap();
+
+    let mut installer4 = Installer::new(InstallOptions {
+        project_dir: project_dir.to_path_buf(),
+        offline: true,
+        ..Default::default()
+    })
+    .unwrap();
+    let drift_empty = installer4.run_ci().await;
+    assert!(
+        drift_empty.is_err(),
+        "run_ci must fail with ELOCKFILE_DRIFT when all workspace members are deleted from disk"
+    );
+    let err_msg4 = drift_empty.unwrap_err().to_string();
+    assert!(
+        err_msg4.contains("ELOCKFILE_DRIFT"),
+        "error must be ELOCKFILE_DRIFT: {err_msg4}"
+    );
 }

@@ -33,7 +33,8 @@ pub use platform_list::PlatformList;
 pub use semver::{Comparator, ComparatorSet, Op, PrereleaseId, Range, Version};
 pub use spec::{PackageSpec, PackageTarget};
 pub use workspace::{
-    discover_workspaces, discover_workspaces_from_manifest, match_glob_patterns, WorkspaceMember,
+    discover_workspaces, discover_workspaces_from_manifest, match_glob_patterns,
+    path_matches_workspace_patterns, WorkspaceMember,
 };
 
 use std::borrow::Cow;

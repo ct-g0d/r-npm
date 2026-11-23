@@ -1401,41 +1401,99 @@ fn test_matches_manifest_ext_workspace_drift_discovered_disk_members_differentia
         },
     );
 
-    // Switch to root directory for discovered members check
-    let original_cwd = std::env::current_dir().unwrap();
-    std::env::set_current_dir(root_path).unwrap();
+    // 1. Initial matching members pass when supplied explicitly (no ambient CWD lookup)
+    let initial_members =
+        rnpm_core::workspace::discover_workspaces_from_manifest(root_path, &manifest).unwrap();
+    assert_eq!(initial_members.len(), 2);
+    assert!(
+        lockfile.matches_manifest_ext_with_workspaces(&manifest, true, false, Some(&initial_members)),
+        "must match when discovered disk members match lockfile members"
+    );
 
-    let match_result = std::panic::catch_unwind(|| {
-        assert!(
-            lockfile.matches_manifest_ext(&manifest, true, false),
-            "must match when discovered disk members match lockfile members"
-        );
+    // 2. Unhoisted workspace dependency must NOT trigger false drift (Round 1 Finding 1 regression)
+    let mut lockfile_with_unhoisted = lockfile.clone();
+    lockfile_with_unhoisted.insert_package(
+        "packages/pkg-a/node_modules/nested-dep",
+        LockfilePackage {
+            version: Some("1.2.3".to_string()),
+            resolved: Some("https://registry.npmjs.org/nested-dep/-/nested-dep-1.2.3.tgz".to_string()),
+            ..Default::default()
+        },
+    );
+    assert!(
+        lockfile_with_unhoisted.matches_manifest_ext_with_workspaces(
+            &manifest,
+            true,
+            false,
+            Some(&initial_members),
+        ),
+        "unhoisted package inside workspace member node_modules must not cause false ELOCKFILE_DRIFT"
+    );
 
-        // Add a new workspace member pkg-c on disk (not in lockfile) -> must trigger drift!
-        std::fs::create_dir_all("packages/pkg-c").unwrap();
-        std::fs::write(
-            "packages/pkg-c/package.json",
-            r#"{"name": "pkg-c", "version": "1.0.0"}"#,
-        )
-        .unwrap();
+    // 3. Add a new workspace member pkg-c on disk (not in lockfile) -> must trigger drift!
+    std::fs::create_dir_all(root_path.join("packages/pkg-c")).unwrap();
+    std::fs::write(
+        root_path.join("packages/pkg-c/package.json"),
+        r#"{"name": "pkg-c", "version": "1.0.0"}"#,
+    )
+    .unwrap();
 
-        assert!(
-            !lockfile.matches_manifest_ext(&manifest, true, false),
-            "must detect genuine drift when a new member is added to disk but missing from lockfile"
-        );
+    let members_with_c =
+        rnpm_core::workspace::discover_workspaces_from_manifest(root_path, &manifest).unwrap();
+    assert_eq!(members_with_c.len(), 3);
+    assert!(
+        !lockfile.matches_manifest_ext_with_workspaces(&manifest, true, false, Some(&members_with_c)),
+        "must detect genuine drift when a new member is added to disk but missing from lockfile"
+    );
 
-        // Remove pkg-c, and remove pkg-b from disk (still in lockfile) -> must trigger drift!
-        std::fs::remove_dir_all("packages/pkg-c").unwrap();
-        std::fs::remove_dir_all("packages/pkg-b").unwrap();
+    // 4. Remove pkg-c, and remove pkg-b from disk (still in lockfile) -> must trigger drift!
+    std::fs::remove_dir_all(root_path.join("packages/pkg-c")).unwrap();
+    std::fs::remove_dir_all(root_path.join("packages/pkg-b")).unwrap();
 
-        assert!(
-            !lockfile.matches_manifest_ext(&manifest, true, false),
-            "must detect genuine drift when a member in lockfile is deleted from disk"
-        );
-    });
+    let members_without_b =
+        rnpm_core::workspace::discover_workspaces_from_manifest(root_path, &manifest).unwrap();
+    assert_eq!(members_without_b.len(), 1);
+    assert!(
+        !lockfile.matches_manifest_ext_with_workspaces(
+            &manifest,
+            true,
+            false,
+            Some(&members_without_b),
+        ),
+        "must detect genuine drift when a member in lockfile is deleted from disk"
+    );
 
-    std::env::set_current_dir(original_cwd).unwrap();
-    match_result.unwrap();
+    // 5. Remove pkg-a as well: all workspace members deleted from disk (Round 1 Finding 2 regression)
+    std::fs::remove_dir_all(root_path.join("packages/pkg-a")).unwrap();
+    let empty_members =
+        rnpm_core::workspace::discover_workspaces_from_manifest(root_path, &manifest).unwrap();
+    assert!(empty_members.is_empty(), "all workspace members on disk deleted");
+    assert!(
+        !lockfile.matches_manifest_ext_with_workspaces(&manifest, true, false, Some(&empty_members)),
+        "must detect drift for stale lockfile members when all workspace packages are deleted from disk"
+    );
+
+    // 6. Explicitly empty discovered members with an empty lockfile matches
+    let empty_lockfile = LockfileV3::new("disk-ws-test", Some("1.0.0".to_string()));
+    assert!(
+        empty_lockfile.matches_manifest_ext_with_workspaces(
+            &manifest,
+            true,
+            false,
+            Some(&empty_members),
+        ),
+        "clean empty lockfile matches explicitly empty discovered workspace members"
+    );
+
+    // 7. Discovery unavailable (None) uses in-memory patterns
+    assert!(
+        lockfile.matches_manifest_ext_with_workspaces(&manifest, true, false, None),
+        "lockfile with matching members validates against patterns when discovery is unavailable"
+    );
+    assert!(
+        !empty_lockfile.matches_manifest_ext_with_workspaces(&manifest, true, false, None),
+        "empty lockfile with omitted root metadata fails when discovery is unavailable"
+    );
 }
 
 #[test]
@@ -1443,6 +1501,7 @@ fn test_path_matches_workspace_patterns_comprehensive() {
     let patterns = vec![
         "packages/*".to_string(),
         "apps/**".to_string(),
+        "modules/**/pkg".to_string(),
         "tools/cli".to_string(),
         "!packages/ignored".to_string(),
     ];
@@ -1457,12 +1516,23 @@ fn test_path_matches_workspace_patterns_comprehensive() {
     assert!(LockfileV3::path_matches_workspace_patterns("apps/web", &patterns));
     assert!(LockfileV3::path_matches_workspace_patterns("apps/mobile/ios", &patterns));
 
+    // Non-trailing ** (Round 1 Finding 4 parity)
+    assert!(LockfileV3::path_matches_workspace_patterns("modules/pkg", &patterns));
+    assert!(LockfileV3::path_matches_workspace_patterns("modules/a/pkg", &patterns));
+    assert!(LockfileV3::path_matches_workspace_patterns("modules/a/b/pkg", &patterns));
+
     // Exact path match
     assert!(LockfileV3::path_matches_workspace_patterns("tools/cli", &patterns));
     assert!(!LockfileV3::path_matches_workspace_patterns("tools/other", &patterns));
 
     // Negative pattern exclusion
     assert!(!LockfileV3::path_matches_workspace_patterns("packages/ignored", &patterns));
+
+    // Excluded directory segments (node_modules)
+    assert!(!LockfileV3::path_matches_workspace_patterns(
+        "packages/pkg-a/node_modules/dep",
+        &patterns
+    ));
 
     // Normalization (leading ./, backslashes, trailing /)
     assert!(LockfileV3::path_matches_workspace_patterns("./packages/pkg-a", &patterns));

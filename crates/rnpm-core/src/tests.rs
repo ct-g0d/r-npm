@@ -692,6 +692,54 @@ fn test_workspace_discovery_malformed_json_error() {
 }
 
 #[test]
+fn test_path_matches_workspace_patterns_semantics() {
+    use crate::workspace::path_matches_workspace_patterns;
+
+    let patterns = vec![
+        "packages/*".to_string(),
+        "apps/**".to_string(),
+        "modules/**/pkg".to_string(),
+        "tools/cli".to_string(),
+        "!packages/ignored".to_string(),
+        "!apps/ignored-app/**".to_string(),
+    ];
+
+    // Single wildcard
+    assert!(path_matches_workspace_patterns("packages/pkg-a", &patterns));
+    assert!(path_matches_workspace_patterns("packages/pkg-b", &patterns));
+    assert!(!path_matches_workspace_patterns("packages", &patterns));
+    assert!(!path_matches_workspace_patterns("packages/nested/pkg", &patterns));
+
+    // Recursive trailing wildcard
+    assert!(path_matches_workspace_patterns("apps/web", &patterns));
+    assert!(path_matches_workspace_patterns("apps/web/client", &patterns));
+
+    // Non-trailing ** (Round 1 Finding 4 parity)
+    assert!(path_matches_workspace_patterns("modules/pkg", &patterns)); // 0 levels
+    assert!(path_matches_workspace_patterns("modules/a/pkg", &patterns)); // 1 level
+    assert!(path_matches_workspace_patterns("modules/a/b/c/pkg", &patterns)); // multi level
+    assert!(!path_matches_workspace_patterns("modules/a/b/other", &patterns));
+
+    // Exact match
+    assert!(path_matches_workspace_patterns("tools/cli", &patterns));
+    assert!(!path_matches_workspace_patterns("tools/other", &patterns));
+
+    // Negative exclusions
+    assert!(!path_matches_workspace_patterns("packages/ignored", &patterns));
+    assert!(!path_matches_workspace_patterns("apps/ignored-app/sub", &patterns));
+
+    // Disallowed directory segments (should_skip_dir: node_modules, target, etc.)
+    assert!(!path_matches_workspace_patterns("packages/pkg-a/node_modules/dep", &patterns));
+    assert!(!path_matches_workspace_patterns("node_modules/pkg-a", &patterns));
+    assert!(!path_matches_workspace_patterns("apps/target/client", &patterns));
+
+    // Path normalization
+    assert!(path_matches_workspace_patterns("./packages/pkg-a", &patterns));
+    assert!(path_matches_workspace_patterns("packages\\pkg-a", &patterns));
+    assert!(path_matches_workspace_patterns("packages/pkg-a/", &patterns));
+}
+
+#[test]
 fn test_semver_pathological_ranges_and_build_tags() {
     // 1. Wildcards: bare and partial
     let r_bare_star = Range::parse("*").unwrap();

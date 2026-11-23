@@ -291,3 +291,137 @@ fn matches_neg_pattern(neg_pattern: &str, rel_path: &str) -> bool {
     }
     wildcard_match(neg_pattern, rel_path)
 }
+
+fn match_segments(pat_segs: &[&str], path_segs: &[&str]) -> bool {
+    if pat_segs.is_empty() {
+        return path_segs.is_empty();
+    }
+
+    let segment = pat_segs[0];
+    let remaining = &pat_segs[1..];
+
+    if segment == "**" {
+        // Option 1: ** matches 0 directory levels
+        if match_segments(remaining, path_segs) {
+            return true;
+        }
+
+        // Option 2: ** matches 1 or more directory levels
+        if !path_segs.is_empty() {
+            let seg = path_segs[0];
+            if should_skip_dir(seg) {
+                return false;
+            }
+            if match_segments(pat_segs, &path_segs[1..])
+                || match_segments(remaining, &path_segs[1..])
+            {
+                return true;
+            }
+        }
+
+        false
+    } else if segment == "*" {
+        if path_segs.is_empty() {
+            return false;
+        }
+        let seg = path_segs[0];
+        if should_skip_dir(seg) {
+            return false;
+        }
+        match_segments(remaining, &path_segs[1..])
+    } else if segment.contains('*') || segment.contains('?') {
+        if path_segs.is_empty() {
+            return false;
+        }
+        let seg = path_segs[0];
+        if should_skip_dir(seg) {
+            return false;
+        }
+        if wildcard_match(segment, seg) {
+            match_segments(remaining, &path_segs[1..])
+        } else {
+            false
+        }
+    } else {
+        if path_segs.is_empty() {
+            return false;
+        }
+        let seg = path_segs[0];
+        if should_skip_dir(seg) {
+            return false;
+        }
+        if segment == seg {
+            match_segments(remaining, &path_segs[1..])
+        } else {
+            false
+        }
+    }
+}
+
+/// Check if a relative POSIX path matches workspace patterns, using the same glob semantics
+/// as workspace discovery (`match_glob_patterns`).
+pub fn path_matches_workspace_patterns(path: &str, patterns: &[String]) -> bool {
+    let mut clean_path = path.trim();
+    if let Some(stripped) = clean_path.strip_prefix("./") {
+        clean_path = stripped;
+    } else if let Some(stripped) = clean_path.strip_prefix(".\\") {
+        clean_path = stripped;
+    }
+    let clean_path = clean_path.replace('\\', "/");
+    let clean_path = clean_path.trim_end_matches('/');
+    if clean_path.is_empty() {
+        return false;
+    }
+
+    let path_segs: Vec<&str> = clean_path.split('/').filter(|s| !s.is_empty()).collect();
+    if path_segs.is_empty() || path_segs.iter().any(|s| should_skip_dir(s)) {
+        return false;
+    }
+
+    let (negative_patterns, positive_patterns): (Vec<_>, Vec<_>) =
+        patterns.iter().partition(|p| p.starts_with('!'));
+
+    // 1. Must match at least one positive pattern
+    let mut matched = false;
+    for pattern in positive_patterns {
+        let clean_pattern = pattern.trim();
+        let clean_pattern = clean_pattern.strip_prefix("./").unwrap_or(clean_pattern);
+        let clean_pattern = clean_pattern.strip_prefix(".\\").unwrap_or(clean_pattern);
+        let posix_pattern = clean_pattern.replace('\\', "/");
+        let posix_pattern = posix_pattern.trim_end_matches('/');
+
+        let pat_segs: Vec<&str> = posix_pattern.split('/').filter(|s| !s.is_empty()).collect();
+        if pat_segs.is_empty() {
+            continue;
+        }
+
+        if match_segments(&pat_segs, &path_segs) {
+            matched = true;
+            break;
+        }
+    }
+
+    if !matched {
+        return false;
+    }
+
+    // 2. Must NOT match any negative pattern
+    for neg in &negative_patterns {
+        let neg_clean = neg.trim().strip_prefix('!').unwrap_or(neg).trim();
+        let neg_clean = neg_clean.strip_prefix("./").unwrap_or(neg_clean);
+        let neg_clean = neg_clean.strip_prefix(".\\").unwrap_or(neg_clean);
+        let posix_neg = neg_clean.replace('\\', "/");
+        let posix_neg = posix_neg.trim_end_matches('/');
+
+        if matches_neg_pattern(&posix_neg, &clean_path) {
+            return false;
+        }
+
+        let neg_segs: Vec<&str> = posix_neg.split('/').filter(|s| !s.is_empty()).collect();
+        if !neg_segs.is_empty() && match_segments(&neg_segs, &path_segs) {
+            return false;
+        }
+    }
+
+    true
+}
