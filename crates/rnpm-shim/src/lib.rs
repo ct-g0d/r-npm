@@ -458,23 +458,45 @@ pub fn parse_shim_target_and_pkg(content: &str) -> Option<(String, Option<String
         return None;
     }
 
-    let normalized = content.replace('\\', "/");
+    let extract_boundary = |remainder: &str| -> usize {
+        if let Some(q_idx) = remainder.find('"') {
+            let nl_idx = remainder.find(['\r', '\n']).unwrap_or(remainder.len());
+            if q_idx < nl_idx {
+                return q_idx;
+            }
+        }
+        let nl_idx = remainder.find(['\r', '\n']).unwrap_or(remainder.len());
+        let line = &remainder[..nl_idx];
+        if let Some(arg_idx) = line.find(" %*").or_else(|| line.find(" \"$@\"")) {
+            return arg_idx;
+        }
+        nl_idx
+    };
+
+    let clean_escapes = |s: &str| -> String {
+        s.replace("%%", "%")
+            .replace("`$", "$")
+            .replace("`\"", "\"")
+            .replace("``", "`")
+    };
+
+    // For POSIX shims, unescape shell escapes (\$, \", \`, \\) before normalizing path separators
+    let unescaped_content = if content.contains("#!/bin/sh") || (content.contains("basedir") && !content.contains("$basedir=")) {
+        content
+            .replace("\\$", "$")
+            .replace("\\\"", "\"")
+            .replace("\\`", "`")
+            .replace("\\\\", "\\")
+    } else {
+        content.to_string()
+    };
+
+    let normalized = unescaped_content.replace('\\', "/");
     // 1. Look for node_modules/...
     if let Some(idx) = normalized.find("node_modules/") {
         let remainder = &normalized[idx..];
-        let end = remainder
-            .find(|c: char| {
-                c == '"'
-                    || c == '\''
-                    || c == ' '
-                    || c == '\r'
-                    || c == '\n'
-                    || c == '$'
-                    || c == '%'
-                    || c == '`'
-            })
-            .unwrap_or(remainder.len());
-        let target_path = remainder[..end].to_string();
+        let end = extract_boundary(remainder);
+        let target_path = clean_escapes(&remainder[..end]);
         let pkg = extract_package_name(&target_path);
         return Some((target_path, pkg));
     }
@@ -483,19 +505,8 @@ pub fn parse_shim_target_and_pkg(content: &str) -> Option<(String, Option<String
     for marker in &["$basedir/../", "%dp0%/../", "%dp0%/.."] {
         if let Some(idx) = normalized.find(marker) {
             let remainder = &normalized[idx + marker.len()..];
-            let end = remainder
-                .find(|c: char| {
-                    c == '"'
-                        || c == '\''
-                        || c == ' '
-                        || c == '\r'
-                        || c == '\n'
-                        || c == '$'
-                        || c == '%'
-                        || c == '`'
-                })
-                .unwrap_or(remainder.len());
-            let target_path = format!("../{}", &remainder[..end]);
+            let end = extract_boundary(remainder);
+            let target_path = format!("../{}", clean_escapes(&remainder[..end]));
             let pkg = extract_package_name(&target_path);
             return Some((target_path, pkg));
         }
@@ -700,8 +711,17 @@ pub fn create_shims_with_force(
     }
 
     // Clean up any stale .cmd or .ps1 shims if present
-    let _ = fs::remove_file(bin_dir.join(format!("{bin_name}.cmd")));
-    let _ = fs::remove_file(bin_dir.join(format!("{bin_name}.ps1")));
+    for stale_ext in [".cmd", ".ps1"] {
+        let stale_path = bin_dir.join(format!("{bin_name}{stale_ext}"));
+        if let Ok(meta) = fs::symlink_metadata(&stale_path) {
+            if meta.permissions().readonly() {
+                let mut perms = meta.permissions();
+                perms.set_readonly(false);
+                let _ = fs::set_permissions(&stale_path, perms);
+            }
+            let _ = fs::remove_file(&stale_path);
+        }
+    }
 
     std::os::unix::fs::symlink(Path::new(&rel_target), &link_path).with_context(|| {
         format!(
@@ -751,30 +771,38 @@ pub fn create_shims_with_force(
 
     let write_shim_file = |path: &Path, data: &[u8]| -> Result<()> {
         if let Ok(meta) = fs::symlink_metadata(path) {
-            if meta.file_type().is_symlink() {
-                #[cfg(windows)]
-                {
-                    use std::os::windows::fs::FileTypeExt;
-                    if meta.file_type().is_symlink_dir() {
+            #[cfg(windows)]
+            {
+                use std::os::windows::fs::MetadataExt;
+                let attrs = meta.file_attributes();
+                if attrs & 0x400 != 0 {
+                    // Reparse point (symlink or junction)
+                    if attrs & 0x10 != 0 {
                         fs::remove_dir(path).with_context(|| {
-                            format!("Failed to remove existing directory symlink {}", path.display())
+                            format!("Failed to remove existing directory reparse point {}", path.display())
                         })?;
                     } else {
                         fs::remove_file(path).with_context(|| {
-                            format!("Failed to remove existing symlink {}", path.display())
+                            format!("Failed to remove existing file reparse point {}", path.display())
                         })?;
                     }
+                } else if meta.permissions().readonly() {
+                    let mut perms = meta.permissions();
+                    perms.set_readonly(false);
+                    let _ = fs::set_permissions(path, perms);
                 }
-                #[cfg(not(windows))]
-                {
+            }
+            #[cfg(not(windows))]
+            {
+                if meta.file_type().is_symlink() {
                     fs::remove_file(path).with_context(|| {
                         format!("Failed to remove existing symlink {}", path.display())
                     })?;
+                } else if meta.permissions().readonly() {
+                    let mut perms = meta.permissions();
+                    perms.set_readonly(false);
+                    let _ = fs::set_permissions(path, perms);
                 }
-            } else if meta.permissions().readonly() {
-                let mut perms = meta.permissions();
-                perms.set_readonly(false);
-                let _ = fs::set_permissions(path, perms);
             }
         }
         fs::write(path, data)

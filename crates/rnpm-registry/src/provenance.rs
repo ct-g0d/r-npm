@@ -253,66 +253,78 @@ pub fn verify_signature(
         ECDSA_P384_SHA384_ASN1, ECDSA_P384_SHA384_FIXED, ED25519,
     };
 
+    if signature.is_empty() {
+        return Err(RegistryError::InvalidSignature("Empty signature".into()));
+    }
+
     // 1. If public key is SPKI DER sequence (starts with 0x30)
     if public_key.first() == Some(&0x30) {
-        if let Ok((algo_oid, curve_oid, pk_bytes)) = parse_spki(public_key) {
-            if algo_oid == crate::asn1::OID_EC_PUBLIC_KEY {
-                if curve_oid.as_deref() == Some(crate::asn1::OID_EC_P256) || pk_bytes.len() == 65 {
-                    if UnparsedPublicKey::new(&ECDSA_P256_SHA256_ASN1, &pk_bytes)
-                        .verify(message, signature)
-                        .is_ok()
-                    {
-                        return Ok(());
-                    }
-                    if UnparsedPublicKey::new(&ECDSA_P256_SHA256_FIXED, &pk_bytes)
-                        .verify(message, signature)
-                        .is_ok()
-                    {
-                        return Ok(());
-                    }
-                } else if curve_oid.as_deref() == Some(crate::asn1::OID_EC_P384)
-                    || pk_bytes.len() == 97
-                {
-                    if UnparsedPublicKey::new(&ECDSA_P384_SHA384_ASN1, &pk_bytes)
-                        .verify(message, signature)
-                        .is_ok()
-                    {
-                        return Ok(());
-                    }
-                    if UnparsedPublicKey::new(&ECDSA_P384_SHA384_FIXED, &pk_bytes)
-                        .verify(message, signature)
-                        .is_ok()
-                    {
-                        return Ok(());
-                    }
+        let (algo_oid, curve_oid, pk_bytes) = parse_spki(public_key)?;
+        if algo_oid == crate::asn1::OID_EC_PUBLIC_KEY {
+            if curve_oid.as_deref() == Some(crate::asn1::OID_EC_P256) {
+                if pk_bytes.len() != 65 || pk_bytes[0] != 0x04 {
+                    return Err(RegistryError::InvalidSignature(
+                        "Invalid P-256 public key point length or format".into(),
+                    ));
                 }
-            } else if (algo_oid == crate::asn1::OID_ED25519 || pk_bytes.len() == 32)
-                && UnparsedPublicKey::new(&ED25519, &pk_bytes)
+                if UnparsedPublicKey::new(&ECDSA_P256_SHA256_ASN1, &pk_bytes)
                     .verify(message, signature)
                     .is_ok()
+                {
+                    return Ok(());
+                }
+                if UnparsedPublicKey::new(&ECDSA_P256_SHA256_FIXED, &pk_bytes)
+                    .verify(message, signature)
+                    .is_ok()
+                {
+                    return Ok(());
+                }
+            } else if curve_oid.as_deref() == Some(crate::asn1::OID_EC_P384) {
+                if pk_bytes.len() != 97 || pk_bytes[0] != 0x04 {
+                    return Err(RegistryError::InvalidSignature(
+                        "Invalid P-384 public key point length or format".into(),
+                    ));
+                }
+                if UnparsedPublicKey::new(&ECDSA_P384_SHA384_ASN1, &pk_bytes)
+                    .verify(message, signature)
+                    .is_ok()
+                {
+                    return Ok(());
+                }
+                if UnparsedPublicKey::new(&ECDSA_P384_SHA384_FIXED, &pk_bytes)
+                    .verify(message, signature)
+                    .is_ok()
+                {
+                    return Ok(());
+                }
+            } else {
+                return Err(RegistryError::InvalidSignature(format!(
+                    "Unsupported elliptic curve OID: {curve_oid:?}"
+                )));
+            }
+        } else if algo_oid == crate::asn1::OID_ED25519 {
+            if pk_bytes.len() != 32 {
+                return Err(RegistryError::InvalidSignature(
+                    "Invalid Ed25519 public key length".into(),
+                ));
+            }
+            if UnparsedPublicKey::new(&ED25519, &pk_bytes)
+                .verify(message, signature)
+                .is_ok()
             {
                 return Ok(());
             }
+        } else {
+            return Err(RegistryError::InvalidSignature(format!(
+                "Unsupported public key algorithm OID: {algo_oid}"
+            )));
         }
+        return Err(RegistryError::InvalidSignature(
+            "Cryptographic signature verification failed".into(),
+        ));
     }
 
-    // 2. Direct formats or standard SPKI lengths
-    if public_key.len() == 91 && public_key[0] == 0x30 {
-        let pk_slice = &public_key[public_key.len() - 65..];
-        if UnparsedPublicKey::new(&ECDSA_P256_SHA256_ASN1, pk_slice)
-            .verify(message, signature)
-            .is_ok()
-        {
-            return Ok(());
-        }
-        if UnparsedPublicKey::new(&ECDSA_P256_SHA256_FIXED, pk_slice)
-            .verify(message, signature)
-            .is_ok()
-        {
-            return Ok(());
-        }
-    }
-
+    // 2. Direct raw key formats (uncompressed EC points or raw 32-byte Ed25519)
     if public_key.len() == 65 && public_key[0] == 0x04 {
         if UnparsedPublicKey::new(&ECDSA_P256_SHA256_ASN1, public_key)
             .verify(message, signature)
@@ -326,9 +338,7 @@ pub fn verify_signature(
         {
             return Ok(());
         }
-    }
-
-    if public_key.len() == 97 && public_key[0] == 0x04 {
+    } else if public_key.len() == 97 && public_key[0] == 0x04 {
         if UnparsedPublicKey::new(&ECDSA_P384_SHA384_ASN1, public_key)
             .verify(message, signature)
             .is_ok()
@@ -341,9 +351,7 @@ pub fn verify_signature(
         {
             return Ok(());
         }
-    }
-
-    if public_key.len() == 32
+    } else if public_key.len() == 32
         && UnparsedPublicKey::new(&ED25519, public_key)
             .verify(message, signature)
             .is_ok()
@@ -362,13 +370,21 @@ pub fn verify_dsse_signatures<'a>(
     envelope: &'a DsseEnvelope,
     public_key: &[u8],
 ) -> Result<Vec<&'a DsseSignature>, RegistryError> {
+    if envelope.signatures.is_empty() {
+        return Err(RegistryError::InvalidSignature(
+            "DSSE envelope has no signatures".into(),
+        ));
+    }
     let payload = envelope.decode_payload()?;
     let pae = dsse_pre_auth_encoding(&envelope.payload_type, &payload);
 
     let mut verified = Vec::new();
     for s in &envelope.signatures {
+        if s.sig.trim().is_empty() {
+            continue;
+        }
         if let Ok(sig_bytes) = decode_base64(&s.sig) {
-            if verify_signature(public_key, &pae, &sig_bytes).is_ok() {
+            if !sig_bytes.is_empty() && verify_signature(public_key, &pae, &sig_bytes).is_ok() {
                 verified.push(s);
             }
         }
@@ -1578,13 +1594,20 @@ impl SigstoreBundle {
     /// Parses a SigstoreBundle from a JSON string, accepting either a direct SigstoreBundle
     /// or an npm AttestationResponse wrapper (`{"attestations": [{"bundle": ...}]}`).
     pub fn from_json(json_str: &str) -> Result<Self, RegistryError> {
-        if let Ok(bundle) = serde_json::from_str::<SigstoreBundle>(json_str) {
+        let trimmed = json_str.trim();
+        if trimmed.is_empty() {
+            return Err(RegistryError::InvalidSigstoreBundle(
+                "Empty JSON string".into(),
+            ));
+        }
+
+        if let Ok(bundle) = serde_json::from_str::<SigstoreBundle>(trimmed) {
             if bundle.dsse_envelope.is_some() {
                 return Ok(bundle);
             }
         }
 
-        if let Ok(response) = serde_json::from_str::<AttestationResponse>(json_str) {
+        if let Ok(response) = serde_json::from_str::<AttestationResponse>(trimmed) {
             for item in response.attestations {
                 if let Some(bundle) = item.bundle {
                     if bundle.dsse_envelope.is_some() {
@@ -1594,7 +1617,7 @@ impl SigstoreBundle {
             }
         }
 
-        if let Ok(val) = serde_json::from_str::<serde_json::Value>(json_str) {
+        if let Ok(val) = serde_json::from_str::<serde_json::Value>(trimmed) {
             if let Some(bundle_val) = val.get("bundle") {
                 if let Ok(bundle) = serde_json::from_value::<SigstoreBundle>(bundle_val.clone()) {
                     if bundle.dsse_envelope.is_some() {
@@ -1607,6 +1630,37 @@ impl SigstoreBundle {
         Err(RegistryError::InvalidSigstoreBundle(
             "No valid Sigstore bundle with dsseEnvelope found in JSON payload".into(),
         ))
+    }
+
+    /// Extracts all valid Sigstore bundles from JSON payload (supporting direct bundle or array of attestations).
+    pub fn from_json_all(json_str: &str) -> Result<Vec<Self>, RegistryError> {
+        let trimmed = json_str.trim();
+        if trimmed.is_empty() {
+            return Err(RegistryError::InvalidSigstoreBundle(
+                "Empty JSON string".into(),
+            ));
+        }
+        let mut bundles = Vec::new();
+        if let Ok(response) = serde_json::from_str::<AttestationResponse>(trimmed) {
+            for item in response.attestations {
+                if let Some(bundle) = item.bundle {
+                    if bundle.dsse_envelope.is_some() {
+                        bundles.push(bundle);
+                    }
+                }
+            }
+        }
+        if bundles.is_empty() {
+            if let Ok(bundle) = Self::from_json(trimmed) {
+                bundles.push(bundle);
+            }
+        }
+        if bundles.is_empty() {
+            return Err(RegistryError::InvalidSigstoreBundle(
+                "No valid Sigstore bundles found in JSON payload".into(),
+            ));
+        }
+        Ok(bundles)
     }
 }
 
@@ -1858,7 +1912,7 @@ fn current_time_ms() -> i64 {
         let mut resolved_keyid: Option<String> = None;
         let cert_count = raw_cert_chain.len();
 
-        let signing_key = if !raw_cert_chain.is_empty() {
+        let (signing_key, verified_sigs) = if !raw_cert_chain.is_empty() {
             // Fulcio-backed bundle
             if vm.tlog_entries.is_empty() {
                 return Err(RegistryError::InvalidSigstoreBundle(
@@ -1898,40 +1952,82 @@ fn current_time_ms() -> i64 {
             verify_rekor_set(&self.rekor_public_keys, tlog)?;
 
             primary_tlog = Some(tlog);
-            spki
+            let v_sigs = verify_dsse_signatures(envelope, &spki)?;
+            (spki, v_sigs)
         } else {
             // Keyed publish attestation
-            let keyid = vm
+            let explicit_hint = vm
                 .public_key
                 .as_ref()
                 .and_then(|pk| pk.hint.as_deref())
-                .or(envelope.signatures[0].keyid.as_deref())
-                .unwrap_or_default();
+                .map(str::trim)
+                .filter(|h| !h.is_empty());
 
-            if keyid.trim().is_empty() {
+            let mut candidate_keys: Vec<(String, Vec<u8>)> = Vec::new();
+
+            if let Some(hint) = explicit_hint {
+                if let Some(key) = self.registry_keys.get(hint) {
+                    candidate_keys.push((hint.to_string(), key.clone()));
+                } else {
+                    return Err(RegistryError::InvalidSignature(format!(
+                        "No corresponding public key found for attestation keyid '{hint}'"
+                    )));
+                }
+            } else {
+                for s in &envelope.signatures {
+                    if let Some(ref kid) = s.keyid {
+                        let kid_trimmed = kid.trim();
+                        if !kid_trimmed.is_empty() {
+                            if let Some(key) = self.registry_keys.get(kid_trimmed) {
+                                if !candidate_keys.iter().any(|(k, _)| k == kid_trimmed) {
+                                    candidate_keys.push((kid_trimmed.to_string(), key.clone()));
+                                }
+                            }
+                        }
+                    }
+                }
+                if candidate_keys.is_empty() {
+                    for (kid, key) in &self.registry_keys {
+                        candidate_keys.push((kid.clone(), key.clone()));
+                    }
+                }
+            }
+
+            if candidate_keys.is_empty() {
                 return Err(RegistryError::InvalidSigstoreBundle(
                     "Missing certificate chain in verification material and no keyid hint for registry key matching".into(),
                 ));
             }
 
-            let reg_key = self.registry_keys.get(keyid).ok_or_else(|| {
-                RegistryError::InvalidSignature(format!(
-                    "No corresponding public key found for attestation keyid '{keyid}'"
-                ))
+            let mut match_found = None;
+            for (kid, key_bytes) in candidate_keys {
+                if let Ok(v_sigs) = verify_dsse_signatures(envelope, &key_bytes) {
+                    match_found = Some((kid, key_bytes, v_sigs));
+                    break;
+                }
+            }
+
+            let (kid, signing_key_bytes, v_sigs) = match_found.ok_or_else(|| {
+                RegistryError::InvalidSignature(
+                    "None of the DSSE signatures matched the expected public key".into(),
+                )
             })?;
 
-            resolved_keyid = Some(keyid.to_string());
-            reg_key.clone()
+            resolved_keyid = Some(kid);
+            (signing_key_bytes, v_sigs)
         };
-
-        // 4. Verify DSSE envelope cryptographic signatures over PAE first to collect all verified_sigs
-        let verified_sigs = verify_dsse_signatures(envelope, &signing_key)?;
 
         // Enforce key expiry for keyed attestation using the exact resolved keyid
         if let Some(ref keyid) = resolved_keyid {
             if let Some((expires_str, expires_ms)) = self.registry_key_expiries.get(keyid.as_str()) {
                 let signing_time_ms = if let Some(tlog) = vm.tlog_entries.first() {
-                    let valid_set = tlog.integrated_time > 0
+                    let now_ms = Self::current_time_ms();
+                    // A timestamp in the future (> now + 5m clock skew) is forged/invalid
+                    let not_future = tlog.integrated_time > 0
+                        && (tlog.integrated_time * 1000) <= (now_ms + 300_000);
+
+                    // Checkpoint-only bundles do not carry an authenticated timestamp; require a verified SET!
+                    let valid_set = not_future
                         && tlog.inclusion_promise.is_some()
                         && verify_rekor_set(&self.rekor_public_keys, tlog).is_ok();
                     let valid_binding = verify_rekor_body_binding_any(
@@ -1945,13 +2041,13 @@ fn current_time_ms() -> i64 {
                     if valid_set && valid_binding {
                         tlog.integrated_time * 1000
                     } else {
-                        Self::current_time_ms()
+                        now_ms
                     }
                 } else {
                     Self::current_time_ms()
                 };
 
-                if signing_time_ms >= *expires_ms {
+                if *expires_ms <= 0 || signing_time_ms >= *expires_ms {
                     return Err(RegistryError::InvalidSignature(format!(
                         "Registry public key for keyid '{keyid}' has expired {expires_str}"
                     )));
@@ -1986,8 +2082,13 @@ fn current_time_ms() -> i64 {
             }
 
             // Bind Rekor body to DSSE envelope & leaf certificate (matching any verified signature paired with leaf cert)
-            let leaf_cert = parsed_leaf_cert.as_ref().unwrap();
-            verify_rekor_body_binding_any(tlog, envelope, &verified_sigs, &leaf_cert.raw_der)?;
+            if let Some(leaf_cert) = parsed_leaf_cert.as_ref() {
+                verify_rekor_body_binding_any(tlog, envelope, &verified_sigs, &leaf_cert.raw_der)?;
+            } else {
+                return Err(RegistryError::InvalidSigstoreBundle(
+                    "Missing parsed leaf certificate for Fulcio verification".into(),
+                ));
+            }
         } else if let Some(tlog) = vm.tlog_entries.first() {
             let valid_set = tlog.integrated_time > 0
                 && tlog.inclusion_promise.is_some()
@@ -2126,6 +2227,28 @@ fn current_time_ms() -> i64 {
                 continue;
             }
 
+            // Name part and version part must not contain qualifiers '?' or fragments '#'
+            if name_part.contains('?') || name_part.contains('#') {
+                continue;
+            }
+
+            // Version part must not contain subpaths '/', qualifiers '?', or fragments '#'
+            if version_part.contains('/') || version_part.contains('?') || version_part.contains('#') {
+                continue;
+            }
+
+            // Path segment count validation:
+            // Unscoped packages MUST have 0 slashes in name_part: e.g. "pkg"
+            // Scoped packages MUST have at most 1 slash: e.g. "@scope/pkg" or "%40scope/pkg" (or "%40scope%2fpkg")
+            let slash_count = name_part.matches('/').count();
+            if is_scoped {
+                if slash_count > 1 {
+                    continue;
+                }
+            } else if slash_count != 0 {
+                continue;
+            }
+
             if let Some(expected_ver) = package_version {
                 if version_part != expected_ver {
                     continue;
@@ -2138,8 +2261,7 @@ fn current_time_ms() -> i64 {
             // NEVER match unscoped `pkg` against `@scope/pkg`!
             // For unscoped package `pkg`:
             // name_part MUST be `pkg`. NEVER match `@scope/pkg` or `%40scope/pkg`!
-            let name_matches = if is_scoped {
-                let stripped = stripped_scope.unwrap();
+            let name_matches = if let Some(stripped) = stripped_scope {
                 let encoded_at = format!("%40{}", stripped);
                 let encoded_full = format!("%40{}", stripped.replace('/', "%2F"));
                 let encoded_full_lower = format!("%40{}", stripped.replace('/', "%2f"));
@@ -2176,8 +2298,8 @@ fn current_time_ms() -> i64 {
         tarball_integrity: Option<&str>,
         tarball_bytes: Option<&[u8]>,
     ) -> Result<(), RegistryError> {
-        let subject_sha512 = subject.digest.get("sha512").map(|s| s.trim());
-        let subject_sha256 = subject.digest.get("sha256").map(|s| s.trim());
+        let subject_sha512 = subject.digest.get("sha512").map(|s| s.trim()).filter(|s| !s.is_empty());
+        let subject_sha256 = subject.digest.get("sha256").map(|s| s.trim()).filter(|s| !s.is_empty());
 
         if subject_sha512.is_none() && subject_sha256.is_none() {
             return Err(RegistryError::ProvenanceVerificationFailed(
@@ -2287,10 +2409,16 @@ fn current_time_ms() -> i64 {
 
     fn digest_matches(expected: &str, actual_hex: &str) -> bool {
         let exp = expected.trim();
+        if exp.is_empty() {
+            return false;
+        }
         if exp.eq_ignore_ascii_case(actual_hex) {
             return true;
         }
         if let Ok(bytes) = decode_base64(exp) {
+            if bytes.is_empty() {
+                return false;
+            }
             let exp_hex = HEXLOWER.encode(&bytes);
             if exp_hex.eq_ignore_ascii_case(actual_hex) {
                 return true;
@@ -2775,11 +2903,37 @@ pub async fn request_fulcio_signing_cert(
 
 /// Decodes a PEM-formatted certificate or key into raw DER bytes.
 pub fn decode_pem_to_der(pem: &str) -> Result<Vec<u8>, RegistryError> {
-    let clean: String = pem
-        .lines()
-        .filter(|l| !l.starts_with("-----"))
-        .collect::<Vec<_>>()
-        .join("");
+    let trimmed = pem.trim();
+    let begin_idx = trimmed.find("-----BEGIN ").ok_or_else(|| {
+        RegistryError::InvalidSigstoreBundle("Missing PEM BEGIN header".into())
+    })?;
+    let after_begin = &trimmed[begin_idx..];
+    let header_line_end = after_begin.find('\n').ok_or_else(|| {
+        RegistryError::InvalidSigstoreBundle("Malformed PEM header line".into())
+    })?;
+    let header_line = after_begin[..header_line_end].trim();
+    let label = header_line
+        .strip_prefix("-----BEGIN ")
+        .and_then(|s| s.strip_suffix("-----"))
+        .ok_or_else(|| {
+            RegistryError::InvalidSigstoreBundle("Malformed PEM BEGIN header line".into())
+        })?;
+
+    let expected_end = format!("-----END {label}-----");
+    let end_idx = after_begin.find(&expected_end).ok_or_else(|| {
+        RegistryError::InvalidSigstoreBundle(format!(
+            "Missing matching PEM END header for label '{label}'"
+        ))
+    })?;
+
+    if header_line_end >= end_idx {
+        return Err(RegistryError::InvalidSigstoreBundle("Empty PEM body".into()));
+    }
+    let body = &after_begin[header_line_end + 1..end_idx];
+    let clean: String = body.chars().filter(|c| !c.is_whitespace()).collect();
+    if clean.is_empty() {
+        return Err(RegistryError::InvalidSigstoreBundle("Empty PEM body".into()));
+    }
     decode_base64(&clean)
 }
 

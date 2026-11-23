@@ -129,6 +129,9 @@ impl PeerContext {
                 break;
             }
         }
+        if curr != peer && (peer_alias != Some(curr)) {
+            return None;
+        }
         path.reverse();
 
         // Cycle path starts at `dependent`, goes through `path`, and ends at `target`

@@ -7,9 +7,57 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
 
+pub(crate) fn default_lockfile_version() -> u32 {
+    1
+}
+
+pub(crate) fn deserialize_lockfile_version<'de, D>(deserializer: D) -> Result<u32, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let val = serde_json::Value::deserialize(deserializer)?;
+    match val {
+        serde_json::Value::Number(n) => {
+            if let Some(u) = n.as_u64() {
+                u32::try_from(u).map_err(serde::de::Error::custom)
+            } else if let Some(f) = n.as_f64() {
+                if f.is_finite() && f.fract() == 0.0 && f >= 0.0 && f <= (u32::MAX as f64) {
+                    Ok(f as u32)
+                } else {
+                    Err(serde::de::Error::custom(
+                        "lockfileVersion float must be a non-negative whole integer within u32 range",
+                    ))
+                }
+            } else {
+                Err(serde::de::Error::custom("invalid lockfileVersion number"))
+            }
+        }
+        serde_json::Value::String(s) => {
+            if let Ok(u) = s.parse::<u32>() {
+                Ok(u)
+            } else if let Ok(f) = s.parse::<f64>() {
+                if f.is_finite() && f.fract() == 0.0 && f >= 0.0 && f <= (u32::MAX as f64) {
+                    Ok(f as u32)
+                } else {
+                    Err(serde::de::Error::custom("invalid lockfileVersion string"))
+                }
+            } else {
+                Err(serde::de::Error::custom("invalid lockfileVersion string"))
+            }
+        }
+        serde_json::Value::Null => Ok(1),
+        _ => Err(serde::de::Error::custom(
+            "lockfileVersion must be a number or string",
+        )),
+    }
+}
+
 /// Legacy dependency node from npm lockfile v1 or v2.
 #[derive(Debug, Clone, Deserialize)]
 pub struct LegacyDependency {
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
     pub version: String,
     #[serde(default)]
     pub resolved: Option<String>,
@@ -40,10 +88,15 @@ pub struct LegacyDependency {
 /// Generic container matching any npm lockfile version (v1, v2, or v3).
 #[derive(Debug, Clone, Deserialize)]
 pub struct AnyLockfile {
+    #[serde(default)]
     pub name: String,
     #[serde(default)]
     pub version: Option<String>,
-    #[serde(rename = "lockfileVersion")]
+    #[serde(
+        rename = "lockfileVersion",
+        default = "default_lockfile_version",
+        deserialize_with = "deserialize_lockfile_version"
+    )]
     pub lockfile_version: u32,
     #[serde(default)]
     pub requires: Option<bool>,
@@ -51,6 +104,55 @@ pub struct AnyLockfile {
     pub packages: Option<BTreeMap<String, LockfilePackage>>,
     #[serde(default)]
     pub dependencies: Option<BTreeMap<String, LegacyDependency>>,
+}
+
+fn parse_legacy_version_and_name(
+    dep_name: &str,
+    dep_version: &str,
+    explicit_name: Option<&str>,
+) -> (Option<String>, Option<String>) {
+    if let Some(alias_part) = dep_version.strip_prefix("npm:") {
+        if let Some(at_idx) = alias_part.rfind('@') {
+            if at_idx > 0 {
+                let name = &alias_part[..at_idx];
+                let ver = &alias_part[at_idx + 1..];
+                return (
+                    if name != dep_name {
+                        Some(name.to_string())
+                    } else {
+                        None
+                    },
+                    if ver.is_empty() {
+                        None
+                    } else {
+                        Some(ver.to_string())
+                    },
+                );
+            }
+        }
+        (
+            if alias_part != dep_name {
+                Some(alias_part.to_string())
+            } else {
+                None
+            },
+            None,
+        )
+    } else {
+        let name = explicit_name.and_then(|n| {
+            if n != dep_name {
+                Some(n.to_string())
+            } else {
+                None
+            }
+        });
+        let ver = if dep_version.is_empty() {
+            None
+        } else {
+            Some(dep_version.to_string())
+        };
+        (name, ver)
+    }
 }
 
 /// Recursively flattens legacy nested `dependencies` from lockfile v1 into v3 `packages` map.
@@ -66,8 +168,12 @@ fn flatten_legacy_dependencies(
             format!("{parent_path}/node_modules/{dep_name}")
         };
 
+        let (alias_or_name, clean_version) =
+            parse_legacy_version_and_name(dep_name, &dep.version, dep.name.as_deref());
+
         let mut pkg = LockfilePackage {
-            version: Some(dep.version.clone()),
+            name: alias_or_name,
+            version: clean_version,
             resolved: dep.resolved.clone(),
             integrity: dep.integrity.clone(),
             dev: if dep.dev == Some(true) {
@@ -137,6 +243,13 @@ fn enrich_packages_from_legacy(
         };
 
         if let Some(pkg) = packages.get_mut(&node_path) {
+            if pkg.name.is_none() {
+                let (alias_or_name, _) =
+                    parse_legacy_version_and_name(dep_name, &dep.version, dep.name.as_deref());
+                if let Some(name) = alias_or_name {
+                    pkg.name = Some(name);
+                }
+            }
             if pkg.dev.is_none() && dep.dev == Some(true) {
                 pkg.dev = Some(true);
             }
@@ -162,6 +275,13 @@ fn enrich_packages_from_legacy(
                 pkg.has_shrinkwrap = Some(true);
             }
             pkg.normalize_flags();
+        } else {
+            // Missing from packages map in v2: inflate from legacy dependency
+            let mut sub_map = BTreeMap::new();
+            let mut single_dep = BTreeMap::new();
+            single_dep.insert(dep_name.clone(), dep.clone());
+            flatten_legacy_dependencies(parent_path, &single_dep, &mut sub_map);
+            packages.append(&mut sub_map);
         }
 
         if let Some(child_deps) = &dep.dependencies {
@@ -258,8 +378,9 @@ pub fn migrate_to_v3(raw: AnyLockfile) -> Result<LockfileV3, LockfileError> {
                 packages,
             })
         }
-        2 => {
+        2 | 3 => {
             // v2 has both `packages` (like v3) and `dependencies` (like v1).
+            // v3 normally has only `packages`, but if packages is empty, fall back to dependencies.
             let mut packages = match raw.packages {
                 Some(pkgs) if !pkgs.is_empty() => {
                     let mut normalized = BTreeMap::new();
@@ -290,33 +411,57 @@ pub fn migrate_to_v3(raw: AnyLockfile) -> Result<LockfileV3, LockfileError> {
                     version: raw.version.clone(),
                     ..Default::default()
                 });
-            root.normalize_flags();
 
-            Ok(LockfileV3 {
-                name: raw.name,
-                version: raw.version,
-                lockfile_version: 3,
-                requires: raw.requires.or(Some(true)),
-                packages,
-            })
-        }
-        3 => {
-            let mut packages = BTreeMap::new();
-            if let Some(pkgs) = raw.packages {
-                for (k, mut v) in pkgs {
-                    v.normalize_flags();
-                    packages.insert(to_posix_path(&k), v);
+            // If root package dependencies are missing, reconstruct from raw.dependencies
+            if root.dependencies.is_none() {
+                let mut root_deps = BTreeMap::new();
+                let mut root_dev_deps = BTreeMap::new();
+                let mut root_opt_deps = BTreeMap::new();
+                let mut root_peer_deps = BTreeMap::new();
+                let mut root_peer_meta = BTreeMap::new();
+                let mut root_bundled = Vec::new();
+
+                if let Some(deps) = &raw.dependencies {
+                    for (name, dep) in deps {
+                        root_deps.insert(name.clone(), dep.version.clone());
+                        if dep.dev == Some(true) {
+                            root_dev_deps.insert(name.clone(), dep.version.clone());
+                        }
+                        if dep.optional == Some(true) {
+                            root_opt_deps.insert(name.clone(), dep.version.clone());
+                        }
+                        if dep.peer == Some(true) {
+                            root_peer_deps.insert(name.clone(), dep.version.clone());
+                            if dep.peer_optional == Some(true) {
+                                root_peer_meta
+                                    .insert(name.clone(), serde_json::json!({ "optional": true }));
+                            }
+                        }
+                        if dep.bundled == Some(true) {
+                            root_bundled.push(name.clone());
+                        }
+                    }
+                }
+                if !root_deps.is_empty() {
+                    root.dependencies = Some(root_deps);
+                }
+                if !root_dev_deps.is_empty() {
+                    root.dev_dependencies = Some(root_dev_deps);
+                }
+                if !root_opt_deps.is_empty() {
+                    root.optional_dependencies = Some(root_opt_deps);
+                }
+                if !root_peer_deps.is_empty() {
+                    root.peer_dependencies = Some(root_peer_deps);
+                }
+                if !root_peer_meta.is_empty() {
+                    root.peer_dependencies_meta = Some(root_peer_meta);
+                }
+                if !root_bundled.is_empty() {
+                    root.bundle_dependencies = Some(BundledDependencies::List(root_bundled));
                 }
             }
 
-            // Ensure root package `""` exists
-            let root = packages
-                .entry("".to_string())
-                .or_insert_with(|| LockfilePackage {
-                    name: Some(raw.name.clone()),
-                    version: raw.version.clone(),
-                    ..Default::default()
-                });
             root.normalize_flags();
 
             Ok(LockfileV3 {
@@ -335,6 +480,11 @@ pub fn migrate_to_v3(raw: AnyLockfile) -> Result<LockfileV3, LockfileError> {
 pub fn parse_and_migrate(json_str: &str) -> Result<LockfileV3, LockfileError> {
     let raw: AnyLockfile = serde_json::from_str(json_str)?;
     if raw.lockfile_version == 3 {
+        if (raw.packages.is_none() || raw.packages.as_ref().is_some_and(|p| p.is_empty()))
+            && raw.dependencies.is_some()
+        {
+            return migrate_to_v3(raw);
+        }
         return LockfileV3::from_json_str(json_str);
     }
     migrate_to_v3(raw)

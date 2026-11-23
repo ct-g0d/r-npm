@@ -564,26 +564,6 @@ pub fn write_file_fast(
 fn path_to_wide_buf(path: &Path, buf: &mut Vec<u16>) {
     use std::os::windows::ffi::OsStrExt;
     buf.clear();
-    if let Some(s) = path.to_str() {
-        if s.starts_with(r"\\?\") {
-            buf.extend(path.as_os_str().encode_wide());
-            buf.push(0);
-            return;
-        }
-        let bytes = s.as_bytes();
-        if bytes.len() >= 3 && bytes[1] == b':' && (bytes[2] == b'\\' || bytes[2] == b'/') {
-            buf.extend([b'\\' as u16, b'\\' as u16, b'?' as u16, b'\\' as u16]);
-            for &b in bytes {
-                if b == b'/' {
-                    buf.push(b'\\' as u16);
-                } else {
-                    buf.push(b as u16);
-                }
-            }
-            buf.push(0);
-            return;
-        }
-    }
     let verbatim = crate::path::to_verbatim_path(path);
     buf.extend(verbatim.as_os_str().encode_wide());
     buf.push(0);
@@ -725,7 +705,7 @@ fn cas_file_is_valid(
     true
 }
 
-fn repair_cas_file(path: &Path, data: &[u8], mode: u32, prealloc_threshold: usize) {
+pub fn repair_cas_file(path: &Path, data: &[u8], mode: u32, prealloc_threshold: usize) {
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
@@ -735,6 +715,21 @@ fn repair_cas_file(path: &Path, data: &[u8], mode: u32, prealloc_threshold: usiz
     if write_file_fast(&tmp_path, data, mode, prealloc_threshold).is_ok()
         && std::fs::rename(&tmp_path, path).is_err()
     {
+        // Check if another concurrent thread already placed a valid file
+            if let Ok(meta) = std::fs::metadata(path) {
+                if meta.len() == data.len() as u64 {
+                    let _ = std::fs::remove_file(&tmp_path);
+                    return;
+                }
+            }
+            #[cfg(windows)]
+            if let Ok(meta) = std::fs::metadata(path) {
+                let mut perms = meta.permissions();
+                if perms.readonly() {
+                    perms.set_readonly(false);
+                    let _ = std::fs::set_permissions(path, perms);
+                }
+            }
         let _ = std::fs::remove_file(path);
         let _ = std::fs::rename(&tmp_path, path);
         let _ = std::fs::remove_file(&tmp_path);

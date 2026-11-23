@@ -10,6 +10,10 @@ pub fn strip_verbatim_prefix(path: &Path) -> PathBuf {
         PathBuf::from(format!(r"\\{}", stripped))
     } else if let Some(stripped) = s.strip_prefix(r"\\?\") {
         PathBuf::from(stripped)
+    } else if let Some(stripped) = s.strip_prefix(r"\??\UNC\") {
+        PathBuf::from(format!(r"\\{}", stripped))
+    } else if let Some(stripped) = s.strip_prefix(r"\??\") {
+        PathBuf::from(stripped)
     } else {
         path.to_path_buf()
     }

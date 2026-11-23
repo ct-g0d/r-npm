@@ -46,8 +46,9 @@ pub use tarball::{
 pub use writer::{
     copy_file_fast, decode_tar_entries, detect_seek_penalty, determine_writer_config,
     extract_packages_direct_parallel, extract_tarball_direct, materialize_files_parallel,
-    materialize_files_parallel_refs, precreate_directories, write_file_fast, BatchDirectItem,
-    DecodedTarball, DriveType, MaterializeFile, MaterializeFileRef, ParallelWriterConfig,
+    materialize_files_parallel_refs, precreate_directories, repair_cas_file, write_file_fast,
+    BatchDirectItem, DecodedTarball, DriveType, MaterializeFile, MaterializeFileRef,
+    ParallelWriterConfig,
 };
 
 #[cfg(test)]

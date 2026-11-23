@@ -92,19 +92,40 @@ pub fn read_tlv(input: &[u8]) -> Result<(u8, &[u8], &[u8]), RegistryError> {
         for &b in &input[2..2 + num_bytes] {
             l = (l << 8) | (b as usize);
         }
+        // Non-canonical DER: multi-byte length must not have redundant leading zeros
+        if input[2] == 0 {
+            return Err(RegistryError::InvalidSigstoreBundle(
+                "Non-canonical DER: leading zero in multi-byte length".into(),
+            ));
+        }
+        // Non-canonical DER: lengths < 128 must use short form
+        if l < 128 {
+            return Err(RegistryError::InvalidSigstoreBundle(
+                "Non-canonical DER: multi-byte encoding used for length < 128".into(),
+            ));
+        }
         (l, 2 + num_bytes)
     };
 
-    if input.len() < header_len + len {
+    let total_len = match header_len.checked_add(len) {
+        Some(t) => t,
+        None => {
+            return Err(RegistryError::InvalidSigstoreBundle(
+                "DER element length overflow".into(),
+            ));
+        }
+    };
+
+    if input.len() < total_len {
         return Err(RegistryError::InvalidSigstoreBundle(format!(
             "DER element requires {} bytes but only {} available",
-            header_len + len,
+            total_len,
             input.len()
         )));
     }
 
-    let value = &input[header_len..header_len + len];
-    let rest = &input[header_len + len..];
+    let value = &input[header_len..total_len];
+    let rest = &input[total_len..];
     Ok((tag, value, rest))
 }
 
@@ -130,11 +151,22 @@ pub fn decode_oid(bytes: &[u8]) -> String {
     parts.push((first % 40).to_string());
 
     let mut val = 0u64;
-    for &b in &bytes[1..] {
-        val = (val << 7) | ((b & 0x7F) as u64);
+    let rest = &bytes[1..];
+    for (i, &b) in rest.iter().enumerate() {
+        if let Some(new_val) = val
+            .checked_mul(128)
+            .and_then(|v| v.checked_add((b & 0x7F) as u64))
+        {
+            val = new_val;
+        } else {
+            return String::new();
+        }
         if (b & 0x80) == 0 {
             parts.push(val.to_string());
             val = 0;
+        } else if i == rest.len() - 1 {
+            // Malformed/truncated OID: last byte has continuation bit set
+            return String::new();
         }
     }
     parts.join(".")
@@ -191,6 +223,11 @@ pub fn der_tlv(tag: u8, content: &[u8]) -> Vec<u8> {
 
 /// Parses UTCTime (`YYMMDDHHMMSSZ`) or GeneralizedTime (`YYYYMMDDHHMMSSZ`) into Unix epoch seconds.
 pub fn parse_der_time(tag: u8, bytes: &[u8]) -> Result<i64, RegistryError> {
+    if bytes.is_empty() || !bytes.iter().all(|&b| b.is_ascii_digit() || b == b'Z') {
+        return Err(RegistryError::InvalidSigstoreBundle(
+            "Invalid non-ASCII or non-digit characters in certificate time".into(),
+        ));
+    }
     let s = std::str::from_utf8(bytes).map_err(|e| {
         RegistryError::InvalidSigstoreBundle(format!("Invalid UTF-8 in certificate time: {e}"))
     })?;
@@ -225,6 +262,12 @@ pub fn parse_der_time(tag: u8, bytes: &[u8]) -> Result<i64, RegistryError> {
         )));
     };
 
+    if rest.len() < 10 {
+        return Err(RegistryError::InvalidSigstoreBundle(
+            "Certificate time string too short for month/day/time".into(),
+        ));
+    }
+
     let month: u32 = rest[0..2].parse().map_err(|e| {
         RegistryError::InvalidSigstoreBundle(format!("Failed to parse time month: {e}"))
     })?;
@@ -240,6 +283,22 @@ pub fn parse_der_time(tag: u8, bytes: &[u8]) -> Result<i64, RegistryError> {
     let sec: u32 = rest[8..10].parse().map_err(|e| {
         RegistryError::InvalidSigstoreBundle(format!("Failed to parse time second: {e}"))
     })?;
+
+    if !(1..=12).contains(&month) {
+        return Err(RegistryError::InvalidSigstoreBundle(format!(
+            "Invalid month in certificate time: {month}"
+        )));
+    }
+    if !(1..=31).contains(&day) {
+        return Err(RegistryError::InvalidSigstoreBundle(format!(
+            "Invalid day in certificate time: {day}"
+        )));
+    }
+    if hour > 23 || min > 59 || sec > 60 {
+        return Err(RegistryError::InvalidSigstoreBundle(format!(
+            "Invalid hour/minute/second in certificate time: {hour}:{min}:{sec}"
+        )));
+    }
 
     let days = date_to_epoch_days(year, month, day);
     let total_secs = days * 86400 + (hour as i64) * 3600 + (min as i64) * 60 + (sec as i64);
@@ -258,7 +317,12 @@ fn date_to_epoch_days(year: i32, month: u32, day: u32) -> i64 {
 
 /// Parses a leaf X.509 DER certificate.
 pub fn parse_x509_certificate(der: &[u8]) -> Result<ParsedCertificate, RegistryError> {
-    let (tag, cert_val, _) = read_tlv(der)?;
+    let (tag, cert_val, rest) = read_tlv(der)?;
+    if !rest.is_empty() {
+        return Err(RegistryError::InvalidSigstoreBundle(
+            "Trailing garbage after certificate DER sequence".into(),
+        ));
+    }
     if tag != TAG_SEQUENCE {
         return Err(RegistryError::InvalidSigstoreBundle(format!(
             "Expected certificate SEQUENCE (0x30), got 0x{tag:02x}"
@@ -288,11 +352,17 @@ pub fn parse_x509_certificate(der: &[u8]) -> Result<ParsedCertificate, RegistryE
     };
 
     let sig_bitstring = cert_elems[2].1;
-    let signature_value = if !sig_bitstring.is_empty() {
-        sig_bitstring[1..].to_vec()
-    } else {
-        Vec::new()
-    };
+    if sig_bitstring.is_empty() || sig_bitstring[0] != 0 {
+        return Err(RegistryError::InvalidSigstoreBundle(
+            "Invalid or empty signature BIT STRING in certificate".into(),
+        ));
+    }
+    let signature_value = sig_bitstring[1..].to_vec();
+    if signature_value.is_empty() {
+        return Err(RegistryError::InvalidSigstoreBundle(
+            "Empty signature value in certificate".into(),
+        ));
+    }
 
     let tbs_elems = parse_sequence(tbs_val)?;
     let mut cursor = 0;
@@ -447,20 +517,30 @@ fn parse_spki_internal(
 
     // 2. subjectPublicKey BIT STRING
     let bit_string = elems[1].1;
-    if bit_string.is_empty() {
+    if bit_string.is_empty() || bit_string[0] != 0 {
         return Err(RegistryError::InvalidSigstoreBundle(
-            "BIT STRING in SPKI is empty".into(),
+            "Invalid or empty BIT STRING in SPKI".into(),
         ));
     }
     // First byte is unused bits count (usually 0)
     let pk_bytes = bit_string[1..].to_vec();
+    if pk_bytes.is_empty() {
+        return Err(RegistryError::InvalidSigstoreBundle(
+            "Empty public key in SPKI".into(),
+        ));
+    }
 
     Ok((algo_oid, curve_oid, pk_bytes))
 }
 
 /// Parses SubjectPublicKeyInfo from full SPKI DER bytes.
 pub fn parse_spki(der: &[u8]) -> Result<(String, Option<String>, Vec<u8>), RegistryError> {
-    let (tag, val, _) = read_tlv(der)?;
+    let (tag, val, rest) = read_tlv(der)?;
+    if !rest.is_empty() {
+        return Err(RegistryError::InvalidSigstoreBundle(
+            "Trailing garbage after SPKI SEQUENCE".into(),
+        ));
+    }
     if tag != TAG_SEQUENCE {
         return Err(RegistryError::InvalidSigstoreBundle(
             "Expected SPKI SEQUENCE".into(),

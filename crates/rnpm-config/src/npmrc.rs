@@ -152,14 +152,22 @@ impl Npmrc {
         let key_trimmed = key.trim();
         let value_trimmed = value.trim();
 
-        // Prevent newline injection in configuration keys and values
+        if key_trimmed.is_empty() {
+            return Err(ConfigError::InvalidLine(
+                "Configuration key cannot be empty".to_string(),
+            ));
+        }
+
+        // Prevent newline and null injection in configuration keys and values
         if key_trimmed.contains('\n')
             || key_trimmed.contains('\r')
+            || key_trimmed.contains('\0')
             || value_trimmed.contains('\n')
             || value_trimmed.contains('\r')
+            || value_trimmed.contains('\0')
         {
             return Err(ConfigError::InvalidLine(format!(
-                "Configuration line contains forbidden newline character: '{key_trimmed}'"
+                "Configuration line contains forbidden control character (newline or null): '{key_trimmed}'"
             )));
         }
 
@@ -327,6 +335,8 @@ impl Npmrc {
     }
 
     /// Retrieve the auth token for a registry URL if configured.
+    /// Performs longest-prefix matching for scoped registry paths down to root,
+    /// falling back to the global `_authToken` setting if present.
     pub fn get_auth_token(&self, registry_url: &Url) -> Option<&str> {
         let host = registry_url.host_str()?;
         let port_part = if let Some(port) = registry_url.port() {
@@ -336,43 +346,88 @@ impl Npmrc {
         };
 
         let path = registry_url.path();
-        let normalized_path = if path.ends_with('/') {
-            path.to_string()
-        } else {
-            format!("{path}/")
-        };
-
         let host_lower = host.to_ascii_lowercase();
+        let prefixes = generate_path_prefixes(path);
 
-        // Exact match: "//host:port/path/"
-        let candidate1 = format!("//{host_lower}{port_part}{normalized_path}");
-        if let Some(token) = self.auth_tokens.get(&candidate1) {
-            return Some(token.as_str());
-        }
-
-        // Without trailing slash in path if not root
-        let candidate2 = format!("//{host_lower}{port_part}{path}");
-        if let Some(token) = self.auth_tokens.get(&candidate2) {
-            return Some(token.as_str());
-        }
-
-        // Root "//host:port/"
-        let candidate3 = format!("//{host_lower}{port_part}/");
-        if let Some(token) = self.auth_tokens.get(&candidate3) {
-            return Some(token.as_str());
-        }
-
-        // Root without port "//host/"
-        if !port_part.is_empty() {
-            let candidate4 = format!("//{host_lower}/");
-            if let Some(token) = self.auth_tokens.get(&candidate4) {
+        for prefix in &prefixes {
+            if !port_part.is_empty() {
+                let cand1 = format!("//{host_lower}{port_part}{prefix}");
+                if let Some(token) = self.auth_tokens.get(&cand1) {
+                    return Some(token.as_str());
+                }
+            }
+            let cand2 = format!("//{host_lower}{prefix}");
+            if let Some(token) = self.auth_tokens.get(&cand2) {
                 return Some(token.as_str());
             }
         }
 
         // Global _authToken setting fallback
-        if let Some(token) = self.settings.get("_authToken") {
+        if let Some(token) = self
+            .settings
+            .get("_authToken")
+            .or_else(|| self.settings.get("_authtoken"))
+        {
             return Some(token.as_str());
+        }
+
+        None
+    }
+
+    /// Retrieve the Basic auth credential for a registry URL if configured.
+    /// Supports exact and scoped path prefix matching from `basic_auths()`,
+    /// falling back to global `_auth` or `username` + `_password` / `password`.
+    pub fn get_basic_auth(&self, registry_url: &Url) -> Option<String> {
+        let host = registry_url.host_str()?;
+        let port_part = if let Some(port) = registry_url.port() {
+            format!(":{port}")
+        } else {
+            String::new()
+        };
+
+        let path = registry_url.path();
+        let host_lower = host.to_ascii_lowercase();
+
+        let basic_map = self.basic_auths();
+        let prefixes = generate_path_prefixes(path);
+
+        for prefix in &prefixes {
+            if !port_part.is_empty() {
+                let cand1 = format!("//{host_lower}{port_part}{prefix}");
+                if let Some(auth) = basic_map.get(&cand1) {
+                    return Some(auth.clone());
+                }
+            }
+            let cand2 = format!("//{host_lower}{prefix}");
+            if let Some(auth) = basic_map.get(&cand2) {
+                return Some(auth.clone());
+            }
+        }
+
+        // Global _auth fallback
+        if let Some(auth) = self.settings.get("_auth") {
+            let v = auth.trim();
+            if !v.is_empty() {
+                return Some(v.to_string());
+            }
+        }
+
+        // Global username + _password / password fallback
+        if let Some(user) = self.settings.get("username") {
+            let pass_opt = self
+                .settings
+                .get("_password")
+                .or_else(|| self.settings.get("password"));
+            if let Some(p) = pass_opt {
+                let password = data_encoding::BASE64
+                    .decode(p.trim().as_bytes())
+                    .ok()
+                    .and_then(|b| String::from_utf8(b).ok())
+                    .unwrap_or_else(|| p.trim().to_string());
+                let encoded = data_encoding::BASE64
+                    .encode(format!("{}:{password}", user.trim()).as_bytes());
+                return Some(encoded);
+            }
         }
 
         None
@@ -444,6 +499,30 @@ fn parse_scoped_registry_key(key: &str) -> Option<String> {
         }
     }
     None
+}
+
+fn generate_path_prefixes(path: &str) -> Vec<String> {
+    let mut prefixes = Vec::new();
+    let trimmed = path.trim();
+    if trimmed.is_empty() || trimmed == "/" {
+        prefixes.push("/".to_string());
+        return prefixes;
+    }
+
+    let norm_path = if trimmed.starts_with('/') {
+        trimmed.to_string()
+    } else {
+        format!("/{trimmed}")
+    };
+
+    let segments: Vec<&str> = norm_path.split('/').filter(|s| !s.is_empty()).collect();
+    for i in (1..=segments.len()).rev() {
+        let sub = segments[..i].join("/");
+        prefixes.push(format!("/{sub}/"));
+        prefixes.push(format!("/{sub}"));
+    }
+    prefixes.push("/".to_string());
+    prefixes
 }
 
 fn ensure_trailing_slash(url: &mut Url) {
@@ -602,7 +681,7 @@ pub fn validate_package_name(name: &str) -> Result<(), ConfigError> {
 }
 
 /// Interpolates `${VAR}`, `${VAR:-default}`, `${VAR-default}`, `$VAR`, and supports `\${VAR}` / `$$` escaping.
-/// Safe against multi-byte UTF-8 boundaries and empty string evaluations.
+/// Safe against multi-byte UTF-8 boundaries, nested braces, and empty string evaluations.
 pub fn interpolate_env<F>(input: &str, lookup: &F) -> String
 where
     F: Fn(&str) -> Option<String>,
@@ -626,9 +705,25 @@ where
         if ch == '$' {
             if let Some(&(_, next_ch)) = chars.peek() {
                 if next_ch == '{' {
-                    chars.next();
+                    chars.next(); // consume '{'
                     let rest = &input[idx + 2..];
-                    if let Some(close_rel) = rest.find('}') {
+
+                    // Balance braces to find matching '}'
+                    let mut depth = 1usize;
+                    let mut close_rel = None;
+                    for (rel_idx, c) in rest.char_indices() {
+                        if c == '{' {
+                            depth += 1;
+                        } else if c == '}' {
+                            depth -= 1;
+                            if depth == 0 {
+                                close_rel = Some(rel_idx);
+                                break;
+                            }
+                        }
+                    }
+
+                    if let Some(close_rel) = close_rel {
                         let expr = &rest[..close_rel];
                         // Advance iterator past '}'
                         while let Some((c_idx, _)) = chars.peek() {
@@ -638,14 +733,45 @@ where
                             chars.next();
                         }
 
-                        let (var_name, default_val, use_default_if_empty) =
-                            if let Some(def_idx) = expr.find(":-") {
-                                (&expr[..def_idx], Some(&expr[def_idx + 2..]), true)
-                            } else if let Some(def_idx) = expr.find('-') {
-                                (&expr[..def_idx], Some(&expr[def_idx + 1..]), false)
-                            } else {
-                                (expr, None, false)
-                            };
+                        // Split var_name and raw_default at top level (depth 0 within expr)
+                        let mut split_pos = None;
+                        let mut is_colon_dash = false;
+                        let mut inner_depth = 0usize;
+                        let expr_chars: Vec<(usize, char)> = expr.char_indices().collect();
+                        for i in 0..expr_chars.len() {
+                            let (c_idx, c) = expr_chars[i];
+                            if c == '{' {
+                                inner_depth += 1;
+                            } else if c == '}' {
+                                inner_depth = inner_depth.saturating_sub(1);
+                            } else if inner_depth == 0 {
+                                if c == ':'
+                                    && i + 1 < expr_chars.len()
+                                    && expr_chars[i + 1].1 == '-'
+                                {
+                                    split_pos = Some(c_idx);
+                                    is_colon_dash = true;
+                                    break;
+                                } else if c == '-' && split_pos.is_none() {
+                                    split_pos = Some(c_idx);
+                                    is_colon_dash = false;
+                                    break;
+                                }
+                            }
+                        }
+
+                        let (var_name, default_val, use_default_if_empty) = match split_pos {
+                            Some(pos) => {
+                                let v = &expr[..pos];
+                                let d = if is_colon_dash {
+                                    &expr[pos + 2..]
+                                } else {
+                                    &expr[pos + 1..]
+                                };
+                                (v, Some(d), is_colon_dash)
+                            }
+                            None => (expr, None, false),
+                        };
 
                         let var_name = var_name.trim();
                         let is_valid_name = !var_name.is_empty()
@@ -654,19 +780,24 @@ where
                                 .all(|c| c.is_ascii_alphanumeric() || c == '_');
 
                         if is_valid_name {
-                            let val = match lookup(var_name) {
+                            let looked_up = lookup(var_name);
+                            let val = match looked_up {
                                 Some(v) => {
                                     if use_default_if_empty && v.is_empty() {
-                                        default_val.map(|d| d.to_string()).unwrap_or(v)
+                                        default_val
+                                            .map(|d| interpolate_env(d, lookup))
+                                            .unwrap_or(v)
                                     } else {
                                         v
                                     }
                                 }
-                                None => default_val.map(|d| d.to_string()).unwrap_or_default(),
+                                None => default_val
+                                    .map(|d| interpolate_env(d, lookup))
+                                    .unwrap_or_default(),
                             };
                             result.push_str(&val);
                         } else if default_val.is_some() && var_name.is_empty() {
-                            result.push_str(default_val.unwrap());
+                            result.push_str(&interpolate_env(default_val.unwrap(), lookup));
                         } else {
                             // Invalid syntax or empty without default, preserve literal
                             result.push_str("${");
@@ -717,15 +848,22 @@ pub fn scrub_credentials(text: &str) -> String {
     // 1. Redact Bearer tokens
     result = replace_bearer(&result);
 
-    // 2. Redact npm / ghp tokens
+    // 2. Redact Basic authorization tokens
+    result = replace_basic_auth(&result);
+
+    // 3. Redact credentials embedded in URLs
+    result = replace_url_credentials(&result);
+
+    // 4. Redact npm / ghp tokens
     result = replace_npm_tokens(&result);
 
-    // 3. Redact :_authToken=<val> and other key-value credentials
+    // 5. Redact :_authToken=<val> and other key-value credentials
     for key in &[
         "_authtoken",
         "_authToken",
         "authtoken",
         "password",
+        "_password",
         "secret",
         "token",
         "_auth",
@@ -762,10 +900,11 @@ pub fn is_sensitive_credential_key(key: &str) -> bool {
 
 /// Masks a credential for display (e.g. "npm_1234567890abcdef" -> "npm_***cdef").
 pub fn mask_credential(token: &str) -> String {
-    if token.is_empty() {
+    let char_count = token.chars().count();
+    if char_count == 0 {
         return String::new();
     }
-    if token.len() <= 6 {
+    if char_count <= 6 {
         return "[REDACTED]".to_string();
     }
     let prefix = if token.starts_with("npm_") {
@@ -775,7 +914,9 @@ pub fn mask_credential(token: &str) -> String {
     } else {
         "***"
     };
-    let tail = &token[token.len().saturating_sub(4)..];
+    let skip_count = char_count.saturating_sub(4);
+    let tail_start = token.char_indices().nth(skip_count).map(|(i, _)| i).unwrap_or(0);
+    let tail = &token[tail_start..];
     format!("{prefix}{tail}")
 }
 
@@ -797,6 +938,93 @@ fn replace_bearer(text: &str) -> String {
             .unwrap_or(remainder.len());
         out.push_str("[REDACTED]");
         last_idx = idx + 7 + end_token;
+    }
+    out.push_str(&text[last_idx..]);
+    out
+}
+
+fn replace_basic_auth(text: &str) -> String {
+    let mut out = String::new();
+    let lower = text.to_ascii_lowercase();
+    let mut last_idx = 0;
+
+    for (idx, _) in lower.match_indices("basic ") {
+        if idx < last_idx {
+            continue;
+        }
+        out.push_str(&text[last_idx..idx + 6]);
+        let remainder = &text[idx + 6..];
+        let end_token = remainder
+            .find(|c: char| {
+                c.is_whitespace() || c == '"' || c == '\'' || c == '\n' || c == '\r' || c == ';'
+            })
+            .unwrap_or(remainder.len());
+        out.push_str("[REDACTED]");
+        last_idx = idx + 6 + end_token;
+    }
+    out.push_str(&text[last_idx..]);
+    out
+}
+
+fn replace_url_credentials(text: &str) -> String {
+    let mut out = String::new();
+    let mut last_idx = 0;
+    let mut curr_idx = 0;
+
+    while curr_idx < text.len() {
+        let next_http = text[curr_idx..].find("http://").map(|i| curr_idx + i);
+        let next_https = text[curr_idx..].find("https://").map(|i| curr_idx + i);
+
+        let next_match = match (next_http, next_https) {
+            (Some(i1), Some(i2)) => {
+                if i1 < i2 {
+                    Some((i1, "http://"))
+                } else {
+                    Some((i2, "https://"))
+                }
+            }
+            (Some(i1), None) => Some((i1, "http://")),
+            (None, Some(i2)) => Some((i2, "https://")),
+            (None, None) => None,
+        };
+
+        let Some((abs_scheme_idx, scheme)) = next_match else {
+            break;
+        };
+
+        let after_scheme_idx = abs_scheme_idx + scheme.len();
+        let after_scheme = &text[after_scheme_idx..];
+        let end_auth = after_scheme.find(|c: char| {
+            c == '/'
+                || c == '?'
+                || c == '#'
+                || c.is_whitespace()
+                || c == '"'
+                || c == '\''
+                || c == '\\'
+                || c == '\n'
+                || c == '\r'
+        });
+        let auth_slice = match end_auth {
+            Some(len) => &after_scheme[..len],
+            None => after_scheme,
+        };
+
+        if let Some(at_idx) = auth_slice.find('@') {
+            let userinfo = &auth_slice[..at_idx];
+            out.push_str(&text[last_idx..after_scheme_idx]);
+            if let Some((user, _pass)) = userinfo.split_once(':') {
+                out.push_str(user);
+                out.push_str(":[REDACTED]");
+            } else {
+                out.push_str("[REDACTED]");
+            }
+            out.push('@');
+            last_idx = after_scheme_idx + at_idx + 1;
+            curr_idx = last_idx;
+        } else {
+            curr_idx = after_scheme_idx;
+        }
     }
     out.push_str(&text[last_idx..]);
     out
@@ -827,30 +1055,312 @@ fn replace_npm_tokens(text: &str) -> String {
 fn replace_kv_pairs(text: &str, key_name: &str) -> String {
     let mut out = String::new();
     let lower = text.to_ascii_lowercase();
-    let pattern = format!("{key_name}=");
     let mut last_idx = 0;
 
-    for (idx, _) in lower.match_indices(&pattern) {
+    for (idx, _) in lower.match_indices(key_name) {
         if idx < last_idx {
             continue;
         }
-        let key_len = pattern.len();
-        out.push_str(&text[last_idx..idx + key_len]);
-        let remainder = &text[idx + key_len..];
-        let end_token = remainder
-            .find(|c: char| {
-                c.is_whitespace()
-                    || c == ';'
-                    || c == '&'
-                    || c == '"'
-                    || c == '\''
-                    || c == '\n'
-                    || c == '\r'
-            })
-            .unwrap_or(remainder.len());
-        out.push_str("[REDACTED]");
-        last_idx = idx + key_len + end_token;
+        let after_key = &text[idx + key_name.len()..];
+        let mut chars = after_key.char_indices().peekable();
+        while let Some(&(_, c)) = chars.peek() {
+            if c == ' ' || c == '\t' {
+                chars.next();
+            } else {
+                break;
+            }
+        }
+        let sep_match = match chars.peek() {
+            Some(&(sep_idx, '=')) | Some(&(sep_idx, ':')) => Some(sep_idx),
+            _ => None,
+        };
+        if sep_match.is_some() {
+            chars.next(); // consume '=' or ':'
+            while let Some(&(_, c)) = chars.peek() {
+                if c == ' ' || c == '\t' {
+                    chars.next();
+                } else {
+                    break;
+                }
+            }
+            let val_start = chars.peek().map(|&(i, _)| i).unwrap_or(after_key.len());
+            let val_slice = &after_key[val_start..];
+            if val_slice.starts_with('"') || val_slice.starts_with('\'') {
+                let quote = val_slice.chars().next().unwrap();
+                let inner = &val_slice[1..];
+                let mut closing_offset = None;
+                let mut escaped = false;
+                for (ci, ch) in inner.char_indices() {
+                    if escaped {
+                        escaped = false;
+                        continue;
+                    }
+                    if ch == '\\' {
+                        escaped = true;
+                    } else if ch == quote {
+                        closing_offset = Some(ci);
+                        break;
+                    } else if ch == '\n' || ch == '\r' {
+                        break;
+                    }
+                }
+                let (val_len, replacement) = match closing_offset {
+                    Some(end_q) => (1 + end_q + 1, format!("{quote}[REDACTED]{quote}")),
+                    None => {
+                        let end_line = val_slice
+                            .find(['\n', '\r'])
+                            .unwrap_or(val_slice.len());
+                        (end_line, format!("{quote}[REDACTED]{quote}"))
+                    }
+                };
+                out.push_str(&text[last_idx..idx + key_name.len() + val_start]);
+                out.push_str(&replacement);
+                last_idx = idx + key_name.len() + val_start + val_len;
+            } else {
+                let end_token = val_slice
+                    .find(|c: char| {
+                        c.is_whitespace()
+                            || c == ';'
+                            || c == '&'
+                            || c == '\n'
+                            || c == '\r'
+                    })
+                    .unwrap_or(val_slice.len());
+
+                out.push_str(&text[last_idx..idx + key_name.len() + val_start]);
+                out.push_str("[REDACTED]");
+                last_idx = idx + key_name.len() + val_start + end_token;
+            }
+        }
     }
     out.push_str(&text[last_idx..]);
     out
+}
+
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+/// Represents an individual rule for proxy bypass matching (NO_PROXY).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NoProxyRule {
+    /// Wildcard `*`: matches every target
+    All,
+    /// Domain/hostname suffix, e.g. `.example.com`, `example.com`, `localhost`
+    Domain {
+        suffix: String,
+        port: Option<u16>,
+    },
+    /// Exact IP address with optional port
+    ExactIp {
+        ip: IpAddr,
+        port: Option<u16>,
+    },
+    /// IPv4 CIDR network subnet
+    Ipv4Cidr {
+        network: u32,
+        mask: u32,
+        port: Option<u16>,
+    },
+    /// IPv6 CIDR network subnet
+    Ipv6Cidr {
+        network: u128,
+        mask: u128,
+        port: Option<u16>,
+    },
+}
+
+impl NoProxyRule {
+    pub fn parse(entry: &str) -> Option<Self> {
+        let trimmed = entry.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+
+        if trimmed == "*" {
+            return Some(Self::All);
+        }
+
+        // Check for CIDR: e.g. 10.0.0.0/8 or 10.0.0.0/8:8080 or fd00::/8
+        if let Some((cidr_part, maybe_port)) = trimmed.split_once(':') {
+            if cidr_part.contains('/') && maybe_port.chars().all(|c| c.is_ascii_digit()) {
+                let port = maybe_port.parse::<u16>().ok();
+                if let Some(rule) = Self::parse_cidr(cidr_part, port) {
+                    return Some(rule);
+                }
+            }
+        }
+        if trimmed.contains('/') {
+            if let Some(rule) = Self::parse_cidr(trimmed, None) {
+                return Some(rule);
+            }
+        }
+
+        // Check for IPv6 bracketed with port: [::1]:8080 or [::1]
+        if let Some(stripped) = trimmed.strip_prefix('[') {
+            if let Some((ip_str, rest)) = stripped.split_once(']') {
+                let port = rest.strip_prefix(':').and_then(|p| p.parse::<u16>().ok());
+                let clean_ip = ip_str.trim();
+                if let Ok(ip) = clean_ip.parse::<IpAddr>() {
+                    return Some(Self::ExactIp { ip, port });
+                }
+            }
+        }
+
+        // Check for host:port
+        let (host_part, port) = if let Some((h, p)) = trimmed.rsplit_once(':') {
+            if p.chars().all(|c| c.is_ascii_digit()) && !h.contains(':') {
+                (h, p.parse::<u16>().ok())
+            } else {
+                (trimmed, None)
+            }
+        } else {
+            (trimmed, None)
+        };
+
+        // Check if host_part is an exact IP
+        let clean_host = host_part.trim().trim_start_matches('[').trim_end_matches(']');
+        if let Ok(ip) = clean_host.parse::<IpAddr>() {
+            return Some(Self::ExactIp { ip, port });
+        }
+
+        // Domain / hostname rule
+        let norm_host = host_part.to_ascii_lowercase();
+        let norm_suffix = norm_host
+            .trim_start_matches('*')
+            .trim_end_matches('.')
+            .to_string();
+
+        if norm_suffix.is_empty() {
+            return Some(Self::All);
+        }
+
+        Some(Self::Domain {
+            suffix: norm_suffix,
+            port,
+        })
+    }
+
+    fn parse_cidr(cidr: &str, port: Option<u16>) -> Option<Self> {
+        let (ip_str, prefix_str) = cidr.split_once('/')?;
+        let clean_ip_str = ip_str.trim().trim_start_matches('[').trim_end_matches(']');
+        let prefix_len = prefix_str.parse::<u32>().ok()?;
+
+        if let Ok(ipv4) = clean_ip_str.parse::<Ipv4Addr>() {
+            if prefix_len > 32 {
+                return None;
+            }
+            let mask = if prefix_len == 0 {
+                0u32
+            } else {
+                !0u32 << (32 - prefix_len)
+            };
+            let network = u32::from(ipv4) & mask;
+            return Some(Self::Ipv4Cidr {
+                network,
+                mask,
+                port,
+            });
+        }
+
+        if let Ok(ipv6) = clean_ip_str.parse::<Ipv6Addr>() {
+            if prefix_len > 128 {
+                return None;
+            }
+            let mask = if prefix_len == 0 {
+                0u128
+            } else {
+                !0u128 << (128 - prefix_len)
+            };
+            let network = u128::from(ipv6) & mask;
+            return Some(Self::Ipv6Cidr {
+                network,
+                mask,
+                port,
+            });
+        }
+
+        None
+    }
+
+    pub fn matches(&self, host: &str, port: Option<u16>) -> bool {
+        let clean_host = host.trim().trim_start_matches('[').trim_end_matches(']');
+        match self {
+            Self::All => true,
+            Self::ExactIp { ip, port: rule_port } => {
+                if rule_port.is_some() && *rule_port != port {
+                    return false;
+                }
+                if let Ok(target_ip) = clean_host.parse::<IpAddr>() {
+                    target_ip == *ip
+                } else {
+                    false
+                }
+            }
+            Self::Ipv4Cidr { network, mask, port: rule_port } => {
+                if rule_port.is_some() && *rule_port != port {
+                    return false;
+                }
+                if let Ok(target_ip) = clean_host.parse::<Ipv4Addr>() {
+                    (u32::from(target_ip) & mask) == *network
+                } else {
+                    false
+                }
+            }
+            Self::Ipv6Cidr { network, mask, port: rule_port } => {
+                if rule_port.is_some() && *rule_port != port {
+                    return false;
+                }
+                if let Ok(target_ip) = clean_host.parse::<Ipv6Addr>() {
+                    (u128::from(target_ip) & mask) == *network
+                } else {
+                    false
+                }
+            }
+            Self::Domain { suffix, port: rule_port } => {
+                if rule_port.is_some() && *rule_port != port {
+                    return false;
+                }
+                let host_domain = clean_host.trim_end_matches('.').to_ascii_lowercase();
+                let clean_suffix = suffix.trim_start_matches('.').to_ascii_lowercase();
+
+                if host_domain == clean_suffix {
+                    return true;
+                }
+                if host_domain.ends_with(&format!(".{clean_suffix}")) {
+                    return true;
+                }
+                false
+            }
+        }
+    }
+}
+
+/// Matcher that evaluates target URLs or host/port pairs against configured NO_PROXY rules.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct NoProxyMatcher {
+    rules: Vec<NoProxyRule>,
+}
+
+impl NoProxyMatcher {
+    pub fn parse(no_proxy_str: &str) -> Self {
+        let mut rules = Vec::new();
+        for item in no_proxy_str.split(&[',', ' ', ';'][..]) {
+            if let Some(rule) = NoProxyRule::parse(item) {
+                rules.push(rule);
+            }
+        }
+        Self { rules }
+    }
+
+    pub fn matches(&self, host: &str, port: Option<u16>) -> bool {
+        self.rules.iter().any(|r| r.matches(host, port))
+    }
+
+    pub fn matches_url(&self, url: &Url) -> bool {
+        let host = match url.host_str() {
+            Some(h) => h,
+            None => return false,
+        };
+        let port = url.port_or_known_default();
+        self.matches(host, port)
+    }
 }
