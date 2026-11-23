@@ -1597,11 +1597,7 @@ fn build_process_env(ctx: &LifecycleContext) -> HashMap<String, String> {
 
 pub fn is_cmd_shell(shell: &str) -> bool {
     let trimmed = shell.trim().trim_matches('"');
-    let path = std::path::Path::new(trimmed);
-    let name = path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or(trimmed);
+    let name = trimmed.rsplit(['/', '\\']).next().unwrap_or(trimmed);
     name.eq_ignore_ascii_case("cmd") || name.eq_ignore_ascii_case("cmd.exe")
 }
 
