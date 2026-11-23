@@ -1149,3 +1149,323 @@ fn test_deserialize_lockfile_version_integral_floats_and_rejections() {
         "negative lockfileVersion -2.0 must be rejected"
     );
 }
+
+// =========================================================================
+// 10. Workspace Metadata Drift Differential Regressions (CP2 Swarm Lane C)
+// =========================================================================
+
+#[test]
+fn test_matches_manifest_ext_absent_root_workspace_metadata_v3_omission() {
+    let mut manifest = Manifest {
+        name: Some("ws-monorepo".to_string()),
+        version: Some("1.0.0".to_string()),
+        workspaces: Some(rnpm_core::manifest::PackageWorkspaces::List(vec![
+            "packages/*".to_string(),
+        ])),
+        ..Default::default()
+    };
+
+    // npm v3 lockfile where root package "" omitted `workspaces` metadata
+    let mut lockfile = LockfileV3::new("ws-monorepo", Some("1.0.0".to_string()));
+    assert!(
+        lockfile.root_package().unwrap().workspaces.is_none(),
+        "root_pkg.workspaces must be None (omitted root metadata)"
+    );
+
+    // Lockfile contains discovered workspace members and available links
+    lockfile.insert_package(
+        "packages/member-a",
+        LockfilePackage {
+            name: Some("member-a".to_string()),
+            version: Some("1.0.0".to_string()),
+            ..Default::default()
+        },
+    );
+    lockfile.insert_package(
+        "packages/member-b",
+        LockfilePackage {
+            name: Some("member-b".to_string()),
+            version: Some("2.0.0".to_string()),
+            ..Default::default()
+        },
+    );
+    lockfile.insert_package(
+        "node_modules/member-a",
+        LockfilePackage {
+            resolved: Some("packages/member-a".to_string()),
+            link: Some(true),
+            ..Default::default()
+        },
+    );
+    lockfile.insert_package(
+        "node_modules/member-b",
+        LockfilePackage {
+            resolved: Some("packages/member-b".to_string()),
+            link: Some(true),
+            ..Default::default()
+        },
+    );
+
+    // 1. Must match successfully despite absent root workspace metadata (P1 bug fix)
+    assert!(
+        lockfile.matches_manifest_ext(&manifest, true, false),
+        "v3 lockfile with omitted root workspaces metadata must validate via discovered members and available links"
+    );
+
+    // 2. Genuine drift: workspace patterns changed to an unrelated pattern
+    let mut drifted_patterns = manifest.clone();
+    drifted_patterns.workspaces = Some(rnpm_core::manifest::PackageWorkspaces::List(vec![
+        "apps/*".to_string(),
+    ]));
+    assert!(
+        !lockfile.matches_manifest_ext(&drifted_patterns, true, false),
+        "must detect genuine drift when workspace patterns change"
+    );
+
+    // 3. Genuine drift: member-b removed from manifest workspace patterns
+    let mut drifted_subset = manifest.clone();
+    drifted_subset.workspaces = Some(rnpm_core::manifest::PackageWorkspaces::List(vec![
+        "packages/member-a".to_string(),
+    ]));
+    assert!(
+        !lockfile.matches_manifest_ext(&drifted_subset, true, false),
+        "must detect genuine drift when a member package in lockfile no longer matches workspace patterns"
+    );
+
+    // 4. Genuine drift: workspaces removed from manifest
+    let mut drifted_no_ws = manifest.clone();
+    drifted_no_ws.workspaces = None;
+    assert!(
+        !lockfile.matches_manifest_ext(&drifted_no_ws, true, false),
+        "must detect genuine drift when workspaces field is deleted from package.json"
+    );
+}
+
+#[test]
+fn test_matches_manifest_ext_absent_root_workspace_metadata_legacy_v1_lock() {
+    let mut manifest = Manifest {
+        name: Some("v1-ws-root".to_string()),
+        version: Some("1.0.0".to_string()),
+        workspaces: Some(rnpm_core::manifest::PackageWorkspaces::List(vec![
+            "packages/*".to_string(),
+        ])),
+        ..Default::default()
+    };
+    manifest
+        .dependencies
+        .insert("pkg-x".to_string(), "file:packages/pkg-x".to_string());
+    manifest
+        .dependencies
+        .insert("pkg-y".to_string(), "file:packages/pkg-y".to_string());
+
+    // Migrated npm v1 lockfile: root package "" has no workspaces metadata
+    let mut lockfile = LockfileV3::new("v1-ws-root", Some("1.0.0".to_string()));
+    assert!(lockfile.root_package().unwrap().workspaces.is_none());
+    let mut root_deps = BTreeMap::new();
+    root_deps.insert("pkg-x".to_string(), "file:packages/pkg-x".to_string());
+    root_deps.insert("pkg-y".to_string(), "file:packages/pkg-y".to_string());
+    lockfile.root_package_mut().unwrap().dependencies = Some(root_deps);
+
+    // Legacy v1 dependency entries migrated to node_modules/ with file: targets
+    lockfile.insert_package(
+        "node_modules/pkg-x",
+        LockfilePackage {
+            version: Some("file:packages/pkg-x".to_string()),
+            ..Default::default()
+        },
+    );
+    lockfile.insert_package(
+        "node_modules/pkg-y",
+        LockfilePackage {
+            version: Some("file:packages/pkg-y".to_string()),
+            ..Default::default()
+        },
+    );
+
+    // 1. Must validate legacy lock via available links matching workspace patterns
+    assert!(
+        lockfile.matches_manifest_ext(&manifest, true, false),
+        "legacy v1 lockfile must match via available file: links"
+    );
+
+    // 2. Genuine drift: patterns changed in manifest
+    let mut drifted = manifest.clone();
+    drifted.workspaces = Some(rnpm_core::manifest::PackageWorkspaces::List(vec![
+        "components/*".to_string(),
+    ]));
+    assert!(
+        !lockfile.matches_manifest_ext(&drifted, true, false),
+        "must detect genuine drift when workspace pattern does not match legacy links"
+    );
+
+    // 3. Genuine drift: workspaces removed
+    let mut no_ws = manifest.clone();
+    no_ws.workspaces = None;
+    no_ws.dependencies.clear();
+    assert!(
+        !lockfile.matches_manifest_ext(&no_ws, true, false),
+        "must detect genuine drift when workspaces removed from manifest"
+    );
+}
+
+#[test]
+fn test_matches_manifest_ext_workspace_drift_empty_lockfile_with_absent_metadata_fails() {
+    let manifest = Manifest {
+        name: Some("empty-ws-root".to_string()),
+        version: Some("1.0.0".to_string()),
+        workspaces: Some(rnpm_core::manifest::PackageWorkspaces::List(vec![
+            "packages/*".to_string(),
+        ])),
+        ..Default::default()
+    };
+
+    // Lockfile with absent root workspaces and no workspace members or links
+    let mut lockfile = LockfileV3::new("empty-ws-root", Some("1.0.0".to_string()));
+    lockfile.insert_package(
+        "node_modules/lodash",
+        LockfilePackage {
+            version: Some("4.17.21".to_string()),
+            resolved: Some("https://registry.npmjs.org/lodash/-/lodash-4.17.21.tgz".to_string()),
+            ..Default::default()
+        },
+    );
+
+    assert!(
+        !lockfile.matches_manifest_ext(&manifest, true, false),
+        "lockfile lacking both root workspaces and any workspace members/links must trigger drift detection"
+    );
+}
+
+#[test]
+fn test_matches_manifest_ext_workspace_drift_discovered_disk_members_differential() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let root_path = temp_dir.path();
+
+    // Setup root package.json
+    let root_pkg_json = r#"{
+        "name": "disk-ws-test",
+        "version": "1.0.0",
+        "workspaces": ["packages/*"]
+    }"#;
+    std::fs::write(root_path.join("package.json"), root_pkg_json).unwrap();
+
+    // Setup member packages on disk
+    std::fs::create_dir_all(root_path.join("packages/pkg-a")).unwrap();
+    std::fs::write(
+        root_path.join("packages/pkg-a/package.json"),
+        r#"{"name": "pkg-a", "version": "1.0.0"}"#,
+    )
+    .unwrap();
+
+    std::fs::create_dir_all(root_path.join("packages/pkg-b")).unwrap();
+    std::fs::write(
+        root_path.join("packages/pkg-b/package.json"),
+        r#"{"name": "pkg-b", "version": "1.0.0"}"#,
+    )
+    .unwrap();
+
+    let manifest = Manifest::from_file(&root_path.join("package.json")).unwrap();
+
+    // Lockfile with absent root workspaces metadata but matching members
+    let mut lockfile = LockfileV3::new("disk-ws-test", Some("1.0.0".to_string()));
+    lockfile.insert_package(
+        "packages/pkg-a",
+        LockfilePackage {
+            name: Some("pkg-a".to_string()),
+            version: Some("1.0.0".to_string()),
+            ..Default::default()
+        },
+    );
+    lockfile.insert_package(
+        "packages/pkg-b",
+        LockfilePackage {
+            name: Some("pkg-b".to_string()),
+            version: Some("1.0.0".to_string()),
+            ..Default::default()
+        },
+    );
+    lockfile.insert_package(
+        "node_modules/pkg-a",
+        LockfilePackage {
+            resolved: Some("packages/pkg-a".to_string()),
+            link: Some(true),
+            ..Default::default()
+        },
+    );
+    lockfile.insert_package(
+        "node_modules/pkg-b",
+        LockfilePackage {
+            resolved: Some("packages/pkg-b".to_string()),
+            link: Some(true),
+            ..Default::default()
+        },
+    );
+
+    // Switch to root directory for discovered members check
+    let original_cwd = std::env::current_dir().unwrap();
+    std::env::set_current_dir(root_path).unwrap();
+
+    let match_result = std::panic::catch_unwind(|| {
+        assert!(
+            lockfile.matches_manifest_ext(&manifest, true, false),
+            "must match when discovered disk members match lockfile members"
+        );
+
+        // Add a new workspace member pkg-c on disk (not in lockfile) -> must trigger drift!
+        std::fs::create_dir_all("packages/pkg-c").unwrap();
+        std::fs::write(
+            "packages/pkg-c/package.json",
+            r#"{"name": "pkg-c", "version": "1.0.0"}"#,
+        )
+        .unwrap();
+
+        assert!(
+            !lockfile.matches_manifest_ext(&manifest, true, false),
+            "must detect genuine drift when a new member is added to disk but missing from lockfile"
+        );
+
+        // Remove pkg-c, and remove pkg-b from disk (still in lockfile) -> must trigger drift!
+        std::fs::remove_dir_all("packages/pkg-c").unwrap();
+        std::fs::remove_dir_all("packages/pkg-b").unwrap();
+
+        assert!(
+            !lockfile.matches_manifest_ext(&manifest, true, false),
+            "must detect genuine drift when a member in lockfile is deleted from disk"
+        );
+    });
+
+    std::env::set_current_dir(original_cwd).unwrap();
+    match_result.unwrap();
+}
+
+#[test]
+fn test_path_matches_workspace_patterns_comprehensive() {
+    let patterns = vec![
+        "packages/*".to_string(),
+        "apps/**".to_string(),
+        "tools/cli".to_string(),
+        "!packages/ignored".to_string(),
+    ];
+
+    // Single wildcard match
+    assert!(LockfileV3::path_matches_workspace_patterns("packages/pkg-a", &patterns));
+    assert!(LockfileV3::path_matches_workspace_patterns("packages/pkg-b", &patterns));
+    assert!(!LockfileV3::path_matches_workspace_patterns("packages/nested/pkg", &patterns));
+    assert!(!LockfileV3::path_matches_workspace_patterns("packages", &patterns));
+
+    // Recursive wildcard match
+    assert!(LockfileV3::path_matches_workspace_patterns("apps/web", &patterns));
+    assert!(LockfileV3::path_matches_workspace_patterns("apps/mobile/ios", &patterns));
+
+    // Exact path match
+    assert!(LockfileV3::path_matches_workspace_patterns("tools/cli", &patterns));
+    assert!(!LockfileV3::path_matches_workspace_patterns("tools/other", &patterns));
+
+    // Negative pattern exclusion
+    assert!(!LockfileV3::path_matches_workspace_patterns("packages/ignored", &patterns));
+
+    // Normalization (leading ./, backslashes, trailing /)
+    assert!(LockfileV3::path_matches_workspace_patterns("./packages/pkg-a", &patterns));
+    assert!(LockfileV3::path_matches_workspace_patterns("packages\\pkg-a", &patterns));
+    assert!(LockfileV3::path_matches_workspace_patterns("packages/pkg-a/", &patterns));
+}

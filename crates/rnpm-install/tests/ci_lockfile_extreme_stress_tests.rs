@@ -621,3 +621,97 @@ async fn test_ci_accepts_referential_overrides_demo() {
         "run_ci must reject lockfile when demo spec drifts to ^2.0.0 while lockfile has 1.2.0"
     );
 }
+
+#[tokio::test]
+async fn test_ci_workspace_absent_root_metadata_differential() {
+    let temp = tempdir().unwrap();
+    let project_dir = temp.path();
+
+    // 1. Root package.json declares workspaces: ["packages/*"]
+    let mut manifest = Manifest::default();
+    manifest.name = Some("ws-ci-app".to_string());
+    manifest.version = Some("1.0.0".to_string());
+    manifest.workspaces = Some(rnpm_core::manifest::PackageWorkspaces::List(vec![
+        "packages/*".to_string(),
+    ]));
+    manifest
+        .save_to_file(project_dir.join("package.json"))
+        .unwrap();
+
+    // 2. Member A on disk
+    fs::create_dir_all(project_dir.join("packages/member-a")).unwrap();
+    let mut member_a = Manifest::default();
+    member_a.name = Some("member-a".to_string());
+    member_a.version = Some("1.0.0".to_string());
+    member_a
+        .save_to_file(project_dir.join("packages/member-a/package.json"))
+        .unwrap();
+
+    // 3. Lockfile v3 where root package omitted workspaces metadata
+    let mut lockfile = LockfileV3::new("ws-ci-app", Some("1.0.0".to_string()));
+    assert!(
+        lockfile.root_package().unwrap().workspaces.is_none(),
+        "root workspaces metadata omitted"
+    );
+    lockfile.insert_package(
+        "packages/member-a",
+        LockfilePackage {
+            name: Some("member-a".to_string()),
+            version: Some("1.0.0".to_string()),
+            ..Default::default()
+        },
+    );
+    lockfile.insert_package(
+        "node_modules/member-a",
+        LockfilePackage {
+            resolved: Some("packages/member-a".to_string()),
+            link: Some(true),
+            ..Default::default()
+        },
+    );
+    lockfile
+        .save_to_file(&project_dir.join("package-lock.json"))
+        .unwrap();
+
+    // 4. `rnpm ci` MUST succeed despite absent root workspaces metadata
+    let mut installer = Installer::new(InstallOptions {
+        project_dir: project_dir.to_path_buf(),
+        offline: true,
+        ..Default::default()
+    })
+    .unwrap();
+
+    let res = installer.run_ci().await;
+    assert!(
+        res.is_ok(),
+        "run_ci must succeed when root workspace metadata is absent in lockfile: {:?}",
+        res.err()
+    );
+
+    // 5. Genuine drift: add member-b on disk without updating lockfile -> run_ci must fail with ELOCKFILE_DRIFT
+    fs::create_dir_all(project_dir.join("packages/member-b")).unwrap();
+    let mut member_b = Manifest::default();
+    member_b.name = Some("member-b".to_string());
+    member_b.version = Some("1.0.0".to_string());
+    member_b
+        .save_to_file(project_dir.join("packages/member-b/package.json"))
+        .unwrap();
+
+    let mut installer2 = Installer::new(InstallOptions {
+        project_dir: project_dir.to_path_buf(),
+        offline: true,
+        ..Default::default()
+    })
+    .unwrap();
+
+    let drift_res = installer2.run_ci().await;
+    assert!(
+        drift_res.is_err(),
+        "run_ci must fail when an untracked member package is added on disk"
+    );
+    let err_msg = drift_res.unwrap_err().to_string();
+    assert!(
+        err_msg.contains("ELOCKFILE_DRIFT"),
+        "error must be ELOCKFILE_DRIFT: {err_msg}"
+    );
+}

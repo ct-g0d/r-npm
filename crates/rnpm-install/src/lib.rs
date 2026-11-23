@@ -3367,13 +3367,18 @@ impl Installer {
             ));
         };
 
+        let workspace_members = if !self.options.is_global {
+            discover_workspaces_from_manifest(&self.options.project_dir, &manifest)
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+
         // npm-package-arg rejects unknown spec protocols (yarn/pnpm's
         // `workspace:`, `patch:`, `link:`...) while loading the root and
         // workspace edges, before anything is resolved.
         if !self.options.is_global {
-            let members = discover_workspaces_from_manifest(&self.options.project_dir, &manifest)
-                .unwrap_or_default();
-            let manifests = std::iter::once(&manifest).chain(members.iter().map(|m| &m.manifest));
+            let manifests = std::iter::once(&manifest).chain(workspace_members.iter().map(|m| &m.manifest));
             for m in manifests {
                 // Node#loadDeps: one edge per name, later types replacing
                 // earlier ones (peer, unless legacy, then prod, optional, dev).
@@ -3415,7 +3420,12 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                     .filter(|s| !legacy_lock::is_old_lockfile(s))
                 {
                     if let Ok(existing_lockfile) = rnpm_lockfile::parse_and_migrate(&lockfile_str) {
-                        if existing_lockfile.matches_manifest(&manifest, !self.options.omit_dev) {
+                        if existing_lockfile.matches_manifest_ext_with_workspaces(
+                            &manifest,
+                            !self.options.omit_dev,
+                            false,
+                            Some(&workspace_members),
+                        ) {
                             info!(
                                 "Lockfile matches manifest: taking lockfile reification fast path"
                             );
@@ -6058,7 +6068,7 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
         }
 
         // 4. Comprehensive lockfile validation via matches_manifest_for_ci
-        if !lockfile.matches_manifest_for_ci(&manifest, true) {
+        if !lockfile.matches_manifest_for_ci_with_workspaces(&manifest, true, Some(&workspace_members)) {
             return Err(anyhow!(
                 "rnpm ERR! code ELOCKFILE_DRIFT: package.json and {} are out of sync. Please run `rnpm install` to update your lockfile. (EUSAGE)",
                 lockfile_name

@@ -5,7 +5,7 @@ use rnpm_core::spec::PackageTarget;
 use rnpm_core::to_posix_path;
 use rnpm_core::PlatformList;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::Path;
 
@@ -1130,7 +1130,16 @@ impl LockfileV3 {
         manifest: &rnpm_core::manifest::Manifest,
         include_dev: bool,
     ) -> bool {
-        self.matches_manifest_ext(manifest, include_dev, true)
+        self.matches_manifest_ext_with_workspaces(manifest, include_dev, true, None)
+    }
+
+    pub fn matches_manifest_for_ci_with_workspaces(
+        &self,
+        manifest: &rnpm_core::manifest::Manifest,
+        include_dev: bool,
+        workspace_members: Option<&[rnpm_core::workspace::WorkspaceMember]>,
+    ) -> bool {
+        self.matches_manifest_ext_with_workspaces(manifest, include_dev, true, workspace_members)
     }
 
     pub fn matches_manifest_ext(
@@ -1138,6 +1147,16 @@ impl LockfileV3 {
         manifest: &rnpm_core::manifest::Manifest,
         include_dev: bool,
         allow_extra_lock_deps: bool,
+    ) -> bool {
+        self.matches_manifest_ext_with_workspaces(manifest, include_dev, allow_extra_lock_deps, None)
+    }
+
+    pub fn matches_manifest_ext_with_workspaces(
+        &self,
+        manifest: &rnpm_core::manifest::Manifest,
+        include_dev: bool,
+        allow_extra_lock_deps: bool,
+        workspace_members: Option<&[rnpm_core::workspace::WorkspaceMember]>,
     ) -> bool {
         let Some(root_pkg) = self.root_package() else {
             return false;
@@ -1226,16 +1245,141 @@ impl LockfileV3 {
         };
         let manifest_has_ws = manifest_ws.as_ref().is_some_and(|w| !w.is_empty());
         let root_has_ws = root_pkg.workspaces.as_ref().is_some_and(|w| !w.is_empty());
-        if manifest_has_ws != root_has_ws {
-            return false;
-        }
-        if manifest_has_ws {
+
+        if manifest_has_ws && root_has_ws {
             let mut m = manifest_ws.unwrap();
             let mut r = root_pkg.workspaces.clone().unwrap_or_default();
             m.sort();
             r.sort();
             if m != r {
                 return false;
+            }
+        } else if !manifest_has_ws && root_has_ws {
+            return false;
+        } else if manifest_has_ws && !root_has_ws {
+            // Root workspace metadata is absent in lockfile (e.g. npm v1 workspace lock or npm v3 omission).
+            // Validate legacy / omitted lockfile via discovered members and available links while preserving genuine drift checks.
+            let patterns = manifest.workspace_patterns();
+
+            // Collect discovered workspace member paths from packages map
+            let lockfile_member_paths: BTreeSet<String> = self
+                .packages
+                .keys()
+                .filter(|k| !k.is_empty() && !k.starts_with("node_modules/"))
+                .cloned()
+                .collect();
+
+            // Collect available links (target relative paths and link package names)
+            let mut available_link_targets = BTreeSet::new();
+            let mut available_link_names = BTreeSet::new();
+
+            for (loc, pkg) in &self.packages {
+                let mut target_opt = None;
+                if pkg.link == Some(true) {
+                    if let Some(res) = &pkg.resolved {
+                        target_opt = Some(res.as_str());
+                    }
+                } else if let Some(ver) = &pkg.version {
+                    if let Some(t) = ver.strip_prefix("file:") {
+                        target_opt = Some(t);
+                    }
+                } else if let Some(res) = &pkg.resolved {
+                    if let Some(t) = res.strip_prefix("file:") {
+                        target_opt = Some(t);
+                    }
+                }
+
+                if let Some(raw_target) = target_opt {
+                    let clean = raw_target
+                        .strip_prefix("./")
+                        .unwrap_or(raw_target)
+                        .strip_prefix(".\\")
+                        .unwrap_or(raw_target);
+                    let posix = clean.replace('\\', "/");
+                    let posix = posix.trim_end_matches('/').to_string();
+                    available_link_targets.insert(posix);
+                    if let Some(name) = loc.strip_prefix("node_modules/") {
+                        available_link_names.insert(name.to_string());
+                    }
+                    if let Some(ref name) = pkg.name {
+                        available_link_names.insert(name.clone());
+                    }
+                }
+            }
+
+            // Discovered members: prefer passed-in workspace_members, then fall back to disk discovery
+            let disk_members: Option<Vec<rnpm_core::workspace::WorkspaceMember>> =
+                if let Some(members) = workspace_members {
+                    Some(members.to_vec())
+                } else if std::path::Path::new("package.json").is_file() {
+                    if let Ok(disk_manifest) =
+                        rnpm_core::manifest::Manifest::from_file(std::path::Path::new("package.json"))
+                    {
+                        if disk_manifest.name == manifest.name
+                            && disk_manifest.version == manifest.version
+                        {
+                            rnpm_core::workspace::discover_workspaces_from_manifest(
+                                std::path::Path::new("."),
+                                manifest,
+                            )
+                            .ok()
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+
+            // 1. Lockfile must have at least one workspace member or link matching patterns
+            let has_matching_member = lockfile_member_paths
+                .iter()
+                .any(|p| Self::path_matches_workspace_patterns(p, &patterns));
+            let has_matching_link = available_link_targets
+                .iter()
+                .any(|t| Self::path_matches_workspace_patterns(t, &patterns));
+
+            if !has_matching_member && !has_matching_link {
+                return false;
+            }
+
+            // 2. All lockfile member paths outside node_modules must match workspace patterns
+            for member_path in &lockfile_member_paths {
+                if !Self::path_matches_workspace_patterns(member_path, &patterns) {
+                    return false;
+                }
+            }
+
+            // 3. If workspace members were discovered on disk, validate bidirectional consistency
+            if let Some(ref members) = disk_members {
+                if !members.is_empty() {
+                    for member in members {
+                        let has_entry = lockfile_member_paths.contains(&member.relative_path)
+                            || available_link_targets.contains(&member.relative_path)
+                            || available_link_names.contains(&member.name);
+                        if !has_entry {
+                            return false;
+                        }
+                    }
+
+                    for member_path in &lockfile_member_paths {
+                        if !members.iter().any(|m| m.relative_path == *member_path) {
+                            return false;
+                        }
+                    }
+                }
+            }
+        } else if !manifest_has_ws && !root_has_ws {
+            if !allow_extra_lock_deps {
+                let has_lockfile_members = self
+                    .packages
+                    .keys()
+                    .any(|k| !k.is_empty() && !k.starts_with("node_modules/"));
+                if has_lockfile_members {
+                    return false;
+                }
             }
         }
 
@@ -1358,6 +1502,134 @@ impl LockfileV3 {
                 }
             } else if !is_optional {
                 return false;
+            }
+        }
+
+        true
+    }
+
+    pub fn path_matches_workspace_patterns(path: &str, patterns: &[String]) -> bool {
+        let mut clean_path = path.trim();
+        if let Some(stripped) = clean_path.strip_prefix("./") {
+            clean_path = stripped;
+        } else if let Some(stripped) = clean_path.strip_prefix(".\\") {
+            clean_path = stripped;
+        }
+        let clean_path = clean_path.replace('\\', "/");
+        let clean_path = clean_path.trim_end_matches('/');
+        if clean_path.is_empty() {
+            return false;
+        }
+
+        let (negative_patterns, positive_patterns): (Vec<_>, Vec<_>) =
+            patterns.iter().partition(|p| p.starts_with('!'));
+
+        // Must match at least one positive pattern
+        let mut matched = false;
+        for pos_pat in positive_patterns {
+            let mut clean_pat = pos_pat.trim();
+            if let Some(stripped) = clean_pat.strip_prefix("./") {
+                clean_pat = stripped;
+            } else if let Some(stripped) = clean_pat.strip_prefix(".\\") {
+                clean_pat = stripped;
+            }
+            let clean_pat = clean_pat.replace('\\', "/");
+            let clean_pat = clean_pat.trim_end_matches('/');
+
+            if clean_pat == clean_path {
+                matched = true;
+                break;
+            }
+            if let Some(prefix) = clean_pat.strip_suffix("/*") {
+                let clean_prefix = prefix.trim_end_matches('/');
+                if clean_path.starts_with(clean_prefix) {
+                    let rest = clean_path[clean_prefix.len()..]
+                        .strip_prefix('/')
+                        .unwrap_or("");
+                    if !rest.is_empty() && !rest.contains('/') {
+                        matched = true;
+                        break;
+                    }
+                }
+            } else if let Some(prefix) = clean_pat.strip_suffix("/**") {
+                let clean_prefix = prefix.trim_end_matches('/');
+                if clean_path.starts_with(clean_prefix) {
+                    let rest = clean_path[clean_prefix.len()..]
+                        .strip_prefix('/')
+                        .unwrap_or("");
+                    if !rest.is_empty() {
+                        matched = true;
+                        break;
+                    }
+                }
+            } else {
+                let p_segs: Vec<&str> = clean_pat.split('/').filter(|s| !s.is_empty()).collect();
+                let path_segs: Vec<&str> =
+                    clean_path.split('/').filter(|s| !s.is_empty()).collect();
+                if p_segs.len() == path_segs.len() {
+                    let all_segs_match = p_segs
+                        .iter()
+                        .zip(path_segs.iter())
+                        .all(|(p, s)| rnpm_core::workspace::wildcard_match(p, s));
+                    if all_segs_match {
+                        matched = true;
+                        break;
+                    }
+                }
+            }
+        }
+
+        if !matched {
+            return false;
+        }
+
+        // Must NOT match any negative pattern
+        for neg_pat in negative_patterns {
+            let mut clean_neg = neg_pat.trim().strip_prefix('!').unwrap_or(neg_pat).trim();
+            if let Some(stripped) = clean_neg.strip_prefix("./") {
+                clean_neg = stripped;
+            } else if let Some(stripped) = clean_neg.strip_prefix(".\\") {
+                clean_neg = stripped;
+            }
+            let clean_neg = clean_neg.replace('\\', "/");
+            let clean_neg = clean_neg.trim_end_matches('/');
+
+            if clean_neg == clean_path {
+                return false;
+            }
+            if let Some(prefix) = clean_neg.strip_suffix("/*") {
+                let clean_prefix = prefix.trim_end_matches('/');
+                if clean_path.starts_with(clean_prefix) {
+                    let rest = clean_path[clean_prefix.len()..]
+                        .strip_prefix('/')
+                        .unwrap_or("");
+                    if !rest.is_empty() && !rest.contains('/') {
+                        return false;
+                    }
+                }
+            } else if let Some(prefix) = clean_neg.strip_suffix("/**") {
+                let clean_prefix = prefix.trim_end_matches('/');
+                if clean_path.starts_with(clean_prefix) {
+                    let rest = clean_path[clean_prefix.len()..]
+                        .strip_prefix('/')
+                        .unwrap_or("");
+                    if !rest.is_empty() {
+                        return false;
+                    }
+                }
+            } else {
+                let p_segs: Vec<&str> = clean_neg.split('/').filter(|s| !s.is_empty()).collect();
+                let path_segs: Vec<&str> =
+                    clean_path.split('/').filter(|s| !s.is_empty()).collect();
+                if p_segs.len() == path_segs.len() {
+                    let all_segs_match = p_segs
+                        .iter()
+                        .zip(path_segs.iter())
+                        .all(|(p, s)| rnpm_core::workspace::wildcard_match(p, s));
+                    if all_segs_match {
+                        return false;
+                    }
+                }
             }
         }
 
