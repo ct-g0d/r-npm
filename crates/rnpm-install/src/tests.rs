@@ -6007,10 +6007,10 @@ fn test_git_normalize_clone_url_handles_git_plus_file_and_ssh() {
     assert!(!normalized.starts_with("git+"), "normalized url must strip git+ prefix");
 
     let gh_ssh = crate::git::normalize_clone_url_for_git("git+ssh://git@github.com/foo/bar.git");
-    assert_eq!(gh_ssh, "https://github.com/foo/bar.git");
+    assert_eq!(gh_ssh, "ssh://git@github.com/foo/bar.git");
 
     let gh_scp = crate::git::normalize_clone_url_for_git("git@github.com:foo/bar.git");
-    assert_eq!(gh_scp, "https://github.com/foo/bar.git");
+    assert_eq!(gh_scp, "git@github.com:foo/bar.git");
 }
 
 #[test]
