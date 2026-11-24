@@ -103,6 +103,12 @@ impl Range {
         Ok(Self { raw, sets })
     }
 
+    /// Checks if this range is a wildcard (*, "", x, X), matching any version.
+    pub fn is_wildcard(&self) -> bool {
+        let t = self.raw.trim();
+        t.is_empty() || t == "*" || t.eq_ignore_ascii_case("x")
+    }
+
     pub fn satisfies(&self, version: &Version) -> bool {
         // Any set matching satisfies the range (OR)
         self.sets.iter().any(|set| set.matches(version))

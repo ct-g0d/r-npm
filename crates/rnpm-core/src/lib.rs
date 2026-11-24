@@ -31,7 +31,7 @@ pub use pkg::{
 };
 pub use platform_list::PlatformList;
 pub use semver::{Comparator, ComparatorSet, Op, PrereleaseId, Range, Version};
-pub use spec::{PackageSpec, PackageTarget};
+pub use spec::{is_scp_git_url, PackageSpec, PackageTarget};
 pub use workspace::{
     discover_workspaces, discover_workspaces_from_manifest, match_glob_patterns,
     path_matches_workspace_patterns, WorkspaceMember,

@@ -1185,7 +1185,7 @@ fn normalize_git_url(raw: &str) -> String {
     } else if let Some(rest) = url_part.strip_prefix("gist:") {
         let id = rest.trim_end_matches(".git");
         format!("git+https://gist.github.com/{id}.git")
-    } else if url_part.starts_with("git@") {
+    } else if crate::spec::is_scp_git_url(url_part) {
         if let Some((user_host, path)) = url_part.split_once(':') {
             let clean_path = path.trim_start_matches('/');
             let path_with_git = if clean_path.ends_with(".git") {

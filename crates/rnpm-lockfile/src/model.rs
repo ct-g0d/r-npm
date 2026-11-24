@@ -1527,6 +1527,16 @@ impl LockfileV3 {
             } else {
                 spec.clone()
             };
+            if let Some(ref lock_deps) = root_pkg.dependencies {
+                if let Some(lock_spec) = lock_deps.get(dep) {
+                    if Self::is_non_registry_spec(&eff_spec)
+                        && Self::is_non_registry_spec(lock_spec)
+                        && !Self::non_registry_specs_match(&eff_spec, lock_spec)
+                    {
+                        return false;
+                    }
+                }
+            }
             if !Self::package_satisfies_spec(dep, pkg, &eff_spec) {
                 return false;
             }
@@ -1547,6 +1557,16 @@ impl LockfileV3 {
                 } else {
                     spec.clone()
                 };
+                if let Some(ref lock_dev) = root_pkg.dev_dependencies {
+                    if let Some(lock_spec) = lock_dev.get(dep) {
+                        if Self::is_non_registry_spec(&eff_spec)
+                            && Self::is_non_registry_spec(lock_spec)
+                            && !Self::non_registry_specs_match(&eff_spec, lock_spec)
+                        {
+                            return false;
+                        }
+                    }
+                }
                 if !Self::package_satisfies_spec(dep, pkg, &eff_spec) {
                     return false;
                 }
@@ -1565,6 +1585,16 @@ impl LockfileV3 {
                 } else {
                     spec.clone()
                 };
+                if let Some(ref lock_opt) = root_pkg.optional_dependencies {
+                    if let Some(lock_spec) = lock_opt.get(dep) {
+                        if Self::is_non_registry_spec(&eff_spec)
+                            && Self::is_non_registry_spec(lock_spec)
+                            && !Self::non_registry_specs_match(&eff_spec, lock_spec)
+                        {
+                            return false;
+                        }
+                    }
+                }
                 if !Self::package_satisfies_spec(dep, pkg, &eff_spec) {
                     return false;
                 }
@@ -1588,6 +1618,16 @@ impl LockfileV3 {
             } else {
                 spec.clone()
             };
+            if let Some(ref lock_peer) = root_pkg.peer_dependencies {
+                if let Some(lock_spec) = lock_peer.get(dep) {
+                    if Self::is_non_registry_spec(&eff_spec)
+                        && Self::is_non_registry_spec(lock_spec)
+                        && !Self::non_registry_specs_match(&eff_spec, lock_spec)
+                    {
+                        return false;
+                    }
+                }
+            }
             if let Some(pkg) = self.packages.get(&key) {
                 if !Self::package_satisfies_spec(dep, pkg, &eff_spec) {
                     return false;
@@ -1648,6 +1688,17 @@ impl LockfileV3 {
                             && target_frag.chars().all(|ch| ch.is_ascii_hexdigit());
                         if target_is_sha {
                             return Self::git_refs_equal(res_frag, target_frag);
+                        }
+                        if let Some(ver_str) = pkg.version.as_deref() {
+                            let clean = target_frag.strip_prefix(['v', 'V']).unwrap_or(target_frag);
+                            if let (Ok(range), Ok(ver)) = (
+                                rnpm_core::semver::Range::parse(clean.trim()),
+                                Version::parse(ver_str),
+                            ) {
+                                if !range.satisfies(&ver) {
+                                    return false;
+                                }
+                            }
                         }
                         return res_is_sha;
                     }
@@ -1740,8 +1791,13 @@ impl LockfileV3 {
 
         let without_user = if let Some(at_idx) = without_proto.find('@') {
             let slash_idx = without_proto.find('/').unwrap_or(usize::MAX);
-            let colon_idx = without_proto.find(':').unwrap_or(usize::MAX);
-            if at_idx < slash_idx && at_idx < colon_idx {
+            let should_strip = if had_scheme {
+                at_idx < slash_idx
+            } else {
+                let colon_idx = without_proto.find(':').unwrap_or(usize::MAX);
+                at_idx < colon_idx && at_idx < slash_idx
+            };
+            if should_strip {
                 &without_proto[at_idx + 1..]
             } else {
                 without_proto
@@ -1835,13 +1891,23 @@ impl LockfileV3 {
             return false;
         }
 
-        let both_hex = a.len() >= 7
-            && b.len() >= 7
-            && a.chars().all(|c| c.is_ascii_hexdigit())
-            && b.chars().all(|c| c.is_ascii_hexdigit());
-        if both_hex {
-            let min_len = a.len().min(b.len());
-            return a[..min_len].eq_ignore_ascii_case(&b[..min_len]);
+        let a_is_hex = a.chars().all(|c| c.is_ascii_hexdigit());
+        let b_is_hex = b.chars().all(|c| c.is_ascii_hexdigit());
+        if a_is_hex && b_is_hex {
+            let a_is_full_sha = a.len() == 40 || a.len() == 64;
+            let b_is_full_sha = b.len() == 40 || b.len() == 64;
+
+            // Same-length hex commit refs (>= 7 chars) match case-insensitively
+            if a.len() == b.len() && a.len() >= 7 {
+                return a.eq_ignore_ascii_case(b);
+            }
+
+            // Prefix matching: ONLY allow when at least ONE operand is a full 40-char (SHA-1)
+            // or 64-char (SHA-256) hex commit SHA and the other is a >= 7-char hex prefix
+            if (a_is_full_sha && b.len() >= 7) || (b_is_full_sha && a.len() >= 7) {
+                let min_len = a.len().min(b.len());
+                return a[..min_len].eq_ignore_ascii_case(&b[..min_len]);
+            }
         }
 
         false
@@ -1887,7 +1953,7 @@ impl LockfileV3 {
             || s.starts_with("bitbucket:")
             || s.starts_with("gist:")
             || s.starts_with("ssh://")
-            || s.starts_with("git@")
+            || rnpm_core::is_scp_git_url(s)
             || s.starts_with("./")
             || s.starts_with(".\\")
             || s.starts_with("../")
@@ -2141,24 +2207,26 @@ impl LockfileV3 {
                         clean_res == clean_p
                     }
                 } else if res_abs {
-                    let suffix = clean_p.trim_start_matches("../");
-                    if cfg!(windows) {
-                        suffix.is_empty()
-                            || clean_res
-                                .to_ascii_lowercase()
-                                .ends_with(&format!("/{suffix}").to_ascii_lowercase())
+                    let suffix = clean_p.trim_start_matches("../").trim_matches('/');
+                    if suffix.is_empty() {
+                        false
+                    } else if cfg!(windows) {
+                        clean_res
+                            .to_ascii_lowercase()
+                            .ends_with(&format!("/{suffix}").to_ascii_lowercase())
                     } else {
-                        suffix.is_empty() || clean_res.ends_with(&format!("/{suffix}"))
+                        clean_res.ends_with(&format!("/{suffix}"))
                     }
                 } else {
-                    let suffix = clean_res.trim_start_matches("../");
-                    if cfg!(windows) {
-                        suffix.is_empty()
-                            || clean_p
-                                .to_ascii_lowercase()
-                                .ends_with(&format!("/{suffix}").to_ascii_lowercase())
+                    let suffix = clean_res.trim_start_matches("../").trim_matches('/');
+                    if suffix.is_empty() {
+                        false
+                    } else if cfg!(windows) {
+                        clean_p
+                            .to_ascii_lowercase()
+                            .ends_with(&format!("/{suffix}").to_ascii_lowercase())
                     } else {
-                        suffix.is_empty() || clean_p.ends_with(&format!("/{suffix}"))
+                        clean_p.ends_with(&format!("/{suffix}"))
                     }
                 }
             }
@@ -2218,6 +2286,17 @@ impl LockfileV3 {
                         return false;
                     };
                     return range.satisfies(&v);
+                }
+                if let Some(c) = committish.as_deref() {
+                    let clean = c.strip_prefix(['v', 'V']).unwrap_or(c);
+                    if let (Ok(range), Ok(v)) = (
+                        rnpm_core::semver::Range::parse(clean.trim()),
+                        Version::parse(ver_str),
+                    ) {
+                        if !range.satisfies(&v) {
+                            return false;
+                        }
+                    }
                 }
                 true
             }
@@ -3650,5 +3729,73 @@ mod platform_field_tests {
 
         // Strict matches_manifest must detect drift because pkg-b is an orphaned workspace member!
         assert!(!lockfile.matches_manifest(&manifest_non_ws, true));
+    }
+
+    #[test]
+    fn test_cross_review_findings_regression_suite() {
+        use std::path::PathBuf;
+
+        // Finding 3: canonicalize_git_identity strips user:password@ in URLs
+        let with_creds = "https://user:password@github.com/org/repo.git";
+        let clean = "https://github.com/org/repo.git";
+        assert_eq!(
+            super::LockfileV3::canonicalize_git_identity(with_creds),
+            super::LockfileV3::canonicalize_git_identity(clean)
+        );
+        assert_eq!(
+            super::LockfileV3::canonicalize_git_identity(with_creds),
+            "github.com/org/repo"
+        );
+
+        // Finding 4: git_refs_equal rejects unsound symmetrical prefix matching
+        assert!(!super::LockfileV3::git_refs_equal("20240101", "202401010"));
+        // Same length >= 7 hex strings match case-insensitively:
+        assert!(super::LockfileV3::git_refs_equal("20240101", "20240101"));
+        assert!(super::LockfileV3::git_refs_equal("abcdef0", "ABCDEF0"));
+        // Prefix matching allowed only when one is full 40/64 hex commit SHA:
+        assert!(super::LockfileV3::git_refs_equal(
+            "abcdef0123456789abcdef0123456789abcdef01",
+            "abcdef0"
+        ));
+        assert!(super::LockfileV3::git_refs_equal(
+            "ABCDEF0",
+            "abcdef0123456789abcdef0123456789abcdef01"
+        ));
+
+        // Finding 5: named git branch/tag drift rejection
+        let pkg_v1 = super::LockfilePackage {
+            version: Some("1.0.0".to_string()),
+            resolved: Some("git+https://github.com/org/repo.git#1a2b3c4d5e6f1a2b3c4d5e6f1a2b3c4d5e6f1a2b".to_string()),
+            ..Default::default()
+        };
+        // Target specifies #v2.0.0 but locked package is 1.0.0: must reject!
+        assert!(!super::LockfileV3::package_satisfies_spec(
+            "repo",
+            &pkg_v1,
+            "git+https://github.com/org/repo.git#v2.0.0"
+        ));
+        // Target specifies #v1.0.0 and locked package is 1.0.0: must accept!
+        assert!(super::LockfileV3::package_satisfies_spec(
+            "repo",
+            &pkg_v1,
+            "git+https://github.com/org/repo.git#v1.0.0"
+        ));
+
+        // Finding 6: target_matches_resolved for file:../ rejects arbitrary absolute paths
+        let file_parent = rnpm_core::spec::PackageTarget::File(PathBuf::from("../"));
+        assert!(!super::LockfileV3::target_matches_resolved(
+            "/usr/local/random/path",
+            &file_parent
+        ));
+        assert!(!super::LockfileV3::target_matches_resolved(
+            "C:/some/random/dir",
+            &file_parent
+        ));
+
+        let file_sibling = rnpm_core::spec::PackageTarget::File(PathBuf::from("../sibling"));
+        assert!(super::LockfileV3::target_matches_resolved(
+            "/workspace/sibling",
+            &file_sibling
+        ));
     }
 }

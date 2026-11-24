@@ -578,6 +578,19 @@ pub fn ranges_intersect(r1: &Range, r2: &Range) -> bool {
     if r1.sets.is_empty() || r2.sets.is_empty() {
         return false;
     }
+    // node-semver Comparator.prototype.intersects handles wildcard / empty comparator:
+    // When r1 is wildcard, any satisfiable r2 intersects.
+    if r1.is_wildcard() {
+        return r2.sets.iter().any(is_set_satisfiable);
+    }
+    // When r2 is wildcard, r1 intersects unless r1 is exclusively an exact prerelease version
+    if r2.is_wildcard() {
+        return r1.sets.iter().any(|s| {
+            is_set_satisfiable(s)
+                && !s.comparators.iter().any(|c| c.op == Op::Eq && c.version.is_prerelease())
+        });
+    }
+
     for s1 in &r1.sets {
         for s2 in &r2.sets {
             if comparator_sets_intersect(s1, s2) {
@@ -586,6 +599,46 @@ pub fn ranges_intersect(r1: &Range, r2: &Range) -> bool {
         }
     }
     false
+}
+
+fn percent_decode(s: &str) -> String {
+    let mut bytes = Vec::with_capacity(s.len());
+    let mut chars = s.bytes();
+    while let Some(b) = chars.next() {
+        if b == b'%' {
+            let h1 = chars.next();
+            let h2 = chars.next();
+            if let (Some(h1), Some(h2)) = (h1, h2) {
+                if let Ok(val) =
+                    u8::from_str_radix(std::str::from_utf8(&[h1, h2]).unwrap_or(""), 16)
+                {
+                    bytes.push(val);
+                    continue;
+                }
+                bytes.push(b'%');
+                bytes.push(h1);
+                bytes.push(h2);
+            } else {
+                bytes.push(b'%');
+                if let Some(h1) = h1 {
+                    bytes.push(h1);
+                }
+            }
+        } else {
+            bytes.push(b);
+        }
+    }
+    String::from_utf8(bytes).unwrap_or_else(|_| s.to_string())
+}
+
+fn extract_semver_range_from_spec(spec: &str) -> Option<String> {
+    let hash_idx = spec.find('#')?;
+    let fragment = spec[hash_idx + 1..].trim();
+    let raw = fragment
+        .strip_prefix("semver:")
+        .or_else(|| fragment.strip_prefix("semver%3A"))
+        .or_else(|| fragment.strip_prefix("semver%3a"))?;
+    Some(percent_decode(raw).trim().to_string())
 }
 
 /// Determines if the requested spec matches the pattern spec in a spec-targeted override.
@@ -617,33 +670,39 @@ fn spec_matches(pattern_spec: &str, requested_spec: &str) -> bool {
         }
     }
 
-    // If requested_spec contains #semver:
-    if let Some(idx) = r.find("#semver:") {
-        r = &r[idx + 8..];
-    }
+    // If requested_spec or pattern_spec contains #semver: (including URL-encoded #semver%3A / #semver%3a)
+    let p_extracted = extract_semver_range_from_spec(p);
+    let p_str = p_extracted.as_deref().unwrap_or(p);
+    let r_extracted = extract_semver_range_from_spec(r);
+    let r_str = r_extracted.as_deref().unwrap_or(r);
 
-    if p == r {
+    if p_str == r_str {
         return true;
     }
 
     // Wildcards: "*" or "x" or "X" match anything
-    if p == "*" || p.eq_ignore_ascii_case("x") || r == "*" || r.eq_ignore_ascii_case("x") {
+    if p_str == "*"
+        || p_str.eq_ignore_ascii_case("x")
+        || r_str == "*"
+        || r_str.eq_ignore_ascii_case("x")
+    {
         return true;
     }
 
-    // If both can be parsed as ranges, test for intersection
-    if let (Ok(p_range), Ok(r_range)) = (Range::parse(p), Range::parse(r)) {
-        return ranges_intersect(&p_range, &r_range);
-    }
-
-    // If requested is exact version and pattern is range
-    if let (Ok(p_range), Ok(r_ver)) = (Range::parse(p), Version::parse(r)) {
+    // 1. If requested is a concrete version (e.g. ancestor version or pinned version),
+    // test if pattern satisfies it per Arborist override-set (semver.satisfies(node.version, rule.keySpec))
+    if let (Ok(p_range), Ok(r_ver)) = (Range::parse(p_str), Version::parse(r_str)) {
         return p_range.satisfies(&r_ver);
     }
 
-    // If pattern is exact version and requested is range
-    if let (Ok(p_ver), Ok(r_range)) = (Version::parse(p), Range::parse(r)) {
+    // 2. If pattern is exact version and requested is a range
+    if let (Ok(p_ver), Ok(r_range)) = (Version::parse(p_str), Range::parse(r_str)) {
         return r_range.satisfies(&p_ver);
+    }
+
+    // 3. If both can be parsed as ranges, test for intersection
+    if let (Ok(p_range), Ok(r_range)) = (Range::parse(p_str), Range::parse(r_str)) {
+        return ranges_intersect(&p_range, &r_range);
     }
 
     false
@@ -1051,7 +1110,7 @@ mod tests {
         assert!(ranges_intersect(&r_caret, &Range::parse("1.0.0").unwrap()));
         assert!(!ranges_intersect(&r_caret, &Range::parse("2.0.0").unwrap()));
 
-        // Empty ranges & wildcards:
+        // Empty ranges & wildcards (node-semver semantics):
         let r_empty1 = Range::parse("").unwrap();
         let r_empty2 = Range::parse("").unwrap();
         let r_star = Range::parse("*").unwrap();
@@ -1060,8 +1119,14 @@ mod tests {
         assert!(ranges_intersect(&r_empty1, &r_empty2));
         assert!(ranges_intersect(&r_empty1, &r_star));
         assert!(ranges_intersect(&r_empty1, &r_stable));
-        assert!(!ranges_intersect(&r_empty1, &r_pre));
-        assert!(!ranges_intersect(&r_star, &r_pre));
+        // * and "" intersect with prereleases when wildcard is left operand in node-semver:
+        assert!(ranges_intersect(&r_empty1, &r_pre));
+        assert!(ranges_intersect(&r_star, &r_pre));
+        // Reverse direction: exact prerelease against wildcard does not intersect in node-semver:
+        assert!(!ranges_intersect(&r_pre, &r_empty1));
+        assert!(!ranges_intersect(&r_pre, &r_star));
+        // Non-wildcard >=0.0.0 does NOT intersect with prereleases:
+        assert!(!ranges_intersect(&Range::parse(">=0.0.0").unwrap(), &r_pre));
 
         // >=1.0.0-0 checks:
         let r_ge_zero = Range::parse(">=1.0.0-0").unwrap();
@@ -1089,9 +1154,38 @@ mod tests {
         let r_gte_alpha = Range::parse(">=1.0.0-alpha.1").unwrap();
         assert!(!ranges_intersect(&r_lt_alpha, &r_gte_alpha));
 
-        // Impossible ranges <0.0.0:
+        // Impossible ranges <0.0.0 against non-wildcard comparators:
         let r_impossible = Range::parse("<0.0.0").unwrap();
-        assert!(!ranges_intersect(&r_impossible, &r_star));
-        assert!(!ranges_intersect(&r_impossible, &Range::parse(">=0.0.0").unwrap()));
+        assert!(!ranges_intersect(&r_impossible, &Range::parse("<1.0.0").unwrap()));
+        assert!(!ranges_intersect(&r_impossible, &Range::parse(">=1.0.0").unwrap()));
+        assert!(ranges_intersect(&r_impossible, &r_star));
+    }
+
+    #[test]
+    fn test_spec_matches_ancestor_prereleases_and_url_encoded_semver() {
+        // Ancestor version matching rule keySpec per Arborist override-set:
+        // ^1.0.0-alpha.1 satisfies 1.0.0-alpha.1 and 1.0.0-alpha.2
+        assert!(spec_matches("^1.0.0-alpha.1", "1.0.0-alpha.1"));
+        assert!(spec_matches("^1.0.0-alpha.1", "1.0.0-alpha.2"));
+        assert!(spec_matches("^1.0.0-alpha.1", "1.0.0"));
+        assert!(!spec_matches("^1.0.0-alpha.1", "2.0.0"));
+
+        // URL-encoded #semver%3A and #semver%3a in requested spec:
+        assert!(spec_matches(
+            "^1.5.0",
+            "git+https://github.com/org/repo.git#semver:^1.0.0"
+        ));
+        assert!(spec_matches(
+            "^1.5.0",
+            "git+https://github.com/org/repo.git#semver%3A^1.0.0"
+        ));
+        assert!(spec_matches(
+            "^1.5.0",
+            "git+https://github.com/org/repo.git#semver%3a%5E1.0.0"
+        ));
+        assert!(!spec_matches(
+            "^2.0.0",
+            "git+https://github.com/org/repo.git#semver%3A^1.0.0"
+        ));
     }
 }
