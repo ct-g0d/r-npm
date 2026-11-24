@@ -9535,9 +9535,22 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                 if let Some(ref mut bundled) = manifest.bundled_dependencies {
                     match bundled {
                         rnpm_core::BundledDependencies::List(list) => {
+                            let old_len = list.len();
                             list.retain(|x| x != pkg);
+                            if list.len() != old_len {
+                                removed = true;
+                            }
                         }
                         rnpm_core::BundledDependencies::Boolean(_) => {}
+                    }
+                }
+                if let Some(rnpm_core::BundledDependencies::List(list)) = &manifest.bundled_dependencies {
+                    if list.is_empty() {
+                        manifest.bundled_dependencies = None;
+                        if let Some(rnpm_core::OrderedJsonValue::Object(map)) = &mut manifest.raw_json {
+                            map.shift_remove("bundleDependencies");
+                            map.shift_remove("bundledDependencies");
+                        }
                     }
                 }
             }
@@ -9565,9 +9578,22 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                 if let Some(ref mut bundled) = m.bundled_dependencies {
                     match bundled {
                         rnpm_core::BundledDependencies::List(list) => {
+                            let old_len = list.len();
                             list.retain(|x| x != pkg);
+                            if list.len() != old_len {
+                                removed = true;
+                            }
                         }
                         rnpm_core::BundledDependencies::Boolean(_) => {}
+                    }
+                }
+                if let Some(rnpm_core::BundledDependencies::List(list)) = &m.bundled_dependencies {
+                    if list.is_empty() {
+                        m.bundled_dependencies = None;
+                        if let Some(rnpm_core::OrderedJsonValue::Object(map)) = &mut m.raw_json {
+                            map.shift_remove("bundleDependencies");
+                            map.shift_remove("bundledDependencies");
+                        }
                     }
                 }
             }

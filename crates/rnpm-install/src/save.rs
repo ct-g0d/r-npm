@@ -60,15 +60,12 @@ pub fn compute_save_spec(
             url,
             committish,
             subdir,
-        } => {
-            let normalized_base = normalize_hosted_git_url(url);
-            match (committish, subdir) {
-                (Some(c), Some(s)) => format!("{normalized_base}#{c}::path:{s}"),
-                (Some(c), None) => format!("{normalized_base}#{c}"),
-                (None, Some(s)) => format!("{normalized_base}#path:{s}"),
-                (None, None) => normalized_base,
-            }
-        }
+        } => match (committish, subdir) {
+            (Some(c), Some(s)) => format!("{url}#{c}::path:{s}"),
+            (Some(c), None) => format!("{url}#{c}"),
+            (None, Some(s)) => format!("{url}#path:{s}"),
+            (None, None) => url.clone(),
+        },
         PackageTarget::Workspace(ws) => format!("workspace:{}", ws),
         PackageTarget::Url(u) => u.to_string(),
         PackageTarget::Alias {
@@ -160,54 +157,11 @@ pub fn member_relative_file_spec(spec: &str, member_relative_path: &str) -> Stri
     }
 }
 
-/// Normalizes hosted git repository URLs to npm hosted shorthand (github:, gitlab:, bitbucket:).
-fn normalize_hosted_git_url(url: &str) -> String {
-    let clean = url.strip_prefix("git+").unwrap_or(url);
-
-    // Check GitHub
-    if let Some(rest) = clean
-        .strip_prefix("https://github.com/")
-        .or_else(|| clean.strip_prefix("http://github.com/"))
-        .or_else(|| clean.strip_prefix("git@github.com:"))
-        .or_else(|| clean.strip_prefix("ssh://git@github.com/"))
-    {
-        let repo = rest.trim_end_matches(".git").trim_matches('/');
-        if repo.split('/').count() == 2 {
-            return format!("github:{repo}");
-        }
-    }
-    // Check GitLab
-    if let Some(rest) = clean
-        .strip_prefix("https://gitlab.com/")
-        .or_else(|| clean.strip_prefix("http://gitlab.com/"))
-        .or_else(|| clean.strip_prefix("git@gitlab.com:"))
-        .or_else(|| clean.strip_prefix("ssh://git@gitlab.com/"))
-    {
-        let repo = rest.trim_end_matches(".git").trim_matches('/');
-        if repo.split('/').count() == 2 {
-            return format!("gitlab:{repo}");
-        }
-    }
-    // Check Bitbucket
-    if let Some(rest) = clean
-        .strip_prefix("https://bitbucket.org/")
-        .or_else(|| clean.strip_prefix("http://bitbucket.org/"))
-        .or_else(|| clean.strip_prefix("git@bitbucket.org:"))
-        .or_else(|| clean.strip_prefix("ssh://git@bitbucket.org/"))
-    {
-        let repo = rest.trim_end_matches(".git").trim_matches('/');
-        if repo.split('/').count() == 2 {
-            return format!("bitbucket:{repo}");
-        }
-    }
-    url.to_string()
-}
-
-/// Inserts a dependency into the appropriate section of a Manifest.
-///
-/// Ensures mutually exclusive dependency sections: when saving to one section
-/// (e.g. devDependencies via -D), removes the package from the other sections
-/// (dependencies, optionalDependencies, peerDependencies), matching npm.
+/// Inserts a dependency into the appropriate section of a Manifest matching npm's add-rm-pkg-deps rules:
+/// - prod: removes from devDependencies, peerDependencies, and optionalDependencies.
+/// - dev: removes from dependencies; preserves peerDependencies and optionalDependencies.
+/// - optional: removes from dependencies and peerDependencies; preserves devDependencies.
+/// - peer: removes from dependencies and optionalDependencies; preserves devDependencies.
 pub fn insert_manifest_dep(
     m: &mut Manifest,
     name: &str,
@@ -220,19 +174,15 @@ pub fn insert_manifest_dep(
         m.dev_dependencies
             .insert(name.to_string(), spec.to_string());
         m.dependencies.remove(name);
-        m.optional_dependencies.remove(name);
-        m.peer_dependencies.remove(name);
     } else if save_optional {
         m.optional_dependencies
             .insert(name.to_string(), spec.to_string());
         m.dependencies.remove(name);
-        m.dev_dependencies.remove(name);
         m.peer_dependencies.remove(name);
     } else if save_peer {
         m.peer_dependencies
             .insert(name.to_string(), spec.to_string());
         m.dependencies.remove(name);
-        m.dev_dependencies.remove(name);
         m.optional_dependencies.remove(name);
     } else {
         m.dependencies.insert(name.to_string(), spec.to_string());

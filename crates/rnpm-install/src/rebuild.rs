@@ -236,14 +236,7 @@ pub async fn execute_rebuild(options: &RebuildOptions) -> Result<RebuildSummary>
     }
 
     // 3. Sort candidates bottom-up (deeper nesting first, dependencies before dependents)
-    // Deeper paths have more `/node_modules/` segments. Normalize backslashes for Windows path safety.
-    candidate_nodes.sort_by(|a, b| {
-        let norm_a = a.package_path.replace('\\', "/");
-        let norm_b = b.package_path.replace('\\', "/");
-        let count_a = norm_a.matches("/node_modules/").count();
-        let count_b = norm_b.matches("/node_modules/").count();
-        count_b.cmp(&count_a).then_with(|| norm_b.cmp(&norm_a))
-    });
+    sort_lifecycle_nodes_bottom_up(&mut candidate_nodes);
 
     // 4. Configure lifecycle execution options
     let sandbox_policy = if options.strict_sandbox {
@@ -288,4 +281,16 @@ pub async fn execute_rebuild(options: &RebuildOptions) -> Result<RebuildSummary>
     Ok(RebuildSummary {
         rebuilt_packages: candidate_names,
     })
+}
+
+/// Sort candidates bottom-up (deeper nesting first, dependencies before dependents).
+/// Deeper paths have more `/node_modules/` segments. Normalizes backslashes for Windows path safety.
+pub(crate) fn sort_lifecycle_nodes_bottom_up(nodes: &mut [LifecyclePackageNode]) {
+    nodes.sort_by(|a, b| {
+        let norm_a = a.package_path.replace('\\', "/");
+        let norm_b = b.package_path.replace('\\', "/");
+        let count_a = norm_a.matches("/node_modules/").count();
+        let count_b = norm_b.matches("/node_modules/").count();
+        count_b.cmp(&count_a).then_with(|| norm_b.cmp(&norm_a))
+    });
 }

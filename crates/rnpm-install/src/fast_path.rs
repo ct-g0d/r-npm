@@ -286,8 +286,8 @@ pub fn validate_hidden_lockfile(project_dir: &Path, options: Option<&InstallOpti
         }
     }
 
-    // Fast directory scan: populate mtimes for top-level and scoped packages in node_modules,
-    // and verify scope directory modification times.
+    // Fast directory scan: populate mtimes for top-level and scoped package directories in node_modules,
+    // and verify scope directory modification times. Non-directory files are ignored.
     let mut dir_mtimes: HashMap<String, SystemTime> = HashMap::new();
     if let Ok(entries) = std::fs::read_dir(&node_modules) {
         for entry in entries.flatten() {
@@ -296,6 +296,17 @@ pub fn validate_hidden_lockfile(project_dir: &Path, options: Option<&InstallOpti
             if name_str.starts_with('.') {
                 continue;
             }
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            let is_dir = file_type.is_dir()
+                || (file_type.is_symlink()
+                    && (entry.path().is_dir()
+                        || rnpm_fs::is_junction(&entry.path()).unwrap_or(false)));
+            if !is_dir {
+                continue;
+            }
+
             if name_str.starts_with('@') {
                 // Check scope directory mtime:
                 // If a package was added to or removed from @scope, scope directory mtime is updated
@@ -315,6 +326,20 @@ pub fn validate_hidden_lockfile(project_dir: &Path, options: Option<&InstallOpti
                     for scoped_entry in scoped_entries.flatten() {
                         let sub_name = scoped_entry.file_name();
                         let sub_str = sub_name.to_string_lossy();
+                        if sub_str.starts_with('.') {
+                            continue;
+                        }
+                        let Ok(sub_type) = scoped_entry.file_type() else {
+                            continue;
+                        };
+                        let is_sub_dir = sub_type.is_dir()
+                            || (sub_type.is_symlink()
+                                && (scoped_entry.path().is_dir()
+                                    || rnpm_fs::is_junction(&scoped_entry.path()).unwrap_or(false)));
+                        if !is_sub_dir {
+                            continue;
+                        }
+
                         if let Ok(meta) = scoped_entry.metadata() {
                             if let Ok(mtime) = meta.modified() {
                                 let key = format!("node_modules/{}/{}", name_str, sub_str);
