@@ -2,6 +2,7 @@ use crate::error::SpecError;
 use crate::semver::range::Range;
 use crate::semver::version::Version;
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -32,6 +33,51 @@ pub fn is_scp_git_url(s: &str) -> bool {
     PackageTarget::is_scp_git_url(s)
 }
 
+#[inline]
+fn is_git_spec(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    if bytes.is_empty() {
+        return false;
+    }
+    match bytes[0] {
+        b'g' => {
+            if let Some(rest) = s.strip_prefix("git+") {
+                rest.starts_with("ssh://")
+                    || rest.starts_with("https://")
+                    || rest.starts_with("http://")
+                    || rest.starts_with("git://")
+                    || rest.starts_with("file://")
+                    || rest.starts_with("rsync://")
+                    || rest.starts_with("ftp://")
+            } else if s.starts_with("git://")
+                || s.starts_with("git:")
+                || s.starts_with("github:")
+                || s.starts_with("gitlab:")
+                || s.starts_with("gist:")
+            {
+                true
+            } else {
+                PackageTarget::is_scp_git_url(s)
+            }
+        }
+        b's' => {
+            if s.starts_with("ssh://") {
+                true
+            } else {
+                PackageTarget::is_scp_git_url(s)
+            }
+        }
+        b'b' => {
+            if s.starts_with("bitbucket:") {
+                true
+            } else {
+                PackageTarget::is_scp_git_url(s)
+            }
+        }
+        _ => PackageTarget::is_scp_git_url(s),
+    }
+}
+
 impl PackageTarget {
     /// Checks if a string is an SCP-syntax git URL, e.g. `git@github.com:org/repo.git`
     /// or `deploy@gitlab.com:org/repo.git`.
@@ -41,6 +87,11 @@ impl PackageTarget {
     /// path (matching `npm-package-arg`: `/^[^@]+@[^:.]+\.[^:]+:.+$/i`).
     /// This prevents misclassifying registry specs like `git@1.0.0`, `git@npm:other`, or `git@file:./foo` as git URLs.
     pub fn is_scp_git_url(s: &str) -> bool {
+        let bytes = s.as_bytes();
+        if bytes.is_empty() || bytes[0] == b'@' || !s.contains(':') {
+            return false;
+        }
+
         if let Some((user, rest)) = s.split_once('@') {
             if user.is_empty()
                 || user.contains('/')
@@ -66,13 +117,46 @@ impl PackageTarget {
     }
 
     pub fn parse(spec: &str) -> Result<Self, SpecError> {
-        let expanded = expand_github_shorthand(spec.trim());
-        let s = expanded.as_str();
-        if s.is_empty() || s == "*" {
+        let trimmed_spec = spec.trim();
+        if trimmed_spec.is_empty() || trimmed_spec == "*" {
             return Ok(PackageTarget::Range(
                 Range::parse("*").map_err(|e| SpecError::Semver(e.to_string()))?,
             ));
         }
+
+        // Fast path for the ~95% most common semver range and exact version specs:
+        // - Ranges starting with '^', '~' (excluding "~/"), '>', '<', '='
+        // - Versions and ranges starting with a digit (e.g. "1.2.3", "0.1.0", "1.x")
+        //   or 'v' + digit (e.g. "v1.2.3") that contain no protocol/path separators (':', '/', '@')
+        let bytes = trimmed_spec.as_bytes();
+        let first = bytes[0];
+        let is_fast_semver = match first {
+            b'^' | b'>' | b'<' | b'=' => true,
+            b'~' => !trimmed_spec.starts_with("~/"),
+            b'0'..=b'9' => {
+                !trimmed_spec.contains(':')
+                    && !trimmed_spec.contains('/')
+                    && !trimmed_spec.contains('@')
+            }
+            b'v' if bytes.len() > 1 && bytes[1].is_ascii_digit() => {
+                !trimmed_spec.contains(':')
+                    && !trimmed_spec.contains('/')
+                    && !trimmed_spec.contains('@')
+            }
+            _ => false,
+        };
+
+        if is_fast_semver {
+            if let Ok(ver) = Version::parse(trimmed_spec) {
+                return Ok(PackageTarget::Version(ver));
+            }
+            if let Ok(range) = Range::parse(trimmed_spec) {
+                return Ok(PackageTarget::Range(range));
+            }
+        }
+
+        let expanded = expand_github_shorthand(trimmed_spec);
+        let s = expanded.as_ref();
 
         // workspace: protocol specifier (e.g. workspace:*, workspace:^, workspace:~, workspace:^1.0.0)
         if let Some(ws_spec) = s.strip_prefix("workspace:") {
@@ -96,27 +180,7 @@ impl PackageTarget {
         }
 
         // Git dependency specifications:
-        // "github:user/repo", "git+https://github.com/org/repo.git#v1.0.0",
-        // "git+ssh://git@github.com/org/repo.git", "git://github.com/org/repo.git",
-        // "gitlab:user/repo", "bitbucket:user/repo", "git+file:///path/to/repo"
-        let git_prefixes = [
-            "git+ssh://",
-            "git+https://",
-            "git+http://",
-            "git+git://",
-            "git+file://",
-            "git+rsync://",
-            "git+ftp://",
-            "git://",
-            "ssh://",
-            "git:",
-            "github:",
-            "gitlab:",
-            "bitbucket:",
-            "gist:",
-        ];
-        let is_git = git_prefixes.iter().any(|prefix| s.starts_with(prefix)) || Self::is_scp_git_url(s);
-        if is_git {
+        if is_git_spec(s) {
             let (url_part, committish, subdir) = if let Some(hash_idx) = s.find('#') {
                 let u = s[..hash_idx].trim().to_string();
                 let (committish, subdir) = parse_git_fragment(&s[hash_idx + 1..]);
@@ -168,7 +232,7 @@ impl PackageTarget {
             || s.starts_with('=')
             || s.contains("||")
             || s.contains(" - ")
-            || (s.chars().any(|c| c.is_ascii_digit()) && s.contains('.'));
+            || (s.bytes().any(|c| c.is_ascii_digit()) && s.contains('.'));
 
         if is_range_syntax {
             if let Ok(range) = Range::parse(s) {
@@ -287,8 +351,12 @@ impl PackageTarget {
     pub fn is_tarball_archive(&self) -> bool {
         match self {
             PackageTarget::File(p) => {
-                let s = p.to_string_lossy();
-                s.ends_with(".tgz") || s.ends_with(".tar.gz") || s.ends_with(".tar")
+                if let Some(s) = p.to_str() {
+                    s.ends_with(".tgz") || s.ends_with(".tar.gz") || s.ends_with(".tar")
+                } else {
+                    let s = p.to_string_lossy();
+                    s.ends_with(".tgz") || s.ends_with(".tar.gz") || s.ends_with(".tar")
+                }
             }
             PackageTarget::Url(u) => {
                 let path = u.path();
@@ -313,7 +381,7 @@ impl PackageTarget {
         };
 
         Ok(PackageTarget::Alias {
-            name,
+            name: name.to_string(),
             target: Box::new(inner_target),
         })
     }
@@ -361,11 +429,13 @@ impl PackageSpec {
     /// e.g. "express", "express@^4.18.0", "@types/node@18.0.0", "foo@npm:bar@^1.0.0", "foo@file:../bar", "foo@workspace:*",
     /// "github:user/repo", "git+https://github.com/org/repo.git#v1.0.0", "https://cdn.example.com/packages/pkg-1.0.0.tgz"
     pub fn parse(input: &str) -> Result<Self, SpecError> {
-        let expanded = expand_github_shorthand(input.trim());
-        let trimmed = expanded.as_str();
-        if trimmed.is_empty() {
+        let trimmed_input = input.trim();
+        if trimmed_input.is_empty() {
             return Err(SpecError::Empty);
         }
+
+        let expanded = expand_github_shorthand(trimmed_input);
+        let trimmed = expanded.as_ref();
 
         // Direct "workspace:" specifier without name (e.g. "workspace:*")
         if let Some(ws_str) = trimmed.strip_prefix("workspace:") {
@@ -397,25 +467,7 @@ impl PackageSpec {
         }
 
         // Direct Git specifier without name (e.g. "github:user/repo", "git+https://github.com/org/repo.git#v1.0.0")
-        let git_prefixes = [
-            "git+ssh://",
-            "git+https://",
-            "git+http://",
-            "git+git://",
-            "git+file://",
-            "git+rsync://",
-            "git+ftp://",
-            "git://",
-            "ssh://",
-            "git:",
-            "github:",
-            "gitlab:",
-            "bitbucket:",
-            "gist:",
-        ];
-        let is_git = git_prefixes.iter().any(|prefix| trimmed.starts_with(prefix))
-            || PackageTarget::is_scp_git_url(trimmed);
-        if is_git {
+        if is_git_spec(trimmed) {
             let name = extract_git_repo_name(trimmed);
             let target = PackageTarget::parse(trimmed)?;
             return Ok(Self { name, target });
@@ -435,7 +487,10 @@ impl PackageSpec {
             PackageTarget::Tag("latest".to_string())
         };
 
-        Ok(Self { name, target })
+        Ok(Self {
+            name: name.to_string(),
+            target,
+        })
     }
 
     /// Parse a dependency entry from package.json:
@@ -469,7 +524,7 @@ impl FromStr for PackageSpec {
 
 /// Splits a package string into (name, Option<spec>)
 /// Handles scoped packages like "@scope/pkg@1.0.0"
-fn split_name_and_spec(input: &str) -> Result<(String, Option<&str>), SpecError> {
+fn split_name_and_spec(input: &str) -> Result<(&str, Option<&str>), SpecError> {
     if input.starts_with('@') {
         // Scoped package
         let slash_idx = input
@@ -483,9 +538,9 @@ fn split_name_and_spec(input: &str) -> Result<(String, Option<&str>), SpecError>
             if name.is_empty() || spec.is_empty() {
                 return Err(SpecError::InvalidFormat(input.to_string()));
             }
-            Ok((name.to_string(), Some(spec)))
+            Ok((name, Some(spec)))
         } else {
-            Ok((input.to_string(), None))
+            Ok((input, None))
         }
     } else {
         // Unscoped package
@@ -495,23 +550,26 @@ fn split_name_and_spec(input: &str) -> Result<(String, Option<&str>), SpecError>
             if name.is_empty() || spec.is_empty() {
                 return Err(SpecError::InvalidFormat(input.to_string()));
             }
-            Ok((name.to_string(), Some(spec)))
+            Ok((name, Some(spec)))
         } else {
-            Ok((input.to_string(), None))
+            Ok((input, None))
         }
     }
 }
 
 fn is_valid_tag(s: &str) -> bool {
     // Dist-tags typically start with letters, e.g. "latest", "next", "beta", "canary"
-    !s.is_empty()
-        && s.chars()
-            .all(|c| c.is_alphanumeric() || c == '-' || c == '_' || c == '.')
-        && s.chars().next().map(|c| c.is_alphabetic()).unwrap_or(false)
+    let bytes = s.as_bytes();
+    if bytes.is_empty() || !bytes[0].is_ascii_alphabetic() {
+        return false;
+    }
+    bytes
+        .iter()
+        .all(|&b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.')
 }
 
 fn extract_git_repo_name(spec: &str) -> String {
-    let clean = spec.split('#').next().unwrap_or(spec);
+    let clean = spec.split_once('#').map(|(u, _)| u).unwrap_or(spec);
     let clean = clean.trim_end_matches(".git").trim_end_matches('/');
     if let Some(slash_idx) = clean.rfind('/') {
         clean[slash_idx + 1..].to_string()
@@ -640,10 +698,14 @@ pub fn parse_file_path(spec: &str) -> std::path::PathBuf {
 
 /// npm-package-arg treats `user/repo[#committish]` as a GitHub dependency
 /// (hosted-git-info shorthand: no protocol, scope, path prefix or spaces).
-fn expand_github_shorthand(spec: &str) -> String {
+fn expand_github_shorthand(spec: &str) -> Cow<'_, str> {
+    if !spec.contains('/') || spec.contains("://") {
+        return Cow::Borrowed(spec);
+    }
+
     let (body, committish) = spec.split_once('#').unwrap_or((spec, ""));
     let Some((user, repo)) = body.split_once('/') else {
-        return spec.to_string();
+        return Cow::Borrowed(spec);
     };
     let user_ok = user
         .chars()
@@ -658,12 +720,12 @@ fn expand_github_shorthand(spec: &str) -> String {
             .any(|c| matches!(c, '@' | '/' | '%') || c.is_whitespace());
     if user_ok && repo_ok {
         if committish.is_empty() && !spec.contains('#') {
-            format!("github:{body}")
+            Cow::Owned(format!("github:{body}"))
         } else {
-            format!("github:{body}#{committish}")
+            Cow::Owned(format!("github:{body}#{committish}"))
         }
     } else {
-        spec.to_string()
+        Cow::Borrowed(spec)
     }
 }
 
@@ -710,17 +772,25 @@ pub fn parse_git_fragment(fragment: &str) -> (Option<String>, Option<String>) {
 /// parsed as a URL, and any scheme other than git or http(s) is rejected.
 /// Returns the protocol (with its colon) npm reports as unsupported.
 pub fn unsupported_protocol(spec: &str) -> Option<String> {
-    let lower = spec.to_ascii_lowercase();
-    let scheme_len = lower.find(':')?;
-    let scheme = &lower[..scheme_len];
-    let plain = scheme.strip_prefix("git+").unwrap_or(scheme);
-    if plain.is_empty() || !plain.bytes().all(|b| b.is_ascii_lowercase()) {
-        return None;
-    }
-    // A single letter is a Windows drive path, handled as a file spec.
+    let colon_idx = spec.find(':')?;
+    let scheme = &spec[..colon_idx];
     if scheme.len() == 1 {
+        // A single letter is a Windows drive path, handled as a file spec.
         return None;
     }
+
+    let plain = if let Some(stripped) = scheme.strip_prefix("git+") {
+        stripped
+    } else if let Some(stripped) = scheme.strip_prefix("GIT+") {
+        stripped
+    } else {
+        scheme
+    };
+
+    if plain.is_empty() || !plain.bytes().all(|b| b.is_ascii_alphabetic()) {
+        return None;
+    }
+
     const ACCEPTED: &[&str] = &[
         "file",
         "npm",
@@ -739,7 +809,13 @@ pub fn unsupported_protocol(spec: &str) -> Option<String> {
         "http",
         "https",
     ];
-    (!ACCEPTED.contains(&scheme)).then(|| format!("{scheme}:"))
+
+    let is_accepted = ACCEPTED.iter().any(|&acc| acc.eq_ignore_ascii_case(scheme));
+    if is_accepted {
+        None
+    } else {
+        Some(format!("{}:", scheme.to_ascii_lowercase()))
+    }
 }
 
 #[cfg(test)]
@@ -828,11 +904,17 @@ mod unsupported_protocol_tests {
         // Real npm registry specs where package name is "git":
         let spec_ver = PackageSpec::parse("git@1.0.0").unwrap();
         assert_eq!(spec_ver.name, "git");
-        assert_eq!(spec_ver.target, PackageTarget::Version(Version::new(1, 0, 0)));
+        assert_eq!(
+            spec_ver.target,
+            PackageTarget::Version(Version::new(1, 0, 0))
+        );
 
         let spec_range = PackageSpec::parse("git@^2.0.0").unwrap();
         assert_eq!(spec_range.name, "git");
-        assert_eq!(spec_range.target, PackageTarget::Range(Range::parse("^2.0.0").unwrap()));
+        assert_eq!(
+            spec_range.target,
+            PackageTarget::Range(Range::parse("^2.0.0").unwrap())
+        );
 
         let spec_tag = PackageSpec::parse("git@latest").unwrap();
         assert_eq!(spec_tag.name, "git");
@@ -856,10 +938,14 @@ mod unsupported_protocol_tests {
 
         // Non-git SSH users with dotted hostnames parse as SCP git URLs (matching npm-package-arg),
         // while dotless hosts such as `git@npm:other` or `git@file:./foo` do not:
-        assert!(PackageTarget::is_scp_git_url("deploy@gitlab.com:org/repo.git"));
+        assert!(PackageTarget::is_scp_git_url(
+            "deploy@gitlab.com:org/repo.git"
+        ));
         assert!(!PackageTarget::is_scp_git_url("git@npm:other"));
         assert!(!PackageTarget::is_scp_git_url("git@file:./foo"));
-        assert!(!PackageTarget::is_scp_git_url("user@localhost:org/repo.git"));
+        assert!(!PackageTarget::is_scp_git_url(
+            "user@localhost:org/repo.git"
+        ));
         assert!(!PackageTarget::is_scp_git_url("@org/pkg:foo"));
 
         let deploy_spec = PackageSpec::parse("deploy@gitlab.com:org/repo.git").unwrap();
