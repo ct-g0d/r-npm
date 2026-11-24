@@ -1377,3 +1377,137 @@ fn test_bracketed_ipv6_no_proxy() {
     let local_v6 = Url::parse("http://[::1]:3000/").unwrap();
     assert!(cfg.should_bypass_proxy(&local_v6), "http://[::1]:3000/ must bypass proxy");
 }
+
+#[test]
+fn test_npmrc_quoting_comments_escaping_bare_keys() {
+    let content = r#"
+        # Global settings
+        registry = "https://registry.npmjs.org/" ; inline comment
+        save-exact = true # another comment
+        bare-flag
+        empty-val =
+        escaped-semicolon = foo\;bar\#baz
+        single-quoted = 'single value'
+        [dummy-section]
+        inside-section = "section_val"
+    "#;
+
+    let parsed = Npmrc::parse(content).unwrap();
+    assert_eq!(parsed.registry.as_str(), "https://registry.npmjs.org/");
+    assert_eq!(parsed.settings.get("save-exact").map(|s| s.as_str()), Some("true"));
+    assert_eq!(parsed.settings.get("bare-flag").map(|s| s.as_str()), Some("true"));
+    assert_eq!(parsed.settings.get("empty-val").map(|s| s.as_str()), Some(""));
+    assert_eq!(parsed.settings.get("escaped-semicolon").map(|s| s.as_str()), Some("foo;bar#baz"));
+    assert_eq!(parsed.settings.get("single-quoted").map(|s| s.as_str()), Some("single value"));
+    assert_eq!(parsed.settings.get("inside-section").map(|s| s.as_str()), Some("section_val"));
+}
+
+#[test]
+fn test_npmrc_uri_scoped_longest_prefix_and_auth_tokens() {
+    let content = r#"
+        //registry.npmjs.org/:_authToken=secret_npm_token
+        //custom.registry.com/path:_authToken=secret_custom_token
+        //custom.registry.com/path:certfile=/certs/client.crt
+        //custom.registry.com/path:keyfile=/certs/client.key
+        //custom.registry.com/:cafile=/certs/ca.pem
+        //custom.registry.com/:proxy=http://proxy.corp:8080
+    "#;
+
+    let parsed = Npmrc::parse(content).unwrap();
+    let npmjs_url = Url::parse("https://registry.npmjs.org/package").unwrap();
+    assert_eq!(parsed.get_auth_token(&npmjs_url), Some("secret_npm_token"));
+
+    let custom_url = Url::parse("https://custom.registry.com/path/deep/package").unwrap();
+    assert_eq!(parsed.get_auth_token(&custom_url), Some("secret_custom_token"));
+    assert_eq!(parsed.get_cert(&custom_url), Some("/certs/client.crt"));
+    assert_eq!(parsed.get_key(&custom_url), Some("/certs/client.key"));
+    assert_eq!(parsed.get_ca(&custom_url), Some("/certs/ca.pem"));
+    assert_eq!(parsed.get_proxy_for_registry(&custom_url), Some("http://proxy.corp:8080"));
+}
+
+#[test]
+fn test_auth_type_not_redacted() {
+    use crate::npmrc::is_sensitive_credential_key;
+
+    assert!(!is_sensitive_credential_key("auth-type"));
+    assert!(!is_sensitive_credential_key("auth_type"));
+    assert!(!is_sensitive_credential_key("author"));
+    assert!(is_sensitive_credential_key("_authToken"));
+    assert!(is_sensitive_credential_key("_auth"));
+    assert!(is_sensitive_credential_key("//registry.npmjs.org/:_authToken"));
+
+    let mut npmrc = Npmrc::default();
+    npmrc.set("auth-type", "web").unwrap();
+    let scrubbed = npmrc.format_scrubbed();
+    assert!(scrubbed.contains("auth-type=web"), "auth-type must not be redacted");
+}
+
+#[test]
+fn test_interpolate_env_optional_and_fallbacks() {
+    let lookup = |name: &str| match name {
+        "DEFINED" => Some("foo".to_string()),
+        "EMPTY" => Some("".to_string()),
+        _ => None,
+    };
+
+    assert_eq!(interpolate_env("val=${DEFINED}", &lookup), "val=foo");
+    assert_eq!(interpolate_env("val=${UNDEFINED}", &lookup), "val=");
+    assert_eq!(interpolate_env("val=${UNDEFINED?}", &lookup), "val=");
+    assert_eq!(interpolate_env("val=${DEFINED?}", &lookup), "val=foo");
+    assert_eq!(interpolate_env("val=${UNDEFINED:-fallback}", &lookup), "val=fallback");
+    assert_eq!(interpolate_env("val=${EMPTY:-fallback}", &lookup), "val=fallback");
+    assert_eq!(interpolate_env("val=${EMPTY-fallback}", &lookup), "val=");
+}
+
+#[test]
+fn test_config_builtin_layer_and_precedence() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let builtin_rc = temp_dir.path().join("builtin.npmrc");
+    let global_rc = temp_dir.path().join("global.npmrc");
+
+    std::fs::write(&builtin_rc, "registry=https://builtin.registry.org/\nsave-exact=false\n").unwrap();
+    std::fs::write(&global_rc, "save-exact=true\n").unwrap();
+
+    let opts = ConfigOptions::new()
+        .builtin_config(builtin_rc)
+        .globalconfig(global_rc)
+        .userconfig(std::path::PathBuf::from("false"))
+        .env_vars(std::collections::BTreeMap::new());
+
+    let cfg = Config::load_with_options(opts).unwrap();
+    assert_eq!(cfg.get("registry"), Some("https://builtin.registry.org/"));
+    assert_eq!(cfg.get("save-exact"), Some("true"));
+    assert_eq!(cfg.layers.len(), 2);
+    assert_eq!(cfg.layers[0].name, "builtin");
+    assert_eq!(cfg.layers[1].name, "global");
+}
+
+#[test]
+fn test_config_nerf_darted_env_vars() {
+    let mut env_map = std::collections::BTreeMap::new();
+    env_map.insert(
+        "npm_config_//registry.npmjs.org/:_authToken".to_string(),
+        "env_token_secret".to_string(),
+    );
+    env_map.insert("npm_config_save_exact".to_string(), "true".to_string());
+
+    let opts = ConfigOptions::new().env_vars(env_map);
+    let cfg = Config::load_with_options(opts).unwrap();
+
+    let url = Url::parse("https://registry.npmjs.org/").unwrap();
+    assert_eq!(cfg.npmrc.get_auth_token(&url), Some("env_token_secret"));
+    assert_eq!(cfg.get("save-exact"), Some("true"));
+}
+
+#[test]
+fn test_config_standard_proxy_env_fallbacks() {
+    let mut env_map = std::collections::BTreeMap::new();
+    env_map.insert("HTTPS_PROXY".to_string(), "http://env-proxy:8080".to_string());
+    env_map.insert("NO_PROXY".to_string(), "localhost,127.0.0.1".to_string());
+
+    let opts = ConfigOptions::new().env_vars(env_map);
+    let cfg = Config::load_with_options(opts).unwrap();
+
+    assert_eq!(cfg.https_proxy(), Some("http://env-proxy:8080"));
+    assert_eq!(cfg.no_proxy(), Some("localhost,127.0.0.1"));
+}

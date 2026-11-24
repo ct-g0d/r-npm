@@ -466,7 +466,11 @@ pub struct Manifest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bin: Option<PackageBin>,
 
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_opt_vec_or_string",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub files: Option<Vec<String>>,
 
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
