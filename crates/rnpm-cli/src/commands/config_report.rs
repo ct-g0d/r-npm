@@ -100,7 +100,6 @@ pub(super) fn run(json: bool, long: bool, dir: &Path) -> Result<()> {
                 .map(|p| p.display().to_string())
                 .or_else(|| std::env::var("NPM_CONFIG_USERCONFIG").ok())
                 .or_else(|| std::env::var("npm_config_userconfig").ok())
-                .or_else(|| std::env::var("USERCONFIG").ok())
                 .or_else(|| {
                     detailed
                         .layers

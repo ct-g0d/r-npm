@@ -399,6 +399,12 @@ fn is_git_ref_match(d_ref: &str, spec_ref: &str) -> bool {
             return true;
         }
     }
+    // When the authored package.json spec pins a named tag/branch/semver ref (not a >=7-char hex commit SHA),
+    // npm lockfiles store the resolved 40/64-char commit SHA in `resolved`. Accept full commit SHAs
+    // while still rejecting any other named ref (e.g. `#evil` or `#v2`).
+    if !d_ref.is_empty() && (!is_hex_str(d_ref) || d_ref.len() < 7) && is_full_commit_sha(spec_ref) {
+        return true;
+    }
     false
 }
 

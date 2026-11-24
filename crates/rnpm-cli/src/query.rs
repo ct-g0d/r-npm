@@ -439,7 +439,9 @@ fn matches_simple(
             "deduped" => node.deduped,
             "overridden" => node.overridden,
             "workspace" => {
-                node.location.starts_with("packages/") || node.location.starts_with("workspaces/")
+                node.is_workspace
+                    || node.location.starts_with("packages/")
+                    || node.location.starts_with("workspaces/")
             }
             "link" => node.is_link,
             "attr" => arg
@@ -725,7 +727,8 @@ fn normalize_workspace_nodes(node: &mut InspectedNode, root: &Path) {
             .realpath
             .as_ref()
             .and_then(|p| p.strip_prefix(root).ok())
-            .is_some_and(|p| workspaces.contains(&p.to_string_lossy().replace('\\', "/")));
+            .is_some_and(|p| workspaces.contains(&p.to_string_lossy().replace('\\', "/")))
+            || workspaces.contains(&node.location);
         if let (Some(path), Some(realpath)) = (&node.path, &node.realpath) {
             if path != realpath {
                 if let Ok(location) = realpath.strip_prefix(root) {

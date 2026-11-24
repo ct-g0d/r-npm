@@ -2088,4 +2088,34 @@ fn test_git_tampered_ref_rejected_under_allow_git_root() {
     assert!(res_tampered_ref.is_err(), "Expected tampered resolved ref '#evil' on node_modules/foo to be rejected under allow-git=root even if root deps map had '#v1'");
     let err_ref = res_tampered_ref.unwrap_err().to_string();
     assert!(err_ref.contains("EALLOWGIT"), "Expected EALLOWGIT, got: {err_ref}");
+
+    // 7. Root declares named tag "github:a/b#v1" and lockfile stores normal resolved 40-char commit SHA
+    let mut packages_resolved_sha = BTreeMap::new();
+    let mut root_deps_v1 = BTreeMap::new();
+    root_deps_v1.insert("foo".to_string(), "github:a/b#v1".to_string());
+    packages_resolved_sha.insert(
+        String::new(),
+        LockfilePackage {
+            dependencies: Some(root_deps_v1),
+            ..Default::default()
+        },
+    );
+    packages_resolved_sha.insert(
+        "node_modules/foo".to_string(),
+        LockfilePackage {
+            resolved: Some("git+ssh://git@github.com/a/b.git#0123456789abcdef0123456789abcdef01234567".to_string()),
+            ..Default::default()
+        },
+    );
+    let lockfile_resolved_sha = LockfileV3 {
+        name: "test-resolved-sha".to_string(),
+        version: None,
+        lockfile_version: 3,
+        requires: None,
+        packages: packages_resolved_sha,
+    };
+    assert!(
+        check_sources(&lockfile_resolved_sha, &root_declared_v1, &workspace_paths, &policy_git_root).is_ok(),
+        "Expected named tag github:a/b#v1 with normal resolved 40-char commit SHA to be accepted under allow-git=root"
+    );
 }
