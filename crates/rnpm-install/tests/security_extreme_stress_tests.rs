@@ -1021,6 +1021,7 @@ async fn test_rebuild_interaction_with_ignore_scripts() {
 
     let options = RebuildOptions {
         project_dir: temp.path().to_path_buf(),
+        init_cwd: None,
         packages: vec![],
         ignore_scripts: true, // Should skip all rebuild scripts immediately!
         foreground_scripts: false,

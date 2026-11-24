@@ -2958,9 +2958,11 @@ impl Installer {
             });
         LifecycleOptions {
             root_dir: self.options.project_dir.clone(),
-            init_cwd: self.options.init_cwd.clone().unwrap_or_else(|| {
-                std::env::current_dir().unwrap_or_else(|_| self.options.project_dir.clone())
-            }),
+            init_cwd: self
+                .options
+                .init_cwd
+                .clone()
+                .unwrap_or_else(|| self.options.project_dir.clone()),
             ignore_scripts: false,
             capture_output: !self.options.foreground_scripts,
             foreground_scripts: self.options.foreground_scripts,

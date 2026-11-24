@@ -18,8 +18,10 @@ pub(crate) async fn run(opts: RebuildOptions, current_dir: PathBuf) -> Result<()
     let effective_strict =
         opts.strict_sandbox || config.get_bool("strict-sandbox").unwrap_or(false);
 
+    let inv_cwd = std::env::current_dir().ok();
     let rebuild_options = rnpm_install::RebuildOptions {
         project_dir: current_dir.clone(),
+        init_cwd: inv_cwd.clone(),
         packages: opts.packages,
         ignore_scripts: effective_ignore,
         foreground_scripts: effective_foreground,
@@ -28,6 +30,7 @@ pub(crate) async fn run(opts: RebuildOptions, current_dir: PathBuf) -> Result<()
 
     let installer = Installer::new(InstallOptions {
         project_dir: current_dir,
+        init_cwd: inv_cwd,
         ignore_scripts: effective_ignore,
         foreground_scripts: effective_foreground,
         strict_sandbox: effective_strict,

@@ -12,6 +12,8 @@ use rnpm_lifecycle::{
 pub struct RebuildOptions {
     /// Project root directory. Defaults to ".".
     pub project_dir: PathBuf,
+    /// Caller invocation working directory (used for `INIT_CWD`). Defaults to `project_dir`.
+    pub init_cwd: Option<PathBuf>,
     /// Specific package names or specs to rebuild. If empty, rebuilds all installed packages.
     pub packages: Vec<String>,
     /// Skip running lifecycle build scripts.
@@ -26,6 +28,7 @@ impl Default for RebuildOptions {
     fn default() -> Self {
         Self {
             project_dir: PathBuf::from("."),
+            init_cwd: None,
             packages: Vec::new(),
             ignore_scripts: false,
             foreground_scripts: false,
@@ -264,7 +267,10 @@ pub async fn execute_rebuild(options: &RebuildOptions) -> Result<RebuildSummary>
 
     let lifecycle_opts = LifecycleOptions {
         root_dir: project_dir.clone(),
-        init_cwd: std::env::current_dir().unwrap_or_else(|_| project_dir.clone()),
+        init_cwd: options
+            .init_cwd
+            .clone()
+            .unwrap_or_else(|| project_dir.clone()),
         ignore_scripts: options.ignore_scripts,
         capture_output: !options.foreground_scripts,
         foreground_scripts: options.foreground_scripts,
