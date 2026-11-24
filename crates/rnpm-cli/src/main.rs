@@ -5646,7 +5646,7 @@ pub(crate) async fn run_cli_with_config(
     dir: Option<PathBuf>,
     loaded_config: Option<rnpm_config::Config>,
 ) -> anyhow::Result<()> {
-    let current_dir = match dir {
+    let inv_cwd = match dir {
         Some(d) => d,
         None => std::env::current_dir()?,
     };
@@ -5654,20 +5654,20 @@ pub(crate) async fn run_cli_with_config(
     let current_dir = match &cli.command {
         Commands::Install { prefix: Some(_), .. }
         | Commands::Uninstall { prefix: Some(_), .. }
-        | Commands::List { prefix: Some(_), .. } => current_dir,
+        | Commands::List { prefix: Some(_), .. } => inv_cwd.clone(),
         Commands::Pkg { prefix, .. } => {
             if prefix == Path::new(".") {
-                apply_cli_prefix(current_dir, cli_overrides.as_ref())
+                apply_cli_prefix(inv_cwd.clone(), cli_overrides.as_ref())
             } else {
-                current_dir
+                inv_cwd.clone()
             }
         }
-        _ => apply_cli_prefix(current_dir, cli_overrides.as_ref()),
+        _ => apply_cli_prefix(inv_cwd.clone(), cli_overrides.as_ref()),
     };
 
     let config = match loaded_config {
-        Some(c) => c,
-        None => rnpm_config::Config::load(Some(&current_dir))?,
+        Some(c) if should_reuse_ambient_config(&current_dir, &inv_cwd, cli_overrides.as_ref()) => c,
+        _ => rnpm_config::Config::load(Some(&current_dir))?,
     };
     let silent = config.get("loglevel") == Some("silent");
 
@@ -8124,6 +8124,25 @@ fn apply_cli_prefix(
     }
 }
 
+fn should_reuse_ambient_config(
+    current_dir: &Path,
+    inv_cwd: &Path,
+    cli_overrides: Option<&std::collections::BTreeMap<String, String>>,
+) -> bool {
+    if current_dir != inv_cwd {
+        return false;
+    }
+    if let Some(overrides) = cli_overrides {
+        if overrides.contains_key("prefix")
+            || overrides.contains_key("userconfig")
+            || overrides.contains_key("globalconfig")
+        {
+            return false;
+        }
+    }
+    true
+}
+
 #[allow(clippy::too_many_arguments)]
 fn execute_run_sync_with_config(
     current_dir: PathBuf,
@@ -8918,7 +8937,7 @@ fn main() {
         if let Some(script) = script_name {
             let cli_overrides = rnpm_config::get_process_cli_overrides();
             let current_dir = apply_cli_prefix(
-                std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+                inv_cwd.clone(),
                 cli_overrides.as_ref(),
             );
             if let Some(ref o) = cli_overrides {
@@ -8975,6 +8994,12 @@ fn main() {
                 (ignore_scripts, foreground_scripts, strict_sandbox)
             };
 
+            let run_config = if should_reuse_ambient_config(&current_dir, &inv_cwd, cli_overrides.as_ref()) {
+                ambient_config.clone()
+            } else {
+                rnpm_config::Config::load(Some(&current_dir)).unwrap_or_default()
+            };
+
             if let Err(err) = execute_run_sync_with_config(
                 current_dir,
                 script,
@@ -8983,7 +9008,7 @@ fn main() {
                 effective_ignore,
                 effective_foreground,
                 effective_strict,
-                &ambient_config,
+                &run_config,
             ) {
                 finish_cli_error(&err);
             }
@@ -9018,15 +9043,23 @@ fn main() {
         }
     };
 
+    let cli_overrides = rnpm_config::get_process_cli_overrides();
+    let current_dir = apply_cli_prefix(inv_cwd.clone(), cli_overrides.as_ref());
+    let effective_config = if should_reuse_ambient_config(&current_dir, &inv_cwd, cli_overrides.as_ref()) {
+        ambient_config
+    } else {
+        rnpm_config::Config::load(Some(&current_dir)).unwrap_or_default()
+    };
+
     let command_name = cli.command.command_name();
-    let mut agent = ambient_config
+    let mut agent = effective_config
         .npmrc
         .settings
         .get("user-agent")
         .cloned()
         .unwrap_or_else(rnpm_lifecycle::npm_user_agent);
-    if ambient_config.get_bool("workspaces") == Some(true)
-        || ambient_config.get("workspace").is_some_and(|v| !v.is_empty())
+    if effective_config.get_bool("workspaces") == Some(true)
+        || effective_config.get("workspace").is_some_and(|v| !v.is_empty())
     {
         agent = agent.replace("workspaces/false", "workspaces/true");
     }
@@ -9041,7 +9074,7 @@ fn main() {
         let forced = raw
             .iter()
             .any(|a| a == "--force" || a == "-f" || a == "--force=true")
-            || ambient_config.get_bool("force").unwrap_or(false);
+            || effective_config.get_bool("force").unwrap_or(false);
         if forced && !silent {
             eprintln!("npm warn using --force Recommended protections disabled.");
         }
@@ -9070,11 +9103,6 @@ fn main() {
     {
         let has_filter = !workspace.is_empty() || !filter.is_empty() || !scope.is_empty();
         if !workspaces && !has_filter && !workspace_root && script.is_some() {
-            let cli_overrides = rnpm_config::get_process_cli_overrides();
-            let current_dir = apply_cli_prefix(
-                std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
-                cli_overrides.as_ref(),
-            );
             if let Some(ref o) = cli_overrides {
                 if let Some(shell) = o.get("script-shell") {
                     if shell == "true" {
@@ -9137,7 +9165,7 @@ fn main() {
                 effective_ignore,
                 effective_foreground,
                 effective_strict,
-                &ambient_config,
+                &effective_config,
             ) {
                 finish_cli_error(&err);
             }
@@ -9146,9 +9174,7 @@ fn main() {
     }
 
     // Fast path: synchronous commands executing directly on the main thread without spinning up Tokio
-    let cli_overrides = rnpm_config::get_process_cli_overrides();
-    let current_dir = apply_cli_prefix(inv_cwd, cli_overrides.as_ref());
-    if let Some(res) = execute_sync_command(&mut cli, &current_dir, &ambient_config) {
+    if let Some(res) = execute_sync_command(&mut cli, &current_dir, &effective_config) {
         if let Err(err) = res {
             finish_cli_error(&err);
         }
@@ -9160,7 +9186,7 @@ fn main() {
         .build()
         .expect("Failed to initialize async runtime");
 
-    if let Err(err) = rt.block_on(run_cli_with_config(cli, None, Some(ambient_config))) {
+    if let Err(err) = rt.block_on(run_cli_with_config(cli, None, Some(effective_config))) {
         if err.is::<audit::AuditThresholdError>() {
             std::process::exit(1);
         }

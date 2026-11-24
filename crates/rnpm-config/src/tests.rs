@@ -1678,3 +1678,65 @@ fn test_npmrc_scoped_tls_entries_and_longest_prefix_precedence() {
     assert_eq!(npmrc.get_cert(&other_pkg_url), Some("/path/to/root.crt"));
     assert_eq!(npmrc.get_key(&other_pkg_url), Some("/path/to/root.key"));
 }
+
+#[test]
+fn test_find_workspace_root_dynamic_stateless() {
+    let tmp = tempdir().unwrap();
+
+    // Setup Tree A
+    let root_a = tmp.path().join("root_a");
+    let pkg_a = root_a.join("packages").join("pkg_a");
+    fs::create_dir_all(&pkg_a).unwrap();
+    fs::write(
+        root_a.join("package.json"),
+        r#"{"name":"root-a","workspaces":["packages/*"]}"#,
+    )
+    .unwrap();
+    fs::write(pkg_a.join("package.json"), r#"{"name":"pkg-a"}"#).unwrap();
+
+    // Setup Tree B
+    let root_b = tmp.path().join("root_b");
+    let pkg_b = root_b.join("modules").join("pkg_b");
+    fs::create_dir_all(&pkg_b).unwrap();
+    fs::write(
+        root_b.join("package.json"),
+        r#"{"name":"root-b","workspaces":["modules/*"]}"#,
+    )
+    .unwrap();
+    fs::write(pkg_b.join("package.json"), r#"{"name":"pkg-b"}"#).unwrap();
+
+    // Setup standalone
+    let standalone = tmp.path().join("standalone").join("child");
+    fs::create_dir_all(&standalone).unwrap();
+    fs::write(standalone.join("package.json"), r#"{"name":"alone"}"#).unwrap();
+
+    // Interleaved lookups must correctly find their respective roots without cross-talk
+    let found_a = crate::find_workspace_root(&pkg_a);
+    let found_b = crate::find_workspace_root(&pkg_b);
+    let found_alone = crate::find_workspace_root(&standalone);
+
+    assert_eq!(
+        found_a.as_deref().and_then(|p| p.canonicalize().ok()),
+        root_a.canonicalize().ok()
+    );
+    assert_eq!(
+        found_b.as_deref().and_then(|p| p.canonicalize().ok()),
+        root_b.canonicalize().ok()
+    );
+    assert_eq!(found_alone, None);
+
+    // Verify dynamic mutation: adding a workspace package.json above standalone is immediately detected
+    let standalone_parent = standalone.parent().unwrap();
+    fs::write(
+        standalone_parent.join("package.json"),
+        r#"{"name":"parent","workspaces":["child"]}"#,
+    )
+    .unwrap();
+
+    let found_new = crate::find_workspace_root(&standalone);
+    assert_eq!(
+        found_new.as_deref().and_then(|p| p.canonicalize().ok()),
+        standalone_parent.canonicalize().ok()
+    );
+}
+

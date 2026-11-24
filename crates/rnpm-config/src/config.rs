@@ -717,36 +717,7 @@ impl Config {
     }
 }
 
-static WORKSPACE_ROOT_CACHE: std::sync::RwLock<
-    Option<std::collections::HashMap<PathBuf, Option<PathBuf>>>,
-> = std::sync::RwLock::new(None);
-
-/// Clear cached workspace root lookups.
-pub fn clear_workspace_root_cache() {
-    if let Ok(mut lock) = WORKSPACE_ROOT_CACHE.write() {
-        if let Some(ref mut cache) = *lock {
-            cache.clear();
-        }
-    }
-}
-
 pub fn find_workspace_root(project_dir: &Path) -> Option<PathBuf> {
-    if let Ok(lock) = WORKSPACE_ROOT_CACHE.read() {
-        if let Some(ref cache) = *lock {
-            if let Some(res) = cache.get(project_dir) {
-                return res.clone();
-            }
-        }
-    }
-    let res = find_workspace_root_uncached(project_dir);
-    if let Ok(mut lock) = WORKSPACE_ROOT_CACHE.write() {
-        let cache = lock.get_or_insert_with(std::collections::HashMap::new);
-        cache.insert(project_dir.to_path_buf(), res.clone());
-    }
-    res
-}
-
-fn find_workspace_root_uncached(project_dir: &Path) -> Option<PathBuf> {
     let project_dir_canon = project_dir
         .canonicalize()
         .unwrap_or_else(|_| project_dir.to_path_buf());
