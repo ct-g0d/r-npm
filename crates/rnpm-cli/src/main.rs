@@ -6210,6 +6210,7 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             workspace_root,
         } => {
             let cli_overrides = rnpm_config::get_process_cli_overrides();
+            let current_dir = apply_cli_prefix(current_dir, cli_overrides.as_ref());
             let has_script_overrides = cli_overrides
                 .as_ref()
                 .map(|o| {
@@ -7910,6 +7911,26 @@ fn format_bytes(bytes: u64, space: bool) -> String {
     }
 }
 
+fn apply_cli_prefix(
+    base: PathBuf,
+    cli_overrides: Option<&std::collections::BTreeMap<String, String>>,
+) -> PathBuf {
+    if let Some(prefix) = cli_overrides
+        .and_then(|o| o.get("prefix"))
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+    {
+        let p = PathBuf::from(prefix);
+        if p.is_absolute() {
+            p
+        } else {
+            base.join(p)
+        }
+    } else {
+        base
+    }
+}
+
 fn execute_run_sync(
     current_dir: PathBuf,
     script: String,
@@ -8451,8 +8472,11 @@ fn main() {
         }
 
         if let Some(script) = script_name {
-            let current_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
             let cli_overrides = rnpm_config::get_process_cli_overrides();
+            let current_dir = apply_cli_prefix(
+                std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+                cli_overrides.as_ref(),
+            );
             if let Some(ref o) = cli_overrides {
                 if let Some(shell) = o.get("script-shell") {
                     if shell == "true" {
@@ -8614,8 +8638,11 @@ fn main() {
     {
         let has_filter = !workspace.is_empty() || !filter.is_empty() || !scope.is_empty();
         if !workspaces && !has_filter && script.is_some() {
-            let current_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
             let cli_overrides = rnpm_config::get_process_cli_overrides();
+            let current_dir = apply_cli_prefix(
+                std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+                cli_overrides.as_ref(),
+            );
             if let Some(ref o) = cli_overrides {
                 if let Some(shell) = o.get("script-shell") {
                     if shell == "true" {

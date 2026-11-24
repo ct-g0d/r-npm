@@ -321,3 +321,53 @@ fn test_outdated_404_package_skips_cleanly() {
         String::from_utf8_lossy(&out.stderr)
     );
 }
+
+#[test]
+fn test_run_with_prefix_executes_in_prefix_and_preserves_init_cwd() {
+    let tmp = tempdir().unwrap();
+    let sub = tmp.path().join("sub");
+    fs::create_dir_all(&sub).unwrap();
+    fs::write(
+        sub.join("package.json"),
+        serde_json::json!({
+            "name": "sub-pkg",
+            "version": "1.0.0",
+            "scripts": {
+                "hello": "node -e \"console.log('INIT=' + process.env.INIT_CWD); console.log('CWD=' + process.cwd())\""
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let rnpm_bin = env!("CARGO_BIN_EXE_rnpm");
+    let out = Command::new(rnpm_bin)
+        .args(["--prefix", "./sub", "run", "hello"])
+        .current_dir(tmp.path())
+        .output()
+        .expect("Failed to run rnpm --prefix ./sub run hello");
+
+    assert!(
+        out.status.success(),
+        "rnpm --prefix ./sub run hello must succeed; stderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let expected_init = fs::canonicalize(tmp.path()).unwrap_or_else(|_| tmp.path().to_path_buf());
+    let expected_sub = fs::canonicalize(&sub).unwrap_or_else(|_| sub.clone());
+    let norm = |p: &std::path::Path| {
+        let s = p.to_string_lossy().to_string();
+        s.strip_prefix(r"\\?\").unwrap_or(&s).to_ascii_lowercase()
+    };
+    let stdout_lower = stdout.to_ascii_lowercase();
+    assert!(
+        stdout_lower.contains(&format!("init={}", norm(&expected_init))),
+        "INIT_CWD should be outer invocation dir '{}', got:\n{stdout}",
+        norm(&expected_init)
+    );
+    assert!(
+        stdout_lower.contains(&format!("cwd={}", norm(&expected_sub))),
+        "process.cwd() should be prefix dir '{}', got:\n{stdout}",
+        norm(&expected_sub)
+    );
+}
