@@ -373,9 +373,12 @@ fn is_declared_root_spec(spec: &str, kind: SourceKind, root_declared: &HashSet<S
         return true;
     }
     if kind == SourceKind::Git {
-        if let Some((spec_repo, spec_ref)) = git_identity(spec) {
+        let spec_ident = git_identity(extracted).or_else(|| git_identity(spec));
+        if let Some((spec_repo, spec_ref)) = spec_ident {
             let matched = root_declared.iter().any(|d| {
-                if let Some((d_repo, d_ref)) = git_identity(d) {
+                let d_unpacked = unpack_alias(d);
+                let d_ident = git_identity(d_unpacked).or_else(|| git_identity(d));
+                if let Some((d_repo, d_ref)) = d_ident {
                     if d_repo.eq_ignore_ascii_case(&spec_repo) {
                         return d_ref.is_empty() || d_ref == spec_ref;
                     }

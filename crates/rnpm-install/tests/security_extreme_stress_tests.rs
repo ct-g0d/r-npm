@@ -1639,3 +1639,62 @@ fn test_single_segment_github_url_classified_as_remote() {
     assert_eq!(parse_source_kind("https://github.com/foo/bar"), SourceKind::Git);
     assert_eq!(parse_source_kind("https://gist.github.com/12345"), SourceKind::Git);
 }
+
+#[test]
+fn test_git_identity_mixed_case_git_plus_prefix() {
+    let (repo1, ref1) = git_identity("Git+https://github.com/user/repo").unwrap();
+    assert_eq!(repo1, "github.com/user/repo");
+    assert_eq!(ref1, "");
+
+    let (repo2, ref2) = git_identity("GIT+ssh://git@github.com/user/repo.git#v1.0").unwrap();
+    assert_eq!(repo2, "github.com/user/repo");
+    assert_eq!(ref2, "v1.0");
+
+    let (repo3, ref3) = git_identity("gIt+https://gitlab.com/group/project#main").unwrap();
+    assert_eq!(repo3, "gitlab.com/group/project");
+    assert_eq!(ref3, "main");
+}
+
+#[test]
+fn test_aliased_git_root_spec_matching() {
+    let mut root_declared = HashSet::new();
+    // package.json declared "my-alias": "npm:foo@github:user/repo#main"
+    root_declared.insert("my-alias".to_string());
+    root_declared.insert("npm:foo@github:user/repo#main".to_string());
+
+    let mut packages = BTreeMap::new();
+    let mut root_deps = BTreeMap::new();
+    // lockfile declared full git+https URL for the dependency
+    root_deps.insert("my-alias".to_string(), "git+https://github.com/user/repo.git#main".to_string());
+    packages.insert(
+        String::new(),
+        LockfilePackage {
+            dependencies: Some(root_deps),
+            ..Default::default()
+        },
+    );
+    packages.insert(
+        "node_modules/my-alias".to_string(),
+        LockfilePackage {
+            resolved: Some("git+https://github.com/user/repo.git#main".to_string()),
+            ..Default::default()
+        },
+    );
+
+    let lockfile = LockfileV3 {
+        name: "test-aliased-git".to_string(),
+        version: None,
+        lockfile_version: 3,
+        requires: None,
+        packages,
+    };
+    let workspace_paths = HashSet::new();
+    let policy = SourcePolicy {
+        git: AllowMode::Root,
+        remote: AllowMode::None,
+        ..Default::default()
+    };
+
+    let res = check_sources(&lockfile, &root_declared, &workspace_paths, &policy);
+    assert!(res.is_ok(), "Expected aliased git spec to match git identity under allow-git=root, got: {:?}", res.err());
+}

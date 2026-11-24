@@ -250,10 +250,8 @@ pub fn git_identity(spec: &str) -> Option<(String, String)> {
         format!("github.com/{body}")
     } else {
         let mut b = body;
-        if let Some(rest) = b.strip_prefix("git+") {
-            b = rest;
-        } else if let Some(rest) = b.strip_prefix("GIT+") {
-            b = rest;
+        if b.get(..4).is_some_and(|p| p.eq_ignore_ascii_case("git+")) {
+            b = &b[4..];
         }
         let lower_b = b.to_ascii_lowercase();
         for p in ["ssh://", "https://", "http://", "file://", "git://"] {
