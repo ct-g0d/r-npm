@@ -1494,3 +1494,107 @@ fn test_hyphen_range_with_partial_upper_is_not_a_version() {
         other => panic!("expected a range, got {other:?}"),
     }
 }
+
+#[test]
+fn test_semver_inc_overflow_protection() {
+    let max_v = Version::new(u64::MAX, 0, 0);
+    assert!(max_v.inc("major", None).is_err());
+
+    let max_patch = Version::new(1, 0, u64::MAX);
+    assert!(max_patch.inc("patch", None).is_err());
+}
+
+#[test]
+fn test_semver_parse_loose_prerelease_leading_zero() {
+    // In strict mode, leading zeroes in numeric prereleases are rejected
+    assert!(Version::parse("1.2.3-01").is_err());
+
+    // In loose mode, leading zeroes parse as numeric, preserving numeric comparison
+    let v_loose = Version::parse_loose("1.2.3-01").unwrap();
+    assert_eq!(v_loose.major, 1);
+    assert_eq!(v_loose.minor, 2);
+    assert_eq!(v_loose.patch, 3);
+    assert_eq!(v_loose.prerelease.len(), 1);
+    assert_eq!(v_loose.prerelease[0], crate::semver::version::PrereleaseId::Numeric(1));
+}
+
+#[test]
+fn test_spec_gist_and_git_protocols() {
+    let spec_gist = PackageSpec::parse("gist:123456#main").unwrap();
+    assert_eq!(spec_gist.name, "123456");
+    assert_eq!(
+        spec_gist.target.git_clone_url(),
+        Some("https://gist.github.com/123456.git".to_string())
+    );
+    assert_eq!(spec_gist.target.git_committish(), Some("main"));
+
+    let spec_rsync = PackageSpec::parse("git+rsync://example.com/repo.git").unwrap();
+    assert_eq!(spec_rsync.name, "repo");
+    assert_eq!(
+        spec_rsync.target.git_clone_url(),
+        Some("rsync://example.com/repo.git".to_string())
+    );
+}
+
+#[test]
+fn test_package_target_helpers() {
+    let file_target = PackageTarget::File(std::path::PathBuf::from("local-pkg.tgz"));
+    assert!(file_target.is_file());
+    assert!(file_target.is_tarball_archive());
+    assert_eq!(
+        file_target.file_path(),
+        Some(std::path::Path::new("local-pkg.tgz"))
+    );
+
+    let url_target = PackageTarget::Url(url::Url::parse("https://cdn.example.com/pkg.tgz").unwrap());
+    assert!(url_target.is_url());
+    assert!(url_target.is_tarball_archive());
+    assert!(!url_target.is_file());
+}
+
+#[test]
+fn test_manifest_files_string_and_array() {
+    // 'files' as single string in package.json
+    let json_str_files = r#"{"name":"test-pkg","version":"1.0.0","files":"dist"}"#;
+    let manifest_str = Manifest::from_str(json_str_files).unwrap();
+    assert_eq!(manifest_str.files, Some(vec!["dist".to_string()]));
+
+    // 'files' as array in package.json
+    let json_arr_files = r#"{"name":"test-pkg","version":"1.0.0","files":["dist","src"]}"#;
+    let manifest_arr = Manifest::from_str(json_arr_files).unwrap();
+    assert_eq!(
+        manifest_arr.files,
+        Some(vec!["dist".to_string(), "src".to_string()])
+    );
+}
+
+#[test]
+fn test_pkg_bracket_escaping_and_append_validation() {
+    use crate::pkg::{parse_path, pkg_get, pkg_set, PathSegment};
+
+    // Bracket unescaping
+    let segs = parse_path(r"scripts[build\:prod]").unwrap();
+    assert_eq!(segs.len(), 2);
+    assert_eq!(segs[0], PathSegment::Key("scripts".to_string()));
+    assert_eq!(segs[1], PathSegment::Key("build:prod".to_string()));
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let pkg_json = temp_dir.path().join("package.json");
+    std::fs::write(&pkg_json, r#"{"name":"test-pkg","scripts":{"build":"tsc"}}"#).unwrap();
+
+    // pkg_get with empty brackets must fail with EINVALIDSYNTAX
+    let get_res = pkg_get(&pkg_json, &["scripts[]".to_string()], false);
+    assert!(get_res.is_err());
+    assert!(get_res.unwrap_err().to_string().contains("Empty brackets are not valid syntax"));
+
+    // pkg_set append to non-array element must fail with ENOAPPEND
+    let set_res = pkg_set(&pkg_json, &["scripts[]=webpack".to_string()]);
+    assert!(set_res.is_err());
+    assert!(set_res.unwrap_err().to_string().contains("Can't use append syntax in non-Array element"));
+
+    // pkg_set append to new array succeeds
+    pkg_set(&pkg_json, &["keywords[]=cli".to_string()]).unwrap();
+    let content = std::fs::read_to_string(&pkg_json).unwrap();
+    assert!(content.contains(r#""keywords": ["#) || content.contains(r#""keywords":["#));
+    assert!(content.contains(r#""cli""#));
+}

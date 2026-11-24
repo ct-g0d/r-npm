@@ -49,6 +49,7 @@ pub fn get_process_globalconfig() -> Option<PathBuf> {
 pub struct ConfigOptions<'a> {
     pub project_dir: Option<&'a Path>,
     pub workspace_root: Option<&'a Path>,
+    pub builtin_config: Option<PathBuf>,
     pub globalconfig: Option<PathBuf>,
     pub userconfig: Option<PathBuf>,
     pub cli_overrides: Option<BTreeMap<String, String>>,
@@ -67,6 +68,11 @@ impl<'a> ConfigOptions<'a> {
 
     pub fn workspace_root(mut self, path: &'a Path) -> Self {
         self.workspace_root = Some(path);
+        self
+    }
+
+    pub fn builtin_config(mut self, path: PathBuf) -> Self {
+        self.builtin_config = Some(path);
         self
     }
 
@@ -272,12 +278,13 @@ impl Config {
         if !self.layers.is_empty() {
             let layer_priority = |name: &str| -> u8 {
                 match name.to_ascii_lowercase().as_str() {
-                    "cli" => 6,
-                    "env" => 5,
-                    "project" => 4,
-                    "workspace" => 3,
-                    "user" => 2,
-                    "global" => 1,
+                    "cli" => 7,
+                    "env" => 6,
+                    "project" => 5,
+                    "workspace" => 4,
+                    "user" => 3,
+                    "global" => 2,
+                    "builtin" => 1,
                     _ => 0,
                 }
             };
@@ -367,6 +374,36 @@ impl Config {
         let mut layers = Vec::new();
         let mut base_npmrc = Npmrc::default();
 
+        let builtin_config_path = options
+            .builtin_config
+            .clone()
+            .or_else(|| {
+                cli_map_opt
+                    .as_ref()
+                    .and_then(|cli| {
+                        cli.get("builtinconfig")
+                            .or_else(|| cli.get("--builtinconfig"))
+                            .map(PathBuf::from)
+                    })
+            })
+            .or_else(|| {
+                env_lookup("npm_config_builtinconfig")
+                    .or_else(|| env_lookup("NPM_CONFIG_BUILTINCONFIG"))
+                    .map(PathBuf::from)
+            });
+
+        if let Some(path) = builtin_config_path {
+            if path.as_os_str() != "false" && !path.as_os_str().is_empty() && path.exists() {
+                let builtin_config = Npmrc::from_file(&path)?;
+                layers.push(ConfigLayer {
+                    name: "builtin".to_string(),
+                    source: Some(path),
+                    settings: builtin_config.scrubbed_settings(),
+                });
+                base_npmrc.merge(builtin_config);
+            }
+        }
+
         let disable_global = options
             .globalconfig
             .as_ref()
@@ -374,7 +411,11 @@ impl Config {
             .unwrap_or(false)
             || cli_map_opt
                 .as_ref()
-                .and_then(|cli| cli.get("globalconfig").map(|v| v == "false"))
+                .and_then(|cli| {
+                    cli.get("globalconfig")
+                        .or_else(|| cli.get("--globalconfig"))
+                        .map(|v| v == "false")
+                })
                 .unwrap_or(false);
 
         let global_config_path = if disable_global {
@@ -387,7 +428,11 @@ impl Config {
                 .or_else(|| {
                     cli_map_opt
                         .as_ref()
-                        .and_then(|cli| cli.get("globalconfig").map(PathBuf::from))
+                        .and_then(|cli| {
+                            cli.get("globalconfig")
+                                .or_else(|| cli.get("--globalconfig"))
+                                .map(PathBuf::from)
+                        })
                 })
                 .or_else(|| {
                     env_lookup("npm_config_globalconfig")
@@ -416,7 +461,11 @@ impl Config {
             .unwrap_or(false)
             || cli_map_opt
                 .as_ref()
-                .and_then(|cli| cli.get("userconfig").map(|v| v == "false"))
+                .and_then(|cli| {
+                    cli.get("userconfig")
+                        .or_else(|| cli.get("--userconfig"))
+                        .map(|v| v == "false")
+                })
                 .unwrap_or(false);
 
         let user_config_path = if disable_user {
@@ -429,7 +478,11 @@ impl Config {
                 .or_else(|| {
                     cli_map_opt
                         .as_ref()
-                        .and_then(|cli| cli.get("userconfig").map(PathBuf::from))
+                        .and_then(|cli| {
+                            cli.get("userconfig")
+                                .or_else(|| cli.get("--userconfig"))
+                                .map(PathBuf::from)
+                        })
                 })
                 .or_else(|| {
                     env_lookup("npm_config_userconfig")
@@ -491,26 +544,48 @@ impl Config {
 
         let mut env_layer_settings = BTreeMap::new();
         for (raw_key, value) in all_env {
-            let lower_key = raw_key.to_ascii_lowercase();
-            if let Some(rest) = lower_key.strip_prefix("npm_config_") {
+            let rest_opt = if raw_key.len() > 11 && raw_key[..11].eq_ignore_ascii_case("npm_config_") {
+                Some(&raw_key[11..])
+            } else {
+                None
+            };
+            if let Some(rest) = rest_opt {
                 if rest.is_empty() {
                     continue;
                 }
-                let (prefix, body) = if rest.starts_with('_') {
-                    ("_", &rest[1..])
+                // In npm, nerf-darted keys (e.g. //registry.npmjs.org/:_authToken)
+                // preserve case and underscores without normalizing.
+                if rest.starts_with("//") {
+                    let val_display = if crate::npmrc::is_sensitive_credential_key(rest) {
+                        crate::npmrc::mask_credential(&value)
+                    } else {
+                        value.clone()
+                    };
+                    env_layer_settings.insert(rest.to_string(), val_display);
+                    base_npmrc.set(rest, &value)?;
                 } else {
-                    ("", rest)
-                };
-                let dashed = format!("{prefix}{}", body.replace('_', "-"));
-                let val_display = if crate::npmrc::is_sensitive_credential_key(&dashed) {
-                    crate::npmrc::mask_credential(&value)
-                } else {
-                    value.clone()
-                };
-                env_layer_settings.insert(dashed.clone(), val_display);
-                base_npmrc.set(&dashed, &value)?;
-                if dashed != rest {
-                    let _ = base_npmrc.set(rest, &value);
+                    let lower = rest.to_ascii_lowercase();
+                    let (prefix, body) = if lower.starts_with('_') {
+                        ("_", &lower[1..])
+                    } else {
+                        ("", lower.as_str())
+                    };
+                    let dashed = format!("{prefix}{}", body.replace('_', "-"));
+                    let val_display = if crate::npmrc::is_sensitive_credential_key(&dashed) {
+                        crate::npmrc::mask_credential(&value)
+                    } else {
+                        value.clone()
+                    };
+                    env_layer_settings.insert(dashed.clone(), val_display);
+                    base_npmrc.set(&dashed, &value)?;
+                    if dashed != rest {
+                        let _ = base_npmrc.set(rest, &value);
+                    }
+                    if dashed == "no-proxy" || dashed == "no_proxy" {
+                        let _ = base_npmrc.set("noproxy", &value);
+                    } else if dashed == "noproxy" {
+                        let _ = base_npmrc.set("no-proxy", &value);
+                    }
                 }
             }
         }
@@ -547,6 +622,11 @@ impl Config {
                 if clean_key != dashed {
                     let _ = base_npmrc.set(&dashed, &value);
                 }
+                if dashed == "no-proxy" || dashed == "no_proxy" {
+                    let _ = base_npmrc.set("noproxy", &value);
+                } else if dashed == "noproxy" {
+                    let _ = base_npmrc.set("no-proxy", &value);
+                }
             }
             if !cli_layer_settings.is_empty() {
                 layers.push(ConfigLayer {
@@ -554,6 +634,29 @@ impl Config {
                     source: None,
                     settings: cli_layer_settings,
                 });
+            }
+        }
+
+        // Standard proxy env vars fallback if not set in any config layer
+        if !base_npmrc.settings.contains_key("https-proxy") && !base_npmrc.settings.contains_key("https_proxy") {
+            if let Some(hp) = env_lookup("HTTPS_PROXY").or_else(|| env_lookup("https_proxy")) {
+                if !hp.is_empty() {
+                    let _ = base_npmrc.set("https-proxy", &hp);
+                }
+            }
+        }
+        if !base_npmrc.settings.contains_key("proxy") && !base_npmrc.settings.contains_key("http-proxy") && !base_npmrc.settings.contains_key("http_proxy") {
+            if let Some(p) = env_lookup("HTTP_PROXY").or_else(|| env_lookup("http_proxy")) {
+                if !p.is_empty() {
+                    let _ = base_npmrc.set("proxy", &p);
+                }
+            }
+        }
+        if !base_npmrc.settings.contains_key("noproxy") && !base_npmrc.settings.contains_key("no-proxy") && !base_npmrc.settings.contains_key("no_proxy") {
+            if let Some(np) = env_lookup("NO_PROXY").or_else(|| env_lookup("no_proxy")) {
+                if !np.is_empty() {
+                    let _ = base_npmrc.set("noproxy", &np);
+                }
             }
         }
 

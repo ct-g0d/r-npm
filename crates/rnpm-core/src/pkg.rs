@@ -129,15 +129,24 @@ pub fn parse_path(path: &str) -> Result<Vec<PathSegment>> {
             } else {
                 let mut content = String::new();
                 let mut closed = false;
+                let mut escaped = false;
 
                 while i < len {
-                    if chars[i] == ']' {
+                    if escaped {
+                        content.push(chars[i]);
+                        escaped = false;
+                        i += 1;
+                    } else if chars[i] == '\\' {
+                        escaped = true;
+                        i += 1;
+                    } else if chars[i] == ']' {
                         closed = true;
                         i += 1; // consume ']'
                         break;
+                    } else {
+                        content.push(chars[i]);
+                        i += 1;
                     }
-                    content.push(chars[i]);
-                    i += 1;
                 }
 
                 if !closed {
@@ -167,9 +176,21 @@ pub fn parse_path(path: &str) -> Result<Vec<PathSegment>> {
             }
         } else {
             let mut key = String::new();
-            while i < len && chars[i] != '.' && chars[i] != '[' && !chars[i].is_whitespace() {
-                key.push(chars[i]);
-                i += 1;
+            let mut escaped = false;
+            while i < len {
+                if escaped {
+                    key.push(chars[i]);
+                    escaped = false;
+                    i += 1;
+                } else if chars[i] == '\\' {
+                    escaped = true;
+                    i += 1;
+                } else if chars[i] == '.' || chars[i] == '[' || chars[i].is_whitespace() {
+                    break;
+                } else {
+                    key.push(chars[i]);
+                    i += 1;
+                }
             }
             let key = key.trim();
             if key.is_empty() {
@@ -332,7 +353,7 @@ pub fn set_value(
                         arr.push(value);
                     }
                     _ => {
-                        *current = OrderedJsonValue::Array(vec![value]);
+                        bail!("Can't use append syntax in non-Array element");
                     }
                 },
             }
@@ -351,9 +372,22 @@ pub fn set_value(
                     let needs_new_container = match map.get(key) {
                         None => true,
                         Some(OrderedJsonValue::Null) => true,
-                        Some(OrderedJsonValue::Object(_)) => false,
+                        Some(OrderedJsonValue::Object(_)) => {
+                            if matches!(&segments[i + 1], PathSegment::Append) {
+                                bail!("Can't use append syntax in non-Array element");
+                            }
+                            false
+                        }
                         Some(OrderedJsonValue::Array(_)) => false,
-                        Some(_) => true,
+                        Some(_) => {
+                            if matches!(&segments[i + 1], PathSegment::Append) {
+                                bail!(
+                                    "Property {} already exists and is not an Array or Object.",
+                                    key
+                                );
+                            }
+                            true
+                        }
                     };
                     if needs_new_container {
                         let new_container = if next_is_array {
@@ -649,6 +683,9 @@ pub fn pkg_get(manifest_path: &Path, field_paths: &[String], _json: bool) -> Res
     if field_paths.len() == 1 {
         let path_str = &field_paths[0];
         let segments = parse_path(path_str)?;
+        if segments.iter().any(|s| matches!(s, PathSegment::Append)) {
+            bail!("Empty brackets are not valid syntax for retrieving values.");
+        }
         let value = match get_value_at_path(&manifest_val, &segments) {
             Some(v) => v,
             None => return Ok("{}".to_string()),
@@ -663,6 +700,9 @@ pub fn pkg_get(manifest_path: &Path, field_paths: &[String], _json: bool) -> Res
     let mut result_map = OrderedJsonMap::new();
     for path_str in field_paths {
         let segments = parse_path(path_str)?;
+        if segments.iter().any(|s| matches!(s, PathSegment::Append)) {
+            bail!("Empty brackets are not valid syntax for retrieving values.");
+        }
         if let Some(value) = get_value_at_path(&manifest_val, &segments) {
             result_map.insert(path_str.clone(), value.clone());
         }
@@ -703,6 +743,9 @@ pub fn pkg_get_value(manifest_path: &Path, field_paths: &[String]) -> Result<Ord
     if field_paths.len() == 1 {
         let path_str = &field_paths[0];
         let segments = parse_path(path_str)?;
+        if segments.iter().any(|s| matches!(s, PathSegment::Append)) {
+            bail!("Empty brackets are not valid syntax for retrieving values.");
+        }
         let val = get_value_at_path(&manifest_val, &segments)
             .cloned()
             .unwrap_or_else(|| OrderedJsonValue::Object(OrderedJsonMap::new()));
@@ -712,6 +755,9 @@ pub fn pkg_get_value(manifest_path: &Path, field_paths: &[String]) -> Result<Ord
     let mut result_map = OrderedJsonMap::new();
     for path_str in field_paths {
         let segments = parse_path(path_str)?;
+        if segments.iter().any(|s| matches!(s, PathSegment::Append)) {
+            bail!("Empty brackets are not valid syntax for retrieving values.");
+        }
         if let Some(value) = get_value_at_path(&manifest_val, &segments) {
             result_map.insert(path_str.clone(), value.clone());
         }

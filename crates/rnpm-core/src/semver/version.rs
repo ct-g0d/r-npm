@@ -193,10 +193,8 @@ impl Version {
                 if part.is_empty() {
                     return Err(SemverError::InvalidPrerelease(p_str.to_string()));
                 }
-                // Check if part is numeric (no leading zeroes except 0 itself)
-                if part.chars().all(|c| c.is_ascii_digit())
-                    && (part.len() == 1 || !part.starts_with('0'))
-                {
+                // In loose mode, parse all-digit segments as numeric (e.g. 01 -> 1)
+                if part.chars().all(|c| c.is_ascii_digit()) {
                     if let Ok(n) = part.parse::<u64>() {
                         pres.push(PrereleaseId::Numeric(n));
                         continue;
@@ -258,7 +256,9 @@ impl Version {
         match release {
             "major" => {
                 if v.minor != 0 || v.patch != 0 || v.prerelease.is_empty() {
-                    v.major += 1;
+                    v.major = v.major.checked_add(1).ok_or_else(|| {
+                        SemverError::InvalidVersion("Numeric overflow in major version increment".to_string())
+                    })?;
                 }
                 v.minor = 0;
                 v.patch = 0;
@@ -266,14 +266,18 @@ impl Version {
             }
             "minor" => {
                 if v.patch != 0 || v.prerelease.is_empty() {
-                    v.minor += 1;
+                    v.minor = v.minor.checked_add(1).ok_or_else(|| {
+                        SemverError::InvalidVersion("Numeric overflow in minor version increment".to_string())
+                    })?;
                 }
                 v.patch = 0;
                 v.prerelease.clear();
             }
             "patch" => {
                 if v.prerelease.is_empty() {
-                    v.patch += 1;
+                    v.patch = v.patch.checked_add(1).ok_or_else(|| {
+                        SemverError::InvalidVersion("Numeric overflow in patch version increment".to_string())
+                    })?;
                 }
                 v.prerelease.clear();
             }
@@ -281,23 +285,31 @@ impl Version {
                 v.prerelease.clear();
                 v.patch = 0;
                 v.minor = 0;
-                v.major += 1;
+                v.major = v.major.checked_add(1).ok_or_else(|| {
+                    SemverError::InvalidVersion("Numeric overflow in major version increment".to_string())
+                })?;
                 v.inc_pre(identifier);
             }
             "preminor" => {
                 v.prerelease.clear();
                 v.patch = 0;
-                v.minor += 1;
+                v.minor = v.minor.checked_add(1).ok_or_else(|| {
+                    SemverError::InvalidVersion("Numeric overflow in minor version increment".to_string())
+                })?;
                 v.inc_pre(identifier);
             }
             "prepatch" => {
                 v.prerelease.clear();
-                v.patch += 1;
+                v.patch = v.patch.checked_add(1).ok_or_else(|| {
+                    SemverError::InvalidVersion("Numeric overflow in patch version increment".to_string())
+                })?;
                 v.inc_pre(identifier);
             }
             "prerelease" => {
                 if v.prerelease.is_empty() {
-                    v.patch += 1;
+                    v.patch = v.patch.checked_add(1).ok_or_else(|| {
+                        SemverError::InvalidVersion("Numeric overflow in patch version increment".to_string())
+                    })?;
                 }
                 v.inc_pre(identifier);
             }
@@ -320,7 +332,7 @@ impl Version {
             while i > 0 {
                 i -= 1;
                 if let PrereleaseId::Numeric(n) = &mut self.prerelease[i] {
-                    *n += 1;
+                    *n = n.saturating_add(1);
                     incremented = true;
                     break;
                 }

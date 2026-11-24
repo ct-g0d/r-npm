@@ -3,7 +3,7 @@ use crate::semver::range::Range;
 use crate::semver::version::Version;
 use serde::{Deserialize, Serialize};
 use std::fmt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use url::Url;
 
@@ -68,10 +68,13 @@ impl PackageTarget {
             "git+http://",
             "git+git://",
             "git+file://",
+            "git+rsync://",
+            "git+ftp://",
             "git://",
             "github:",
             "gitlab:",
             "bitbucket:",
+            "gist:",
         ];
         for prefix in git_prefixes {
             if s.starts_with(prefix) {
@@ -176,6 +179,10 @@ impl PackageTarget {
                 } else if let Some(rest) = url.strip_prefix("bitbucket:") {
                     let repo = rest.trim_end_matches(".git");
                     Some(format!("https://bitbucket.org/{repo}.git"))
+                } else if let Some(rest) = url.strip_prefix("gist:") {
+                    let clean = rest.trim_end_matches(".git");
+                    let id = clean.rsplit('/').next().unwrap_or(clean);
+                    Some(format!("https://gist.github.com/{id}.git"))
                 } else if let Some(rest) = url.strip_prefix("git+") {
                     Some(rest.to_string())
                 } else {
@@ -223,6 +230,34 @@ impl PackageTarget {
     /// Checks if this target is a direct URL dependency.
     pub fn is_url(&self) -> bool {
         matches!(self, PackageTarget::Url(_))
+    }
+
+    /// Returns the file path if this target is a local file or directory.
+    pub fn file_path(&self) -> Option<&Path> {
+        match self {
+            PackageTarget::File(p) => Some(p.as_path()),
+            _ => None,
+        }
+    }
+
+    /// Checks if this target is a local file or directory.
+    pub fn is_file(&self) -> bool {
+        matches!(self, PackageTarget::File(_))
+    }
+
+    /// Checks if this target is a tarball archive (e.g. .tgz, .tar.gz, .tar).
+    pub fn is_tarball_archive(&self) -> bool {
+        match self {
+            PackageTarget::File(p) => {
+                let s = p.to_string_lossy();
+                s.ends_with(".tgz") || s.ends_with(".tar.gz") || s.ends_with(".tar")
+            }
+            PackageTarget::Url(u) => {
+                let path = u.path();
+                path.ends_with(".tgz") || path.ends_with(".tar.gz") || path.ends_with(".tar")
+            }
+            _ => false,
+        }
     }
 
     fn parse_alias(alias_str: &str) -> Result<Self, SpecError> {
@@ -330,10 +365,13 @@ impl PackageSpec {
             "git+http://",
             "git+git://",
             "git+file://",
+            "git+rsync://",
+            "git+ftp://",
             "git://",
             "github:",
             "gitlab:",
             "bitbucket:",
+            "gist:",
         ];
         for prefix in git_prefixes {
             if trimmed.starts_with(prefix) {
