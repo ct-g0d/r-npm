@@ -237,13 +237,13 @@ pub fn git_identity(spec: &str) -> Option<(String, String)> {
         && !spec.starts_with('\\')
         && !spec.starts_with('~')
         && !(spec.len() >= 2 && spec.as_bytes()[1] == b':' && spec.as_bytes()[0].is_ascii_alphabetic())
+        && !body.contains(':')
         && body.split_once('/').is_some_and(|(u, r)| {
             !u.is_empty()
                 && !r.is_empty()
                 && !r.contains('/')
-                && !u.contains(':')
-                && u.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-                && r.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
+                && !u.chars().any(|c| c.is_whitespace() || c.is_control())
+                && !r.chars().any(|c| c.is_whitespace() || c.is_control())
         })
     {
         // GitHub shorthand "user/repo"

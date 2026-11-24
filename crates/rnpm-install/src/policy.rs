@@ -175,7 +175,16 @@ pub(crate) fn is_git_spec(spec: &str) -> bool {
     ] {
         if let Some(path) = lower.strip_prefix(host) {
             let base = path.split_once('#').map(|(b, _)| b).unwrap_or(path);
-            if !base.ends_with(".tgz")
+            let trimmed_base = base.trim_matches('/');
+            let segments: Vec<&str> = trimmed_base.split('/').collect();
+            let is_gist = host.contains("gist.github.com");
+            let has_required_segments = if is_gist {
+                !segments.is_empty() && !segments[0].is_empty()
+            } else {
+                segments.len() >= 2 && !segments[0].is_empty() && !segments[1].is_empty()
+            };
+            if has_required_segments
+                && !base.ends_with(".tgz")
                 && !base.ends_with(".tar.gz")
                 && !base.ends_with(".tar")
                 && !base.contains("/archive/")
@@ -194,14 +203,16 @@ pub(crate) fn is_git_spec(spec: &str) -> bool {
         && !(spec.len() >= 2 && spec.as_bytes()[1] == b':' && spec.as_bytes()[0].is_ascii_alphabetic())
     {
         let base = spec.split_once('#').map(|(b, _)| b).unwrap_or(spec);
-        if let Some((user, repo)) = base.split_once('/') {
-            if !user.is_empty()
-                && !repo.is_empty()
-                && !repo.contains('/')
-                && user.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-                && repo.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
-            {
-                return true;
+        if !base.contains(':') {
+            if let Some((user, repo)) = base.split_once('/') {
+                if !user.is_empty()
+                    && !repo.is_empty()
+                    && !repo.contains('/')
+                    && !user.chars().any(|c| c.is_whitespace() || c.is_control())
+                    && !repo.chars().any(|c| c.is_whitespace() || c.is_control())
+                {
+                    return true;
+                }
             }
         }
     }
@@ -531,7 +542,7 @@ pub fn check_sources_with_root_context(
     let mut add_remote_spec = |spec: &str| {
         let extracted = unpack_alias(spec);
         let lower = extracted.to_ascii_lowercase();
-        if lower.starts_with("http://") || lower.starts_with("https://") {
+        if (lower.starts_with("http://") || lower.starts_with("https://")) && !is_git_spec(extracted) {
             explicit_remote_specs.insert(extracted.to_string());
             explicit_remote_specs.insert(lower.clone());
             if let Some((base, _)) = extracted.split_once('#') {

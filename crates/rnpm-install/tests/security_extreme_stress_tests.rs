@@ -1207,23 +1207,23 @@ fn test_git_identity_non_ascii_prefix_boundary_safety() {
     let temp = tempdir().unwrap();
 
     // 1. Multi-byte UTF-8 character where byte 5, 7, or 10 lands mid-codepoint.
-    // "你好世界" is 12 bytes: [0..3, 3..6, 6..9, 9..12]. Byte 7 is inside '世' (6..9).
+    // "你好世界" is 12 bytes: [0..3, 3..6, 6..9, 9..12]. Canonicalized as GitHub shorthand to github.com/...
     let (repo_zh, committish_zh) = git_identity("你好世界/repo#main").unwrap();
-    assert_eq!(repo_zh, "你好世界/repo");
+    assert_eq!(repo_zh, "github.com/你好世界/repo");
     assert_eq!(committish_zh, "main");
 
-    // 2. 4-byte UTF-8 emoji "🦀" (bytes 0..4). Byte 5 or 7 lands on boundary or inside.
+    // 2. 4-byte UTF-8 emoji "🦀" (bytes 0..4).
     let (repo_crab, committish_crab) = git_identity("🦀/repo#feat").unwrap();
-    assert_eq!(repo_crab, "🦀/repo");
+    assert_eq!(repo_crab, "github.com/🦀/repo");
     assert_eq!(committish_crab, "feat");
 
     // 3. Accented character "é" (2 bytes).
     let (repo_accent, _) = git_identity("école/projet").unwrap();
-    assert_eq!(repo_accent, "école/projet");
+    assert_eq!(repo_accent, "github.com/école/projet");
 
     // 4. Multiple emojis with byte length > 10, crossing 5, 7, and 10 byte boundaries.
     let (repo_multi, _) = git_identity("🚀🎉🔥/tools").unwrap();
-    assert_eq!(repo_multi, "🚀🎉🔥/tools");
+    assert_eq!(repo_multi, "github.com/🚀🎉🔥/tools");
 
     // 5. Cyrillic text with 2-byte characters.
     let (repo_cyr, committish_cyr) = git_identity("git+https://example.com/пользователь/проект#v1.0").unwrap();
@@ -1233,7 +1233,7 @@ fn test_git_identity_non_ascii_prefix_boundary_safety() {
     let (repo_git_at, _) = git_identity("git@example.com:пользователь/проект").unwrap();
     assert_eq!(repo_git_at, "example.com/пользователь/проект");
 
-    // 6. ScriptNode matching with non-ASCII git spec
+    // 6. ScriptNode matching with non-ASCII git spec and shorthand
     let node = ScriptNode {
         location: "node_modules/unicode-dep",
         resolved: Some("git+https://github.com/用户/仓库.git#main"),
@@ -1242,6 +1242,8 @@ fn test_git_identity_non_ascii_prefix_boundary_safety() {
         link: false,
         project_dir: temp.path(),
     };
+    assert!(node.matches("用户/仓库#main", false));
+    assert!(node.matches("用户/仓库", false));
     assert!(node.matches("github:用户/仓库#main", false));
     assert!(node.matches("git+https://github.com/用户/仓库.git#main", false));
 }
@@ -1586,4 +1588,54 @@ fn test_authored_file_spec_with_windows_slash_matches() {
 
     let res = check_sources(&lockfile, &root_declared, &workspace_paths, &policy);
     assert!(res.is_ok(), "Expected Windows backslash spec in lockfile to match authored forward slash spec, got: {:?}", res.err());
+}
+
+#[test]
+fn test_hosted_git_without_dot_git_under_allow_git_all_allow_remote_none() {
+    let mut root_declared = HashSet::new();
+    root_declared.insert("git-pkg".to_string());
+    root_declared.insert("https://github.com/user/repo".to_string());
+
+    let mut packages = BTreeMap::new();
+    let mut root_deps = BTreeMap::new();
+    root_deps.insert("git-pkg".to_string(), "https://github.com/user/repo".to_string());
+    packages.insert(
+        String::new(),
+        LockfilePackage {
+            dependencies: Some(root_deps),
+            ..Default::default()
+        },
+    );
+    packages.insert(
+        "node_modules/git-pkg".to_string(),
+        LockfilePackage {
+            resolved: Some("https://github.com/user/repo".to_string()),
+            ..Default::default()
+        },
+    );
+
+    let lockfile = LockfileV3 {
+        name: "test-git".to_string(),
+        version: None,
+        lockfile_version: 3,
+        requires: None,
+        packages,
+    };
+    let workspace_paths = HashSet::new();
+    let policy = SourcePolicy {
+        git: AllowMode::All,
+        remote: AllowMode::None,
+        ..Default::default()
+    };
+
+    // Must PASS because https://github.com/user/repo is Git, not Remote!
+    let res = check_sources(&lockfile, &root_declared, &workspace_paths, &policy);
+    assert!(res.is_ok(), "Expected https://github.com/user/repo to pass under allow-git=all allow-remote=none, got: {:?}", res.err());
+}
+
+#[test]
+fn test_single_segment_github_url_classified_as_remote() {
+    assert_eq!(parse_source_kind("https://github.com/foo"), SourceKind::Remote);
+    assert_eq!(parse_source_kind("https://github.com/foo/bar"), SourceKind::Git);
+    assert_eq!(parse_source_kind("https://gist.github.com/12345"), SourceKind::Git);
 }
