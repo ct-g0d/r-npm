@@ -297,16 +297,21 @@ fn is_native_companion_binary(path: &std::path::Path) -> bool {
     if !path.is_file() {
         return false;
     }
-    // Reject text/script launchers (e.g. Node's `#!/usr/bin/env node` npm script) so
-    // standalone Rust `npx` never silently falls back to Node's JS npm.
+    // Reject text/script launchers (e.g. Node's `#!/usr/bin/env node` npm script,
+    // or Windows batch/cmd scripts) so standalone Rust `npx` never silently falls
+    // back to Node's JS npm.
     use std::io::Read;
     let Ok(mut file) = std::fs::File::open(path) else {
         return false;
     };
     let mut header = [0u8; 2];
-    match file.read_exact(&mut header) {
-        Ok(()) => &header != b"#!",
-        Err(_) => false,
+    let Ok(()) = file.read_exact(&mut header) else {
+        return false;
+    };
+    if cfg!(windows) {
+        &header == b"MZ"
+    } else {
+        &header != b"#!"
     }
 }
 
@@ -672,8 +677,9 @@ mod tests {
         fs::create_dir_all(&install_dir).unwrap();
         let fake_npx = install_dir.join(if cfg!(windows) { "npx.exe" } else { "npx" });
         let fake_npm = install_dir.join(sibling_name);
-        fs::write(&fake_npx, b"binary").unwrap();
-        fs::write(&fake_npm, b"binary").unwrap();
+        let native_bytes = if cfg!(windows) { &b"MZ_native"[..] } else { &b"\x7fELF_native"[..] };
+        fs::write(&fake_npx, native_bytes).unwrap();
+        fs::write(&fake_npm, native_bytes).unwrap();
 
         let found = find_rnpm_executable_in(Some(&fake_npx), &[]);
         assert_eq!(found, Some(fake_npm));
@@ -687,8 +693,8 @@ mod tests {
         // Node's npm is earlier in PATH
         let node_npm = node_bin_dir.join(sibling_name);
         let actual_rnpm = rnpm_bin_dir.join(rnpm_name);
-        fs::write(&node_npm, b"node_npm").unwrap();
-        fs::write(&actual_rnpm, b"actual_rnpm").unwrap();
+        fs::write(&node_npm, native_bytes).unwrap();
+        fs::write(&actual_rnpm, native_bytes).unwrap();
 
         let search_path = vec![node_bin_dir.clone(), rnpm_bin_dir];
         let found = find_rnpm_executable_in(None, &search_path);
@@ -714,17 +720,46 @@ mod tests {
         fs::create_dir_all(&install_dir).unwrap();
         fs::create_dir_all(&path_dir).unwrap();
 
+        let native_bytes = if cfg!(windows) { &b"MZ_native"[..] } else { &b"\x7fELF_native"[..] };
         let fake_npx = install_dir.join(if cfg!(windows) { "npx.exe" } else { "npx" });
         // Sibling npm is a JS script starting with #!
         let fake_npm_script = install_dir.join(sibling_name);
-        fs::write(&fake_npx, b"binary").unwrap();
+        fs::write(&fake_npx, native_bytes).unwrap();
         fs::write(&fake_npm_script, b"#!/usr/bin/env node\nconsole.log('hi');").unwrap();
 
         // Valid rnpm in PATH
         let actual_rnpm = path_dir.join(rnpm_name);
-        fs::write(&actual_rnpm, b"native_binary").unwrap();
+        fs::write(&actual_rnpm, native_bytes).unwrap();
 
         let found = find_rnpm_executable_in(Some(&fake_npx), &[path_dir]);
         assert_eq!(found, Some(actual_rnpm), "Should skip #! JS npm and pick native rnpm");
+    }
+
+    #[test]
+    fn test_find_rnpm_executable_skips_batch_script_npm_and_selects_rnpm() {
+        use std::fs;
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+
+        let sibling_name = if cfg!(windows) { "npm.exe" } else { "npm" };
+        let rnpm_name = if cfg!(windows) { "rnpm.exe" } else { "rnpm" };
+
+        let install_dir = root.join("install");
+        let path_dir = root.join("path_dir");
+        fs::create_dir_all(&install_dir).unwrap();
+        fs::create_dir_all(&path_dir).unwrap();
+
+        let native_bytes = if cfg!(windows) { &b"MZ_native"[..] } else { &b"\x7fELF_native"[..] };
+        let fake_npx = install_dir.join(if cfg!(windows) { "npx.exe" } else { "npx" });
+        // Sibling npm is a Windows batch script or shell launcher
+        let fake_npm_script = install_dir.join(sibling_name);
+        fs::write(&fake_npx, native_bytes).unwrap();
+        fs::write(&fake_npm_script, b"@echo off\r\nnode npm-cli.js\r\n").unwrap();
+
+        let actual_rnpm = path_dir.join(rnpm_name);
+        fs::write(&actual_rnpm, native_bytes).unwrap();
+
+        let found = find_rnpm_executable_in(Some(&fake_npx), &[path_dir]);
+        assert_eq!(found, Some(actual_rnpm), "Should skip batch script npm and pick native rnpm");
     }
 }

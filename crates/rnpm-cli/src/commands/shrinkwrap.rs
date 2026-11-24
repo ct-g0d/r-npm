@@ -15,17 +15,35 @@ fn populate_from_node_modules(root: &Path, lock: &mut rnpm_lockfile::LockfileV3)
     Ok(())
 }
 
+struct AncestorGuard<'a> {
+    visited: &'a mut HashSet<PathBuf>,
+    inserted: Option<PathBuf>,
+}
+
+impl<'a> Drop for AncestorGuard<'a> {
+    fn drop(&mut self) {
+        if let Some(ref p) = self.inserted {
+            self.visited.remove(p);
+        }
+    }
+}
+
 fn walk_nm(
     dir: &Path,
     root: &Path,
     lock: &mut rnpm_lockfile::LockfileV3,
     visited: &mut HashSet<PathBuf>,
 ) -> Result<()> {
-    if let Ok(canon_dir) = std::fs::canonicalize(dir) {
-        if !visited.insert(canon_dir) {
+    let canon_dir = std::fs::canonicalize(dir).ok();
+    if let Some(ref c) = canon_dir {
+        if !visited.insert(c.clone()) {
             return Ok(());
         }
     }
+    let guard = AncestorGuard {
+        visited,
+        inserted: canon_dir,
+    };
     for entry in std::fs::read_dir(dir)?.flatten() {
         let path = entry.path();
         let Ok(sym_meta) = std::fs::symlink_metadata(&path) else {
@@ -45,7 +63,7 @@ fn walk_nm(
         }
         if file_name.starts_with('@') {
             if !is_symlink_or_junction {
-                walk_nm(&path, root, lock, visited)?;
+                walk_nm(&path, root, lock, guard.visited)?;
             }
             continue;
         }
@@ -79,11 +97,6 @@ fn walk_nm(
             );
             continue;
         }
-        if let Ok(canon) = std::fs::canonicalize(&path) {
-            if !visited.insert(canon) {
-                continue;
-            }
-        }
         let manifest_path = path.join("package.json");
         if manifest_path.is_file() {
             if let Ok(manifest) = rnpm_core::Manifest::from_file(&manifest_path) {
@@ -112,7 +125,7 @@ fn walk_nm(
             }
             let nested = path.join("node_modules");
             if nested.is_dir() {
-                walk_nm(&nested, root, lock, visited)?;
+                walk_nm(&nested, root, lock, guard.visited)?;
             }
         }
     }

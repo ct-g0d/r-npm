@@ -152,7 +152,7 @@ fn test_prefix_applies_to_test_start_restart_stop_and_dev_engines_check() {
     );
     assert!(sub.join("sub-restart.txt").exists());
 
-    // 5. devEngines check sees the prefixed package.json
+    // 5. devEngines check sees the prefixed package.json for test and run
     let sub_pkg_incompatible_engines = serde_json::json!({
         "name": "sub-pkg",
         "version": "1.0.0",
@@ -163,7 +163,8 @@ fn test_prefix_applies_to_test_start_restart_stop_and_dev_engines_check() {
             }
         },
         "scripts": {
-            "test": "node -e \"require('fs').writeFileSync('sub-test-should-fail.txt', 'fail')\""
+            "test": "node -e \"require('fs').writeFileSync('sub-test-should-fail.txt', 'fail')\"",
+            "custom": "node -e \"require('fs').writeFileSync('sub-custom-should-fail.txt', 'fail')\""
         }
     });
     fs::write(
@@ -190,6 +191,46 @@ fn test_prefix_applies_to_test_start_restart_stop_and_dev_engines_check() {
     assert!(
         !sub.join("sub-test-should-fail.txt").exists(),
         "script must not have run when devEngines failed"
+    );
+
+    // rnpm --prefix ./sub run custom must ALSO fail checking ./sub's devEngines
+    let out_run_engines = Command::new(rnpm_bin)
+        .args(["--prefix", "./sub", "run", "custom"])
+        .current_dir(tmp.path())
+        .output()
+        .expect("Failed to run rnpm --prefix ./sub run custom with devEngines");
+
+    assert!(
+        !out_run_engines.status.success(),
+        "rnpm --prefix ./sub run custom should fail due to incompatible devEngines in prefix"
+    );
+    let stderr_run = String::from_utf8_lossy(&out_run_engines.stderr);
+    assert!(
+        stderr_run.contains("EBADENGINE") || stderr_run.contains("devEngines") || stderr_run.contains("node"),
+        "run stderr should mention devEngines failure; got:\n{stderr_run}"
+    );
+    assert!(
+        !sub.join("sub-custom-should-fail.txt").exists(),
+        "custom script must not have run when devEngines failed"
+    );
+
+    // 6. rnpm pkg get name --prefix ./sub must not double-join ./sub/sub
+    let out_pkg = Command::new(rnpm_bin)
+        .args(["pkg", "get", "name", "--prefix", "./sub"])
+        .current_dir(tmp.path())
+        .output()
+        .expect("Failed to run rnpm pkg get name --prefix ./sub");
+
+    assert!(
+        out_pkg.status.success(),
+        "rnpm pkg get name --prefix ./sub must succeed; stderr:\n{}",
+        String::from_utf8_lossy(&out_pkg.stderr)
+    );
+    let pkg_name_out = String::from_utf8_lossy(&out_pkg.stdout).trim().to_string();
+    assert_eq!(pkg_name_out, "\"sub-pkg\"");
+    assert!(
+        !sub.join("sub").exists(),
+        "must not create or expect nested ./sub/sub directory"
     );
 }
 
@@ -233,6 +274,27 @@ fn test_run_filter_scope_workspace_root_bypasses_ultra_fast_path() {
     assert!(
         tmp.path().join("root-built.txt").exists(),
         "root-built.txt must exist when run with --workspace-root"
+    );
+
+    // 1b. --workspace-root build invoked from inside child package directory (packages/pkg-a) runs root script
+    fs::remove_file(tmp.path().join("root-built.txt")).unwrap();
+    let out_ws_child = Command::new(rnpm_bin)
+        .args(["run", "--workspace-root", "build"])
+        .current_dir(&pkg_a)
+        .output()
+        .expect("Failed to run rnpm run --workspace-root build from child package dir");
+    assert!(
+        out_ws_child.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out_ws_child.stderr)
+    );
+    assert!(
+        tmp.path().join("root-built.txt").exists(),
+        "root-built.txt must exist when run with --workspace-root from child package dir"
+    );
+    assert!(
+        !pkg_a.join("pkg-a-built.txt").exists(),
+        "pkg-a script must not run when --workspace-root is specified"
     );
 
     // 2. --filter pkg-a build runs in pkg-a
@@ -322,7 +384,41 @@ fn test_shrinkwrap_ignores_stale_hidden_lockfile_survives_symlink_cycle_and_omit
 
     // Create a node_modules symlink/junction cycle: real-dep/node_modules -> nm
     let nested_nm = real_dep_dir.join("node_modules");
-    let _ = rnpm_fs::create_junction(&nested_nm, &nm);
+    rnpm_fs::create_junction(&nested_nm, &nm).expect("failed to create cycle junction");
+
+    // Create a diamond structure:
+    // node_modules/shared-pkg (with manifest)
+    // node_modules/dep-a/node_modules/shared -> node_modules/shared-pkg
+    // node_modules/dep-b/node_modules/shared -> node_modules/shared-pkg
+    let shared_pkg_dir = nm.join("shared-pkg");
+    fs::create_dir_all(&shared_pkg_dir).unwrap();
+    let shared_pkg = serde_json::json!({
+        "name": "shared-pkg",
+        "version": "1.0.0"
+    });
+    fs::write(shared_pkg_dir.join("package.json"), shared_pkg.to_string()).unwrap();
+
+    let dep_a_dir = nm.join("dep-a");
+    let dep_a_nm = dep_a_dir.join("node_modules");
+    fs::create_dir_all(&dep_a_nm).unwrap();
+    let dep_a_pkg = serde_json::json!({
+        "name": "dep-a",
+        "version": "1.0.0"
+    });
+    fs::write(dep_a_dir.join("package.json"), dep_a_pkg.to_string()).unwrap();
+    rnpm_fs::create_junction(&dep_a_nm.join("shared"), &shared_pkg_dir)
+        .expect("failed to create dep-a diamond junction");
+
+    let dep_b_dir = nm.join("dep-b");
+    let dep_b_nm = dep_b_dir.join("node_modules");
+    fs::create_dir_all(&dep_b_nm).unwrap();
+    let dep_b_pkg = serde_json::json!({
+        "name": "dep-b",
+        "version": "1.0.0"
+    });
+    fs::write(dep_b_dir.join("package.json"), dep_b_pkg.to_string()).unwrap();
+    rnpm_fs::create_junction(&dep_b_nm.join("shared"), &shared_pkg_dir)
+        .expect("failed to create dep-b diamond junction");
 
     let out = Command::new(rnpm_bin)
         .arg("shrinkwrap")
@@ -361,6 +457,21 @@ fn test_shrinkwrap_ignores_stale_hidden_lockfile_survives_symlink_cycle_and_omit
     assert!(
         real_dep_node.get("devDependencies").is_none(),
         "devDependencies on installed node_modules/real-dep must be omitted"
+    );
+
+    // 4. Diamond structure: dep-a/node_modules/shared and dep-b/node_modules/shared
+    // both link to shared-pkg. Neither must be omitted due to monotonic visited set.
+    assert!(
+        packages.contains_key("node_modules/dep-a/node_modules/shared"),
+        "dep-a diamond branch must be present in packages"
+    );
+    assert!(
+        packages.contains_key("node_modules/dep-b/node_modules/shared"),
+        "dep-b diamond branch must be present in packages"
+    );
+    assert!(
+        packages.contains_key("node_modules/shared-pkg"),
+        "shared-pkg target must be present in packages"
     );
 }
 

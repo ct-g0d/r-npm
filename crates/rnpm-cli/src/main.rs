@@ -2345,6 +2345,16 @@ pub(crate) async fn execute_run(
     strict_sandbox: bool,
     workspace_root: bool,
 ) -> anyhow::Result<()> {
+    let current_dir = if workspace_root
+        && !workspaces
+        && workspace.is_empty()
+        && filter.is_empty()
+        && scope.is_empty()
+    {
+        rnpm_config::find_workspace_root(&current_dir).unwrap_or(current_dir)
+    } else {
+        current_dir
+    };
     let manifest_path = current_dir.join("package.json");
     if !manifest_path.exists() {
         return Err(anyhow::anyhow!(
@@ -2407,7 +2417,7 @@ pub(crate) async fn execute_run(
     let has_filter = !workspace.is_empty() || !filter.is_empty() || !scope.is_empty();
     if workspaces || has_filter {
         // Fail before any member runs, not as one member's script failure.
-        enforce_run_dev_engines_once()?;
+        enforce_run_dev_engines_once(&current_dir)?;
         let mut filters = workspace;
         filters.extend(filter);
         filters.extend(scope);
@@ -5449,12 +5459,12 @@ fn should_cleanup_trash(cmd: &Commands) -> bool {
 }
 
 /// The devEngines gate for `run`, applied once per process.
-fn enforce_run_dev_engines_once() -> anyhow::Result<()> {
+fn enforce_run_dev_engines_once(project_dir: &std::path::Path) -> anyhow::Result<()> {
     static CHECKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     if CHECKED.swap(true, std::sync::atomic::Ordering::SeqCst) {
         return Ok(());
     }
-    enforce_dev_engines(&std::env::current_dir()?)
+    enforce_dev_engines(project_dir)
 }
 
 /// npm's devEngines gate for the current (non-global) project.
@@ -5531,6 +5541,13 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
         Commands::Install { prefix: Some(_), .. }
         | Commands::Uninstall { prefix: Some(_), .. }
         | Commands::List { prefix: Some(_), .. } => current_dir,
+        Commands::Pkg { prefix, .. } => {
+            if prefix == Path::new(".") {
+                apply_cli_prefix(current_dir, cli_overrides.as_ref())
+            } else {
+                current_dir
+            }
+        }
         _ => apply_cli_prefix(current_dir, cli_overrides.as_ref()),
     };
 
@@ -5546,6 +5563,13 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
                     p.clone()
                 } else {
                     current_dir.join(p)
+                }
+            }
+            Commands::Pkg { prefix, .. } => {
+                if prefix.is_absolute() {
+                    prefix.clone()
+                } else {
+                    current_dir.join(prefix)
                 }
             }
             _ => current_dir.clone(),
@@ -5564,6 +5588,13 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
                     p.clone()
                 } else {
                     current_dir.join(p)
+                }
+            }
+            Commands::Pkg { prefix, .. } => {
+                if prefix.is_absolute() {
+                    prefix.clone()
+                } else {
+                    current_dir.join(prefix)
                 }
             }
             _ => current_dir.clone(),
@@ -7972,7 +8003,7 @@ fn execute_run_sync(
 ) -> anyhow::Result<()> {
     // `npm run` (and test/start/stop/restart, which run through it) checks
     // devEngines once, at the project prefix, before any script.
-    enforce_run_dev_engines_once()?;
+    enforce_run_dev_engines_once(&current_dir)?;
     let manifest_path = current_dir.join("package.json");
     if !manifest_path.exists() {
         return Err(anyhow::anyhow!(
