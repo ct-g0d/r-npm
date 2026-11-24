@@ -69,7 +69,7 @@ pub fn translate_npx_args(tokens: &[String]) -> Vec<String> {
                     i += 1;
                     continue;
                 }
-                "npm" | "node-arg" => {
+                "npm" | "node-arg" | "n" => {
                     eprintln!("npx: the --{key} argument has been removed.");
                     saw_removed_flags = true;
                     if inline_val.is_none()
@@ -99,7 +99,7 @@ pub fn translate_npx_args(tokens: &[String]) -> Vec<String> {
                     i += 1;
                     continue;
                 }
-                "n" | "no" | "no-yes" => {
+                "no" | "no-yes" => {
                     if let Some(val) = inline_val {
                         if val == "false" || val == "0" || val == "no" || val == "off" {
                             result.push("--yes".to_string());
@@ -113,15 +113,7 @@ pub fn translate_npx_args(tokens: &[String]) -> Vec<String> {
                     continue;
                 }
                 "no-install" => {
-                    if let Some(val) = inline_val {
-                        if val == "false" || val == "0" || val == "no" || val == "off" {
-                            result.push("--yes".to_string());
-                        } else {
-                            result.push("--no-yes".to_string());
-                        }
-                    } else {
-                        result.push("--no-yes".to_string());
-                    }
+                    result.push("--no-yes".to_string());
                     i += 1;
                     continue;
                 }
@@ -451,11 +443,7 @@ mod tests {
             vec!["exec", "--no-yes", "--", "cowsay"]
         );
 
-        // -n, --no and --no-yes
-        assert_eq!(
-            translate_npx_args(&["-n".into(), "cowsay".into()]),
-            vec!["exec", "--no-yes", "--", "cowsay"]
-        );
+        // --no and --no-yes
         assert_eq!(
             translate_npx_args(&["--no".into(), "cowsay".into()]),
             vec!["exec", "--no-yes", "--", "cowsay"]
@@ -465,20 +453,22 @@ mod tests {
             vec!["exec", "--no-yes", "--", "cowsay"]
         );
         assert_eq!(
-            translate_npx_args(&["-n=false".into(), "cowsay".into()]),
-            vec!["exec", "--yes", "--", "cowsay"]
-        );
-        assert_eq!(
-            translate_npx_args(&["-n=0".into(), "cowsay".into()]),
-            vec!["exec", "--yes", "--", "cowsay"]
-        );
-        assert_eq!(
             translate_npx_args(&["--no=false".into(), "cowsay".into()]),
             vec!["exec", "--yes", "--", "cowsay"]
         );
         assert_eq!(
             translate_npx_args(&["--no-install=false".into(), "cowsay".into()]),
-            vec!["exec", "--yes", "--", "cowsay"]
+            vec!["exec", "--no-yes", "--", "cowsay"]
+        );
+
+        // -n removed flag (legacy --node-arg switch from npm 11.20.0)
+        assert_eq!(
+            translate_npx_args(&["-n=val".into(), "cowsay".into()]),
+            vec!["exec", "--", "cowsay"]
+        );
+        assert_eq!(
+            translate_npx_args(&["-n".into(), "val".into(), "cowsay".into()]),
+            vec!["exec", "--", "cowsay"]
         );
 
         // --yes=false / --yes=0 / -y=false / -y=0 / --yes=true / --yes=1 / -y=true / -y=1
