@@ -1539,3 +1539,231 @@ fn test_path_matches_workspace_patterns_comprehensive() {
     assert!(LockfileV3::path_matches_workspace_patterns("packages\\pkg-a", &patterns));
     assert!(LockfileV3::path_matches_workspace_patterns("packages/pkg-a/", &patterns));
 }
+
+#[test]
+fn test_engine_non_ascii_whitespace_boundary_no_panic() {
+    // Non-ASCII whitespace characters like U+00A0 (NBSP, 2 bytes) and U+3000 (ideographic space, 3 bytes)
+    // should not cause byte-indexing panics on character boundaries.
+    let json = r#"{
+        "name": "engine-test",
+        "version": "1.0.0",
+        "lockfileVersion": 3,
+        "packages": {
+            "": {
+                "name": "engine-test",
+                "version": "1.0.0",
+                "engines": [
+                    "node\u00A0>=18.0.0",
+                    "npm\u3000>=9.0.0"
+                ]
+            }
+        }
+    }"#;
+
+    let lock: LockfileV3 = serde_json::from_str(json).expect("Must parse engines with non-ASCII whitespace without panic");
+    let root = lock.packages.get("").expect("Root package must exist");
+    let map = root.engines_map().expect("Engines map must parse");
+    assert_eq!(map.get("node").map(|s| s.as_str()), Some(">=18.0.0"));
+    assert_eq!(map.get("npm").map(|s| s.as_str()), Some(">=9.0.0"));
+}
+
+#[test]
+fn test_license_deserialization_shapes() {
+    let json = r#"{
+        "name": "license-shapes",
+        "version": "1.0.0",
+        "lockfileVersion": 3,
+        "packages": {
+            "node_modules/obj-lic": {
+                "version": "1.0.0",
+                "license": { "type": "MIT", "url": "https://example.com" }
+            },
+            "node_modules/name-lic": {
+                "version": "1.0.0",
+                "license": { "name": "Apache-2.0" }
+            },
+            "node_modules/arr-lic": {
+                "version": "1.0.0",
+                "license": ["MIT", "Apache-2.0"]
+            },
+            "node_modules/str-lic": {
+                "version": "1.0.0",
+                "license": "BSD-3-Clause"
+            }
+        }
+    }"#;
+
+    let lock: LockfileV3 = serde_json::from_str(json).expect("Must parse object and array license shapes");
+    assert_eq!(lock.packages.get("node_modules/obj-lic").unwrap().license.as_deref(), Some("MIT"));
+    assert_eq!(lock.packages.get("node_modules/name-lic").unwrap().license.as_deref(), Some("Apache-2.0"));
+    assert_eq!(lock.packages.get("node_modules/arr-lic").unwrap().license.as_deref(), Some("MIT OR Apache-2.0"));
+    assert_eq!(lock.packages.get("node_modules/str-lic").unwrap().license.as_deref(), Some("BSD-3-Clause"));
+}
+
+#[test]
+fn test_integrity_and_shrinkwrap_aliases() {
+    let json = r#"{
+        "name": "alias-test",
+        "version": "1.0.0",
+        "lockfileVersion": 3,
+        "packages": {
+            "node_modules/aliased-pkg": {
+                "version": "1.0.0",
+                "_integrity": "sha512-test==",
+                "_hasShrinkwrap": true
+            }
+        }
+    }"#;
+
+    let lock: LockfileV3 = serde_json::from_str(json).expect("Must parse _integrity and _hasShrinkwrap aliases");
+    let pkg = lock.packages.get("node_modules/aliased-pkg").unwrap();
+    assert_eq!(pkg.integrity.as_deref(), Some("sha512-test=="));
+    assert_eq!(pkg.has_shrinkwrap, Some(true));
+}
+
+#[test]
+fn test_flag_mutations_clear_raw_value() {
+    let json = r#"{
+        "name": "raw-val-test",
+        "version": "1.0.0",
+        "lockfileVersion": 3,
+        "packages": {
+            "node_modules/foo": {
+                "version": "1.0.0",
+                "dev": true
+            }
+        }
+    }"#;
+
+    let mut lock = LockfileV3::from_json_str(json).unwrap();
+    let pkg = lock.packages.get_mut("node_modules/foo").unwrap();
+    assert!(pkg.raw_value.is_some(), "from_json_str must cache raw_value");
+
+    // Mutation via set_dev must clear raw_value
+    pkg.set_dev(false);
+    assert!(pkg.raw_value.is_none(), "set_dev must invalidate raw_value");
+
+    let out_json = lock.to_json_string().unwrap();
+    assert!(!out_json.contains("\"dev\": true"), "Output JSON must reflect mutated dev: false");
+}
+
+#[test]
+fn test_to_legacy_dependencies_link_parity() {
+    let mut lock = LockfileV3::new("link-test", Some("1.0.0".to_string()));
+    lock.lockfile_version = 2;
+
+    // Target workspace package
+    let mut target = LockfilePackage {
+        version: Some("1.2.3".to_string()),
+        ..Default::default()
+    };
+    let mut target_deps = BTreeMap::new();
+    target_deps.insert("chalk".to_string(), "^5.0.0".to_string());
+    target.dependencies = Some(target_deps);
+    lock.packages.insert("packages/my-ws".to_string(), target);
+
+    // Symlink node
+    let link_pkg = LockfilePackage {
+        resolved: Some("packages/my-ws".to_string()),
+        link: Some(true),
+        dev: Some(true),
+        ..Default::default()
+    };
+    lock.packages.insert("node_modules/my-ws".to_string(), link_pkg);
+
+    let json = lock.to_json_string_version(2).unwrap();
+    let val: serde_json::Value = serde_json::from_str(&json).unwrap();
+
+    let link_dep = &val["dependencies"]["my-ws"];
+    assert_eq!(link_dep["version"], "file:packages/my-ws");
+    assert!(link_dep.get("resolved").is_none(), "Link must NOT have resolved in legacy dependencies");
+    assert!(link_dep.get("integrity").is_none(), "Link must NOT have integrity in legacy dependencies");
+    assert!(link_dep.get("dev").is_none(), "Link must NOT have dev flag in legacy dependencies");
+    assert_eq!(link_dep["requires"]["chalk"], "^5.0.0", "Link requires must be populated from target package");
+}
+
+#[test]
+fn test_to_legacy_dependencies_requires_includes_optional_and_omits_dev_optional_when_dev() {
+    let mut lock = LockfileV3::new("requires-test", Some("1.0.0".to_string()));
+    lock.lockfile_version = 2;
+
+    let mut pkg = LockfilePackage {
+        version: Some("1.0.0".to_string()),
+        dev: Some(true),
+        dev_optional: Some(true), // redundant flag with dev
+        ..Default::default()
+    };
+    let mut deps = BTreeMap::new();
+    deps.insert("dep-prod".to_string(), "1.0.0".to_string());
+    pkg.dependencies = Some(deps);
+    let mut opt_deps = BTreeMap::new();
+    opt_deps.insert("dep-opt".to_string(), "2.0.0".to_string());
+    pkg.optional_dependencies = Some(opt_deps);
+
+    lock.packages.insert("node_modules/foo".to_string(), pkg);
+
+    let json = lock.to_json_string_version(2).unwrap();
+    let val: serde_json::Value = serde_json::from_str(&json).unwrap();
+
+    let foo = &val["dependencies"]["foo"];
+    assert_eq!(foo["dev"], true);
+    assert!(foo.get("devOptional").is_none(), "devOptional must be omitted when dev: true");
+    assert_eq!(foo["requires"]["dep-prod"], "1.0.0");
+    assert_eq!(foo["requires"]["dep-opt"], "2.0.0");
+}
+
+#[test]
+fn test_v1_to_v3_directory_link_migration() {
+    let v1_json = r#"{
+        "name": "v1-link-test",
+        "version": "1.0.0",
+        "lockfileVersion": 1,
+        "dependencies": {
+            "local-ws": {
+                "version": "file:packages/local-ws",
+                "requires": {
+                    "bar": "1.0.0"
+                }
+            }
+        }
+    }"#;
+
+    let v3 = parse_and_migrate(v1_json).expect("Must migrate v1 file: links to v3");
+    let link = v3.packages.get("node_modules/local-ws").expect("Must create node_modules link entry");
+    assert_eq!(link.link, Some(true));
+    assert_eq!(link.resolved.as_deref(), Some("packages/local-ws"));
+    assert!(link.version.is_none());
+
+    let target = v3.packages.get("packages/local-ws").expect("Must create target entry for workspace link");
+    assert_eq!(target.dependencies.as_ref().unwrap().get("bar").map(|s| s.as_str()), Some("1.0.0"));
+}
+
+#[test]
+fn test_integrity_audit_aliased_direct_dependency() {
+    let mut lock = LockfileV3::new("audit-alias-test", Some("1.0.0".to_string()));
+    let mut root_deps = BTreeMap::new();
+    root_deps.insert("my-alias".to_string(), "npm:chalk@5.0.0".to_string());
+    lock.root_package_mut().unwrap().dependencies = Some(root_deps);
+
+    let mut pkg = LockfilePackage {
+        name: Some("chalk".to_string()),
+        version: Some("5.0.0".to_string()),
+        resolved: Some("file:./local-chalk.tgz".to_string()),
+        integrity: Some("sha512-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==".to_string()),
+        ..Default::default()
+    };
+    pkg.normalize_flags();
+    lock.packages.insert("node_modules/my-alias".to_string(), pkg);
+
+    let policy = IntegrityPolicy {
+        allow_transitive_file: false, // Disallow transitive files, but direct files are allowed
+        require_integrity: false,
+        ..Default::default()
+    };
+
+    let res = verify_lockfile_integrity(&lock, &policy);
+    if let Err(e) = &res {
+        eprintln!("Integrity error: {:?}", e);
+    }
+    assert!(res.is_ok(), "Aliased direct dependency must be recognized as direct");
+}
