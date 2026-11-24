@@ -3788,6 +3788,7 @@ pub(crate) async fn ensure_npx_environment(
         std::fs::write(env_dir.join("package.json"), &manifest_text)?;
         let mut installer = Installer::new(InstallOptions {
             project_dir: env_dir.clone(),
+            init_cwd: std::env::current_dir().ok(),
             registry_url: registry,
             cache_dir: Some(cache_path),
             silent: true,
@@ -3942,6 +3943,7 @@ pub(crate) async fn execute_exec(
 
                 let install_options = InstallOptions {
                     project_dir: npx_env_dir.clone(),
+                    init_cwd: std::env::current_dir().ok(),
                     registry_url: registry,
                     cache_dir: Some(cache_path.clone()),
                     offline: false,
@@ -4028,6 +4030,7 @@ pub(crate) async fn execute_exec(
 
             let install_options = InstallOptions {
                 project_dir: npx_env_dir.clone(),
+                init_cwd: std::env::current_dir().ok(),
                 registry_url: registry,
                 cache_dir: Some(cache_path.clone()),
                 offline: false,
@@ -5314,6 +5317,7 @@ async fn run_audit_fix(
 
     let options = InstallOptions {
         project_dir: project_dir.to_path_buf(),
+        init_cwd: std::env::current_dir().ok(),
         registry_url: registry.clone(),
         ignore_scripts: config.get_bool("ignore-scripts").unwrap_or(false),
         foreground_scripts: config.get_bool("foreground-scripts").unwrap_or(false),
@@ -5715,6 +5719,7 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
 
             let options = InstallOptions {
                 project_dir: target_dir,
+                init_cwd: std::env::current_dir().ok(),
                 is_global: global,
                 registry_url: registry.clone(),
                 cache_dir: cache,
@@ -5957,6 +5962,7 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             };
             let options = InstallOptions {
                 project_dir: current_dir.clone(),
+                init_cwd: std::env::current_dir().ok(),
                 registry_url: registry.clone(),
                 cache_dir: cache,
                 offline,
@@ -6446,6 +6452,7 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             let report_dir = target_dir.clone();
             let options = InstallOptions {
                 project_dir: target_dir,
+                init_cwd: std::env::current_dir().ok(),
                 is_global,
                 ..Default::default()
             };
@@ -7999,6 +8006,10 @@ fn execute_run_sync(
         ctx.package_version = manifest.version.clone();
         ctx.foreground_scripts = foreground_scripts;
         ctx.extra_env = lifecycle_config_env(&current_dir);
+        if let Ok(inv_cwd) = std::env::current_dir() {
+            ctx.extra_env
+                .insert("INIT_CWD".into(), inv_cwd.to_string_lossy().to_string());
+        }
         ctx.extra_env
             .insert("npm_lifecycle_script".into(), cmd.clone());
         if let Some(shell) = config.get("script-shell") {

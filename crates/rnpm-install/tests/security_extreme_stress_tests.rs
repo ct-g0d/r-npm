@@ -1897,3 +1897,195 @@ fn test_numeric_org_git_scp_parsing_and_remote_fragment_and_registry_root_smuggl
     let err = res_forged.unwrap_err().to_string();
     assert!(err.contains("EALLOWREGISTRY"), "Expected EALLOWREGISTRY, got: {err}");
 }
+
+#[test]
+fn test_git_tampered_ref_rejected_under_allow_git_root() {
+    let workspace_paths = HashSet::new();
+    let policy_git_root = SourcePolicy {
+        git: AllowMode::Root,
+        ..Default::default()
+    };
+
+    // 1. package.json declares "github:a/b#v1", lockfile tampered with "github:a/b#evil"
+    let mut root_declared_v1 = HashSet::new();
+    root_declared_v1.insert("foo".to_string());
+    root_declared_v1.insert("github:a/b#v1".to_string());
+
+    let mut packages_tampered = BTreeMap::new();
+    let mut root_deps_tampered = BTreeMap::new();
+    root_deps_tampered.insert("foo".to_string(), "github:a/b#evil".to_string());
+    packages_tampered.insert(
+        String::new(),
+        LockfilePackage {
+            dependencies: Some(root_deps_tampered),
+            ..Default::default()
+        },
+    );
+    packages_tampered.insert(
+        "node_modules/foo".to_string(),
+        LockfilePackage {
+            resolved: Some("git+https://github.com/a/b.git#evil".to_string()),
+            ..Default::default()
+        },
+    );
+    let lockfile_tampered = LockfileV3 {
+        name: "test-tampered-git".to_string(),
+        version: None,
+        lockfile_version: 3,
+        requires: None,
+        packages: packages_tampered,
+    };
+
+    let res_tampered = check_sources(&lockfile_tampered, &root_declared_v1, &workspace_paths, &policy_git_root);
+    assert!(res_tampered.is_err(), "Expected tampered git ref '#evil' to be rejected when package.json declared '#v1'");
+    let err = res_tampered.unwrap_err().to_string();
+    assert!(err.contains("EALLOWGIT"), "Expected EALLOWGIT error, got: {err}");
+
+    // 2. package.json declares "github:a/b#v1", lockfile has exact matching "#v1"
+    let mut packages_exact = BTreeMap::new();
+    let mut root_deps_exact = BTreeMap::new();
+    root_deps_exact.insert("foo".to_string(), "github:a/b#v1".to_string());
+    packages_exact.insert(
+        String::new(),
+        LockfilePackage {
+            dependencies: Some(root_deps_exact),
+            ..Default::default()
+        },
+    );
+    packages_exact.insert(
+        "node_modules/foo".to_string(),
+        LockfilePackage {
+            resolved: Some("git+https://github.com/a/b.git#v1".to_string()),
+            ..Default::default()
+        },
+    );
+    let lockfile_exact = LockfileV3 {
+        name: "test-exact-git".to_string(),
+        version: None,
+        lockfile_version: 3,
+        requires: None,
+        packages: packages_exact,
+    };
+    let res_exact = check_sources(&lockfile_exact, &root_declared_v1, &workspace_paths, &policy_git_root);
+    assert!(res_exact.is_ok(), "Expected exact git ref '#v1' to succeed under allow-git=root, got: {:?}", res_exact.err());
+
+    // 3. package.json declares unpinned "github:a/b", lockfile resolves to full 40-char commit SHA
+    let mut root_declared_unpinned = HashSet::new();
+    root_declared_unpinned.insert("bar".to_string());
+    root_declared_unpinned.insert("github:a/b".to_string());
+
+    let mut packages_unpinned = BTreeMap::new();
+    let mut root_deps_unpinned = BTreeMap::new();
+    root_deps_unpinned.insert("bar".to_string(), "git+https://github.com/a/b.git#1234567890abcdef1234567890abcdef12345678".to_string());
+    packages_unpinned.insert(
+        String::new(),
+        LockfilePackage {
+            dependencies: Some(root_deps_unpinned),
+            ..Default::default()
+        },
+    );
+    packages_unpinned.insert(
+        "node_modules/bar".to_string(),
+        LockfilePackage {
+            resolved: Some("git+https://github.com/a/b.git#1234567890abcdef1234567890abcdef12345678".to_string()),
+            ..Default::default()
+        },
+    );
+    let lockfile_unpinned = LockfileV3 {
+        name: "test-unpinned-git".to_string(),
+        version: None,
+        lockfile_version: 3,
+        requires: None,
+        packages: packages_unpinned,
+    };
+    let res_unpinned = check_sources(&lockfile_unpinned, &root_declared_unpinned, &workspace_paths, &policy_git_root);
+    assert!(res_unpinned.is_ok(), "Expected unpinned github:a/b resolving to 40-char SHA to succeed under allow-git=root, got: {:?}", res_unpinned.err());
+
+    // 4. package.json declares unpinned "github:a/b", but lockfile tampered with non-SHA branch/ref "#evil"
+    let mut packages_unpinned_tampered = BTreeMap::new();
+    let mut root_deps_unpinned_tampered = BTreeMap::new();
+    root_deps_unpinned_tampered.insert("bar".to_string(), "github:a/b#evil".to_string());
+    packages_unpinned_tampered.insert(
+        String::new(),
+        LockfilePackage {
+            dependencies: Some(root_deps_unpinned_tampered),
+            ..Default::default()
+        },
+    );
+    packages_unpinned_tampered.insert(
+        "node_modules/bar".to_string(),
+        LockfilePackage {
+            resolved: Some("git+https://github.com/a/b.git#evil".to_string()),
+            ..Default::default()
+        },
+    );
+    let lockfile_unpinned_tampered = LockfileV3 {
+        name: "test-unpinned-tampered".to_string(),
+        version: None,
+        lockfile_version: 3,
+        requires: None,
+        packages: packages_unpinned_tampered,
+    };
+    let res_unpinned_tampered = check_sources(&lockfile_unpinned_tampered, &root_declared_unpinned, &workspace_paths, &policy_git_root);
+    assert!(res_unpinned_tampered.is_err(), "Expected unpinned github:a/b with tampered non-SHA ref '#evil' to be rejected under allow-git=root");
+    let err_unpinned = res_unpinned_tampered.unwrap_err().to_string();
+    assert!(err_unpinned.contains("EALLOWGIT"), "Expected EALLOWGIT, got: {err_unpinned}");
+
+    // 5. Root dependencies map has untampered "github:a/b#v1", but node_modules/foo.resolved has attacker repo
+    let mut packages_resolved_tampered_repo = BTreeMap::new();
+    let mut root_deps_ok = BTreeMap::new();
+    root_deps_ok.insert("foo".to_string(), "github:a/b#v1".to_string());
+    packages_resolved_tampered_repo.insert(
+        String::new(),
+        LockfilePackage {
+            dependencies: Some(root_deps_ok.clone()),
+            ..Default::default()
+        },
+    );
+    packages_resolved_tampered_repo.insert(
+        "node_modules/foo".to_string(),
+        LockfilePackage {
+            resolved: Some("git+https://github.com/evil/backdoor.git#evil".to_string()),
+            ..Default::default()
+        },
+    );
+    let lockfile_resolved_tampered_repo = LockfileV3 {
+        name: "test-resolved-tampered-repo".to_string(),
+        version: None,
+        lockfile_version: 3,
+        requires: None,
+        packages: packages_resolved_tampered_repo,
+    };
+    let res_tampered_repo = check_sources(&lockfile_resolved_tampered_repo, &root_declared_v1, &workspace_paths, &policy_git_root);
+    assert!(res_tampered_repo.is_err(), "Expected tampered resolved repo 'evil/backdoor' to be rejected under allow-git=root even if root deps map had '#v1'");
+    let err_repo = res_tampered_repo.unwrap_err().to_string();
+    assert!(err_repo.contains("EALLOWGIT"), "Expected EALLOWGIT, got: {err_repo}");
+
+    // 6. Root dependencies map has untampered "github:a/b#v1", but node_modules/foo.resolved has tampered ref #evil
+    let mut packages_resolved_tampered_ref = BTreeMap::new();
+    packages_resolved_tampered_ref.insert(
+        String::new(),
+        LockfilePackage {
+            dependencies: Some(root_deps_ok),
+            ..Default::default()
+        },
+    );
+    packages_resolved_tampered_ref.insert(
+        "node_modules/foo".to_string(),
+        LockfilePackage {
+            resolved: Some("git+https://github.com/a/b.git#evil".to_string()),
+            ..Default::default()
+        },
+    );
+    let lockfile_resolved_tampered_ref = LockfileV3 {
+        name: "test-resolved-tampered-ref".to_string(),
+        version: None,
+        lockfile_version: 3,
+        requires: None,
+        packages: packages_resolved_tampered_ref,
+    };
+    let res_tampered_ref = check_sources(&lockfile_resolved_tampered_ref, &root_declared_v1, &workspace_paths, &policy_git_root);
+    assert!(res_tampered_ref.is_err(), "Expected tampered resolved ref '#evil' on node_modules/foo to be rejected under allow-git=root even if root deps map had '#v1'");
+    let err_ref = res_tampered_ref.unwrap_err().to_string();
+    assert!(err_ref.contains("EALLOWGIT"), "Expected EALLOWGIT, got: {err_ref}");
+}

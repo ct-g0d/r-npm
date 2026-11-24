@@ -1287,7 +1287,11 @@ pub fn build_lifecycle_env(ctx: &LifecycleContext) -> HashMap<String, String> {
     env.insert("Path".to_string(), final_path);
 
     // 4. Standard npm environment contract
-    if !env.contains_key("INIT_CWD") {
+    // Real npm set-envs.js always sets INIT_CWD to invocation cwd (unless explicitly passed in extra_env),
+    // never letting a stale outer process INIT_CWD leak through from inherited process.env.
+    if let Some(val) = ctx.extra_env.get("INIT_CWD") {
+        env.insert("INIT_CWD".to_string(), val.clone());
+    } else {
         env.insert(
             "INIT_CWD".to_string(),
             ctx.project_root.to_string_lossy().to_string(),
