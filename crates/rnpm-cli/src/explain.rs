@@ -175,7 +175,7 @@ pub fn run_explain(project_dir: &Path, package: &str, json: bool) -> anyhow::Res
         })
         .collect();
     if matches.is_empty() {
-        anyhow::bail!("npm error code EUSAGE\nnpm error No dependencies found matching {package}");
+        anyhow::bail!("npm error No dependencies found matching {package}");
     }
     if json {
         println!("{}", serde_json::to_string_pretty(&matches)?);
