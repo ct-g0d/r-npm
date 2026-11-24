@@ -184,7 +184,8 @@ impl GitFetcher {
             if !fetch_ok {
                 warn!(
                     "Failed to fetch updates for git repository '{}': {}; continuing with cached refs",
-                    clone_url, fetch_err
+                    rnpm_config::scrub_credentials(clone_url),
+                    rnpm_config::scrub_credentials(&fetch_err)
                 );
             }
 
@@ -194,7 +195,7 @@ impl GitFetcher {
         if offline {
             return Err(anyhow!(
                 "Cannot clone git dependency '{}' in offline mode: repository is not cached",
-                clone_url
+                rnpm_config::scrub_credentials(clone_url)
             ));
         }
 
@@ -331,7 +332,7 @@ impl GitFetcher {
 
                 return Err(anyhow!(
                     "Failed to resolve default HEAD commit in git repository '{}'",
-                    clone_url
+                    rnpm_config::scrub_credentials(clone_url)
                 ));
             }
             Some(r) => r,
@@ -340,7 +341,10 @@ impl GitFetcher {
         // 2. Semver range over tags: e.g. semver:^1.0.0
         if let Some(range_str) = ref_name.strip_prefix("semver:") {
             let range = Range::parse(range_str.trim()).map_err(|e| {
-                anyhow!("Invalid semver range '{range_str}' in git dependency '{clone_url}': {e}")
+                anyhow!(
+                    "Invalid semver range '{range_str}' in git dependency '{}': {e}",
+                    rnpm_config::scrub_credentials(clone_url)
+                )
             })?;
 
             let (ok, stdout, stderr) =
@@ -349,8 +353,8 @@ impl GitFetcher {
             if !ok {
                 return Err(anyhow!(
                     "Failed to list tags in git repository '{}': {}",
-                    clone_url,
-                    stderr
+                    rnpm_config::scrub_credentials(clone_url),
+                    rnpm_config::scrub_credentials(&stderr)
                 ));
             }
 
@@ -375,7 +379,7 @@ impl GitFetcher {
                 return Err(anyhow!(
                     "No matching git tag found for semver range '{}' in '{}'",
                     range_str,
-                    clone_url
+                    rnpm_config::scrub_credentials(clone_url)
                 ));
             }
 
@@ -392,8 +396,8 @@ impl GitFetcher {
             return Err(anyhow!(
                 "Failed to resolve commit for git tag '{}' in '{}': {}",
                 best_tag,
-                clone_url,
-                stderr
+                rnpm_config::scrub_credentials(clone_url),
+                rnpm_config::scrub_credentials(&stderr)
             ));
         }
 
@@ -440,7 +444,7 @@ impl GitFetcher {
         Err(anyhow!(
             "Git ref, tag, or commit '{}' not found in repository '{}'",
             ref_name,
-            clone_url
+            rnpm_config::scrub_credentials(clone_url)
         ))
     }
 

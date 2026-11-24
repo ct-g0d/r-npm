@@ -36,7 +36,7 @@ impl AllowMode {
 }
 
 /// Which dependency sources may be fetched.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct SourcePolicy {
     pub git: AllowMode,
     pub remote: AllowMode,

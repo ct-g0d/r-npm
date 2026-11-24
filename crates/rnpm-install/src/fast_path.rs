@@ -385,9 +385,10 @@ pub fn validate_hidden_lockfile(project_dir: &Path, options: Option<&InstallOpti
         }
     } else if let Ok(manifest) = Manifest::from_file(project_dir.join("package.json")) {
         for name in manifest.dependencies.keys() {
-            if !omit_optional || !manifest.optional_dependencies.contains_key(name) {
-                direct_top_level_deps.insert(format!("node_modules/{name}"));
+            if manifest.optional_dependencies.contains_key(name) {
+                continue;
             }
+            direct_top_level_deps.insert(format!("node_modules/{name}"));
         }
         if !omit_dev {
             for name in manifest.dev_dependencies.keys() {

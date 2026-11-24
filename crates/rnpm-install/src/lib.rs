@@ -2299,6 +2299,54 @@ fn lockfile_entry_omitted(
         || (options.omit_peer && is_peer)
 }
 
+fn is_file_or_local_spec(spec: &str) -> bool {
+    let s = spec.trim();
+    if s.starts_with("file:") {
+        return true;
+    }
+    match PackageTarget::parse(s) {
+        Ok(PackageTarget::File(_)) => true,
+        Ok(PackageTarget::Alias { ref target, .. }) => {
+            matches!(**target, PackageTarget::File(_))
+        }
+        _ => false,
+    }
+}
+
+pub fn lockfile_node_satisfies_spec(
+    lockfile: &LockfileV3,
+    dep_name: &str,
+    pkg: &LockfilePackage,
+    spec: &str,
+) -> bool {
+    let is_file_spec = is_file_or_local_spec(spec);
+    if pkg.link == Some(true) {
+        if is_file_spec {
+            // For file/local path specs, match against the link node directly.
+            // Do NOT dereference to target_pkg, otherwise a mismatched file:./other
+            // would be falsely accepted (target_pkg has resolved=None which passes version_matches_target).
+            return LockfileV3::package_satisfies_spec(dep_name, pkg, spec);
+        }
+        if let Some(target) = pkg.resolved.as_deref() {
+            let norm_target = target.replace('\\', "/");
+            let target_clean = norm_target.strip_prefix("file:").unwrap_or(&norm_target);
+            let target_key = if target_clean == "." || target_clean == "./" {
+                ""
+            } else {
+                target_clean.strip_prefix("./").unwrap_or(target_clean)
+            };
+            let target_pkg = lockfile
+                .packages
+                .get(target_key)
+                .or_else(|| lockfile.packages.get(&target_key.replace('/', "\\")));
+            if let Some(target_pkg) = target_pkg {
+                return LockfileV3::package_satisfies_spec(dep_name, target_pkg, spec);
+            }
+        }
+    }
+    LockfileV3::package_satisfies_spec(dep_name, pkg, spec)
+}
+
 /// Result of an update run.
 #[derive(Debug, Clone)]
 pub struct UpdateSummary {
@@ -6016,12 +6064,15 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
         let lock_deps = root_pkg.dependencies.as_ref().unwrap_or(&empty_deps);
 
         for (dep_name, dep_spec) in &manifest.dependencies {
+            if manifest.optional_dependencies.contains_key(dep_name) {
+                continue;
+            }
             if let Some(lock_spec) = lock_deps.get(dep_name) {
                 if lock_spec != dep_spec {
                     let satisfies = if let Some(pkg) =
                         lockfile.packages.get(&format!("node_modules/{dep_name}"))
                     {
-                        LockfileV3::package_satisfies_spec(dep_name, pkg, dep_spec)
+                        lockfile_node_satisfies_spec(&lockfile, dep_name, pkg, dep_spec)
                     } else {
                         false
                     };
@@ -6050,7 +6101,7 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                     let satisfies = if let Some(pkg) =
                         lockfile.packages.get(&format!("node_modules/{dep_name}"))
                     {
-                        LockfileV3::package_satisfies_spec(dep_name, pkg, dep_spec)
+                        lockfile_node_satisfies_spec(&lockfile, dep_name, pkg, dep_spec)
                     } else {
                         false
                     };
@@ -6083,7 +6134,7 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                         let satisfies = if let Some(pkg) =
                             lockfile.packages.get(&format!("node_modules/{dep_name}"))
                         {
-                            LockfileV3::package_satisfies_spec(dep_name, pkg, dep_spec)
+                            lockfile_node_satisfies_spec(&lockfile, dep_name, pkg, dep_spec)
                         } else {
                             false
                         };
@@ -6105,7 +6156,23 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
         }
 
         // 4. Comprehensive lockfile validation via matches_manifest_for_ci
-        if !lockfile.matches_manifest_for_ci_with_workspaces(&manifest, true, Some(&workspace_members)) {
+        let effective_manifest = if manifest
+            .dependencies
+            .keys()
+            .any(|k| manifest.optional_dependencies.contains_key(k))
+        {
+            let mut m = manifest.clone();
+            m.dependencies
+                .retain(|k, _| !manifest.optional_dependencies.contains_key(k));
+            m
+        } else {
+            manifest.clone()
+        };
+        if !lockfile.matches_manifest_for_ci_with_workspaces(
+            &effective_manifest,
+            true,
+            Some(&workspace_members),
+        ) {
             return Err(anyhow!(
                 "rnpm ERR! code ELOCKFILE_DRIFT: package.json and {} are out of sync. Please run `rnpm install` to update your lockfile. (EUSAGE)",
                 lockfile_name
@@ -6120,7 +6187,7 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
             if platform_skipped_packages.contains(pkg_key) || pkg_info.is_extraneous() {
                 continue;
             }
-            if self.options.omit_dev && pkg_info.dev == Some(true) {
+            if lockfile_entry_omitted(&self.options, &lockfile, pkg_key, pkg_info) {
                 continue;
             }
             if let Some(deps) = &pkg_info.dependencies {
@@ -6167,7 +6234,7 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                     }
 
                     let is_satisfied = if let Some(resolved_pkg) = found_node {
-                        LockfileV3::package_satisfies_spec(dep_name, resolved_pkg, &effective_range)
+                        lockfile_node_satisfies_spec(&lockfile, dep_name, resolved_pkg, &effective_range)
                     } else {
                         false
                     };
