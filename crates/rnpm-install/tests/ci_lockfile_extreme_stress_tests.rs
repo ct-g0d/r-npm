@@ -767,7 +767,9 @@ async fn test_ci_workspace_absent_root_metadata_differential() {
         res3.err()
     );
 
-    // 7. Delete all members from disk while workspaces field remains in package.json (Round 1 Finding 2 regression)
+    // 7. Delete all members from disk while workspaces field remains in package.json:
+    // Real npm 11.20.0 `ci` (e.g. `ci-missing-link-target` and published `eslint` tarballs)
+    // allows absent lockfile workspace folders and leaves dangling links instead of throwing ELOCKFILE_DRIFT.
     fs::remove_dir_all(project_dir.join("packages/member-a")).unwrap();
     fs::remove_dir_all(project_dir.join("packages/member-b")).unwrap();
 
@@ -777,15 +779,11 @@ async fn test_ci_workspace_absent_root_metadata_differential() {
         ..Default::default()
     })
     .unwrap();
-    let drift_empty = installer4.run_ci().await;
+    let res4 = installer4.run_ci().await;
     assert!(
-        drift_empty.is_err(),
-        "run_ci must fail with ELOCKFILE_DRIFT when all workspace members are deleted from disk"
-    );
-    let err_msg4 = drift_empty.unwrap_err().to_string();
-    assert!(
-        err_msg4.contains("ELOCKFILE_DRIFT"),
-        "error must be ELOCKFILE_DRIFT: {err_msg4}"
+        res4.is_ok(),
+        "run_ci must match real npm 11.20.0 by allowing absent workspace folders in lockfile: {:?}",
+        res4.err()
     );
 }
 
