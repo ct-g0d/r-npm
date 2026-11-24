@@ -2353,7 +2353,11 @@ impl RegistryClient {
         {
             // pacote treats a corgi 404 as "abbreviated documents unsupported"
             // and asks once more for the full packument before failing.
-            Err(RegistryError::PackageNotFound { .. }) => {
+            // Strict private registries / proxies may return 406 Not Acceptable or 415 Unsupported Media Type.
+            Err(RegistryError::PackageNotFound { .. })
+            | Err(RegistryError::ServerError {
+                status: 406 | 415, ..
+            }) => {
                 self.get_package_metadata_from_url_conditional_with_accept(
                     package_name,
                     url,
@@ -2419,8 +2423,12 @@ impl RegistryClient {
             )
             .await
         {
-            // If abbreviated documents are unsupported or return 404, fall back once to full JSON
-            Err(RegistryError::PackageNotFound { .. }) => {
+            // If abbreviated documents are unsupported or return 404, 406 Not Acceptable,
+            // or 415 Unsupported Media Type, fall back once to full JSON
+            Err(RegistryError::PackageNotFound { .. })
+            | Err(RegistryError::ServerError {
+                status: 406 | 415, ..
+            }) => {
                 self.get_package_metadata_from_url_conditional_with_accept(
                     package_name,
                     url,
@@ -2775,14 +2783,30 @@ impl RegistryClient {
             join_set.spawn(async move {
                 let res = match client.package_metadata_url(&name) {
                     Ok(url) => {
-                        client
+                        match client
                             .get_package_metadata_from_url_conditional_with_accept(
                                 &name,
-                                url,
+                                url.clone(),
                                 etag.as_deref(),
                                 accept,
                             )
                             .await
+                        {
+                            Err(RegistryError::PackageNotFound { .. })
+                            | Err(RegistryError::ServerError {
+                                status: 406 | 415, ..
+                            }) if accept != "application/json" => {
+                                client
+                                    .get_package_metadata_from_url_conditional_with_accept(
+                                        &name,
+                                        url,
+                                        etag.as_deref(),
+                                        "application/json",
+                                    )
+                                    .await
+                            }
+                            other => other,
+                        }
                     }
                     Err(error) => Err(error),
                 };

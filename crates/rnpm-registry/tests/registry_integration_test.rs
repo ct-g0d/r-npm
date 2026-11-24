@@ -1839,3 +1839,95 @@ async fn test_get_package_metadata_install_concurrent() {
 
     server.stop();
 }
+
+#[tokio::test]
+async fn test_get_package_metadata_install_fallback_on_406_and_415() {
+    let mock_json_406 = br#"{
+        "name": "proxy-pkg-406",
+        "dist-tags": { "latest": "1.0.0" },
+        "versions": {
+            "1.0.0": {
+                "name": "proxy-pkg-406",
+                "version": "1.0.0",
+                "dist": { "tarball": "https://registry.npmjs.org/proxy-pkg-406/-/proxy-pkg-406-1.0.0.tgz" }
+            }
+        }
+    }"#.to_vec();
+
+    let mock_json_415 = br#"{
+        "name": "proxy-pkg-415",
+        "dist-tags": { "latest": "2.0.0" },
+        "versions": {
+            "2.0.0": {
+                "name": "proxy-pkg-415",
+                "version": "2.0.0",
+                "dist": { "tarball": "https://registry.npmjs.org/proxy-pkg-415/-/proxy-pkg-415-2.0.0.tgz" }
+            }
+        }
+    }"#.to_vec();
+
+    let mock_json_406_clone = mock_json_406.clone();
+    let mock_json_415_clone = mock_json_415.clone();
+
+    let server = MockHttpServer::start(move |req| {
+        if req.contains("GET /proxy-pkg-406") {
+            // Strict enterprise proxy rejecting install-v1 with 406 Not Acceptable
+            if req.contains("application/vnd.npm.install-v1+json") {
+                (406, vec![], b"406 Not Acceptable: unknown accept header".to_vec())
+            } else {
+                (
+                    200,
+                    vec![
+                        ("Content-Type", "application/json".to_string()),
+                        ("Content-Length", mock_json_406_clone.len().to_string()),
+                    ],
+                    mock_json_406_clone.clone(),
+                )
+            }
+        } else if req.contains("GET /proxy-pkg-415") {
+            // Strict enterprise proxy rejecting install-v1 with 415 Unsupported Media Type
+            if req.contains("application/vnd.npm.install-v1+json") {
+                (415, vec![], b"415 Unsupported Media Type".to_vec())
+            } else {
+                (
+                    200,
+                    vec![
+                        ("Content-Type", "application/json".to_string()),
+                        ("Content-Length", mock_json_415_clone.len().to_string()),
+                    ],
+                    mock_json_415_clone.clone(),
+                )
+            }
+        } else {
+            (404, vec![], b"Not found".to_vec())
+        }
+    })
+    .await;
+
+    let config = RegistryClientConfig {
+        default_registry: server.url(),
+        timeout: Duration::from_secs(5),
+        ..Default::default()
+    };
+    let client = RegistryClient::with_config(config).unwrap();
+
+    // Verify 406 fallback on get_package_metadata_install
+    let meta_406 = client.get_package_metadata_install("proxy-pkg-406").await.unwrap();
+    assert_eq!(meta_406.name, "proxy-pkg-406");
+    assert_eq!(meta_406.dist_tags.get("latest"), Some(&"1.0.0".to_string()));
+
+    // Verify 415 fallback on get_package_metadata_install
+    let meta_415 = client.get_package_metadata_install("proxy-pkg-415").await.unwrap();
+    assert_eq!(meta_415.name, "proxy-pkg-415");
+    assert_eq!(meta_415.dist_tags.get("latest"), Some(&"2.0.0".to_string()));
+
+    // Verify 406 fallback on get_package_metadata (abbreviated v1)
+    let meta_v1_406 = client.get_package_metadata("proxy-pkg-406").await.unwrap();
+    assert_eq!(meta_v1_406.name, "proxy-pkg-406");
+
+    // Verify 415 fallback on get_package_metadata (abbreviated v1)
+    let meta_v1_415 = client.get_package_metadata("proxy-pkg-415").await.unwrap();
+    assert_eq!(meta_v1_415.name, "proxy-pkg-415");
+
+    server.stop();
+}
