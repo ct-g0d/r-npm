@@ -172,7 +172,7 @@ const oracleEnv={...baseEnv,NPM_CONFIG_USERCONFIG:path.join(root,'empty.npmrc'),
 write(root,'empty.npmrc','');write(root,'global.npmrc','');
 for(const name of ['dep','parent','changing'])for(const version of ['1.0.0','1.1.0','2.0.0']){
   const dir=path.join(root,'tarballs',`${name}-${version}`);manifest(dir,{name,version,...(name==='parent'?{dependencies:{dep:'^1.0.0'}}:{})});write(dir,'index.js','module.exports = 1;\n');
-  const p=await run(process.execPath,[npmCli,'pack','--ignore-scripts','--silent'],dir,oracleEnv);if(p.exit!==0)throw new Error(p.stderr);
+  const p=await run(process.execPath,[npmCli,'pack','--ignore-scripts','--silent'],dir,oracleEnv);if(p.exit!==0)throw new Error(`pack ${name}-${version} failed: exit=${p.exit} err=${p.error} stdout=${p.stdout} stderr=${p.stderr}`);
   tarballs.set(`/${name}-${version}.tgz`,fs.readFileSync(path.join(dir,`${name}-${version}.tgz`)));
 }
 const cases=[];
@@ -632,7 +632,7 @@ for(const [name,versions] of Object.entries({
       manifest(path.join(dir,'node_modules/bundled-leaf/node_modules/bundled-transitive'),{name:'bundled-transitive',license:'ISC',bin:'bin/transitive.js'});
       write(path.join(dir,'node_modules/bundled-leaf/node_modules/bundled-transitive'),'bin/transitive.js','#!/usr/bin/env node\nconsole.log("bundled transitive");\n');
     }
-    const p=await run(process.execPath,[npmCli,'pack','--ignore-scripts','--silent'],dir,oracleEnv);if(p.exit!==0)throw new Error(p.stderr);
+    const p=await run(process.execPath,[npmCli,'pack','--ignore-scripts','--silent'],dir,oracleEnv);if(p.exit!==0)throw new Error(`pack ${name}-${version} failed: exit=${p.exit} err=${p.error} stdout=${p.stdout} stderr=${p.stderr}`);
     const bytes=fs.readFileSync(path.join(dir,`${name}-${version}.tgz`));tarballs.set(`/${name}-${version}.tgz`,bytes);
     packed[version]={name,version,...fields,dist:{tarball:`${registry}${name}-${version}.tgz`,integrity:'sha512-'+createHash('sha512').update(bytes).digest('base64')}};
   }
@@ -895,7 +895,7 @@ for(const [name,versions] of Object.entries({
   const file=name.replace(/^@/,'').replace('/','-');
   for(const [version,fields]of Object.entries(versions)){
     const dir=path.join(root,'tarballs',`${file}-${version}`);manifest(dir,{name,version,...fields});write(dir,'index.js','module.exports = 1;\n');
-    const p=await run(process.execPath,[npmCli,'pack','--ignore-scripts','--silent'],dir,oracleEnv);if(p.exit!==0)throw new Error(p.stderr);
+    const p=await run(process.execPath,[npmCli,'pack','--ignore-scripts','--silent'],dir,oracleEnv);if(p.exit!==0)throw new Error(`pack ${name}-${version} failed: exit=${p.exit} err=${p.error} stdout=${p.stdout} stderr=${p.stderr}`);
     const bytes=fs.readFileSync(path.join(dir,`${file}-${version}.tgz`));tarballs.set(`/${file}-${version}.tgz`,bytes);
     packed[version]={name,version,...fields,dist:{tarball:`${registry}${file}-${version}.tgz`,integrity:'sha512-'+createHash('sha512').update(bytes).digest('base64')}};
   }
