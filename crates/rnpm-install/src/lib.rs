@@ -2319,31 +2319,101 @@ pub fn lockfile_node_satisfies_spec(
     pkg: &LockfilePackage,
     spec: &str,
 ) -> bool {
-    let is_file_spec = is_file_or_local_spec(spec);
     if pkg.link == Some(true) {
-        if is_file_spec {
+        if is_file_or_local_spec(spec) {
             // For file/local path specs, match against the link node directly.
             // Do NOT dereference to target_pkg, otherwise a mismatched file:./other
-            // would be falsely accepted (target_pkg has resolved=None which passes version_matches_target).
+            // would be falsely accepted.
             return LockfileV3::package_satisfies_spec(dep_name, pkg, spec);
         }
-        if let Some(target) = pkg.resolved.as_deref() {
-            let norm_target = target.replace('\\', "/");
-            let target_clean = norm_target.strip_prefix("file:").unwrap_or(&norm_target);
-            let target_key = if target_clean == "." || target_clean == "./" {
-                ""
-            } else {
-                target_clean.strip_prefix("./").unwrap_or(target_clean)
+
+        // Parse target to determine whether this spec is allowed to dereference a link node.
+        // ONLY dereference for semver/version/range/tag/workspace specs, or an Alias pointing to them.
+        // Never dereference for git specs, remote URLs, or file/bare path specs!
+        let parsed_target = PackageSpec::parse_dependency(dep_name, spec)
+            .map(|s| s.target)
+            .or_else(|_| PackageTarget::parse(spec));
+
+        let (can_dereference, maybe_alias_name) = match parsed_target {
+            Ok(
+                PackageTarget::Range(_)
+                | PackageTarget::Version(_)
+                | PackageTarget::Tag(_)
+                | PackageTarget::Workspace(_),
+            ) => (true, None),
+            Ok(PackageTarget::Alias { ref name, ref target }) => {
+                if matches!(
+                    **target,
+                    PackageTarget::Range(_) | PackageTarget::Version(_) | PackageTarget::Tag(_)
+                ) {
+                    (true, Some(name.clone()))
+                } else {
+                    (false, None)
+                }
+            }
+            _ => (false, None),
+        };
+
+        if !can_dereference {
+            // A local link cannot satisfy a remote git, tarball, or arbitrary non-semver spec.
+            return false;
+        }
+
+        // Follow link chains safely with a bounded loop (up to 8 hops) and cycle detection.
+        let mut current_pkg = pkg;
+        let mut hops = 0;
+        let mut visited = HashSet::new();
+
+        let final_target_pkg = loop {
+            if hops >= 8 {
+                return false;
+            }
+            hops += 1;
+
+            let Some(target_raw) = current_pkg.resolved.as_deref() else {
+                return false;
             };
+            let norm_target = target_raw.replace('\\', "/");
+            let target_clean = norm_target
+                .strip_prefix("file:")
+                .unwrap_or(&norm_target)
+                .trim_end_matches('/');
+            let target_key =
+                if target_clean == "." || target_clean == "./" || target_clean.is_empty() {
+                    ""
+                } else {
+                    target_clean.strip_prefix("./").unwrap_or(target_clean)
+                };
+
+            if !visited.insert(target_key.to_string()) {
+                return false; // cycle detected
+            }
+
             let target_pkg = lockfile
                 .packages
                 .get(target_key)
                 .or_else(|| lockfile.packages.get(&target_key.replace('/', "\\")));
-            if let Some(target_pkg) = target_pkg {
-                return LockfileV3::package_satisfies_spec(dep_name, target_pkg, spec);
+
+            let Some(target_pkg) = target_pkg else {
+                return false; // broken link: target package missing from lockfile
+            };
+
+            if target_pkg.link == Some(true) {
+                current_pkg = target_pkg;
+            } else {
+                break target_pkg;
+            }
+        };
+
+        if let Some(ref alias_name) = maybe_alias_name {
+            if final_target_pkg.name.as_deref() != Some(alias_name.as_str()) {
+                return false;
             }
         }
+
+        return LockfileV3::package_satisfies_spec(dep_name, final_target_pkg, spec);
     }
+
     LockfileV3::package_satisfies_spec(dep_name, pkg, spec)
 }
 
@@ -6220,7 +6290,12 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                         range_str.clone()
                     };
 
-                    let mut found_node: Option<&LockfilePackage> = None;
+                    let is_optional_dep = pkg_info
+                        .optional_dependencies
+                        .as_ref()
+                        .is_some_and(|od| od.contains_key(dep_name));
+
+                    let mut found_node: Option<(String, &LockfilePackage)> = None;
                     for scope in rnpm_solver::hoisting::iter_ancestor_scopes(pkg_key) {
                         let candidate_key = if scope.is_empty() {
                             format!("node_modules/{dep_name}")
@@ -6228,12 +6303,25 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                             format!("{scope}/node_modules/{dep_name}")
                         };
                         if let Some(p) = lockfile.packages.get(&candidate_key) {
-                            found_node = Some(p);
+                            found_node = Some((candidate_key, p));
                             break;
                         }
                     }
 
-                    let is_satisfied = if let Some(resolved_pkg) = found_node {
+                    if is_optional_dep {
+                        if self.options.omit_optional || found_node.is_none() {
+                            continue;
+                        }
+                        if let Some((ref cand_key, cand_pkg)) = found_node {
+                            if platform_skipped_packages.contains(cand_key)
+                                || lockfile_entry_omitted(&self.options, &lockfile, cand_key, cand_pkg)
+                            {
+                                continue;
+                            }
+                        }
+                    }
+
+                    let is_satisfied = if let Some((_, resolved_pkg)) = found_node {
                         lockfile_node_satisfies_spec(&lockfile, dep_name, resolved_pkg, &effective_range)
                     } else {
                         false

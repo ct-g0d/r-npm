@@ -15,6 +15,7 @@ use std::fs;
 use tempfile::tempdir;
 
 use rnpm_core::manifest::{Manifest, PackageWorkspaces};
+use rnpm_core::spec::PackageTarget;
 use rnpm_install::fast_path::{compute_project_fingerprint, validate_hidden_lockfile};
 use rnpm_install::git::GitFetcher;
 use rnpm_install::policy::{
@@ -24,15 +25,18 @@ use rnpm_install::{lockfile_node_satisfies_spec, InstallOptions, Installer};
 use rnpm_lockfile::{LockfilePackage, LockfileV3};
 
 /// a) `check_ci_drift` with a dep in both `dependencies` and `optionalDependencies` (Flash 4B-F4).
-/// In npm 11.20.0, optionalDependencies overrides dependencies, so package-lock.json omits
-/// it from packages[""].dependencies and places it only in packages[""].optionalDependencies.
-/// check_ci_drift must NOT fail with "package.json dependency missing from package-lock.json".
+/// Tests:
+/// 1. Conflicting ranges: dependencies: "^1.0.0" vs optionalDependencies: "^2.0.0" -> optionalDependencies wins.
+/// 2. Negative case: a real missing required production dependency fails run_ci with ELOCKFILE_DRIFT.
+/// 3. Negative case: drifted optionalDependencies range fails run_ci with ELOCKFILE_DRIFT.
 #[tokio::test]
 async fn test_check_ci_drift_dep_in_both_dependencies_and_optional_dependencies() {
     let tmp = tempdir().unwrap();
     let project_dir = tmp.path();
 
-    // 1. package.json declares "dual-dep" in both dependencies and optionalDependencies
+    // 1. Conflicting ranges: package.json declares "dual-dep" with ^1.0.0 in dependencies,
+    // but ^2.0.0 in optionalDependencies. In npm 11.20.0, optionalDependencies overrides dependencies,
+    // so package-lock.json only has dual-dep in optionalDependencies with ^2.0.0.
     let mut manifest = Manifest::default();
     manifest.name = Some("dual-dep-app".to_string());
     manifest.version = Some("1.0.0".to_string());
@@ -41,22 +45,20 @@ async fn test_check_ci_drift_dep_in_both_dependencies_and_optional_dependencies(
         .insert("dual-dep".to_string(), "^1.0.0".to_string());
     manifest
         .optional_dependencies
-        .insert("dual-dep".to_string(), "^1.0.0".to_string());
+        .insert("dual-dep".to_string(), "^2.0.0".to_string());
     manifest
         .save_to_file(project_dir.join("package.json"))
         .unwrap();
 
-    // 2. package-lock.json matches npm 11.20.0 behavior:
-    // root.dependencies does NOT contain "dual-dep" (it is only in root.optionalDependencies)
     let mut lockfile = LockfileV3::new("dual-dep-app", Some("1.0.0".to_string()));
     let mut opt_deps = BTreeMap::new();
-    opt_deps.insert("dual-dep".to_string(), "^1.0.0".to_string());
+    opt_deps.insert("dual-dep".to_string(), "^2.0.0".to_string());
     lockfile.root_package_mut().unwrap().optional_dependencies = Some(opt_deps);
     lockfile.insert_package(
         "node_modules/dual-dep",
         LockfilePackage {
-            version: Some("1.0.0".to_string()),
-            resolved: Some("https://registry.npmjs.org/dual-dep/-/dual-dep-1.0.0.tgz".to_string()),
+            version: Some("2.1.0".to_string()),
+            resolved: Some("https://registry.npmjs.org/dual-dep/-/dual-dep-2.1.0.tgz".to_string()),
             optional: Some(true),
             ..Default::default()
         },
@@ -76,13 +78,69 @@ async fn test_check_ci_drift_dep_in_both_dependencies_and_optional_dependencies(
     let res = installer.run_ci().await;
     assert!(
         res.is_ok(),
-        "run_ci must succeed when a dependency is in both dependencies and optionalDependencies: {:?}",
+        "run_ci must succeed when optionalDependencies overrides dependencies: {:?}",
         res.err()
+    );
+
+    // 2. Negative case: a missing required production dependency must fail run_ci with ELOCKFILE_DRIFT
+    manifest
+        .dependencies
+        .insert("missing-prod-dep".to_string(), "^1.0.0".to_string());
+    manifest
+        .save_to_file(project_dir.join("package.json"))
+        .unwrap();
+
+    let mut failing_installer = Installer::new(InstallOptions {
+        project_dir: project_dir.to_path_buf(),
+        offline: true,
+        dry_run: true,
+        ..Default::default()
+    })
+    .unwrap();
+
+    let fail_res = failing_installer.run_ci().await;
+    assert!(
+        fail_res.is_err(),
+        "run_ci must fail when a required production dependency is missing from lockfile"
+    );
+    let fail_err = fail_res.unwrap_err().to_string();
+    assert!(
+        fail_err.contains("ELOCKFILE_DRIFT") && fail_err.contains("missing-prod-dep"),
+        "Error should be ELOCKFILE_DRIFT mentioning missing-prod-dep: {fail_err}"
+    );
+
+    // 3. Negative case: drifted optionalDependencies range (manifest asks for ^3.0.0, lock has 2.1.0 / ^2.0.0)
+    manifest.dependencies.remove("missing-prod-dep");
+    manifest
+        .optional_dependencies
+        .insert("dual-dep".to_string(), "^3.0.0".to_string());
+    manifest
+        .save_to_file(project_dir.join("package.json"))
+        .unwrap();
+
+    let mut opt_drift_installer = Installer::new(InstallOptions {
+        project_dir: project_dir.to_path_buf(),
+        offline: true,
+        dry_run: true,
+        ..Default::default()
+    })
+    .unwrap();
+
+    let opt_drift_res = opt_drift_installer.run_ci().await;
+    assert!(
+        opt_drift_res.is_err(),
+        "run_ci must fail when optionalDependencies range drifts"
+    );
+    let opt_drift_err = opt_drift_res.unwrap_err().to_string();
+    assert!(
+        opt_drift_err.contains("ELOCKFILE_DRIFT"),
+        "Error should be ELOCKFILE_DRIFT for drifted optionalDependencies: {opt_drift_err}"
     );
 }
 
 /// b) `check_ci_drift` with a `link: true` workspace member satisfied by a semver range
-/// AND rejecting a mismatched `file:` path (Flash 4B-F2).
+/// AND rejecting a mismatched `file:` path, remote git specs, remote tarball URLs,
+/// broken links, and supporting trailing slashes and link chains (Flash 4B-F2).
 #[tokio::test]
 async fn test_check_ci_drift_link_true_workspace_member_and_file_spec() {
     let tmp = tempdir().unwrap();
@@ -148,7 +206,82 @@ async fn test_check_ci_drift_link_true_workspace_member_and_file_spec() {
         "Link package must REJECT mismatched file:./packages/other"
     );
 
-    // 5. End-to-end run_ci test with workspace member
+    // 5. Remote git spec: a local link MUST REJECT arbitrary remote git URLs
+    assert!(
+        !lockfile_node_satisfies_spec(
+            &lockfile,
+            "my-lib",
+            link_pkg,
+            "git+https://github.com/evil/repo.git#main"
+        ),
+        "Link package must REJECT remote git spec"
+    );
+
+    // 6. Remote tarball URL: a local link MUST REJECT remote tarball URLs
+    assert!(
+        !lockfile_node_satisfies_spec(
+            &lockfile,
+            "my-lib",
+            link_pkg,
+            "https://evil.example.com/pkg.tgz"
+        ),
+        "Link package must REJECT remote tarball URL"
+    );
+
+    // 7. Trailing slash on resolved: "packages/my-lib/" must be normalized cleanly
+    let link_trailing = LockfilePackage {
+        resolved: Some("packages/my-lib/".to_string()),
+        link: Some(true),
+        ..Default::default()
+    };
+    assert!(
+        lockfile_node_satisfies_spec(&lockfile, "my-lib", &link_trailing, "^1.0.0"),
+        "Trailing slash in resolved path must be stripped and satisfy ^1.0.0"
+    );
+    assert!(
+        !lockfile_node_satisfies_spec(&lockfile, "my-lib", &link_trailing, "^2.0.0"),
+        "Trailing slash in resolved path must reject mismatching ^2.0.0"
+    );
+
+    // 8. Broken link pointing to nonexistent workspace target must return false
+    let broken_link = LockfilePackage {
+        resolved: Some("packages/nonexistent-target".to_string()),
+        link: Some(true),
+        ..Default::default()
+    };
+    assert!(
+        !lockfile_node_satisfies_spec(&lockfile, "my-lib", &broken_link, "^1.0.0"),
+        "Broken link to nonexistent target must return false and not fall through"
+    );
+
+    // 9. Chained link: link-1 -> link-2 -> packages/my-lib
+    lockfile.insert_package(
+        "node_modules/chain-1",
+        LockfilePackage {
+            resolved: Some("node_modules/chain-2".to_string()),
+            link: Some(true),
+            ..Default::default()
+        },
+    );
+    lockfile.insert_package(
+        "node_modules/chain-2",
+        LockfilePackage {
+            resolved: Some("packages/my-lib".to_string()),
+            link: Some(true),
+            ..Default::default()
+        },
+    );
+    let chain1_pkg = lockfile.packages.get("node_modules/chain-1").unwrap();
+    assert!(
+        lockfile_node_satisfies_spec(&lockfile, "my-lib", chain1_pkg, "^1.0.0"),
+        "Chained link must be followed safely to final target and satisfy ^1.0.0"
+    );
+    assert!(
+        !lockfile_node_satisfies_spec(&lockfile, "my-lib", chain1_pkg, "^2.0.0"),
+        "Chained link must reject mismatching range ^2.0.0"
+    );
+
+    // 10. End-to-end run_ci test with workspace member
     let mut root_manifest = Manifest::default();
     root_manifest.name = Some("root-app".to_string());
     root_manifest.version = Some("1.0.0".to_string());
@@ -182,7 +315,7 @@ async fn test_check_ci_drift_link_true_workspace_member_and_file_spec() {
 
 /// c) `check_ci_drift` step 5 with `--omit=optional` and `--omit=peer` (Flash 4B-F3).
 /// In step 5, internal lockfile consistency check must skip omitted packages consistently,
-/// so missing transitive dependencies of omitted packages do not trigger EUSAGE.
+/// and handle non-omitted packages whose dependencies list an optional dep that is absent or platform-skipped.
 #[tokio::test]
 async fn test_check_ci_drift_step5_omit_optional_and_omit_peer() {
     let tmp = tempdir().unwrap();
@@ -204,40 +337,48 @@ async fn test_check_ci_drift_step5_omit_optional_and_omit_peer() {
     root_deps.insert("prod-dep".to_string(), "^1.0.0".to_string());
     lockfile.root_package_mut().unwrap().dependencies = Some(root_deps);
 
-    // Valid prod-dep
+    // Valid prod-dep that also lists an optional dep in both dependencies and optionalDependencies
+    // where the optional dep is platform-skipped (absent from lockfile)
+    let mut prod_deps = BTreeMap::new();
+    prod_deps.insert("platform-opt-dep".to_string(), "^1.0.0".to_string());
+    let mut prod_opt_deps = BTreeMap::new();
+    prod_opt_deps.insert("platform-opt-dep".to_string(), "^1.0.0".to_string());
+
     lockfile.insert_package(
         "node_modules/prod-dep",
         LockfilePackage {
             version: Some("1.0.0".to_string()),
             resolved: Some("https://registry.npmjs.org/prod-dep/-/prod-dep-1.0.0.tgz".to_string()),
+            dependencies: Some(prod_deps),
+            optional_dependencies: Some(prod_opt_deps),
             ..Default::default()
         },
     );
 
     // Broken optional package with missing transitive dep in lockfile
-    let mut opt_deps = BTreeMap::new();
-    opt_deps.insert("ghost-missing-dep".to_string(), "^1.0.0".to_string());
+    let mut broken_opt_deps = BTreeMap::new();
+    broken_opt_deps.insert("ghost-missing-dep".to_string(), "^1.0.0".to_string());
     lockfile.insert_package(
         "node_modules/broken-opt",
         LockfilePackage {
             version: Some("1.0.0".to_string()),
             resolved: Some("https://registry.npmjs.org/broken-opt/-/broken-opt-1.0.0.tgz".to_string()),
             optional: Some(true),
-            dependencies: Some(opt_deps),
+            dependencies: Some(broken_opt_deps),
             ..Default::default()
         },
     );
 
     // Broken peer package with missing transitive dep in lockfile
-    let mut peer_deps = BTreeMap::new();
-    peer_deps.insert("ghost-peer-missing-dep".to_string(), "^1.0.0".to_string());
+    let mut broken_peer_deps = BTreeMap::new();
+    broken_peer_deps.insert("ghost-peer-missing-dep".to_string(), "^1.0.0".to_string());
     lockfile.insert_package(
         "node_modules/broken-peer",
         LockfilePackage {
             version: Some("1.0.0".to_string()),
             resolved: Some("https://registry.npmjs.org/broken-peer/-/broken-peer-1.0.0.tgz".to_string()),
             peer: Some(true),
-            dependencies: Some(peer_deps),
+            dependencies: Some(broken_peer_deps),
             ..Default::default()
         },
     );
@@ -246,7 +387,7 @@ async fn test_check_ci_drift_step5_omit_optional_and_omit_peer() {
         .save_to_file(&project_dir.join("package-lock.json"))
         .unwrap();
 
-    // With --omit=optional --omit=peer, step 5 must skip broken-opt and broken-peer!
+    // With --omit=optional --omit=peer, step 5 must skip broken-opt, broken-peer, and platform-opt-dep!
     let mut installer = Installer::new(InstallOptions {
         project_dir: project_dir.to_path_buf(),
         offline: true,
@@ -260,11 +401,14 @@ async fn test_check_ci_drift_step5_omit_optional_and_omit_peer() {
     let res = installer.run_ci().await;
     assert!(
         res.is_ok(),
-        "run_ci with --omit=optional --omit=peer must skip omitted packages in step 5: {:?}",
+        "run_ci with --omit=optional --omit=peer must skip omitted packages and absent optional deps in step 5: {:?}",
         res.err()
     );
 
-    // Without omission, step 5 MUST catch the missing dependencies and fail with EUSAGE
+    // Even with omit_optional=false, prod-dep's platform-opt-dep is absent (platform-skipped)
+    // and must be handled gracefully without failing as a missing dependency.
+    // However, broken-opt has a missing non-optional transitive dependency ("ghost-missing-dep"),
+    // which MUST trigger EUSAGE when omit_optional=false.
     let mut failing_installer = Installer::new(InstallOptions {
         project_dir: project_dir.to_path_buf(),
         offline: true,
@@ -368,6 +512,10 @@ fn test_fast_path_fingerprint_differentiation_source_policy_override() {
 
 /// e) `fast_path` staying valid when a direct optional dep (e.g. `fsevents` with mismatched `os`)
 /// is platform-skipped and absent from hidden lockfile (Flash 4B-F1).
+/// Tests:
+/// 1. Hidden lockfile WITH packages[""]
+/// 2. Hidden lockfile WITHOUT packages[""] (triggers package.json fallback at line 388)
+/// 3. Negative case: missing non-optional direct dependency returns false.
 #[test]
 fn test_fast_path_valid_when_direct_optional_dep_platform_skipped_and_absent() {
     let tmp = tempdir().unwrap();
@@ -384,17 +532,14 @@ fn test_fast_path_valid_when_direct_optional_dep_platform_skipped_and_absent() {
         .save_to_file(project_dir.join("package.json"))
         .unwrap();
 
-    // Hidden lockfile (.package-lock.json in node_modules) has root declaring optionalDependencies
-    // but packages map strips platform-skipped fsevents (and fsevents is not on disk)
     let nm = project_dir.join("node_modules");
     fs::create_dir_all(&nm).unwrap();
 
+    // 1. Hidden lockfile WITH packages[""] declaring optionalDependencies
     let mut hidden_lock = LockfileV3::new("fsevents-app", Some("1.0.0".to_string()));
     let mut opt_deps = BTreeMap::new();
     opt_deps.insert("fsevents".to_string(), "^2.3.2".to_string());
     hidden_lock.root_package_mut().unwrap().optional_dependencies = Some(opt_deps);
-    // Note: hidden_lock.packages does NOT have node_modules/fsevents
-
     let hidden_path = nm.join(".package-lock.json");
     hidden_lock.save_to_file(&hidden_path).unwrap();
 
@@ -405,7 +550,33 @@ fn test_fast_path_valid_when_direct_optional_dep_platform_skipped_and_absent() {
 
     assert!(
         validate_hidden_lockfile(project_dir, Some(&options)),
-        "validate_hidden_lockfile must remain valid when a direct optional dependency is platform-skipped and absent from hidden lockfile"
+        "validate_hidden_lockfile must remain valid with packages[\"\"] when optional dep is absent"
+    );
+
+    // 2. Hidden lockfile WITHOUT packages[""] (triggers package.json fallback at line 388)
+    let mut hidden_lock_no_root = LockfileV3::new("fsevents-app", Some("1.0.0".to_string()));
+    hidden_lock_no_root.packages.remove("");
+    hidden_lock_no_root.save_to_file(&hidden_path).unwrap();
+
+    assert!(
+        validate_hidden_lockfile(project_dir, Some(&options)),
+        "validate_hidden_lockfile must remain valid without packages[\"\"] via package.json fallback"
+    );
+
+    // 3. Negative case: manifest has a NON-optional production dependency that is absent from hidden lockfile
+    let mut bad_manifest = Manifest::default();
+    bad_manifest.name = Some("fsevents-app".to_string());
+    bad_manifest.version = Some("1.0.0".to_string());
+    bad_manifest
+        .dependencies
+        .insert("missing-prod".to_string(), "^1.0.0".to_string());
+    bad_manifest
+        .save_to_file(project_dir.join("package.json"))
+        .unwrap();
+
+    assert!(
+        !validate_hidden_lockfile(project_dir, Some(&options)),
+        "validate_hidden_lockfile MUST return false when a required non-optional dependency is missing"
     );
 }
 
@@ -588,5 +759,51 @@ async fn test_git_credential_scrubbing_on_errors() {
     assert!(
         checkout_err.contains("[REDACTED]"),
         "checkout_tree error should contain scrubbed credentials: {checkout_err}"
+    );
+
+    // 3. Missing package.json in cloned checkout (lines 70-74 / 121-127) must scrub credentials
+    let commit_sha = "1111222233334444555566667777888899990000";
+    let fake_checkout_dir = fetcher.checkout_cache_dir(sensitive_url, commit_sha);
+    fs::create_dir_all(&fake_checkout_dir).unwrap();
+    // Create the completion marker file outside checkout dir so checkout_tree reuses it
+    let marker_file = fake_checkout_dir.with_extension("done");
+    fs::write(&marker_file, b"").unwrap();
+
+    let target = PackageTarget::Git {
+        url: sensitive_url.to_string(),
+        committish: Some(commit_sha.to_string()),
+        subdir: None,
+    };
+
+    let checkout_dep_res = fetcher.checkout_git_dependency(&target, true).await;
+    assert!(
+        checkout_dep_res.is_err(),
+        "checkout_git_dependency must fail when package.json is missing"
+    );
+    let checkout_dep_err = checkout_dep_res.unwrap_err().to_string();
+    assert!(
+        !checkout_dep_err.contains("supersecretpass123"),
+        "checkout_git_dependency missing package.json error leaked credentials: {checkout_dep_err}"
+    );
+    assert!(
+        checkout_dep_err.contains("[REDACTED]"),
+        "checkout_git_dependency missing package.json error should be scrubbed: {checkout_dep_err}"
+    );
+
+    // 4. Invalid package.json in cloned checkout (lines 77-83) must scrub credentials
+    fs::write(fake_checkout_dir.join("package.json"), b"{ invalid json content").unwrap();
+    let resolve_dep_res = fetcher.resolve_git_dependency(&target, true).await;
+    assert!(
+        resolve_dep_res.is_err(),
+        "resolve_git_dependency must fail when package.json is invalid JSON"
+    );
+    let resolve_dep_err = resolve_dep_res.unwrap_err().to_string();
+    assert!(
+        !resolve_dep_err.contains("supersecretpass123"),
+        "resolve_git_dependency invalid package.json error leaked credentials: {resolve_dep_err}"
+    );
+    assert!(
+        resolve_dep_err.contains("[REDACTED]"),
+        "resolve_git_dependency invalid package.json error should be scrubbed: {resolve_dep_err}"
     );
 }

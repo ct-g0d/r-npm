@@ -337,14 +337,14 @@ pub fn validate_hidden_lockfile(project_dir: &Path, options: Option<&InstallOpti
     if let Some(root_pkg) = lockfile.packages.get("") {
         if let Some(deps) = &root_pkg.dependencies {
             for name in deps.keys() {
-                if !omit_optional
-                    || !root_pkg
-                        .optional_dependencies
-                        .as_ref()
-                        .is_some_and(|od| od.contains_key(name))
+                if root_pkg
+                    .optional_dependencies
+                    .as_ref()
+                    .is_some_and(|od| od.contains_key(name))
                 {
-                    direct_top_level_deps.insert(format!("node_modules/{name}"));
+                    continue;
                 }
+                direct_top_level_deps.insert(format!("node_modules/{name}"));
             }
         }
         if !omit_dev {

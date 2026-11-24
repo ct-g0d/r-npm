@@ -69,7 +69,7 @@ impl GitFetcher {
         if !manifest_path.exists() {
             return Err(anyhow!(
                 "package.json not found in git dependency '{}' at commit '{}'",
-                clone_url,
+                rnpm_config::scrub_credentials(&clone_url),
                 commit_sha
             ));
         }
@@ -77,7 +77,7 @@ impl GitFetcher {
         let manifest = Manifest::from_file(&manifest_path).with_context(|| {
             format!(
                 "Failed to parse package.json from git dependency '{}' at '{}'",
-                clone_url,
+                rnpm_config::scrub_credentials(&clone_url),
                 manifest_path.display()
             )
         })?;
@@ -121,7 +121,7 @@ impl GitFetcher {
         if !manifest_path.exists() {
             return Err(anyhow!(
                 "package.json not found in git dependency '{}' at commit '{}'",
-                clone_url,
+                rnpm_config::scrub_credentials(&clone_url),
                 commit_sha
             ));
         }
@@ -160,12 +160,15 @@ impl GitFetcher {
             if offline {
                 debug!(
                     "Using cached git repository for '{}' (offline mode)",
-                    clone_url
+                    rnpm_config::scrub_credentials(clone_url)
                 );
                 return Ok(remote_dir);
             }
 
-            debug!("Updating cached git repository for '{}'", clone_url);
+            debug!(
+                "Updating cached git repository for '{}'",
+                rnpm_config::scrub_credentials(clone_url)
+            );
             let remote_dir_str = remote_dir.to_string_lossy();
             let (fetch_ok, _, fetch_err) = run_git_cmd(
                 &[
@@ -1298,7 +1301,12 @@ async fn run_git_cmd(args: &[&str], cwd: Option<&Path>) -> Result<(bool, String,
     let output = cmd
         .output()
         .await
-        .map_err(|e| anyhow!("Failed to execute 'git {}': {e}", args.join(" ")))?;
+        .map_err(|e| {
+            anyhow!(
+                "Failed to execute 'git {}': {e}",
+                rnpm_config::scrub_credentials(&args.join(" "))
+            )
+        })?;
 
     let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
