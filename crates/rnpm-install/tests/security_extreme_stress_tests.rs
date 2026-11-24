@@ -1748,3 +1748,64 @@ fn test_hosted_git_zip_archive_and_sha_prefix_matching() {
     let res = check_sources(&lockfile, &root_declared, &workspace_paths, &policy);
     assert!(res.is_ok(), "Expected SHA prefix matching to succeed under allow-git=root, got: {:?}", res.err());
 }
+
+#[test]
+fn test_case_insensitive_git_sha_and_windows_backslash_clean_file_path() {
+    let temp = tempdir().unwrap();
+
+    // 1. clean_file_path with leading backslash on Windows drive path
+    assert_eq!(clean_file_path(r"\C:\projects\pkg"), r"C:\projects\pkg");
+    assert_eq!(clean_file_path(r"/C:\projects\pkg"), r"C:\projects\pkg");
+
+    // 2. ScriptNode::matches with uppercase hex commit hash against lowercase in lockfile
+    let node = ScriptNode {
+        location: "node_modules/my-sha-pkg",
+        resolved: Some("git+https://github.com/user/repo.git#1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b"),
+        lock_name: None,
+        in_bundle: false,
+        link: false,
+        project_dir: temp.path(),
+    };
+    assert!(node.matches("github:user/repo#1A2B3C4", false));
+    assert!(node.matches("user/repo#1A2B3C4D5E6F7A8B9C0D1E2F3A4B5C6D7E8F9A0B", false));
+
+    // 3. check_sources with uppercase SHA in package.json and lowercase in lockfile
+    let mut root_declared = HashSet::new();
+    root_declared.insert("case-pkg".to_string());
+    root_declared.insert("github:user/repo#1A2B3C4".to_string());
+
+    let mut packages = BTreeMap::new();
+    let mut root_deps = BTreeMap::new();
+    root_deps.insert("case-pkg".to_string(), "git+https://github.com/user/repo.git#1a2b3c4".to_string());
+    packages.insert(
+        String::new(),
+        LockfilePackage {
+            dependencies: Some(root_deps),
+            ..Default::default()
+        },
+    );
+    packages.insert(
+        "node_modules/case-pkg".to_string(),
+        LockfilePackage {
+            resolved: Some("git+https://github.com/user/repo.git#1a2b3c4".to_string()),
+            ..Default::default()
+        },
+    );
+
+    let lockfile = LockfileV3 {
+        name: "test-case-sha".to_string(),
+        version: None,
+        lockfile_version: 3,
+        requires: None,
+        packages,
+    };
+    let workspace_paths = HashSet::new();
+    let policy = SourcePolicy {
+        git: AllowMode::Root,
+        remote: AllowMode::None,
+        ..Default::default()
+    };
+
+    let res = check_sources(&lockfile, &root_declared, &workspace_paths, &policy);
+    assert!(res.is_ok(), "Expected case-insensitive git SHA comparison to pass under allow-git=root, got: {:?}", res.err());
+}

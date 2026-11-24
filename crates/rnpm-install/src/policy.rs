@@ -382,11 +382,14 @@ fn is_declared_root_spec(spec: &str, kind: SourceKind, root_declared: &HashSet<S
                 let d_ident = git_identity(d_unpacked).or_else(|| git_identity(d));
                 if let Some((d_repo, d_ref)) = d_ident {
                     if d_repo.eq_ignore_ascii_case(&spec_repo) {
+                        let d_ref_lower = d_ref.to_ascii_lowercase();
+                        let spec_ref_lower = spec_ref.to_ascii_lowercase();
                         return d_ref.is_empty()
-                            || d_ref == spec_ref
+                            || d_ref_lower == spec_ref_lower
                             || (d_ref.len() >= 7
                                 && spec_ref.len() >= 7
-                                && (d_ref.starts_with(&spec_ref) || spec_ref.starts_with(&d_ref)));
+                                && (d_ref_lower.starts_with(&spec_ref_lower)
+                                    || spec_ref_lower.starts_with(&d_ref_lower)));
                     }
                 }
                 false

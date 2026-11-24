@@ -60,8 +60,8 @@ pub fn is_path_spec(key: &str) -> bool {
 
 pub fn clean_file_path(p: &str) -> &str {
     let mut p = p.trim();
-    if p.starts_with('/') {
-        let stripped = p.trim_start_matches('/');
+    if p.starts_with('/') || p.starts_with('\\') {
+        let stripped = p.trim_start_matches(['/', '\\']);
         if stripped.len() >= 2
             && stripped.as_bytes()[1] == b':'
             && stripped.as_bytes()[0].is_ascii_alphabetic()
@@ -349,9 +349,9 @@ impl ScriptNode<'_> {
                 && key_ref.chars().all(|c| c.is_ascii_hexdigit())
                 && node_ref.chars().all(|c| c.is_ascii_hexdigit())
             {
-                node_ref.starts_with(&key_ref)
+                node_ref.to_ascii_lowercase().starts_with(&key_ref.to_ascii_lowercase())
             } else {
-                node_ref == key_ref
+                node_ref.eq_ignore_ascii_case(&key_ref)
             };
             return key_repo == node_repo && ref_matches;
         }
