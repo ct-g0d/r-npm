@@ -304,6 +304,7 @@ impl PackagePack {
     /// hardlinking target files to their CAS counterparts with zero duplicated file writes.
     pub fn extract_and_populate_cas(&self, target_dir: &Path) -> std::io::Result<()> {
         let pack_data = self.data();
+        fs::create_dir_all(target_dir)?;
         let mut created_dirs: std::collections::HashSet<PathBuf> =
             std::collections::HashSet::new();
         created_dirs.insert(target_dir.to_path_buf());
@@ -470,6 +471,7 @@ impl PackagePack {
 
             // 1. Directories first: collect all unique parent directory paths for the package entries
             // and create them up-front, deduplicating with created_dirs in descending depth order.
+            std::fs::create_dir_all(target_dir)?;
             let mut created_dirs: std::collections::HashSet<PathBuf> =
                 std::collections::HashSet::new();
             created_dirs.insert(target_dir.to_path_buf());
@@ -1845,6 +1847,7 @@ impl PackStore {
         let mut total_uncompressed = 0u64;
 
         let mut created_dirs = if let Some(target) = target_dir {
+            std::fs::create_dir_all(target).map_err(CacheError::Io)?;
             let mut set = std::collections::HashSet::new();
             set.insert(target.to_path_buf());
             Some(set)
@@ -3819,6 +3822,49 @@ mod tests {
         assert_eq!(
             fs::read(target_dir.path().join("package.json")).unwrap(),
             b"{\"name\":\"nested\"}"
+        );
+    }
+
+    #[test]
+    fn test_materialize_and_extract_root_only_files_into_nonexistent_target_dir() {
+        let dir = tempdir().unwrap();
+        let store = PackStore::new(dir.path().join("cache")).unwrap();
+
+        let integrity = "sha512-root-only-nonexistent-target==";
+        let files = [
+            PackInputFile::new("package.json", 0o644, b"{\"name\":\"root-only\"}"),
+            PackInputFile::new("index.js", 0o644, b"module.exports = 42;"),
+        ];
+        store.put_package_pack(integrity, &files).unwrap();
+
+        // 1. materialize_pack into a nonexistent target directory
+        let missing_target = dir.path().join("nested").join("node_modules").join("root-only");
+        assert!(!missing_target.exists());
+        let summary = store
+            .materialize_pack(integrity, &missing_target, None)
+            .unwrap();
+        assert_eq!(summary.entries_extracted, 2);
+        assert_eq!(
+            fs::read(missing_target.join("package.json")).unwrap(),
+            b"{\"name\":\"root-only\"}"
+        );
+        assert_eq!(
+            fs::read(missing_target.join("index.js")).unwrap(),
+            b"module.exports = 42;"
+        );
+
+        // 2. extract_and_populate_cas into a nonexistent target directory
+        let pack = store.get_package_pack(integrity).unwrap().unwrap();
+        let missing_cas_target = dir.path().join("cas_out").join("root-only");
+        assert!(!missing_cas_target.exists());
+        pack.extract_and_populate_cas(&missing_cas_target).unwrap();
+        assert_eq!(
+            fs::read(missing_cas_target.join("package.json")).unwrap(),
+            b"{\"name\":\"root-only\"}"
+        );
+        assert_eq!(
+            fs::read(missing_cas_target.join("index.js")).unwrap(),
+            b"module.exports = 42;"
         );
     }
 }

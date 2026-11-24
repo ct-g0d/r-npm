@@ -1559,7 +1559,12 @@ pub fn build_script_env_with_config(
         };
         env.insert("npm_command".to_string(), cmd.to_string());
         env.insert("npm_lifecycle_event".to_string(), ctx.event.clone());
-        env.insert("npm_lifecycle_script".to_string(), ctx.script_cmd.clone());
+        let has_precomputed_script = env
+            .get("npm_lifecycle_script")
+            .is_some_and(|s| !s.is_empty());
+        if !has_precomputed_script {
+            env.insert("npm_lifecycle_script".to_string(), ctx.script_cmd.clone());
+        }
         for (k, v) in &ctx.extra_env {
             if !is_sensitive_credential_key(k) {
                 env.insert(k.clone(), v.clone());

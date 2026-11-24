@@ -355,7 +355,7 @@ where
 
         let mut created_dirs: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
         let mut sorted_dirs: Vec<PathBuf> = all_dirs.into_iter().collect();
-        sorted_dirs.sort_by(|a, b| b.components().count().cmp(&a.components().count()));
+        sorted_dirs.sort_by_key(|a| std::cmp::Reverse(a.components().count()));
 
         for dir in &sorted_dirs {
             if created_dirs.contains(dir) {

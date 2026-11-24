@@ -12,7 +12,7 @@ use tracing::{debug, info};
 use rnpm_core::manifest::Manifest;
 use rnpm_core::to_posix_path;
 use rnpm_core::workspace::discover_workspaces_from_manifest;
-use rnpm_fs::junction::{is_junction, remove_junction};
+use rnpm_fs::junction::{is_dir_entry_reparse_or_symlink, is_junction, remove_junction};
 use rnpm_lockfile::LockfileV3;
 
 /// Options controlling reachability analysis and dependency pruning.
@@ -385,20 +385,12 @@ fn scan_nm_directory(
         let Ok(file_type) = entry.file_type() else {
             continue;
         };
-        let is_symlink = file_type.is_symlink();
-        if !file_type.is_dir() && !is_symlink {
+        let is_junc = is_dir_entry_reparse_or_symlink(&entry, &file_type);
+        if !file_type.is_dir() && !is_junc {
             continue;
         }
 
         let entry_path = entry.path();
-        let is_junc = if is_symlink {
-            is_junction(&entry_path).unwrap_or(false)
-        } else {
-            false
-        };
-        if !file_type.is_dir() && !is_junc {
-            continue;
-        }
 
         if name_str.starts_with('@') {
             // Scoped directory (e.g. "@types"): scan its child packages
@@ -417,20 +409,12 @@ fn scan_nm_directory(
                 let Ok(sub_ft) = scope_entry.file_type() else {
                     continue;
                 };
-                let sub_symlink = sub_ft.is_symlink();
-                if !sub_ft.is_dir() && !sub_symlink {
+                let sub_junc = is_dir_entry_reparse_or_symlink(&scope_entry, &sub_ft);
+                if !sub_ft.is_dir() && !sub_junc {
                     continue;
                 }
 
                 let sub_path = scope_entry.path();
-                let sub_junc = if sub_symlink {
-                    is_junction(&sub_path).unwrap_or(false)
-                } else {
-                    false
-                };
-                if !sub_ft.is_dir() && !sub_junc {
-                    continue;
-                }
 
                 let pkg_rel = format!("{nm_rel_posix}/{name_str}/{sub_name_str}");
                 discovered.push(pkg_rel.clone());
@@ -933,5 +917,78 @@ mod tests {
         assert!(analysis
             .extraneous_paths()
             .contains(&"node_modules/parent-pkg/node_modules/nested-unused".to_string()));
+    }
+
+    #[test]
+    fn test_prune_does_not_recurse_into_junction_linked_packages() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+
+        // External target packages (both ordinary and scoped) with their own nested node_modules
+        let external_plain = root.join("packages/linked-plain");
+        let external_plain_dep = external_plain.join("node_modules/target-only-dep");
+        fs::create_dir_all(&external_plain_dep).unwrap();
+        fs::write(
+            external_plain.join("package.json"),
+            r#"{"name": "linked-plain", "version": "1.0.0"}"#,
+        )
+        .unwrap();
+        fs::write(
+            external_plain_dep.join("package.json"),
+            r#"{"name": "target-only-dep", "version": "1.0.0"}"#,
+        )
+        .unwrap();
+
+        let external_scoped = root.join("packages/linked-scoped");
+        let external_scoped_dep = external_scoped.join("node_modules/scoped-target-dep");
+        fs::create_dir_all(&external_scoped_dep).unwrap();
+        fs::write(
+            external_scoped.join("package.json"),
+            r#"{"name": "@ws/linked-scoped", "version": "1.0.0"}"#,
+        )
+        .unwrap();
+        fs::write(
+            external_scoped_dep.join("package.json"),
+            r#"{"name": "scoped-target-dep", "version": "1.0.0"}"#,
+        )
+        .unwrap();
+
+        fs::write(
+            root.join("package.json"),
+            r#"{
+                "name": "test-junction-prune",
+                "version": "1.0.0",
+                "dependencies": {
+                    "linked-plain": "file:packages/linked-plain",
+                    "@ws/linked-scoped": "file:packages/linked-scoped"
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let nm = root.join("node_modules");
+        fs::create_dir_all(nm.join("@ws")).unwrap();
+        rnpm_fs::create_junction(&nm.join("linked-plain"), &external_plain).unwrap();
+        rnpm_fs::create_junction(&nm.join("@ws/linked-scoped"), &external_scoped).unwrap();
+
+        let analysis = discover_extraneous_packages(root, &PruneOptions::default()).unwrap();
+        assert!(
+            !analysis
+                .extraneous_paths()
+                .iter()
+                .any(|p| p.contains("target-only-dep") || p.contains("scoped-target-dep")),
+            "Prune must never traverse into junction-backed package node_modules: {:?}",
+            analysis.extraneous_paths()
+        );
+
+        let _ = execute_prune(root, &analysis.extraneous_packages).unwrap();
+        assert!(
+            external_plain_dep.join("package.json").exists(),
+            "Ordinary junction target's nested dependency must stay intact"
+        );
+        assert!(
+            external_scoped_dep.join("package.json").exists(),
+            "Scoped junction target's nested dependency must stay intact"
+        );
     }
 }

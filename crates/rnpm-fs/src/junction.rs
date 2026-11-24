@@ -530,6 +530,36 @@ pub fn is_junction(path: &Path) -> Result<bool, FsError> {
     is_reparse_point_or_symlink(&path_v)
 }
 
+/// Fast check for whether a `DirEntry` is a symlink or (on Windows) a reparse point / NTFS junction.
+///
+/// On Windows, `FileType::is_symlink()` returns `false` for directory junctions, whereas
+/// `DirEntry::metadata()` exposes the `FILE_ATTRIBUTE_REPARSE_POINT` bit directly from
+/// `WIN32_FIND_DATAW` without an extra syscall.
+pub fn is_dir_entry_reparse_or_symlink(
+    entry: &fs::DirEntry,
+    file_type: &fs::FileType,
+) -> bool {
+    if file_type.is_symlink() {
+        return true;
+    }
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+        if let Ok(meta) = entry.metadata() {
+            return (meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) != 0;
+        }
+        is_junction(&entry.path()).unwrap_or(false)
+    }
+
+    #[cfg(not(windows))]
+    {
+        let _ = entry;
+        false
+    }
+}
+
 fn is_reparse_point_or_symlink(path: &Path) -> Result<bool, FsError> {
     let meta = match fs::symlink_metadata(path) {
         Ok(m) => m,

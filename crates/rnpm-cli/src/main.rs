@@ -8302,6 +8302,8 @@ fn execute_run_sync_with_config(
         hook_env.insert("npm_lifecycle_event".into(), hook.to_string());
         hook_env.insert("npm_lifecycle_script".into(), cmd.clone());
         ctx.precomputed_env = Some(hook_env);
+        ctx.extra_env
+            .insert("npm_lifecycle_script".into(), cmd.clone());
 
         if let Some(shell) = config.get("script-shell") {
             let trimmed = shell.trim().trim_matches('"');

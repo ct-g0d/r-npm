@@ -551,7 +551,7 @@ pub fn validate_hidden_lockfile(project_dir: &Path, options: Option<&InstallOpti
         let Ok(file_type) = entry.file_type() else {
             continue;
         };
-        let is_symlink = file_type.is_symlink();
+        let is_symlink = rnpm_fs::is_dir_entry_reparse_or_symlink(&entry, &file_type);
         if is_symlink {
             detected_junction = true;
         }
@@ -580,7 +580,8 @@ pub fn validate_hidden_lockfile(project_dir: &Path, options: Option<&InstallOpti
                     let Ok(sub_type) = scoped_entry.file_type() else {
                         continue;
                     };
-                    let sub_is_symlink = sub_type.is_symlink();
+                    let sub_is_symlink =
+                        rnpm_fs::is_dir_entry_reparse_or_symlink(&scoped_entry, &sub_type);
                     if sub_is_symlink {
                         detected_junction = true;
                     }
