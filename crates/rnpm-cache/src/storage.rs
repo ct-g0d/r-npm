@@ -491,10 +491,6 @@ impl Cache {
     /// PURGED and `Ok(None)` is returned (signaling a cache miss for re-fetch).
     pub fn get_by_sha512(&self, sha512_hex: &str) -> Result<Option<Vec<u8>>, CacheError> {
         let blob_path = self.blob_path(sha512_hex);
-        if !blob_path.exists() {
-            return Ok(None);
-        }
-
         let bytes = match read_file_with_retries(&blob_path) {
             Ok(b) => b,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -584,10 +580,6 @@ impl Cache {
 
     fn get_index_entry_internal(&self, key: &str) -> Result<Option<IndexEntry>, CacheError> {
         let index_path = IndexEntry::path_for_key(&self.root, key);
-        if !index_path.exists() {
-            return Ok(None);
-        }
-
         let content = match read_to_string_with_retries(&index_path) {
             Ok(c) => c,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),

@@ -14,6 +14,7 @@ pub enum Op {
 }
 
 impl Op {
+    #[inline]
     pub fn as_str(&self) -> &'static str {
         match self {
             Op::Eq => "=",
@@ -38,10 +39,12 @@ pub struct Comparator {
 }
 
 impl Comparator {
+    #[inline]
     pub fn new(op: Op, version: Version) -> Self {
         Self { op, version }
     }
 
+    #[inline]
     pub fn matches(&self, version: &Version) -> bool {
         match self.op {
             Op::Eq => version == &self.version,
@@ -52,22 +55,23 @@ impl Comparator {
         }
     }
 
+    #[inline]
     pub fn parse(input: &str) -> Result<Self, SemverError> {
         let s = input.trim();
         if s.is_empty() {
             return Err(SemverError::InvalidComparator(input.to_string()));
         }
 
-        let (op, ver_str) = if s.starts_with(">=") {
-            (Op::Gte, &s[2..])
-        } else if s.starts_with("<=") {
-            (Op::Lte, &s[2..])
-        } else if s.starts_with('>') {
-            (Op::Gt, &s[1..])
-        } else if s.starts_with('<') {
-            (Op::Lt, &s[1..])
-        } else if s.starts_with('=') {
-            (Op::Eq, &s[1..])
+        let (op, ver_str) = if let Some(rest) = s.strip_prefix(">=") {
+            (Op::Gte, rest)
+        } else if let Some(rest) = s.strip_prefix("<=") {
+            (Op::Lte, rest)
+        } else if let Some(rest) = s.strip_prefix('>') {
+            (Op::Gt, rest)
+        } else if let Some(rest) = s.strip_prefix('<') {
+            (Op::Lt, rest)
+        } else if let Some(rest) = s.strip_prefix('=') {
+            (Op::Eq, rest)
         } else {
             (Op::Eq, s)
         };
@@ -105,7 +109,23 @@ impl<'de> Deserialize<'de> for Comparator {
     where
         D: Deserializer<'de>,
     {
-        let s = String::deserialize(deserializer)?;
-        Comparator::parse(&s).map_err(serde::de::Error::custom)
+        struct ComparatorVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for ComparatorVisitor {
+            type Value = Comparator;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("a semver comparator string")
+            }
+
+            fn visit_str<E>(self, v: &str) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                Comparator::parse(v).map_err(serde::de::Error::custom)
+            }
+        }
+
+        deserializer.deserialize_str(ComparatorVisitor)
     }
 }

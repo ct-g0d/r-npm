@@ -17,7 +17,7 @@ pub(crate) struct VersionCommandArgs {
     pub include_workspace_root: bool,
 }
 
-fn wrap_version_error(err: anyhow::Error) -> anyhow::Error {
+pub(crate) fn wrap_version_error(err: anyhow::Error) -> anyhow::Error {
     let msg = format!("{err:#}");
     if msg.contains("package.json not found") || msg.starts_with("npm error ") {
         err

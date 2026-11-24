@@ -447,7 +447,57 @@ where
     deserializer.deserialize_any(OptStringOrBoolVisitor)
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub type OrderedDeps = (BTreeMap<String, String>, Vec<String>);
+
+pub fn deserialize_ordered_deps<'de, D>(
+    deserializer: D,
+) -> Result<OrderedDeps, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct OrderedDepsVisitor;
+
+    impl<'de> Visitor<'de> for OrderedDepsVisitor {
+        type Value = OrderedDeps;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+            formatter.write_str("a map of dependencies or null")
+        }
+
+        fn visit_map<M>(self, mut access: M) -> Result<Self::Value, M::Error>
+        where
+            M: MapAccess<'de>,
+        {
+            let mut map = BTreeMap::new();
+            let mut order = Vec::new();
+            while let Some((k, v)) = access.next_entry::<String, String>()? {
+                if !map.contains_key(&k) {
+                    order.push(k.clone());
+                }
+                map.insert(k, v);
+            }
+            Ok((map, order))
+        }
+
+        fn visit_none<E>(self) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            Ok((BTreeMap::new(), Vec::new()))
+        }
+
+        fn visit_unit<E>(self) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            Ok((BTreeMap::new(), Vec::new()))
+        }
+    }
+
+    deserializer.deserialize_any(OrderedDepsVisitor)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct Manifest {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -543,6 +593,82 @@ pub struct Manifest {
     /// Raw JSON representation preserving original key order and comments/fields
     #[serde(skip)]
     pub raw_json: Option<crate::ordered_json::OrderedJsonValue>,
+
+    /// Raw JSON text preserving original formatting cheaply without building an IndexMap DOM on load
+    #[serde(skip)]
+    pub raw_text: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ManifestDe {
+    name: Option<String>,
+    version: Option<String>,
+    description: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_opt_string_or_bool")]
+    main: Option<String>,
+    bin: Option<PackageBin>,
+    #[serde(default, deserialize_with = "deserialize_opt_vec_or_string")]
+    files: Option<Vec<String>>,
+    #[serde(default)]
+    scripts: BTreeMap<String, String>,
+    #[serde(default, deserialize_with = "deserialize_ordered_deps")]
+    dependencies: (BTreeMap<String, String>, Vec<String>),
+    #[serde(default, deserialize_with = "deserialize_ordered_deps")]
+    dev_dependencies: (BTreeMap<String, String>, Vec<String>),
+    #[serde(default, deserialize_with = "deserialize_ordered_deps")]
+    peer_dependencies: (BTreeMap<String, String>, Vec<String>),
+    #[serde(default)]
+    peer_dependencies_meta: BTreeMap<String, PeerDependencyMeta>,
+    #[serde(default, deserialize_with = "deserialize_ordered_deps")]
+    optional_dependencies: (BTreeMap<String, String>, Vec<String>),
+    #[serde(default, alias = "bundleDependencies")]
+    bundled_dependencies: Option<BundledDependencies>,
+    workspaces: Option<PackageWorkspaces>,
+    os: Option<PlatformList>,
+    cpu: Option<PlatformList>,
+    libc: Option<PlatformList>,
+    #[serde(default, deserialize_with = "deserialize_engines")]
+    engines: BTreeMap<String, String>,
+    #[serde(flatten)]
+    extra: BTreeMap<String, serde_json::Value>,
+}
+
+impl<'de> Deserialize<'de> for Manifest {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let de = ManifestDe::deserialize(deserializer)?;
+        Ok(Manifest {
+            name: de.name,
+            version: de.version,
+            description: de.description,
+            main: de.main,
+            bin: de.bin,
+            files: de.files,
+            scripts: de.scripts,
+            dependencies: de.dependencies.0,
+            dependency_order: de.dependencies.1,
+            dev_dependencies: de.dev_dependencies.0,
+            dev_dependency_order: de.dev_dependencies.1,
+            peer_dependencies: de.peer_dependencies.0,
+            peer_dependency_order: de.peer_dependencies.1,
+            peer_dependencies_meta: de.peer_dependencies_meta,
+            optional_dependencies: de.optional_dependencies.0,
+            optional_dependency_order: de.optional_dependencies.1,
+            bundled_dependencies: de.bundled_dependencies,
+            workspaces: de.workspaces,
+            os: de.os,
+            cpu: de.cpu,
+            libc: de.libc,
+            engines: de.engines,
+            extra: de.extra,
+            format: ManifestFormat::default(),
+            raw_json: None,
+            raw_text: None,
+        })
+    }
 }
 
 impl Manifest {
@@ -578,8 +704,8 @@ impl Manifest {
                 line: err.line(),
                 column: err.column(),
             })?;
-        manifest.capture_dependency_order(&value);
         manifest.format = format;
+        manifest.raw_text = Some(clean_str.to_string());
         manifest.raw_json = Some(value);
         Ok(manifest)
     }
@@ -594,7 +720,61 @@ impl Manifest {
         Self::from_slice(&bytes)
     }
 
-    fn capture_dependency_order(&mut self, value: &crate::ordered_json::OrderedJsonValue) {
+    /// Parse manifest in read-only mode without building the heavy OrderedJsonValue DOM.
+    /// Runs in a pure single pass and sets `raw_json: None` and `raw_text: None`.
+    pub fn from_str_readonly(s: &str) -> Result<Self, ManifestError> {
+        let format = ManifestFormat::detect(s);
+        let clean_str = s.strip_prefix('\u{feff}').unwrap_or(s);
+        let mut manifest: Self =
+            serde_json::from_str(clean_str).map_err(|err| ManifestError::MalformedJson {
+                message: err.to_string(),
+                line: err.line(),
+                column: err.column(),
+            })?;
+        manifest.format = format;
+        manifest.raw_text = None;
+        manifest.raw_json = None;
+        Ok(manifest)
+    }
+
+    /// Parse manifest from raw bytes in read-only mode, with tolerance for UTF-8 BOM.
+    pub fn from_slice_readonly(bytes: &[u8]) -> Result<Self, ManifestError> {
+        let clean_bytes = if bytes.starts_with(b"\xEF\xBB\xBF") {
+            &bytes[3..]
+        } else {
+            bytes
+        };
+        let s = std::str::from_utf8(clean_bytes).map_err(|_| ManifestError::MalformedJson {
+            message: "invalid utf-8".to_string(),
+            line: 0,
+            column: 0,
+        })?;
+        Self::from_str_readonly(s)
+    }
+
+    /// Read and parse a package.json file from disk in read-only mode without building OrderedJsonValue.
+    pub fn from_file_readonly(path: impl AsRef<Path>) -> Result<Self, ManifestError> {
+        let path = path.as_ref();
+        let bytes = fs::read(path).map_err(|err| ManifestError::Io {
+            path: path.to_path_buf(),
+            source: err,
+        })?;
+        Self::from_slice_readonly(&bytes)
+    }
+
+    /// Lazily parse and return a mutable reference to raw_json if raw_text is present.
+    pub fn ensure_raw_json(&mut self) -> Option<&mut crate::ordered_json::OrderedJsonValue> {
+        if self.raw_json.is_none() {
+            if let Some(ref text) = self.raw_text {
+                if let Ok(val) = serde_json::from_str(text) {
+                    self.raw_json = Some(val);
+                }
+            }
+        }
+        self.raw_json.as_mut()
+    }
+
+    pub fn capture_dependency_order(&mut self, value: &crate::ordered_json::OrderedJsonValue) {
         let Some(object) = value.as_object() else {
             return;
         };
@@ -717,6 +897,12 @@ impl Manifest {
 
         let mut doc = if let Some(ref raw) = self.raw_json {
             raw.clone()
+        } else if let Some(ref raw_str) = self.raw_text {
+            let parsed: Result<OrderedJsonValue, _> = serde_json::from_str(raw_str);
+            parsed.unwrap_or_else(|_| {
+                let val = serde_json::to_value(self).unwrap_or_default();
+                OrderedJsonValue::from(val)
+            })
         } else {
             let val = serde_json::to_value(self).map_err(|err| ManifestError::MalformedJson {
                 message: err.to_string(),
@@ -757,28 +943,39 @@ impl Manifest {
                 map: &mut indexmap::IndexMap<String, OrderedJsonValue>,
                 key: &str,
                 deps: &BTreeMap<String, String>,
+                order: &[String],
             ) {
                 if deps.is_empty() {
                     map.shift_remove(key);
                 } else {
                     let mut deps_map = indexmap::IndexMap::new();
+                    for k in order {
+                        if let Some(v) = deps.get(k) {
+                            deps_map.insert(k.clone(), OrderedJsonValue::String(v.clone()));
+                        }
+                    }
                     for (k, v) in deps {
-                        deps_map.insert(k.clone(), OrderedJsonValue::String(v.clone()));
+                        if !deps_map.contains_key(k) {
+                            deps_map.insert(k.clone(), OrderedJsonValue::String(v.clone()));
+                        }
                     }
                     map.insert(key.to_string(), OrderedJsonValue::Object(deps_map));
                 }
             }
 
-            sync_deps(map, "dependencies", &self.dependencies);
-            sync_deps(map, "devDependencies", &self.dev_dependencies);
-            sync_deps(map, "peerDependencies", &self.peer_dependencies);
-            sync_deps(map, "optionalDependencies", &self.optional_dependencies);
+            sync_deps(map, "dependencies", &self.dependencies, &self.dependency_order);
+            sync_deps(map, "devDependencies", &self.dev_dependencies, &self.dev_dependency_order);
+            sync_deps(map, "peerDependencies", &self.peer_dependencies, &self.peer_dependency_order);
+            sync_deps(map, "optionalDependencies", &self.optional_dependencies, &self.optional_dependency_order);
             if let Some(ref bundled) = self.bundled_dependencies {
                 map.shift_remove("bundledDependencies");
                 map.insert(
                     "bundleDependencies".to_string(),
                     OrderedJsonValue::from(serde_json::to_value(bundled).unwrap_or_default()),
                 );
+            } else {
+                map.shift_remove("bundleDependencies");
+                map.shift_remove("bundledDependencies");
             }
 
             if !self.peer_dependencies_meta.is_empty() {

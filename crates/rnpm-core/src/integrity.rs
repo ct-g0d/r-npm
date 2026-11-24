@@ -4,6 +4,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use sha1::Sha1;
 use sha2::{Digest, Sha256, Sha384, Sha512};
 use std::fmt;
+use std::io::Read;
 use std::str::FromStr;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -15,6 +16,7 @@ pub enum Algorithm {
 }
 
 impl Algorithm {
+    #[inline]
     pub fn as_str(&self) -> &'static str {
         match self {
             Algorithm::Sha1 => "sha1",
@@ -48,11 +50,28 @@ impl Algorithm {
             }
         }
     }
+
+    pub fn hasher(&self) -> IntegrityHasher {
+        IntegrityHasher::new(*self)
+    }
+
+    pub fn compute_digest_reader<R: Read>(&self, mut reader: R) -> std::io::Result<Vec<u8>> {
+        let mut hasher = self.hasher();
+        let mut buf = [0u8; 16384];
+        loop {
+            let n = reader.read(&mut buf)?;
+            if n == 0 {
+                break;
+            }
+            hasher.update(&buf[..n]);
+        }
+        Ok(hasher.finalize())
+    }
 }
 
 impl fmt::Display for Algorithm {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.as_str())
+        f.write_str(self.as_str())
     }
 }
 
@@ -60,12 +79,59 @@ impl FromStr for Algorithm {
     type Err = IntegrityError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.to_ascii_lowercase().as_str() {
-            "sha1" => Ok(Algorithm::Sha1),
-            "sha256" => Ok(Algorithm::Sha256),
-            "sha384" => Ok(Algorithm::Sha384),
-            "sha512" => Ok(Algorithm::Sha512),
-            other => Err(IntegrityError::UnsupportedAlgorithm(other.to_string())),
+        if s.eq_ignore_ascii_case("sha512") {
+            Ok(Algorithm::Sha512)
+        } else if s.eq_ignore_ascii_case("sha1") {
+            Ok(Algorithm::Sha1)
+        } else if s.eq_ignore_ascii_case("sha256") {
+            Ok(Algorithm::Sha256)
+        } else if s.eq_ignore_ascii_case("sha384") {
+            Ok(Algorithm::Sha384)
+        } else {
+            Err(IntegrityError::UnsupportedAlgorithm(s.to_string()))
+        }
+    }
+}
+
+pub enum IntegrityHasher {
+    Sha1(Sha1),
+    Sha256(Sha256),
+    Sha384(Sha384),
+    Sha512(Sha512),
+}
+
+impl IntegrityHasher {
+    pub fn new(algorithm: Algorithm) -> Self {
+        match algorithm {
+            Algorithm::Sha1 => IntegrityHasher::Sha1(Sha1::new()),
+            Algorithm::Sha256 => IntegrityHasher::Sha256(Sha256::new()),
+            Algorithm::Sha384 => IntegrityHasher::Sha384(Sha384::new()),
+            Algorithm::Sha512 => IntegrityHasher::Sha512(Sha512::new()),
+        }
+    }
+
+    pub fn update(&mut self, bytes: &[u8]) {
+        match self {
+            IntegrityHasher::Sha1(h) => h.update(bytes),
+            IntegrityHasher::Sha256(h) => h.update(bytes),
+            IntegrityHasher::Sha384(h) => h.update(bytes),
+            IntegrityHasher::Sha512(h) => h.update(bytes),
+        }
+    }
+
+    pub fn finalize(self) -> Vec<u8> {
+        match self {
+            IntegrityHasher::Sha1(h) => h.finalize().to_vec(),
+            IntegrityHasher::Sha256(h) => h.finalize().to_vec(),
+            IntegrityHasher::Sha384(h) => h.finalize().to_vec(),
+            IntegrityHasher::Sha512(h) => h.finalize().to_vec(),
+        }
+    }
+
+    pub fn finalize_integrity(self, algorithm: Algorithm) -> Integrity {
+        let digest = self.finalize();
+        Integrity {
+            entries: vec![IntegrityEntry::new(algorithm, digest)],
         }
     }
 }
@@ -110,6 +176,18 @@ pub struct Integrity {
     pub entries: Vec<IntegrityEntry>,
 }
 
+#[inline]
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (&x, &y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
 impl Integrity {
     pub fn empty() -> Self {
         Self {
@@ -125,13 +203,15 @@ impl Integrity {
 
         let mut entries = Vec::new();
         for token in trimmed.split_whitespace() {
-            let parts: Vec<&str> = token.splitn(2, '-').collect();
-            if parts.len() != 2 || parts[0].is_empty() || parts[1].is_empty() {
+            let Some((algo_str, base64_str)) = token.split_once('-') else {
+                return Err(IntegrityError::InvalidFormat(token.to_string()));
+            };
+            if algo_str.is_empty() || base64_str.is_empty() {
                 return Err(IntegrityError::InvalidFormat(token.to_string()));
             }
 
-            let algo = Algorithm::from_str(parts[0])?;
-            let entry = IntegrityEntry::from_base64(algo, parts[1])?;
+            let algo = Algorithm::from_str(algo_str)?;
+            let entry = IntegrityEntry::from_base64(algo, base64_str)?;
             entries.push(entry);
         }
 
@@ -149,38 +229,56 @@ impl Integrity {
         }
     }
 
+    pub fn from_reader<R: Read>(reader: R, algorithm: Algorithm) -> std::io::Result<Self> {
+        let digest = algorithm.compute_digest_reader(reader)?;
+        Ok(Self {
+            entries: vec![IntegrityEntry::new(algorithm, digest)],
+        })
+    }
+
     pub fn strongest_algorithm(&self) -> Option<Algorithm> {
         self.entries.iter().map(|e| e.algorithm).max()
+    }
+
+    fn verify_digest(&self, strongest: Algorithm, actual_digest: &[u8]) -> Result<(), IntegrityError> {
+        let mut first_expected: Option<&str> = None;
+        for candidate in &self.entries {
+            if candidate.algorithm == strongest {
+                if first_expected.is_none() {
+                    first_expected = Some(&candidate.digest_base64);
+                }
+                if constant_time_eq(&candidate.digest, actual_digest) {
+                    return Ok(());
+                }
+            }
+        }
+
+        let actual_base64 = BASE64.encode(actual_digest);
+        let expected_base64 = first_expected.unwrap_or_default();
+
+        Err(IntegrityError::Mismatch {
+            algorithm: strongest.to_string(),
+            expected: format!("{strongest}-{expected_base64}"),
+            actual: format!("{strongest}-{actual_base64}"),
+        })
     }
 
     pub fn verify(&self, bytes: &[u8]) -> Result<(), IntegrityError> {
         let strongest = self.strongest_algorithm().ok_or(IntegrityError::Empty)?;
         let actual_digest = strongest.compute_digest(bytes);
-        let actual_base64 = BASE64.encode(&actual_digest);
+        self.verify_digest(strongest, &actual_digest)
+    }
 
-        // Filter by the strongest algorithm
-        let candidates: Vec<&IntegrityEntry> = self
-            .entries
-            .iter()
-            .filter(|e| e.algorithm == strongest)
-            .collect();
-
-        for candidate in &candidates {
-            if candidate.digest == actual_digest {
-                return Ok(());
-            }
-        }
-
-        let expected_base64 = candidates
-            .first()
-            .map(|e| e.digest_base64.clone())
-            .unwrap_or_default();
-
-        Err(IntegrityError::Mismatch {
-            algorithm: strongest.to_string(),
-            expected: format!("{}-{}", strongest, expected_base64),
-            actual: format!("{}-{}", strongest, actual_base64),
-        })
+    pub fn verify_reader<R: Read>(&self, reader: R) -> Result<(), IntegrityError> {
+        let strongest = self.strongest_algorithm().ok_or(IntegrityError::Empty)?;
+        let actual_digest = strongest
+            .compute_digest_reader(reader)
+            .map_err(|e| IntegrityError::Mismatch {
+                algorithm: strongest.to_string(),
+                expected: "valid stream".to_string(),
+                actual: format!("i/o error reading stream: {e}"),
+            })?;
+        self.verify_digest(strongest, &actual_digest)
     }
 }
 
@@ -188,7 +286,7 @@ impl fmt::Display for Integrity {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         for (i, entry) in self.entries.iter().enumerate() {
             if i > 0 {
-                write!(f, " ")?;
+                f.write_str(" ")?;
             }
             write!(f, "{entry}")?;
         }
@@ -208,7 +306,7 @@ impl Serialize for Integrity {
     where
         S: Serializer,
     {
-        serializer.serialize_str(&self.to_string())
+        serializer.collect_str(self)
     }
 }
 
@@ -217,7 +315,30 @@ impl<'de> Deserialize<'de> for Integrity {
     where
         D: Deserializer<'de>,
     {
-        let s = String::deserialize(deserializer)?;
-        Integrity::parse(&s).map_err(serde::de::Error::custom)
+        struct IntegrityVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for IntegrityVisitor {
+            type Value = Integrity;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("an SRI integrity string")
+            }
+
+            fn visit_str<E>(self, v: &str) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                Integrity::parse(v).map_err(serde::de::Error::custom)
+            }
+
+            fn visit_borrowed_str<E>(self, v: &'de str) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                Integrity::parse(v).map_err(serde::de::Error::custom)
+            }
+        }
+
+        deserializer.deserialize_str(IntegrityVisitor)
     }
 }

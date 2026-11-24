@@ -156,11 +156,7 @@ pub async fn execute_rebuild(options: &RebuildOptions) -> Result<RebuildSummary>
     for pkg_rel_path in discovered {
         let full_path = project_dir.join(&pkg_rel_path);
         let manifest_path = full_path.join("package.json");
-        if !manifest_path.is_file() {
-            continue;
-        }
-
-        let mut manifest = match Manifest::from_file(&manifest_path) {
+        let mut manifest = match Manifest::from_file_readonly(&manifest_path) {
             Ok(m) => m,
             Err(_) => continue,
         };
@@ -213,10 +209,7 @@ pub async fn execute_rebuild(options: &RebuildOptions) -> Result<RebuildSummary>
         }
 
         // Collect dependencies for topological sorting
-        let mut deps = Vec::new();
-        for dep in manifest.dependencies.keys() {
-            deps.push(dep.clone());
-        }
+        let deps: Vec<String> = manifest.dependencies.keys().cloned().collect();
 
         let id = match &version {
             Some(v) => format!("{name}@{v}"),
@@ -292,11 +285,9 @@ pub async fn execute_rebuild(options: &RebuildOptions) -> Result<RebuildSummary>
 /// Sort candidates bottom-up (deeper nesting first, dependencies before dependents).
 /// Deeper paths have more `/node_modules/` segments. Normalizes backslashes for Windows path safety.
 pub(crate) fn sort_lifecycle_nodes_bottom_up(nodes: &mut [LifecyclePackageNode]) {
-    nodes.sort_by(|a, b| {
-        let norm_a = a.package_path.replace('\\', "/");
-        let norm_b = b.package_path.replace('\\', "/");
-        let count_a = norm_a.matches("/node_modules/").count();
-        let count_b = norm_b.matches("/node_modules/").count();
-        count_b.cmp(&count_a).then_with(|| norm_b.cmp(&norm_a))
+    nodes.sort_by_cached_key(|node| {
+        let norm = node.package_path.replace('\\', "/");
+        let count = norm.matches("/node_modules/").count();
+        (std::cmp::Reverse(count), std::cmp::Reverse(norm))
     });
 }

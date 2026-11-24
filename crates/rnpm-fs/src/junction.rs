@@ -1,7 +1,7 @@
 use crate::error::FsError;
 use path_clean::clean;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 static JUNCTIONS_CREATED: AtomicU64 = AtomicU64::new(0);
@@ -262,49 +262,169 @@ pub fn remove_junction(path: &Path) -> Result<(), FsError> {
     }
 }
 
+/// Helper to unlink a single regular file, clearing read-only attributes and retrying on transient Windows locks.
+fn remove_file_safe(path: &Path, meta: Option<&fs::Metadata>) -> Result<(), FsError> {
+    #[cfg(windows)]
+    {
+        let is_ro = meta.map(|m| m.permissions().readonly()).unwrap_or_else(|| {
+            fs::symlink_metadata(path)
+                .map(|m| m.permissions().readonly())
+                .unwrap_or(false)
+        });
+        if is_ro {
+            if let Ok(m) = fs::symlink_metadata(path) {
+                let mut perms = m.permissions();
+                perms.set_readonly(false);
+                let _ = fs::set_permissions(path, perms);
+            }
+        }
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let needs_chmod = meta
+            .map(|m| m.permissions().mode() & 0o200 == 0)
+            .unwrap_or_else(|| {
+                fs::symlink_metadata(path)
+                    .map(|m| m.permissions().mode() & 0o200 == 0)
+                    .unwrap_or(false)
+            });
+        if needs_chmod {
+            if let Ok(m) = fs::symlink_metadata(path) {
+                let mut perms = m.permissions();
+                perms.set_mode(perms.mode() | 0o600);
+                let _ = fs::set_permissions(path, perms);
+            }
+        }
+    }
+
+    let mut attempts = 0;
+    let mut delay = std::time::Duration::from_millis(5);
+    loop {
+        attempts += 1;
+        match fs::remove_file(path) {
+            Ok(()) => return Ok(()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(err) => {
+                if attempts >= 15 || !crate::atomic::is_retryable_error(&err) {
+                    return Err(FsError::Io(err));
+                }
+                let jitter_ms = (attempts as u64 * 3) % 7;
+                std::thread::sleep(delay + std::time::Duration::from_millis(jitter_ms));
+                delay = delay
+                    .saturating_mul(2)
+                    .min(std::time::Duration::from_millis(250));
+            }
+        }
+    }
+}
+
+/// Helper to remove an empty directory, clearing read-only attributes on Windows and retrying on transient locks.
+fn remove_dir_safe(path: &Path) -> Result<(), FsError> {
+    #[cfg(windows)]
+    {
+        if let Ok(meta) = fs::symlink_metadata(path) {
+            let mut perms = meta.permissions();
+            if perms.readonly() {
+                perms.set_readonly(false);
+                let _ = fs::set_permissions(path, perms);
+            }
+        }
+    }
+
+    let mut attempts = 0;
+    let mut delay = std::time::Duration::from_millis(5);
+    loop {
+        attempts += 1;
+        match fs::remove_dir(path) {
+            Ok(()) => return Ok(()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(err) => {
+                if attempts >= 15 || !crate::atomic::is_retryable_error(&err) {
+                    return Err(FsError::Io(err));
+                }
+                let jitter_ms = (attempts as u64 * 3) % 7;
+                std::thread::sleep(delay + std::time::Duration::from_millis(jitter_ms));
+                delay = delay
+                    .saturating_mul(2)
+                    .min(std::time::Duration::from_millis(250));
+            }
+        }
+    }
+}
+
+enum UnlinkKind {
+    File,
+    ReparsePoint,
+}
+
+struct UnlinkEntry {
+    path: PathBuf,
+    kind: UnlinkKind,
+}
+
 /// Recursively removes a directory tree while guaranteeing that junctions and symlinks
 /// are NEVER recursively traversed (only their reparse points are unlinked).
+/// Uses parallel file unlinking across worker threads for large trees.
 /// Also handles Windows read-only attributes and transient file locks with backoff retries.
 pub fn remove_dir_all_safe(path: &Path) -> Result<(), FsError> {
     let path_v = crate::path::to_verbatim_path(path);
-    if !path_v.exists() && !is_reparse_point_or_symlink(&path_v)? {
-        return Ok(());
-    }
 
-    // 1. If it's a junction or symlink, remove ONLY the reparse point/link, never target contents!
-    if is_reparse_point_or_symlink(&path_v)? {
-        return remove_junction(&path_v);
-    }
-
-    // 2. Query metadata to determine file vs directory
+    // 1. Single symlink_metadata call: determines existence, reparse point, and file vs dir
     let meta = match fs::symlink_metadata(&path_v) {
         Ok(m) => m,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(e) => return Err(FsError::Io(e)),
     };
 
-    if meta.is_dir() {
-        // Ensure directory has write permissions so its child items can be deleted
+    #[cfg(windows)]
+    let is_reparse = {
+        use std::os::windows::fs::MetadataExt;
+        (meta.file_attributes() & 0x400) != 0
+    };
+    #[cfg(not(windows))]
+    let is_reparse = meta.file_type().is_symlink();
+
+    // 2. If it's a junction or symlink, remove ONLY the reparse point/link, never target contents!
+    if is_reparse {
+        return remove_junction(&path_v);
+    }
+
+    // 3. Regular file: unlink directly
+    if !meta.is_dir() {
+        return remove_file_safe(&path_v, Some(&meta));
+    }
+
+    // 4. Directory: traverse iteratively, collecting files/links to unlink and directories to remove in post-order
+    let mut dir_stack = vec![path_v];
+    let mut dirs_collected = Vec::new();
+    let mut unlinks = Vec::new();
+
+    while let Some(current_dir) = dir_stack.pop() {
+        // Ensure directory has write permissions so its child items can be read/deleted
         #[cfg(windows)]
         {
-            let mut perms = meta.permissions();
-            if perms.readonly() {
-                perms.set_readonly(false);
-                let _ = fs::set_permissions(&path_v, perms);
+            if let Ok(m) = fs::symlink_metadata(&current_dir) {
+                let mut perms = m.permissions();
+                if perms.readonly() {
+                    perms.set_readonly(false);
+                    let _ = fs::set_permissions(&current_dir, perms);
+                }
             }
         }
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let mut perms = meta.permissions();
-            if perms.mode() & 0o200 == 0 {
-                perms.set_mode(perms.mode() | 0o700);
-                let _ = fs::set_permissions(path, perms);
+            if let Ok(m) = fs::symlink_metadata(&current_dir) {
+                let mut perms = m.permissions();
+                if perms.mode() & 0o200 == 0 {
+                    perms.set_mode(perms.mode() | 0o700);
+                    let _ = fs::set_permissions(&current_dir, perms);
+                }
             }
         }
 
-        // Read directory entries
-        match fs::read_dir(&path_v) {
+        match fs::read_dir(&current_dir) {
             Ok(entries) => {
                 for entry_res in entries {
                     let entry = match entry_res {
@@ -312,88 +432,132 @@ pub fn remove_dir_all_safe(path: &Path) -> Result<(), FsError> {
                         Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
                         Err(err) => return Err(FsError::Io(err)),
                     };
-                    remove_dir_all_safe(&entry.path())?;
+                    let entry_path = entry.path();
+                    let entry_meta = match fs::symlink_metadata(&entry_path) {
+                        Ok(m) => m,
+                        Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+                        Err(err) => return Err(FsError::Io(err)),
+                    };
+
+                    #[cfg(windows)]
+                    let entry_is_reparse = {
+                        use std::os::windows::fs::MetadataExt;
+                        (entry_meta.file_attributes() & 0x400) != 0
+                    };
+                    #[cfg(not(windows))]
+                    let entry_is_reparse = entry_meta.file_type().is_symlink();
+
+                    if entry_is_reparse {
+                        // Reparse points / symlinks: add to unlinks, NEVER push to dir_stack!
+                        unlinks.push(UnlinkEntry {
+                            path: entry_path,
+                            kind: UnlinkKind::ReparsePoint,
+                        });
+                    } else if entry_meta.is_dir() {
+                        dir_stack.push(entry_path);
+                    } else {
+                        unlinks.push(UnlinkEntry {
+                            path: entry_path,
+                            kind: UnlinkKind::File,
+                        });
+                    }
                 }
+                dirs_collected.push(current_dir);
             }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => return Err(FsError::Io(e)),
         }
+    }
 
-        // Now remove the empty directory itself
-        #[cfg(windows)]
-        {
-            let mut perms = meta.permissions();
-            if perms.readonly() {
-                perms.set_readonly(false);
-                let _ = fs::set_permissions(&path_v, perms);
-            }
-        }
-
-        let mut attempts = 0;
-        let mut delay = std::time::Duration::from_millis(5);
-        loop {
-            attempts += 1;
-            match fs::remove_dir(&path_v) {
-                Ok(()) => return Ok(()),
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-                Err(err) => {
-                    if attempts >= 15 || !crate::atomic::is_retryable_error(&err) {
-                        return Err(FsError::Io(err));
-                    }
-                    let jitter_ms = (attempts as u64 * 3) % 7;
-                    std::thread::sleep(delay + std::time::Duration::from_millis(jitter_ms));
-                    delay = delay
-                        .saturating_mul(2)
-                        .min(std::time::Duration::from_millis(250));
-                }
+    // 5. Parallel file/reparse-point unlinking
+    let total_unlinks = unlinks.len();
+    if total_unlinks < 32 {
+        for item in unlinks {
+            match item.kind {
+                UnlinkKind::ReparsePoint => remove_junction(&item.path)?,
+                UnlinkKind::File => remove_file_safe(&item.path, None)?,
             }
         }
     } else {
-        // Regular file
-        #[cfg(windows)]
-        {
-            let mut perms = meta.permissions();
-            if perms.readonly() {
-                perms.set_readonly(false);
-                let _ = fs::set_permissions(&path_v, perms);
-            }
-        }
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perms = meta.permissions();
-            if perms.mode() & 0o200 == 0 {
-                perms.set_mode(perms.mode() | 0o600);
-                let _ = fs::set_permissions(&path_v, perms);
-            }
-        }
+        let concurrency = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4)
+            .clamp(2, 16)
+            .min(total_unlinks);
+        let chunk_size = total_unlinks.div_ceil(concurrency);
+        let first_error = std::sync::Mutex::new(None);
 
-        let mut attempts = 0;
-        let mut delay = std::time::Duration::from_millis(5);
-        loop {
-            attempts += 1;
-            match fs::remove_file(&path_v) {
-                Ok(()) => return Ok(()),
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-                Err(err) => {
-                    if attempts >= 15 || !crate::atomic::is_retryable_error(&err) {
-                        return Err(FsError::Io(err));
+        std::thread::scope(|scope| {
+            for chunk in unlinks.chunks(chunk_size) {
+                let err_ref = &first_error;
+                scope.spawn(move || {
+                    for item in chunk {
+                        let res = match item.kind {
+                            UnlinkKind::ReparsePoint => remove_junction(&item.path),
+                            UnlinkKind::File => remove_file_safe(&item.path, None),
+                        };
+                        if let Err(e) = res {
+                            let mut guard = err_ref.lock().unwrap();
+                            if guard.is_none() {
+                                *guard = Some(e);
+                            }
+                            break;
+                        }
                     }
-                    let jitter_ms = (attempts as u64 * 3) % 7;
-                    std::thread::sleep(delay + std::time::Duration::from_millis(jitter_ms));
-                    delay = delay
-                        .saturating_mul(2)
-                        .min(std::time::Duration::from_millis(250));
-                }
+                });
             }
+        });
+
+        if let Some(err) = first_error.into_inner().unwrap() {
+            return Err(err);
         }
     }
+
+    // 6. Remove empty directories bottom-up: sort descending by depth (component count)
+    // so leaf directories are strictly removed before their parents!
+    dirs_collected.sort_by_key(|a| std::cmp::Reverse(a.components().count()));
+
+    for dir in dirs_collected {
+        remove_dir_safe(&dir)?;
+    }
+
+    Ok(())
 }
 
 /// Check if a path is a junction or symlink.
 pub fn is_junction(path: &Path) -> Result<bool, FsError> {
     let path_v = crate::path::to_verbatim_path(path);
     is_reparse_point_or_symlink(&path_v)
+}
+
+/// Fast check for whether a `DirEntry` is a symlink or (on Windows) a reparse point / NTFS junction.
+///
+/// On Windows, `FileType::is_symlink()` returns `false` for directory junctions, whereas
+/// `DirEntry::metadata()` exposes the `FILE_ATTRIBUTE_REPARSE_POINT` bit directly from
+/// `WIN32_FIND_DATAW` without an extra syscall.
+pub fn is_dir_entry_reparse_or_symlink(
+    entry: &fs::DirEntry,
+    file_type: &fs::FileType,
+) -> bool {
+    if file_type.is_symlink() {
+        return true;
+    }
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+        if let Ok(meta) = entry.metadata() {
+            return (meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) != 0;
+        }
+        is_junction(&entry.path()).unwrap_or(false)
+    }
+
+    #[cfg(not(windows))]
+    {
+        let _ = entry;
+        false
+    }
 }
 
 fn is_reparse_point_or_symlink(path: &Path) -> Result<bool, FsError> {

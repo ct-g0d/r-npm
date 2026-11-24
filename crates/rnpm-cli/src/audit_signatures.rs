@@ -114,14 +114,23 @@ pub async fn run(project_dir: &Path, json_output: bool) -> anyhow::Result<()> {
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or(Value::Null);
 
-    let mut nodes: Vec<(&str, &Value, bool)> = vec![("", &root, true)];
     let mut locations: Vec<&String> = disk.keys().collect();
     locations.sort();
-    for loc in locations {
-        let pkg = &disk[loc];
-        if let Some(raw) = pkg.raw_json.as_ref().filter(|_| !is_link(&pkg.dir_path)) {
-            nodes.push((loc.as_str(), raw, false));
-        }
+    let raw_pkgs: Vec<(String, Value)> = locations
+        .into_iter()
+        .filter_map(|loc| {
+            let pkg = &disk[loc];
+            if !is_link(&pkg.dir_path) {
+                Some((loc.clone(), pkg.raw_json_or_load()))
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    let mut nodes: Vec<(&str, &Value, bool)> = vec![("", &root, true)];
+    for (loc, raw) in &raw_pkgs {
+        nodes.push((loc.as_str(), raw, false));
     }
 
     let client = registry_client(&config)?;

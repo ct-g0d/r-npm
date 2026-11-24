@@ -12,7 +12,7 @@ use tracing::{debug, info};
 use rnpm_core::manifest::Manifest;
 use rnpm_core::to_posix_path;
 use rnpm_core::workspace::discover_workspaces_from_manifest;
-use rnpm_fs::junction::{is_junction, remove_junction};
+use rnpm_fs::junction::{is_dir_entry_reparse_or_symlink, is_junction, remove_junction};
 use rnpm_lockfile::LockfileV3;
 
 /// Options controlling reachability analysis and dependency pruning.
@@ -194,7 +194,7 @@ fn collect_transitive_dependencies(
 
     // Source A: on-disk package.json
     let disk_manifest_path = project_dir.join(pkg_path).join("package.json");
-    if let Ok(m) = Manifest::from_file(&disk_manifest_path) {
+    if let Ok(m) = Manifest::from_file_readonly(&disk_manifest_path) {
         for name in m.dependencies.keys() {
             deps.insert(name.clone());
         }
@@ -219,7 +219,7 @@ fn collect_transitive_dependencies(
             if lock_pkg.link == Some(true) {
                 if let Some(target_rel) = &lock_pkg.resolved {
                     let target_manifest = project_dir.join(target_rel).join("package.json");
-                    if let Ok(m) = Manifest::from_file(&target_manifest) {
+                    if let Ok(m) = Manifest::from_file_readonly(&target_manifest) {
                         for name in m.dependencies.keys() {
                             deps.insert(name.clone());
                         }
@@ -382,12 +382,15 @@ fn scan_nm_directory(
             continue;
         }
 
-        let entry_path = entry.path();
-        let is_junc = is_junction(&entry_path).unwrap_or(false);
-        let is_dir = entry_path.is_dir() || is_junc;
-        if !is_dir {
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        let is_junc = is_dir_entry_reparse_or_symlink(&entry, &file_type);
+        if !file_type.is_dir() && !is_junc {
             continue;
         }
+
+        let entry_path = entry.path();
 
         if name_str.starts_with('@') {
             // Scoped directory (e.g. "@types"): scan its child packages
@@ -403,12 +406,15 @@ fn scan_nm_directory(
                     continue;
                 }
 
-                let sub_path = scope_entry.path();
-                let sub_junc = is_junction(&sub_path).unwrap_or(false);
-                let sub_is_dir = sub_path.is_dir() || sub_junc;
-                if !sub_is_dir {
+                let Ok(sub_ft) = scope_entry.file_type() else {
+                    continue;
+                };
+                let sub_junc = is_dir_entry_reparse_or_symlink(&scope_entry, &sub_ft);
+                if !sub_ft.is_dir() && !sub_junc {
                     continue;
                 }
+
+                let sub_path = scope_entry.path();
 
                 let pkg_rel = format!("{nm_rel_posix}/{name_str}/{sub_name_str}");
                 discovered.push(pkg_rel.clone());
@@ -457,7 +463,7 @@ pub fn discover_extraneous_packages(
             manifest_path.display()
         ));
     }
-    let manifest = Manifest::from_file(&manifest_path).with_context(|| {
+    let manifest = Manifest::from_file_readonly(&manifest_path).with_context(|| {
         format!(
             "Failed to read root manifest at {}",
             manifest_path.display()
@@ -482,7 +488,7 @@ pub fn discover_extraneous_packages(
         if !reachable_packages.contains(&normalized_path) {
             let full_path = project_dir.join(&normalized_path);
             let manifest_file = full_path.join("package.json");
-            let (name, version) = if let Ok(m) = Manifest::from_file(&manifest_file) {
+            let (name, version) = if let Ok(m) = Manifest::from_file_readonly(&manifest_file) {
                 let pkg_name = m
                     .name
                     .unwrap_or_else(|| extract_package_name_from_path(&normalized_path));
@@ -522,7 +528,7 @@ pub fn discover_extraneous_packages(
 pub fn load_lockfile_if_exists(project_dir: &Path) -> Option<LockfileV3> {
     let (lockfile_path, _) = crate::resolve_lockfile_path(project_dir);
     if lockfile_path.is_file() {
-        if let Ok(lock) = LockfileV3::load_from_file(&lockfile_path) {
+        if let Ok(lock) = LockfileV3::load_from_file_readonly(&lockfile_path) {
             return Some(lock);
         }
     }
@@ -556,7 +562,7 @@ pub fn execute_prune(project_dir: &Path, extraneous: &[ExtraneousPackage]) -> Re
             info!("Pruning package {}", pkg.path);
             // Remove binary shims from enclosing .bin if package had bin entries
             let pkg_manifest = pkg.full_path.join("package.json");
-            if let Ok(m) = Manifest::from_file(&pkg_manifest) {
+            if let Ok(m) = Manifest::from_file_readonly(&pkg_manifest) {
                 let enclosing_bin_dir = if let Some(parent) = pkg.full_path.parent() {
                     let maybe_scoped = parent
                         .file_name()
@@ -594,6 +600,7 @@ pub fn execute_prune(project_dir: &Path, extraneous: &[ExtraneousPackage]) -> Re
             } else if pkg.full_path.is_dir() {
                 let nm_dir = project_dir.join("node_modules");
                 crate::trash::fast_trash_delete(&pkg.full_path, &nm_dir).is_ok()
+                    || rnpm_fs::remove_dir_all_safe(&pkg.full_path).is_ok()
             } else {
                 std::fs::remove_file(&pkg.full_path).is_ok()
             };
@@ -657,7 +664,7 @@ pub fn execute_prune(project_dir: &Path, extraneous: &[ExtraneousPackage]) -> Re
     let updated_lockfile_path = if lockfile_path.is_file() {
         if let Ok(mut lockfile) = LockfileV3::load_from_file(&lockfile_path) {
             let manifest_path = project_dir.join("package.json");
-            if let Ok(manifest) = Manifest::from_file(&manifest_path) {
+            if let Ok(manifest) = Manifest::from_file_readonly(&manifest_path) {
                 crate::prune_lockfile(&mut lockfile, &manifest);
                 let _ = lockfile.save_to_file(&lockfile_path);
                 let _ = lockfile.save_hidden(project_dir);
@@ -669,7 +676,7 @@ pub fn execute_prune(project_dir: &Path, extraneous: &[ExtraneousPackage]) -> Re
             None
         }
     } else {
-        let manifest = Manifest::from_file(project_dir.join("package.json"))?;
+        let manifest = Manifest::from_file_readonly(project_dir.join("package.json"))?;
         // With no dependency graph to reconstruct, npm still saves a root lockfile.
         if manifest.dependencies.is_empty()
             && manifest.dev_dependencies.is_empty()
@@ -910,5 +917,78 @@ mod tests {
         assert!(analysis
             .extraneous_paths()
             .contains(&"node_modules/parent-pkg/node_modules/nested-unused".to_string()));
+    }
+
+    #[test]
+    fn test_prune_does_not_recurse_into_junction_linked_packages() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+
+        // External target packages (both ordinary and scoped) with their own nested node_modules
+        let external_plain = root.join("packages/linked-plain");
+        let external_plain_dep = external_plain.join("node_modules/target-only-dep");
+        fs::create_dir_all(&external_plain_dep).unwrap();
+        fs::write(
+            external_plain.join("package.json"),
+            r#"{"name": "linked-plain", "version": "1.0.0"}"#,
+        )
+        .unwrap();
+        fs::write(
+            external_plain_dep.join("package.json"),
+            r#"{"name": "target-only-dep", "version": "1.0.0"}"#,
+        )
+        .unwrap();
+
+        let external_scoped = root.join("packages/linked-scoped");
+        let external_scoped_dep = external_scoped.join("node_modules/scoped-target-dep");
+        fs::create_dir_all(&external_scoped_dep).unwrap();
+        fs::write(
+            external_scoped.join("package.json"),
+            r#"{"name": "@ws/linked-scoped", "version": "1.0.0"}"#,
+        )
+        .unwrap();
+        fs::write(
+            external_scoped_dep.join("package.json"),
+            r#"{"name": "scoped-target-dep", "version": "1.0.0"}"#,
+        )
+        .unwrap();
+
+        fs::write(
+            root.join("package.json"),
+            r#"{
+                "name": "test-junction-prune",
+                "version": "1.0.0",
+                "dependencies": {
+                    "linked-plain": "file:packages/linked-plain",
+                    "@ws/linked-scoped": "file:packages/linked-scoped"
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let nm = root.join("node_modules");
+        fs::create_dir_all(nm.join("@ws")).unwrap();
+        rnpm_fs::create_junction(&nm.join("linked-plain"), &external_plain).unwrap();
+        rnpm_fs::create_junction(&nm.join("@ws/linked-scoped"), &external_scoped).unwrap();
+
+        let analysis = discover_extraneous_packages(root, &PruneOptions::default()).unwrap();
+        assert!(
+            !analysis
+                .extraneous_paths()
+                .iter()
+                .any(|p| p.contains("target-only-dep") || p.contains("scoped-target-dep")),
+            "Prune must never traverse into junction-backed package node_modules: {:?}",
+            analysis.extraneous_paths()
+        );
+
+        let _ = execute_prune(root, &analysis.extraneous_packages).unwrap();
+        assert!(
+            external_plain_dep.join("package.json").exists(),
+            "Ordinary junction target's nested dependency must stay intact"
+        );
+        assert!(
+            external_scoped_dep.join("package.json").exists(),
+            "Scoped junction target's nested dependency must stay intact"
+        );
     }
 }

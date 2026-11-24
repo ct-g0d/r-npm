@@ -596,7 +596,6 @@ pub fn resolve_workspace_graph<P: PackageMetadataProvider>(
         .version
         .clone()
         .unwrap_or_else(|| "1.0.0".to_string());
-    let parsed_root_version = Version::parse(&root_version).ok();
 
     // 2. Insert root package node at ""
     let root_node = Node {
@@ -630,7 +629,7 @@ pub fn resolve_workspace_graph<P: PackageMetadataProvider>(
             .and_then(|v| v.as_str())
             .map(str::to_owned),
         engines: root_manifest.engines.clone(),
-        parsed_version: parsed_root_version,
+        parsed_version: None,
         extra: {
             let mut extra = root_manifest.extra.clone();
             if let Some(ref bd) = root_manifest.bundled_dependencies {
@@ -651,14 +650,13 @@ pub fn resolve_workspace_graph<P: PackageMetadataProvider>(
             .version
             .clone()
             .unwrap_or_else(|| "0.0.0".to_string());
-        let parsed_mem_ver = Version::parse(&mem_ver).ok();
 
         let member_node = Node {
             location: member_loc.clone(),
             install_name: member.name.clone(),
             name: member.name.clone(),
             version: mem_ver.clone(),
-            parsed_version: parsed_mem_ver.clone(),
+            parsed_version: None,
             resolved: None,
             integrity: None,
             flags: NodeFlags {
@@ -704,7 +702,6 @@ pub fn resolve_workspace_graph<P: PackageMetadataProvider>(
             install_name: member.name.clone(),
             name: member.name.clone(),
             version: mem_ver,
-            parsed_version: parsed_mem_ver,
             resolved: Some(member_loc.clone()),
             integrity: None,
             flags: NodeFlags {

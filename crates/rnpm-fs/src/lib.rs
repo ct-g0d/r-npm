@@ -30,9 +30,9 @@ pub use block_clone::{
 };
 pub use error::FsError;
 pub use junction::{
-    create_junction, create_link_or_copy, is_junction, junction_points_to, junctions_created,
-    read_junction_target, record_junction_created, remove_dir_all_safe, remove_junction,
-    reset_junctions_created,
+    create_junction, create_link_or_copy, is_dir_entry_reparse_or_symlink, is_junction,
+    junction_points_to, junctions_created, read_junction_target, record_junction_created,
+    remove_dir_all_safe, remove_junction, reset_junctions_created,
 };
 pub use parallel::{extract_batch_parallel, BatchExtractionItem};
 pub use path::{strip_verbatim_prefix, to_verbatim_path};

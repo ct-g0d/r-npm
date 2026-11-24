@@ -1,6 +1,49 @@
 use crate::graph::DependencyGraph;
 use rnpm_core::semver::Version;
 use rnpm_core::spec::PackageTarget;
+use std::cell::RefCell;
+use std::collections::HashMap;
+
+const MAX_CACHE_ENTRIES: usize = 8192;
+
+thread_local! {
+    static TARGET_CACHE: RefCell<HashMap<String, Option<PackageTarget>>> = RefCell::new(HashMap::with_capacity(1024));
+    static VERSION_CACHE: RefCell<HashMap<String, Option<Version>>> = RefCell::new(HashMap::with_capacity(2048));
+}
+
+/// Cached parser for PackageTarget, avoiding repeated parse calls on identical specs like "^1.0.0".
+#[inline]
+pub fn cached_parse_package_target(spec: &str) -> Option<PackageTarget> {
+    TARGET_CACHE.with(|cache| {
+        let mut map = cache.borrow_mut();
+        if let Some(target) = map.get(spec) {
+            return target.clone();
+        }
+        let parsed = PackageTarget::parse(spec).ok();
+        if map.len() >= MAX_CACHE_ENTRIES {
+            map.clear();
+        }
+        map.insert(spec.to_string(), parsed.clone());
+        parsed
+    })
+}
+
+/// Cached parser for SemVer Version, avoiding repeated parses of package version strings.
+#[inline]
+pub fn cached_parse_version(version_str: &str) -> Option<Version> {
+    VERSION_CACHE.with(|cache| {
+        let mut map = cache.borrow_mut();
+        if let Some(v) = map.get(version_str) {
+            return v.clone();
+        }
+        let parsed = Version::parse(version_str).ok();
+        if map.len() >= MAX_CACHE_ENTRIES {
+            map.clear();
+        }
+        map.insert(version_str.to_string(), parsed.clone());
+        parsed
+    })
+}
 
 /// Placement decision made by the deduplication and hoisting engine.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -49,7 +92,7 @@ pub(crate) fn file_target_matches_resolved(target: &std::path::Path, resolved: &
 
 /// Checks if an exact version string satisfies a package target specification.
 pub fn version_satisfies_target(version_str: &str, target: &PackageTarget) -> bool {
-    let Ok(v) = Version::parse(version_str) else {
+    let Some(v) = cached_parse_version(version_str) else {
         return false;
     };
     match target {
@@ -86,7 +129,7 @@ pub fn version_satisfies_target(version_str: &str, target: &PackageTarget) -> bo
                 true
             } else if let Ok(range) = rnpm_core::semver::Range::parse(s) {
                 range.satisfies(&v)
-            } else if let Ok(expected) = Version::parse(s) {
+            } else if let Some(expected) = cached_parse_version(s) {
                 v == expected
             } else {
                 true
@@ -206,10 +249,10 @@ pub fn node_satisfies_target(node: &crate::graph::Node, target: &PackageTarget) 
         _ => {}
     }
 
-    if let Some(parsed) = &node.parsed_version {
+    if let Some(parsed) = cached_parse_version(&node.version) {
         match target {
-            PackageTarget::Version(expected) => parsed == expected,
-            PackageTarget::Range(range) => range.satisfies(parsed),
+            PackageTarget::Version(expected) => &parsed == expected,
+            PackageTarget::Range(range) => range.satisfies(&parsed),
             PackageTarget::Tag(_) => true,
             PackageTarget::Alias { name, target } => {
                 node.name == *name && node_satisfies_target(node, target)
@@ -222,9 +265,9 @@ pub fn node_satisfies_target(node: &crate::graph::Node, target: &PackageTarget) 
                 if s == "*" || s == "^" || s == "~" || s.is_empty() {
                     true
                 } else if let Ok(range) = rnpm_core::semver::Range::parse(s) {
-                    range.satisfies(parsed)
-                } else if let Ok(expected) = Version::parse(s) {
-                    parsed == &expected
+                    range.satisfies(&parsed)
+                } else if let Some(expected) = cached_parse_version(s) {
+                    parsed == expected
                 } else {
                     true
                 }
@@ -540,7 +583,7 @@ fn candidate_shadows_ancestor_dep(
         return false;
     };
 
-    if let Ok(req_target) = PackageTarget::parse(spec) {
+    if let Some(req_target) = cached_parse_package_target(spec) {
         if let Some(version) = resolved_version {
             return !version_satisfies_target(version, &req_target);
         }
@@ -558,7 +601,7 @@ fn candidate_shadows_ancestor_dep(
                 }
             }
             PackageTarget::Range(range) => {
-                if let Ok(v) = Version::parse(&range.raw) {
+                if let Some(v) = cached_parse_version(&range.raw) {
                     if !version_satisfies_target(&v.to_string(), &req_target) {
                         return true;
                     }
@@ -578,6 +621,12 @@ fn is_in_scope_subtree(loc: &str, scope: &str) -> bool {
     if scope.is_empty() {
         loc.starts_with("node_modules/")
     } else {
+        if !loc.starts_with(scope) {
+            return false;
+        }
+        if loc.as_bytes().get(scope.len()) != Some(&b'/') {
+            return false;
+        }
         iter_ancestor_scopes(loc).any(|s| s == scope)
     }
 }
@@ -597,39 +646,49 @@ fn candidate_shadows_descendant_dep(
     // Arborist attaches edgesOut when a node enters the tree, before that
     // node's turn in depsQueue. Our graph.edges only contains processed
     // tasks, so also inspect pending edges from the manifest.
-    if graph
-        .nodes
-        .values()
-        .filter(|node| is_in_scope_subtree(&node.location, scope))
-        .any(|node| {
-            let Some(spec) = node
-                .optional_dependencies
-                .get(install_name)
-                .or_else(|| node.dependencies.get(install_name))
-                .or_else(|| node.peer_dependencies.get(install_name))
-            else {
-                return false;
-            };
-            let Ok(target) = PackageTarget::parse(spec) else {
-                return false;
-            };
-            find_visible_node(graph, &node.location, install_name).is_some_and(|current| {
-                !is_in_scope_subtree(&current.location, scope)
-                    && node_satisfies_target(current, &target)
-                    && !version_satisfies_target(version, &target)
-            })
+    let check_node = |loc: &str| -> bool {
+        if !is_in_scope_subtree(loc, scope) {
+            return false;
+        }
+        let Some(node) = graph.nodes.get(loc) else {
+            return false;
+        };
+        let Some(spec) = node
+            .optional_dependencies
+            .get(install_name)
+            .or_else(|| node.dependencies.get(install_name))
+            .or_else(|| node.peer_dependencies.get(install_name))
+        else {
+            return false;
+        };
+        let Some(target) = cached_parse_package_target(spec) else {
+            return false;
+        };
+        find_visible_node(graph, &node.location, install_name).is_some_and(|current| {
+            !is_in_scope_subtree(&current.location, scope)
+                && node_satisfies_target(current, &target)
+                && !version_satisfies_target(version, &target)
         })
-    {
+    };
+
+    if !graph.nodes_by_dep_name.is_empty() {
+        if let Some(relevant) = graph.nodes_by_dep_name.get(install_name) {
+            if relevant.iter().any(|loc| check_node(loc)) {
+                return true;
+            }
+        }
+    } else if graph.nodes.values().any(|node| check_node(&node.location)) {
         return true;
     }
-    graph.edges.iter().any(|edge| {
+
+    let check_edge = |edge: &crate::graph::DependencyEdge| -> bool {
         if edge.install_name != install_name
             || !is_in_scope_subtree(&edge.from_location, scope)
             || is_in_scope_subtree(&edge.to_location, scope)
         {
             return false;
         }
-        let Ok(target) = PackageTarget::parse(&edge.spec) else {
+        let Some(target) = cached_parse_package_target(&edge.spec) else {
             return false;
         };
         graph
@@ -637,7 +696,17 @@ fn candidate_shadows_descendant_dep(
             .get(&edge.to_location)
             .is_some_and(|current| node_satisfies_target(current, &target))
             && !version_satisfies_target(version, &target)
-    })
+    };
+
+    if !graph.edges_by_install_name.is_empty() {
+        if let Some(relevant_edges) = graph.edges_by_install_name.get(install_name) {
+            relevant_edges.iter().any(|&idx| check_edge(&graph.edges[idx]))
+        } else {
+            false
+        }
+    } else {
+        graph.edges.iter().any(check_edge)
+    }
 }
 
 fn candidate_has_incompatible_peer(
@@ -660,7 +729,7 @@ fn candidate_has_incompatible_peer(
         else {
             return false;
         };
-        let Ok(target) = PackageTarget::parse(peer_spec) else {
+        let Some(target) = cached_parse_package_target(peer_spec) else {
             return false;
         };
         if node_satisfies_target(existing, &target) {
@@ -712,7 +781,7 @@ pub fn root_provider_replaceable(
     if existing.location != format!("node_modules/{peer_name}") {
         return false;
     }
-    let Ok(version) = rnpm_core::semver::Version::parse(peer_spec) else {
+    let Some(version) = cached_parse_version(peer_spec) else {
         return false;
     };
     provider_accepts_version(graph, &existing.location, &version.to_string())
@@ -726,23 +795,37 @@ pub fn provider_accepts_version(graph: &DependencyGraph, location: &str, version
     };
     let replacement = crate::graph::Node {
         version: version.to_string(),
-        parsed_version: Version::parse(version).ok(),
         resolved: None,
         integrity: None,
         ..existing.clone()
     };
     // A provider whose placing edge is not recorded yet (a late optional peer
     // activated while it is being placed) has dependents this cannot see.
-    let mut incoming = graph
-        .edges
-        .iter()
-        .filter(|edge| edge.to_location == location)
-        .peekable();
-    incoming.peek().is_some()
-        && incoming.all(|edge| {
-            PackageTarget::parse(&edge.spec)
-                .is_ok_and(|target| node_satisfies_target(&replacement, &target))
-        })
+    if !graph.incoming_edges_by_location.is_empty() {
+        if let Some(incoming) = graph.incoming_edges_by_location.get(location) {
+            if incoming.is_empty() {
+                return false;
+            }
+            incoming.iter().all(|&idx| {
+                let edge = &graph.edges[idx];
+                cached_parse_package_target(&edge.spec)
+                    .is_some_and(|target| node_satisfies_target(&replacement, &target))
+            })
+        } else {
+            false
+        }
+    } else {
+        let mut incoming = graph
+            .edges
+            .iter()
+            .filter(|edge| edge.to_location == location)
+            .peekable();
+        incoming.peek().is_some()
+            && incoming.all(|edge| {
+                cached_parse_package_target(&edge.spec)
+                    .is_some_and(|target| node_satisfies_target(&replacement, &target))
+            })
+    }
 }
 
 /// can-place-dep: a required peer that is visible but incompatible at the
@@ -764,7 +847,7 @@ fn target_peer_conflicts(
         {
             return false;
         }
-        let Ok(target) = PackageTarget::parse(peer_spec) else {
+        let Some(target) = cached_parse_package_target(peer_spec) else {
             return false;
         };
         find_visible_peer_node(graph, candidate_location, peer_name, peer_name)
@@ -781,6 +864,11 @@ fn is_shadowed_by_incompatible_between(
     install_name: &str,
     target: &PackageTarget,
 ) -> bool {
+    if !graph.nodes_by_install_name.is_empty()
+        && !graph.nodes_by_install_name.contains_key(install_name)
+    {
+        return false;
+    }
     let mut current = from_scope;
     let mut candidate_buf = String::with_capacity(from_scope.len() + 14 + install_name.len());
     while !current.is_empty() && current != to_ancestor {
@@ -849,9 +937,6 @@ pub fn find_visible_peer_node<'a>(
             }
         }
 
-        // Arborist resolves an edge by folder name only: an alias such as
-        // `@typescript/native` -> typescript is never `typescript`'s peer.
-
         // Ascend one directory level in node_modules hierarchy
         current = match parent_scope(current) {
             Some(p) if !p.is_empty() => p,
@@ -861,8 +946,10 @@ pub fn find_visible_peer_node<'a>(
 
     // Finally, check root scope ("")
     // 1. Direct check by install_name
-    let root_install = format!("node_modules/{install_name}");
-    if let Some(node) = graph.nodes.get(&root_install) {
+    candidate_buf.clear();
+    candidate_buf.push_str("node_modules/");
+    candidate_buf.push_str(install_name);
+    if let Some(node) = graph.nodes.get(&candidate_buf) {
         if node_matches_peer_name(node, install_name, package_name) {
             return Some(node);
         }
@@ -870,8 +957,10 @@ pub fn find_visible_peer_node<'a>(
 
     // 2. Direct check by package_name
     if package_name != install_name {
-        let root_pkg = format!("node_modules/{package_name}");
-        if let Some(node) = graph.nodes.get(&root_pkg) {
+        candidate_buf.clear();
+        candidate_buf.push_str("node_modules/");
+        candidate_buf.push_str(package_name);
+        if let Some(node) = graph.nodes.get(&candidate_buf) {
             if node_matches_peer_name(node, install_name, package_name) {
                 return Some(node);
             }
@@ -903,7 +992,6 @@ mod tests {
             install_name: name.to_string(),
             name: name.to_string(),
             version: version.to_string(),
-            parsed_version: Version::parse(version).ok(),
             ..Default::default()
         }
     }

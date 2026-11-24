@@ -33,6 +33,14 @@ pub use release_age::{is_release_age_excluded, match_package_pattern};
 
 use url::Url;
 
+/// Get the cached parsed default npm registry URL.
+pub fn default_registry_url() -> Url {
+    static DEFAULT_URL: std::sync::OnceLock<Url> = std::sync::OnceLock::new();
+    DEFAULT_URL
+        .get_or_init(|| Url::parse(DEFAULT_REGISTRY).expect("default registry URL is valid"))
+        .clone()
+}
+
 /// Parse a scoped registry key or CLI flag into a normalized scope name (e.g. `@scope`).
 ///
 /// Accepts:

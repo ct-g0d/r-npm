@@ -1615,3 +1615,77 @@ fn test_readonly_file_replacement_and_mode_preservation() {
     assert!(new_cmd.starts_with("@ECHO off"));
     assert!(new_ps1.starts_with("#!/usr/bin/env pwsh"));
 }
+
+#[test]
+fn test_header_only_shebang_scanning_multi_mb_binary_untouched() {
+    let dir = tempdir().unwrap();
+    let large_bin = dir.path().join("large_tool.exe");
+
+    // Create 2 MB binary without shebang
+    let mut data = vec![0x90u8; 2 * 1024 * 1024];
+    data[0] = 0x4D;
+    data[1] = 0x5A; // MZ header
+    fs::write(&large_bin, &data).unwrap();
+
+    // 1. read_shebang_from_file should return None immediately
+    let info = shebang::read_shebang_from_file(&large_bin).unwrap();
+    assert_eq!(info, None);
+
+    // 2. normalize_shebang_file should return Ok(false) without rewriting file
+    let modified = shebang::normalize_shebang_file(&large_bin).unwrap();
+    assert!(!modified, "Non-shebang binary must not be modified");
+
+    // 3. Verify content is untouched
+    let read_back = fs::read(&large_bin).unwrap();
+    assert_eq!(read_back.len(), 2 * 1024 * 1024);
+    assert_eq!(&read_back[..2], &[0x4D, 0x5A]);
+}
+
+#[test]
+fn test_header_only_shebang_crlf_normalized_and_readonly_preserved() {
+    let dir = tempdir().unwrap();
+    let script = dir.path().join("crlf_readonly.js");
+
+    let original = b"#!/usr/bin/env node\r\nconsole.log('hello');\r\n";
+    fs::write(&script, original).unwrap();
+
+    // Mark as read-only
+    let mut perms = fs::metadata(&script).unwrap().permissions();
+    perms.set_readonly(true);
+    fs::set_permissions(&script, perms).unwrap();
+    assert!(fs::metadata(&script).unwrap().permissions().readonly());
+
+    // Run normalize_shebang_file
+    let modified = shebang::normalize_shebang_file(&script).unwrap();
+    assert!(modified, "CRLF shebang must be normalized");
+
+    // Verify shebang line is now LF while body and readonly are preserved
+    let content = fs::read(&script).unwrap();
+    assert_eq!(&content[..20], b"#!/usr/bin/env node\n");
+    assert_eq!(&content[20..], b"console.log('hello');\r\n");
+
+    // Verify read-only status is preserved
+    #[cfg(windows)]
+    assert!(fs::metadata(&script).unwrap().permissions().readonly());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(fs::metadata(&script).unwrap().permissions().mode() & 0o200, 0);
+    }
+
+    // Calling it again on already-normalized LF file should return Ok(false)
+    let modified_again = shebang::normalize_shebang_file(&script).unwrap();
+    assert!(!modified_again, "Already normalized file must not be modified");
+}
+
+#[test]
+fn test_check_existing_bin_collision_fast_path_dot_bin() {
+    let dir = tempdir().unwrap();
+    let bin_dir = dir.path().join("node_modules").join(".bin");
+    fs::create_dir_all(&bin_dir).unwrap();
+
+    // Any link path in .bin passes collision check without error
+    let link_path = bin_dir.join("any_tool");
+    let res = check_existing_bin_collision(&bin_dir, &link_path, "../foo/cli.js", false);
+    assert!(res.is_ok(), ".bin directory must fast-path collision check");
+}

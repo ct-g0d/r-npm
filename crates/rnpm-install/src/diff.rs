@@ -199,54 +199,84 @@ pub fn is_node_modules_package_path(path: &str) -> bool {
 }
 
 /// Diffs two maps of package path -> LockfilePackage.
+///
+/// Merges both sorted BTreeMaps in a single linear pass (O(N + M)),
+/// eliminating redundant tree lookups and re-indexing.
 pub fn diff_package_maps(
     ideal: &BTreeMap<String, LockfilePackage>,
     actual: &BTreeMap<String, LockfilePackage>,
 ) -> TreeDiff {
     let mut diff = TreeDiff::new();
+    let mut it_ideal = ideal
+        .iter()
+        .filter(|(p, _)| is_node_modules_package_path(p))
+        .peekable();
+    let mut it_actual = actual
+        .iter()
+        .filter(|(p, _)| is_node_modules_package_path(p))
+        .peekable();
 
-    for (path, ideal_pkg) in ideal {
-        if !is_node_modules_package_path(path) {
-            continue;
-        }
-        if let Some(actual_pkg) = actual.get(path) {
-            if package_differs(ideal_pkg, actual_pkg) {
+    loop {
+        match (it_ideal.peek(), it_actual.peek()) {
+            (Some(&(path_i, pkg_i)), Some(&(path_a, pkg_a))) => match path_i.cmp(path_a) {
+                std::cmp::Ordering::Less => {
+                    diff.insert(
+                        path_i.clone(),
+                        TreeAction::Add {
+                            package: Box::new(pkg_i.clone()),
+                        },
+                    );
+                    it_ideal.next();
+                }
+                std::cmp::Ordering::Greater => {
+                    diff.insert(
+                        path_a.clone(),
+                        TreeAction::Remove {
+                            package: Box::new(pkg_a.clone()),
+                        },
+                    );
+                    it_actual.next();
+                }
+                std::cmp::Ordering::Equal => {
+                    if package_differs(pkg_i, pkg_a) {
+                        diff.insert(
+                            path_i.clone(),
+                            TreeAction::Replace {
+                                actual: Box::new(pkg_a.clone()),
+                                ideal: Box::new(pkg_i.clone()),
+                            },
+                        );
+                    } else {
+                        diff.insert(
+                            path_i.clone(),
+                            TreeAction::Unchanged {
+                                package: Box::new(pkg_i.clone()),
+                            },
+                        );
+                    }
+                    it_ideal.next();
+                    it_actual.next();
+                }
+            },
+            (Some(&(path_i, pkg_i)), None) => {
                 diff.insert(
-                    path.clone(),
-                    TreeAction::Replace {
-                        actual: Box::new(actual_pkg.clone()),
-                        ideal: Box::new(ideal_pkg.clone()),
+                    path_i.clone(),
+                    TreeAction::Add {
+                        package: Box::new(pkg_i.clone()),
                     },
                 );
-            } else {
-                diff.insert(
-                    path.clone(),
-                    TreeAction::Unchanged {
-                        package: Box::new(ideal_pkg.clone()),
-                    },
-                );
+                it_ideal.next();
             }
-        } else {
-            diff.insert(
-                path.clone(),
-                TreeAction::Add {
-                    package: Box::new(ideal_pkg.clone()),
-                },
-            );
-        }
-    }
-
-    for (path, actual_pkg) in actual {
-        if !is_node_modules_package_path(path) {
-            continue;
-        }
-        if !ideal.contains_key(path) {
-            diff.insert(
-                path.clone(),
-                TreeAction::Remove {
-                    package: Box::new(actual_pkg.clone()),
-                },
-            );
+            (None, Some(&(path_a, pkg_a))) => {
+                diff.insert(
+                    path_a.clone(),
+                    TreeAction::Remove {
+                        package: Box::new(pkg_a.clone()),
+                    },
+                );
+                it_actual.next();
+            }
+            (None, None) => break,
         }
     }
 

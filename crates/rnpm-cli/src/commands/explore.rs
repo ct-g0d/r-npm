@@ -124,20 +124,11 @@ pub async fn run(
         ));
     }
 
-    let manifest_content = std::fs::read_to_string(&manifest_path).unwrap_or_default();
-    let manifest_json: serde_json::Value =
-        serde_json::from_str(&manifest_content).unwrap_or(serde_json::Value::Null);
+    let manifest =
+        rnpm_core::manifest::Manifest::from_file_readonly(&manifest_path).unwrap_or_default();
 
-    let pkg_real_name = manifest_json
-        .get("name")
-        .and_then(|v| v.as_str())
-        .unwrap_or(&pkgname)
-        .to_string();
-    let pkg_version = manifest_json
-        .get("version")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string();
+    let pkg_real_name = manifest.name.unwrap_or_else(|| pkgname.to_string());
+    let pkg_version = manifest.version.unwrap_or_default();
 
     let new_path = build_explore_path(&pkg_dir);
     let config = rnpm_config::Config::load(Some(&current_dir)).unwrap_or_default();

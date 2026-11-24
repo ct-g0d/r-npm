@@ -539,7 +539,15 @@ impl Config {
         let all_env: BTreeMap<String, String> = if let Some(ref map) = options.env_vars {
             map.clone()
         } else {
-            env::vars().collect()
+            let mut filtered = BTreeMap::new();
+            for (k, v) in env::vars() {
+                if let Some(prefix) = k.get(..11) {
+                    if prefix.eq_ignore_ascii_case("npm_config_") {
+                        filtered.insert(k, v);
+                    }
+                }
+            }
+            filtered
         };
 
         let mut env_layer_settings = BTreeMap::new();
@@ -716,7 +724,7 @@ pub fn find_workspace_root(project_dir: &Path) -> Option<PathBuf> {
     let mut current = project_dir.parent();
     while let Some(dir) = current {
         let pkg_json = dir.join("package.json");
-        if pkg_json.exists() {
+        if pkg_json.is_file() {
             if let Ok(manifest) = rnpm_core::manifest::Manifest::from_file(&pkg_json) {
                 if !manifest.workspace_patterns().is_empty() {
                     if let Ok(members) =

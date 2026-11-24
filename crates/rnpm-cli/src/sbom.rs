@@ -526,7 +526,7 @@ fn load_actual_nodes(project_dir: &Path, root_pkg: Value) -> Vec<Node> {
     disk.sort_by(|a, b| a.location.cmp(&b.location));
     let mut nodes = vec![new_node(project_dir, String::new(), root_pkg)];
     for pkg in disk {
-        let raw = pkg.raw_json.clone().unwrap_or_else(|| json!({}));
+        let raw = pkg.raw_json_or_load();
         let mut node = new_node(project_dir, pkg.location.clone(), raw);
         let entry = lock
             .as_ref()

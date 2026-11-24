@@ -1,6 +1,8 @@
 use crate::circuit_breaker::{CircuitBreaker, CircuitBreakerState};
 use crate::error::RegistryError;
-use crate::metadata::AbbreviatedPackageMetadata;
+use crate::metadata::{
+    parse_packument_with_mode, AbbreviatedPackageMetadata, PackumentParseMode,
+};
 use reqwest::header::{
     HeaderMap, HeaderValue, ACCEPT, AUTHORIZATION, CONNECTION, CONTENT_LENGTH, CONTENT_TYPE, ETAG,
     IF_NONE_MATCH, LOCATION, RETRY_AFTER, USER_AGENT,
@@ -26,6 +28,10 @@ pub fn default_user_agent() -> String {
 
 /// Abbreviated metadata MIME type for npm registry.
 pub const NPM_INSTALL_V1_JSON: &str = "application/vnd.npm.install-v1+json";
+
+/// Accept header for install-optimized packument requests prioritizing abbreviated metadata.
+pub const NPM_INSTALL_ACCEPT: &str =
+    "application/vnd.npm.install-v1+json; q=1.0, application/json; q=0.8";
 
 static CLI_REQUEST_CONTEXT: std::sync::OnceLock<(String, String)> = std::sync::OnceLock::new();
 
@@ -2347,7 +2353,82 @@ impl RegistryClient {
         {
             // pacote treats a corgi 404 as "abbreviated documents unsupported"
             // and asks once more for the full packument before failing.
-            Err(RegistryError::PackageNotFound { .. }) => {
+            // Strict private registries / proxies may return 406 Not Acceptable or 415 Unsupported Media Type.
+            Err(RegistryError::PackageNotFound { .. })
+            | Err(RegistryError::ServerError {
+                status: 406 | 415, ..
+            }) => {
+                self.get_package_metadata_from_url_conditional_with_accept(
+                    package_name,
+                    url,
+                    if_none_match,
+                    "application/json",
+                )
+                .await
+            }
+            other => other,
+        }
+    }
+
+    /// Fetch lean install metadata requesting `NPM_INSTALL_ACCEPT`.
+    pub async fn get_package_metadata_install(
+        &self,
+        package_name: &str,
+    ) -> Result<AbbreviatedPackageMetadata, RegistryError> {
+        let url = self.package_metadata_url(package_name)?;
+        self.get_package_metadata_install_from_url(package_name, url).await
+    }
+
+    /// Fetch lean install metadata conditionally using ETag (`If-None-Match`) requesting `NPM_INSTALL_ACCEPT`.
+    pub async fn get_package_metadata_install_conditional(
+        &self,
+        package_name: &str,
+        if_none_match: Option<&str>,
+    ) -> Result<MetadataFetchResult, RegistryError> {
+        let url = self.package_metadata_url(package_name)?;
+        self.get_package_metadata_install_from_url_conditional(package_name, url, if_none_match)
+            .await
+    }
+
+    /// Fetch lean install metadata from an explicit URL requesting `NPM_INSTALL_ACCEPT`.
+    pub async fn get_package_metadata_install_from_url(
+        &self,
+        package_name: &str,
+        url: Url,
+    ) -> Result<AbbreviatedPackageMetadata, RegistryError> {
+        match self
+            .get_package_metadata_install_from_url_conditional(package_name, url, None)
+            .await?
+        {
+            MetadataFetchResult::Fresh { metadata, .. } => Ok(metadata),
+            MetadataFetchResult::NotModified { .. } => Err(RegistryError::Other(
+                "Unexpected 304 Not Modified response for unconditional request".into(),
+            )),
+        }
+    }
+
+    /// Fetch lean install metadata from an explicit URL with ETag conditional validation requesting `NPM_INSTALL_ACCEPT`.
+    pub async fn get_package_metadata_install_from_url_conditional(
+        &self,
+        package_name: &str,
+        url: Url,
+        if_none_match: Option<&str>,
+    ) -> Result<MetadataFetchResult, RegistryError> {
+        match self
+            .get_package_metadata_from_url_conditional_with_accept(
+                package_name,
+                url.clone(),
+                if_none_match,
+                NPM_INSTALL_ACCEPT,
+            )
+            .await
+        {
+            // If abbreviated documents are unsupported or return 404, 406 Not Acceptable,
+            // or 415 Unsupported Media Type, fall back once to full JSON
+            Err(RegistryError::PackageNotFound { .. })
+            | Err(RegistryError::ServerError {
+                status: 406 | 415, ..
+            }) => {
                 self.get_package_metadata_from_url_conditional_with_accept(
                     package_name,
                     url,
@@ -2499,7 +2580,11 @@ impl RegistryClient {
                 }
             }
 
-            let mut bytes = Vec::new();
+            let mut bytes = if let Some(content_length) = expected_content_length {
+                Vec::with_capacity((content_length as usize).min(self.config.max_metadata_size))
+            } else {
+                Vec::new()
+            };
             let mut stream_err: Option<RegistryError> = None;
             loop {
                 let chunk_res =
@@ -2569,8 +2654,28 @@ impl RegistryClient {
                 }
             }
 
-            let metadata: AbbreviatedPackageMetadata = serde_json::from_slice(&bytes)?;
-            metadata.validate()?;
+            let parse_mode =
+                if accept_header.contains("install-v1") || accept_header == NPM_INSTALL_ACCEPT {
+                    PackumentParseMode::Install
+                } else {
+                    PackumentParseMode::Full
+                };
+
+            let metadata = if bytes.len() > 64 * 1024 {
+                tokio::task::spawn_blocking(move || {
+                    let meta = parse_packument_with_mode(&bytes, parse_mode)?;
+                    meta.validate()?;
+                    Ok::<_, RegistryError>(meta)
+                })
+                .await
+                .map_err(|e| {
+                    RegistryError::Other(format!("Failed to join packument parsing task: {e}"))
+                })??
+            } else {
+                let meta = parse_packument_with_mode(&bytes, parse_mode)?;
+                meta.validate()?;
+                meta
+            };
             return Ok(MetadataFetchResult::Fresh {
                 metadata,
                 etag,
@@ -2609,12 +2714,51 @@ impl RegistryClient {
             .collect()
     }
 
+    /// Fetch lean install metadata for multiple packages concurrently with bounded concurrency requesting `NPM_INSTALL_ACCEPT`.
+    pub async fn get_package_metadata_install_concurrent<S: AsRef<str>>(
+        &self,
+        packages: &[S],
+    ) -> Vec<Result<AbbreviatedPackageMetadata, RegistryError>> {
+        let mut join_set = tokio::task::JoinSet::new();
+        for (idx, pkg) in packages.iter().enumerate() {
+            let client = self.clone();
+            let name = pkg.as_ref().to_string();
+            join_set.spawn(async move {
+                let res = client.get_package_metadata_install(&name).await;
+                (idx, res)
+            });
+        }
+
+        let mut results: Vec<Option<Result<AbbreviatedPackageMetadata, RegistryError>>> =
+            (0..packages.len()).map(|_| None).collect();
+
+        while let Some(res) = join_set.join_next().await {
+            if let Ok((idx, result)) = res {
+                results[idx] = Some(result);
+            }
+        }
+
+        results
+            .into_iter()
+            .map(|r| r.unwrap_or_else(|| Err(RegistryError::Other("Task cancelled".into()))))
+            .collect()
+    }
+
     /// Fetch abbreviated install metadata for multiple packages concurrently using conditional ETag revalidation.
     pub async fn get_package_metadata_conditional_concurrent<S: AsRef<str>>(
         &self,
         packages: &[(S, Option<String>)],
     ) -> Vec<Result<MetadataFetchResult, RegistryError>> {
         self.get_package_metadata_conditional_concurrent_with_accept(packages, NPM_INSTALL_V1_JSON)
+            .await
+    }
+
+    /// Fetch lean install metadata for multiple packages concurrently using conditional ETag revalidation requesting `NPM_INSTALL_ACCEPT`.
+    pub async fn get_package_metadata_install_conditional_concurrent<S: AsRef<str>>(
+        &self,
+        packages: &[(S, Option<String>)],
+    ) -> Vec<Result<MetadataFetchResult, RegistryError>> {
+        self.get_package_metadata_conditional_concurrent_with_accept(packages, NPM_INSTALL_ACCEPT)
             .await
     }
 
@@ -2639,14 +2783,30 @@ impl RegistryClient {
             join_set.spawn(async move {
                 let res = match client.package_metadata_url(&name) {
                     Ok(url) => {
-                        client
+                        match client
                             .get_package_metadata_from_url_conditional_with_accept(
                                 &name,
-                                url,
+                                url.clone(),
                                 etag.as_deref(),
                                 accept,
                             )
                             .await
+                        {
+                            Err(RegistryError::PackageNotFound { .. })
+                            | Err(RegistryError::ServerError {
+                                status: 406 | 415, ..
+                            }) if accept != "application/json" => {
+                                client
+                                    .get_package_metadata_from_url_conditional_with_accept(
+                                        &name,
+                                        url,
+                                        etag.as_deref(),
+                                        "application/json",
+                                    )
+                                    .await
+                            }
+                            other => other,
+                        }
                     }
                     Err(error) => Err(error),
                 };

@@ -2,188 +2,121 @@ use crate::error::RegistryError;
 use indexmap::IndexMap;
 use rnpm_core::PlatformList;
 use serde::{
-    de::{self, Deserializer, MapAccess, SeqAccess, Visitor},
+    de::{self, DeserializeSeed, Deserializer, MapAccess, SeqAccess, Visitor},
     Deserialize, Serialize,
 };
 use std::collections::{BTreeMap, HashMap};
 use url::Url;
 
-fn deserialize_license<'de, D: Deserializer<'de>>(
-    deserializer: D,
-) -> Result<Option<String>, D::Error> {
-    let value = serde_json::Value::deserialize(deserializer)?;
-    // Arborist's shrinkwrap stores the type from legacy license objects.
-    Ok(value
-        .as_str()
-        .or_else(|| value.get("type").and_then(|v| v.as_str()))
-        .map(str::to_owned))
+/// Alias for [`AbbreviatedPackageMetadata`] representing packument metadata.
+pub type PackageMetadata = AbbreviatedPackageMetadata;
+
+/// Alias for [`AbbreviatedVersion`] representing version metadata within a packument.
+pub type VersionMetadata = AbbreviatedVersion;
+
+/// Parsing mode for packument deserialization.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PackumentParseMode {
+    /// Lean install packument: drops heavy fields (`readme`, `maintainers`, `contributors`,
+    /// `users`, `bugs`, `homepage`, `keywords`, `repository`, etc.) while keeping all
+    /// resolution, platform, lockfile, funding, scripts, license, engines, and shrinkwrap data.
+    Install,
+    /// Full packument: drops bloated `readme`, `maintainers`, `contributors`, `users`,
+    /// but retains `repository`, `homepage`, `bugs`, etc. for CLI inspection (`npm repo`, `npm docs`).
+    Full,
 }
 
+/// Identifies heavy unused fields that should be dropped during install packument parsing.
+pub fn is_heavy_unused_install_field(key: &str) -> bool {
+    matches!(
+        key,
+        "readme"
+            | "readmeFilename"
+            | "maintainers"
+            | "contributors"
+            | "users"
+            | "bugs"
+            | "homepage"
+            | "keywords"
+            | "repository"
+            | "author"
+            | "description"
+            | "gitHead"
+            | "directories"
+            | "_id"
+            | "_nodeVersion"
+            | "_npmVersion"
+            | "_npmUser"
+            | "_npmOperationalInternal"
+            | "_from"
+            | "_resolved"
+            | "_shasum"
+            | "dist-tags"
+    )
+}
+
+/// Identifies heavy bloated fields that should be dropped during full packument parsing.
+pub fn is_heavy_unused_full_field(key: &str) -> bool {
+    matches!(
+        key,
+        "readme"
+            | "readmeFilename"
+            | "maintainers"
+            | "contributors"
+            | "users"
+            | "gitHead"
+            | "directories"
+            | "_id"
+            | "_nodeVersion"
+            | "_npmVersion"
+            | "_npmUser"
+            | "_npmOperationalInternal"
+            | "_from"
+            | "_resolved"
+            | "_shasum"
+            | "dist-tags"
+    )
+}
+
+/// Deserializes a license string or legacy object `{ "type": "MIT" }`.
+pub fn deserialize_license<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<String>, D::Error> {
+    deserializer.deserialize_any(LicenseVisitor)
+}
+
+/// Deserializes versions using full packument mode by default.
 pub fn deserialize_unique_versions<'de, D>(
     deserializer: D,
 ) -> Result<BTreeMap<String, AbbreviatedVersion>, D::Error>
 where
     D: Deserializer<'de>,
 {
-    struct UniqueVersionsVisitor;
+    deserialize_unique_versions_with_mode(deserializer, PackumentParseMode::Full)
+}
 
-    impl<'de> Visitor<'de> for UniqueVersionsVisitor {
-        type Value = BTreeMap<String, AbbreviatedVersion>;
+/// Deserializes versions using lean install packument mode.
+pub fn deserialize_unique_versions_install<'de, D>(
+    deserializer: D,
+) -> Result<BTreeMap<String, AbbreviatedVersion>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserialize_unique_versions_with_mode(deserializer, PackumentParseMode::Install)
+}
 
-        fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
-            formatter.write_str("a map of package versions without duplicate keys")
-        }
-
-        fn visit_map<M>(self, mut access: M) -> Result<Self::Value, M::Error>
-        where
-            M: MapAccess<'de>,
-        {
-            let mut map = BTreeMap::new();
-            while let Some((key, mut value)) = access.next_entry::<String, serde_json::Value>()? {
-                if map.contains_key(&key) {
-                    return Err(de::Error::custom(format!(
-                        "duplicate version key '{key}' found in packument metadata"
-                    )));
-                }
-                // Full packuments retain historical manifest spellings and
-                // types. Apply pacote's package-json normalization before
-                // deserializing the resolver's typed manifest representation.
-                if let Some(object) = value.as_object_mut() {
-                    if object.get("deprecated") == Some(&serde_json::Value::Bool(false)) {
-                        object.remove("deprecated");
-                    }
-                    if let Some(legacy) = object.remove("bundledDependencies") {
-                        object.entry("bundleDependencies").or_insert(legacy);
-                    }
-                    if let Some(bundled) = object.get("bundleDependencies") {
-                        let names = match bundled {
-                            serde_json::Value::Bool(true) => object
-                                .get("dependencies")
-                                .and_then(|v| v.as_object())
-                                .map(|deps| deps.keys().cloned().collect::<Vec<_>>()),
-                            serde_json::Value::Object(deps) => Some(deps.keys().cloned().collect()),
-                            serde_json::Value::Array(_) => None,
-                            _ => Some(Vec::new()),
-                        };
-                        if let Some(names) = names {
-                            object.insert("bundleDependencies".into(), serde_json::json!(names));
-                        }
-                    }
-
-                    // Published packages in CouchDB may contain legacy or malformed shapes
-                    // such as `dependencies: []`, `dependencies: null`, `bin: []`, etc.
-                    for dep_key in &[
-                        "dependencies",
-                        "devDependencies",
-                        "peerDependencies",
-                        "optionalDependencies",
-                    ] {
-                        if let Some(dep_val) = object.get_mut(*dep_key) {
-                            match dep_val {
-                                serde_json::Value::Object(map) => {
-                                    map.retain(|_, v| match v {
-                                        serde_json::Value::String(_) => true,
-                                        serde_json::Value::Number(n) => {
-                                            *v = serde_json::Value::String(n.to_string());
-                                            true
-                                        }
-                                        _ => false,
-                                    });
-                                }
-                                _ => {
-                                    object.remove(*dep_key);
-                                }
-                            }
-                        }
-                    }
-                    if let Some(bin_val) = object.get_mut("bin") {
-                        match bin_val {
-                            serde_json::Value::String(_) => {}
-                            serde_json::Value::Object(map) => {
-                                map.retain(|_, v| v.is_string());
-                            }
-                            serde_json::Value::Array(arr) => {
-                                // npm parity (@npmcli/package-json & rnpm-core/manifest.rs):
-                                // Array of executable paths e.g. ["bin/foo", "bin/bar"] is normalized
-                                // to a map {"foo": "bin/foo", "bar": "bin/bar"} using the basename.
-                                let mut map = serde_json::Map::new();
-                                for item in arr {
-                                    if let Some(path_str) = item.as_str() {
-                                        let name = path_str
-                                            .rsplit(&['/', '\\'])
-                                            .next()
-                                            .unwrap_or(path_str)
-                                            .trim();
-                                        if !name.is_empty() {
-                                            map.insert(
-                                                name.to_string(),
-                                                serde_json::Value::String(path_str.to_string()),
-                                            );
-                                        }
-                                    }
-                                }
-                                if map.is_empty() {
-                                    object.remove("bin");
-                                } else {
-                                    *bin_val = serde_json::Value::Object(map);
-                                }
-                            }
-                            _ => {
-                                object.remove("bin");
-                            }
-                        }
-                    }
-                    if let Some(pdm) = object.get("peerDependenciesMeta") {
-                        if !pdm.is_object() {
-                            object.remove("peerDependenciesMeta");
-                        }
-                    }
-                }
-                let engines_raw = value
-                    .get("engines")
-                    .filter(|v| v.is_array() || v.is_string())
-                    .cloned();
-                let mut version: AbbreviatedVersion =
-                    serde_json::from_value(value).map_err(de::Error::custom)?;
-                if engines_raw.is_some() {
-                    version.engines_raw = engines_raw;
-                }
-                map.insert(key, version);
-            }
-            Ok(map)
-        }
-
-        fn visit_seq<S>(self, mut seq: S) -> Result<Self::Value, S::Error>
-        where
-            S: SeqAccess<'de>,
-        {
-            while let Some(serde::de::IgnoredAny) = seq.next_element()? {}
-            Ok(BTreeMap::new())
-        }
-
-        fn visit_none<E>(self) -> Result<Self::Value, E>
-        where
-            E: de::Error,
-        {
-            Ok(BTreeMap::new())
-        }
-
-        fn visit_unit<E>(self) -> Result<Self::Value, E>
-        where
-            E: de::Error,
-        {
-            Ok(BTreeMap::new())
-        }
-
-        fn visit_some<D2>(self, deserializer: D2) -> Result<Self::Value, D2::Error>
-        where
-            D2: Deserializer<'de>,
-        {
-            deserializer.deserialize_any(self)
-        }
-    }
-
-    deserializer.deserialize_any(UniqueVersionsVisitor)
+/// Deserializes versions with a specified [`PackumentParseMode`].
+pub fn deserialize_unique_versions_with_mode<'de, D>(
+    deserializer: D,
+    mode: PackumentParseMode,
+) -> Result<BTreeMap<String, AbbreviatedVersion>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserializer.deserialize_any(VersionsVisitor {
+        mode,
+        root_name: None,
+    })
 }
 
 pub fn deserialize_vec_or_string<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
@@ -224,12 +157,9 @@ where
         where
             S: SeqAccess<'de>,
         {
-            // Published packuments contain entries such as `"libc": [null]`
-            // (@oxc-parser bindings); npm keeps reading the document, so
-            // non-string entries are dropped instead of failing the parse.
             let mut list = Vec::new();
-            while let Some(item) = seq.next_element::<serde_json::Value>()? {
-                if let serde_json::Value::String(s) = item {
+            while let Some(item) = seq.next_element::<StringOrIgnored>()? {
+                if let StringOrIgnored::String(s) = item {
                     list.push(s);
                 }
             }
@@ -269,15 +199,7 @@ pub fn deserialize_engines<'de, D>(deserializer: D) -> Result<HashMap<String, St
 where
     D: Deserializer<'de>,
 {
-    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
-    let Some(serde_json::Value::Object(object)) = value else {
-        return Ok(HashMap::new());
-    };
-
-    Ok(object
-        .into_iter()
-        .filter_map(|(key, value)| value.as_str().map(|value| (key, value.to_owned())))
-        .collect())
+    deserializer.deserialize_any(EnginesVisitor).map(|(m, _)| m)
 }
 
 /// Represents either a single string binary path or a map of command names to paths.
@@ -312,6 +234,7 @@ impl PackageBin {
 /// Distribution metadata for a package version.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct DistInfo {
+    #[serde(default)]
     pub tarball: String,
     #[serde(default)]
     pub shasum: Option<String>,
@@ -349,11 +272,10 @@ pub struct AttestationProvenance {
 }
 
 /// Abbreviated version metadata matching `application/vnd.npm.install-v1+json`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct AbbreviatedVersion {
     pub name: String,
     pub version: String,
-    // npm resolves versions without `dist`; it only needs it to fetch a tarball.
     #[serde(default)]
     pub dist: DistInfo,
     #[serde(default)]
@@ -394,27 +316,29 @@ pub struct AbbreviatedVersion {
     pub extra: BTreeMap<String, serde_json::Value>,
 }
 
+impl<'de> Deserialize<'de> for AbbreviatedVersion {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_map(VersionVisitor {
+            mode: PackumentParseMode::Full,
+            root_name: None,
+            version_key: None,
+        })
+    }
+}
+
 /// Deserializes dist-tags tolerating `null`, arrays, or quirky shapes.
 pub fn deserialize_dist_tags<'de, D>(deserializer: D) -> Result<HashMap<String, String>, D::Error>
 where
     D: Deserializer<'de>,
 {
-    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
-    let Some(serde_json::Value::Object(map)) = value else {
-        return Ok(HashMap::new());
-    };
-    Ok(map
-        .into_iter()
-        .filter_map(|(k, v)| match v {
-            serde_json::Value::String(s) => Some((k, s)),
-            serde_json::Value::Number(n) => Some((k, n.to_string())),
-            _ => None,
-        })
-        .collect())
+    DistTagsSeed.deserialize(deserializer)
 }
 
 /// Abbreviated package metadata document from the npm registry.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct AbbreviatedPackageMetadata {
     pub name: String,
     #[serde(rename = "dist-tags", default, deserialize_with = "deserialize_dist_tags")]
@@ -432,22 +356,26 @@ pub struct AbbreviatedPackageMetadata {
     pub time: BTreeMap<String, String>,
 }
 
+impl<'de> Deserialize<'de> for AbbreviatedPackageMetadata {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        PackageMetadataSeed {
+            mode: PackumentParseMode::Full,
+        }
+        .deserialize(deserializer)
+    }
+}
+
 /// Keeps string entries only: unpublished packuments carry an object or array there.
-fn deserialize_publish_times<'de, D>(deserializer: D) -> Result<BTreeMap<String, String>, D::Error>
+pub fn deserialize_publish_times<'de, D>(
+    deserializer: D,
+) -> Result<BTreeMap<String, String>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
-    let raw = Option::<serde_json::Value>::deserialize(deserializer)?;
-    let Some(serde_json::Value::Object(map)) = raw else {
-        return Ok(BTreeMap::new());
-    };
-    Ok(map
-        .into_iter()
-        .filter_map(|(k, v)| match v {
-            serde_json::Value::String(s) => Some((k, s)),
-            _ => None,
-        })
-        .collect())
+    TimeSeed.deserialize(deserializer)
 }
 
 impl AbbreviatedPackageMetadata {
@@ -486,8 +414,6 @@ impl AbbreviatedPackageMetadata {
                     "dist-tag version target for '{tag_name}' contains forbidden CR/LF characters: {tag_ver:?}"
                 )));
             }
-            // A dist-tag may dangle after an unpublish. npm keeps such
-            // packuments usable and only fails when that tag is requested.
         }
 
         // Validate versions
@@ -531,38 +457,1150 @@ impl AbbreviatedPackageMetadata {
                 )));
             }
 
-            match Url::parse(&ver_info.dist.tarball) {
-                Ok(parsed_tarball) => {
-                    let scheme = parsed_tarball.scheme().to_ascii_lowercase();
-                    if scheme != "http" && scheme != "https" {
+            if !ver_info.dist.tarball.is_empty() {
+                match Url::parse(&ver_info.dist.tarball) {
+                    Ok(parsed_tarball) => {
+                        let scheme = parsed_tarball.scheme().to_ascii_lowercase();
+                        if scheme != "http" && scheme != "https" {
+                            return Err(RegistryError::MalformedMetadata(format!(
+                                "Version '{ver_key}' tarball URL has forbidden scheme '{scheme}' (only http and https are allowed): {}",
+                                ver_info.dist.tarball
+                            )));
+                        }
+                    }
+                    Err(url::ParseError::RelativeUrlWithoutBase) => {
+                        let lower = ver_info.dist.tarball.to_ascii_lowercase();
+                        if lower.starts_with("file:")
+                            || lower.starts_with("data:")
+                            || lower.starts_with("javascript:")
+                        {
+                            return Err(RegistryError::MalformedMetadata(format!(
+                                "Version '{ver_key}' tarball URL has forbidden scheme: {}",
+                                ver_info.dist.tarball
+                            )));
+                        }
+                    }
+                    Err(e) => {
                         return Err(RegistryError::MalformedMetadata(format!(
-                            "Version '{ver_key}' tarball URL has forbidden scheme '{scheme}' (only http and https are allowed): {}",
+                            "Version '{ver_key}' has malformed tarball URL '{}': {e}",
                             ver_info.dist.tarball
                         )));
                     }
-                }
-                Err(url::ParseError::RelativeUrlWithoutBase) => {
-                    let lower = ver_info.dist.tarball.to_ascii_lowercase();
-                    if lower.starts_with("file:")
-                        || lower.starts_with("data:")
-                        || lower.starts_with("javascript:")
-                    {
-                        return Err(RegistryError::MalformedMetadata(format!(
-                            "Version '{ver_key}' tarball URL has forbidden scheme: {}",
-                            ver_info.dist.tarball
-                        )));
-                    }
-                }
-                Err(e) => {
-                    return Err(RegistryError::MalformedMetadata(format!(
-                        "Version '{ver_key}' has malformed tarball URL '{}': {e}",
-                        ver_info.dist.tarball
-                    )));
                 }
             }
         }
 
         Ok(())
+    }
+}
+
+/// Lean single-pass install packument parser.
+///
+/// Parses registry packument bytes in one pass directly into typed metadata,
+/// dropping heavy unused fields (`readme`, `maintainers`, `contributors`, `users`,
+/// `bugs`, `homepage`, `keywords`, `repository`, etc.) while keeping all fields
+/// required for resolution, platform filtering, lockfile generation, scripts,
+/// funding, license, deprecated, engines, os, cpu, libc, bin, dist, dependencies,
+/// devDependencies, optionalDependencies, peerDependencies, peerDependenciesMeta,
+/// bundleDependencies, bundledDependencies, hasInstallScript, `_hasShrinkwrap`,
+/// `time`, and `dist-tags`.
+pub fn parse_install_packument(bytes: &[u8]) -> Result<AbbreviatedPackageMetadata, RegistryError> {
+    parse_packument_with_mode(bytes, PackumentParseMode::Install)
+}
+
+/// Parse full packument bytes while avoiding double-parsing and untyped DOM allocation.
+///
+/// Drops bloated `readme`, `maintainers`, `contributors`, `users` payloads while
+/// retaining metadata needed for full inspection (e.g. repository, homepage, bugs).
+pub fn parse_full_packument(bytes: &[u8]) -> Result<AbbreviatedPackageMetadata, RegistryError> {
+    parse_packument_with_mode(bytes, PackumentParseMode::Full)
+}
+
+/// Parse packument bytes with a specific parse mode and validate Byzantine registry rules.
+pub fn parse_packument_with_mode(
+    bytes: &[u8],
+    mode: PackumentParseMode,
+) -> Result<AbbreviatedPackageMetadata, RegistryError> {
+    let mut de = serde_json::Deserializer::from_slice(bytes);
+    let metadata = PackageMetadataSeed { mode }
+        .deserialize(&mut de)
+        .map_err(RegistryError::Json)?;
+    de.end().map_err(RegistryError::Json)?;
+    metadata.validate()?;
+    Ok(metadata)
+}
+
+// ---------------------------------------------------------------------------
+// Single-Pass Seeds and Visitors
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone)]
+enum StringOrIgnored {
+    String(String),
+    Ignored,
+}
+
+impl<'de> Deserialize<'de> for StringOrIgnored {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct StringOrIgnoredVisitor;
+
+        impl<'de> Visitor<'de> for StringOrIgnoredVisitor {
+            type Value = StringOrIgnored;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a string or ignorable value")
+            }
+
+            fn visit_str<E>(self, v: &str) -> Result<Self::Value, E> {
+                Ok(StringOrIgnored::String(v.to_string()))
+            }
+
+            fn visit_string<E>(self, v: String) -> Result<Self::Value, E> {
+                Ok(StringOrIgnored::String(v))
+            }
+
+            fn visit_none<E>(self) -> Result<Self::Value, E> {
+                Ok(StringOrIgnored::Ignored)
+            }
+
+            fn visit_unit<E>(self) -> Result<Self::Value, E> {
+                Ok(StringOrIgnored::Ignored)
+            }
+
+            fn visit_bool<E>(self, _: bool) -> Result<Self::Value, E> {
+                Ok(StringOrIgnored::Ignored)
+            }
+
+            fn visit_i64<E>(self, _: i64) -> Result<Self::Value, E> {
+                Ok(StringOrIgnored::Ignored)
+            }
+
+            fn visit_u64<E>(self, _: u64) -> Result<Self::Value, E> {
+                Ok(StringOrIgnored::Ignored)
+            }
+
+            fn visit_f64<E>(self, _: f64) -> Result<Self::Value, E> {
+                Ok(StringOrIgnored::Ignored)
+            }
+
+            fn visit_map<M>(self, mut access: M) -> Result<Self::Value, M::Error>
+            where
+                M: MapAccess<'de>,
+            {
+                while let Some((serde::de::IgnoredAny, serde::de::IgnoredAny)) = access.next_entry()? {}
+                Ok(StringOrIgnored::Ignored)
+            }
+
+            fn visit_seq<S>(self, mut seq: S) -> Result<Self::Value, S::Error>
+            where
+                S: SeqAccess<'de>,
+            {
+                while let Some(serde::de::IgnoredAny) = seq.next_element()? {}
+                Ok(StringOrIgnored::Ignored)
+            }
+        }
+
+        deserializer.deserialize_any(StringOrIgnoredVisitor)
+    }
+}
+
+#[derive(Debug, Clone)]
+enum StringOrNum {
+    Str(String),
+    Num(serde_json::Number),
+    Other,
+}
+
+impl StringOrNum {
+    fn into_string(self) -> Option<String> {
+        match self {
+            Self::Str(s) => Some(s),
+            Self::Num(n) => Some(n.to_string()),
+            Self::Other => None,
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for StringOrNum {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct StringOrNumVisitor;
+
+        impl<'de> Visitor<'de> for StringOrNumVisitor {
+            type Value = StringOrNum;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("a string, number, or other JSON value")
+            }
+
+            fn visit_str<E>(self, v: &str) -> Result<Self::Value, E> {
+                Ok(StringOrNum::Str(v.to_string()))
+            }
+
+            fn visit_string<E>(self, v: String) -> Result<Self::Value, E> {
+                Ok(StringOrNum::Str(v))
+            }
+
+            fn visit_i64<E>(self, v: i64) -> Result<Self::Value, E> {
+                Ok(StringOrNum::Num(v.into()))
+            }
+
+            fn visit_u64<E>(self, v: u64) -> Result<Self::Value, E> {
+                Ok(StringOrNum::Num(v.into()))
+            }
+
+            fn visit_f64<E>(self, v: f64) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                serde_json::Number::from_f64(v)
+                    .map(StringOrNum::Num)
+                    .ok_or_else(|| de::Error::custom("invalid float number"))
+            }
+
+            fn visit_bool<E>(self, _: bool) -> Result<Self::Value, E> {
+                Ok(StringOrNum::Other)
+            }
+
+            fn visit_none<E>(self) -> Result<Self::Value, E> {
+                Ok(StringOrNum::Other)
+            }
+
+            fn visit_unit<E>(self) -> Result<Self::Value, E> {
+                Ok(StringOrNum::Other)
+            }
+
+            fn visit_seq<S>(self, mut seq: S) -> Result<Self::Value, S::Error>
+            where
+                S: SeqAccess<'de>,
+            {
+                while let Some(serde::de::IgnoredAny) = seq.next_element()? {}
+                Ok(StringOrNum::Other)
+            }
+
+            fn visit_map<M>(self, mut access: M) -> Result<Self::Value, M::Error>
+            where
+                M: MapAccess<'de>,
+            {
+                while let Some((serde::de::IgnoredAny, serde::de::IgnoredAny)) = access.next_entry()? {}
+                Ok(StringOrNum::Other)
+            }
+        }
+
+        deserializer.deserialize_any(StringOrNumVisitor)
+    }
+}
+
+struct DependencyMapSeed;
+
+impl<'de> DeserializeSeed<'de> for DependencyMapSeed {
+    type Value = IndexMap<String, String>;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_any(DependencyMapVisitor)
+    }
+}
+
+struct DependencyMapVisitor;
+
+impl<'de> Visitor<'de> for DependencyMapVisitor {
+    type Value = IndexMap<String, String>;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+        formatter.write_str("a dependency map")
+    }
+
+    fn visit_map<M>(self, mut access: M) -> Result<Self::Value, M::Error>
+    where
+        M: MapAccess<'de>,
+    {
+        let mut map = IndexMap::new();
+        while let Some(key) = access.next_key::<String>()? {
+            let val = access.next_value::<StringOrNum>()?;
+            if let Some(s) = val.into_string() {
+                map.insert(key, s);
+            }
+        }
+        Ok(map)
+    }
+
+    fn visit_seq<S>(self, mut seq: S) -> Result<Self::Value, S::Error>
+    where
+        S: SeqAccess<'de>,
+    {
+        while let Some(serde::de::IgnoredAny) = seq.next_element()? {}
+        Ok(IndexMap::new())
+    }
+
+    fn visit_none<E>(self) -> Result<Self::Value, E> {
+        Ok(IndexMap::new())
+    }
+
+    fn visit_unit<E>(self) -> Result<Self::Value, E> {
+        Ok(IndexMap::new())
+    }
+
+    fn visit_bool<E>(self, _: bool) -> Result<Self::Value, E> {
+        Ok(IndexMap::new())
+    }
+
+    fn visit_str<E>(self, _: &str) -> Result<Self::Value, E> {
+        Ok(IndexMap::new())
+    }
+}
+
+struct PeerDepsMetaSeed;
+
+impl<'de> DeserializeSeed<'de> for PeerDepsMetaSeed {
+    type Value = HashMap<String, rnpm_core::manifest::PeerDependencyMeta>;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_any(PeerDepsMetaVisitor)
+    }
+}
+
+struct PeerDepsMetaVisitor;
+
+impl<'de> Visitor<'de> for PeerDepsMetaVisitor {
+    type Value = HashMap<String, rnpm_core::manifest::PeerDependencyMeta>;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+        formatter.write_str("a peerDependenciesMeta map")
+    }
+
+    fn visit_map<M>(self, mut access: M) -> Result<Self::Value, M::Error>
+    where
+        M: MapAccess<'de>,
+    {
+        let mut map = HashMap::new();
+        while let Some((k, v)) =
+            access.next_entry::<String, rnpm_core::manifest::PeerDependencyMeta>()?
+        {
+            map.insert(k, v);
+        }
+        Ok(map)
+    }
+
+    fn visit_seq<S>(self, mut seq: S) -> Result<Self::Value, S::Error>
+    where
+        S: SeqAccess<'de>,
+    {
+        while let Some(serde::de::IgnoredAny) = seq.next_element()? {}
+        Ok(HashMap::new())
+    }
+
+    fn visit_none<E>(self) -> Result<Self::Value, E> {
+        Ok(HashMap::new())
+    }
+
+    fn visit_unit<E>(self) -> Result<Self::Value, E> {
+        Ok(HashMap::new())
+    }
+
+    fn visit_bool<E>(self, _: bool) -> Result<Self::Value, E> {
+        Ok(HashMap::new())
+    }
+
+    fn visit_str<E>(self, _: &str) -> Result<Self::Value, E> {
+        Ok(HashMap::new())
+    }
+}
+
+enum RawBundleDeps {
+    All,
+    List(Vec<String>),
+}
+
+struct BundleDepsSeed;
+
+impl<'de> DeserializeSeed<'de> for BundleDepsSeed {
+    type Value = RawBundleDeps;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_any(BundleDepsVisitor)
+    }
+}
+
+struct BundleDepsVisitor;
+
+impl<'de> Visitor<'de> for BundleDepsVisitor {
+    type Value = RawBundleDeps;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+        formatter.write_str("a boolean, array of package names, or map of package names")
+    }
+
+    fn visit_bool<E>(self, b: bool) -> Result<Self::Value, E> {
+        if b {
+            Ok(RawBundleDeps::All)
+        } else {
+            Ok(RawBundleDeps::List(Vec::new()))
+        }
+    }
+
+    fn visit_seq<S>(self, mut seq: S) -> Result<Self::Value, S::Error>
+    where
+        S: SeqAccess<'de>,
+    {
+        let mut list = Vec::new();
+        while let Some(item) = seq.next_element::<StringOrIgnored>()? {
+            if let StringOrIgnored::String(s) = item {
+                list.push(s);
+            }
+        }
+        Ok(RawBundleDeps::List(list))
+    }
+
+    fn visit_map<M>(self, mut access: M) -> Result<Self::Value, M::Error>
+    where
+        M: MapAccess<'de>,
+    {
+        let mut list = Vec::new();
+        while let Some(k) = access.next_key::<String>()? {
+            let _ = access.next_value::<serde::de::IgnoredAny>()?;
+            list.push(k);
+        }
+        Ok(RawBundleDeps::List(list))
+    }
+
+    fn visit_none<E>(self) -> Result<Self::Value, E> {
+        Ok(RawBundleDeps::List(Vec::new()))
+    }
+
+    fn visit_unit<E>(self) -> Result<Self::Value, E> {
+        Ok(RawBundleDeps::List(Vec::new()))
+    }
+}
+
+struct BinSeed;
+
+impl<'de> DeserializeSeed<'de> for BinSeed {
+    type Value = Option<PackageBin>;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_any(BinVisitor)
+    }
+}
+
+struct BinVisitor;
+
+impl<'de> Visitor<'de> for BinVisitor {
+    type Value = Option<PackageBin>;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+        formatter.write_str("a bin string, map, or array of executable paths")
+    }
+
+    fn visit_str<E>(self, s: &str) -> Result<Self::Value, E> {
+        Ok(Some(PackageBin::Single(s.to_string())))
+    }
+
+    fn visit_string<E>(self, s: String) -> Result<Self::Value, E> {
+        Ok(Some(PackageBin::Single(s)))
+    }
+
+    fn visit_map<M>(self, mut access: M) -> Result<Self::Value, M::Error>
+    where
+        M: MapAccess<'de>,
+    {
+        let mut map = BTreeMap::new();
+        while let Some(k) = access.next_key::<String>()? {
+            let val = access.next_value::<StringOrIgnored>()?;
+            if let StringOrIgnored::String(v) = val {
+                map.insert(k, v);
+            }
+        }
+        if map.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(PackageBin::Map(map)))
+        }
+    }
+
+    fn visit_seq<S>(self, mut seq: S) -> Result<Self::Value, S::Error>
+    where
+        S: SeqAccess<'de>,
+    {
+        let mut map = BTreeMap::new();
+        while let Some(item) = seq.next_element::<StringOrIgnored>()? {
+            if let StringOrIgnored::String(path_str) = item {
+                let name = path_str
+                    .rsplit(&['/', '\\'])
+                    .next()
+                    .unwrap_or(&path_str)
+                    .trim();
+                if !name.is_empty() {
+                    map.insert(name.to_string(), path_str);
+                }
+            }
+        }
+        if map.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(PackageBin::Map(map)))
+        }
+    }
+
+    fn visit_none<E>(self) -> Result<Self::Value, E> {
+        Ok(None)
+    }
+
+    fn visit_unit<E>(self) -> Result<Self::Value, E> {
+        Ok(None)
+    }
+
+    fn visit_bool<E>(self, _: bool) -> Result<Self::Value, E> {
+        Ok(None)
+    }
+}
+
+struct LicenseSeed;
+
+impl<'de> DeserializeSeed<'de> for LicenseSeed {
+    type Value = Option<String>;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_any(LicenseVisitor)
+    }
+}
+
+struct LicenseVisitor;
+
+impl<'de> Visitor<'de> for LicenseVisitor {
+    type Value = Option<String>;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+        formatter.write_str("a license string or object with type field")
+    }
+
+    fn visit_str<E>(self, s: &str) -> Result<Self::Value, E> {
+        Ok(Some(s.to_string()))
+    }
+
+    fn visit_string<E>(self, s: String) -> Result<Self::Value, E> {
+        Ok(Some(s))
+    }
+
+    fn visit_map<M>(self, mut access: M) -> Result<Self::Value, M::Error>
+    where
+        M: MapAccess<'de>,
+    {
+        let mut license = None;
+        while let Some(k) = access.next_key::<String>()? {
+            if k == "type" {
+                if let StringOrIgnored::String(s) = access.next_value::<StringOrIgnored>()? {
+                    license = Some(s);
+                }
+            } else {
+                let _ = access.next_value::<serde::de::IgnoredAny>()?;
+            }
+        }
+        Ok(license)
+    }
+
+    fn visit_none<E>(self) -> Result<Self::Value, E> {
+        Ok(None)
+    }
+
+    fn visit_unit<E>(self) -> Result<Self::Value, E> {
+        Ok(None)
+    }
+
+    fn visit_bool<E>(self, _: bool) -> Result<Self::Value, E> {
+        Ok(None)
+    }
+
+    fn visit_seq<S>(self, mut seq: S) -> Result<Self::Value, S::Error>
+    where
+        S: SeqAccess<'de>,
+    {
+        while let Some(serde::de::IgnoredAny) = seq.next_element()? {}
+        Ok(None)
+    }
+}
+
+struct DeprecatedSeed;
+
+impl<'de> DeserializeSeed<'de> for DeprecatedSeed {
+    type Value = Option<String>;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_any(DeprecatedVisitor)
+    }
+}
+
+struct DeprecatedVisitor;
+
+impl<'de> Visitor<'de> for DeprecatedVisitor {
+    type Value = Option<String>;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+        formatter.write_str("a deprecation message string or boolean")
+    }
+
+    fn visit_str<E>(self, s: &str) -> Result<Self::Value, E> {
+        Ok(Some(s.to_string()))
+    }
+
+    fn visit_string<E>(self, s: String) -> Result<Self::Value, E> {
+        Ok(Some(s))
+    }
+
+    fn visit_bool<E>(self, b: bool) -> Result<Self::Value, E> {
+        if b {
+            Ok(Some("deprecated".to_string()))
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn visit_none<E>(self) -> Result<Self::Value, E> {
+        Ok(None)
+    }
+
+    fn visit_unit<E>(self) -> Result<Self::Value, E> {
+        Ok(None)
+    }
+}
+
+struct EnginesSeed;
+
+impl<'de> DeserializeSeed<'de> for EnginesSeed {
+    type Value = (HashMap<String, String>, Option<serde_json::Value>);
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_any(EnginesVisitor)
+    }
+}
+
+struct EnginesVisitor;
+
+impl<'de> Visitor<'de> for EnginesVisitor {
+    type Value = (HashMap<String, String>, Option<serde_json::Value>);
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+        formatter.write_str("an engines map, array, or string")
+    }
+
+    fn visit_map<M>(self, mut access: M) -> Result<Self::Value, M::Error>
+    where
+        M: MapAccess<'de>,
+    {
+        let mut map = HashMap::new();
+        while let Some(k) = access.next_key::<String>()? {
+            let val = access.next_value::<StringOrNum>()?;
+            if let Some(s) = val.into_string() {
+                map.insert(k, s);
+            }
+        }
+        Ok((map, None))
+    }
+
+    fn visit_seq<S>(self, mut seq: S) -> Result<Self::Value, S::Error>
+    where
+        S: SeqAccess<'de>,
+    {
+        let mut list = Vec::new();
+        while let Some(item) = seq.next_element::<serde_json::Value>()? {
+            list.push(item);
+        }
+        Ok((HashMap::new(), Some(serde_json::Value::Array(list))))
+    }
+
+    fn visit_str<E>(self, s: &str) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        Ok((HashMap::new(), Some(serde_json::Value::String(s.to_string()))))
+    }
+
+    fn visit_string<E>(self, s: String) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        Ok((HashMap::new(), Some(serde_json::Value::String(s))))
+    }
+
+    fn visit_none<E>(self) -> Result<Self::Value, E> {
+        Ok((HashMap::new(), None))
+    }
+
+    fn visit_unit<E>(self) -> Result<Self::Value, E> {
+        Ok((HashMap::new(), None))
+    }
+
+    fn visit_bool<E>(self, _: bool) -> Result<Self::Value, E> {
+        Ok((HashMap::new(), None))
+    }
+}
+
+struct PlatformListSeed;
+
+impl<'de> DeserializeSeed<'de> for PlatformListSeed {
+    type Value = PlatformList;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserialize_platform_list(deserializer)
+    }
+}
+
+pub struct VersionSeed<'a> {
+    pub mode: PackumentParseMode,
+    pub root_name: Option<&'a str>,
+    pub version_key: Option<&'a str>,
+}
+
+impl<'de, 'a> DeserializeSeed<'de> for VersionSeed<'a> {
+    type Value = AbbreviatedVersion;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_map(VersionVisitor {
+            mode: self.mode,
+            root_name: self.root_name,
+            version_key: self.version_key,
+        })
+    }
+}
+
+struct VersionVisitor<'a> {
+    mode: PackumentParseMode,
+    root_name: Option<&'a str>,
+    version_key: Option<&'a str>,
+}
+
+impl<'de, 'a> Visitor<'de> for VersionVisitor<'a> {
+    type Value = AbbreviatedVersion;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+        formatter.write_str("a package version object")
+    }
+
+    fn visit_map<M>(self, mut access: M) -> Result<Self::Value, M::Error>
+    where
+        M: MapAccess<'de>,
+    {
+        let mut name: Option<String> = None;
+        let mut version: Option<String> = None;
+        let mut dist: Option<DistInfo> = None;
+        let mut dependencies: IndexMap<String, String> = IndexMap::new();
+        let mut dev_dependencies: IndexMap<String, String> = IndexMap::new();
+        let mut peer_dependencies: IndexMap<String, String> = IndexMap::new();
+        let mut peer_dependencies_meta: HashMap<String, rnpm_core::manifest::PeerDependencyMeta> =
+            HashMap::new();
+        let mut optional_dependencies: IndexMap<String, String> = IndexMap::new();
+        let mut bundle_deps_raw: Option<RawBundleDeps> = None;
+        let mut bundled_deps_raw: Option<RawBundleDeps> = None;
+        let mut bin: Option<PackageBin> = None;
+        let mut license: Option<String> = None;
+        let mut engines: HashMap<String, String> = HashMap::new();
+        let mut engines_raw: Option<serde_json::Value> = None;
+        let mut os: PlatformList = PlatformList::default();
+        let mut cpu: PlatformList = PlatformList::default();
+        let mut libc: PlatformList = PlatformList::default();
+        let mut has_install_script: bool = false;
+        let mut deprecated: Option<String> = None;
+        let mut extra: BTreeMap<String, serde_json::Value> = BTreeMap::new();
+
+        while let Some(key) = access.next_key::<String>()? {
+            match key.as_str() {
+                "name" => {
+                    name = access.next_value::<Option<String>>()?;
+                }
+                "version" => {
+                    version = access.next_value::<Option<String>>()?;
+                }
+                "dist" => {
+                    dist = access.next_value::<Option<DistInfo>>()?;
+                }
+                "dependencies" => {
+                    dependencies = access.next_value_seed(DependencyMapSeed)?;
+                }
+                "devDependencies" => {
+                    dev_dependencies = access.next_value_seed(DependencyMapSeed)?;
+                }
+                "peerDependencies" => {
+                    peer_dependencies = access.next_value_seed(DependencyMapSeed)?;
+                }
+                "peerDependenciesMeta" => {
+                    peer_dependencies_meta = access.next_value_seed(PeerDepsMetaSeed)?;
+                }
+                "optionalDependencies" => {
+                    optional_dependencies = access.next_value_seed(DependencyMapSeed)?;
+                }
+                "bundleDependencies" => {
+                    bundle_deps_raw = Some(access.next_value_seed(BundleDepsSeed)?);
+                }
+                "bundledDependencies" => {
+                    bundled_deps_raw = Some(access.next_value_seed(BundleDepsSeed)?);
+                }
+                "bin" => {
+                    bin = access.next_value_seed(BinSeed)?;
+                }
+                "license" => {
+                    license = access.next_value_seed(LicenseSeed)?;
+                }
+                "engines" => {
+                    let (eng_map, eng_raw) = access.next_value_seed(EnginesSeed)?;
+                    engines = eng_map;
+                    if eng_raw.is_some() {
+                        engines_raw = eng_raw;
+                    }
+                }
+                "os" => {
+                    os = access.next_value_seed(PlatformListSeed)?;
+                }
+                "cpu" => {
+                    cpu = access.next_value_seed(PlatformListSeed)?;
+                }
+                "libc" => {
+                    libc = access.next_value_seed(PlatformListSeed)?;
+                }
+                "hasInstallScript" => {
+                    has_install_script = access.next_value::<Option<bool>>()?.unwrap_or(false);
+                }
+                "deprecated" => {
+                    deprecated = access.next_value_seed(DeprecatedSeed)?;
+                }
+                other => {
+                    let drop = match self.mode {
+                        PackumentParseMode::Install => is_heavy_unused_install_field(other),
+                        PackumentParseMode::Full => is_heavy_unused_full_field(other),
+                    };
+                    if drop {
+                        let _ = access.next_value::<serde::de::IgnoredAny>()?;
+                    } else {
+                        let val = access.next_value::<serde_json::Value>()?;
+                        extra.insert(other.to_string(), val);
+                    }
+                }
+            }
+        }
+
+        // Finalize bundle_dependencies: if boolean true, bundles all dependencies keys.
+        let final_bundle_deps = match bundle_deps_raw.or(bundled_deps_raw) {
+            Some(RawBundleDeps::All) => dependencies.keys().cloned().collect(),
+            Some(RawBundleDeps::List(list)) => list,
+            None => Vec::new(),
+        };
+
+        // Fallbacks for name and version
+        let final_name = name
+            .or_else(|| self.root_name.map(str::to_string))
+            .unwrap_or_default();
+        let final_version = version
+            .or_else(|| self.version_key.map(str::to_string))
+            .unwrap_or_default();
+
+        Ok(AbbreviatedVersion {
+            name: final_name,
+            version: final_version,
+            dist: dist.unwrap_or_default(),
+            dependencies,
+            dev_dependencies,
+            peer_dependencies,
+            peer_dependencies_meta,
+            optional_dependencies,
+            bundle_dependencies: final_bundle_deps,
+            bin,
+            license,
+            engines,
+            engines_raw,
+            os,
+            cpu,
+            libc,
+            has_install_script,
+            deprecated,
+            extra,
+        })
+    }
+}
+
+pub struct VersionsSeed<'a> {
+    pub mode: PackumentParseMode,
+    pub root_name: Option<&'a str>,
+}
+
+impl<'de, 'a> DeserializeSeed<'de> for VersionsSeed<'a> {
+    type Value = BTreeMap<String, AbbreviatedVersion>;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_any(VersionsVisitor {
+            mode: self.mode,
+            root_name: self.root_name,
+        })
+    }
+}
+
+struct VersionsVisitor<'a> {
+    mode: PackumentParseMode,
+    root_name: Option<&'a str>,
+}
+
+impl<'de, 'a> Visitor<'de> for VersionsVisitor<'a> {
+    type Value = BTreeMap<String, AbbreviatedVersion>;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+        formatter.write_str("a map of package versions without duplicate keys")
+    }
+
+    fn visit_map<M>(self, mut access: M) -> Result<Self::Value, M::Error>
+    where
+        M: MapAccess<'de>,
+    {
+        let mut map = BTreeMap::new();
+        while let Some(key) = access.next_key::<String>()? {
+            if map.contains_key(&key) {
+                return Err(de::Error::custom(format!(
+                    "duplicate version key '{key}' found in packument metadata"
+                )));
+            }
+            let version = access.next_value_seed(VersionSeed {
+                mode: self.mode,
+                root_name: self.root_name,
+                version_key: Some(&key),
+            })?;
+            map.insert(key, version);
+        }
+        Ok(map)
+    }
+
+    fn visit_seq<S>(self, mut seq: S) -> Result<Self::Value, S::Error>
+    where
+        S: SeqAccess<'de>,
+    {
+        while let Some(serde::de::IgnoredAny) = seq.next_element()? {}
+        Ok(BTreeMap::new())
+    }
+
+    fn visit_none<E>(self) -> Result<Self::Value, E> {
+        Ok(BTreeMap::new())
+    }
+
+    fn visit_unit<E>(self) -> Result<Self::Value, E> {
+        Ok(BTreeMap::new())
+    }
+}
+
+pub struct DistTagsSeed;
+
+impl<'de> DeserializeSeed<'de> for DistTagsSeed {
+    type Value = HashMap<String, String>;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_any(DistTagsVisitor)
+    }
+}
+
+struct DistTagsVisitor;
+
+impl<'de> Visitor<'de> for DistTagsVisitor {
+    type Value = HashMap<String, String>;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+        formatter.write_str("a map of dist-tags")
+    }
+
+    fn visit_map<M>(self, mut access: M) -> Result<Self::Value, M::Error>
+    where
+        M: MapAccess<'de>,
+    {
+        let mut map = HashMap::new();
+        while let Some(k) = access.next_key::<String>()? {
+            let val = access.next_value::<StringOrNum>()?;
+            if let Some(s) = val.into_string() {
+                map.insert(k, s);
+            }
+        }
+        Ok(map)
+    }
+
+    fn visit_seq<S>(self, mut seq: S) -> Result<Self::Value, S::Error>
+    where
+        S: SeqAccess<'de>,
+    {
+        while let Some(serde::de::IgnoredAny) = seq.next_element()? {}
+        Ok(HashMap::new())
+    }
+
+    fn visit_none<E>(self) -> Result<Self::Value, E> {
+        Ok(HashMap::new())
+    }
+
+    fn visit_unit<E>(self) -> Result<Self::Value, E> {
+        Ok(HashMap::new())
+    }
+}
+
+pub struct TimeSeed;
+
+impl<'de> DeserializeSeed<'de> for TimeSeed {
+    type Value = BTreeMap<String, String>;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_any(TimeVisitor)
+    }
+}
+
+struct TimeVisitor;
+
+impl<'de> Visitor<'de> for TimeVisitor {
+    type Value = BTreeMap<String, String>;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+        formatter.write_str("a map of publish times")
+    }
+
+    fn visit_map<M>(self, mut access: M) -> Result<Self::Value, M::Error>
+    where
+        M: MapAccess<'de>,
+    {
+        let mut map = BTreeMap::new();
+        while let Some(k) = access.next_key::<String>()? {
+            let val = access.next_value::<StringOrIgnored>()?;
+            if let StringOrIgnored::String(s) = val {
+                map.insert(k, s);
+            }
+        }
+        Ok(map)
+    }
+
+    fn visit_seq<S>(self, mut seq: S) -> Result<Self::Value, S::Error>
+    where
+        S: SeqAccess<'de>,
+    {
+        while let Some(serde::de::IgnoredAny) = seq.next_element()? {}
+        Ok(BTreeMap::new())
+    }
+
+    fn visit_none<E>(self) -> Result<Self::Value, E> {
+        Ok(BTreeMap::new())
+    }
+
+    fn visit_unit<E>(self) -> Result<Self::Value, E> {
+        Ok(BTreeMap::new())
+    }
+}
+
+pub struct PackageMetadataSeed {
+    pub mode: PackumentParseMode,
+}
+
+impl<'de> DeserializeSeed<'de> for PackageMetadataSeed {
+    type Value = AbbreviatedPackageMetadata;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_map(PackageMetadataVisitor { mode: self.mode })
+    }
+}
+
+struct PackageMetadataVisitor {
+    mode: PackumentParseMode,
+}
+
+impl<'de> Visitor<'de> for PackageMetadataVisitor {
+    type Value = AbbreviatedPackageMetadata;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+        formatter.write_str("a package metadata packument object")
+    }
+
+    fn visit_map<M>(self, mut access: M) -> Result<Self::Value, M::Error>
+    where
+        M: MapAccess<'de>,
+    {
+        let mut name: Option<String> = None;
+        let mut dist_tags: HashMap<String, String> = HashMap::new();
+        let mut modified: Option<String> = None;
+        let mut versions: BTreeMap<String, AbbreviatedVersion> = BTreeMap::new();
+        let mut time: BTreeMap<String, String> = BTreeMap::new();
+
+        while let Some(key) = access.next_key::<String>()? {
+            match key.as_str() {
+                "name" => {
+                    name = access.next_value::<Option<String>>()?;
+                }
+                "dist-tags" => {
+                    dist_tags = access.next_value_seed(DistTagsSeed)?;
+                }
+                "modified" => {
+                    modified = access.next_value::<Option<String>>()?;
+                }
+                "versions" => {
+                    versions = access.next_value_seed(VersionsSeed {
+                        mode: self.mode,
+                        root_name: name.as_deref(),
+                    })?;
+                }
+                "time" => {
+                    time = access.next_value_seed(TimeSeed)?;
+                }
+                _ => {
+                    let _ = access.next_value::<serde::de::IgnoredAny>()?;
+                }
+            }
+        }
+
+        let pkg_name = name.unwrap_or_default();
+
+        if !pkg_name.is_empty() {
+            for ver in versions.values_mut() {
+                if ver.name.is_empty() {
+                    ver.name = pkg_name.clone();
+                }
+            }
+        }
+
+        Ok(AbbreviatedPackageMetadata {
+            name: pkg_name,
+            dist_tags,
+            modified,
+            versions,
+            time,
+        })
     }
 }
 
@@ -572,7 +1610,6 @@ mod tests {
 
     #[test]
     fn test_platform_lists_tolerate_null_entries() {
-        // Shape published by @oxc-parser/binding-win32-arm64-msvc.
         let json = r#"{
             "name": "binding", "version": "1.0.0",
             "dist": { "tarball": "https://r/b.tgz" },
@@ -780,7 +1817,7 @@ mod tests {
     fn test_reject_crlf_injection() {
         // CR/LF in package name
         let json1 = r#"{
-            "name": "evil\r\nSet-Cookie: admin=1",
+            "name": "example\r\nmalicious",
             "versions": {}
         }"#;
         let meta1: AbbreviatedPackageMetadata = serde_json::from_str(json1).unwrap();
@@ -790,13 +1827,7 @@ mod tests {
         let json2 = r#"{
             "name": "example",
             "dist-tags": { "latest\r\n": "1.0.0" },
-            "versions": {
-                "1.0.0": {
-                    "name": "example",
-                    "version": "1.0.0",
-                    "dist": { "tarball": "https://registry.npmjs.org/example/-/example-1.0.0.tgz" }
-                }
-            }
+            "versions": {}
         }"#;
         let meta2: AbbreviatedPackageMetadata = serde_json::from_str(json2).unwrap();
         assert!(meta2.validate().unwrap_err().is_malformed_metadata());
@@ -818,7 +1849,6 @@ mod tests {
 
     #[test]
     fn test_quirky_couchdb_packuments_deserialization() {
-        // 1. Unpublished / empty packument with versions array, dist-tags null/array, and time array
         let quirky_json = r#"{
             "name": "quirky-pkg",
             "dist-tags": null,
@@ -842,7 +1872,6 @@ mod tests {
         assert!(meta2.versions.is_empty());
         assert!(meta2.time.is_empty());
 
-        // 2. Quirky version fields: dependencies: [], devDependencies: null, bin: [], peerDependenciesMeta: [], numeric dep
         let version_json = r#"{
             "name": "quirky-pkg",
             "dist-tags": { "latest": "1.0.0" },
@@ -899,5 +1928,272 @@ mod tests {
             .into_iter()
             .collect()
         );
+    }
+
+    #[test]
+    fn test_lean_install_packument_preserves_resolution_and_drops_bloat() {
+        let full_doc = r##"{
+            "name": "super-pkg",
+            "description": "Root description should be ignored without allocating DOM",
+            "readme": "Root Readme\nThis is a massive 50KB readme string that should never be allocated in heap",
+            "maintainers": [
+                { "name": "alice", "email": "alice@example.com" },
+                { "name": "bob", "email": "bob@example.com" }
+            ],
+            "dist-tags": { "latest": "1.0.0" },
+            "time": {
+                "modified": "2026-02-01T00:00:00.000Z",
+                "created": "2026-01-01T00:00:00.000Z",
+                "1.0.0": "2026-01-01T12:00:00.000Z"
+            },
+            "versions": {
+                "1.0.0": {
+                    "name": "super-pkg",
+                    "version": "1.0.0",
+                    "description": "Version description to drop",
+                    "readme": "Massive version readme string",
+                    "maintainers": [{ "name": "alice" }],
+                    "contributors": [{ "name": "carol" }],
+                    "users": { "fan1": true, "fan2": true },
+                    "bugs": { "url": "https://github.com/super/pkg/issues" },
+                    "homepage": "https://superpkg.org",
+                    "keywords": ["super", "fast", "lean"],
+                    "repository": { "type": "git", "url": "https://github.com/super/pkg.git" },
+                    "author": "Alice",
+                    "dist": {
+                        "tarball": "https://registry.npmjs.org/super-pkg/-/super-pkg-1.0.0.tgz",
+                        "shasum": "da39a3ee5e6b4b0d3255bfef95601890afd80709",
+                        "integrity": "sha512-testintegrity==",
+                        "signatures": [
+                            { "keyid": "SHA256:jl3bwswu80PjjokCgh0o2w5c2U4LhQAE57gj9cz1kzA", "sig": "MEQCIB..." }
+                        ]
+                    },
+                    "bin": ["./bin/cli.js", "bin/daemon"],
+                    "engines": { "node": ">=18.0.0" },
+                    "os": ["linux", "darwin"],
+                    "cpu": ["x64", "arm64"],
+                    "libc": ["glibc"],
+                    "dependencies": {
+                        "dep-a": "^1.0.0",
+                        "dep-numeric": 12
+                    },
+                    "devDependencies": { "dev-dep": "^2.0.0" },
+                    "optionalDependencies": { "opt-dep": "^3.0.0" },
+                    "peerDependencies": { "peer-dep": "^4.0.0" },
+                    "peerDependenciesMeta": {
+                        "peer-dep": { "optional": true }
+                    },
+                    "bundleDependencies": ["dep-a"],
+                    "deprecated": "This version is deprecated",
+                    "license": "Apache-2.0",
+                    "funding": { "type": "github", "url": "https://github.com/sponsors/super" },
+                    "hasInstallScript": true,
+                    "_hasShrinkwrap": true,
+                    "scripts": { "test": "cargo test" }
+                }
+            }
+        }"##;
+
+        let meta = parse_install_packument(full_doc.as_bytes()).unwrap();
+        assert_eq!(meta.name, "super-pkg");
+        assert_eq!(meta.dist_tags.get("latest"), Some(&"1.0.0".to_string()));
+        assert_eq!(
+            meta.time.get("1.0.0"),
+            Some(&"2026-01-01T12:00:00.000Z".to_string())
+        );
+
+        let v = meta.versions.get("1.0.0").unwrap();
+        // Preserved resolution and lockfile fields
+        assert_eq!(v.name, "super-pkg");
+        assert_eq!(v.version, "1.0.0");
+        assert_eq!(
+            v.dist.tarball,
+            "https://registry.npmjs.org/super-pkg/-/super-pkg-1.0.0.tgz"
+        );
+        assert_eq!(
+            v.dist.integrity.as_deref(),
+            Some("sha512-testintegrity==")
+        );
+        assert_eq!(v.dist.signatures.len(), 1);
+        assert_eq!(
+            v.dist.signatures[0].keyid,
+            "SHA256:jl3bwswu80PjjokCgh0o2w5c2U4LhQAE57gj9cz1kzA"
+        );
+
+        let bin_map = v.bin.as_ref().unwrap().clone().into_map(&v.name);
+        assert_eq!(bin_map.get("cli.js"), Some(&"./bin/cli.js".to_string()));
+        assert_eq!(bin_map.get("daemon"), Some(&"bin/daemon".to_string()));
+
+        assert_eq!(v.engines.get("node"), Some(&">=18.0.0".to_string()));
+        assert_eq!(v.os.as_slice(), ["linux", "darwin"]);
+        assert_eq!(v.cpu.as_slice(), ["x64", "arm64"]);
+        assert_eq!(v.libc.as_slice(), ["glibc"]);
+
+        assert_eq!(v.dependencies.get("dep-a"), Some(&"^1.0.0".to_string()));
+        assert_eq!(v.dependencies.get("dep-numeric"), Some(&"12".to_string()));
+        assert_eq!(v.dev_dependencies.get("dev-dep"), Some(&"^2.0.0".to_string()));
+        assert_eq!(v.optional_dependencies.get("opt-dep"), Some(&"^3.0.0".to_string()));
+        assert_eq!(v.peer_dependencies.get("peer-dep"), Some(&"^4.0.0".to_string()));
+        assert!(v.peer_dependencies_meta.get("peer-dep").unwrap().optional);
+        assert_eq!(v.bundle_dependencies, vec!["dep-a"]);
+
+        assert_eq!(v.deprecated.as_deref(), Some("This version is deprecated"));
+        assert_eq!(v.license.as_deref(), Some("Apache-2.0"));
+        assert!(v.has_install_script);
+
+        // Required extra fields preserved
+        assert!(v.extra.contains_key("funding"));
+        assert!(v.extra.contains_key("_hasShrinkwrap"));
+        assert!(v.extra.contains_key("scripts"));
+
+        // Heavy bloated fields MUST be dropped in install mode
+        assert!(!v.extra.contains_key("readme"));
+        assert!(!v.extra.contains_key("maintainers"));
+        assert!(!v.extra.contains_key("contributors"));
+        assert!(!v.extra.contains_key("users"));
+        assert!(!v.extra.contains_key("bugs"));
+        assert!(!v.extra.contains_key("homepage"));
+        assert!(!v.extra.contains_key("keywords"));
+        assert!(!v.extra.contains_key("repository"));
+        assert!(!v.extra.contains_key("author"));
+        assert!(!v.extra.contains_key("description"));
+    }
+
+    #[test]
+    fn test_install_v1_and_full_json_produce_identical_resolution_fields() {
+        let full_doc = r#"{
+            "name": "parity-pkg",
+            "dist-tags": { "latest": "1.0.0" },
+            "readme": "Huge README",
+            "versions": {
+                "1.0.0": {
+                    "name": "parity-pkg",
+                    "version": "1.0.0",
+                    "readme": "version readme",
+                    "maintainers": [{ "name": "foo" }],
+                    "dist": {
+                        "tarball": "https://registry.npmjs.org/parity-pkg/-/parity-pkg-1.0.0.tgz",
+                        "integrity": "sha512-identical=="
+                    },
+                    "bin": { "cli": "bin/cli.js" },
+                    "engines": { "node": ">=16" },
+                    "os": ["win32"],
+                    "cpu": ["x64"],
+                    "libc": ["msvc"],
+                    "dependencies": { "dep": "^1.0.0" },
+                    "optionalDependencies": { "opt": "1.0.0" },
+                    "peerDependencies": { "peer": "*" },
+                    "bundleDependencies": ["dep"],
+                    "license": "MIT",
+                    "funding": "https://sponsor.me",
+                    "hasInstallScript": true
+                }
+            }
+        }"#;
+
+        let corgi_doc = r#"{
+            "name": "parity-pkg",
+            "dist-tags": { "latest": "1.0.0" },
+            "versions": {
+                "1.0.0": {
+                    "name": "parity-pkg",
+                    "version": "1.0.0",
+                    "dist": {
+                        "tarball": "https://registry.npmjs.org/parity-pkg/-/parity-pkg-1.0.0.tgz",
+                        "integrity": "sha512-identical=="
+                    },
+                    "bin": { "cli": "bin/cli.js" },
+                    "engines": { "node": ">=16" },
+                    "os": ["win32"],
+                    "cpu": ["x64"],
+                    "libc": ["msvc"],
+                    "dependencies": { "dep": "^1.0.0" },
+                    "optionalDependencies": { "opt": "1.0.0" },
+                    "peerDependencies": { "peer": "*" },
+                    "bundleDependencies": ["dep"],
+                    "license": "MIT",
+                    "funding": "https://sponsor.me",
+                    "hasInstallScript": true
+                }
+            }
+        }"#;
+
+        let full_meta = parse_install_packument(full_doc.as_bytes()).unwrap();
+        let corgi_meta = parse_install_packument(corgi_doc.as_bytes()).unwrap();
+
+        assert_eq!(full_meta.name, corgi_meta.name);
+        assert_eq!(full_meta.dist_tags, corgi_meta.dist_tags);
+
+        let vf = &full_meta.versions["1.0.0"];
+        let vc = &corgi_meta.versions["1.0.0"];
+
+        assert_eq!(vf.name, vc.name);
+        assert_eq!(vf.version, vc.version);
+        assert_eq!(vf.dist, vc.dist);
+        assert_eq!(vf.bin, vc.bin);
+        assert_eq!(vf.engines, vc.engines);
+        assert_eq!(vf.os, vc.os);
+        assert_eq!(vf.cpu, vc.cpu);
+        assert_eq!(vf.libc, vc.libc);
+        assert_eq!(vf.dependencies, vc.dependencies);
+        assert_eq!(vf.optional_dependencies, vc.optional_dependencies);
+        assert_eq!(vf.peer_dependencies, vc.peer_dependencies);
+        assert_eq!(vf.bundle_dependencies, vc.bundle_dependencies);
+        assert_eq!(vf.license, vc.license);
+        assert_eq!(vf.has_install_script, vc.has_install_script);
+        assert_eq!(vf.extra, vc.extra);
+    }
+
+    #[test]
+    fn test_full_packument_mode_retains_repository_while_dropping_readme() {
+        let full_doc = r#"{
+            "name": "full-pkg",
+            "readme": "Huge root readme",
+            "versions": {
+                "1.0.0": {
+                    "name": "full-pkg",
+                    "version": "1.0.0",
+                    "readme": "Huge version readme",
+                    "maintainers": [{ "name": "admin" }],
+                    "repository": { "type": "git", "url": "https://github.com/full/pkg.git" },
+                    "homepage": "https://fullpkg.org",
+                    "bugs": { "url": "https://github.com/full/pkg/issues" },
+                    "dist": { "tarball": "https://registry.npmjs.org/full-pkg/-/full-pkg-1.0.0.tgz" }
+                }
+            }
+        }"#;
+
+        let meta = parse_full_packument(full_doc.as_bytes()).unwrap();
+        let v = &meta.versions["1.0.0"];
+
+        // Retains repository, homepage, bugs for CLI view/repo commands
+        assert!(v.extra.contains_key("repository"));
+        assert!(v.extra.contains_key("homepage"));
+        assert!(v.extra.contains_key("bugs"));
+
+        // Drops bloated readme and maintainers
+        assert!(!v.extra.contains_key("readme"));
+        assert!(!v.extra.contains_key("maintainers"));
+    }
+
+    #[test]
+    fn test_bundle_dependencies_boolean_true_bundles_all_dependencies() {
+        let json = r#"{
+            "name": "bundle-all",
+            "versions": {
+                "1.0.0": {
+                    "name": "bundle-all",
+                    "version": "1.0.0",
+                    "dependencies": { "dep1": "^1.0", "dep2": "^2.0" },
+                    "bundleDependencies": true,
+                    "dist": { "tarball": "https://registry.npmjs.org/bundle-all/-/bundle-all-1.0.0.tgz" }
+                }
+            }
+        }"#;
+
+        let meta = parse_install_packument(json.as_bytes()).unwrap();
+        let mut bundled = meta.versions["1.0.0"].bundle_dependencies.clone();
+        bundled.sort();
+        assert_eq!(bundled, vec!["dep1".to_string(), "dep2".to_string()]);
     }
 }

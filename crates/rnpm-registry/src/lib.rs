@@ -14,6 +14,7 @@ pub mod network_errors;
 pub mod not_found;
 pub mod provenance;
 pub mod publish;
+pub mod types;
 
 pub use circuit_breaker::{CircuitBreaker, CircuitBreakerState};
 pub use client::{
@@ -22,13 +23,17 @@ pub use client::{
     parse_retry_after, parse_retry_after_str, reset_http_request_count, BytesFetchResult,
     MetadataFetchResult, RegistryClient, RegistryClientConfig, ScopedTlsConfig, ScopedTlsIdentity,
     TarballFetchResult, TarballStream, DEFAULT_RETRY_FACTOR, HTTP_REQUEST_COUNT,
-    NPM_INSTALL_V1_JSON,
+    NPM_INSTALL_ACCEPT, NPM_INSTALL_V1_JSON,
 };
 pub use error::RegistryError;
-pub use reqwest::StatusCode;
 pub use metadata::{
-    AbbreviatedPackageMetadata, AbbreviatedVersion, AttestationProvenance, DistAttestations,
-    DistInfo, DistSignature, PackageBin,
+    deserialize_dist_tags, deserialize_engines, deserialize_license, deserialize_platform_list,
+    deserialize_publish_times, deserialize_unique_versions, deserialize_unique_versions_install,
+    deserialize_unique_versions_with_mode, deserialize_vec_or_string, is_heavy_unused_full_field,
+    is_heavy_unused_install_field, parse_full_packument, parse_install_packument,
+    parse_packument_with_mode, AbbreviatedPackageMetadata, AbbreviatedVersion,
+    AttestationProvenance, DistAttestations, DistInfo, DistSignature, PackageBin, PackageMetadata,
+    PackumentParseMode, VersionMetadata,
 };
 pub use provenance::{
     assemble_sigstore_bundle, build_slsa_v1_statement, format_registry_signature_payload,
@@ -43,3 +48,4 @@ pub use provenance::{
 pub use publish::{
     create_publish_payload, PublishAttachment, PublishPayloadOptions, PublishTarballData,
 };
+pub use reqwest::StatusCode;

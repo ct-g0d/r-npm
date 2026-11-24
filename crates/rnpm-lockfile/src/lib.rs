@@ -22,7 +22,8 @@ pub use migration::{
 };
 pub use model::{
     get_format_package_lock, reset_format_package_lock, set_format_package_lock,
-    set_omit_registry_resolved, LockfilePackage, LockfileV3, PackageBin, PackageEngines,
+    set_omit_registry_resolved, LockfilePackage, LockfileV3, LockfileWriter, PackageBin,
+    PackageEngines,
 };
 pub use rnpm_core::manifest::BundledDependencies;
 

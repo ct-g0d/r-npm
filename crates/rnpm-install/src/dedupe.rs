@@ -190,13 +190,9 @@ pub fn execute_dedupe(options: &DedupeOptions) -> Result<DedupeSummary> {
         return Ok(DedupeSummary::default());
     }
 
-    // 1. Load root manifest
+    // 1. Load root manifest (read-only mode)
     let root_manifest_path = project_dir.join("package.json");
-    let root_manifest = if root_manifest_path.is_file() {
-        Manifest::from_file(&root_manifest_path).ok()
-    } else {
-        None
-    };
+    let root_manifest = Manifest::from_file_readonly(&root_manifest_path).ok();
 
     // 2. Load lockfile if present
     let (lockfile_path, _) = crate::resolve_lockfile_path(project_dir);
@@ -212,19 +208,20 @@ pub fn execute_dedupe(options: &DedupeOptions) -> Result<DedupeSummary> {
 
     let mut installed_map: HashMap<String, InstalledPackage> = HashMap::new();
 
-    // Map of (parent_path, dep_name) -> requested range
-    let mut requirements_map: HashMap<(String, String), String> = HashMap::new();
+    // Map of parent_path -> (dep_name -> requested range)
+    let mut requirements_map: HashMap<String, HashMap<String, String>> = HashMap::new();
 
     // Collect requirements from root manifest
     if let Some(ref m) = root_manifest {
+        let root_entry = requirements_map.entry("".to_string()).or_default();
         for (dep, range) in &m.dependencies {
-            requirements_map.insert(("".to_string(), dep.clone()), range.clone());
+            root_entry.insert(dep.clone(), range.clone());
         }
         for (dep, range) in &m.dev_dependencies {
-            requirements_map.insert(("".to_string(), dep.clone()), range.clone());
+            root_entry.insert(dep.clone(), range.clone());
         }
         for (dep, range) in &m.optional_dependencies {
-            requirements_map.insert(("".to_string(), dep.clone()), range.clone());
+            root_entry.insert(dep.clone(), range.clone());
         }
     }
 
@@ -234,11 +231,7 @@ pub fn execute_dedupe(options: &DedupeOptions) -> Result<DedupeSummary> {
         let is_link = is_junction(&full_path).unwrap_or(false);
 
         let manifest_path = full_path.join("package.json");
-        let manifest = if manifest_path.is_file() {
-            Manifest::from_file(&manifest_path).ok()
-        } else {
-            None
-        };
+        let manifest = Manifest::from_file_readonly(&manifest_path).ok();
 
         let name = manifest
             .as_ref()
@@ -263,20 +256,22 @@ pub fn execute_dedupe(options: &DedupeOptions) -> Result<DedupeSummary> {
 
         let mut deps = HashMap::new();
         if let Some(ref m) = manifest {
+            let req_entry = requirements_map.entry(pkg_rel_path.clone()).or_default();
             for (d, r) in &m.dependencies {
                 deps.insert(d.clone(), r.clone());
-                requirements_map.insert((pkg_rel_path.clone(), d.clone()), r.clone());
+                req_entry.insert(d.clone(), r.clone());
             }
             for (d, r) in &m.optional_dependencies {
                 deps.insert(d.clone(), r.clone());
-                requirements_map.insert((pkg_rel_path.clone(), d.clone()), r.clone());
+                req_entry.insert(d.clone(), r.clone());
             }
         } else if let Some(ref l) = lockfile {
             if let Some(lp) = l.get_package(pkg_rel_path) {
                 if let Some(ref d_map) = lp.dependencies {
+                    let req_entry = requirements_map.entry(pkg_rel_path.clone()).or_default();
                     for (d, r) in d_map {
                         deps.insert(d.clone(), r.clone());
-                        requirements_map.insert((pkg_rel_path.clone(), d.clone()), r.clone());
+                        req_entry.insert(d.clone(), r.clone());
                     }
                 }
             }
@@ -333,6 +328,24 @@ pub fn execute_dedupe(options: &DedupeOptions) -> Result<DedupeSummary> {
         .as_ref()
         .map(rnpm_solver::graph::DependencyGraph::from_lockfile_v3);
 
+    // Pre-index incoming dependency edges by target location for O(1) lookups
+    let incoming_edges_by_target: Option<HashMap<&str, Vec<&rnpm_solver::graph::DependencyEdge>>> =
+        dep_graph.as_ref().map(|graph| {
+            let mut map: HashMap<&str, Vec<&rnpm_solver::graph::DependencyEdge>> =
+                HashMap::with_capacity(graph.edges.len());
+            for edge in &graph.edges {
+                map.entry(edge.to_location.as_str()).or_default().push(edge);
+            }
+            map
+        });
+
+    let get_req_range = |parent: &str, dep: &str| -> Option<&str> {
+        requirements_map
+            .get(parent)
+            .and_then(|m| m.get(dep))
+            .map(|s| s.as_str())
+    };
+
     // 5. Evaluate deduplication opportunities for duplicated packages
     for (pkg_name, mut instances) in by_name {
         if instances.len() <= 1 {
@@ -362,18 +375,15 @@ pub fn execute_dedupe(options: &DedupeOptions) -> Result<DedupeSummary> {
                     continue;
                 }
 
-                let satisfies = if let Some(ref graph) = dep_graph {
-                    let incoming: Vec<&rnpm_solver::graph::DependencyEdge> = graph
-                        .edges
-                        .iter()
-                        .filter(|e| e.to_location == nested.path)
-                        .collect();
+                let satisfies = if let Some(ref incoming_map) = incoming_edges_by_target {
+                    let incoming = incoming_map
+                        .get(nested.path.as_str())
+                        .map(|v| v.as_slice())
+                        .unwrap_or(&[]);
 
                     if incoming.is_empty() {
                         // If there are no incoming edges in the lockfile graph, verify with requirements_map
-                        if let Some(req_range) =
-                            requirements_map.get(&(nested.parent_path.clone(), pkg_name.clone()))
-                        {
+                        if let Some(req_range) = get_req_range(&nested.parent_path, &pkg_name) {
                             version_matches_range(&root_ver, req_range)
                         } else {
                             false
@@ -383,9 +393,7 @@ pub fn execute_dedupe(options: &DedupeOptions) -> Result<DedupeSummary> {
                             .iter()
                             .all(|e| version_matches_range(&root_ver, &e.spec))
                     }
-                } else if let Some(req_range) =
-                    requirements_map.get(&(nested.parent_path.clone(), pkg_name.clone()))
-                {
+                } else if let Some(req_range) = get_req_range(&nested.parent_path, &pkg_name) {
                     version_matches_range(&root_ver, req_range)
                 } else {
                     false
@@ -411,7 +419,7 @@ pub fn execute_dedupe(options: &DedupeOptions) -> Result<DedupeSummary> {
             // Multiple nested copies exist. Find if a satisfying version can be hoisted
             // to the shallowest level (root node_modules/<pkg>).
             // First collect all requirements that would look up root_install_path:
-            let root_range_opt = requirements_map.get(&("".to_string(), pkg_name.clone()));
+            let root_range_opt = get_req_range("", &pkg_name);
 
             // Find candidate version among nested instances that satisfies root requirement (if any)
             // and as many nested parents as possible.
@@ -444,16 +452,14 @@ pub fn execute_dedupe(options: &DedupeOptions) -> Result<DedupeSummary> {
                 }
 
                 // Check if best_ver satisfies all other nested instances' consumers
-                let all_satisfied = if let Some(ref graph) = dep_graph {
+                let all_satisfied = if let Some(ref incoming_map) = incoming_edges_by_target {
                     instances.iter().all(|nested| {
-                        let incoming: Vec<&rnpm_solver::graph::DependencyEdge> = graph
-                            .edges
-                            .iter()
-                            .filter(|e| e.to_location == nested.path)
-                            .collect();
+                        let incoming = incoming_map
+                            .get(nested.path.as_str())
+                            .map(|v| v.as_slice())
+                            .unwrap_or(&[]);
                         if incoming.is_empty() {
-                            if let Some(req_range) = requirements_map
-                                .get(&(nested.parent_path.clone(), pkg_name.clone()))
+                            if let Some(req_range) = get_req_range(&nested.parent_path, &pkg_name)
                             {
                                 version_matches_range(&best_ver, req_range)
                             } else {
@@ -467,9 +473,7 @@ pub fn execute_dedupe(options: &DedupeOptions) -> Result<DedupeSummary> {
                     })
                 } else {
                     instances.iter().all(|nested| {
-                        if let Some(req_range) =
-                            requirements_map.get(&(nested.parent_path.clone(), pkg_name.clone()))
-                        {
+                        if let Some(req_range) = get_req_range(&nested.parent_path, &pkg_name) {
                             version_matches_range(&best_ver, req_range)
                         } else {
                             false

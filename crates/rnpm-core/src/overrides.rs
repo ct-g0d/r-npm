@@ -6,7 +6,7 @@ use crate::semver::{
     Range, Version,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 /// Value in an override definition: either an exact spec string or a nested map of overrides.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -16,22 +16,297 @@ pub enum OverrideValue {
     Nested(BTreeMap<String, OverrideValue>),
 }
 
-/// Overrides engine implementing npm RFC 36 package overrides.
+/// Pre-compiled pattern for an override rule key or target.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PrecompiledPattern {
+    Any,
+    ExactVersion(Version),
+    SemverRange(Range),
+    Raw(String),
+}
+
+impl PrecompiledPattern {
+    pub fn compile(raw_spec: &str) -> Self {
+        let mut p = raw_spec.trim();
+        p = p.strip_prefix("workspace:").unwrap_or(p).trim();
+        let p_extracted = extract_semver_range_from_spec(p);
+        let p_str = p_extracted.as_deref().unwrap_or(p).trim();
+
+        if p_str == "*"
+            || p_str == "^"
+            || p_str == "~"
+            || p_str.is_empty()
+            || p_str.eq_ignore_ascii_case("x")
+        {
+            return PrecompiledPattern::Any;
+        }
+
+        if let Ok(ver) = Version::parse(p_str) {
+            return PrecompiledPattern::ExactVersion(ver);
+        }
+
+        if let Ok(range) = Range::parse(p_str) {
+            return PrecompiledPattern::SemverRange(range);
+        }
+
+        PrecompiledPattern::Raw(p_str.to_string())
+    }
+
+    pub fn matches(&self, requested_spec: &str) -> bool {
+        let mut r = requested_spec.trim();
+        if matches!(self, PrecompiledPattern::Any) {
+            return true;
+        }
+
+        r = r.strip_prefix("workspace:").unwrap_or(r).trim();
+        if r == "*" || r == "^" || r == "~" || r.is_empty() || r.eq_ignore_ascii_case("x") {
+            return true;
+        }
+
+        if let Some(rest) = r.strip_prefix("npm:") {
+            if let Some((_, sub_spec)) = parse_key_and_spec(rest) {
+                r = sub_spec;
+            } else if let Some(at_idx) = rest.rfind('@') {
+                r = &rest[at_idx + 1..];
+            } else {
+                r = "*";
+            }
+            if r == "*" || r == "^" || r == "~" || r.is_empty() || r.eq_ignore_ascii_case("x") {
+                return true;
+            }
+        }
+
+        let r_extracted = extract_semver_range_from_spec(r);
+        let r_str = r_extracted.as_deref().unwrap_or(r).trim();
+        if r_str == "*" || r_str.eq_ignore_ascii_case("x") {
+            return true;
+        }
+
+        match self {
+            PrecompiledPattern::Any => true,
+            PrecompiledPattern::ExactVersion(p_ver) => {
+                if let Ok(r_ver) = Version::parse(r_str) {
+                    return p_ver == &r_ver;
+                }
+                if let Ok(r_range) = Range::parse(r_str) {
+                    return r_range.satisfies(p_ver);
+                }
+                false
+            }
+            PrecompiledPattern::SemverRange(p_range) => {
+                if let Ok(r_ver) = Version::parse(r_str) {
+                    return p_range.satisfies(&r_ver);
+                }
+                if let Ok(r_range) = Range::parse(r_str) {
+                    return ranges_intersect(p_range, &r_range);
+                }
+                false
+            }
+            PrecompiledPattern::Raw(s) => s == r_str,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrecompiledRule {
+    pub raw_key: String,
+    pub pkg_name: String,
+    pub pattern: PrecompiledPattern,
+    pub has_spec: bool,
+    pub nested: Option<PrecompiledNode>,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PrecompiledNode {
+    pub rules_by_pkg: BTreeMap<String, Vec<PrecompiledRule>>,
+}
+
+impl PrecompiledNode {
+    pub fn compile(
+        rules: &BTreeMap<String, OverrideValue>,
+        all_targets: &mut HashSet<String>,
+    ) -> Self {
+        let mut rules_by_pkg: BTreeMap<String, Vec<PrecompiledRule>> = BTreeMap::new();
+
+        for (k, v) in rules {
+            let (k_name, k_spec, has_spec) = if let Some((name, spec)) = parse_key_and_spec(k) {
+                (name, spec, true)
+            } else {
+                (k.as_str(), "", false)
+            };
+
+            all_targets.insert(k_name.to_string());
+
+            let pattern = if has_spec {
+                PrecompiledPattern::compile(k_spec)
+            } else {
+                PrecompiledPattern::Any
+            };
+
+            let nested = if let OverrideValue::Nested(ref sub_map) = v {
+                Some(PrecompiledNode::compile(sub_map, all_targets))
+            } else {
+                None
+            };
+
+            let rule = PrecompiledRule {
+                raw_key: k.clone(),
+                pkg_name: k_name.to_string(),
+                pattern,
+                has_spec,
+                nested,
+            };
+
+            rules_by_pkg
+                .entry(k_name.to_string())
+                .or_default()
+                .push(rule);
+        }
+
+        Self { rules_by_pkg }
+    }
+
+    pub fn find_direct<'a>(
+        &self,
+        rules: &'a BTreeMap<String, OverrideValue>,
+        dep_name: &str,
+        requested_spec: &str,
+    ) -> Option<&'a OverrideValue> {
+        let rule_list = self.rules_by_pkg.get(dep_name)?;
+
+        // 1. Check spec-targeted overrides in declaration order
+        for rule in rule_list {
+            if rule.has_spec && rule.pattern.matches(requested_spec) {
+                return rules.get(&rule.raw_key);
+            }
+        }
+
+        // 2. Check exact package name override (e.g. "semver")
+        for rule in rule_list {
+            if !rule.has_spec {
+                return rules.get(&rule.raw_key);
+            }
+        }
+
+        None
+    }
+
+    pub fn find_in_nested<'a, T: AsRef<str>>(
+        &self,
+        rules: &'a BTreeMap<String, OverrideValue>,
+        ancestors: &[T],
+        dep_name: &str,
+        requested_spec: &str,
+    ) -> Option<&'a OverrideValue> {
+        if ancestors.is_empty() {
+            return self.find_direct(rules, dep_name, requested_spec);
+        }
+
+        let parent_str = ancestors[0].as_ref();
+        let (parent_name, parent_ver) = parse_key_and_spec(parent_str).unwrap_or((parent_str, ""));
+
+        let rule_list = self.rules_by_pkg.get(parent_name)?;
+
+        for rule in rule_list {
+            let matches_parent = if rule.has_spec && !parent_ver.is_empty() {
+                rule.pattern.matches(parent_ver)
+            } else {
+                true
+            };
+
+            if matches_parent {
+                if let (Some(ref nested_node), Some(OverrideValue::Nested(ref nested_map))) =
+                    (&rule.nested, rules.get(&rule.raw_key))
+                {
+                    if ancestors.len() > 1 {
+                        for next_idx in 1..ancestors.len() {
+                            if let Some(res) = nested_node.find_in_nested(
+                                nested_map,
+                                &ancestors[next_idx..],
+                                dep_name,
+                                requested_spec,
+                            ) {
+                                return Some(res);
+                            }
+                        }
+                    }
+                    if let Some(res) = nested_node.find_direct(nested_map, dep_name, requested_spec) {
+                        return Some(res);
+                    }
+                }
+            }
+        }
+
+        None
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrecompiledOverrides {
+    pub all_target_names: HashSet<String>,
+    pub root_node: PrecompiledNode,
+    pub rules_snapshot: BTreeMap<String, OverrideValue>,
+    pub rules_len: usize,
+    pub compiled: bool,
+}
+
+impl Default for PrecompiledOverrides {
+    fn default() -> Self {
+        Self {
+            all_target_names: HashSet::new(),
+            root_node: PrecompiledNode::default(),
+            rules_snapshot: BTreeMap::new(),
+            rules_len: 0,
+            compiled: true,
+        }
+    }
+}
+
+impl PrecompiledOverrides {
+    pub fn compile(rules: &BTreeMap<String, OverrideValue>) -> Self {
+        let mut all_targets = HashSet::new();
+        let root_node = PrecompiledNode::compile(rules, &mut all_targets);
+        Self {
+            all_target_names: all_targets,
+            root_node,
+            rules_snapshot: rules.clone(),
+            rules_len: rules.len(),
+            compiled: true,
+        }
+    }
+
+    pub fn matches_rules(&self, rules: &BTreeMap<String, OverrideValue>) -> bool {
+        self.compiled && self.rules_len == rules.len() && &self.rules_snapshot == rules
+    }
+}
+
+/// Overrides engine implementing npm RFC 36 package overrides.
+#[derive(Debug, Clone, Default)]
 pub struct Overrides {
     pub rules: BTreeMap<String, OverrideValue>,
     /// Root dependencies map (for reference overrides like `"$foo"`).
     pub root_dependencies: BTreeMap<String, String>,
+    indexed: PrecompiledOverrides,
 }
+
+impl PartialEq for Overrides {
+    fn eq(&self, other: &Self) -> bool {
+        self.rules == other.rules && self.root_dependencies == other.root_dependencies
+    }
+}
+
+impl Eq for Overrides {}
 
 impl Overrides {
     pub fn new(
         rules: BTreeMap<String, OverrideValue>,
         root_dependencies: BTreeMap<String, String>,
     ) -> Self {
+        let indexed = PrecompiledOverrides::compile(&rules);
         Self {
             rules,
             root_dependencies,
+            indexed,
         }
     }
 
@@ -139,12 +414,25 @@ impl Overrides {
             return Ok(None);
         }
 
+        let fallback_indexed;
+        let indexed = if self.indexed.matches_rules(&self.rules) {
+            &self.indexed
+        } else {
+            fallback_indexed = PrecompiledOverrides::compile(&self.rules);
+            &fallback_indexed
+        };
+
+        // O(1) fast check: If dep_name is not targeted anywhere in overrides, exit immediately
+        if !indexed.all_target_names.contains(dep_name) {
+            return Ok(None);
+        }
+
         let mut matched_val = None;
 
         // 1. Check nested scoped overrides along ancestor chain
         for i in 0..ancestors.len() {
             let slice = &ancestors[i..];
-            if let Some(val) = self.find_in_nested(&self.rules, slice, dep_name, requested_spec) {
+            if let Some(val) = indexed.root_node.find_in_nested(&self.rules, slice, dep_name, requested_spec) {
                 matched_val = Some(val);
                 break;
             }
@@ -152,7 +440,7 @@ impl Overrides {
 
         // 2. If no nested override matched, check top-level global overrides
         if matched_val.is_none() {
-            matched_val = self.find_direct(&self.rules, dep_name, requested_spec);
+            matched_val = indexed.root_node.find_direct(&self.rules, dep_name, requested_spec);
         }
 
         // 3. Extract the target spec string
@@ -191,78 +479,6 @@ impl Overrides {
         }
 
         Ok(Some(current_spec))
-    }
-
-    fn find_direct<'a>(
-        &self,
-        rules: &'a BTreeMap<String, OverrideValue>,
-        dep_name: &str,
-        requested_spec: &str,
-    ) -> Option<&'a OverrideValue> {
-        // First check spec-targeted override: e.g. "debug@^2.0.0"
-        for (k, v) in rules {
-            if let Some((k_name, k_spec)) = parse_key_and_spec(k) {
-                if k_name == dep_name && spec_matches(k_spec, requested_spec) {
-                    return Some(v);
-                }
-            }
-        }
-
-        // Then check exact package name: e.g. "semver"
-        if let Some(v) = rules.get(dep_name) {
-            return Some(v);
-        }
-
-        None
-    }
-
-    fn find_in_nested<'a, T: AsRef<str>>(
-        &self,
-        rules: &'a BTreeMap<String, OverrideValue>,
-        ancestors: &[T],
-        dep_name: &str,
-        requested_spec: &str,
-    ) -> Option<&'a OverrideValue> {
-        if ancestors.is_empty() {
-            return self.find_direct(rules, dep_name, requested_spec);
-        }
-
-        let parent_str = ancestors[0].as_ref();
-        let (parent_name, parent_ver) = parse_key_and_spec(parent_str).unwrap_or((parent_str, ""));
-
-        for (k, v) in rules {
-            let (k_name, k_spec) = parse_key_and_spec(k).unwrap_or((k.as_str(), ""));
-
-            let matches_parent = if k_name != parent_name {
-                false
-            } else if !k_spec.is_empty() && !parent_ver.is_empty() {
-                spec_matches(k_spec, parent_ver)
-            } else {
-                true
-            };
-
-            if matches_parent {
-                if let OverrideValue::Nested(nested_map) = v {
-                    if ancestors.len() > 1 {
-                        for next_idx in 1..ancestors.len() {
-                            if let Some(res) = self.find_in_nested(
-                                nested_map,
-                                &ancestors[next_idx..],
-                                dep_name,
-                                requested_spec,
-                            ) {
-                                return Some(res);
-                            }
-                        }
-                    }
-                    if let Some(res) = self.find_direct(nested_map, dep_name, requested_spec) {
-                        return Some(res);
-                    }
-                }
-            }
-        }
-
-        None
     }
 }
 
@@ -454,6 +670,9 @@ fn insert_override_rule(
 impl Overrides {
     /// Whether any rule, at any depth, names `name`.
     pub fn mentions(&self, name: &str) -> bool {
+        if self.indexed.matches_rules(&self.rules) {
+            return self.indexed.all_target_names.contains(name);
+        }
         fn walk(rules: &BTreeMap<String, OverrideValue>, name: &str) -> bool {
             rules.iter().any(|(key, value)| {
                 parse_key_and_spec(key).map_or(key.as_str(), |(key_name, _)| key_name) == name
@@ -642,74 +861,9 @@ fn extract_semver_range_from_spec(spec: &str) -> Option<String> {
 }
 
 /// Determines if the requested spec matches the pattern spec in a spec-targeted override.
-fn spec_matches(pattern_spec: &str, requested_spec: &str) -> bool {
-    let mut p = pattern_spec.trim();
-    let mut r = requested_spec.trim();
-    if p == r {
-        return true;
-    }
-
-    // Strip workspace: prefix if present on either side, e.g. workspace:^1.0.0 -> ^1.0.0
-    p = p.strip_prefix("workspace:").unwrap_or(p).trim();
-    if p == "*" || p == "^" || p == "~" || p.is_empty() {
-        p = "*";
-    }
-    r = r.strip_prefix("workspace:").unwrap_or(r).trim();
-    if r == "*" || r == "^" || r == "~" || r.is_empty() {
-        r = "*";
-    }
-    if p == r {
-        return true;
-    }
-
-    // If requested_spec is an alias, e.g. "npm:react@^18.0.0" or "npm:@scope/pkg@^18.0.0"
-    if let Some(rest) = r.strip_prefix("npm:") {
-        if let Some((_, sub_spec)) = parse_key_and_spec(rest) {
-            r = sub_spec;
-        } else if let Some(at_idx) = rest.rfind('@') {
-            r = &rest[at_idx + 1..];
-        } else {
-            // Bare alias like "npm:react" defaults to "*"
-            r = "*";
-        }
-    }
-
-    // If requested_spec or pattern_spec contains #semver: (including URL-encoded #semver%3A / #semver%3a)
-    let p_extracted = extract_semver_range_from_spec(p);
-    let p_str = p_extracted.as_deref().unwrap_or(p);
-    let r_extracted = extract_semver_range_from_spec(r);
-    let r_str = r_extracted.as_deref().unwrap_or(r);
-
-    if p_str == r_str {
-        return true;
-    }
-
-    // Wildcards: "*" or "x" or "X" match anything
-    if p_str == "*"
-        || p_str.eq_ignore_ascii_case("x")
-        || r_str == "*"
-        || r_str.eq_ignore_ascii_case("x")
-    {
-        return true;
-    }
-
-    // 1. If requested is a concrete version (e.g. ancestor version or pinned version),
-    // test if pattern satisfies it per Arborist override-set (semver.satisfies(node.version, rule.keySpec))
-    if let (Ok(p_range), Ok(r_ver)) = (Range::parse(p_str), Version::parse(r_str)) {
-        return p_range.satisfies(&r_ver);
-    }
-
-    // 2. If pattern is exact version and requested is a range
-    if let (Ok(p_ver), Ok(r_range)) = (Version::parse(p_str), Range::parse(r_str)) {
-        return r_range.satisfies(&p_ver);
-    }
-
-    // 3. If both can be parsed as ranges, test for intersection
-    if let (Ok(p_range), Ok(r_range)) = (Range::parse(p_str), Range::parse(r_str)) {
-        return ranges_intersect(&p_range, &r_range);
-    }
-
-    false
+#[allow(dead_code)]
+pub fn spec_matches(pattern_spec: &str, requested_spec: &str) -> bool {
+    PrecompiledPattern::compile(pattern_spec).matches(requested_spec)
 }
 
 #[cfg(test)]

@@ -45,6 +45,16 @@ pub fn extract_batch_parallel<R: Read + Send>(
     };
 
     let actual_threads = concurrency.min(num_items);
+
+    // Fast path: for single-item batches or single-threaded concurrency,
+    // execute sequentially on current thread to avoid thread spawn and mutex overhead.
+    if num_items == 1 || actual_threads == 1 {
+        return items
+            .into_iter()
+            .map(|item| extract_and_replace(item.reader, &item.destination, item.limits))
+            .collect();
+    }
+
     let items_queue = Arc::new(Mutex::new(
         items.into_iter().enumerate().collect::<Vec<_>>(),
     ));
@@ -56,8 +66,8 @@ pub fn extract_batch_parallel<R: Read + Send>(
             let queue_clone = Arc::clone(&items_queue);
 
             let handle = scope.spawn(move || {
-                let mut local_results = Vec::new();
-                let mut local_batch = Vec::new();
+                let mut local_results = Vec::with_capacity(num_items / actual_threads + 2);
+                let mut local_batch = Vec::with_capacity(8);
 
                 loop {
                     // Guided batch extraction: take a proportional chunk of tasks to minimize mutex contention
@@ -67,9 +77,12 @@ pub fn extract_batch_parallel<R: Read + Send>(
                         if remaining == 0 {
                             break;
                         }
-                        let chunk_size = (remaining / (actual_threads * 2)).clamp(1, 8);
-                        let start_idx = remaining.saturating_sub(chunk_size);
-                        local_batch.extend(guard.split_off(start_idx));
+                        let chunk_size = (remaining / (actual_threads * 2)).clamp(1, 8).min(remaining);
+                        for _ in 0..chunk_size {
+                            if let Some(task) = guard.pop() {
+                                local_batch.push(task);
+                            }
+                        }
                     }
 
                     // Process local batch without holding any lock

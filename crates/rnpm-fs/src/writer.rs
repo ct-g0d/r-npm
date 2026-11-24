@@ -353,11 +353,23 @@ where
             all_dirs.insert(d.to_path_buf());
         }
 
+        let mut created_dirs: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
         let mut sorted_dirs: Vec<PathBuf> = all_dirs.into_iter().collect();
-        sorted_dirs.sort_by_key(|p| (p.components().count(), p.as_os_str().len()));
+        sorted_dirs.sort_by_key(|a| std::cmp::Reverse(a.components().count()));
 
-        for dir in sorted_dirs {
-            let _ = std::fs::create_dir_all(&dir);
+        for dir in &sorted_dirs {
+            if created_dirs.contains(dir) {
+                continue;
+            }
+            let _ = std::fs::create_dir_all(dir);
+            let mut curr = dir.as_path();
+            while let Some(parent) = curr.parent() {
+                if !created_dirs.insert(parent.to_path_buf()) {
+                    break;
+                }
+                curr = parent;
+            }
+            created_dirs.insert(dir.clone());
         }
 
         Ok(())
@@ -1527,15 +1539,18 @@ pub fn extract_tarball_direct<R: Read>(
 
     let t_mat = std::time::Instant::now();
 
-    // 1. Directory pre-creation
-    let mut all_dirs = decoded.directories;
-    all_dirs.push(destination.to_path_buf());
+    // 1. Directory pre-creation with pre-deduplication to avoid redundant allocations and syscalls
+    let mut unique_dirs: std::collections::HashSet<&Path> = std::collections::HashSet::new();
+    unique_dirs.insert(destination);
+    for d in &decoded.directories {
+        unique_dirs.insert(d.as_path());
+    }
     for f in &decoded.files {
         if let Some(p) = f.path.parent() {
-            all_dirs.push(p.to_path_buf());
+            unique_dirs.insert(p);
         }
     }
-    let dir_refs: Vec<&Path> = all_dirs.iter().map(|p| p.as_path()).collect();
+    let dir_refs: Vec<&Path> = unique_dirs.into_iter().collect();
     precreate_directories(dir_refs).map_err(FsError::Io)?;
 
     // 2. Parallel file materialization
@@ -1618,21 +1633,24 @@ pub fn extract_packages_direct_parallel<R: Read + Send>(
         decoded_results.push(res);
     }
 
-    // Collect all directories across all successfully decoded packages
-    let mut all_dirs = Vec::new();
+    // Collect all unique directories across all successfully decoded packages with pre-deduplication
+    let mut unique_dirs: std::collections::HashSet<&Path> = std::collections::HashSet::new();
+    unique_dirs.insert(root_destination);
     let mut all_files = Vec::new();
     for decoded in decoded_results.iter().flatten() {
-        all_dirs.extend(decoded.directories.clone());
+        for d in &decoded.directories {
+            unique_dirs.insert(d.as_path());
+        }
         for f in &decoded.files {
             if let Some(p) = f.path.parent() {
-                all_dirs.push(p.to_path_buf());
+                unique_dirs.insert(p);
             }
         }
         all_files.extend(decoded.files.clone());
     }
 
     // Pre-create all directories in one pass
-    let dir_refs: Vec<&Path> = all_dirs.iter().map(|p| p.as_path()).collect();
+    let dir_refs: Vec<&Path> = unique_dirs.into_iter().collect();
     if let Err(e) = precreate_directories(dir_refs) {
         return (0..num_items)
             .map(|_| Err(FsError::Io(std::io::Error::new(e.kind(), e.to_string()))))

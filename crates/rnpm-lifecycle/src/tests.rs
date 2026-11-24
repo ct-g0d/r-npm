@@ -4646,3 +4646,44 @@ async fn test_init_cwd_reflects_invocation_directory_not_prefix() {
         "INIT_CWD must reflect invocation_dir, NOT prefix_sub_dir"
     );
 }
+
+#[test]
+fn test_precomputed_env_preserves_original_npm_lifecycle_script_when_forwarding_args() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    std::fs::write(
+        root.join("package.json"),
+        r#"{"name":"arg-fwd","version":"1.0.0","scripts":{"greet":"node -e \"console.log(process.env.npm_lifecycle_script)\""}}"#,
+    )
+    .unwrap();
+
+    let config = rnpm_config::Config::default();
+    let original_cmd = r#"node -e "console.log(process.env.npm_lifecycle_script)""#;
+    let full_cmd = format!(r#"{original_cmd} "extra-arg""#);
+
+    let base_env = precompute_lifecycle_env(root, root, "arg-fwd", Some("1.0.0"), &config, None);
+    let mut hook_env = base_env.clone();
+    hook_env.insert("npm_lifecycle_event".into(), "greet".into());
+    hook_env.insert("npm_lifecycle_script".into(), original_cmd.into());
+
+    let mut ctx = LifecycleContext::new_with_config(root, root, "arg-fwd", "greet", &full_cmd, config.clone());
+    ctx.precomputed_env = Some(hook_env);
+
+    let env = build_script_env_with_config(&ctx, &config);
+    assert_eq!(
+        env.get("npm_lifecycle_script").map(String::as_str),
+        Some(original_cmd),
+        "Precomputed npm_lifecycle_script must preserve original manifest script rather than forwarded-arg command"
+    );
+
+    // When precomputed_env came straight from precompute_lifecycle_env (empty npm_lifecycle_script),
+    // build_script_env_with_config must still populate ctx.script_cmd.
+    let mut ctx_default = LifecycleContext::new_with_config(root, root, "arg-fwd", "greet", original_cmd, config.clone());
+    ctx_default.precomputed_env = Some(base_env);
+    let env_default = build_script_env_with_config(&ctx_default, &config);
+    assert_eq!(
+        env_default.get("npm_lifecycle_script").map(String::as_str),
+        Some(original_cmd),
+        "Unset precomputed npm_lifecycle_script must fall back to ctx.script_cmd"
+    );
+}

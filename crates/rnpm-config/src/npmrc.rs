@@ -67,7 +67,7 @@ impl Default for Npmrc {
     fn default() -> Self {
         Self {
             settings: BTreeMap::new(),
-            registry: Url::parse(DEFAULT_REGISTRY).expect("default registry URL is valid"),
+            registry: crate::default_registry_url(),
             scoped_registries: BTreeMap::new(),
             auth_tokens: BTreeMap::new(),
         }
@@ -205,7 +205,12 @@ impl Npmrc {
 
         // 1. Check if key is the default registry
         if key_trimmed == "registry" {
-            if let Ok(mut reg_url) = Url::parse(value_trimmed) {
+            if value_trimmed == DEFAULT_REGISTRY
+                || value_trimmed == "https://registry.npmjs.org"
+                || value_trimmed == "https://registry.npmjs.org/"
+            {
+                self.registry = crate::default_registry_url();
+            } else if let Ok(mut reg_url) = Url::parse(value_trimmed) {
                 ensure_trailing_slash(&mut reg_url);
                 self.registry = reg_url;
             }

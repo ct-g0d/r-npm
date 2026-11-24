@@ -63,7 +63,7 @@ pub struct DependencyEdge {
 }
 
 /// A node in the resolved dependency graph representing a package placed in `node_modules`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Node {
     /// Relative POSIX path in the tree (e.g. `""`, `"node_modules/foo"`, `"node_modules/bar/node_modules/foo"`).
     pub location: String,
@@ -109,6 +109,32 @@ pub struct Node {
     pub extra: BTreeMap<String, serde_json::Value>,
 }
 
+impl PartialEq for Node {
+    fn eq(&self, other: &Self) -> bool {
+        self.location == other.location
+            && self.install_name == other.install_name
+            && self.name == other.name
+            && self.version == other.version
+            && self.resolved == other.resolved
+            && self.integrity == other.integrity
+            && self.flags == other.flags
+            && self.dependencies == other.dependencies
+            && self.dev_dependencies == other.dev_dependencies
+            && self.peer_dependencies == other.peer_dependencies
+            && self.peer_dependencies_meta == other.peer_dependencies_meta
+            && self.optional_dependencies == other.optional_dependencies
+            && self.os == other.os
+            && self.cpu == other.cpu
+            && self.libc == other.libc
+            && self.bin == other.bin
+            && self.license == other.license
+            && self.engines == other.engines
+            && self.extra == other.extra
+    }
+}
+
+impl Eq for Node {}
+
 impl Node {
     /// `$name` override references of this package, in arborist's edge.js
     /// lookup order: dev, optional, dependencies, peer. The first non-empty
@@ -150,7 +176,7 @@ impl Node {
 }
 
 /// Complete resolved dependency graph and tree geometry.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct DependencyGraph {
     pub root_location: String,
     pub nodes: BTreeMap<String, Node>,
@@ -159,7 +185,40 @@ pub struct DependencyGraph {
     /// `legacy-peer-deps`: arborist creates no peer edges at all.
     #[serde(skip)]
     pub legacy_peer_deps: bool,
+    /// Incremental index: dependency/install name -> node locations declaring it as a dependency.
+    #[serde(skip, default)]
+    pub nodes_by_dep_name: HashMap<String, Vec<String>>,
+    /// Incremental index: edge install name -> edge indices in self.edges.
+    #[serde(skip, default)]
+    pub edges_by_install_name: HashMap<String, Vec<usize>>,
+    /// Incremental index: parent scope -> child node locations directly under parent's node_modules.
+    #[serde(skip, default)]
+    pub children_by_parent: HashMap<String, Vec<String>>,
+    /// Incremental index: package real name -> node locations.
+    #[serde(skip, default)]
+    pub nodes_by_name: HashMap<String, Vec<String>>,
+    /// Incremental index: folder/install name -> node locations.
+    #[serde(skip, default)]
+    pub nodes_by_install_name: HashMap<String, Vec<String>>,
+    /// Incremental index: target node location -> incoming edge indices.
+    #[serde(skip, default)]
+    pub incoming_edges_by_location: HashMap<String, Vec<usize>>,
+    /// Incremental index: source node location -> outgoing edge indices.
+    #[serde(skip, default)]
+    pub outgoing_edges_by_location: HashMap<String, Vec<usize>>,
 }
+
+impl PartialEq for DependencyGraph {
+    fn eq(&self, other: &Self) -> bool {
+        self.root_location == other.root_location
+            && self.nodes == other.nodes
+            && self.edges == other.edges
+            && self.skipped == other.skipped
+            && self.legacy_peer_deps == other.legacy_peer_deps
+    }
+}
+
+impl Eq for DependencyGraph {}
 
 impl DependencyGraph {
     pub fn new() -> Self {
@@ -169,7 +228,248 @@ impl DependencyGraph {
             edges: Vec::new(),
             skipped: HashSet::new(),
             legacy_peer_deps: false,
+            nodes_by_dep_name: HashMap::new(),
+            edges_by_install_name: HashMap::new(),
+            children_by_parent: HashMap::new(),
+            nodes_by_name: HashMap::new(),
+            nodes_by_install_name: HashMap::new(),
+            incoming_edges_by_location: HashMap::new(),
+            outgoing_edges_by_location: HashMap::new(),
         }
+    }
+
+    /// Adds or replaces a node in the graph, updating all secondary indices.
+    pub fn add_node(&mut self, location: String, node: Node) {
+        if let Some(old) = self.nodes.remove(&location) {
+            Self::remove_node_from_indices(
+                &mut self.nodes_by_dep_name,
+                &mut self.nodes_by_name,
+                &mut self.nodes_by_install_name,
+                &mut self.children_by_parent,
+                &location,
+                &old,
+            );
+        }
+        Self::add_node_to_indices(
+            &mut self.nodes_by_dep_name,
+            &mut self.nodes_by_name,
+            &mut self.nodes_by_install_name,
+            &mut self.children_by_parent,
+            &location,
+            &node,
+        );
+        self.nodes.insert(location, node);
+    }
+
+    /// Removes a node from the graph and updates all secondary indices.
+    pub fn remove_node(&mut self, location: &str) -> Option<Node> {
+        if let Some(node) = self.nodes.remove(location) {
+            Self::remove_node_from_indices(
+                &mut self.nodes_by_dep_name,
+                &mut self.nodes_by_name,
+                &mut self.nodes_by_install_name,
+                &mut self.children_by_parent,
+                location,
+                &node,
+            );
+            Some(node)
+        } else {
+            None
+        }
+    }
+
+    /// Adds an edge to the graph, updating all secondary indices.
+    pub fn add_edge(&mut self, edge: DependencyEdge) {
+        let idx = self.edges.len();
+        Self::add_edge_to_indices(
+            &mut self.edges_by_install_name,
+            &mut self.incoming_edges_by_location,
+            &mut self.outgoing_edges_by_location,
+            idx,
+            &edge,
+        );
+        self.edges.push(edge);
+    }
+
+    /// Removes an edge by index and rebuilds edge indices.
+    pub fn remove_edge(&mut self, index: usize) -> Option<DependencyEdge> {
+        if index < self.edges.len() {
+            let edge = self.edges.remove(index);
+            self.rebuild_edge_indices();
+            Some(edge)
+        } else {
+            None
+        }
+    }
+
+    /// Checks if a node location has any child packages nested directly under its `node_modules`.
+    #[inline]
+    pub fn has_children(&self, location: &str) -> bool {
+        if self.children_by_parent.is_empty() && !self.nodes.is_empty() {
+            return self.nodes.keys().any(|child| {
+                if let Some(rest) = child.strip_prefix(location) {
+                    if location.is_empty() {
+                        rest.starts_with("node_modules/")
+                    } else {
+                        rest.starts_with("/node_modules/")
+                    }
+                } else {
+                    false
+                }
+            });
+        }
+        self.children_by_parent
+            .get(location)
+            .is_some_and(|children| !children.is_empty())
+    }
+
+    /// Helper to index a node across all node-related secondary maps.
+    fn add_node_to_indices(
+        nodes_by_dep_name: &mut HashMap<String, Vec<String>>,
+        nodes_by_name: &mut HashMap<String, Vec<String>>,
+        nodes_by_install_name: &mut HashMap<String, Vec<String>>,
+        children_by_parent: &mut HashMap<String, Vec<String>>,
+        location: &str,
+        node: &Node,
+    ) {
+        let mut dep_names = HashSet::new();
+        for name in node.dependencies.keys() {
+            dep_names.insert(name);
+        }
+        for name in node.optional_dependencies.keys() {
+            dep_names.insert(name);
+        }
+        for name in node.peer_dependencies.keys() {
+            dep_names.insert(name);
+        }
+        for name in node.dev_dependencies.keys() {
+            dep_names.insert(name);
+        }
+        for name in dep_names {
+            let vec = nodes_by_dep_name.entry(name.clone()).or_default();
+            if !vec.iter().any(|l| l == location) {
+                vec.push(location.to_string());
+            }
+        }
+
+        let by_name = nodes_by_name.entry(node.name.clone()).or_default();
+        if !by_name.iter().any(|l| l == location) {
+            by_name.push(location.to_string());
+        }
+
+        let by_install = nodes_by_install_name
+            .entry(node.install_name.clone())
+            .or_default();
+        if !by_install.iter().any(|l| l == location) {
+            by_install.push(location.to_string());
+        }
+
+        if let Some(parent) = crate::hoisting::parent_scope(location) {
+            let children = children_by_parent.entry(parent.to_string()).or_default();
+            if !children.iter().any(|l| l == location) {
+                children.push(location.to_string());
+            }
+        }
+    }
+
+    /// Helper to remove a node from all node-related secondary maps.
+    fn remove_node_from_indices(
+        nodes_by_dep_name: &mut HashMap<String, Vec<String>>,
+        nodes_by_name: &mut HashMap<String, Vec<String>>,
+        nodes_by_install_name: &mut HashMap<String, Vec<String>>,
+        children_by_parent: &mut HashMap<String, Vec<String>>,
+        location: &str,
+        node: &Node,
+    ) {
+        let mut dep_names = HashSet::new();
+        for name in node.dependencies.keys() {
+            dep_names.insert(name);
+        }
+        for name in node.optional_dependencies.keys() {
+            dep_names.insert(name);
+        }
+        for name in node.peer_dependencies.keys() {
+            dep_names.insert(name);
+        }
+        for name in node.dev_dependencies.keys() {
+            dep_names.insert(name);
+        }
+        for name in dep_names {
+            if let Some(vec) = nodes_by_dep_name.get_mut(name) {
+                vec.retain(|l| l != location);
+            }
+        }
+
+        if let Some(vec) = nodes_by_name.get_mut(&node.name) {
+            vec.retain(|l| l != location);
+        }
+
+        if let Some(vec) = nodes_by_install_name.get_mut(&node.install_name) {
+            vec.retain(|l| l != location);
+        }
+
+        if let Some(parent) = crate::hoisting::parent_scope(location) {
+            if let Some(children) = children_by_parent.get_mut(parent) {
+                children.retain(|l| l != location);
+            }
+        }
+    }
+
+    /// Helper to index an edge into edge-related secondary maps.
+    fn add_edge_to_indices(
+        edges_by_install_name: &mut HashMap<String, Vec<usize>>,
+        incoming_edges_by_location: &mut HashMap<String, Vec<usize>>,
+        outgoing_edges_by_location: &mut HashMap<String, Vec<usize>>,
+        idx: usize,
+        edge: &DependencyEdge,
+    ) {
+        edges_by_install_name
+            .entry(edge.install_name.clone())
+            .or_default()
+            .push(idx);
+        incoming_edges_by_location
+            .entry(edge.to_location.clone())
+            .or_default()
+            .push(idx);
+        outgoing_edges_by_location
+            .entry(edge.from_location.clone())
+            .or_default()
+            .push(idx);
+    }
+
+    /// Rebuilds edge secondary indices from scratch.
+    pub fn rebuild_edge_indices(&mut self) {
+        self.edges_by_install_name.clear();
+        self.incoming_edges_by_location.clear();
+        self.outgoing_edges_by_location.clear();
+        for (idx, edge) in self.edges.iter().enumerate() {
+            Self::add_edge_to_indices(
+                &mut self.edges_by_install_name,
+                &mut self.incoming_edges_by_location,
+                &mut self.outgoing_edges_by_location,
+                idx,
+                edge,
+            );
+        }
+    }
+
+    /// Rebuilds all secondary graph indices from scratch.
+    pub fn rebuild_indices(&mut self) {
+        self.nodes_by_dep_name.clear();
+        self.nodes_by_name.clear();
+        self.nodes_by_install_name.clear();
+        self.children_by_parent.clear();
+        for (loc, node) in &self.nodes {
+            Self::add_node_to_indices(
+                &mut self.nodes_by_dep_name,
+                &mut self.nodes_by_name,
+                &mut self.nodes_by_install_name,
+                &mut self.children_by_parent,
+                loc,
+                node,
+            );
+        }
+        self.rebuild_edge_indices();
     }
 
     pub fn is_skipped(&self, name: &str) -> bool {
@@ -189,10 +489,18 @@ impl DependencyGraph {
     }
 
     pub fn get_outgoing_edges(&self, from_location: &str) -> Vec<&DependencyEdge> {
-        self.edges
-            .iter()
-            .filter(|e| e.from_location == from_location)
-            .collect()
+        if !self.outgoing_edges_by_location.is_empty() {
+            if let Some(indices) = self.outgoing_edges_by_location.get(from_location) {
+                indices.iter().map(|&i| &self.edges[i]).collect()
+            } else {
+                Vec::new()
+            }
+        } else {
+            self.edges
+                .iter()
+                .filter(|e| e.from_location == from_location)
+                .collect()
+        }
     }
 
     /// Recomputes dev/optional reachability from the root dependency edges.
@@ -251,7 +559,10 @@ impl DependencyGraph {
                 }
             }
         }
-        self.edges.extend(late);
+        if !late.is_empty() {
+            self.edges.extend(late);
+            self.rebuild_edge_indices();
+        }
     }
 
     pub fn normalize_dependency_flags(&mut self) {
@@ -497,6 +808,7 @@ impl DependencyGraph {
             self.edges.retain(|e| {
                 !(e.from_location == self.root_location && e.install_name == package_name)
             });
+            self.rebuild_indices();
         }
         removed
     }
@@ -553,6 +865,7 @@ impl DependencyGraph {
 
         self.edges
             .retain(|e| reachable.contains(&e.from_location) && reachable.contains(&e.to_location));
+        self.rebuild_indices();
         pruned
     }
 
@@ -837,7 +1150,6 @@ impl DependencyGraph {
 
             let name = pkg.name.clone().unwrap_or_else(|| install_name.clone());
             let version = pkg.version.clone().unwrap_or_default();
-            let parsed_version = rnpm_core::semver::Version::parse(&version).ok();
 
             let is_dev_opt = pkg.dev_optional.unwrap_or(false);
             let peer_dependencies_meta = pkg
@@ -858,7 +1170,7 @@ impl DependencyGraph {
                 location: loc.clone(),
                 install_name: install_name.clone(),
                 name,
-                parsed_version,
+                parsed_version: rnpm_core::semver::Version::parse(&version).ok(),
                 version,
                 resolved: pkg.resolved.clone(),
                 integrity: pkg.integrity.clone(),
@@ -963,6 +1275,7 @@ impl DependencyGraph {
             }
         }
 
+        graph.rebuild_indices();
         graph
     }
 

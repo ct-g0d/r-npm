@@ -98,7 +98,8 @@ pub fn match_glob_patterns(
     root_dir: &Path,
     patterns: &[String],
 ) -> Result<Vec<PathBuf>, std::io::Error> {
-    let mut matched_dirs = HashSet::new();
+    let mut ordered_dirs: Vec<PathBuf> = Vec::new();
+    let mut seen: HashSet<PathBuf> = HashSet::new();
 
     let (negative_patterns, positive_patterns): (Vec<_>, Vec<_>) =
         patterns.iter().partition(|p| p.starts_with('!'));
@@ -109,18 +110,35 @@ pub fn match_glob_patterns(
         let clean_pattern = clean_pattern.strip_prefix(".\\").unwrap_or(clean_pattern);
         let posix_pattern = clean_pattern.replace('\\', "/");
 
-        let segments: Vec<&str> = posix_pattern.split('/').filter(|s| !s.is_empty()).collect();
+        let mut segments: Vec<&str> = Vec::new();
+        for s in posix_pattern.split('/').filter(|s| !s.is_empty()) {
+            if s == "**" && segments.last() == Some(&"**") {
+                continue;
+            }
+            segments.push(s);
+        }
 
         if segments.is_empty() {
             continue;
         }
 
-        traverse_segments(root_dir, &segments, &mut matched_dirs)?;
+        let mut pattern_results = HashSet::new();
+        let mut visited = HashSet::new();
+        traverse_segments(root_dir, &segments, &mut pattern_results, &mut visited)?;
+
+        let mut sorted_matches: Vec<PathBuf> = pattern_results.into_iter().collect();
+        sorted_matches.sort();
+
+        for dir in sorted_matches {
+            if seen.insert(dir.clone()) {
+                ordered_dirs.push(dir);
+            }
+        }
     }
 
     // Filter out exclusions
     let mut final_results: Vec<PathBuf> = Vec::new();
-    for dir in matched_dirs {
+    for dir in ordered_dirs {
         let rel_path = dir.strip_prefix(root_dir).unwrap_or(&dir);
         let posix_rel = to_posix_path(&rel_path.to_string_lossy());
 
@@ -143,7 +161,6 @@ pub fn match_glob_patterns(
         }
     }
 
-    final_results.sort();
     Ok(final_results)
 }
 
@@ -151,7 +168,12 @@ fn traverse_segments(
     current: &Path,
     segments: &[&str],
     results: &mut HashSet<PathBuf>,
+    visited: &mut HashSet<(PathBuf, usize)>,
 ) -> std::io::Result<()> {
+    if !visited.insert((current.to_path_buf(), segments.len())) {
+        return Ok(());
+    }
+
     if segments.is_empty() {
         if current.join("package.json").is_file() {
             results.insert(current.to_path_buf());
@@ -164,7 +186,7 @@ fn traverse_segments(
 
     if segment == "**" {
         // Option 1: ** matches 0 directory levels
-        traverse_segments(current, remaining, results)?;
+        traverse_segments(current, remaining, results, visited)?;
 
         // Option 2: ** matches 1 or more directory levels
         if current.is_dir() {
@@ -178,10 +200,7 @@ fn traverse_segments(
                         continue;
                     }
                     let child_path = entry.path();
-                    // Recurse keeping ** to go deeper
-                    traverse_segments(&child_path, segments, results)?;
-                    // Or match remaining from here
-                    traverse_segments(&child_path, remaining, results)?;
+                    traverse_segments(&child_path, segments, results, visited)?;
                 }
             }
         }
@@ -196,7 +215,7 @@ fn traverse_segments(
                     if should_skip_dir(&name_str) {
                         continue;
                     }
-                    traverse_segments(&entry.path(), remaining, results)?;
+                    traverse_segments(&entry.path(), remaining, results, visited)?;
                 }
             }
         }
@@ -212,7 +231,7 @@ fn traverse_segments(
                         continue;
                     }
                     if wildcard_match(segment, &name_str) {
-                        traverse_segments(&entry.path(), remaining, results)?;
+                        traverse_segments(&entry.path(), remaining, results, visited)?;
                     }
                 }
             }
@@ -220,7 +239,7 @@ fn traverse_segments(
     } else {
         let child = current.join(segment);
         if child.is_dir() {
-            traverse_segments(&child, remaining, results)?;
+            traverse_segments(&child, remaining, results, visited)?;
         }
     }
 
@@ -323,9 +342,7 @@ fn match_segments(pat_segs: &[&str], path_segs: &[&str]) -> bool {
             if should_skip_dir(seg) {
                 return false;
             }
-            if match_segments(pat_segs, &path_segs[1..])
-                || match_segments(remaining, &path_segs[1..])
-            {
+            if match_segments(pat_segs, &path_segs[1..]) {
                 return true;
             }
         }

@@ -7,6 +7,7 @@ use rnpm_core::workspace::discover_workspaces_from_manifest;
 use rnpm_lockfile::LockfileV3;
 use rnpm_solver::Platform;
 use sha2::{Digest, Sha256};
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -26,15 +27,18 @@ pub use compute_project_fingerprint as compute_input_fingerprint;
 
 pub fn compute_project_fingerprint(project_dir: &Path, options: &InstallOptions) -> Result<String> {
     let manifest_path = project_dir.join("package.json");
-    if !manifest_path.exists() {
-        return Err(anyhow!(
-            "package.json not found in {}",
-            project_dir.display()
-        ));
-    }
-
-    let pkg_json_bytes = std::fs::read(&manifest_path)
-        .with_context(|| format!("Failed to read {}", manifest_path.display()))?;
+    let pkg_json_bytes = match std::fs::read(&manifest_path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(anyhow!(
+                "package.json not found in {}",
+                project_dir.display()
+            ));
+        }
+        Err(e) => {
+            return Err(e).with_context(|| format!("Failed to read {}", manifest_path.display()));
+        }
+    };
     let manifest =
         Manifest::from_slice(&pkg_json_bytes).context("Failed to parse project package.json")?;
 
@@ -56,33 +60,37 @@ pub fn compute_project_fingerprint(project_dir: &Path, options: &InstallOptions)
             hasher.update(&bytes);
         }
         let member_npmrc = member.path.join(".npmrc");
-        if member_npmrc.is_file() {
-            if let Ok(bytes) = std::fs::read(&member_npmrc) {
-                hasher.update(format!("\nworkspace:{}:.npmrc:\n", member.relative_path).as_bytes());
-                hasher.update(&bytes);
-            }
+        if let Ok(bytes) = std::fs::read(&member_npmrc) {
+            hasher.update(format!("\nworkspace:{}:.npmrc:\n", member.relative_path).as_bytes());
+            hasher.update(&bytes);
         }
     }
 
     // 3. Lockfile: npm-shrinkwrap.json takes precedence over package-lock.json in npm
     let shrinkwrap_path = project_dir.join("npm-shrinkwrap.json");
     let lockfile_path = project_dir.join("package-lock.json");
-    if shrinkwrap_path.exists() {
-        if let Ok(bytes) = std::fs::read(&shrinkwrap_path) {
+    match std::fs::read(&shrinkwrap_path) {
+        Ok(bytes) => {
             hasher.update(b"\nlockfile:npm-shrinkwrap.json:\n");
             hasher.update(&bytes);
-        } else {
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            match std::fs::read(&lockfile_path) {
+                Ok(bytes) => {
+                    hasher.update(b"\nlockfile:package-lock.json:\n");
+                    hasher.update(&bytes);
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    hasher.update(b"\nlockfile:none\n");
+                }
+                Err(_) => {
+                    hasher.update(b"\nlockfile:package-lock.json:unreadable\n");
+                }
+            }
+        }
+        Err(_) => {
             hasher.update(b"\nlockfile:npm-shrinkwrap.json:unreadable\n");
         }
-    } else if lockfile_path.exists() {
-        if let Ok(bytes) = std::fs::read(&lockfile_path) {
-            hasher.update(b"\nlockfile:package-lock.json:\n");
-            hasher.update(&bytes);
-        } else {
-            hasher.update(b"\nlockfile:package-lock.json:unreadable\n");
-        }
-    } else {
-        hasher.update(b"\nlockfile:none\n");
     }
 
     // 4. .npmrc configuration & registry settings
@@ -125,13 +133,11 @@ pub fn compute_project_fingerprint(project_dir: &Path, options: &InstallOptions)
     // Hash raw configuration file sources from loaded layers (project, workspace, user, global, builtin)
     for layer in &config.layers {
         if let Some(ref src) = layer.source {
-            if src.is_file() {
-                if let Ok(bytes) = std::fs::read(src) {
-                    hasher.update(
-                        format!("\nconfig_layer:{}:{}:\n", layer.name, src.display()).as_bytes(),
-                    );
-                    hasher.update(&bytes);
-                }
+            if let Ok(bytes) = std::fs::read(src) {
+                hasher.update(
+                    format!("\nconfig_layer:{}:{}:\n", layer.name, src.display()).as_bytes(),
+                );
+                hasher.update(&bytes);
             }
         }
     }
@@ -139,20 +145,16 @@ pub fn compute_project_fingerprint(project_dir: &Path, options: &InstallOptions)
     // Process-level userconfig, globalconfig, and CLI overrides
     if let Some(user_cfg) = rnpm_config::get_process_userconfig() {
         hasher.update(format!("\nprocess_userconfig:{:?}:\n", user_cfg).as_bytes());
-        if user_cfg.is_file() {
-            if let Ok(bytes) = std::fs::read(&user_cfg) {
-                hasher.update(b"userconfig_bytes:\n");
-                hasher.update(&bytes);
-            }
+        if let Ok(bytes) = std::fs::read(&user_cfg) {
+            hasher.update(b"userconfig_bytes:\n");
+            hasher.update(&bytes);
         }
     }
     if let Some(global_cfg) = rnpm_config::get_process_globalconfig() {
         hasher.update(format!("\nprocess_globalconfig:{:?}:\n", global_cfg).as_bytes());
-        if global_cfg.is_file() {
-            if let Ok(bytes) = std::fs::read(&global_cfg) {
-                hasher.update(b"globalconfig_bytes:\n");
-                hasher.update(&bytes);
-            }
+        if let Ok(bytes) = std::fs::read(&global_cfg) {
+            hasher.update(b"globalconfig_bytes:\n");
+            hasher.update(&bytes);
         }
     }
     if let Some(cli_map) = rnpm_config::get_process_cli_overrides() {
@@ -162,20 +164,16 @@ pub fn compute_project_fingerprint(project_dir: &Path, options: &InstallOptions)
     }
 
     let project_npmrc = project_dir.join(".npmrc");
-    if project_npmrc.is_file() {
-        if let Ok(bytes) = std::fs::read(&project_npmrc) {
-            hasher.update(b"\nproject_npmrc_bytes:\n");
-            hasher.update(&bytes);
-        }
+    if let Ok(bytes) = std::fs::read(&project_npmrc) {
+        hasher.update(b"\nproject_npmrc_bytes:\n");
+        hasher.update(&bytes);
     }
 
     if let Some(ws_root) = rnpm_config::find_workspace_root(project_dir) {
         let ws_npmrc = ws_root.join(".npmrc");
-        if ws_npmrc.is_file() {
-            if let Ok(bytes) = std::fs::read(&ws_npmrc) {
-                hasher.update(b"\nworkspace_root_npmrc_bytes:\n");
-                hasher.update(&bytes);
-            }
+        if let Ok(bytes) = std::fs::read(&ws_npmrc) {
+            hasher.update(b"\nworkspace_root_npmrc_bytes:\n");
+            hasher.update(&bytes);
         }
     }
 
@@ -291,11 +289,34 @@ pub fn validate_hidden_lockfile(project_dir: &Path, options: Option<&InstallOpti
         }
     }
 
-    let content = match std::fs::read_to_string(&hidden_path) {
-        Ok(c) => c,
-        Err(_) => return false,
-    };
-    let lockfile = match LockfileV3::from_json_str(&content) {
+    // Check modification time of root package-lock.json or npm-shrinkwrap.json if present
+    let lockfile_path = project_dir.join("package-lock.json");
+    if let Ok(meta) = std::fs::symlink_metadata(&lockfile_path) {
+        if let Ok(mtime) = meta.modified() {
+            if mtime > hidden_mtime {
+                debug!(
+                    "Hidden lockfile invalid: package-lock.json mtime ({:?}) is newer than hidden lockfile ({:?})",
+                    mtime, hidden_mtime
+                );
+                return false;
+            }
+        }
+    }
+    let shrinkwrap_path = project_dir.join("npm-shrinkwrap.json");
+    if let Ok(meta) = std::fs::symlink_metadata(&shrinkwrap_path) {
+        if let Ok(mtime) = meta.modified() {
+            if mtime > hidden_mtime {
+                debug!(
+                    "Hidden lockfile invalid: npm-shrinkwrap.json mtime ({:?}) is newer than hidden lockfile ({:?})",
+                    mtime, hidden_mtime
+                );
+                return false;
+            }
+        }
+    }
+
+    // Load lockfile using zero-DOM read-only loader (avoids Value allocations and raw_value cloning)
+    let lockfile = match LockfileV3::from_file_readonly(&hidden_path) {
         Ok(l) => l,
         Err(_) => {
             debug!("Hidden lockfile is not valid JSON / LockfileV3");
@@ -307,22 +328,6 @@ pub fn validate_hidden_lockfile(project_dir: &Path, options: Option<&InstallOpti
     let platform = options
         .map(|o| o.platform())
         .unwrap_or_else(Platform::current);
-    let is_linked = options
-        .map(|o| o.install_strategy == InstallStrategy::Linked)
-        .unwrap_or_else(|| {
-            if let Ok(entries) = std::fs::read_dir(&node_modules) {
-                for entry in entries.flatten() {
-                    let name = entry.file_name();
-                    let name_str = name.to_string_lossy();
-                    if !name_str.starts_with('.')
-                        && rnpm_fs::is_junction(&entry.path()).unwrap_or(false)
-                    {
-                        return true;
-                    }
-                }
-            }
-            false
-        });
 
     let omit_dev = options.map(|o| o.omit_dev && !o.include.iter().any(|i| i == "dev")).unwrap_or(false);
     let omit_optional = options.map(|o| o.omit_optional && !o.include.iter().any(|i| i == "optional")).unwrap_or(false);
@@ -330,6 +335,109 @@ pub fn validate_hidden_lockfile(project_dir: &Path, options: Option<&InstallOpti
 
     // Platform-skipped lockfile packages (incompatible optional packages and their descendants)
     let platform_skipped = crate::lockfile_platform_skipped_packages(&lockfile, &platform);
+
+    // Verify root package.json if present on disk
+    let pkg_json_path = project_dir.join("package.json");
+    let root_manifest = match std::fs::read(&pkg_json_path) {
+        Ok(bytes) => {
+            if let Ok(meta) = std::fs::symlink_metadata(&pkg_json_path) {
+                if let Ok(mtime) = meta.modified() {
+                    if mtime > hidden_mtime {
+                        debug!(
+                            "Hidden lockfile invalid: package.json mtime ({:?}) is newer than hidden lockfile ({:?})",
+                            mtime, hidden_mtime
+                        );
+                        return false;
+                    }
+                }
+            }
+            Manifest::from_slice(&bytes).ok()
+        }
+        Err(_) => None,
+    };
+
+    if let (Some(manifest), Some(root_pkg)) = (&root_manifest, lockfile.packages.get("")) {
+        if let Some(lock_deps) = &root_pkg.dependencies {
+            for (name, spec) in &manifest.dependencies {
+                if manifest.optional_dependencies.contains_key(name) {
+                    continue;
+                }
+                if lock_deps.get(name) != Some(spec) {
+                    debug!(
+                        "Hidden lockfile invalid: dependency '{}' spec mismatch between package.json ({:?}) and hidden lockfile ({:?})",
+                        name, Some(spec), lock_deps.get(name)
+                    );
+                    return false;
+                }
+            }
+            for name in lock_deps.keys() {
+                if !manifest.dependencies.contains_key(name)
+                    && !manifest.optional_dependencies.contains_key(name)
+                {
+                    debug!(
+                        "Hidden lockfile invalid: dependency '{}' in hidden lockfile removed from package.json",
+                        name
+                    );
+                    return false;
+                }
+            }
+        } else if !manifest.dependencies.is_empty() {
+            debug!("Hidden lockfile invalid: package.json has dependencies but hidden lockfile has none");
+            return false;
+        }
+
+        if !omit_dev {
+            if let Some(lock_dev) = &root_pkg.dev_dependencies {
+                for (name, spec) in &manifest.dev_dependencies {
+                    if lock_dev.get(name) != Some(spec) {
+                        debug!(
+                            "Hidden lockfile invalid: devDependency '{}' spec mismatch between package.json ({:?}) and hidden lockfile ({:?})",
+                            name, Some(spec), lock_dev.get(name)
+                        );
+                        return false;
+                    }
+                }
+                for name in lock_dev.keys() {
+                    if !manifest.dev_dependencies.contains_key(name) {
+                        debug!(
+                            "Hidden lockfile invalid: devDependency '{}' in hidden lockfile removed from package.json",
+                            name
+                        );
+                        return false;
+                    }
+                }
+            } else if !manifest.dev_dependencies.is_empty() {
+                debug!("Hidden lockfile invalid: package.json has devDependencies but hidden lockfile has none");
+                return false;
+            }
+        }
+
+        if !omit_optional {
+            if let Some(lock_opt) = &root_pkg.optional_dependencies {
+                for (name, spec) in &manifest.optional_dependencies {
+                    if lock_opt.get(name) != Some(spec) {
+                        debug!(
+                            "Hidden lockfile invalid: optionalDependency '{}' spec mismatch between package.json ({:?}) and hidden lockfile ({:?})",
+                            name, Some(spec), lock_opt.get(name)
+                        );
+                        return false;
+                    }
+                }
+                for name in lock_opt.keys() {
+                    if !manifest.optional_dependencies.contains_key(name) {
+                        debug!(
+                            "Hidden lockfile invalid: optionalDependency '{}' in hidden lockfile removed from package.json",
+                            name
+                        );
+                        return false;
+                    }
+                }
+            } else if !manifest.optional_dependencies.is_empty() {
+                debug!("Hidden lockfile invalid: package.json has optionalDependencies but hidden lockfile has none");
+                return false;
+            }
+        }
+    }
 
     // Direct top-level packages declared on root
     let mut direct_top_level_deps: HashSet<String> = HashSet::new();
@@ -383,7 +491,7 @@ pub fn validate_hidden_lockfile(project_dir: &Path, options: Option<&InstallOpti
                 }
             }
         }
-    } else if let Ok(manifest) = Manifest::from_file(project_dir.join("package.json")) {
+    } else if let Some(manifest) = &root_manifest {
         for name in manifest.dependencies.keys() {
             if manifest.optional_dependencies.contains_key(name) {
                 continue;
@@ -416,16 +524,165 @@ pub fn validate_hidden_lockfile(project_dir: &Path, options: Option<&InstallOpti
         }
     }
 
+    struct DiskEntry {
+        path: PathBuf,
+        is_symlink: bool,
+    }
+
+    let mut disk_packages: HashMap<String, DiskEntry> = HashMap::with_capacity(lockfile.packages.len());
+    #[cfg(windows)]
+    let mut disk_packages_lower: HashMap<String, String> = HashMap::with_capacity(lockfile.packages.len());
+
+    let mut detected_junction = false;
+
+    // Fast directory scan: populate entries for top-level and scoped package directories in node_modules,
+    // and verify scope directory modification times. Non-directory files are ignored.
+    let nm_entries = match std::fs::read_dir(&node_modules) {
+        Ok(e) => e,
+        Err(_) => return false,
+    };
+
+    for entry in nm_entries.flatten() {
+        let file_name = entry.file_name();
+        let name_str = file_name.to_string_lossy();
+        if name_str.starts_with('.') {
+            continue;
+        }
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        let is_symlink = rnpm_fs::is_dir_entry_reparse_or_symlink(&entry, &file_type);
+        if is_symlink {
+            detected_junction = true;
+        }
+
+        if name_str.starts_with('@') {
+            // Check scope directory mtime:
+            // If a package was added to or removed from @scope, scope directory mtime is updated
+            if let Ok(meta) = entry.metadata() {
+                if let Ok(mtime) = meta.modified() {
+                    if mtime > hidden_mtime {
+                        debug!(
+                            "Hidden lockfile invalid: scope directory '{}' mtime ({:?}) is newer than hidden lockfile ({:?})",
+                            name_str, mtime, hidden_mtime
+                        );
+                        return false;
+                    }
+                }
+            }
+            if let Ok(scoped_entries) = std::fs::read_dir(entry.path()) {
+                for scoped_entry in scoped_entries.flatten() {
+                    let sub_name = scoped_entry.file_name();
+                    let sub_str = sub_name.to_string_lossy();
+                    if sub_str.starts_with('.') {
+                        continue;
+                    }
+                    let Ok(sub_type) = scoped_entry.file_type() else {
+                        continue;
+                    };
+                    let sub_is_symlink =
+                        rnpm_fs::is_dir_entry_reparse_or_symlink(&scoped_entry, &sub_type);
+                    if sub_is_symlink {
+                        detected_junction = true;
+                    }
+                    let is_sub_dir = sub_type.is_dir() || sub_is_symlink;
+                    if !is_sub_dir {
+                        continue;
+                    }
+
+                    let mtime = scoped_entry.metadata().ok().and_then(|m| m.modified().ok());
+                    if let Some(m) = mtime {
+                        if m > hidden_mtime {
+                            debug!(
+                                "Hidden lockfile invalid: package folder 'node_modules/{}/{}' mtime ({:?}) is newer than hidden lockfile ({:?})",
+                                name_str, sub_str, m, hidden_mtime
+                            );
+                            return false;
+                        }
+                    }
+
+                    let key = format!("node_modules/{}/{}", name_str, sub_str);
+                    #[cfg(windows)]
+                    disk_packages_lower.insert(key.to_ascii_lowercase(), key.clone());
+
+                    disk_packages.insert(key, DiskEntry {
+                        path: scoped_entry.path(),
+                        is_symlink: sub_is_symlink,
+                    });
+                }
+            }
+        } else {
+            let is_dir = file_type.is_dir() || is_symlink;
+            if !is_dir {
+                continue;
+            }
+
+            let mtime = entry.metadata().ok().and_then(|m| m.modified().ok());
+            if let Some(m) = mtime {
+                if m > hidden_mtime {
+                    debug!(
+                        "Hidden lockfile invalid: package folder 'node_modules/{}' mtime ({:?}) is newer than hidden lockfile ({:?})",
+                        name_str, m, hidden_mtime
+                    );
+                    return false;
+                }
+            }
+
+            let key = format!("node_modules/{}", name_str);
+            #[cfg(windows)]
+            disk_packages_lower.insert(key.to_ascii_lowercase(), key.clone());
+
+            disk_packages.insert(key, DiskEntry {
+                path: entry.path(),
+                is_symlink,
+            });
+        }
+    }
+
+    let is_linked = options
+        .map(|o| o.install_strategy == InstallStrategy::Linked)
+        .unwrap_or(detected_junction);
+
+    // Verify there are no extraneous package directories in node_modules
+    let normalized_lockfile_keys: HashSet<String> = lockfile
+        .packages
+        .keys()
+        .map(|k| k.replace('\\', "/"))
+        .collect();
+
+    #[cfg(windows)]
+    let normalized_lockfile_keys_lower: HashSet<String> = normalized_lockfile_keys
+        .iter()
+        .map(|k| k.to_ascii_lowercase())
+        .collect();
+
+    for key in disk_packages.keys() {
+        let is_known = normalized_lockfile_keys.contains(key);
+        #[cfg(windows)]
+        let is_known = is_known || normalized_lockfile_keys_lower.contains(&key.to_ascii_lowercase());
+
+        if !is_known {
+            debug!(
+                "Hidden lockfile invalid: extraneous directory '{}' found on disk",
+                key
+            );
+            return false;
+        }
+    }
+
     // Verify all non-omitted, non-skipped direct dependencies exist in lockfile and on disk
     for dep_key in &direct_top_level_deps {
         let pkg_info = lockfile.packages.get(dep_key)
             .or_else(|| lockfile.packages.get(&dep_key.replace('/', "\\")));
+
+        let on_disk = disk_packages.contains_key(dep_key);
+        #[cfg(windows)]
+        let on_disk = on_disk || disk_packages_lower.contains_key(&dep_key.to_ascii_lowercase());
+
         let Some(pkg_info) = pkg_info else {
             // Platform-skipped optional / optional-peer direct dependencies (e.g. fsevents on Windows/Linux)
             // are stripped from `node_modules/.package-lock.json` by `save_hidden` and are not on disk.
-            if optional_or_opt_peer_direct_deps.contains(dep_key)
-                && !project_dir.join(dep_key).exists()
-            {
+            if optional_or_opt_peer_direct_deps.contains(dep_key) && !on_disk {
                 continue;
             }
             debug!(
@@ -456,9 +713,7 @@ pub fn validate_hidden_lockfile(project_dir: &Path, options: Option<&InstallOpti
             continue;
         }
 
-        let folder = project_dir.join(dep_key);
-        let exists = folder.exists() || rnpm_fs::is_junction(&folder).unwrap_or(false);
-        if !exists {
+        if !on_disk {
             debug!(
                 "Hidden lockfile invalid: declared direct dependency '{}' missing on disk",
                 dep_key
@@ -467,76 +722,16 @@ pub fn validate_hidden_lockfile(project_dir: &Path, options: Option<&InstallOpti
         }
     }
 
-    // Fast directory scan: populate mtimes for top-level and scoped package directories in node_modules,
-    // and verify scope directory modification times. Non-directory files are ignored.
-    let mut dir_mtimes: HashMap<String, SystemTime> = HashMap::new();
-    if let Ok(entries) = std::fs::read_dir(&node_modules) {
-        for entry in entries.flatten() {
-            let file_name = entry.file_name();
-            let name_str = file_name.to_string_lossy();
-            if name_str.starts_with('.') {
-                continue;
-            }
-            let Ok(file_type) = entry.file_type() else {
-                continue;
-            };
-            let is_dir = file_type.is_dir()
-                || (file_type.is_symlink()
-                    && (entry.path().is_dir()
-                        || rnpm_fs::is_junction(&entry.path()).unwrap_or(false)));
-            if !is_dir {
-                continue;
-            }
-
-            if name_str.starts_with('@') {
-                // Check scope directory mtime:
-                // If a package was added to or removed from @scope, scope directory mtime is updated
-                if let Ok(meta) = entry.metadata() {
-                    if let Ok(mtime) = meta.modified() {
-                        if mtime > hidden_mtime {
-                            debug!(
-                                "Hidden lockfile invalid: scope directory '{}' mtime ({:?}) is newer than hidden lockfile ({:?})",
-                                name_str, mtime, hidden_mtime
-                            );
-                            return false;
-                        }
-                    }
-                }
-                // Scoped directory: inspect its packages
-                if let Ok(scoped_entries) = std::fs::read_dir(entry.path()) {
-                    for scoped_entry in scoped_entries.flatten() {
-                        let sub_name = scoped_entry.file_name();
-                        let sub_str = sub_name.to_string_lossy();
-                        if sub_str.starts_with('.') {
-                            continue;
-                        }
-                        let Ok(sub_type) = scoped_entry.file_type() else {
-                            continue;
-                        };
-                        let is_sub_dir = sub_type.is_dir()
-                            || (sub_type.is_symlink()
-                                && (scoped_entry.path().is_dir()
-                                    || rnpm_fs::is_junction(&scoped_entry.path()).unwrap_or(false)));
-                        if !is_sub_dir {
-                            continue;
-                        }
-
-                        if let Ok(meta) = scoped_entry.metadata() {
-                            if let Ok(mtime) = meta.modified() {
-                                let key = format!("node_modules/{}/{}", name_str, sub_str);
-                                dir_mtimes.insert(key, mtime);
-                            }
-                        }
-                    }
-                }
-            } else if let Ok(meta) = entry.metadata() {
-                if let Ok(mtime) = meta.modified() {
-                    let key = format!("node_modules/{}", name_str);
-                    dir_mtimes.insert(key, mtime);
-                }
-            }
-        }
+    struct PackageDiskCheck<'a> {
+        folder_path: Cow<'a, Path>,
+        is_link_or_junction: bool,
+        check_mtime: Option<SystemTime>,
     }
+
+    let mut checks: Vec<PackageDiskCheck> = Vec::with_capacity(lockfile.packages.len());
+    let mut present_packages: HashSet<String> = HashSet::with_capacity(lockfile.packages.len());
+    #[cfg(windows)]
+    let mut present_packages_lower: HashSet<String> = HashSet::with_capacity(lockfile.packages.len());
 
     // Verify every package folder listed in lockfile:
     // - If it exists on disk, its mtime must be <= hidden_mtime
@@ -546,22 +741,20 @@ pub fn validate_hidden_lockfile(project_dir: &Path, options: Option<&InstallOpti
         if pkg_key.is_empty() {
             continue;
         }
-        let normalized_key = pkg_key.replace('\\', "/");
-        if !pkg_key.starts_with("node_modules/") && !pkg_key.contains("/node_modules/") {
+        let normalized_key: Cow<str> = if pkg_key.contains('\\') {
+            Cow::Owned(pkg_key.replace('\\', "/"))
+        } else {
+            Cow::Borrowed(pkg_key)
+        };
+
+        if !normalized_key.starts_with("node_modules/") && !normalized_key.contains("/node_modules/") {
             // Workspace member directory (e.g. "packages/a")
-            let ws_folder = project_dir.join(&normalized_key);
-            let ws_pkg_json = ws_folder.join("package.json");
-            let is_valid = match std::fs::metadata(&ws_pkg_json) {
-                Ok(m) => m.is_file() && m.len() > 0,
-                Err(_) => false,
-            };
-            if !is_valid {
-                debug!(
-                    "Hidden lockfile invalid: workspace member package.json missing or empty in '{}'",
-                    normalized_key
-                );
-                return false;
-            }
+            let ws_folder = project_dir.join(normalized_key.as_ref());
+            checks.push(PackageDiskCheck {
+                folder_path: Cow::Owned(ws_folder),
+                is_link_or_junction: false,
+                check_mtime: None,
+            });
             continue;
         }
 
@@ -588,97 +781,174 @@ pub fn validate_hidden_lockfile(project_dir: &Path, options: Option<&InstallOpti
             || (omit_dev && omit_optional && is_dev_optional)
             || (omit_peer && is_peer);
 
-        let is_top_level = direct_top_level_deps.contains(&normalized_key);
+        let is_top_level = direct_top_level_deps.contains(normalized_key.as_ref());
         let is_transitive_in_linked = is_linked && !is_top_level;
 
-        let folder_path = project_dir.join(&normalized_key);
-        let is_junction = rnpm_fs::is_junction(&folder_path).unwrap_or(false);
+        let is_nested = normalized_key.contains("/node_modules/");
         let is_link = pkg_info.link == Some(true);
-        let exists_on_disk = folder_path.exists() || is_junction;
 
-        if exists_on_disk {
-            // If the package is omitted by current options (e.g. devDependency under --omit=dev),
-            // it must NOT remain on disk. If it's on disk, hidden lockfile is invalid so prune runs.
-            if is_omitted {
-                debug!(
-                    "Hidden lockfile invalid: package folder '{}' exists on disk but is omitted by options",
-                    normalized_key
-                );
-                return false;
-            }
+        if !is_nested {
+            let disk_pkg = disk_packages.get(normalized_key.as_ref());
+            #[cfg(windows)]
+            let disk_pkg = disk_pkg.or_else(|| {
+                disk_packages_lower.get(&normalized_key.to_ascii_lowercase()).and_then(|k| disk_packages.get(k))
+            });
 
-            // Top-level junction check in linked mode: if junction exists, ensure target is not broken
-            if is_linked
-                && is_top_level
-                && is_junction
-                && !folder_path.exists()
-            {
-                debug!(
-                    "Hidden lockfile invalid: linked junction target for '{}' missing from store",
-                    normalized_key
-                );
-                return false;
-            }
+            if let Some(entry) = disk_pkg {
+                if is_omitted {
+                    debug!(
+                        "Hidden lockfile invalid: package folder '{}' exists on disk but is omitted by options",
+                        normalized_key
+                    );
+                    return false;
+                }
 
-            // In linked mode, top-level non-link packages MUST be junctions to the store
-            if is_linked && is_top_level && !is_link && !is_junction {
-                debug!(
-                    "Hidden lockfile invalid: top-level package '{}' is a directory instead of a junction in linked mode",
-                    normalized_key
-                );
-                return false;
-            }
+                // In linked mode, top-level non-link packages MUST be junctions to the store
+                if is_linked && is_top_level && !is_link && !entry.is_symlink {
+                    debug!(
+                        "Hidden lockfile invalid: top-level package '{}' is a directory instead of a junction in linked mode",
+                        normalized_key
+                    );
+                    return false;
+                }
 
-            // If path is a junction or link, ensure its destination target exists!
-            if (is_junction || is_link) && !folder_path.exists() {
-                debug!(
-                    "Hidden lockfile invalid: junction or link target for '{}' is missing on disk",
-                    normalized_key
-                );
-                return false;
-            }
+                present_packages.insert(normalized_key.to_string());
+                #[cfg(windows)]
+                present_packages_lower.insert(normalized_key.to_ascii_lowercase());
 
-            // A valid package directory on disk must contain a non-empty package.json
-            let pkg_json_path = folder_path.join("package.json");
-            let is_pkg_json_valid = match std::fs::metadata(&pkg_json_path) {
-                Ok(m) => m.is_file() && m.len() > 0,
-                Err(_) => false,
-            };
-            if !is_pkg_json_valid {
-                debug!(
-                    "Hidden lockfile invalid: package.json missing or 0 bytes in package folder '{}'",
-                    normalized_key
-                );
-                return false;
-            }
-
-            let folder_mtime = if let Some(mtime) = dir_mtimes.get(&normalized_key) {
-                Some(*mtime)
+                checks.push(PackageDiskCheck {
+                    folder_path: Cow::Borrowed(&entry.path),
+                    is_link_or_junction: entry.is_symlink || is_link,
+                    check_mtime: None,
+                });
             } else {
-                match std::fs::symlink_metadata(&folder_path) {
+                // Missing on disk
+                if is_platform_skipped || is_omitted || is_transitive_in_linked {
+                    continue;
+                }
+                debug!(
+                    "Hidden lockfile invalid: package folder '{}' missing from disk",
+                    normalized_key
+                );
+                return false;
+            }
+        } else {
+            // Nested package
+            let folder_path = project_dir.join(normalized_key.as_ref());
+            let is_junction = rnpm_fs::is_junction(&folder_path).unwrap_or(false);
+            let exists_on_disk = folder_path.exists() || is_junction;
+
+            if exists_on_disk {
+                if is_omitted {
+                    debug!(
+                        "Hidden lockfile invalid: nested package folder '{}' exists on disk but is omitted by options",
+                        normalized_key
+                    );
+                    return false;
+                }
+
+                let folder_mtime = match std::fs::symlink_metadata(&folder_path) {
                     Ok(meta) => meta.modified().ok(),
                     Err(_) => return false,
-                }
-            };
+                };
 
-            if let Some(mtime) = folder_mtime {
+                present_packages.insert(normalized_key.to_string());
+                #[cfg(windows)]
+                present_packages_lower.insert(normalized_key.to_ascii_lowercase());
+
+                checks.push(PackageDiskCheck {
+                    folder_path: Cow::Owned(folder_path),
+                    is_link_or_junction: is_junction || is_link,
+                    check_mtime: folder_mtime,
+                });
+            } else {
+                if is_platform_skipped || is_omitted || is_transitive_in_linked {
+                    continue;
+                }
+                debug!(
+                    "Hidden lockfile invalid: nested package folder '{}' missing from disk",
+                    normalized_key
+                );
+                return false;
+            }
+        }
+    }
+
+    // Execute package disk checks (package.json presence/length, junction target existence, mtime)
+    let num_threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .min(16)
+        .min(checks.len());
+
+    if checks.len() <= 32 || num_threads <= 1 {
+        for check in &checks {
+            if check.is_link_or_junction && !check.folder_path.exists() {
+                debug!(
+                    "Hidden lockfile invalid: junction or link target for '{:?}' is missing on disk",
+                    check.folder_path
+                );
+                return false;
+            }
+            if let Some(mtime) = check.check_mtime {
                 if mtime > hidden_mtime {
                     debug!(
-                        "Hidden lockfile invalid: package folder '{}' mtime ({:?}) is newer than hidden lockfile ({:?})",
-                        normalized_key, folder_mtime, hidden_mtime
+                        "Hidden lockfile invalid: package folder '{:?}' mtime ({:?}) is newer than hidden lockfile ({:?})",
+                        check.folder_path, mtime, hidden_mtime
                     );
                     return false;
                 }
             }
-        } else {
-            // Missing on disk
-            if is_platform_skipped || is_omitted || is_transitive_in_linked {
-                continue;
+            let pkg_json = check.folder_path.join("package.json");
+            let is_valid = match std::fs::metadata(&pkg_json) {
+                Ok(m) => m.is_file() && m.len() > 0,
+                Err(_) => false,
+            };
+            if !is_valid {
+                debug!(
+                    "Hidden lockfile invalid: package.json missing or 0 bytes in package folder '{:?}'",
+                    check.folder_path
+                );
+                return false;
             }
-            debug!(
-                "Hidden lockfile invalid: package folder '{}' missing from disk",
-                normalized_key
-            );
+        }
+    } else {
+        let chunk_size = checks.len().div_ceil(num_threads);
+        let failed = std::sync::atomic::AtomicBool::new(false);
+
+        std::thread::scope(|scope| {
+            for chunk in checks.chunks(chunk_size) {
+                let failed_ref = &failed;
+                scope.spawn(move || {
+                    for check in chunk {
+                        if failed_ref.load(std::sync::atomic::Ordering::Relaxed) {
+                            return;
+                        }
+                        if check.is_link_or_junction && !check.folder_path.exists() {
+                            failed_ref.store(true, std::sync::atomic::Ordering::Relaxed);
+                            return;
+                        }
+                        if let Some(mtime) = check.check_mtime {
+                            if mtime > hidden_mtime {
+                                failed_ref.store(true, std::sync::atomic::Ordering::Relaxed);
+                                return;
+                            }
+                        }
+                        let pkg_json = check.folder_path.join("package.json");
+                        let is_valid = match std::fs::metadata(&pkg_json) {
+                            Ok(m) => m.is_file() && m.len() > 0,
+                            Err(_) => false,
+                        };
+                        if !is_valid {
+                            failed_ref.store(true, std::sync::atomic::Ordering::Relaxed);
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+
+        if failed.load(std::sync::atomic::Ordering::Relaxed) {
             return false;
         }
     }
@@ -688,15 +958,35 @@ pub fn validate_hidden_lockfile(project_dir: &Path, options: Option<&InstallOpti
     if check_bin_links {
         let known_bins = build_known_bins_map(&lockfile);
         let bin_dir = node_modules.join(".bin");
+        let mut bin_files = HashSet::new();
+        let bin_dir_is_dir = bin_dir.is_dir();
+        if bin_dir_is_dir {
+            if let Ok(entries) = std::fs::read_dir(&bin_dir) {
+                for entry in entries.flatten() {
+                    let s = entry.file_name().to_string_lossy().to_string();
+                    #[cfg(windows)]
+                    bin_files.insert(s.to_ascii_lowercase());
+                    #[cfg(not(windows))]
+                    bin_files.insert(s);
+                }
+            }
+        }
+
         let mut has_expected_bins = false;
 
         for (loc, bins) in &known_bins {
-            let normalized = loc.replace('\\', "/");
+            let normalized: Cow<str> = if loc.contains('\\') {
+                Cow::Owned(loc.replace('\\', "/"))
+            } else {
+                Cow::Borrowed(loc)
+            };
             if !normalized.starts_with("node_modules/") && !normalized.contains("/node_modules/") {
                 continue;
             }
-            let pkg_folder = project_dir.join(&normalized);
-            let exists_pkg = pkg_folder.exists() || rnpm_fs::is_junction(&pkg_folder).unwrap_or(false);
+
+            let exists_pkg = present_packages.contains(normalized.as_ref());
+            #[cfg(windows)]
+            let exists_pkg = exists_pkg || present_packages_lower.contains(&normalized.to_ascii_lowercase());
             if !exists_pkg {
                 continue;
             }
@@ -723,7 +1013,7 @@ pub fn validate_hidden_lockfile(project_dir: &Path, options: Option<&InstallOpti
                 }
             }
 
-            let is_top_level = direct_top_level_deps.contains(&normalized)
+            let is_top_level = direct_top_level_deps.contains(normalized.as_ref())
                 || normalized
                     .strip_prefix("node_modules/")
                     .is_some_and(|rest| !rest.contains("/node_modules/"));
@@ -731,11 +1021,14 @@ pub fn validate_hidden_lockfile(project_dir: &Path, options: Option<&InstallOpti
                 for (bin_name, _) in bins {
                     has_expected_bins = true;
                     #[cfg(windows)]
-                    let bin_exists = bin_dir.join(format!("{bin_name}.cmd")).exists()
-                        || bin_dir.join(bin_name).exists()
-                        || bin_dir.join(format!("{bin_name}.ps1")).exists();
+                    let bin_exists = {
+                        let lower = bin_name.to_ascii_lowercase();
+                        bin_files.contains(&format!("{lower}.cmd"))
+                            || bin_files.contains(&lower)
+                            || bin_files.contains(&format!("{lower}.ps1"))
+                    };
                     #[cfg(not(windows))]
-                    let bin_exists = bin_dir.join(bin_name).exists();
+                    let bin_exists = bin_files.contains(bin_name);
 
                     if !bin_exists {
                         debug!(
@@ -750,25 +1043,8 @@ pub fn validate_hidden_lockfile(project_dir: &Path, options: Option<&InstallOpti
             }
         }
 
-        if has_expected_bins && !bin_dir.is_dir() {
+        if has_expected_bins && !bin_dir_is_dir {
             debug!("Hidden lockfile invalid: node_modules/.bin directory missing");
-            return false;
-        }
-    }
-
-    // Verify there are no extraneous package directories in node_modules
-    let normalized_lockfile_keys: HashSet<String> = lockfile
-        .packages
-        .keys()
-        .map(|k| k.replace('\\', "/"))
-        .collect();
-
-    for key in dir_mtimes.keys() {
-        if !normalized_lockfile_keys.contains(key) {
-            debug!(
-                "Hidden lockfile invalid: extraneous directory '{}' found on disk",
-                key
-            );
             return false;
         }
     }
@@ -983,27 +1259,36 @@ pub fn enrich_lockfile_from_installed_manifests(
         }
 
         if package.engines.is_none() {
-            let manifest_path = if location.is_empty() {
-                project_dir.join("package.json")
+            if let Some(engines_val) = manifest.extra.get("engines") {
+                if let Ok(engines) = serde_json::from_value::<rnpm_lockfile::PackageEngines>(
+                    engines_val.clone(),
+                ) {
+                    if !engines.is_empty() {
+                        package.engines = Some(engines);
+                    }
+                }
+            } else if !manifest.engines.is_empty() {
+                package.engines =
+                    Some(rnpm_lockfile::PackageEngines::Map(manifest.engines.clone()));
             } else {
-                project_dir.join(&location).join("package.json")
-            };
-            if let Ok(raw_str) = std::fs::read_to_string(&manifest_path) {
-                if let Ok(json) = serde_json::from_str::<serde_json::Value>(&raw_str) {
-                    if let Some(engines_val) = json.get("engines") {
-                        if let Ok(engines) = serde_json::from_value::<rnpm_lockfile::PackageEngines>(
-                            engines_val.clone(),
-                        ) {
-                            if !engines.is_empty() {
-                                package.engines = Some(engines);
+                let manifest_path = if location.is_empty() {
+                    project_dir.join("package.json")
+                } else {
+                    project_dir.join(&location).join("package.json")
+                };
+                if let Ok(raw_str) = std::fs::read_to_string(&manifest_path) {
+                    if let Ok(json) = serde_json::from_str::<serde_json::Value>(&raw_str) {
+                        if let Some(engines_val) = json.get("engines") {
+                            if let Ok(engines) = serde_json::from_value::<rnpm_lockfile::PackageEngines>(
+                                engines_val.clone(),
+                            ) {
+                                if !engines.is_empty() {
+                                    package.engines = Some(engines);
+                                }
                             }
                         }
                     }
                 }
-            }
-            if package.engines.is_none() && !manifest.engines.is_empty() {
-                package.engines =
-                    Some(rnpm_lockfile::PackageEngines::Map(manifest.engines.clone()));
             }
         }
         if package.bin.is_none() {

@@ -50,7 +50,7 @@ pub async fn execute_version(project_dir: &Path, options: VersionOptions) -> Res
     execute_version_bump(project_dir, target, &options).await
 }
 
-fn execute_bare_version(project_dir: &Path, json_mode: bool) -> Result<()> {
+pub(crate) fn execute_bare_version(project_dir: &Path, json_mode: bool) -> Result<()> {
     let pkg_path = project_dir.join("package.json");
     let mut results = serde_json::Map::new();
 
