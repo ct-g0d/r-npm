@@ -2301,3 +2301,62 @@ fn test_opus_bonus_finding_is_direct_dependency_aliased_and_hoisted() {
         other => panic!("expected PoisonedDependency error, got: {other:?}"),
     }
 }
+
+#[test]
+fn test_missing_root_dep_in_packages_root_is_always_ci_drift_even_if_node_modules_exists() {
+    // Lockfile has packages[""].dependencies with only "a" -> "^1.0.0"
+    let mut lockfile = LockfileV3::new("test-app", Some("1.0.0".to_string()));
+    let mut root_deps = BTreeMap::new();
+    root_deps.insert("a".to_string(), "^1.0.0".to_string());
+    lockfile.root_package_mut().unwrap().dependencies = Some(root_deps);
+
+    // node_modules/a exists in lockfile
+    lockfile.insert_package(
+        "node_modules/a",
+        LockfilePackage {
+            version: Some("1.0.0".to_string()),
+            resolved: Some("https://registry.npmjs.org/a/-/a-1.0.0.tgz".to_string()),
+            integrity: Some("sha512-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==".to_string()),
+            ..Default::default()
+        },
+    );
+
+    // node_modules/b also exists in lockfile (e.g. hoisted transitive of a, or former devDependency)
+    lockfile.insert_package(
+        "node_modules/b",
+        LockfilePackage {
+            version: Some("1.0.0".to_string()),
+            resolved: Some("https://registry.npmjs.org/b/-/b-1.0.0.tgz".to_string()),
+            integrity: Some("sha512-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==".to_string()),
+            dev: Some(true),
+            ..Default::default()
+        },
+    );
+
+    // Initial manifest has only "a" -> matches CI
+    let mut manifest = Manifest {
+        name: Some("test-app".to_string()),
+        version: Some("1.0.0".to_string()),
+        dependencies: {
+            let mut m = BTreeMap::new();
+            m.insert("a".to_string(), "^1.0.0".to_string());
+            m
+        },
+        ..Default::default()
+    };
+    assert!(
+        lockfile.matches_manifest_for_ci(&manifest, true),
+        "initial manifest with 'a' matches CI lockfile"
+    );
+
+    // User adds "b": "^1.0.0" to package.json dependencies without updating package-lock.json
+    manifest.dependencies.insert("b".to_string(), "^1.0.0".to_string());
+
+    // Even though node_modules/b exists in lockfile and version 1.0.0 satisfies ^1.0.0,
+    // lockfile.packages[""].dependencies is missing "b".
+    // matches_manifest_for_ci MUST return false (drift detected)!
+    assert!(
+        !lockfile.matches_manifest_for_ci(&manifest, true),
+        "adding 'b' to manifest when packages[''].dependencies omits 'b' must reject CI even if node_modules/b exists"
+    );
+}

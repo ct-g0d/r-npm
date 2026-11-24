@@ -2084,58 +2084,8 @@ impl LockfileV3 {
         }
 
         for (k, manifest_spec) in manifest_map {
-            let lock_spec = match lock.get(k) {
-                Some(s) => s,
-                None => {
-                    let key = format!("node_modules/{k}");
-                    let Some(pkg) = packages.get(&key) else {
-                        return false;
-                    };
-                    if Self::is_non_registry_spec(manifest_spec) {
-                        if let Ok(PackageTarget::Git {
-                            url, committish, ..
-                        }) = PackageTarget::parse(manifest_spec)
-                        {
-                            let Some(ref res) = pkg.resolved else {
-                                return false;
-                            };
-                            let canon_target = Self::canonicalize_git_identity(url.as_str());
-                            let canon_res = Self::canonicalize_git_identity(res);
-                            if canon_target != canon_res {
-                                return false;
-                            }
-                            if let Some(ref c) = committish {
-                                let res_frag = res.split('#').nth(1).unwrap_or("");
-                                if !res_frag.eq_ignore_ascii_case(c) {
-                                    return false;
-                                }
-                            }
-                        } else if manifest_spec.starts_with("git@")
-                            || manifest_spec.starts_with("ssh://")
-                        {
-                            let Some(ref res) = pkg.resolved else {
-                                return false;
-                            };
-                            let canon_target = Self::canonicalize_git_identity(manifest_spec);
-                            let canon_res = Self::canonicalize_git_identity(res);
-                            if canon_target != canon_res {
-                                return false;
-                            }
-                            let target_frag = manifest_spec.split('#').nth(1).unwrap_or("");
-                            let res_frag = res.split('#').nth(1).unwrap_or("");
-                            if !target_frag.is_empty()
-                                && !res_frag.eq_ignore_ascii_case(target_frag)
-                            {
-                                return false;
-                            }
-                        } else if !Self::package_satisfies_spec(k, pkg, manifest_spec) {
-                            return false;
-                        }
-                    } else if !Self::package_satisfies_spec(k, pkg, manifest_spec) {
-                        return false;
-                    }
-                    continue;
-                }
+            let Some(lock_spec) = lock.get(k) else {
+                return false;
             };
 
             if lock_spec == manifest_spec {
