@@ -69,6 +69,49 @@ where
                             object.insert("bundleDependencies".into(), serde_json::json!(names));
                         }
                     }
+
+                    // Published packages in CouchDB may contain legacy or malformed shapes
+                    // such as `dependencies: []`, `dependencies: null`, `bin: []`, etc.
+                    for dep_key in &[
+                        "dependencies",
+                        "devDependencies",
+                        "peerDependencies",
+                        "optionalDependencies",
+                    ] {
+                        if let Some(dep_val) = object.get_mut(*dep_key) {
+                            match dep_val {
+                                serde_json::Value::Object(map) => {
+                                    map.retain(|_, v| match v {
+                                        serde_json::Value::String(_) => true,
+                                        serde_json::Value::Number(n) => {
+                                            *v = serde_json::Value::String(n.to_string());
+                                            true
+                                        }
+                                        _ => false,
+                                    });
+                                }
+                                _ => {
+                                    object.remove(*dep_key);
+                                }
+                            }
+                        }
+                    }
+                    if let Some(bin_val) = object.get_mut("bin") {
+                        match bin_val {
+                            serde_json::Value::String(_) => {}
+                            serde_json::Value::Object(map) => {
+                                map.retain(|_, v| v.is_string());
+                            }
+                            _ => {
+                                object.remove("bin");
+                            }
+                        }
+                    }
+                    if let Some(pdm) = object.get("peerDependenciesMeta") {
+                        if !pdm.is_object() {
+                            object.remove("peerDependenciesMeta");
+                        }
+                    }
                 }
                 let engines_raw = value
                     .get("engines")
@@ -82,6 +125,14 @@ where
                 map.insert(key, version);
             }
             Ok(map)
+        }
+
+        fn visit_seq<S>(self, mut seq: S) -> Result<Self::Value, S::Error>
+        where
+            S: SeqAccess<'de>,
+        {
+            while let Some(serde::de::IgnoredAny) = seq.next_element()? {}
+            Ok(BTreeMap::new())
         }
 
         fn visit_none<E>(self) -> Result<Self::Value, E>
@@ -317,11 +368,30 @@ pub struct AbbreviatedVersion {
     pub extra: BTreeMap<String, serde_json::Value>,
 }
 
+/// Deserializes dist-tags tolerating `null`, arrays, or quirky shapes.
+pub fn deserialize_dist_tags<'de, D>(deserializer: D) -> Result<HashMap<String, String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    let Some(serde_json::Value::Object(map)) = value else {
+        return Ok(HashMap::new());
+    };
+    Ok(map
+        .into_iter()
+        .filter_map(|(k, v)| match v {
+            serde_json::Value::String(s) => Some((k, s)),
+            serde_json::Value::Number(n) => Some((k, n.to_string())),
+            _ => None,
+        })
+        .collect())
+}
+
 /// Abbreviated package metadata document from the npm registry.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AbbreviatedPackageMetadata {
     pub name: String,
-    #[serde(rename = "dist-tags", default)]
+    #[serde(rename = "dist-tags", default, deserialize_with = "deserialize_dist_tags")]
     pub dist_tags: HashMap<String, String>,
     #[serde(default)]
     pub modified: Option<String>,
@@ -336,14 +406,16 @@ pub struct AbbreviatedPackageMetadata {
     pub time: BTreeMap<String, String>,
 }
 
-/// Keeps string entries only: unpublished packuments carry an object there.
+/// Keeps string entries only: unpublished packuments carry an object or array there.
 fn deserialize_publish_times<'de, D>(deserializer: D) -> Result<BTreeMap<String, String>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
-    let raw = Option::<BTreeMap<String, serde_json::Value>>::deserialize(deserializer)?;
-    Ok(raw
-        .unwrap_or_default()
+    let raw = Option::<serde_json::Value>::deserialize(deserializer)?;
+    let Some(serde_json::Value::Object(map)) = raw else {
+        return Ok(BTreeMap::new());
+    };
+    Ok(map
         .into_iter()
         .filter_map(|(k, v)| match v {
             serde_json::Value::String(s) => Some((k, s)),
@@ -716,5 +788,73 @@ mod tests {
         }"#;
         let meta3: AbbreviatedPackageMetadata = serde_json::from_str(json3).unwrap();
         assert!(meta3.validate().unwrap_err().is_malformed_metadata());
+    }
+
+    #[test]
+    fn test_quirky_couchdb_packuments_deserialization() {
+        // 1. Unpublished / empty packument with versions array, dist-tags null/array, and time array
+        let quirky_json = r#"{
+            "name": "quirky-pkg",
+            "dist-tags": null,
+            "versions": [],
+            "time": []
+        }"#;
+        let meta: AbbreviatedPackageMetadata = serde_json::from_str(quirky_json).unwrap();
+        assert_eq!(meta.name, "quirky-pkg");
+        assert!(meta.dist_tags.is_empty());
+        assert!(meta.versions.is_empty());
+        assert!(meta.time.is_empty());
+
+        let quirky_json2 = r#"{
+            "name": "quirky-pkg2",
+            "dist-tags": [],
+            "versions": [],
+            "time": null
+        }"#;
+        let meta2: AbbreviatedPackageMetadata = serde_json::from_str(quirky_json2).unwrap();
+        assert!(meta2.dist_tags.is_empty());
+        assert!(meta2.versions.is_empty());
+        assert!(meta2.time.is_empty());
+
+        // 2. Quirky version fields: dependencies: [], devDependencies: null, bin: [], peerDependenciesMeta: [], numeric dep
+        let version_json = r#"{
+            "name": "quirky-pkg",
+            "dist-tags": { "latest": "1.0.0" },
+            "versions": {
+                "1.0.0": {
+                    "name": "quirky-pkg",
+                    "version": "1.0.0",
+                    "dependencies": [],
+                    "devDependencies": null,
+                    "optionalDependencies": false,
+                    "bin": [],
+                    "peerDependenciesMeta": [],
+                    "dist": { "tarball": "https://registry.npmjs.org/quirky-pkg/-/quirky-pkg-1.0.0.tgz" }
+                },
+                "1.0.1": {
+                    "name": "quirky-pkg",
+                    "version": "1.0.1",
+                    "dependencies": { "valid-dep": "^1.0.0", "numeric-dep": 2 },
+                    "bin": "cli.js",
+                    "dist": { "tarball": "https://registry.npmjs.org/quirky-pkg/-/quirky-pkg-1.0.1.tgz" }
+                }
+            }
+        }"#;
+        let meta3: AbbreviatedPackageMetadata = serde_json::from_str(version_json).unwrap();
+        assert_eq!(meta3.versions.len(), 2);
+        let v0 = meta3.versions.get("1.0.0").unwrap();
+        assert!(v0.dependencies.is_empty());
+        assert!(v0.dev_dependencies.is_empty());
+        assert!(v0.optional_dependencies.is_empty());
+        assert!(v0.bin.is_none());
+        assert!(v0.peer_dependencies_meta.is_empty());
+
+        let v1 = meta3.versions.get("1.0.1").unwrap();
+        assert_eq!(v1.dependencies.get("valid-dep").unwrap(), "^1.0.0");
+        assert_eq!(v1.dependencies.get("numeric-dep").unwrap(), "2");
+        assert_eq!(
+            v1.bin.as_ref().unwrap().clone().into_map("quirky-pkg"),
+            [("quirky-pkg".to_string(), "cli.js".to_string())].into_iter().collect()
+        );
     }
 }

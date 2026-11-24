@@ -434,21 +434,26 @@ pub fn verify_rekor_set(rekor_pubkeys: &[Vec<u8>], entry: &TlogEntry) -> Result<
             "Missing canonicalizedBody for Rekor SET verification".into(),
         )
     })?;
+    let body_b64 = if body.trim_start().starts_with('{') {
+        BASE64.encode(body.as_bytes())
+    } else {
+        body.to_string()
+    };
 
     let log_id_str = &entry.log_id.key_id;
     let log_id_hex = if log_id_str.len() == 64 && log_id_str.chars().all(|c| c.is_ascii_hexdigit())
     {
-        log_id_str.clone()
+        log_id_str.to_ascii_lowercase()
     } else if let Ok(bytes) = decode_base64(log_id_str) {
         HEXLOWER.encode(&bytes)
     } else {
-        log_id_str.clone()
+        log_id_str.to_ascii_lowercase()
     };
 
     // Canonical JSON format: keys sorted lexicographically
     let canonical_json = format!(
         r#"{{"body":"{}","integratedTime":{},"logID":"{}","logIndex":{}}}"#,
-        body, entry.integrated_time, log_id_hex, entry.log_index
+        body_b64, entry.integrated_time, log_id_hex, entry.log_index
     );
 
     let mut ok = false;
@@ -1089,14 +1094,17 @@ pub fn verify_fulcio_certificate_chain(
 
     let leaf = &parsed_chain[0];
 
-    // Check validity window of leaf cert against Rekor integratedTime
-    if integrated_time > 0
-        && (integrated_time < leaf.not_before || integrated_time > leaf.not_after)
-    {
-        return Err(RegistryError::InvalidSigstoreBundle(format!(
-            "Leaf certificate not valid at integratedTime {}: validity window [{}, {}]",
-            integrated_time, leaf.not_before, leaf.not_after
-        )));
+    // Check validity window of all certificates in the chain against Rekor integratedTime
+    if integrated_time > 0 {
+        for (idx, cert) in parsed_chain.iter().enumerate() {
+            if integrated_time < cert.not_before || integrated_time > cert.not_after {
+                let role = if idx == 0 { "Leaf" } else { "Intermediate" };
+                return Err(RegistryError::InvalidSigstoreBundle(format!(
+                    "{role} certificate not valid at integratedTime {}: validity window [{}, {}]",
+                    integrated_time, cert.not_before, cert.not_after
+                )));
+            }
+        }
     }
 
     // Check if leaf cert is self-signed:
@@ -2308,6 +2316,7 @@ fn current_time_ms() -> i64 {
         }
 
         if let Some(bytes) = tarball_bytes {
+            let mut checked = false;
             if let Some(expected_512) = subject_sha512 {
                 let actual_hex = HEXLOWER.encode(&Sha512::digest(bytes));
                 if !Self::digest_matches(expected_512, &actual_hex) {
@@ -2317,7 +2326,7 @@ fn current_time_ms() -> i64 {
                         actual: actual_hex,
                     });
                 }
-                return Ok(());
+                checked = true;
             }
 
             if let Some(expected_256) = subject_sha256 {
@@ -2329,6 +2338,10 @@ fn current_time_ms() -> i64 {
                         actual: actual_hex,
                     });
                 }
+                checked = true;
+            }
+
+            if checked {
                 return Ok(());
             }
         }
@@ -2339,11 +2352,9 @@ fn current_time_ms() -> i64 {
             for token in trimmed.split_whitespace() {
                 if let Some((algo, b64)) = token.split_once('-') {
                     let algo_lower = algo.to_ascii_lowercase();
-                    let decoded = decode_base64(b64).map_err(|e| {
-                        RegistryError::ProvenanceVerificationFailed(format!(
-                            "Invalid base64 in tarball integrity '{token}': {e}"
-                        ))
-                    })?;
+                    let Ok(decoded) = decode_base64(b64) else {
+                        continue;
+                    };
                     let actual_hex = HEXLOWER.encode(&decoded);
 
                     if algo_lower == "sha512" {
@@ -3826,5 +3837,119 @@ pub(crate) mod tests {
         let wrong_signer = EphemeralSigner::new().unwrap();
         let wrong_pubkeys = vec![wrong_signer.public_key_spki().to_vec()];
         assert!(verify_rekor_set(&wrong_pubkeys, &entry).is_err());
+    }
+
+    #[test]
+    fn test_rekor_set_canonical_body_raw_json_and_uppercase_logid() {
+        let rekor_signer = EphemeralSigner::new().unwrap();
+        let raw_body = r#"{"apiVersion":"0.0.1","kind":"dsse"}"#;
+        let body_b64 = BASE64.encode(raw_body.as_bytes());
+        let integrated_time = 1700000000i64;
+        let log_index = 100u64;
+        let log_id_hex_lower = "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890";
+        let log_id_hex_upper = log_id_hex_lower.to_ascii_uppercase();
+
+        let payload = format!(
+            r#"{{"body":"{}","integratedTime":{},"logID":"{}","logIndex":{}}}"#,
+            body_b64, integrated_time, log_id_hex_lower, log_index
+        );
+        let set_sig = rekor_signer.sign(payload.as_bytes()).unwrap();
+
+        let entry = TlogEntry {
+            log_index,
+            log_id: LogId {
+                key_id: log_id_hex_upper,
+            },
+            integrated_time,
+            inclusion_promise: Some(InclusionPromise {
+                signed_entry_timestamp: BASE64.encode(&set_sig),
+            }),
+            inclusion_proof: None,
+            // Provide raw JSON string instead of pre-base64-encoded body
+            canonicalized_body: Some(raw_body.to_string()),
+        };
+
+        let pubkeys = vec![rekor_signer.public_key_spki().to_vec()];
+        assert!(verify_rekor_set(&pubkeys, &entry).is_ok());
+    }
+
+    #[test]
+    fn test_verify_intermediate_cert_expiry() {
+        let rng = ring::rand::SystemRandom::new();
+        let ca_priv = decode_base64(TEST_MOCK_CA_PRIV_PKCS8_B64).unwrap();
+        let ca_key_pair = ring::signature::EcdsaKeyPair::from_pkcs8(
+            &ring::signature::ECDSA_P256_SHA256_ASN1_SIGNING,
+            &ca_priv,
+            &rng,
+        )
+        .unwrap();
+
+        let inter_signer = EphemeralSigner::new().unwrap();
+        let leaf_signer = EphemeralSigner::new().unwrap();
+
+        let integrated_time = 1700000000i64;
+
+        // Leaf certificate is valid at integrated_time
+        let leaf_der = crate::asn1::create_test_x509_certificate(
+            "leaf-signer",
+            "inter-ca",
+            leaf_signer.public_key_uncompressed(),
+            None,
+            &[],
+            integrated_time - 60,
+            integrated_time + 600,
+            &|tbs| inter_signer.sign(tbs).unwrap(),
+        );
+
+        // Intermediate certificate is EXPIRED at integrated_time
+        let inter_der = crate::asn1::create_test_x509_certificate(
+            "inter-ca",
+            "sigstore",
+            inter_signer.public_key_uncompressed(),
+            None,
+            &[],
+            integrated_time - 1000,
+            integrated_time - 100, // expired before integrated_time!
+            &|tbs| ca_key_pair.sign(&rng, tbs).unwrap().as_ref().to_vec(),
+        );
+
+        let root_der = test_mock_fulcio_root_cert();
+        let chain_raw = [BASE64.encode(&leaf_der), BASE64.encode(&inter_der)];
+        let chain_refs = [chain_raw[0].as_str(), chain_raw[1].as_str()];
+
+        let err = verify_fulcio_certificate_chain(&chain_refs, &[root_der], integrated_time)
+            .unwrap_err();
+        match err {
+            RegistryError::InvalidSigstoreBundle(msg) => {
+                assert!(
+                    msg.contains("Intermediate certificate not valid at integratedTime"),
+                    "{msg}"
+                );
+            }
+            other => panic!("Expected InvalidSigstoreBundle, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_verify_subject_digest_multiple_integrity_tokens() {
+        let tarball_bytes = b"sample tarball payload";
+        let sha512_hex = HEXLOWER.encode(&Sha512::digest(tarball_bytes));
+        let sha512_b64 = BASE64.encode(&Sha512::digest(tarball_bytes));
+
+        let mut digests = HashMap::new();
+        digests.insert("sha512".to_string(), sha512_hex);
+        let subject = InTotoSubject {
+            name: "pkg@1.0.0".into(),
+            digest: digests,
+        };
+
+        // Multiple tokens with invalid / unsupported first token
+        let integrity = format!("sha384-invalidBase64!! sha512-{sha512_b64}");
+        assert!(ProvenanceVerifier::verify_subject_digest(
+            &subject,
+            Some(&integrity),
+            None
+        )
+        .is_ok());
     }
 }

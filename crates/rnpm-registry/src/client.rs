@@ -1164,6 +1164,11 @@ impl RegistryClient {
         registry: &Url,
         package_name: &str,
     ) -> Result<Url, RegistryError> {
+        if package_name.contains('\r') || package_name.contains('\n') {
+            return Err(RegistryError::SecurityViolation(
+                "Package name contains forbidden CR/LF characters".into(),
+            ));
+        }
         let encoded = encode_package_name(package_name);
         let base_str = registry.as_str().trim_end_matches('/');
         let url_str = format!("{base_str}/{encoded}");
@@ -1530,6 +1535,14 @@ impl RegistryClient {
         otp: Option<&str>,
         body: Vec<u8>,
     ) -> Result<Response, RegistryError> {
+        if let Some(otp_code) = otp {
+            if otp_code.contains('\r') || otp_code.contains('\n') {
+                return Err(RegistryError::SecurityViolation(
+                    "OTP code contains forbidden CR/LF characters".into(),
+                ));
+            }
+        }
+
         let host_key = if let Some(port) = initial_url.port() {
             format!("{}:{}", initial_url.host_str().unwrap_or_default(), port).to_ascii_lowercase()
         } else {
@@ -1550,6 +1563,9 @@ impl RegistryClient {
 
         loop {
             let mut current_url = initial_url.clone();
+            let mut current_method = method.clone();
+            let mut current_body = body.clone();
+            let mut current_content_type = content_type;
             let mut redirect_count = 0;
             let mut seen_redirect_urls: HashSet<Url> = HashSet::new();
             seen_redirect_urls.insert(current_url.clone());
@@ -1557,10 +1573,10 @@ impl RegistryClient {
             let response_result: Result<Response, RegistryError> = loop {
                 let mut req = self
                     .client
-                    .request(method.clone(), current_url.clone())
+                    .request(current_method.clone(), current_url.clone())
                     .header(USER_AGENT, self.user_agent.clone());
 
-                if let Some(ct) = content_type {
+                if let Some(ct) = current_content_type {
                     req = req.header(CONTENT_TYPE, ct);
                 }
 
@@ -1586,9 +1602,11 @@ impl RegistryClient {
                     );
                 }
 
-                req = req.body(body.clone());
+                if !current_body.is_empty() {
+                    req = req.body(current_body.clone());
+                }
 
-                track_http_request(&method, &current_url);
+                track_http_request(&current_method, &current_url);
                 let resp = match req.send().await {
                     Ok(r) => r,
                     Err(e) => break Err(RegistryError::Http(e)),
@@ -1606,6 +1624,12 @@ impl RegistryClient {
                     redirect_count += 1;
                     if redirect_count > MAX_REDIRECTS {
                         break Err(RegistryError::TooManyRedirects(MAX_REDIRECTS));
+                    }
+
+                    if status == StatusCode::SEE_OTHER {
+                        current_method = Method::GET;
+                        current_body = Vec::new();
+                        current_content_type = None;
                     }
 
                     if let Some(location) = resp.headers().get(LOCATION) {
@@ -1931,7 +1955,19 @@ impl RegistryClient {
             }
 
             if status == StatusCode::UNAUTHORIZED {
+                let www = resp
+                    .headers()
+                    .get(reqwest::header::WWW_AUTHENTICATE)
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::to_string);
                 let msg = resp.text().await.unwrap_or_default();
+                if let Some(www_authenticate) = www {
+                    return Err(RegistryError::AuthChallenge {
+                        url: url.to_string(),
+                        www_authenticate,
+                        body: msg,
+                    });
+                }
                 return Err(RegistryError::Unauthorized {
                     url: url.to_string(),
                     status: 401,
@@ -2188,7 +2224,19 @@ impl RegistryClient {
         }
 
         if status == StatusCode::UNAUTHORIZED {
+            let www = resp
+                .headers()
+                .get(reqwest::header::WWW_AUTHENTICATE)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string);
             let msg = resp.text().await.unwrap_or_default();
+            if let Some(www_authenticate) = www {
+                return Err(RegistryError::AuthChallenge {
+                    url: url.to_string(),
+                    www_authenticate,
+                    body: msg,
+                });
+            }
             return Err(RegistryError::Unauthorized {
                 url: url.to_string(),
                 status: 401,
@@ -2261,7 +2309,19 @@ impl RegistryClient {
         }
 
         if status == StatusCode::UNAUTHORIZED {
+            let www = resp
+                .headers()
+                .get(reqwest::header::WWW_AUTHENTICATE)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string);
             let msg = resp.text().await.unwrap_or_default();
+            if let Some(www_authenticate) = www {
+                return Err(RegistryError::AuthChallenge {
+                    url: url.to_string(),
+                    www_authenticate,
+                    body: msg,
+                });
+            }
             return Err(RegistryError::Unauthorized {
                 url: url.to_string(),
                 status: 401,
@@ -2365,7 +2425,19 @@ impl RegistryClient {
             }
 
             if status == StatusCode::UNAUTHORIZED {
+                let www = resp
+                    .headers()
+                    .get(reqwest::header::WWW_AUTHENTICATE)
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::to_string);
                 let msg = resp.text().await.unwrap_or_default();
+                if let Some(www_authenticate) = www {
+                    return Err(RegistryError::AuthChallenge {
+                        url: url.to_string(),
+                        www_authenticate,
+                        body: msg,
+                    });
+                }
                 return Err(RegistryError::Unauthorized {
                     url: url.to_string(),
                     status: 401,
@@ -2573,7 +2645,19 @@ impl RegistryClient {
             }
 
             if status == StatusCode::UNAUTHORIZED {
+                let www = resp
+                    .headers()
+                    .get(reqwest::header::WWW_AUTHENTICATE)
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::to_string);
                 let msg = resp.text().await.unwrap_or_default();
+                if let Some(www_authenticate) = www {
+                    return Err(RegistryError::AuthChallenge {
+                        url: url.to_string(),
+                        www_authenticate,
+                        body: msg,
+                    });
+                }
                 return Err(RegistryError::Unauthorized {
                     url: url.to_string(),
                     status: 401,
@@ -2893,7 +2977,19 @@ impl RegistryClient {
 
         let status = resp.status();
         if status == StatusCode::UNAUTHORIZED {
+            let www = resp
+                .headers()
+                .get(reqwest::header::WWW_AUTHENTICATE)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string);
             let body_text = resp.text().await.unwrap_or_default();
+            if let Some(www_authenticate) = www {
+                return Err(RegistryError::AuthChallenge {
+                    url: target_url.to_string(),
+                    www_authenticate,
+                    body: body_text,
+                });
+            }
             return Err(RegistryError::Unauthorized {
                 url: target_url.to_string(),
                 status: 401,
@@ -4245,5 +4341,52 @@ mod tests {
         assert_eq!(client.calculate_backoff(2), Duration::from_millis(450));
         assert_eq!(client.calculate_backoff(3), Duration::from_millis(1350));
         assert_eq!(client.calculate_backoff(4), Duration::from_millis(2000)); // capped
+    }
+
+    #[test]
+    fn test_package_metadata_url_rejects_crlf() {
+        let client = RegistryClient::new().unwrap();
+        let err = client.package_metadata_url("bad\r\npkg").unwrap_err();
+        assert!(matches!(err, RegistryError::SecurityViolation(_)));
+    }
+
+    #[tokio::test]
+    async fn test_auth_challenge_propagated_on_401() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        tokio::spawn(async move {
+            if let Ok((mut socket, _)) = listener.accept().await {
+                let mut buf = [0u8; 1024];
+                let _ = socket.read(&mut buf).await;
+                let response = "HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: OTP realm=\"npm\"\r\nContent-Length: 18\r\n\r\n{\"error\":\"need otp\"}";
+                let _ = socket.write_all(response.as_bytes()).await;
+            }
+        });
+
+        let client = RegistryClient::new().unwrap();
+        let url = Url::parse(&format!("http://127.0.0.1:{port}/test-pkg")).unwrap();
+        let err = client
+            .get_package_metadata_from_url_conditional_with_accept(
+                "test-pkg",
+                url,
+                None,
+                "application/json",
+            )
+            .await
+            .unwrap_err();
+
+        match err {
+            RegistryError::AuthChallenge {
+                www_authenticate,
+                body,
+                ..
+            } => {
+                assert_eq!(www_authenticate, "OTP realm=\"npm\"");
+                assert!(body.contains("need otp"));
+            }
+            other => panic!("Expected AuthChallenge, got {other:?}"),
+        }
     }
 }

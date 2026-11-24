@@ -140,6 +140,9 @@ pub fn create_publish_payload(opts: &PublishPayloadOptions) -> serde_json::Value
     if let Some(desc) = opts.description {
         doc.insert("description".into(), serde_json::json!(desc));
     }
+    if let Some(readme) = opts.manifest.get("readme") {
+        doc.insert("readme".into(), readme.clone());
+    }
     doc.insert(
         "dist-tags".into(),
         serde_json::json!({ opts.tag: opts.version }),

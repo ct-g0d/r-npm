@@ -146,12 +146,44 @@ pub fn decode_oid(bytes: &[u8]) -> String {
         return String::new();
     }
     let mut parts = Vec::new();
-    let first = bytes[0];
-    parts.push((first / 40).to_string());
-    parts.push((first % 40).to_string());
-
     let mut val = 0u64;
-    let rest = &bytes[1..];
+    let mut cursor = 0;
+
+    // Decode first subidentifier (X * 40 + Y) using VLQ
+    while cursor < bytes.len() {
+        let b = bytes[cursor];
+        cursor += 1;
+        if let Some(new_val) = val
+            .checked_mul(128)
+            .and_then(|v| v.checked_add((b & 0x7F) as u64))
+        {
+            val = new_val;
+        } else {
+            return String::new();
+        }
+        if (b & 0x80) == 0 {
+            break;
+        }
+    }
+    if cursor == 0 || (bytes[cursor - 1] & 0x80) != 0 {
+        // Malformed/truncated first subidentifier
+        return String::new();
+    }
+
+    // ITU-T X.690 Section 8.19.4:
+    // If the first component X is 0 or 1, the second component Y is 0..39.
+    // If X is 2, Y can be any value, and (X*40)+Y = 80+Y.
+    if val < 80 {
+        parts.push((val / 40).to_string());
+        parts.push((val % 40).to_string());
+    } else {
+        parts.push("2".to_string());
+        parts.push((val - 80).to_string());
+    }
+
+    // Decode subsequent subidentifiers
+    val = 0;
+    let rest = &bytes[cursor..];
     for (i, &b) in rest.iter().enumerate() {
         if let Some(new_val) = val
             .checked_mul(128)
@@ -179,7 +211,22 @@ pub fn encode_oid(oid: &str) -> Vec<u8> {
         return Vec::new();
     }
     let mut res = Vec::new();
-    res.push((parts[0] * 40 + parts[1]) as u8);
+    let first_subid = if parts[0] == 2 && parts[1] > 39 {
+        80 + parts[1]
+    } else {
+        parts[0] * 40 + parts[1]
+    };
+    let mut v = first_subid;
+    let mut buf = Vec::new();
+    buf.push((v & 0x7F) as u8);
+    v >>= 7;
+    while v > 0 {
+        buf.push(((v & 0x7F) as u8) | 0x80);
+        v >>= 7;
+    }
+    buf.reverse();
+    res.extend_from_slice(&buf);
+
     for &p in &parts[2..] {
         let mut v = p;
         let mut buf = Vec::new();
@@ -203,9 +250,17 @@ pub fn encode_der_length(len: usize) -> Vec<u8> {
         vec![0x81, len as u8]
     } else if len <= 0xFFFF {
         vec![0x82, (len >> 8) as u8, len as u8]
-    } else {
+    } else if len <= 0xFF_FFFF {
         vec![
             0x83,
+            (len >> 16) as u8,
+            (len >> 8) as u8,
+            len as u8,
+        ]
+    } else {
+        vec![
+            0x84,
+            (len >> 24) as u8,
             (len >> 16) as u8,
             (len >> 8) as u8,
             len as u8,
@@ -351,6 +406,12 @@ pub fn parse_x509_certificate(der: &[u8]) -> Result<ParsedCertificate, RegistryE
         String::new()
     };
 
+    if cert_elems[2].0 != TAG_BIT_STRING {
+        return Err(RegistryError::InvalidSigstoreBundle(format!(
+            "Expected certificate signatureValue BIT STRING (0x03), got 0x{:02x}",
+            cert_elems[2].0
+        )));
+    }
     let sig_bitstring = cert_elems[2].1;
     if sig_bitstring.is_empty() || sig_bitstring[0] != 0 {
         return Err(RegistryError::InvalidSigstoreBundle(
@@ -750,4 +811,55 @@ pub fn create_test_x509_certificate(
         TAG_SEQUENCE,
         &[tbs, sig_algo, der_tlv(TAG_BIT_STRING, &sig_bitstring)].concat(),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_encode_der_length_boundaries() {
+        assert_eq!(encode_der_length(0), vec![0x00]);
+        assert_eq!(encode_der_length(127), vec![0x7F]);
+        assert_eq!(encode_der_length(128), vec![0x81, 0x80]);
+        assert_eq!(encode_der_length(255), vec![0x81, 0xFF]);
+        assert_eq!(encode_der_length(256), vec![0x82, 0x01, 0x00]);
+        assert_eq!(encode_der_length(0xFFFF), vec![0x82, 0xFF, 0xFF]);
+        assert_eq!(encode_der_length(0x10000), vec![0x83, 0x01, 0x00, 0x00]);
+        assert_eq!(encode_der_length(0xFF_FFFF), vec![0x83, 0xFF, 0xFF, 0xFF]);
+        // Over 16MB requires 4 length octets (0x84)
+        assert_eq!(
+            encode_der_length(0x100_0000),
+            vec![0x84, 0x01, 0x00, 0x00, 0x00]
+        );
+        assert_eq!(
+            encode_der_length(0x1234_5678),
+            vec![0x84, 0x12, 0x34, 0x56, 0x78]
+        );
+    }
+
+    #[test]
+    fn test_oid_encode_decode_roundtrip_all_arcs() {
+        let test_cases = [
+            "1.2.840.10045.2.1",
+            "1.3.6.1.4.1.57264.1.1",
+            "2.5.4.3",
+            "2.999.1",
+            "0.9.2342.19200300.100.1.1",
+        ];
+        for oid in test_cases {
+            let encoded = encode_oid(oid);
+            let decoded = decode_oid(&encoded);
+            assert_eq!(decoded, oid);
+        }
+    }
+
+    #[test]
+    fn test_oid_malformed_handling() {
+        assert_eq!(decode_oid(&[]), "");
+        // Continuation bit set on last byte (truncated VLQ)
+        assert_eq!(decode_oid(&[0x2A, 0x86]), "");
+        // First byte continuation bit set but truncated
+        assert_eq!(decode_oid(&[0x81]), "");
+    }
 }
