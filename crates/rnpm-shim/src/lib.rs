@@ -198,42 +198,11 @@ pub fn generate_ps1_shim(target_rel_from_node_modules: &str) -> String {
 /// Rewrites CRLF shebang to LF to prevent `/usr/bin/env: 'node\r': No such file or directory` on Unix and Git Bash.
 /// Also supports files with UTF-8 BOM and clears Windows read-only flags if necessary.
 pub fn normalize_shebang(file_path: &Path) -> std::io::Result<()> {
-    if !file_path.exists() {
-        return Ok(());
-    }
-    let content = fs::read(file_path)?;
-    let (offset, is_shebang) = if content.starts_with(b"\xEF\xBB\xBF#!") {
-        (3, true)
-    } else if content.starts_with(b"#!") {
-        (0, true)
-    } else {
-        (0, false)
-    };
-
-    if !is_shebang {
-        return Ok(());
-    }
-
-    if let Some(newline_pos) = content[offset..].iter().position(|&b| b == b'\n') {
-        let abs_pos = offset + newline_pos;
-        if abs_pos > offset && content[abs_pos - 1] == b'\r' {
-            let mut new_content = Vec::with_capacity(content.len());
-            new_content.extend_from_slice(&content[..abs_pos - 1]);
-            new_content.push(b'\n');
-            new_content.extend_from_slice(&content[abs_pos + 1..]);
-
-            // Clear read-only attribute if set (common on Windows)
-            if let Ok(metadata) = fs::metadata(file_path) {
-                let mut perms = metadata.permissions();
-                if perms.readonly() {
-                    perms.set_readonly(false);
-                    let _ = fs::set_permissions(file_path, perms);
-                }
-            }
-
-            fs::write(file_path, new_content)?;
-        }
-    }
+    let _ = shebang::normalize_shebang_file(file_path)
+        .map_err(|e| match e {
+            crate::error::ShimError::Io { source, .. } => source,
+            other => std::io::Error::other(other.to_string()),
+        })?;
     Ok(())
 }
 
@@ -242,9 +211,41 @@ pub fn normalize_shebang(file_path: &Path) -> std::io::Result<()> {
 #[cfg(any(not(unix), test))]
 #[allow(dead_code)]
 fn cmd_shim_shebang(target: &Path) -> Option<(String, String, String)> {
-    let data = fs::read(target).ok()?;
-    let text = String::from_utf8_lossy(&data);
-    let clean_text = text.strip_prefix('\u{feff}').unwrap_or(&text);
+    use std::io::Read;
+    let mut file = fs::File::open(target).ok()?;
+    let mut buf = [0u8; 512];
+    let n = file.read(&mut buf).ok()?;
+    let header = &buf[..n];
+    if !header.starts_with(b"#!") && !header.starts_with(b"\xEF\xBB\xBF#!") {
+        return None;
+    }
+    let clean_bytes = if header.starts_with(b"\xEF\xBB\xBF#!") {
+        &header[3..]
+    } else {
+        header
+    };
+    let line_bytes = if let Some(pos) = clean_bytes.iter().position(|&b| b == b'\n') {
+        &clean_bytes[..pos]
+    } else if n < 512 {
+        clean_bytes
+    } else {
+        let mut line_vec = clean_bytes.to_vec();
+        let mut byte = [0u8; 1];
+        while let Ok(1) = file.read(&mut byte) {
+            if byte[0] == b'\n' {
+                break;
+            }
+            line_vec.push(byte[0]);
+        }
+        return parse_cmd_shim_shebang_line(&String::from_utf8_lossy(&line_vec));
+    };
+    let text = String::from_utf8_lossy(line_bytes);
+    parse_cmd_shim_shebang_line(&text)
+}
+
+#[cfg(any(not(unix), test))]
+fn parse_cmd_shim_shebang_line(text: &str) -> Option<(String, String, String)> {
+    let clean_text = text.strip_prefix('\u{feff}').unwrap_or(text);
     let line = clean_text
         .trim()
         .split('\n')
@@ -536,6 +537,12 @@ pub fn check_existing_bin_collision(
     rel_target: &str,
     force: bool,
 ) -> Result<()> {
+    // Fast path: local .bin directory allows clobbering across dependencies without checking metadata.
+    // Hoisting this to the very top skips 3 redundant symlink_metadata syscalls per binary!
+    if bin_dir.file_name().is_some_and(|f| f == ".bin") {
+        return Ok(());
+    }
+
     let meta = match fs::symlink_metadata(link_path) {
         Ok(m) => m,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -570,12 +577,6 @@ pub fn check_existing_bin_collision(
 
     // 2. Force allows overwriting files and symlinks
     if force {
-        return Ok(());
-    }
-
-    // 3. Local .bin allows overwriting stale files/symlinks
-    let is_dot_bin = bin_dir.file_name().is_some_and(|f| f == ".bin");
-    if is_dot_bin {
         return Ok(());
     }
 
@@ -798,6 +799,11 @@ pub fn create_shims_with_force(
                             format!("Failed to remove existing file reparse point {}", path.display())
                         })?;
                     }
+                } else if meta.is_dir() {
+                    anyhow::bail!(
+                        "EEXIST: refusing to overwrite existing directory {} with bin link",
+                        path.display()
+                    );
                 } else if meta.permissions().readonly() {
                     let mut perms = meta.permissions();
                     perms.set_readonly(false);

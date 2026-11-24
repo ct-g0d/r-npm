@@ -36,7 +36,7 @@ use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, RwLock};
 use std::thread::sleep;
 use std::time::Duration;
 use tracing::warn;
@@ -304,8 +304,11 @@ impl PackagePack {
     /// hardlinking target files to their CAS counterparts with zero duplicated file writes.
     pub fn extract_and_populate_cas(&self, target_dir: &Path) -> std::io::Result<()> {
         let pack_data = self.data();
+        let mut created_dirs: std::collections::HashSet<PathBuf> =
+            std::collections::HashSet::new();
+        created_dirs.insert(target_dir.to_path_buf());
+
         let mut parents = std::collections::HashSet::new();
-        parents.insert(target_dir.to_path_buf());
         for entry in &self.index.files {
             let full_path = target_dir.join(&entry.path);
             if let Some(parent) = full_path.parent() {
@@ -318,9 +321,24 @@ impl PackagePack {
                 parents.insert(parent.to_path_buf());
             }
         }
+
+        let mut sorted_parents: Vec<PathBuf> = parents.into_iter().collect();
+        sorted_parents.sort_by_key(|a| std::cmp::Reverse(a.components().count()));
+
         let t_dirs = std::time::Instant::now();
-        for dir in &parents {
+        for dir in &sorted_parents {
+            if created_dirs.contains(dir) {
+                continue;
+            }
             let _ = fs::create_dir_all(dir);
+            let mut curr = dir.as_path();
+            while curr != target_dir && created_dirs.insert(curr.to_path_buf()) {
+                if let Some(p) = curr.parent() {
+                    curr = p;
+                } else {
+                    break;
+                }
+            }
         }
         TIME_EXTRACT_DIRS.fetch_add(t_dirs.elapsed().as_nanos() as u64, Ordering::Relaxed);
 
@@ -451,9 +469,12 @@ impl PackagePack {
             }
 
             // 1. Directories first: collect all unique parent directory paths for the package entries
-            // and create them all up-front in one batch using std::fs::create_dir_all
+            // and create them up-front, deduplicating with created_dirs in descending depth order.
+            let mut created_dirs: std::collections::HashSet<PathBuf> =
+                std::collections::HashSet::new();
+            created_dirs.insert(target_dir.to_path_buf());
+
             let mut parent_dirs = std::collections::HashSet::new();
-            parent_dirs.insert(target_dir.to_path_buf());
             for entry in &self.index.files {
                 let full_path = target_dir.join(&entry.path);
                 if let Some(parent) = full_path.parent() {
@@ -466,8 +487,23 @@ impl PackagePack {
                     parent_dirs.insert(parent.to_path_buf());
                 }
             }
-            for dir in &parent_dirs {
+
+            let mut sorted_parents: Vec<PathBuf> = parent_dirs.into_iter().collect();
+            sorted_parents.sort_by_key(|a| std::cmp::Reverse(a.components().count()));
+
+            for dir in &sorted_parents {
+                if created_dirs.contains(dir) {
+                    continue;
+                }
                 std::fs::create_dir_all(dir)?;
+                let mut curr = dir.as_path();
+                while curr != target_dir && created_dirs.insert(curr.to_path_buf()) {
+                    if let Some(p) = curr.parent() {
+                        curr = p;
+                    } else {
+                        break;
+                    }
+                }
             }
         }
 
@@ -587,7 +623,7 @@ pub struct DeferredPackPayloads {
 #[derive(Debug, Clone)]
 pub struct PackStore {
     root: PathBuf,
-    mmap_cache: Arc<Mutex<HashMap<String, PackagePack>>>,
+    mmap_cache: Arc<RwLock<HashMap<String, PackagePack>>>,
     block_clone_cache: Arc<RwLock<HashMap<PathBuf, bool>>>,
     cas_stamp_cache: Arc<RwLock<HashMap<PathBuf, (u64, u64)>>>,
     has_cas_files: Arc<std::sync::atomic::AtomicBool>,
@@ -613,7 +649,7 @@ impl PackStore {
 
         Ok(Self {
             root,
-            mmap_cache: Arc::new(Mutex::new(HashMap::new())),
+            mmap_cache: Arc::new(RwLock::new(HashMap::new())),
             block_clone_cache: Arc::new(RwLock::new(HashMap::new())),
             cas_stamp_cache: Arc::new(RwLock::new(HashMap::new())),
             has_cas_files: Arc::new(std::sync::atomic::AtomicBool::new(has_cas)),
@@ -916,7 +952,7 @@ impl PackStore {
 
         // 1. Remove from in-memory cache
         {
-            let mut guard = self.mmap_cache.lock().unwrap();
+            let mut guard = self.mmap_cache.write().unwrap();
             guard.remove(integrity);
             guard.remove(integrity.trim());
             guard.remove(&safe_stem);
@@ -951,7 +987,7 @@ impl PackStore {
     pub fn has_package_pack(&self, integrity: &str) -> bool {
         // Fast path: check open memory map cache
         {
-            let guard = self.mmap_cache.lock().unwrap();
+            let guard = self.mmap_cache.read().unwrap();
             if guard.contains_key(integrity) {
                 return true;
             }
@@ -1010,7 +1046,7 @@ impl PackStore {
 
         // 1. Check in-memory mmap cache
         {
-            let guard = self.mmap_cache.lock().unwrap();
+            let guard = self.mmap_cache.read().unwrap();
             if let Some(pack) = guard.get(integrity) {
                 return Ok(Some(pack.clone()));
             }
@@ -1022,29 +1058,29 @@ impl PackStore {
             }
         }
 
-        // 2. Locate on disk
+        // 2. Locate on disk and read index: try reading index directly to avoid redundant stat syscalls
         let (mut pack_path, mut idx_path) = self.pack_paths(integrity);
-        if !pack_path.is_file() || !idx_path.is_file() {
-            let alt_pack = self
-                .packs_dir()
-                .join(&prefix)
-                .join(format!("{sha512_hex}.pack"));
-            let alt_idx = self
-                .packs_dir()
-                .join(&prefix)
-                .join(format!("{sha512_hex}.idx"));
-            if alt_pack.is_file() && alt_idx.is_file() {
-                pack_path = alt_pack;
-                idx_path = alt_idx;
-            } else {
-                return Ok(None);
-            }
-        }
-
-        // 3. Read and parse index
         let idx_bytes = match fs::read(&idx_path) {
             Ok(b) => b,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                let alt_pack = self
+                    .packs_dir()
+                    .join(&prefix)
+                    .join(format!("{sha512_hex}.pack"));
+                let alt_idx = self
+                    .packs_dir()
+                    .join(&prefix)
+                    .join(format!("{sha512_hex}.idx"));
+                match fs::read(&alt_idx) {
+                    Ok(b) => {
+                        pack_path = alt_pack;
+                        idx_path = alt_idx;
+                        b
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                    Err(e) => return Err(CacheError::Io(e)),
+                }
+            }
             Err(e) => return Err(CacheError::Io(e)),
         };
         let index: PackIndex = match PackIndex::from_bytes(&idx_bytes) {
@@ -1109,7 +1145,11 @@ impl PackStore {
         }
 
         // 4. Memory-map the pack file and verify file length matches index.total_pack_size (accounting for 4 KiB padding)
-        let file = OpenOptions::new().read(true).open(&pack_path)?;
+        let file = match OpenOptions::new().read(true).open(&pack_path) {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(CacheError::Io(e)),
+        };
         let meta = file.metadata()?;
         let pack_len = meta.len();
 
@@ -1283,7 +1323,7 @@ impl PackStore {
 
         // 5. Store in cache across process lifetime
         {
-            let mut guard = self.mmap_cache.lock().unwrap();
+            let mut guard = self.mmap_cache.write().unwrap();
             guard.insert(integrity.to_string(), pack.clone());
             guard.insert(safe_stem, pack.clone());
             guard.insert(sha512_hex, pack.clone());
@@ -1649,7 +1689,7 @@ impl PackStore {
         };
 
         {
-            let mut guard = self.mmap_cache.lock().unwrap();
+            let mut guard = self.mmap_cache.write().unwrap();
             guard.insert(integrity.to_string(), pack.clone());
             guard.insert(safe_stem, pack.clone());
             guard.insert(sha512_hex, pack.clone());
@@ -2132,7 +2172,7 @@ impl PackStore {
 
     /// Clear in-memory cached memory maps.
     pub fn clear_mmap_cache(&self) {
-        self.mmap_cache.lock().unwrap().clear();
+        self.mmap_cache.write().unwrap().clear();
     }
 
     /// Derives (prefix, safe_stem, sha512_hex) for an integrity string.
@@ -3736,5 +3776,49 @@ mod tests {
                 assert!(!name.contains("tmp"), "Leftover temp file: {name}");
             }
         }
+    }
+
+    #[test]
+    fn test_pack_materialization_directory_dedup() {
+        let dir = tempdir().unwrap();
+        let store = PackStore::new(dir.path().join("cache")).unwrap();
+
+        let integrity = "sha512-nested-dirs-test-dedup==";
+        let files = [
+            PackInputFile::new("a/b/c/d/deep1.js", 0o644, b"console.log('deep1');"),
+            PackInputFile::new("a/b/c/d/deep2.js", 0o644, b"console.log('deep2');"),
+            PackInputFile::new("a/b/c/sibling.js", 0o644, b"console.log('sibling');"),
+            PackInputFile::new("a/b/other/file.js", 0o644, b"console.log('other');"),
+            PackInputFile::new("package.json", 0o644, b"{\"name\":\"nested\"}"),
+        ];
+
+        store.put_package_pack(integrity, &files).unwrap();
+
+        let target_dir = tempdir().unwrap();
+        let summary = store
+            .materialize_pack(integrity, target_dir.path(), None)
+            .unwrap();
+
+        assert_eq!(summary.entries_extracted, 5);
+        assert_eq!(
+            fs::read(target_dir.path().join("a/b/c/d/deep1.js")).unwrap(),
+            b"console.log('deep1');"
+        );
+        assert_eq!(
+            fs::read(target_dir.path().join("a/b/c/d/deep2.js")).unwrap(),
+            b"console.log('deep2');"
+        );
+        assert_eq!(
+            fs::read(target_dir.path().join("a/b/c/sibling.js")).unwrap(),
+            b"console.log('sibling');"
+        );
+        assert_eq!(
+            fs::read(target_dir.path().join("a/b/other/file.js")).unwrap(),
+            b"console.log('other');"
+        );
+        assert_eq!(
+            fs::read(target_dir.path().join("package.json")).unwrap(),
+            b"{\"name\":\"nested\"}"
+        );
     }
 }

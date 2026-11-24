@@ -3625,3 +3625,55 @@ fn pack_files_precedence_and_scoped_ignores() {
         .iter()
         .any(|(p, _)| p == "keep.js"));
 }
+
+#[test]
+fn test_parallel_safe_removal_large_tree_with_junctions_and_readonly() {
+    let dir = tempdir().unwrap();
+    let root = dir.path().join("large_tree");
+    fs::create_dir_all(&root).unwrap();
+
+    // 1. External directory that MUST be preserved
+    let external = dir.path().join("external_keep");
+    fs::create_dir_all(&external).unwrap();
+    let external_secret = external.join("secret.txt");
+    fs::write(&external_secret, b"MUST_NEVER_BE_DELETED").unwrap();
+
+    // 2. Create 100+ files in nested directories inside root
+    for d in 0..10 {
+        let subdir = root.join(format!("subdir_{d}"));
+        fs::create_dir_all(&subdir).unwrap();
+        for f in 0..12 {
+            let file_path = subdir.join(format!("file_{f}.txt"));
+            fs::write(&file_path, format!("content_{d}_{f}")).unwrap();
+            // Mark some files readonly
+            if f % 3 == 0 {
+                let mut perms = fs::metadata(&file_path).unwrap().permissions();
+                perms.set_readonly(true);
+                fs::set_permissions(&file_path, perms).unwrap();
+            }
+        }
+    }
+
+    // 3. Create a junction/symlink pointing to the external directory
+    let link_path = root.join("nested_link");
+    #[cfg(windows)]
+    crate::junction::create_junction(&link_path, &external).unwrap();
+    #[cfg(not(windows))]
+    std::os::unix::fs::symlink(&external, &link_path).unwrap();
+
+    assert!(link_path.exists());
+
+    // 4. Run remove_dir_all_safe
+    crate::junction::remove_dir_all_safe(&root).unwrap();
+
+    // 5. Verify root is completely gone
+    assert!(!root.exists(), "Root directory must be deleted");
+
+    // 6. CRUCIAL: External directory and files must be 100% intact
+    assert!(external.exists(), "External directory must NOT be deleted");
+    assert!(external_secret.exists(), "External file must NOT be deleted");
+    assert_eq!(
+        fs::read(&external_secret).unwrap(),
+        b"MUST_NEVER_BE_DELETED"
+    );
+}
