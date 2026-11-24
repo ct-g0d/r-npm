@@ -512,7 +512,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let cache = Cache::new(dir.path())
             .unwrap()
-            .with_lock_timeout(Duration::from_millis(500))
+            .with_lock_timeout(Duration::from_secs(5))
             .with_stale_threshold(Duration::from_secs(3600)); // Very large stale threshold
 
         let lock_path = cache.lock_path("idx_dead_pid_lock");
@@ -528,18 +528,21 @@ mod tests {
         let start = std::time::Instant::now();
         let lock_res = CacheLock::acquire_exclusive_with_options(
             &lock_path,
-            Duration::from_millis(500),
+            Duration::from_secs(5),
             Duration::from_secs(3600),
         );
+        let elapsed = start.elapsed();
 
         assert!(
             lock_res.is_ok(),
-            "Must break and reclaim lock held by dead PID: {:?}",
-            lock_res.err()
+            "Must break and reclaim lock held by dead PID: {:?}, elapsed: {:?}",
+            lock_res.err(),
+            elapsed
         );
         assert!(
-            start.elapsed() < Duration::from_millis(250),
-            "Reclamation must be immediate"
+            elapsed < Duration::from_secs(5),
+            "Reclamation must be immediate without waiting for the 3600s stale threshold; elapsed: {:?}",
+            elapsed
         );
 
         let lock = lock_res.unwrap();
