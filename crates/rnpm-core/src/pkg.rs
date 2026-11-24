@@ -288,6 +288,31 @@ pub fn set_value(
         bail!("Path cannot be empty");
     }
 
+    if let Some(PathSegment::Key(first_key)) = segments.first() {
+        if first_key == "scripts" {
+            if segments.len() == 1 {
+                match &value {
+                    OrderedJsonValue::Object(map) => {
+                        for (_, v) in map {
+                            if !matches!(v, OrderedJsonValue::String(_)) {
+                                bail!("npm error code ESCRIPTSINVALID\nnpm error package.json scripts should be a key-value pair of strings.");
+                            }
+                        }
+                    }
+                    _ => {
+                        bail!("npm error code ESCRIPTSINVALID\nnpm error package.json scripts should be a key-value pair of strings.");
+                    }
+                }
+            } else if segments.len() == 2 {
+                if !matches!(value, OrderedJsonValue::String(_)) {
+                    bail!("npm error code ESCRIPTSINVALID\nnpm error package.json scripts should be a key-value pair of strings.");
+                }
+            } else {
+                bail!("npm error code ESCRIPTSINVALID\nnpm error package.json scripts should be a key-value pair of strings.");
+            }
+        }
+    }
+
     if !root.is_object() {
         *root = OrderedJsonValue::Object(OrderedJsonMap::new());
     }

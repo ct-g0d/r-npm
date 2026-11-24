@@ -74,6 +74,8 @@ pub(super) fn run(json: bool, long: bool, dir: &Path) -> Result<()> {
     };
     let home =
         std::env::var(if cfg!(windows) { "USERPROFILE" } else { "HOME" }).unwrap_or_default();
+    let detailed =
+        rnpm_config::Config::load_detailed(rnpm_config::ConfigOptions::new().project_dir(dir))?;
     let mut defaults: Map = serde_json::from_str::<Value>(include_str!("config_defaults.json"))?
         .as_object()
         .cloned()
@@ -94,7 +96,20 @@ pub(super) fn run(json: bool, long: bool, dir: &Path) -> Result<()> {
                         .display()
                         .to_string()
                 }),
-            "userconfig" => Path::new(&home).join(".npmrc").display().to_string(),
+            "userconfig" => rnpm_config::get_process_userconfig()
+                .map(|p| p.display().to_string())
+                .or_else(|| std::env::var("NPM_CONFIG_USERCONFIG").ok())
+                .or_else(|| std::env::var("npm_config_userconfig").ok())
+                .or_else(|| std::env::var("USERCONFIG").ok())
+                .or_else(|| {
+                    detailed
+                        .layers
+                        .iter()
+                        .find(|l| l.name == "user")
+                        .and_then(|l| l.source.as_ref())
+                        .map(|p| p.display().to_string())
+                })
+                .unwrap_or_else(|| Path::new(&home).join(".npmrc").display().to_string()),
             "init.module" => Path::new(&home).join(".npm-init.js").display().to_string(),
             "node-gyp" => npm_dir
                 .join("node_modules")
@@ -129,8 +144,6 @@ pub(super) fn run(json: bool, long: bool, dir: &Path) -> Result<()> {
         };
         *value = Value::String(dynamic);
     }
-    let detailed =
-        rnpm_config::Config::load_detailed(rnpm_config::ConfigOptions::new().project_dir(dir))?;
     let mut layers = vec![Layer {
         name: "default".into(),
         source: "default values".into(),

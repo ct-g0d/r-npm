@@ -47,8 +47,10 @@ pub enum SimpleSelector {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Combinator {
-    Child,      // >
-    Descendant, // ' '
+    Child,             // >
+    Descendant,        // ' '
+    SubsequentSibling, // ~
+    AdjacentSibling,   // +
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -171,8 +173,25 @@ fn parse_complex_selector(s: &str) -> Result<ComplexSelector, String> {
             }
             compound_tokens.push(std::mem::take(&mut current_compound));
             combinators.push(Combinator::Child);
+        } else if tok == "~" {
+            if current_compound.is_empty() {
+                return Err("Unexpected '~' at start or duplicate combinator".to_string());
+            }
+            compound_tokens.push(std::mem::take(&mut current_compound));
+            combinators.push(Combinator::SubsequentSibling);
+        } else if tok == "+" {
+            if current_compound.is_empty() {
+                return Err("Unexpected '+' at start or duplicate combinator".to_string());
+            }
+            compound_tokens.push(std::mem::take(&mut current_compound));
+            combinators.push(Combinator::AdjacentSibling);
         } else if tok == " " {
-            if !current_compound.is_empty() && i + 1 < tokens.len() && tokens[i + 1] != ">" {
+            if !current_compound.is_empty()
+                && i + 1 < tokens.len()
+                && tokens[i + 1] != ">"
+                && tokens[i + 1] != "~"
+                && tokens[i + 1] != "+"
+            {
                 compound_tokens.push(std::mem::take(&mut current_compound));
                 combinators.push(Combinator::Descendant);
             }
@@ -239,7 +258,7 @@ fn tokenize_selector(s: &str) -> Result<Vec<String>, String> {
                         break;
                     }
                 } else if paren_depth == 0
-                    && (p == ' ' || p == '>' || p == '[' || p == ':' || p == '.')
+                    && (p == ' ' || p == '>' || p == '~' || p == '+' || p == '[' || p == ':' || p == '.')
                 {
                     break;
                 } else {
@@ -254,7 +273,7 @@ fn tokenize_selector(s: &str) -> Result<Vec<String>, String> {
             chars.next(); // consume '.'
             let mut class_name = String::from(".");
             while let Some(&c) = chars.peek() {
-                if c == ' ' || c == '>' || c == '[' || c == ':' || c == '.' {
+                if c == ' ' || c == '>' || c == '~' || c == '+' || c == '[' || c == ':' || c == '.' {
                     break;
                 }
                 class_name.push(chars.next().unwrap());
@@ -266,6 +285,18 @@ fn tokenize_selector(s: &str) -> Result<Vec<String>, String> {
             }
             chars.next();
             tokens.push(">".to_string());
+        } else if ch == '~' {
+            if !current.is_empty() {
+                tokens.push(std::mem::take(&mut current));
+            }
+            chars.next();
+            tokens.push("~".to_string());
+        } else if ch == '+' {
+            if !current.is_empty() {
+                tokens.push(std::mem::take(&mut current));
+            }
+            chars.next();
+            tokens.push("+".to_string());
         } else if ch.is_whitespace() {
             if !current.is_empty() {
                 tokens.push(std::mem::take(&mut current));
@@ -383,7 +414,11 @@ fn matches_simple(
             "optional" => node.optional,
             "peer" => node.peer,
             "prod" => !node.dev && !node.optional && !node.peer,
-            "workspace" => node.is_workspace,
+            "workspace" => {
+                node.is_workspace
+                    || node.location.starts_with("packages/")
+                    || node.location.starts_with("workspaces/")
+            }
             _ => false,
         },
         SimpleSelector::PseudoClass { name, arg } => match name.as_str() {
@@ -550,6 +585,27 @@ fn matches_complex(
                 }
             }
 
+            false
+        }
+        Combinator::SubsequentSibling | Combinator::AdjacentSibling => {
+            // Sibling shares the same parent in the dependency graph
+            let mut checked_parents = HashSet::new();
+            for parent_loc in &node.from {
+                if !checked_parents.insert(parent_loc) {
+                    continue;
+                }
+                if let Some(parent_node) = all_nodes_map.get(parent_loc) {
+                    for sibling_loc in &parent_node.to {
+                        if sibling_loc != &node.location {
+                            if let Some(sibling_node) = all_nodes_map.get(sibling_loc) {
+                                if matches_complex(&prefix_complex, sibling_node, all_nodes_map) {
+                                    return true;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
             false
         }
     }
@@ -836,5 +892,48 @@ mod tests {
 
         let q_child = QuerySelector::parse(":root > [name=react]").unwrap();
         assert!(matches_query(&q_child, &child, &map));
+    }
+
+    #[test]
+    fn test_parse_combinator_siblings() {
+        let q = QuerySelector::parse("[name=a] ~ [name=b]").unwrap();
+        assert_eq!(q.selectors.len(), 1);
+        assert_eq!(q.selectors[0].tail.len(), 1);
+        assert_eq!(q.selectors[0].tail[0].0, Combinator::SubsequentSibling);
+
+        let q = QuerySelector::parse("[name=a] + [name=b]").unwrap();
+        assert_eq!(q.selectors.len(), 1);
+        assert_eq!(q.selectors[0].tail.len(), 1);
+        assert_eq!(q.selectors[0].tail[0].0, Combinator::AdjacentSibling);
+    }
+
+    #[test]
+    fn test_matches_query_siblings() {
+        let mut root = InspectedNode::new_root("my-app".to_string(), Some("1.0.0".to_string()), Path::new("."));
+        root.location = String::new();
+
+        let mut a = InspectedNode::new_root("a".to_string(), Some("1.0.0".to_string()), Path::new("."));
+        a.location = "node_modules/a".to_string();
+        a.from.push(String::new());
+
+        let mut b = InspectedNode::new_root("b".to_string(), Some("1.0.0".to_string()), Path::new("."));
+        b.location = "node_modules/b".to_string();
+        b.from.push(String::new());
+
+        root.to.push("node_modules/a".to_string());
+        root.to.push("node_modules/b".to_string());
+
+        let mut map = HashMap::new();
+        map.insert(root.location.clone(), &root);
+        map.insert(a.location.clone(), &a);
+        map.insert(b.location.clone(), &b);
+
+        let q_tilde = QuerySelector::parse("[name=a] ~ [name=b]").unwrap();
+        assert!(matches_query(&q_tilde, &b, &map));
+        assert!(!matches_query(&q_tilde, &a, &map));
+
+        let q_plus = QuerySelector::parse("[name=a] + [name=b]").unwrap();
+        assert!(matches_query(&q_plus, &b, &map));
+        assert!(!matches_query(&q_plus, &a, &map));
     }
 }
