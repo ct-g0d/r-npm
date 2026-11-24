@@ -1555,6 +1555,40 @@ impl LockfileV3 {
 
     pub fn package_satisfies_spec(install_name: &str, pkg: &LockfilePackage, spec: &str) -> bool {
         let Ok(target) = PackageTarget::parse(spec) else {
+            // Handle SCP-like git specs (e.g. git@host:path#ref) or ssh:// that PackageTarget doesn't parse
+            if spec.starts_with("git@") || spec.starts_with("ssh://") {
+                if let Some(ref real_name) = pkg.name {
+                    if real_name != install_name {
+                        return false;
+                    }
+                }
+                if let Some(ref res) = pkg.resolved {
+                    let canon_target = Self::canonicalize_git_identity(spec);
+                    let canon_res = Self::canonicalize_git_identity(res);
+                    if canon_target != canon_res {
+                        return false;
+                    }
+                    let target_frag = spec.split('#').nth(1).unwrap_or("");
+                    if !target_frag.is_empty() {
+                        let res_frag = res.split('#').nth(1).unwrap_or("");
+                        if res_frag.is_empty() {
+                            return false;
+                        }
+                        if res_frag.eq_ignore_ascii_case(target_frag) {
+                            return true;
+                        }
+                        let res_is_sha = res_frag.len() >= 7
+                            && res_frag.chars().all(|ch| ch.is_ascii_hexdigit());
+                        let target_is_sha = (target_frag.len() == 40 || target_frag.len() == 64)
+                            && target_frag.chars().all(|ch| ch.is_ascii_hexdigit());
+                        if target_is_sha && !res_frag.eq_ignore_ascii_case(target_frag) {
+                            return false;
+                        }
+                        return res_is_sha;
+                    }
+                    return true;
+                }
+            }
             return false;
         };
         if pkg.link == Some(true) {
@@ -1669,6 +1703,255 @@ impl LockfileV3 {
         clean.to_ascii_lowercase()
     }
 
+    pub fn is_non_registry_spec(spec: &str) -> bool {
+        let s = spec.trim();
+        if s.is_empty() {
+            return false;
+        }
+
+        // npm: alias specifier wrapping an inner spec: e.g. npm:pkg@spec or npm:@scope/pkg@spec
+        if let Some(rest) = s.strip_prefix("npm:") {
+            let inner = if let Some(stripped_scope) = rest.strip_prefix('@') {
+                if let Some(slash_idx) = stripped_scope.find('/') {
+                    let after_slash = &stripped_scope[slash_idx + 1..];
+                    if let Some(at_idx) = after_slash.find('@') {
+                        &after_slash[at_idx + 1..]
+                    } else {
+                        ""
+                    }
+                } else {
+                    ""
+                }
+            } else if let Some(at_idx) = rest.find('@') {
+                &rest[at_idx + 1..]
+            } else {
+                ""
+            };
+            if !inner.is_empty() {
+                return Self::is_non_registry_spec(inner);
+            }
+            return false;
+        }
+
+        // Direct protocol and path prefixes
+        if s.starts_with("file:")
+            || s.starts_with("link:")
+            || s.starts_with("git:")
+            || s.starts_with("git+")
+            || s.starts_with("github:")
+            || s.starts_with("gitlab:")
+            || s.starts_with("bitbucket:")
+            || s.starts_with("gist:")
+            || s.starts_with("ssh://")
+            || s.starts_with("git@")
+            || s.starts_with("./")
+            || s.starts_with(".\\")
+            || s.starts_with("../")
+            || s.starts_with("..\\")
+            || s.starts_with('/')
+            || s.starts_with("~/")
+            || s.starts_with("http://")
+            || s.starts_with("https://")
+        {
+            return true;
+        }
+
+        // Windows drive path like C:\ or C:/
+        let b = s.as_bytes();
+        if b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':' {
+            return true;
+        }
+
+        // Tarball archive suffixes (.tgz, .tar.gz, .tar) before any query or fragment
+        let without_hash = s.split('#').next().unwrap_or(s);
+        let without_query = without_hash.split('?').next().unwrap_or(without_hash);
+        if without_query.ends_with(".tgz")
+            || without_query.ends_with(".tar.gz")
+            || without_query.ends_with(".tar")
+        {
+            return true;
+        }
+
+        // GitHub shorthand: user/repo or user/repo#committish
+        let (body, _) = s.split_once('#').unwrap_or((s, ""));
+        if let Some((user, repo)) = body.split_once('/') {
+            let user_ok = user
+                .chars()
+                .next()
+                .is_some_and(|c| !matches!(c, '@' | '%' | '/' | '.' | '-') && !c.is_whitespace())
+                && !user
+                    .chars()
+                    .any(|c| matches!(c, ':' | '@' | '%' | '/') || c.is_whitespace());
+            let repo_ok = !repo.is_empty()
+                && !repo
+                    .chars()
+                    .any(|c| matches!(c, '@' | '/' | '%') || c.is_whitespace());
+            if user_ok && repo_ok {
+                return true;
+            }
+        }
+
+        // Checked against PackageTarget::parse
+        if let Ok(target) = PackageTarget::parse(s) {
+            match target {
+                PackageTarget::Git { .. }
+                | PackageTarget::File(_)
+                | PackageTarget::Url(_) => return true,
+                PackageTarget::Alias { target, .. } => {
+                    match *target {
+                        PackageTarget::Git { .. }
+                        | PackageTarget::File(_)
+                        | PackageTarget::Url(_) => return true,
+                        _ => {}
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        false
+    }
+
+    pub fn non_registry_specs_match(spec_a: &str, spec_b: &str) -> bool {
+        let a = spec_a.trim();
+        let b = spec_b.trim();
+        if a == b {
+            return true;
+        }
+
+        // Handle npm: aliases
+        let a_alias = a.strip_prefix("npm:");
+        let b_alias = b.strip_prefix("npm:");
+        if a_alias.is_some() != b_alias.is_some() {
+            return false;
+        }
+        if let (Some(a_rest), Some(b_rest)) = (a_alias, b_alias) {
+            let parse_alias_parts = |rest: &str| -> (String, String) {
+                if let Some(stripped_scope) = rest.strip_prefix('@') {
+                    if let Some(slash_idx) = stripped_scope.find('/') {
+                        let after_slash = &stripped_scope[slash_idx + 1..];
+                        if let Some(at_idx) = after_slash.find('@') {
+                            let name = format!("@{}", &stripped_scope[..slash_idx + 1 + at_idx]);
+                            let sub_spec = &after_slash[at_idx + 1..];
+                            (name, sub_spec.to_string())
+                        } else {
+                            (format!("@{stripped_scope}"), String::new())
+                        }
+                    } else {
+                        (format!("@{stripped_scope}"), String::new())
+                    }
+                } else if let Some(at_idx) = rest.find('@') {
+                    (rest[..at_idx].to_string(), rest[at_idx + 1..].to_string())
+                } else {
+                    (rest.to_string(), String::new())
+                }
+            };
+            let (name_a, sub_a) = parse_alias_parts(a_rest);
+            let (name_b, sub_b) = parse_alias_parts(b_rest);
+            if name_a != name_b {
+                return false;
+            }
+            if sub_a.is_empty() && sub_b.is_empty() {
+                return true;
+            }
+            return Self::non_registry_specs_match(&sub_a, &sub_b);
+        }
+
+        // Check if both parse as PackageTarget::Git
+        let target_a = PackageTarget::parse(a);
+        let target_b = PackageTarget::parse(b);
+        if let (
+            Ok(PackageTarget::Git {
+                url: url_a,
+                committish: c_a,
+                subdir: s_a,
+            }),
+            Ok(PackageTarget::Git {
+                url: url_b,
+                committish: c_b,
+                subdir: s_b,
+            }),
+        ) = (&target_a, &target_b)
+        {
+            let canon_a = Self::canonicalize_git_identity(url_a.as_str());
+            let canon_b = Self::canonicalize_git_identity(url_b.as_str());
+            if canon_a != canon_b {
+                return false;
+            }
+            if s_a != s_b {
+                return false;
+            }
+            let c_a_str = c_a.as_deref().unwrap_or("");
+            let c_b_str = c_b.as_deref().unwrap_or("");
+            return c_a_str.eq_ignore_ascii_case(c_b_str);
+        }
+
+        // Also handle git specs that might not parse via PackageTarget::parse (e.g. git@ or ssh://)
+        let is_git_prefix = |s: &str| {
+            s.starts_with("git@")
+                || s.starts_with("ssh://")
+                || s.starts_with("git:")
+                || s.starts_with("git+")
+                || s.starts_with("github:")
+                || s.starts_with("gitlab:")
+                || s.starts_with("bitbucket:")
+                || s.starts_with("gist:")
+        };
+        if is_git_prefix(a) || is_git_prefix(b) {
+            if is_git_prefix(a) && is_git_prefix(b) {
+                let canon_a = Self::canonicalize_git_identity(a);
+                let canon_b = Self::canonicalize_git_identity(b);
+                if canon_a != canon_b {
+                    return false;
+                }
+                let frag_a = a.split('#').nth(1).unwrap_or("");
+                let frag_b = b.split('#').nth(1).unwrap_or("");
+                return frag_a.eq_ignore_ascii_case(frag_b);
+            }
+            return false;
+        }
+
+        // Check if both are File specs
+        if let (Ok(PackageTarget::File(p_a)), Ok(PackageTarget::File(p_b))) = (&target_a, &target_b) {
+            let norm = |p: &std::path::Path| -> String {
+                let s = p.to_string_lossy().replace('\\', "/");
+                let s = s.strip_prefix("./").unwrap_or(&s).trim_end_matches('/').to_string();
+                if s == "." {
+                    String::new()
+                } else {
+                    s
+                }
+            };
+            return norm(p_a) == norm(p_b);
+        }
+
+        // Also check raw file/link prefixes if PackageTarget::File wasn't returned
+        let is_file_prefix = |s: &str| {
+            s.starts_with("file:")
+                || s.starts_with("link:")
+                || s.starts_with("./")
+                || s.starts_with(".\\")
+                || s.starts_with("../")
+                || s.starts_with("..\\")
+        };
+        if is_file_prefix(a) && is_file_prefix(b) {
+            let clean = |s: &str| -> String {
+                let s = s.strip_prefix("file:").unwrap_or(s);
+                let s = s.strip_prefix("link:").unwrap_or(s);
+                let s = s.replace('\\', "/");
+                let s = s.strip_prefix("./").unwrap_or(&s).trim_end_matches('/').to_string();
+                if s == "." {
+                    String::new()
+                } else {
+                    s
+                }
+            };
+            return clean(a) == clean(b);
+        }
+
+        false
+    }
+
     fn target_matches_resolved(resolved: &str, target: &PackageTarget) -> bool {
         match target {
             PackageTarget::Url(u) => resolved == u.as_str(),
@@ -1716,8 +1999,17 @@ impl LockfileV3 {
                         if !res_frag.eq_ignore_ascii_case(c) {
                             return false;
                         }
-                    } else if !res_frag.is_empty() && res_frag.eq_ignore_ascii_case(c) {
-                        return true;
+                    } else if !res_frag.is_empty() {
+                        if res_frag.eq_ignore_ascii_case(c) {
+                            return true;
+                        }
+                        let res_is_sha = res_frag.len() >= 7
+                            && res_frag.chars().all(|ch| ch.is_ascii_hexdigit());
+                        if !res_is_sha {
+                            return false;
+                        }
+                    } else {
+                        return false;
                     }
                 }
                 true
@@ -1792,9 +2084,60 @@ impl LockfileV3 {
         }
 
         for (k, manifest_spec) in manifest_map {
-            let Some(lock_spec) = lock.get(k) else {
-                return false;
+            let lock_spec = match lock.get(k) {
+                Some(s) => s,
+                None => {
+                    let key = format!("node_modules/{k}");
+                    let Some(pkg) = packages.get(&key) else {
+                        return false;
+                    };
+                    if Self::is_non_registry_spec(manifest_spec) {
+                        if let Ok(PackageTarget::Git {
+                            url, committish, ..
+                        }) = PackageTarget::parse(manifest_spec)
+                        {
+                            let Some(ref res) = pkg.resolved else {
+                                return false;
+                            };
+                            let canon_target = Self::canonicalize_git_identity(url.as_str());
+                            let canon_res = Self::canonicalize_git_identity(res);
+                            if canon_target != canon_res {
+                                return false;
+                            }
+                            if let Some(ref c) = committish {
+                                let res_frag = res.split('#').nth(1).unwrap_or("");
+                                if !res_frag.eq_ignore_ascii_case(c) {
+                                    return false;
+                                }
+                            }
+                        } else if manifest_spec.starts_with("git@")
+                            || manifest_spec.starts_with("ssh://")
+                        {
+                            let Some(ref res) = pkg.resolved else {
+                                return false;
+                            };
+                            let canon_target = Self::canonicalize_git_identity(manifest_spec);
+                            let canon_res = Self::canonicalize_git_identity(res);
+                            if canon_target != canon_res {
+                                return false;
+                            }
+                            let target_frag = manifest_spec.split('#').nth(1).unwrap_or("");
+                            let res_frag = res.split('#').nth(1).unwrap_or("");
+                            if !target_frag.is_empty()
+                                && !res_frag.eq_ignore_ascii_case(target_frag)
+                            {
+                                return false;
+                            }
+                        } else if !Self::package_satisfies_spec(k, pkg, manifest_spec) {
+                            return false;
+                        }
+                    } else if !Self::package_satisfies_spec(k, pkg, manifest_spec) {
+                        return false;
+                    }
+                    continue;
+                }
             };
+
             if lock_spec == manifest_spec {
                 continue;
             }
@@ -1814,19 +2157,18 @@ impl LockfileV3 {
                     }
                 }
             }
-            // For other spec differences, verify whether resolved package in packages satisfies manifest spec,
-            // but ONLY if the lock spec itself was not a non-registry/tarball/git spec that diverged.
-            let is_non_registry = |s: &str| {
-                s.starts_with("file:")
-                    || s.starts_with("git:")
-                    || s.starts_with("git+")
-                    || s.starts_with("github:")
-                    || s.starts_with("http:")
-                    || s.starts_with("https:")
-                    || s.ends_with(".tgz")
-                    || s.ends_with(".tar.gz")
-            };
-            if is_non_registry(lock_spec) || is_non_registry(manifest_spec) {
+
+            // For non-registry specs, check whether they canonically match (e.g. user/repo#v1 vs github:user/repo#v1);
+            // any drift in ref/path/identity must reject with false.
+            let m_non_reg = Self::is_non_registry_spec(manifest_spec);
+            let l_non_reg = Self::is_non_registry_spec(lock_spec);
+            if m_non_reg || l_non_reg {
+                if m_non_reg
+                    && l_non_reg
+                    && Self::non_registry_specs_match(manifest_spec, lock_spec)
+                {
+                    continue;
+                }
                 return false;
             }
 
