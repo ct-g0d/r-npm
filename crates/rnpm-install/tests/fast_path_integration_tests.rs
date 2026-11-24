@@ -402,3 +402,54 @@ fn test_fast_path_linked_mode_rejects_plain_directory() {
         "Linked mode must reject top-level package that is a plain directory instead of a junction"
     );
 }
+
+#[test]
+fn test_fast_path_bin_validation_safe_on_workspace_nested_packages_and_unicode_paths() {
+    let tmp = tempdir().unwrap();
+    let root = tmp.path();
+    let nm = root.join("node_modules");
+    std::fs::create_dir_all(&nm).unwrap();
+
+    // Create root package.json
+    std::fs::write(
+        root.join("package.json"),
+        r#"{"name": "root-app", "version": "1.0.0"}"#,
+    )
+    .unwrap();
+
+    // A workspace package with a unicode path and a nested dependency containing a binary
+    let ws_dep_dir = root.join("packages/日本語/node_modules/inner-tool");
+    std::fs::create_dir_all(&ws_dep_dir).unwrap();
+    std::fs::write(
+        ws_dep_dir.join("package.json"),
+        r#"{"name": "inner-tool", "version": "1.0.0", "bin": {"inner-tool": "bin/tool.js"}}"#,
+    )
+    .unwrap();
+
+    let mut lockfile = LockfileV3::new("root-app", Some("1.0.0".to_string()));
+    let root_pkg = LockfilePackage::default();
+    lockfile.packages.insert("".to_string(), root_pkg);
+
+    let mut tool_pkg = LockfilePackage::default();
+    tool_pkg.version = Some("1.0.0".to_string());
+    let mut bin_map = BTreeMap::new();
+    bin_map.insert("inner-tool".to_string(), "bin/tool.js".to_string());
+    tool_pkg.bin = Some(rnpm_lockfile::PackageBin::Map(bin_map));
+    lockfile.packages.insert(
+        "packages/日本語/node_modules/inner-tool".to_string(),
+        tool_pkg,
+    );
+
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    lockfile.save_hidden(root).unwrap();
+
+    let mut opts = InstallOptions::default();
+    opts.project_dir = root.to_path_buf();
+    opts.bin_links = true;
+
+    // Must not panic on UTF-8 path, and must not fail validation looking for inner-tool in root .bin
+    assert!(
+        validate_hidden_lockfile(root, Some(&opts)),
+        "Workspace nested package bin must not trigger UTF-8 slice panic or false cache invalidation at root"
+    );
+}

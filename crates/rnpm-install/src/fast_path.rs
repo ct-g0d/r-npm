@@ -336,7 +336,14 @@ pub fn validate_hidden_lockfile(project_dir: &Path, options: Option<&InstallOpti
     if let Some(root_pkg) = lockfile.packages.get("") {
         if let Some(deps) = &root_pkg.dependencies {
             for name in deps.keys() {
-                direct_top_level_deps.insert(format!("node_modules/{name}"));
+                if !omit_optional
+                    || !root_pkg
+                        .optional_dependencies
+                        .as_ref()
+                        .is_some_and(|od| od.contains_key(name))
+                {
+                    direct_top_level_deps.insert(format!("node_modules/{name}"));
+                }
             }
         }
         if !omit_dev {
@@ -415,7 +422,16 @@ pub fn validate_hidden_lockfile(project_dir: &Path, options: Option<&InstallOpti
                     pkg_info.cpu.as_deref(),
                     pkg_info.libc.as_deref(),
                 ));
-        if is_platform_skipped {
+        let dev_opt = pkg_info.dev_optional.unwrap_or(false);
+        let is_dev = (pkg_info.is_dev() || pkg_info.dev.unwrap_or(false)) && !dev_opt;
+        let is_opt = (pkg_info.is_effective_optional() || pkg_info.is_peer_optional()) && !dev_opt;
+        let is_peer = pkg_info.peer.unwrap_or(false) || pkg_info.peer_optional.unwrap_or(false);
+        let is_omitted = (omit_dev && is_dev)
+            || (omit_optional && is_opt)
+            || (omit_dev && omit_optional && dev_opt)
+            || (omit_peer && is_peer);
+
+        if is_platform_skipped || is_omitted {
             continue;
         }
 
@@ -602,14 +618,10 @@ pub fn validate_hidden_lockfile(project_dir: &Path, options: Option<&InstallOpti
             }
 
             // A valid package directory on disk must contain a non-empty package.json
-            let is_pkg_json_valid = if is_link {
-                folder_path.join("package.json").is_file()
-            } else {
-                let pkg_json_path = folder_path.join("package.json");
-                match std::fs::metadata(&pkg_json_path) {
-                    Ok(m) => m.is_file() && m.len() > 0,
-                    Err(_) => false,
-                }
+            let pkg_json_path = folder_path.join("package.json");
+            let is_pkg_json_valid = match std::fs::metadata(&pkg_json_path) {
+                Ok(m) => m.is_file() && m.len() > 0,
+                Err(_) => false,
             };
             if !is_pkg_json_valid {
                 debug!(
@@ -691,7 +703,9 @@ pub fn validate_hidden_lockfile(project_dir: &Path, options: Option<&InstallOpti
             }
 
             let is_top_level = direct_top_level_deps.contains(&normalized)
-                || (!normalized.is_empty() && !normalized["node_modules/".len()..].contains("/node_modules/"));
+                || normalized
+                    .strip_prefix("node_modules/")
+                    .is_some_and(|rest| !rest.contains("/node_modules/"));
             if is_top_level {
                 for (bin_name, _) in bins {
                     has_expected_bins = true;
