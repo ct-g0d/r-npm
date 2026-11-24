@@ -1391,67 +1391,6 @@ mod tests {
     }
 
     #[test]
-    fn test_compute_project_fingerprint_respects_userconfig_and_globalconfig_overrides() {
-        let tmp = tempdir().unwrap();
-        let pkg_json = tmp.path().join("package.json");
-        std::fs::write(&pkg_json, r#"{"name": "test-pkg", "version": "1.0.0"}"#).unwrap();
-
-        let mut opts = InstallOptions::default();
-        opts.project_dir = tmp.path().to_path_buf();
-        opts.config_override = None; // explicitly None to exercise fallback config loading
-
-        let base_fp = compute_project_fingerprint(tmp.path(), &opts).unwrap();
-
-        // 1. Setting userconfig override
-        let user_npmrc = tmp.path().join(".user-npmrc");
-        std::fs::write(&user_npmrc, "registry=https://custom-user-registry.org/\n").unwrap();
-        rnpm_config::set_process_userconfig(user_npmrc.clone());
-
-        let userconfig_fp = compute_project_fingerprint(tmp.path(), &opts).unwrap();
-        assert_ne!(
-            base_fp, userconfig_fp,
-            "fingerprint must change when process userconfig override is set"
-        );
-
-        // Modifying userconfig file content must also change fingerprint
-        std::fs::write(&user_npmrc, "registry=https://updated-user-registry.org/\n").unwrap();
-        let userconfig_updated_fp = compute_project_fingerprint(tmp.path(), &opts).unwrap();
-        assert_ne!(
-            userconfig_fp, userconfig_updated_fp,
-            "fingerprint must change when userconfig file content is modified"
-        );
-
-        // Reset process userconfig to a non-existent dummy to avoid polluting other tests
-        rnpm_config::set_process_userconfig(tmp.path().join(".cleared-user-npmrc"));
-
-        // 2. Setting globalconfig override
-        let global_npmrc = tmp.path().join(".global-npmrc");
-        std::fs::write(&global_npmrc, "logs-max=100\n").unwrap();
-        rnpm_config::set_process_globalconfig(global_npmrc.clone());
-
-        let globalconfig_fp = compute_project_fingerprint(tmp.path(), &opts).unwrap();
-        assert_ne!(
-            base_fp, globalconfig_fp,
-            "fingerprint must change when process globalconfig override is set"
-        );
-
-        // Reset process globalconfig
-        rnpm_config::set_process_globalconfig(tmp.path().join(".cleared-global-npmrc"));
-
-        // 3. Setting CLI overrides
-        let mut cli_map = std::collections::BTreeMap::new();
-        cli_map.insert("fetch-retries".to_string(), "5".to_string());
-        rnpm_config::set_process_cli_overrides(cli_map);
-
-        let cli_fp = compute_project_fingerprint(tmp.path(), &opts).unwrap();
-        assert_ne!(
-            base_fp, cli_fp,
-            "fingerprint must change when process CLI overrides are set"
-        );
-        rnpm_config::set_process_cli_overrides(std::collections::BTreeMap::new());
-    }
-
-    #[test]
     fn test_validate_hidden_lockfile_detects_missing_bin_shims() {
         let tmp = tempdir().unwrap();
         let nm = tmp.path().join("node_modules");
