@@ -174,13 +174,13 @@ fn installed_manifest(
     if let Some(integrity) = integrity.filter(|i| !i.is_empty()) {
         if let Ok(Some(pack)) = pack_store.get_package_pack(integrity) {
             if let Some(slice) = pack.get_file_slice("package.json") {
-                return Manifest::from_slice(slice).ok();
+                return Manifest::from_slice_readonly(slice).ok();
             }
         }
     }
     let path = dest.join("package.json");
     path.exists()
-        .then(|| Manifest::from_file(&path).ok())
+        .then(|| Manifest::from_file_readonly(&path).ok())
         .flatten()
 }
 
@@ -653,7 +653,7 @@ pub(crate) fn scan_global_packages(global_nm: &Path) -> HashMap<String, String> 
                     let pkg_dir = scoped_entry.path();
                     let pkg_json = pkg_dir.join("package.json");
                     if pkg_json.is_file() {
-                        if let Ok(pkg_m) = Manifest::from_file(&pkg_json) {
+                        if let Ok(pkg_m) = Manifest::from_file_readonly(&pkg_json) {
                             let pkg_name =
                                 pkg_m.name.unwrap_or_else(|| format!("{name}/{sub_name}"));
                             let version = pkg_m.version.unwrap_or_else(|| "1.0.0".to_string());
@@ -665,7 +665,7 @@ pub(crate) fn scan_global_packages(global_nm: &Path) -> HashMap<String, String> 
         } else if path.is_dir() || rnpm_fs::is_junction(&path).unwrap_or(false) {
             let pkg_json = path.join("package.json");
             if pkg_json.is_file() {
-                if let Ok(pkg_m) = Manifest::from_file(&pkg_json) {
+                if let Ok(pkg_m) = Manifest::from_file_readonly(&pkg_json) {
                     let pkg_name = pkg_m.name.unwrap_or(name);
                     let version = pkg_m.version.unwrap_or_else(|| "1.0.0".to_string());
                     installed.insert(pkg_name, format!("^{version}"));
@@ -702,7 +702,7 @@ fn populate_global_disk_metadata(
                     let pkg_dir = scoped_entry.path();
                     let pkg_json = pkg_dir.join("package.json");
                     if pkg_json.is_file() {
-                        if let Ok(pkg_m) = Manifest::from_file(&pkg_json) {
+                        if let Ok(pkg_m) = Manifest::from_file_readonly(&pkg_json) {
                             if let Some(meta) = package_metadata_from_manifest(&pkg_m) {
                                 if let Ok(mut cache) = metadata_cache.lock() {
                                     cache.entry(meta.name.clone()).or_insert(meta);
@@ -715,7 +715,7 @@ fn populate_global_disk_metadata(
         } else if path.is_dir() || rnpm_fs::is_junction(&path).unwrap_or(false) {
             let pkg_json = path.join("package.json");
             if pkg_json.is_file() {
-                if let Ok(pkg_m) = Manifest::from_file(&pkg_json) {
+                if let Ok(pkg_m) = Manifest::from_file_readonly(&pkg_json) {
                     if let Some(meta) = package_metadata_from_manifest(&pkg_m) {
                         if let Ok(mut cache) = metadata_cache.lock() {
                             cache.entry(meta.name.clone()).or_insert(meta);
@@ -1033,7 +1033,7 @@ impl RegistryPackageProvider {
             let if_none_match = stored_etag.clone();
             let res = self.handle.block_on(async move {
                 client
-                    .get_package_metadata_full_conditional(&pkg_name, if_none_match.as_deref())
+                    .get_package_metadata_install_conditional(&pkg_name, if_none_match.as_deref())
                     .await
             });
 
@@ -1116,7 +1116,7 @@ impl RegistryPackageProvider {
         let pkg_name = name.to_string();
         let res = self.handle.block_on(async move {
             client
-                .get_package_metadata_full_conditional(&pkg_name, None)
+                .get_package_metadata_install_conditional(&pkg_name, None)
                 .await
         });
         match res {
@@ -1494,7 +1494,7 @@ impl PackageMetadataProvider for RegistryPackageProvider {
                     .map(|(n, etag, _)| (n.clone(), etag.clone()))
                     .collect();
                 let results = client_c
-                    .get_package_metadata_full_conditional_concurrent(&req_pkgs)
+                    .get_package_metadata_install_conditional_concurrent(&req_pkgs)
                     .await;
                 for ((name, stored_etag, cached_info), res) in
                     to_revalidate.into_iter().zip(results)
@@ -1866,7 +1866,7 @@ fn process_installed_pkg_manifest_without_bins(
     declared_dependencies: &[String],
     is_optional: bool,
 ) -> Option<LifecyclePackageNode> {
-    let pkg_manifest = Manifest::from_file(target_path.join("package.json")).ok()?;
+    let pkg_manifest = Manifest::from_file_readonly(target_path.join("package.json")).ok()?;
     lifecycle_node_for_manifest(
         target_path,
         pkg_key,
@@ -2230,10 +2230,22 @@ fn peer_graph_from_lockfile(lockfile: &LockfileV3, manifest: &Manifest) -> Depen
 /// part of it.
 fn without_omitted(options: &InstallOptions, lockfile: &LockfileV3) -> LockfileV3 {
     let mut kept = lockfile.clone();
-    kept.packages.retain(|key, info| {
-        key.is_empty() || !lockfile_entry_omitted(options, lockfile, key, info)
-    });
+    if options.omit_dev || options.omit_optional || options.omit_peer {
+        kept.packages.retain(|key, info| {
+            key.is_empty() || !lockfile_entry_omitted(options, lockfile, key, info)
+        });
+    }
     kept
+}
+
+fn retain_not_omitted(options: &InstallOptions, lockfile: &mut LockfileV3) {
+    if !options.omit_dev && !options.omit_optional && !options.omit_peer {
+        return;
+    }
+    let orig = lockfile.clone();
+    lockfile.packages.retain(|key, info| {
+        key.is_empty() || !lockfile_entry_omitted(options, &orig, key, info)
+    });
 }
 
 /// The lockfile location `name` resolves to from `from`, walking up the
@@ -2494,7 +2506,7 @@ fn installs_as_copy(install_links: bool, clean_rel: &str) -> bool {
 
 /// Copies the files `npm pack` would include from `src` into `dest`.
 fn copy_packed_directory(src: &Path, dest: &Path) -> Result<()> {
-    let manifest = Manifest::from_file(src.join("package.json"))
+    let manifest = Manifest::from_file_readonly(src.join("package.json"))
         .with_context(|| format!("Failed to read {}", src.join("package.json").display()))?;
     let files = rnpm_fs::collect_pack_files(src, &manifest)
         .map_err(|e| anyhow!("Failed to list files to pack in {}: {e}", src.display()))?;
@@ -2554,7 +2566,7 @@ fn directory_target_entry(
             .then_some(true),
         ..Default::default()
     };
-    let manifest = Manifest::from_file(dir.join("package.json")).ok();
+    let manifest = Manifest::from_file_readonly(dir.join("package.json")).ok();
     if manifest.is_none() {
         return flags;
     }
@@ -2682,7 +2694,7 @@ pub fn inspect_manifest_from_tarball(bytes: &[u8]) -> Result<Manifest> {
                 {
                     let mut manifest_bytes = Vec::new();
                     if std::io::Read::read_to_end(&mut entry, &mut manifest_bytes).is_ok() {
-                        if let Ok(manifest) = Manifest::from_slice(&manifest_bytes) {
+                        if let Ok(manifest) = Manifest::from_slice_readonly(&manifest_bytes) {
                             return Ok(manifest);
                         }
                     }
@@ -3174,7 +3186,7 @@ impl Installer {
         if self.options.ignore_scripts || self.options.silent {
             return;
         }
-        let workspace_paths: HashSet<String> = Manifest::from_file(base_dir.join("package.json"))
+        let workspace_paths: HashSet<String> = Manifest::from_file_readonly(base_dir.join("package.json"))
             .ok()
             .and_then(|m| discover_workspaces_from_manifest(base_dir, &m).ok())
             .unwrap_or_default()
@@ -3311,14 +3323,9 @@ impl Installer {
                     .flatten();
                 let metadata = if cached.is_some() || self.options.offline {
                     cached
-                } else if before_cutoff().is_some() {
-                    self.registry_client
-                        .get_package_metadata_full(&spec.package_name)
-                        .await
-                        .ok()
                 } else {
                     self.registry_client
-                        .get_package_metadata(&spec.package_name)
+                        .get_package_metadata_install(&spec.package_name)
                         .await
                         .ok()
                 };
@@ -3440,16 +3447,16 @@ impl Installer {
                                 .project_dir
                                 .join("node_modules")
                                 .join(".package-lock.json");
-                            if let Ok(actual) = LockfileV3::load_from_file(&hidden) {
+                            if let Ok(actual) = LockfileV3::load_from_file_readonly(&hidden) {
                                 self.warn_unreviewed_scripts(&actual, &self.options.project_dir);
                             }
-                            let root_manifest = Manifest::from_file(&manifest_path)
+                            let root_manifest = Manifest::from_file_readonly(&manifest_path)
                                 .context("Failed to parse project package.json")?;
                             let opts = self.lifecycle_options();
                             let _life_guard = collector.enter_phase(Phase::Lifecycle);
                             self.run_lifecycle_hooks(rnpm_lifecycle::execute_root_hooks(&root_manifest, &opts)).await?;
                         }
-                        let actual = LockfileV3::load_from_file(
+                        let actual = LockfileV3::load_from_file_readonly(
                             &self
                                 .options
                                 .project_dir
@@ -3469,14 +3476,14 @@ impl Installer {
                                     .is_some_and(|peers| !peers.is_empty())
                             })
                         }) {
-                            let project_lock = LockfileV3::load_from_file(&lockfile_path).ok();
+                            let project_lock = LockfileV3::load_from_file_readonly(&lockfile_path).ok();
                             let peer_lock = if self.options.package_lock_enabled() {
                                 project_lock.as_ref().or(actual.as_ref())
                             } else {
                                 actual.as_ref()
                             };
                             if let (Some(lock), Ok(root)) =
-                                (peer_lock, Manifest::from_file(&manifest_path))
+                                (peer_lock, Manifest::from_file_readonly(&manifest_path))
                             {
                                 peer_warnings = self
                                     .peer_conflict_warnings(
@@ -4550,7 +4557,7 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
             && self.options.install_strategy != InstallStrategy::Linked
             && validate_hidden_lockfile(&loc_base_dir, Some(&self.options))
         {
-            LockfileV3::load_hidden(&loc_base_dir).ok()
+            LockfileV3::load_from_file_readonly(&loc_base_dir.join(LockfileV3::HIDDEN_LOCKFILE_PATH)).ok()
         } else {
             None
         };
@@ -4575,7 +4582,7 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                                 || rnpm_fs::is_junction(&target_path).unwrap_or(false))
                         {
                             let pkg_manifest_path = target_path.join("package.json");
-                            if let Ok(pkg_m) = Manifest::from_file(&pkg_manifest_path) {
+                            if let Ok(pkg_m) = Manifest::from_file_readonly(&pkg_manifest_path) {
                                 let bin_dir = find_enclosing_bin_dir(
                                     &target_path,
                                     &root_bin_dir,
@@ -4613,7 +4620,7 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                 }
                 if target_path.exists() || rnpm_fs::is_junction(&target_path).unwrap_or(false) {
                     let pkg_manifest_path = target_path.join("package.json");
-                    if let Ok(pkg_m) = Manifest::from_file(&pkg_manifest_path) {
+                    if let Ok(pkg_m) = Manifest::from_file_readonly(&pkg_manifest_path) {
                         let bin_dir =
                             find_enclosing_bin_dir(&target_path, &root_bin_dir, &node_modules_dir);
                         for (bin_name, _) in pkg_m.bin_entries() {
@@ -4896,7 +4903,7 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                     {
                         if is_opt {
                             warn!("Failed to materialize optional git dependency '{}': {e}; skipping", loc);
-                            let _ = std::fs::remove_dir_all(&dest_dir);
+                            let _ = rnpm_fs::remove_dir_all_safe(&dest_dir);
                             continue;
                         }
                         return Err(e);
@@ -4906,7 +4913,7 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
 
                     let pkg_manifest_path = dest_dir.join("package.json");
                     if pkg_manifest_path.exists() {
-                        if let Ok(m) = Manifest::from_file(&pkg_manifest_path) {
+                        if let Ok(m) = Manifest::from_file_readonly(&pkg_manifest_path) {
                             if m.scripts.contains_key("preinstall")
                                 || m.scripts.contains_key("install")
                                 || m.scripts.contains_key("postinstall")
@@ -5018,7 +5025,7 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
 
                         let pkg_manifest_path = dest_dir.join("package.json");
                         if pkg_manifest_path.exists() {
-                            if let Ok(m) = Manifest::from_file(&pkg_manifest_path) {
+                            if let Ok(m) = Manifest::from_file_readonly(&pkg_manifest_path) {
                                 if m.scripts.contains_key("preinstall")
                                     || m.scripts.contains_key("install")
                                     || m.scripts.contains_key("postinstall")
@@ -5043,7 +5050,7 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                             let _ = rnpm_fs::remove_junction(&dest_dir);
                         }
                         if dest_dir.exists() {
-                            let _ = std::fs::remove_dir_all(&dest_dir);
+                            let _ = rnpm_fs::remove_dir_all_safe(&dest_dir);
                         }
                         copy_packed_directory(&abs_file, &dest_dir)?;
                         packages_installed += 1;
@@ -5059,7 +5066,7 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                             if dest_dir.exists()
                                 && !rnpm_fs::is_junction(&dest_dir).unwrap_or(false)
                             {
-                                let _ = std::fs::remove_dir_all(&dest_dir);
+                                let _ = rnpm_fs::remove_dir_all_safe(&dest_dir);
                             }
                         }
                         if let Some(parent) = dest_dir.parent() {
@@ -5069,7 +5076,7 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                             .map_err(|e| anyhow!("Failed to link file dir {}: {e}", loc))?;
                         packages_installed += 1;
                         let pkg_manifest_path = abs_file.join("package.json");
-                        if let Ok(m) = Manifest::from_file(&pkg_manifest_path) {
+                        if let Ok(m) = Manifest::from_file_readonly(&pkg_manifest_path) {
                             if m.scripts.contains_key("preinstall")
                                 || m.scripts.contains_key("install")
                                 || m.scripts.contains_key("postinstall")
@@ -5714,7 +5721,7 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                                     if e.is_pack_corruption() {
                                         warn!("materialize_pack failed: {e}, purging pack and falling back to tarball extraction");
                                         let _ = ps_clone.purge(integ);
-                                        let _ = std::fs::remove_dir_all(&dest_dir_clone);
+                                        let _ = rnpm_fs::remove_dir_all_safe(&dest_dir_clone);
                                     } else {
                                         return Err(rnpm_fs::FsError::Io(match e {
                                             CacheError::Io(io_err) => io_err,
@@ -5743,7 +5750,7 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                                 "npm warn optional SKIPPING OPTIONAL DEPENDENCY: Failed to extract package {}: {}",
                                 loc, e
                             );
-                            let _ = std::fs::remove_dir_all(&dest_dir);
+                            let _ = rnpm_fs::remove_dir_all_safe(&dest_dir);
                             return Ok(None);
                         } else {
                             return Err(anyhow!("Failed to extract package {}: {e}", loc));
@@ -5809,8 +5816,8 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
             }
         }
 
-        // Fill CAS by copying from node_modules on 16 threads for cold installs
-        if !used_fast_materialize {
+        // Fill CAS by copying from node_modules on 16 threads for cold installs (offloaded if eligible)
+        if !used_fast_materialize && self.pack_store.is_block_cloning_eligible(&loc_base_dir) {
             let mut cas_copy_list = Vec::new();
             for (loc, node) in &packages_to_download {
                 if let Some(ref integrity_str) = node.integrity {
@@ -5829,9 +5836,10 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                 }
             }
             if !cas_copy_list.is_empty() {
-                let t_cas = std::time::Instant::now();
-                self.pack_store.populate_cas_from_installed(&cas_copy_list);
-                collector.record_phase(Phase::StoreWrite, t_cas.elapsed());
+                let ps = self.pack_store.clone();
+                std::thread::spawn(move || {
+                    ps.populate_cas_from_installed(&cas_copy_list);
+                });
             }
         }
 
@@ -6122,7 +6130,7 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
             ));
         }
 
-        let manifest = Manifest::from_file(&manifest_path)?;
+        let manifest = Manifest::from_file_readonly(&manifest_path)?;
         drop(_plan_span);
         collector.record_phase(Phase::Plan, plan_start.elapsed());
 
@@ -6130,8 +6138,17 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
         let _meta_span = tracing::info_span!("metadata").entered();
 
         let lockfile_str = std::fs::read_to_string(&lockfile_path)?;
-        let mut lockfile = rnpm_lockfile::parse_and_migrate(&lockfile_str)
-            .with_context(|| format!("Failed to parse {lockfile_name}"))?;
+        let mut lockfile = if let Ok(lf) = LockfileV3::from_json_str_readonly(&lockfile_str) {
+            if lf.lockfile_version == 3 && !lf.packages.is_empty() {
+                lf
+            } else {
+                rnpm_lockfile::parse_and_migrate(&lockfile_str)
+                    .with_context(|| format!("Failed to parse {lockfile_name}"))?
+            }
+        } else {
+            rnpm_lockfile::parse_and_migrate(&lockfile_str)
+                .with_context(|| format!("Failed to parse {lockfile_name}"))?
+        };
         // 0. Discover workspace members (if any)
         let workspace_members =
             discover_workspaces_from_manifest(&self.options.project_dir, &manifest)
@@ -6664,7 +6681,7 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                 if link_path.exists() || rnpm_fs::is_junction(&link_path).unwrap_or(false) {
                     let _ = rnpm_fs::remove_junction(&link_path);
                     if link_path.exists() && !rnpm_fs::is_junction(&link_path).unwrap_or(false) {
-                        let _ = std::fs::remove_dir_all(&link_path);
+                        let _ = rnpm_fs::remove_dir_all_safe(&link_path);
                     }
                 }
                 rnpm_fs::junction::create_directory_link(&link_path, &target_dir).map_err(|e| {
@@ -6678,7 +6695,7 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
 
                 let pkg_manifest_path = target_dir.join("package.json");
                 if pkg_manifest_path.exists() {
-                    if let Ok(pkg_manifest) = Manifest::from_file(&pkg_manifest_path) {
+                    if let Ok(pkg_manifest) = Manifest::from_file_readonly(&pkg_manifest_path) {
                         let clean_pkg_name =
                             pkg_key.strip_prefix("node_modules/").unwrap_or(pkg_key);
                         if !workspace_members.iter().any(|m| m.name == clean_pkg_name) {
@@ -6821,7 +6838,7 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                 let src = self.options.project_dir.join(rel);
                 if pkg_info.link != Some(true) && src.is_dir() {
                     if full_target.exists() {
-                        let _ = std::fs::remove_dir_all(&full_target);
+                        let _ = rnpm_fs::remove_dir_all_safe(&full_target);
                     }
                     copy_packed_directory(&src, &full_target)?;
                     packages_installed += 1;
@@ -6872,7 +6889,7 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                     drop(_mat_span);
                     if is_opt {
                         warn!("Failed to materialize optional git dependency '{}': {e}; skipping", pkg_key);
-                        let _ = std::fs::remove_dir_all(&full_target);
+                        let _ = rnpm_fs::remove_dir_all_safe(&full_target);
                         continue;
                     }
                     return Err(e);
@@ -6886,7 +6903,7 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
 
                 let pkg_manifest_path = full_target.join("package.json");
                 if pkg_manifest_path.exists() {
-                    if let Ok(pkg_manifest) = Manifest::from_file(&pkg_manifest_path) {
+                    if let Ok(pkg_manifest) = Manifest::from_file_readonly(&pkg_manifest_path) {
                         let has_scripts = pkg_manifest.scripts.contains_key("preinstall")
                             || pkg_manifest.scripts.contains_key("install")
                             || pkg_manifest.scripts.contains_key("postinstall");
@@ -7359,7 +7376,7 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                             .map_err(|e| anyhow!("{e}"))?;
                         tokio::task::spawn_blocking(move || {
                             let _hold_permit = _permit;
-                            let populate_cas = idx < 5;
+                            let populate_cas = false;
                             if !integrity_str.is_empty() {
                                 pack_store
                                     .put_decoded_package(
@@ -7753,8 +7770,12 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                         }
                         if save_hidden_needed {
                             let t_lock = std::time::Instant::now();
-                            let _ = without_omitted(&self.options, lockfile_ref)
-                                .save_hidden(project_dir_ref);
+                            if self.options.omit_dev || self.options.omit_optional || self.options.omit_peer {
+                                let _ = without_omitted(&self.options, lockfile_ref)
+                                    .save_hidden(project_dir_ref);
+                            } else {
+                                let _ = lockfile_ref.save_hidden(project_dir_ref);
+                            }
                             collector.record_phase(Phase::Lockfile, t_lock.elapsed());
                         }
                     }
@@ -7894,7 +7915,7 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                                 if e.is_pack_corruption() {
                                     warn!("Warm CI materialize_pack failed for {pkg_key}: {e}. Purging pack and falling back to tarball fetch.");
                                     let _ = pack_store.purge(&integrity_str);
-                                    let _ = std::fs::remove_dir_all(&target_path);
+                                    let _ = rnpm_fs::remove_dir_all_safe(&target_path);
                                 } else {
                                     return Err(anyhow!(
                                         "Warm CI materialize_pack failed for {pkg_key}: {e}"
@@ -8082,7 +8103,7 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                                     if e.is_pack_corruption() {
                                         warn!("materialize_pack failed: {e}, purging pack and falling back to tarball extraction");
                                         let _ = ps_clone.purge(&integ_clone);
-                                        let _ = std::fs::remove_dir_all(&target_clone);
+                                        let _ = rnpm_fs::remove_dir_all_safe(&target_clone);
                                         extract_tarball_direct(Cursor::new(&bytes), &target_clone, None, Some(&cfg_clone))
                                             .map_err(|e| anyhow!("{e}"))
                                     } else {
@@ -8133,26 +8154,29 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                 }
             }
 
-            // Fill CAS by copying from node_modules on 16 threads for cold installs
-            let mut cas_copy_list = Vec::new();
-            for (pkg_key, _, integrity_str, _, _, _) in &packages_to_process {
-                if !integrity_str.is_empty() {
-                    if let Ok(Some(pack)) = self.pack_store.get_package_pack(integrity_str) {
-                        for entry in &pack.index.files {
-                            if let Some(ref cas_path) = entry.cas_path {
-                                if !cas_path.metadata().is_ok_and(|m| m.len() == entry.size) {
-                                    let src = loc_base_dir.join(pkg_key).join(&entry.path);
-                                    cas_copy_list.push((src, cas_path.clone()));
+            // Fill CAS by copying from node_modules on 16 threads for cold installs (offloaded if eligible)
+            if self.pack_store.is_block_cloning_eligible(&loc_base_dir) {
+                let mut cas_copy_list = Vec::new();
+                for (pkg_key, _, integrity_str, _, _, _) in &packages_to_process {
+                    if !integrity_str.is_empty() {
+                        if let Ok(Some(pack)) = self.pack_store.get_package_pack(integrity_str) {
+                            for entry in &pack.index.files {
+                                if let Some(ref cas_path) = entry.cas_path {
+                                    if !cas_path.metadata().is_ok_and(|m| m.len() == entry.size) {
+                                        let src = loc_base_dir.join(pkg_key).join(&entry.path);
+                                        cas_copy_list.push((src, cas_path.clone()));
+                                    }
                                 }
                             }
                         }
                     }
                 }
-            }
-            if !cas_copy_list.is_empty() {
-                let t_cas = std::time::Instant::now();
-                self.pack_store.populate_cas_from_installed(&cas_copy_list);
-                collector.record_phase(Phase::StoreWrite, t_cas.elapsed());
+                if !cas_copy_list.is_empty() {
+                    let ps = self.pack_store.clone();
+                    std::thread::spawn(move || {
+                        ps.populate_cas_from_installed(&cas_copy_list);
+                    });
+                }
             }
         }
 
@@ -8237,7 +8261,7 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
             && has_packages
         {
             let _lock_guard = collector.enter_phase(Phase::Lockfile);
-            lockfile = without_omitted(&self.options, &lockfile);
+            retain_not_omitted(&self.options, &mut lockfile);
             lockfile.packages.retain(|_, pkg| !pkg.is_extraneous());
             lockfile
                 .save_hidden(&self.options.project_dir)
@@ -9091,16 +9115,11 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
         let metadata = if let Some(cached) = self.metadata_cache.get(lookup_name) {
             cached.clone()
         } else {
-            let meta = if before_cutoff().is_some() {
-                self.registry_client
-                    .get_package_metadata_full(lookup_name)
-                    .await
-            } else {
-                self.registry_client
-                    .get_package_metadata(lookup_name)
-                    .await
-            }
-            .map_err(|e| anyhow!("Failed to fetch metadata for {lookup_name}: {e}"))?;
+            let meta = self
+                .registry_client
+                .get_package_metadata_install(lookup_name)
+                .await
+                .map_err(|e| anyhow!("Failed to fetch metadata for {lookup_name}: {e}"))?;
             self.metadata_cache
                 .insert(lookup_name.to_string(), meta.clone());
             meta
@@ -9237,26 +9256,10 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
             return Ok(());
         }
 
-        let results = if before_cutoff().is_some() {
-            let reqs: Vec<(String, Option<String>)> =
-                missing.iter().map(|s| (s.clone(), None)).collect();
-            self.registry_client
-                .get_package_metadata_full_conditional_concurrent(&reqs)
-                .await
-                .into_iter()
-                .map(|r| {
-                    r.and_then(|m| {
-                        m.into_metadata().ok_or_else(|| {
-                            rnpm_registry::RegistryError::Other("Not modified".into())
-                        })
-                    })
-                })
-                .collect()
-        } else {
-            self.registry_client
-                .get_package_metadata_concurrent(&missing)
-                .await
-        };
+        let results = self
+            .registry_client
+            .get_package_metadata_install_concurrent(&missing)
+            .await;
 
         for (name, res) in missing.into_iter().zip(results) {
             if let Ok(meta) = res {
@@ -9440,7 +9443,7 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
         let mut lifecycle_node = None;
 
         if pkg_manifest_path.exists() {
-            if let Ok(pkg_manifest) = Manifest::from_file(&pkg_manifest_path) {
+            if let Ok(pkg_manifest) = Manifest::from_file_readonly(&pkg_manifest_path) {
                 if self.options.bin_links {
                     let pkg_bin_dir = find_enclosing_bin_dir(&dest_dir, bin_dir, node_modules_dir);
                     let _ = std::fs::create_dir_all(&pkg_bin_dir);
@@ -9538,7 +9541,7 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
 
         let lockfile_path = project_lockfile_path(&self.options.project_dir);
         let existing_lockfile_opt = if lockfile_path.exists() {
-            LockfileV3::load_from_file(&lockfile_path).ok()
+            LockfileV3::load_from_file_readonly(&lockfile_path).ok()
         } else {
             None
         };
@@ -9590,7 +9593,7 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
         let install_summary = self.install().await?;
 
         // Compare old lockfile with newly written lockfile to construct UpdateSummary
-        let new_lockfile = LockfileV3::load_from_file(&install_summary.lockfile_path)?;
+        let new_lockfile = LockfileV3::load_from_file_readonly(&install_summary.lockfile_path)?;
         let mut updated_packages = Vec::new();
         let mut old_versions = HashMap::new();
         let mut new_versions = HashMap::new();
@@ -9909,7 +9912,7 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
             if target_path.exists() || is_junc {
                 // Remove shims from .bin if package had bin entries
                 let pkg_manifest_path = target_path.join("package.json");
-                if let Ok(pkg_manifest) = Manifest::from_file(&pkg_manifest_path) {
+                if let Ok(pkg_manifest) = Manifest::from_file_readonly(&pkg_manifest_path) {
                     for (bin_name, _) in pkg_manifest.bin_entries() {
                         let shim_path = bin_dir.join(&bin_name);
                         let _ = std::fs::remove_file(&shim_path);
@@ -9924,7 +9927,7 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                 if is_junc {
                     let _ = remove_junction(&target_path);
                 } else if target_path.is_dir() {
-                    let _ = std::fs::remove_dir_all(&target_path);
+                    let _ = rnpm_fs::remove_dir_all_safe(&target_path);
                 } else {
                     let _ = std::fs::remove_file(&target_path);
                 }
@@ -9991,7 +9994,7 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
             if target_path.exists() || is_junc {
                 // Remove shims from global bin dir if package had bin entries
                 let pkg_manifest_path = target_path.join("package.json");
-                if let Ok(pkg_manifest) = Manifest::from_file(&pkg_manifest_path) {
+                if let Ok(pkg_manifest) = Manifest::from_file_readonly(&pkg_manifest_path) {
                     for (bin_name, _) in pkg_manifest.bin_entries() {
                         let shim_path = bin_dir.join(&bin_name);
                         let _ = std::fs::remove_file(&shim_path);
@@ -10007,7 +10010,7 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                 if is_junc {
                     let _ = remove_junction(&target_path);
                 } else if target_path.is_dir() {
-                    let _ = std::fs::remove_dir_all(&target_path);
+                    let _ = rnpm_fs::remove_dir_all_safe(&target_path);
                 } else {
                     let _ = std::fs::remove_file(&target_path);
                 }
