@@ -121,6 +121,63 @@ impl<R: Read> Read for CountingReader<R> {
     }
 }
 
+/// Helper that creates `dir` and registers it and all intermediate ancestors down to `root`
+/// in both `created_dirs` and `safe_cache` so that directory creation and ancestor symlink
+/// checks are performed at most once per unique directory hierarchy.
+fn ensure_dir_created(
+    dir: &Path,
+    root: &Path,
+    created_dirs: &mut HashSet<PathBuf>,
+    safe_cache: &mut HashSet<PathBuf>,
+) -> Result<(), FsError> {
+    if created_dirs.contains(dir) {
+        return Ok(());
+    }
+
+    if let Err(e) = fs::create_dir_all(dir) {
+        #[cfg(unix)]
+        if e.kind() == std::io::ErrorKind::PermissionDenied {
+            if let Some(parent) = dir.parent() {
+                if let Ok(meta) = fs::metadata(parent) {
+                    use std::os::unix::fs::PermissionsExt;
+                    let mut perms = meta.permissions();
+                    if perms.mode() & 0o200 == 0 {
+                        perms.set_mode(perms.mode() | 0o700);
+                        let _ = fs::set_permissions(parent, perms);
+                    }
+                }
+            }
+        }
+        #[cfg(windows)]
+        if e.kind() == std::io::ErrorKind::PermissionDenied {
+            if let Some(parent) = dir.parent() {
+                if let Ok(meta) = fs::metadata(parent) {
+                    let mut perms = meta.permissions();
+                    if perms.readonly() {
+                        perms.set_readonly(false);
+                        let _ = fs::set_permissions(parent, perms);
+                    }
+                }
+            }
+        }
+        fs::create_dir_all(dir)?;
+    }
+
+    let mut curr = Some(dir);
+    while let Some(p) = curr {
+        if !p.starts_with(root) {
+            break;
+        }
+        let inserted = created_dirs.insert(p.to_path_buf());
+        safe_cache.insert(p.to_path_buf());
+        if !inserted {
+            break;
+        }
+        curr = p.parent();
+    }
+    Ok(())
+}
+
 /// Extract a .tar.gz stream into destination, stripping the archive's first root component
 /// and enforcing all security and tar-bomb defenses.
 pub fn extract_tar_gz<R: Read>(
@@ -134,12 +191,28 @@ pub fn extract_tar_gz<R: Read>(
     let verbatim_dest = crate::path::to_verbatim_path(destination);
     fs::create_dir_all(&verbatim_dest)?;
     let clean_dest = clean(&verbatim_dest);
+
+    // Fast-path detection: if destination is fresh/empty before unpacking,
+    // entries that were not previously unpacked in this archive guaranteed do not exist on disk.
+    let is_fresh_dest = match fs::read_dir(&verbatim_dest) {
+        Ok(mut it) => it.next().is_none(),
+        Err(_) => true,
+    };
+
+    let mut created_dirs: HashSet<PathBuf> = HashSet::new();
+    created_dirs.insert(clean_dest.clone());
+    created_dirs.insert(verbatim_dest.clone());
+
     let mut verified_safe_ancestors: HashSet<PathBuf> = HashSet::new();
+    verified_safe_ancestors.insert(clean_dest.clone());
+    verified_safe_ancestors.insert(verbatim_dest.clone());
 
     let compressed_counter = Arc::new(AtomicU64::new(0));
-    let counting_reader = CountingReader::with_counter(reader, Arc::clone(&compressed_counter));
+    let buf_reader = io::BufReader::with_capacity(64 * 1024, reader);
+    let counting_reader = CountingReader::with_counter(buf_reader, Arc::clone(&compressed_counter));
     let gz = GzDecoder::new(counting_reader);
-    let mut archive = Archive::new(gz);
+    let buffered_gz = io::BufReader::with_capacity(64 * 1024, gz);
+    let mut archive = Archive::new(buffered_gz);
 
     let mut entry_count = 0;
     let mut directory_count = 0usize;
@@ -152,7 +225,7 @@ pub fn extract_tar_gz<R: Read>(
     let mut seen_files_lower: HashSet<String> = HashSet::new();
     let mut hardlink_targets: std::collections::HashMap<PathBuf, PathBuf> =
         std::collections::HashMap::new();
-    let mut copy_buf = vec![0u8; 128 * 1024];
+    let mut copy_buf = vec![0u8; 64 * 1024];
 
     let entries = archive.entries().map_err(FsError::Io)?;
 
@@ -249,6 +322,8 @@ pub fn extract_tar_gz<R: Read>(
 
         // Security check relative path: path traversal, absolute paths, device names, trailing dots/spaces
         validate_entry_path(&relative_path)?;
+
+        let norm_rel = normalize_rel_path(&relative_path);
 
         // Check path depth: count components; if deeper than limits.max_path_depth
         let path_depth = relative_path
@@ -423,16 +498,21 @@ pub fn extract_tar_gz<R: Read>(
                         validate_link_target(&relative_path, &normalized_target, destination)?;
 
                     if let Some(parent) = target_path.parent() {
-                        fs::create_dir_all(parent)?;
+                        ensure_dir_created(
+                            parent,
+                            &verbatim_dest,
+                            &mut created_dirs,
+                            &mut verified_safe_ancestors,
+                        )?;
                     }
 
                     // If target_path exists, safely unlink it (handling Windows junctions) before creating link
                     unlink_target_path(&target_path);
 
                     extracted_regular_files.remove(&relative_path);
-                    extracted_regular_files.remove(&normalize_rel_path(&relative_path));
+                    extracted_regular_files.remove(&norm_rel);
                     symlink_paths.insert(relative_path.clone());
-                    symlink_paths.insert(normalize_rel_path(&relative_path));
+                    symlink_paths.insert(norm_rel.clone());
                     #[cfg(unix)]
                     {
                         let _ = &cleaned_rel;
@@ -594,7 +674,12 @@ pub fn extract_tar_gz<R: Read>(
                     }
 
                     if let Some(parent) = target_path.parent() {
-                        fs::create_dir_all(parent)?;
+                        ensure_dir_created(
+                            parent,
+                            &verbatim_dest,
+                            &mut created_dirs,
+                            &mut verified_safe_ancestors,
+                        )?;
                     }
 
                     unlink_target_path(&target_path);
@@ -605,7 +690,7 @@ pub fn extract_tar_gz<R: Read>(
 
                     hardlink_targets.insert(relative_path.clone(), cleaned_target);
                     extracted_regular_files.insert(relative_path.clone());
-                    extracted_regular_files.insert(normalize_rel_path(&relative_path));
+                    extracted_regular_files.insert(norm_rel.clone());
                 }
             }
             continue;
@@ -613,36 +698,24 @@ pub fn extract_tar_gz<R: Read>(
 
         // Unpack entry with size and ratio checks
         if entry_type.is_dir() {
-            if !target_path.is_dir() {
-                unlink_target_path(&target_path);
-                if let Err(e) = fs::create_dir_all(&target_path) {
-                    #[cfg(unix)]
-                    if e.kind() == std::io::ErrorKind::PermissionDenied {
-                        if let Some(parent) = target_path.parent() {
-                            if let Ok(meta) = fs::metadata(parent) {
-                                use std::os::unix::fs::PermissionsExt;
-                                let mut perms = meta.permissions();
-                                if perms.mode() & 0o200 == 0 {
-                                    perms.set_mode(perms.mode() | 0o700);
-                                    let _ = fs::set_permissions(parent, perms);
-                                }
-                            }
-                        }
-                    }
-                    #[cfg(windows)]
-                    if e.kind() == std::io::ErrorKind::PermissionDenied {
-                        if let Some(parent) = target_path.parent() {
-                            if let Ok(meta) = fs::metadata(parent) {
-                                let mut perms = meta.permissions();
-                                if perms.readonly() {
-                                    perms.set_readonly(false);
-                                    let _ = fs::set_permissions(parent, perms);
-                                }
-                            }
-                        }
-                    }
-                    fs::create_dir_all(&target_path)?;
+            if !created_dirs.contains(&target_path) {
+                let should_unlink = if is_fresh_dest {
+                    symlink_paths.contains(&relative_path)
+                        || symlink_paths.contains(&norm_rel)
+                        || extracted_regular_files.contains(&relative_path)
+                        || extracted_regular_files.contains(&norm_rel)
+                } else {
+                    true
+                };
+                if should_unlink {
+                    unlink_target_path(&target_path);
                 }
+                ensure_dir_created(
+                    &target_path,
+                    &verbatim_dest,
+                    &mut created_dirs,
+                    &mut verified_safe_ancestors,
+                )?;
             }
         } else if entry_type.is_file() {
             // Check single entry size limit from header if available
@@ -667,17 +740,38 @@ pub fn extract_tar_gz<R: Read>(
                 }
             }
 
+            // Ensure parent directory exists using deduplicated directory cache
+            if let Some(parent) = target_path.parent() {
+                ensure_dir_created(
+                    parent,
+                    &verbatim_dest,
+                    &mut created_dirs,
+                    &mut verified_safe_ancestors,
+                )?;
+            }
+
             // Replace the directory entry before opening it: truncating an existing
             // symlink or hardlink would modify the linked file, possibly outside dest.
-            unlink_target_path(&target_path);
+            let should_unlink = if is_fresh_dest {
+                symlink_paths.contains(&relative_path)
+                    || symlink_paths.contains(&norm_rel)
+                    || extracted_regular_files.contains(&relative_path)
+                    || extracted_regular_files.contains(&norm_rel)
+                    || created_dirs.contains(&target_path)
+            } else {
+                true
+            };
+            if should_unlink {
+                unlink_target_path(&target_path);
+            }
 
             if let Ok(0) = entry.header().size() {
                 crate::writer::write_file_fast(&target_path, &[], mode, 64 * 1024)
                     .map_err(FsError::Io)?;
                 symlink_paths.remove(&relative_path);
-                symlink_paths.remove(&normalize_rel_path(&relative_path));
+                symlink_paths.remove(&norm_rel);
                 extracted_regular_files.insert(relative_path.clone());
-                extracted_regular_files.insert(normalize_rel_path(&relative_path));
+                extracted_regular_files.insert(norm_rel.clone());
                 continue;
             }
 
@@ -685,7 +779,12 @@ pub fn extract_tar_gz<R: Read>(
                 Ok(f) => f,
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
                     if let Some(parent) = target_path.parent() {
-                        let _ = fs::create_dir_all(parent);
+                        ensure_dir_created(
+                            parent,
+                            &verbatim_dest,
+                            &mut created_dirs,
+                            &mut verified_safe_ancestors,
+                        )?;
                     }
                     File::create(&target_path)?
                 }
@@ -775,9 +874,9 @@ pub fn extract_tar_gz<R: Read>(
             }
             drop(raw_file);
             symlink_paths.remove(&relative_path);
-            symlink_paths.remove(&normalize_rel_path(&relative_path));
+            symlink_paths.remove(&norm_rel);
             extracted_regular_files.insert(relative_path.clone());
-            extracted_regular_files.insert(normalize_rel_path(&relative_path));
+            extracted_regular_files.insert(norm_rel);
         }
     }
 
@@ -934,7 +1033,7 @@ pub fn ensure_no_symlink_ancestors_with_cache(
 
     // 3. Check all intermediate ancestors between destination and target on disk
     let mut current = target.parent();
-    let mut newly_verified = Vec::new();
+    let mut newly_verified = Vec::with_capacity(8);
     while let Some(parent) = current {
         if parent == destination || parent.as_os_str().is_empty() {
             break;
@@ -1841,7 +1940,9 @@ fn sort_pack_file_paths(a: &str, b: &str) -> std::cmp::Ordering {
 /// Summarize an existing .tgz the way npm's `getContents` does, returning
 /// the summary and the parsed `package/package.json`.
 pub fn summarize_tarball(bytes: &[u8]) -> Result<(PackSummary, serde_json::Value), FsError> {
-    let mut archive = Archive::new(GzDecoder::new(bytes));
+    let gz = GzDecoder::new(bytes);
+    let buffered = io::BufReader::with_capacity(64 * 1024, gz);
+    let mut archive = Archive::new(buffered);
     let mut files = Vec::new();
     let mut bundled: Vec<String> = Vec::new();
     let mut unpacked_size = 0u64;
@@ -1915,7 +2016,9 @@ pub fn summarize_tarball(bytes: &[u8]) -> Result<(PackSummary, serde_json::Value
 
 /// Text of one `package/<path>` entry in a .tgz, if present.
 pub fn read_tarball_text(bytes: &[u8], inner_path: &str) -> Option<String> {
-    let mut archive = Archive::new(GzDecoder::new(bytes));
+    let gz = GzDecoder::new(bytes);
+    let buffered = io::BufReader::with_capacity(64 * 1024, gz);
+    let mut archive = Archive::new(buffered);
     for entry in archive.entries().ok()? {
         let mut entry = entry.ok()?;
         let raw = entry.path().ok()?.to_string_lossy().replace('\\', "/");
@@ -2131,7 +2234,8 @@ pub fn pure_rust_gzip(input: &[u8]) -> Result<Vec<u8>, FsError> {
     use flate2::write::GzEncoder;
     use flate2::Compression;
 
-    let mut encoder = GzEncoder::new(Vec::new(), Compression::new(9));
+    let initial_cap = (input.len() / 2).max(1024);
+    let mut encoder = GzEncoder::new(Vec::with_capacity(initial_cap), Compression::new(9));
     encoder.write_all(input).map_err(FsError::Io)?;
     let mut output = encoder.finish().map_err(FsError::Io)?;
     if output.len() >= 10 {
