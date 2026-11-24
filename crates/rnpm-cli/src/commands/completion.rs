@@ -291,7 +291,8 @@ fn compute_completions(
     results
 }
 
-const BASH_ZSH_INIT_SCRIPT: &str = r#"###-begin-npm-completion-###
+const BASH_ZSH_INIT_SCRIPT: &str = r#"#!/bin/bash
+###-begin-npm-completion-###
 #
 # npm command completion script
 #
