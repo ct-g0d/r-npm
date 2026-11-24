@@ -59,8 +59,25 @@ fn test_npx_argument_translation_unit() {
         vec!["exec", "--no-yes", "--", "cowsay"]
     );
     assert_eq!(
+        translate_npx_args(&["--no=false".into(), "cowsay".into()]),
+        vec!["exec", "--yes", "--", "cowsay"]
+    );
+    assert_eq!(
         translate_npx_args(&["--no-install".into(), "nonexistent-pkg".into()]),
         vec!["exec", "--no-yes", "--", "nonexistent-pkg"]
+    );
+    assert_eq!(
+        translate_npx_args(&["--no-install=false".into(), "cowsay".into()]),
+        vec!["exec", "--no-yes", "--", "cowsay"]
+    );
+    // -n removed flag (legacy --node-arg switch from npm 11.20.0)
+    assert_eq!(
+        translate_npx_args(&["-n=val".into(), "cowsay".into()]),
+        vec!["exec", "--", "cowsay"]
+    );
+    assert_eq!(
+        translate_npx_args(&["-n".into(), "val".into(), "cowsay".into()]),
+        vec!["exec", "--", "cowsay"]
     );
     assert_eq!(
         translate_npx_args(&["--yes=false".into(), "nonexistent-pkg".into()]),
@@ -521,5 +538,85 @@ fn test_compiled_npx_yes_0_rejects_without_installing() {
     assert!(
         !npx_cache.exists() || fs::read_dir(&npx_cache).unwrap().count() == 0,
         "No npx cache mutations should occur on cancel"
+    );
+}
+
+#[test]
+fn test_compiled_npx_dash_n_warns_removed_flag() {
+    let temp = tempdir().unwrap();
+    let temp_path = temp.path();
+
+    // Run npx -n nonexistent-pkg
+    let output = isolated_npx_cmd(temp_path)
+        .current_dir(temp_path)
+        .args([
+            "-n",
+            "nonexistent-pkg-w3-2-random-xyz-dash-n",
+        ])
+        .output()
+        .expect("failed to execute npx -n");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("npx: the --n argument has been removed."),
+        "stderr was: {stderr}"
+    );
+    assert!(
+        stderr.contains("See `npm help exec` for more information"),
+        "stderr was: {stderr}"
+    );
+}
+
+#[test]
+fn test_compiled_npx_dash_no_rejects_without_installing() {
+    let temp = tempdir().unwrap();
+    let temp_path = temp.path();
+    let cache_dir = temp_path.join("cache");
+    fs::create_dir_all(&cache_dir).unwrap();
+
+    // Run npx --no nonexistent-pkg
+    let output = isolated_npx_cmd(temp_path)
+        .current_dir(temp_path)
+        .args([
+            &format!("--cache={}", cache_dir.display()),
+            "--no",
+            "nonexistent-pkg-w3-2-random-xyz-dash-no",
+        ])
+        .output()
+        .expect("failed to execute npx --no");
+
+    assert!(!output.status.success());
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("npx canceled due to missing packages and no YES option"),
+        "stderr was: {stderr}"
+    );
+}
+
+#[test]
+fn test_compiled_npx_offline_flag() {
+    let temp = tempdir().unwrap();
+    let temp_path = temp.path();
+    let cache_dir = temp_path.join("cache");
+    fs::create_dir_all(&cache_dir).unwrap();
+
+    // Run npx --yes --offline nonexistent-pkg
+    let output = isolated_npx_cmd(temp_path)
+        .current_dir(temp_path)
+        .args([
+            &format!("--cache={}", cache_dir.display()),
+            "--yes",
+            "--offline",
+            "nonexistent-pkg-w3-2-random-xyz-offline",
+        ])
+        .output()
+        .expect("failed to execute npx --offline");
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("offline") || stderr.contains("ENOTCACHED"),
+        "stderr was: {stderr}"
     );
 }
