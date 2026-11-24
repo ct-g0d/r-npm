@@ -6657,3 +6657,99 @@ fn test_node_satisfies_target_alias_name_check() {
     };
     assert!(!node_satisfies_target(&node, &target_mismatched));
 }
+
+#[test]
+fn test_repro_octokit_types_hoisting() {
+    let mut provider = InMemoryPackageProvider::new();
+
+    // Versions of @octokit/types
+    provider.add_version("@octokit/types", "18.0.0", |_| {});
+    provider.add_version("@octokit/types", "13.10.0", |_| {});
+
+    // Root octokit stack (occupies root node_modules with @octokit/types@18.0.0)
+    provider.add_version("@octokit/core", "7.0.2", |v| {
+        v.dependencies.insert("@octokit/types".into(), "^18.0.0".into());
+        v.dependencies.insert("@octokit/graphql".into(), "^9.0.0".into());
+        v.dependencies.insert("@octokit/request".into(), "^10.0.0".into());
+    });
+    provider.add_version("@octokit/graphql", "9.0.1", |_| {});
+    provider.add_version("@octokit/request", "10.0.2", |v| {
+        v.dependencies.insert("@octokit/request-error".into(), "^7.0.0".into());
+        v.dependencies.insert("@octokit/endpoint".into(), "^10.0.0".into());
+    });
+    provider.add_version("@octokit/request-error", "7.0.0", |_| {});
+    provider.add_version("@octokit/endpoint", "10.0.0", |_| {});
+    provider.add_version("@octokit/plugin-paginate-rest", "13.0.1", |_| {});
+    provider.add_version("@octokit/plugin-rest-endpoint-methods", "16.0.0", |_| {});
+
+    provider.add_version("@octokit/rest", "22.0.0", |v| {
+        v.dependencies.insert("@octokit/core".into(), "^7.0.0".into());
+        v.dependencies.insert("@octokit/plugin-paginate-rest".into(), "^13.0.0".into());
+        v.dependencies.insert("@octokit/plugin-rest-endpoint-methods".into(), "^16.0.0".into());
+    });
+
+    // Nested subtree under release-please:
+    // release-please has an uninstalled devDependency on @octokit/types@^9.0.0.
+    // In npm Arborist, non-root devDependencies are never installed and never shadow.
+    // Transitive dependencies (@octokit/types@13.10.0) must hoist to the common intermediate
+    // ancestor (node_modules/release-please/node_modules/@octokit/types), rather than nesting
+    // under each of the 7 child packages.
+    provider.add_version("release-please", "17.1.1", |v| {
+        v.dependencies.insert("@octokit/rest".into(), "^20.0.0".into());
+        v.dependencies.insert("@octokit/graphql".into(), "^7.0.0".into());
+        v.dependencies.insert("@octokit/request".into(), "^8.0.0".into());
+        v.dependencies.insert("@octokit/request-error".into(), "^5.0.0".into());
+        v.dev_dependencies.insert("@octokit/types".into(), "^9.0.0".into());
+    });
+
+    provider.add_version("@octokit/rest", "20.1.1", |v| {
+        v.dependencies.insert("@octokit/core".into(), "^5.0.0".into());
+        v.dependencies.insert("@octokit/plugin-paginate-rest".into(), "^11.0.0".into());
+        v.dependencies.insert("@octokit/plugin-rest-endpoint-methods".into(), "^13.0.0".into());
+    });
+
+    provider.add_version("@octokit/graphql", "7.0.0", |v| {
+        v.dependencies.insert("@octokit/types".into(), "^13.0.0".into());
+    });
+    provider.add_version("@octokit/request", "8.0.2", |v| {
+        v.dependencies.insert("@octokit/endpoint".into(), "^9.0.0".into());
+        v.dependencies.insert("@octokit/types".into(), "^13.1.0".into());
+    });
+    provider.add_version("@octokit/request-error", "5.0.0", |v| {
+        v.dependencies.insert("@octokit/types".into(), "^13.1.0".into());
+    });
+    provider.add_version("@octokit/endpoint", "9.0.0", |v| {
+        v.dependencies.insert("@octokit/types".into(), "^13.1.0".into());
+    });
+    provider.add_version("@octokit/core", "5.0.2", |v| {
+        v.dependencies.insert("@octokit/types".into(), "^13.0.0".into());
+    });
+    provider.add_version("@octokit/plugin-paginate-rest", "11.3.1", |v| {
+        v.dependencies.insert("@octokit/types".into(), "^13.7.0".into());
+    });
+    provider.add_version("@octokit/plugin-rest-endpoint-methods", "13.2.2", |v| {
+        v.dependencies.insert("@octokit/types".into(), "^13.8.0".into());
+    });
+
+    let mut manifest = Manifest::default();
+    manifest.dependencies.insert("@octokit/rest".into(), "22.0.0".into());
+    manifest.dependencies.insert("release-please".into(), "17.1.1".into());
+
+    let options = ResolverOptions::default();
+    let graph = resolve_dependency_graph(&manifest, &provider, &options).unwrap();
+
+    let mut types_locations: Vec<_> = graph
+        .nodes
+        .keys()
+        .filter(|k| k.ends_with("@octokit/types"))
+        .cloned()
+        .collect();
+    types_locations.sort();
+    assert_eq!(
+        types_locations,
+        vec![
+            "node_modules/@octokit/types".to_string(),
+            "node_modules/release-please/node_modules/@octokit/types".to_string(),
+        ]
+    );
+}
