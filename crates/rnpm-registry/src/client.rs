@@ -301,6 +301,42 @@ impl TarballFetchResult {
     }
 }
 
+/// Scoped TLS identity configuration for a registry URI prefix.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ScopedTlsConfig {
+    pub cert: Option<String>,
+    pub key: Option<String>,
+    pub certfile: Option<PathBuf>,
+    pub keyfile: Option<PathBuf>,
+}
+
+impl ScopedTlsConfig {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn from_files(certfile: impl Into<PathBuf>, keyfile: impl Into<PathBuf>) -> Self {
+        Self {
+            cert: None,
+            key: None,
+            certfile: Some(certfile.into()),
+            keyfile: Some(keyfile.into()),
+        }
+    }
+
+    pub fn from_pem(cert: impl Into<String>, key: impl Into<String>) -> Self {
+        Self {
+            cert: Some(cert.into()),
+            key: Some(key.into()),
+            certfile: None,
+            keyfile: None,
+        }
+    }
+}
+
+/// Alias for `ScopedTlsConfig` representing a scoped TLS identity.
+pub type ScopedTlsIdentity = ScopedTlsConfig;
+
 /// Registry client configuration.
 #[derive(Debug, Clone)]
 pub struct RegistryClientConfig {
@@ -336,7 +372,10 @@ pub struct RegistryClientConfig {
     pub ca: Option<String>,
     pub cafile: Option<PathBuf>,
     pub cert: Option<String>,
+    pub certfile: Option<PathBuf>,
     pub key: Option<String>,
+    pub keyfile: Option<PathBuf>,
+    pub scoped_tls: std::collections::BTreeMap<String, ScopedTlsConfig>,
     pub strict_ssl: bool,
     pub maxsockets: Option<usize>,
 }
@@ -387,7 +426,10 @@ impl Default for RegistryClientConfig {
             ca: None,
             cafile: None,
             cert: None,
+            certfile: None,
             key: None,
+            keyfile: None,
+            scoped_tls: std::collections::BTreeMap::new(),
             strict_ssl: true,
             maxsockets: None,
         }
@@ -428,6 +470,11 @@ impl RegistryClientConfig {
             self.retry_factor,
             attempt,
         )
+    }
+
+    /// Add or update a scoped TLS configuration for a registry URI prefix.
+    pub fn add_scoped_tls(&mut self, uri_prefix: impl Into<String>, tls: ScopedTlsConfig) {
+        self.scoped_tls.insert(uri_prefix.into(), tls);
     }
 }
 
@@ -672,6 +719,330 @@ fn extract_www_authenticate(headers: &reqwest::header::HeaderMap) -> Option<Stri
     }
 }
 
+/// Helper to generate path prefixes for longest-prefix matching (e.g. `/a/b/c` -> `["/a/b/c/", "/a/b/c", "/a/b/", "/a/b", "/a/", "/a", "/", ""]`).
+pub fn generate_path_prefixes(path: &str) -> Vec<String> {
+    let mut prefixes = Vec::new();
+    let trimmed = path.trim();
+    if trimmed.is_empty() || trimmed == "/" {
+        prefixes.push("/".to_string());
+        prefixes.push(String::new());
+        return prefixes;
+    }
+
+    let norm_path = if trimmed.starts_with('/') {
+        trimmed.to_string()
+    } else {
+        format!("/{trimmed}")
+    };
+
+    let segments: Vec<&str> = norm_path.split('/').filter(|s| !s.is_empty()).collect();
+    for i in (1..=segments.len()).rev() {
+        let sub = segments[..i].join("/");
+        prefixes.push(format!("/{sub}/"));
+        prefixes.push(format!("/{sub}"));
+    }
+    prefixes.push("/".to_string());
+    prefixes.push(String::new());
+    prefixes
+}
+
+/// Helper to normalize a URI prefix into standard npm format (e.g. `//hostname/path/`).
+pub fn normalize_uri_prefix(prefix: &str) -> String {
+    let mut p = prefix.trim();
+    if let Some(rest) = p.strip_prefix("https://") {
+        p = rest;
+    } else if let Some(rest) = p.strip_prefix("http://") {
+        p = rest;
+    } else if let Some(rest) = p.strip_prefix("//") {
+        p = rest;
+    }
+
+    let (host_part, path_part) = if let Some(slash_idx) = p.find('/') {
+        (&p[..slash_idx], &p[slash_idx..])
+    } else {
+        (p, "/")
+    };
+
+    let host_lower = host_part.to_ascii_lowercase();
+    let mut normalized_path = path_part.to_string();
+    if !normalized_path.ends_with('/') {
+        normalized_path.push('/');
+    }
+
+    format!("//{host_lower}{normalized_path}")
+}
+
+/// Helper to load and parse an X.509 client certificate and private key into a reqwest Identity.
+pub fn load_tls_identity(
+    certfile: Option<&Path>,
+    cert_str: Option<&str>,
+    keyfile: Option<&Path>,
+    key_str: Option<&str>,
+) -> Result<Option<reqwest::Identity>, RegistryError> {
+    let cert_content = if let Some(path) = certfile {
+        Some(std::fs::read_to_string(path).map_err(|err| {
+            RegistryError::Other(format!("Failed to read certfile at '{}': {err}", path.display()))
+        })?)
+    } else if let Some(c) = cert_str {
+        if Path::new(c).exists() {
+            Some(std::fs::read_to_string(c).map_err(|err| {
+                RegistryError::Other(format!("Failed to read cert file '{c}': {err}"))
+            })?)
+        } else {
+            Some(c.to_string())
+        }
+    } else {
+        None
+    };
+
+    let key_content = if let Some(path) = keyfile {
+        Some(std::fs::read_to_string(path).map_err(|err| {
+            RegistryError::Other(format!("Failed to read keyfile at '{}': {err}", path.display()))
+        })?)
+    } else if let Some(k) = key_str {
+        if Path::new(k).exists() {
+            Some(std::fs::read_to_string(k).map_err(|err| {
+                RegistryError::Other(format!("Failed to read key file '{k}': {err}"))
+            })?)
+        } else {
+            Some(k.to_string())
+        }
+    } else {
+        None
+    };
+
+    match (cert_content, key_content) {
+        (Some(cert), Some(key)) => {
+            let combined_pem = format!("{}\n{}", cert.trim(), key.trim());
+            let identity = reqwest::Identity::from_pem(combined_pem.as_bytes()).map_err(|err| {
+                RegistryError::Other(format!(
+                    "Failed to parse client certificate and key into Identity: {err}"
+                ))
+            })?;
+            Ok(Some(identity))
+        }
+        (Some(_), None) => Err(RegistryError::Other(
+            "Client certificate configured without corresponding private key (both cert and key are required)".to_string(),
+        )),
+        (None, Some(_)) => Err(RegistryError::Other(
+            "Client private key configured without corresponding certificate (both cert and key are required)".to_string(),
+        )),
+        (None, None) => Ok(None),
+    }
+}
+
+/// Builds a reqwest Client configured per RegistryClientConfig, optionally with a client TLS Identity.
+pub fn build_http_client(
+    config: &RegistryClientConfig,
+    headers: &HeaderMap,
+    identity: Option<reqwest::Identity>,
+) -> Result<Client, RegistryError> {
+    let max_idle = if let Some(sockets) = config.maxsockets {
+        if sockets == 0 {
+            DEFAULT_POOL_MAX_IDLE_PER_HOST
+        } else {
+            sockets
+        }
+    } else if config.pool_max_idle_per_host == 0 {
+        DEFAULT_POOL_MAX_IDLE_PER_HOST
+    } else {
+        config.pool_max_idle_per_host
+    };
+
+    // We disable reqwest's automatic redirect following so that we can enforce
+    // the strict security rule: NEVER forward auth headers across redirects to untrusted hostnames.
+    let mut builder = Client::builder()
+        .default_headers(headers.clone())
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(config.timeout)
+        .connect_timeout(config.connect_timeout)
+        .tcp_nodelay(true)
+        .tcp_keepalive(Some(config.tcp_keepalive))
+        .pool_idle_timeout(Some(config.pool_idle_timeout))
+        .pool_max_idle_per_host(max_idle);
+
+    if !config.strict_ssl {
+        builder = builder.danger_accept_invalid_certs(true);
+    }
+
+    // Proxies follow @npmcli/agent, not reqwest's system lookup: the
+    // configured proxy, else HTTPS_PROXY for every URL (HTTP_PROXY and
+    // PROXY only for http), bypassed only by the `noproxy` setting.
+    builder = builder.no_proxy();
+    let (env_https_proxy, env_http_proxy) =
+        if config.https_proxy.is_none() && config.http_proxy.is_none() && config.proxy.is_none() {
+            let env = |name: &str| {
+                std::env::vars()
+                    .filter(|(k, _)| k.eq_ignore_ascii_case(name))
+                    .last()
+                    .map(|(_, v)| v)
+                    .filter(|v| !v.is_empty())
+            };
+            let https = env("https_proxy");
+            let http = env("http_proxy").or_else(|| env("proxy"));
+            (https, http)
+        } else {
+            (None, None)
+        };
+    if env_https_proxy.is_some() || env_http_proxy.is_some() {
+        // @npmcli/agent's isNoProxy: an entry matches when its dot
+        // segments end the hostname's; `*` and ports mean nothing.
+        let no_proxy: Vec<Vec<String>> = config
+            .no_proxy
+            .clone()
+            .filter(|v| !v.is_empty())
+            .or_else(|| {
+                std::env::vars()
+                    .filter(|(k, _)| k.eq_ignore_ascii_case("no_proxy"))
+                    .last()
+                    .map(|(_, v)| v)
+            })
+            .unwrap_or_default()
+            .split(',')
+            .map(|entry| {
+                entry
+                    .trim()
+                    .split('.')
+                    .filter(|s| !s.is_empty())
+                    .rev()
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            })
+            .filter(|segments| !segments.is_empty())
+            .collect();
+        let https = env_https_proxy.and_then(|u| reqwest::Url::parse(&u).ok());
+        let http = env_http_proxy.and_then(|u| reqwest::Url::parse(&u).ok());
+        let https_p = https.clone();
+        let http_p = http.clone();
+        let mut custom_proxy = reqwest::Proxy::custom(move |url| {
+            let host_str = url.host_str()?;
+            // Never proxy RFC 2606 / RFC 6761 special-use reserved test domains (.invalid, .test, .example, .localhost)
+            if host_str.ends_with(".invalid")
+                || host_str.ends_with(".test")
+                || host_str.ends_with(".example")
+                || host_str.ends_with(".localhost")
+                || host_str.eq_ignore_ascii_case("localhost")
+            {
+                return None;
+            }
+            let proxy = if url.scheme() == "https" { https_p.as_ref() } else { http_p.as_ref() }?;
+            let host: Vec<&str> = host_str.split('.').rev().collect();
+            let bypass = no_proxy
+                .iter()
+                .any(|entry| entry.iter().enumerate().all(|(i, s)| host.get(i) == Some(&s.as_str())));
+            (!bypass).then(|| proxy.clone())
+        });
+        if let Some(https_u) = &https {
+            if let (Some(u), Some(p)) = (Some(https_u.username()), https_u.password()) {
+                if !u.is_empty() {
+                    custom_proxy = custom_proxy.basic_auth(u, p);
+                }
+            }
+        } else if let Some(http_u) = &http {
+            if let (Some(u), Some(p)) = (Some(http_u.username()), http_u.password()) {
+                if !u.is_empty() {
+                    custom_proxy = custom_proxy.basic_auth(u, p);
+                }
+            }
+        }
+        builder = builder.proxy(custom_proxy);
+    }
+
+    if let Some(https_proxy) = &config.https_proxy {
+        let mut proxy = reqwest::Proxy::https(https_proxy).map_err(|err| {
+            RegistryError::Other(format!("Invalid https_proxy '{https_proxy}': {err}"))
+        })?;
+        if let Some(no_proxy) = &config.no_proxy {
+            proxy = proxy.no_proxy(reqwest::NoProxy::from_string(no_proxy));
+        }
+        builder = builder.proxy(proxy);
+    }
+
+    if let Some(http_proxy) = &config.http_proxy {
+        let mut proxy = reqwest::Proxy::http(http_proxy).map_err(|err| {
+            RegistryError::Other(format!("Invalid http_proxy '{http_proxy}': {err}"))
+        })?;
+        if let Some(no_proxy) = &config.no_proxy {
+            proxy = proxy.no_proxy(reqwest::NoProxy::from_string(no_proxy));
+        }
+        builder = builder.proxy(proxy);
+    }
+
+    if let Some(general_proxy) = &config.proxy {
+        if config.https_proxy.is_none() && config.http_proxy.is_none() {
+            let mut proxy = reqwest::Proxy::all(general_proxy).map_err(|err| {
+                RegistryError::Other(format!("Invalid proxy '{general_proxy}': {err}"))
+            })?;
+            if let Some(no_proxy) = &config.no_proxy {
+                proxy = proxy.no_proxy(reqwest::NoProxy::from_string(no_proxy));
+            }
+            builder = builder.proxy(proxy);
+        } else if config.http_proxy.is_none() {
+            let mut proxy = reqwest::Proxy::http(general_proxy).map_err(|err| {
+                RegistryError::Other(format!("Invalid proxy '{general_proxy}': {err}"))
+            })?;
+            if let Some(no_proxy) = &config.no_proxy {
+                proxy = proxy.no_proxy(reqwest::NoProxy::from_string(no_proxy));
+            }
+            builder = builder.proxy(proxy);
+        } else if config.https_proxy.is_none() {
+            let mut proxy = reqwest::Proxy::https(general_proxy).map_err(|err| {
+                RegistryError::Other(format!("Invalid proxy '{general_proxy}': {err}"))
+            })?;
+            if let Some(no_proxy) = &config.no_proxy {
+                proxy = proxy.no_proxy(reqwest::NoProxy::from_string(no_proxy));
+            }
+            builder = builder.proxy(proxy);
+        }
+    }
+
+    if let Some(cafile_path) = &config.cafile {
+        let pem_bytes = std::fs::read(cafile_path).map_err(|err| {
+            RegistryError::Other(format!(
+                "Failed to read cafile at '{}': {err}",
+                cafile_path.display()
+            ))
+        })?;
+        let certs = reqwest::Certificate::from_pem_bundle(&pem_bytes).unwrap_or_default();
+        if certs.is_empty() {
+            return Err(RegistryError::Other(format!(
+                "No PEM certificates found in cafile '{}'",
+                cafile_path.display()
+            )));
+        }
+        for cert in certs {
+            builder = builder.add_root_certificate(cert);
+        }
+    }
+
+    if let Some(ca_content_or_path) = &config.ca {
+        let pem_bytes = if Path::new(ca_content_or_path).exists() {
+            std::fs::read(ca_content_or_path).map_err(|err| {
+                RegistryError::Other(format!(
+                    "Failed to read CA path '{ca_content_or_path}': {err}"
+                ))
+            })?
+        } else {
+            ca_content_or_path.as_bytes().to_vec()
+        };
+        let certs = reqwest::Certificate::from_pem_bundle(&pem_bytes).unwrap_or_default();
+        if certs.is_empty() {
+            return Err(RegistryError::Other(
+                "No PEM certificates found in ca configuration".to_string(),
+            ));
+        }
+        for cert in certs {
+            builder = builder.add_root_certificate(cert);
+        }
+    }
+
+    if let Some(identity) = identity {
+        builder = builder.identity(identity);
+    }
+
+    builder.build().map_err(RegistryError::from)
+}
+
 /// Client for interacting with npm package registries.
 #[derive(Clone)]
 pub struct RegistryClient {
@@ -682,6 +1053,8 @@ pub struct RegistryClient {
     circuit_breaker: CircuitBreaker,
     http_requests: std::sync::Arc<std::sync::atomic::AtomicU64>,
     http_304s: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    scoped_clients: std::collections::BTreeMap<String, Client>,
+    global_client: Option<Client>,
 }
 
 impl RegistryClient {
@@ -708,232 +1081,44 @@ impl RegistryClient {
         }
         headers.insert(CONNECTION, HeaderValue::from_static("keep-alive"));
 
-        let max_idle = if let Some(sockets) = config.maxsockets {
-            if sockets == 0 {
-                DEFAULT_POOL_MAX_IDLE_PER_HOST
-            } else {
-                sockets
-            }
-        } else if config.pool_max_idle_per_host == 0 {
-            DEFAULT_POOL_MAX_IDLE_PER_HOST
+        // Load and validate global identity upfront
+        let global_identity = load_tls_identity(
+            config.certfile.as_deref(),
+            config.cert.as_deref(),
+            config.keyfile.as_deref(),
+            config.key.as_deref(),
+        )?;
+
+        // Build base unauthenticated client
+        let client = build_http_client(&config, &headers, None)?;
+
+        // Build global client if global identity configured
+        let global_client = if let Some(id) = global_identity {
+            Some(build_http_client(&config, &headers, Some(id))?)
         } else {
-            config.pool_max_idle_per_host
+            None
         };
 
-        // We disable reqwest's automatic redirect following so that we can enforce
-        // the strict security rule: NEVER forward auth headers across redirects to untrusted hostnames.
-        let mut builder = Client::builder()
-            .default_headers(headers)
-            .redirect(reqwest::redirect::Policy::none())
-            .timeout(config.timeout)
-            .connect_timeout(config.connect_timeout)
-            .tcp_nodelay(true)
-            .tcp_keepalive(Some(config.tcp_keepalive))
-            .pool_idle_timeout(Some(config.pool_idle_timeout))
-            .pool_max_idle_per_host(max_idle);
+        // Load and build scoped clients
+        let mut scoped_clients = std::collections::BTreeMap::new();
+        for (prefix, scoped_cfg) in &config.scoped_tls {
+            let certfile = scoped_cfg.certfile.as_deref().or(config.certfile.as_deref());
+            let cert = scoped_cfg.cert.as_deref().or(config.cert.as_deref());
+            let keyfile = scoped_cfg.keyfile.as_deref().or(config.keyfile.as_deref());
+            let key = scoped_cfg.key.as_deref().or(config.key.as_deref());
 
-        if !config.strict_ssl {
-            builder = builder.danger_accept_invalid_certs(true);
-        }
-
-        // Proxies follow @npmcli/agent, not reqwest's system lookup: the
-        // configured proxy, else HTTPS_PROXY for every URL (HTTP_PROXY and
-        // PROXY only for http), bypassed only by the `noproxy` setting.
-        builder = builder.no_proxy();
-        let (env_https_proxy, env_http_proxy) =
-            if config.https_proxy.is_none() && config.http_proxy.is_none() && config.proxy.is_none() {
-                let env = |name: &str| {
-                    std::env::vars()
-                        .filter(|(k, _)| k.eq_ignore_ascii_case(name))
-                        .last()
-                        .map(|(_, v)| v)
-                        .filter(|v| !v.is_empty())
-                };
-                let https = env("https_proxy");
-                let http = env("http_proxy").or_else(|| env("proxy"));
-                (https, http)
-            } else {
-                (None, None)
-            };
-        if env_https_proxy.is_some() || env_http_proxy.is_some() {
-            // @npmcli/agent's isNoProxy: an entry matches when its dot
-            // segments end the hostname's; `*` and ports mean nothing.
-            let no_proxy: Vec<Vec<String>> = config
-                .no_proxy
-                .clone()
-                .filter(|v| !v.is_empty())
-                .or_else(|| {
-                    std::env::vars()
-                        .filter(|(k, _)| k.eq_ignore_ascii_case("no_proxy"))
-                        .last()
-                        .map(|(_, v)| v)
-                })
-                .unwrap_or_default()
-                .split(',')
-                .map(|entry| {
-                    entry
-                        .trim()
-                        .split('.')
-                        .filter(|s| !s.is_empty())
-                        .rev()
-                        .map(str::to_string)
-                        .collect::<Vec<_>>()
-                })
-                .filter(|segments| !segments.is_empty())
-                .collect();
-            let https = env_https_proxy.and_then(|u| reqwest::Url::parse(&u).ok());
-            let http = env_http_proxy.and_then(|u| reqwest::Url::parse(&u).ok());
-            let https_p = https.clone();
-            let http_p = http.clone();
-            let mut custom_proxy = reqwest::Proxy::custom(move |url| {
-                let host_str = url.host_str()?;
-                // Never proxy RFC 2606 / RFC 6761 special-use reserved test domains (.invalid, .test, .example, .localhost)
-                if host_str.ends_with(".invalid")
-                    || host_str.ends_with(".test")
-                    || host_str.ends_with(".example")
-                    || host_str.ends_with(".localhost")
-                    || host_str.eq_ignore_ascii_case("localhost")
-                {
-                    return None;
+            let scoped_identity = load_tls_identity(certfile, cert, keyfile, key)?;
+            if let Some(id) = scoped_identity {
+                let scoped_client = build_http_client(&config, &headers, Some(id))?;
+                let norm = normalize_uri_prefix(prefix);
+                scoped_clients.insert(norm.clone(), scoped_client.clone());
+                if norm.ends_with('/') {
+                    let no_slash = norm.trim_end_matches('/').to_string();
+                    scoped_clients.insert(no_slash, scoped_client.clone());
                 }
-                let proxy = if url.scheme() == "https" { https_p.as_ref() } else { http_p.as_ref() }?;
-                let host: Vec<&str> = host_str.split('.').rev().collect();
-                let bypass = no_proxy
-                    .iter()
-                    .any(|entry| entry.iter().enumerate().all(|(i, s)| host.get(i) == Some(&s.as_str())));
-                (!bypass).then(|| proxy.clone())
-            });
-            if let Some(https_u) = &https {
-                if let (Some(u), Some(p)) = (Some(https_u.username()), https_u.password()) {
-                    if !u.is_empty() {
-                        custom_proxy = custom_proxy.basic_auth(u, p);
-                    }
-                }
-            } else if let Some(http_u) = &http {
-                if let (Some(u), Some(p)) = (Some(http_u.username()), http_u.password()) {
-                    if !u.is_empty() {
-                        custom_proxy = custom_proxy.basic_auth(u, p);
-                    }
-                }
-            }
-            builder = builder.proxy(custom_proxy);
-        }
-
-        if let Some(https_proxy) = &config.https_proxy {
-            let mut proxy = reqwest::Proxy::https(https_proxy).map_err(|err| {
-                RegistryError::Other(format!("Invalid https_proxy '{https_proxy}': {err}"))
-            })?;
-            if let Some(no_proxy) = &config.no_proxy {
-                proxy = proxy.no_proxy(reqwest::NoProxy::from_string(no_proxy));
-            }
-            builder = builder.proxy(proxy);
-        }
-
-        if let Some(http_proxy) = &config.http_proxy {
-            let mut proxy = reqwest::Proxy::http(http_proxy).map_err(|err| {
-                RegistryError::Other(format!("Invalid http_proxy '{http_proxy}': {err}"))
-            })?;
-            if let Some(no_proxy) = &config.no_proxy {
-                proxy = proxy.no_proxy(reqwest::NoProxy::from_string(no_proxy));
-            }
-            builder = builder.proxy(proxy);
-        }
-
-        if let Some(general_proxy) = &config.proxy {
-            if config.https_proxy.is_none() && config.http_proxy.is_none() {
-                let mut proxy = reqwest::Proxy::all(general_proxy).map_err(|err| {
-                    RegistryError::Other(format!("Invalid proxy '{general_proxy}': {err}"))
-                })?;
-                if let Some(no_proxy) = &config.no_proxy {
-                    proxy = proxy.no_proxy(reqwest::NoProxy::from_string(no_proxy));
-                }
-                builder = builder.proxy(proxy);
-            } else if config.http_proxy.is_none() {
-                let mut proxy = reqwest::Proxy::http(general_proxy).map_err(|err| {
-                    RegistryError::Other(format!("Invalid proxy '{general_proxy}': {err}"))
-                })?;
-                if let Some(no_proxy) = &config.no_proxy {
-                    proxy = proxy.no_proxy(reqwest::NoProxy::from_string(no_proxy));
-                }
-                builder = builder.proxy(proxy);
-            } else if config.https_proxy.is_none() {
-                let mut proxy = reqwest::Proxy::https(general_proxy).map_err(|err| {
-                    RegistryError::Other(format!("Invalid proxy '{general_proxy}': {err}"))
-                })?;
-                if let Some(no_proxy) = &config.no_proxy {
-                    proxy = proxy.no_proxy(reqwest::NoProxy::from_string(no_proxy));
-                }
-                builder = builder.proxy(proxy);
+                scoped_clients.insert(prefix.clone(), scoped_client);
             }
         }
-
-        if let Some(cafile_path) = &config.cafile {
-            let pem_bytes = std::fs::read(cafile_path).map_err(|err| {
-                RegistryError::Other(format!(
-                    "Failed to read cafile at '{}': {err}",
-                    cafile_path.display()
-                ))
-            })?;
-            let certs = reqwest::Certificate::from_pem_bundle(&pem_bytes).unwrap_or_default();
-            if certs.is_empty() {
-                return Err(RegistryError::Other(format!(
-                    "No PEM certificates found in cafile '{}'",
-                    cafile_path.display()
-                )));
-            }
-            for cert in certs {
-                builder = builder.add_root_certificate(cert);
-            }
-        }
-
-        if let Some(ca_content_or_path) = &config.ca {
-            let pem_bytes = if Path::new(ca_content_or_path).exists() {
-                std::fs::read(ca_content_or_path).map_err(|err| {
-                    RegistryError::Other(format!(
-                        "Failed to read CA path '{ca_content_or_path}': {err}"
-                    ))
-                })?
-            } else {
-                ca_content_or_path.as_bytes().to_vec()
-            };
-            let certs = reqwest::Certificate::from_pem_bundle(&pem_bytes).unwrap_or_default();
-            if certs.is_empty() {
-                return Err(RegistryError::Other(
-                    "No PEM certificates found in ca configuration".to_string(),
-                ));
-            }
-            for cert in certs {
-                builder = builder.add_root_certificate(cert);
-            }
-        }
-
-        if let (Some(cert_str), Some(key_str)) = (&config.cert, &config.key) {
-            let cert_content = if Path::new(cert_str).exists() {
-                std::fs::read_to_string(cert_str).map_err(|err| {
-                    RegistryError::Other(format!("Failed to read cert file '{cert_str}': {err}"))
-                })?
-            } else {
-                cert_str.clone()
-            };
-
-            let key_content = if Path::new(key_str).exists() {
-                std::fs::read_to_string(key_str).map_err(|err| {
-                    RegistryError::Other(format!("Failed to read key file '{key_str}': {err}"))
-                })?
-            } else {
-                key_str.clone()
-            };
-
-            let combined_pem = format!("{}\n{}", cert_content.trim(), key_content.trim());
-            let identity = reqwest::Identity::from_pem(combined_pem.as_bytes()).map_err(|err| {
-                RegistryError::Other(format!(
-                    "Failed to parse client certificate and key into Identity: {err}"
-                ))
-            })?;
-            builder = builder.identity(identity);
-        }
-
-        let client = builder.build()?;
 
         let max_concurrency = if let Some(sockets) = config.maxsockets {
             if sockets == 0 {
@@ -964,6 +1149,8 @@ impl RegistryClient {
             circuit_breaker,
             http_requests: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             http_304s: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            scoped_clients,
+            global_client,
         })
     }
 
@@ -1075,6 +1262,27 @@ impl RegistryClient {
                 {
                     return true;
                 }
+            }
+        }
+
+        for prefix in self.config.scoped_tls.keys() {
+            let norm = normalize_uri_prefix(prefix);
+            let trimmed = norm.trim_start_matches('/');
+            let host_part = if let Some(slash_idx) = trimmed.find('/') {
+                &trimmed[..slash_idx]
+            } else {
+                trimmed
+            };
+            if let Some((shost, sport)) = host_part.split_once(':') {
+                if shost.eq_ignore_ascii_case(&host) {
+                    if let Ok(p) = sport.parse::<u16>() {
+                        if url.port_or_known_default() == Some(p) {
+                            return true;
+                        }
+                    }
+                }
+            } else if host_part.eq_ignore_ascii_case(&host) {
+                return true;
             }
         }
 
@@ -1191,6 +1399,15 @@ impl RegistryClient {
         Url::parse(&url_str).map_err(RegistryError::UrlParse)
     }
 
+    /// Check whether two URLs share the exact same origin (scheme, host, and port).
+    pub fn is_same_origin(&self, a: &Url, b: &Url) -> bool {
+        a.scheme() == b.scheme()
+            && a.host_str().is_some()
+            && a.host_str().map(|s| s.to_ascii_lowercase())
+                == b.host_str().map(|s| s.to_ascii_lowercase())
+            && a.port_or_known_default() == b.port_or_known_default()
+    }
+
     /// Check if target URL is trusted to receive authorization headers.
     /// When following redirects or downloading tarballs, never forward registry auth token
     /// to untrusted cross-origin hosts.
@@ -1200,10 +1417,24 @@ impl RegistryClient {
             None => return false,
         };
 
-        // If explicitly defined in auth_tokens map for this URL, that specific host token is allowed
+        // Never forward authorization headers across an HTTPS -> HTTP downgrade!
+        if initial_url.scheme() == "https" && current_url.scheme() == "http" {
+            return false;
+        }
+
+        // If explicitly defined in auth_tokens or basic_auths map for this URL, that specific host token is allowed
         let has_explicit_token = {
             let port_part = if let Some(port) = current_url.port() {
                 format!(":{port}")
+            } else {
+                String::new()
+            };
+            let default_port_part = if port_part.is_empty() {
+                if let Some(port) = current_url.port_or_known_default() {
+                    format!(":{port}")
+                } else {
+                    String::new()
+                }
             } else {
                 String::new()
             };
@@ -1226,12 +1457,20 @@ impl RegistryClient {
                     .contains_key(&format!("//{host}{port_part}/"))
                 || (!port_part.is_empty()
                     && self.config.auth_tokens.contains_key(&format!("//{host}/")))
+                || (!default_port_part.is_empty()
+                    && (self.config.auth_tokens.contains_key(&format!("//{host}{default_port_part}{normalized_path}"))
+                        || self.config.auth_tokens.contains_key(&format!("//{host}{default_port_part}/"))))
+                || self
+                    .config
+                    .basic_auths
+                    .contains_key(&format!("//{host}{port_part}{normalized_path}"))
+                || self
+                    .config
+                    .basic_auths
+                    .contains_key(&format!("//{host}{port_part}/"))
+                || (!default_port_part.is_empty()
+                    && self.config.basic_auths.contains_key(&format!("//{host}{default_port_part}/")))
         };
-
-        // Never forward authorization headers across an HTTPS -> HTTP downgrade!
-        if initial_url.scheme() == "https" && current_url.scheme() == "http" {
-            return false;
-        }
 
         if has_explicit_token {
             return true;
@@ -1242,12 +1481,7 @@ impl RegistryClient {
             return false;
         }
 
-        let same_origin = initial_url.scheme() == current_url.scheme()
-            && initial_url.host_str().map(|s| s.to_ascii_lowercase())
-                == current_url.host_str().map(|s| s.to_ascii_lowercase())
-            && initial_url.port_or_known_default() == current_url.port_or_known_default();
-
-        if same_origin {
+        if self.is_same_origin(initial_url, current_url) {
             return true;
         }
 
@@ -1269,6 +1503,111 @@ impl RegistryClient {
         }
 
         false
+    }
+
+    /// Returns the appropriate `reqwest::Client` for a target URL:
+    /// - If the URL matches a configured scoped TLS identity (longest prefix first), the client
+    ///   configured with that scoped identity is returned.
+    /// - Otherwise, if a global TLS identity is configured and the host is trusted, the client
+    ///   configured with the global identity is returned.
+    /// - Otherwise, the unauthenticated client (no client certificate) is returned.
+    pub fn client_for_url(&self, url: &Url) -> &Client {
+        if self.scoped_clients.is_empty() && self.global_client.is_none() {
+            return &self.client;
+        }
+
+        if let Some(client) = self.match_scoped_client(url) {
+            return client;
+        }
+
+        if let Some(ref client) = self.global_client {
+            if self.is_trusted_host(url) {
+                return client;
+            }
+        }
+
+        &self.client
+    }
+
+    /// Match a target URL against scoped TLS identities using longest-prefix-first precedence.
+    pub fn match_scoped_client(&self, url: &Url) -> Option<&Client> {
+        if self.scoped_clients.is_empty() {
+            return None;
+        }
+
+        let host = url.host_str()?;
+        let host_lower = host.to_ascii_lowercase();
+        let port_part = if let Some(port) = url.port() {
+            format!(":{port}")
+        } else {
+            String::new()
+        };
+        let default_port_part = if port_part.is_empty() {
+            if let Some(port) = url.port_or_known_default() {
+                format!(":{port}")
+            } else {
+                String::new()
+            }
+        } else {
+            String::new()
+        };
+
+        let path = url.path();
+        let prefixes = generate_path_prefixes(path);
+
+        for prefix in &prefixes {
+            if !port_part.is_empty() {
+                let cand1 = format!("//{host_lower}{port_part}{prefix}");
+                if let Some(client) = self.scoped_clients.get(&cand1) {
+                    return Some(client);
+                }
+                if prefix.ends_with('/') {
+                    let no_slash = &prefix[..prefix.len() - 1];
+                    let cand1_no_slash = format!("//{host_lower}{port_part}{no_slash}");
+                    if let Some(client) = self.scoped_clients.get(&cand1_no_slash) {
+                        return Some(client);
+                    }
+                }
+            }
+
+            if !default_port_part.is_empty() {
+                let cand_def = format!("//{host_lower}{default_port_part}{prefix}");
+                if let Some(client) = self.scoped_clients.get(&cand_def) {
+                    return Some(client);
+                }
+                if prefix.ends_with('/') {
+                    let no_slash = &prefix[..prefix.len() - 1];
+                    let cand_def_no_slash = format!("//{host_lower}{default_port_part}{no_slash}");
+                    if let Some(client) = self.scoped_clients.get(&cand_def_no_slash) {
+                        return Some(client);
+                    }
+                }
+            }
+
+            let cand2 = format!("//{host_lower}{prefix}");
+            if let Some(client) = self.scoped_clients.get(&cand2) {
+                return Some(client);
+            }
+            if prefix.ends_with('/') {
+                let no_slash = &prefix[..prefix.len() - 1];
+                let cand3 = format!("//{host_lower}{no_slash}");
+                if let Some(client) = self.scoped_clients.get(&cand3) {
+                    return Some(client);
+                }
+            }
+        }
+
+        None
+    }
+
+    /// Check whether a scoped TLS client matches the target URL.
+    pub fn has_scoped_tls_for_url(&self, url: &Url) -> bool {
+        self.match_scoped_client(url).is_some()
+    }
+
+    /// Check whether a global TLS identity client is configured.
+    pub fn has_global_tls(&self) -> bool {
+        self.global_client.is_some()
     }
 
     /// Execute a request under semaphore permit with redirect security and retry backoff.
@@ -1344,8 +1683,8 @@ impl RegistryClient {
             seen_redirect_urls.insert(current_url.clone());
 
             let response_result: Result<Response, RegistryError> = loop {
-                let mut req = self
-                    .client
+                let client = self.client_for_url(&current_url);
+                let mut req = client
                     .request(current_method.clone(), current_url.clone())
                     .header(USER_AGENT, self.user_agent.clone());
 
@@ -1595,8 +1934,8 @@ impl RegistryClient {
             seen_redirect_urls.insert(current_url.clone());
 
             let response_result: Result<Response, RegistryError> = loop {
-                let mut req = self
-                    .client
+                let client = self.client_for_url(&current_url);
+                let mut req = client
                     .request(current_method.clone(), current_url.clone())
                     .header(USER_AGENT, self.user_agent.clone());
 
@@ -1611,10 +1950,7 @@ impl RegistryClient {
                 // Security check: only send auth headers if the target is trusted (same origin or in trusted_hosts),
                 // and ONLY send npm-otp to the exact initial origin (an OTP belongs strictly to the origin it was issued for).
                 let should_send_auth = self.is_trusted_target(&initial_url, &current_url);
-                let is_same_origin = initial_url.scheme() == current_url.scheme()
-                    && initial_url.host_str().map(|s| s.to_ascii_lowercase())
-                        == current_url.host_str().map(|s| s.to_ascii_lowercase())
-                    && initial_url.port_or_known_default() == current_url.port_or_known_default();
+                let is_same_origin = self.is_same_origin(&initial_url, &current_url);
 
                 if should_send_auth {
                     if let Some(auth) = self.auth_header_for_url(&current_url) {
@@ -4487,5 +4823,476 @@ mod tests {
         assert!(target_req.starts_with("GET /dest"));
         // OTP must be stripped on redirect to different port/untrusted target
         assert!(!target_req.to_ascii_lowercase().contains("npm-otp"));
+    }
+
+    const TEST_CERT_PEM_1: &str = "-----BEGIN CERTIFICATE-----\n\
+MIIDEzCCAfugAwIBAgIUQgC/5PP3O/WJ6mrMKuoYAkZMlrowDQYJKoZIhvcNAQEL\n\
+BQAwGTEXMBUGA1UEAwwOcmVnaXN0cnkxLnRlc3QwHhcNMjYxMTI0MTE0NDA1WhcN\n\
+MjcxMTI0MTE0NDA1WjAZMRcwFQYDVQQDDA5yZWdpc3RyeTEudGVzdDCCASIwDQYJ\n\
+KoZIhvcNAQEBBQADggEPADCCAQoCggEBAJVrlXj6Jmov7G53BUkWN6paLX4Lq7yh\n\
+FUDiXo/YVyqPBF0yDQuqzBetd1XnUWhEHzYKfvdrEPvvEAJzKVkIMY2cGoC3v7dN\n\
+oRAQ3QuaLa9NdclXw929J1qBxaoJkuTNO/lI2XtuSHmDX3ng3v7M/yPDgK+tW0s7\n\
+rgn6FwlIRElfmW/pNicfycHJajc27tjTtFypJlQE/S05Ox4z8O+05LABZrpYF5DG\n\
+c0ARjazoB1cD9iqXhKRz336ctqqqaVXGDLU8G7/3YITYVjPyCir8pZPcLt36BWha\n\
+zgDvb/M+NarY8CI6IIrATA0cyzDkMxopVw8yLKb6WA5y3m5hZeuK67ECAwEAAaNT\n\
+MFEwHQYDVR0OBBYEFAizmC3Yhf+GWuEXGBL456WoCzYBMB8GA1UdIwQYMBaAFAiz\n\
+mC3Yhf+GWuEXGBL456WoCzYBMA8GA1UdEwEB/wQFMAMBAf8wDQYJKoZIhvcNAQEL\n\
+BQADggEBAFAD12y8iEUuV02v7PpkGjzOewPFzlhyDga/IT2QUbpYnNqOOhyGn1UJ\n\
+qzFca6SUaXPC/C1HsftFPr0HwHMo/XWmp6zjgrRefPVuM9fbfLwOOSv3Vw98UBW6\n\
+emVX+nFx65DjAJYDqWa32I5S/IBb1giDo5FU6RF5z7Fhzbq2HCnP58SkNqZxv2Za\n\
+iE6xGS5IhEXOsUs78y8Cbf1uhBDqdVsGuzI5K1/ejj4hYdnjL1XAkW8X+zQgWl6w\n\
+4nZoAl7lkSNnZBNf+aGcwucgxOkQ/VCvVmViY18UJAsBmuY93XKHMyMumVG7owz9\n\
+JuHO29V5bQS8RfMxU87PjWqfy8gvcKk=\n\
+-----END CERTIFICATE-----\n";
+
+    const TEST_KEY_PEM_1: &str = "-----BEGIN PRIVATE KEY-----\n\
+MIIEvwIBADANBgkqhkiG9w0BAQEFAASCBKkwggSlAgEAAoIBAQCVa5V4+iZqL+xu\n\
+dwVJFjeqWi1+C6u8oRVA4l6P2FcqjwRdMg0LqswXrXdV51FoRB82Cn73axD77xAC\n\
+cylZCDGNnBqAt7+3TaEQEN0Lmi2vTXXJV8PdvSdagcWqCZLkzTv5SNl7bkh5g195\n\
+4N7+zP8jw4CvrVtLO64J+hcJSERJX5lv6TYnH8nByWo3Nu7Y07RcqSZUBP0tOTse\n\
+M/DvtOSwAWa6WBeQxnNAEY2s6AdXA/Yql4Skc99+nLaqqmlVxgy1PBu/92CE2FYz\n\
+8goq/KWT3C7d+gVoWs4A72/zPjWq2PAiOiCKwEwNHMsw5DMaKVcPMiym+lgOct5u\n\
+YWXriuuxAgMBAAECggEAGFcM44beRJx3Z3w4bnIx0ax8biSxDlpwJ6BodoavllVz\n\
+SMorMVwagH3nq2Tx0CoOqoM1sRCuFNgZ08hWMzRgPBjygUbNcmrxIniYxXfRWtXj\n\
+qs+C7sdOFpJ+tEb4eJCNJTvOf6qUoES8BBLTSI70veruNs/mx//aBzKH16F/zDLI\n\
+VxJrbq6zmsYDnzug9qfvSq4TCQpg7D7lpMHhrnmIGSf7Kip7VkX+Gjy8/qyXgk5c\n\
+6xQC/xaPLOrBATuQ/DDBI0QGozbO0o+qV4L436LyemwIsc/0VjvxqZMYGDUsFe8b\n\
+/vbVl+u3bxgWPgeUL0SDoisiMpfdCGJ/x3u8A37DBQKBgQDTT22ij44lfVN/Lr9d\n\
+42p3y8E+I2gEZo3s7zDXFFdgyGiwBjAdaCebh+lomIxnxhleePjiJ1vL9o19wrQr\n\
+bEJk2kOdvT2Mwi0dNu7t1OOVnzyA9W6+UbzVaCG99Hnl7cAsa8mS+zdaWrJ2vimC\n\
+kbzRZNQdqjcjE81pQUXEOrLVPQKBgQC1BVyQmSFf16Be1ibh2li4zrdqRTa0q8rY\n\
+4kJFSxlZ/vBSRhMK/gHBYgOVGKLcvARJi7i8FZ7uXqR2CU9Ngr55yLrzceP59ol2\n\
+MSRougZtbNO8d7j5I2Eks206Nb7hClYWhLQ+9iRiHJvBdmiN7Axdy4lpLNQAanfk\n\
+gHd0morfhQKBgQCLgV3NO99JiuMMDU3T62cH7eIHZxKuDRLYANYKuOgzAjxzMbKk\n\
+R3YWrXUAU+4mONfY0h7mF7v3/S9OfrO6E0AGGz8WrbAr9KoaJoE5TRpvVnB4ZxCU\n\
+35u+fIACS5wKm5sK+KJcwjO6GDTIRiVbiWHSEDIl35GFO/aZ7bjkoygbtQKBgQCX\n\
+MV044M2BUYX+7/sV1NsZsH59YkXo7TvFnmUfnzQTeN2cui6ZlcI9lPHNDACrQNaL\n\
+3wly/tP54E6Yz/nOkY8qBMAxKUTyuDnj3/O7DPTlXGoVFiIG5Mf0cXCfl9hP+eQh\n\
+dsFdfRSyZZaqJY36S9egV6nzkJ+ZoVN2JN6hI5suSQKBgQDHGzsN0Q06qDpvhf63\n\
+YKnpA15ce2/TmSCx0B7MZPxV71eapUTHbq/6NSyxPKEq3+eB36Pbe/MXKXhfisWm\n\
+mKvCKFIq7VLWb4r2VkeVPb+HAylIf9ajEpzmXrKrN+20mHbC5EyWhcPIb3bmuh3w\n\
+AD1kT35hNx5FOcjfcnVOjyV9fA==\n\
+-----END PRIVATE KEY-----\n";
+
+    const TEST_CERT_PEM_2: &str = "-----BEGIN CERTIFICATE-----\n\
+MIIDEzCCAfugAwIBAgIUP5YU7kvsEybJhzpee+A3wZ+CdBwwDQYJKoZIhvcNAQEL\n\
+BQAwGTEXMBUGA1UEAwwOcmVnaXN0cnkyLnRlc3QwHhcNMjYxMTI0MTE0NDExWhcN\n\
+MjcxMTI0MTE0NDExWjAZMRcwFQYDVQQDDA5yZWdpc3RyeTIudGVzdDCCASIwDQYJ\n\
+KoZIhvcNAQEBBQADggEPADCCAQoCggEBALkDvL1bGGwd9SvjUGe+W/gCpmye8eGo\n\
+mlu9QfHHiGfSO+pHEAJeX7wE4l1hfgEke1Z8QcD5NqpnmasciBq3GtmbjpYXGi39\n\
+KJ/oXO/ADEUkgeyeQpAZZpPOx6dBKj0xrJLxFYS5PLR36NBE7S9/VCXUufZkwJtr\n\
+br79POwadzjB1i+g8mNCp4hSWMjFL+kpPpsiLvXu6vtWR383EnIvQ6U1AybsNuRK\n\
+taEdVUTy6jbXNx5NJqP1LjbE/G6qHZDOmVJ+7VVyqqbZraUYFwjRO900R6P2tp0I\n\
+SuGJw2c2CkyuUARFiIXCnVZ2pLPRwjMsRBUtXHH93Tww3Rpe5x6SNj8CAwEAAaNT\n\
+MFEwHQYDVR0OBBYEFGZSaURlakmy2Rg/LCGVviqXkTWiMB8GA1UdIwQYMBaAFGZS\n\
+aURlakmy2Rg/LCGVviqXkTWiMA8GA1UdEwEB/wQFMAMBAf8wDQYJKoZIhvcNAQEL\n\
+BQADggEBAFSx4Df2KpQn6tujaA43G0dGT5xNkCUS4NatdW/4ZJHO7zgKU+VtBc56\n\
+GcxBYATSCU1blp6SnNP/CiIVA+AToHLqOHBKodGmoW3CIMvhyxpwR8Zj95x34fL7\n\
+aHejP1RXfyuEq96zGh8pFAJyKnv2ofGx4YjPO1ijZcIcbWRVKerbZ3ExJHDqF3a+\n\
++9AHmOdOy+cQsGtuCgv6JBtXMAr2ECHIXIdL983XS9nzsvd/8Hbz1P8iEx7AqL2d\n\
+4Zefva868DK44w7qH0UNuRgD5g5y5s4GB7GzN3Ob+8W8IuwLG9DV9tSvc+JxCVB4\n\
+xEH8MefZ9kceFJbS8SRtPgqKrGkk73A=\n\
+-----END CERTIFICATE-----\n";
+
+    const TEST_KEY_PEM_2: &str = "-----BEGIN PRIVATE KEY-----\n\
+MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQC5A7y9WxhsHfUr\n\
+41Bnvlv4AqZsnvHhqJpbvUHxx4hn0jvqRxACXl+8BOJdYX4BJHtWfEHA+TaqZ5mr\n\
+HIgatxrZm46WFxot/Sif6FzvwAxFJIHsnkKQGWaTzsenQSo9MayS8RWEuTy0d+jQ\n\
+RO0vf1Ql1Ln2ZMCba26+/TzsGnc4wdYvoPJjQqeIUljIxS/pKT6bIi717ur7Vkd/\n\
+NxJyL0OlNQMm7DbkSrWhHVVE8uo21zceTSaj9S42xPxuqh2QzplSfu1Vcqqm2a2l\n\
+GBcI0TvdNEej9radCErhicNnNgpMrlAERYiFwp1WdqSz0cIzLEQVLVxx/d08MN0a\n\
+XucekjY/AgMBAAECggEAMQhBBmv0gn7EAZAaOIxWAlntcj8Depr84ZA8QE/xohYw\n\
+48tWflI1i/Y9aaMTSkk5WLfQk0xYxPt02cjTd0UMnBwiQzu3J/X+RLbHnpBmkBJ3\n\
+Tla47EiXC1gTSIu4HoSiKEU1Pzn6URewPzXtKBfWHLqOWDLmaqojrQEfGrF+5C7i\n\
+5IDkGFtRNmvI2XN6AECh0vCiJuwHCEPImccEVazKxy95iAPjmFAqZ4YehekhbCPK\n\
+H9OZVYueM57iwomxOlF/pS2XFhvZX3g4akFOBqHbK4dUwEVgOED+fG00s/Vz8VUT\n\
+Lb9NK/YS+feF8q49jStmGRg+5Tf27+f3/pkSpWsl1QKBgQDwCfVTFxodvKeKVbaU\n\
+HMknObqjLIm+ZWPPLYi7H5N6iygI8fkqhr+3/99+2W4dhoh6vXFYCSPhLk58r03G\n\
+KtTdnEOAb0LeOsYBZ64SEeBceKl/L69rc1NW5LooZVmClKk1WRsZsum4kpHnjnV1\n\
+NcPh7hp2E1Abvbvkg5xqh4/gFQKBgQDFUSHrLAF8QuiNiLJsE46V3W3eK92yxKxs\n\
+Xzekxmf8ITAr88QSi6py2VMIM54aIewrimfOYayFzE2TuG0zA5/ADMrwNXpV5+pQ\n\
+4ssj2g+Zg+ot37+Ym9o3yiRGDgMAUbTmZA5gttbB4GoDWo1QHa4kBONlKllMFRgf\n\
+Q5AF4we+AwKBgAhXADwL0G96D4Qh6D8LJP4E5nQm5v5DfY1EMrz1ouUeEp0E8zhE\n\
+CEM3U6ePnGDQPMuu61I4txNqzXVNjfE1qcGtXTcIJpWcCycfWA/uqRHta04s9PZR\n\
+wnKBbepbYxnDWoGs/+ELs00jYoheDbytyol+AVNa5mygUffljriwzxHlAoGAa7wD\n\
+wArz+Kvzm6uid74p4QvYvDDJSJ1342gN0qr+Bbz9N1JOoS2e8DxWyKieT3hsIc3d\n\
+JeNQtnE5fkl5XhxBcjPJ7mPUmukYl/dsoPOkBtbu2wNK8oFOIZ3+Nj3aR6dVFWJW\n\
+M1pBYfQtDg24EKFT/piorAj2XsM5u4BBN+WgyY8CgYEArREl99NSOJqmCIz4xCOH\n\
+ab8Zf9Di7tJEFp6itPl9I3rOpV+RqqONcapw/jPeZsbGbsbgStX50b52hMbllfS1\n\
+nB99xJBcpcklOhB/x8L3Vb9kw8ZPzUvYKI7lj0+yjYJannulkI7H7LB4hxKnVKp5\n\
+/zgIzR6sWiCxqCSZSdAKj4w=\n\
+-----END PRIVATE KEY-----\n";
+
+    #[tokio::test]
+    async fn test_cross_origin_redirect_drops_otp_even_when_destination_trusted_and_has_token() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener_target = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_port = listener_target.local_addr().unwrap().port();
+
+        let listener_src = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let src_port = listener_src.local_addr().unwrap().port();
+
+        // Server 1 (source): redirects to Server 2 (target)
+        tokio::spawn(async move {
+            if let Ok((mut socket, _)) = listener_src.accept().await {
+                let mut buf = [0u8; 1024];
+                let _ = socket.read(&mut buf).await;
+                let response = format!(
+                    "HTTP/1.1 307 Temporary Redirect\r\nLocation: http://127.0.0.1:{target_port}/dest\r\nContent-Length: 0\r\n\r\n"
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+            }
+        });
+
+        // Server 2 (target): receives redirect
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        tokio::spawn(async move {
+            if let Ok((mut socket, _)) = listener_target.accept().await {
+                let mut buf = [0u8; 2048];
+                let n = socket.read(&mut buf).await.unwrap_or(0);
+                let req_text = String::from_utf8_lossy(&buf[..n]).to_string();
+                let _ = tx.send(req_text).await;
+                let response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}";
+                let _ = socket.write_all(response.as_bytes()).await;
+            }
+        });
+
+        // Configure client where target host is explicitly trusted and has an explicit token
+        let mut config = RegistryClientConfig::default();
+        config.trusted_hosts.insert(format!("127.0.0.1:{target_port}"));
+        config.auth_tokens.insert(format!("//127.0.0.1:{target_port}/"), "target-secret-token".into());
+
+        let client = RegistryClient::with_config(config).unwrap();
+        let initial_url = Url::parse(&format!("http://127.0.0.1:{src_port}/initial")).unwrap();
+        let res = client
+            .execute_request_loop_with_body(
+                Method::POST,
+                initial_url,
+                Some("application/json"),
+                Some("application/json"),
+                Some("654321"),
+                b"{}".to_vec(),
+            )
+            .await;
+        assert!(res.is_ok());
+
+        let target_req = rx.recv().await.unwrap();
+        // Destination received authorization token because it has an explicit token configured
+        assert!(target_req.contains("authorization: Bearer target-secret-token"));
+        // BUT npm-otp MUST be strictly dropped on cross-origin redirect
+        assert!(!target_req.to_ascii_lowercase().contains("npm-otp"), "OTP leaked across cross-origin redirect!");
+    }
+
+    #[tokio::test]
+    async fn test_same_origin_redirect_keeps_otp() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(2);
+        tokio::spawn(async move {
+            // First request: redirect to same-origin /second
+            if let Ok((mut socket, _)) = listener.accept().await {
+                let mut buf = [0u8; 2048];
+                let n = socket.read(&mut buf).await.unwrap_or(0);
+                let req_text = String::from_utf8_lossy(&buf[..n]).to_string();
+                let _ = tx.send(req_text).await;
+                let response = format!(
+                    "HTTP/1.1 307 Temporary Redirect\r\nLocation: http://127.0.0.1:{port}/second\r\nContent-Length: 0\r\n\r\n"
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+            }
+
+            // Second request: received at /second
+            if let Ok((mut socket, _)) = listener.accept().await {
+                let mut buf = [0u8; 2048];
+                let n = socket.read(&mut buf).await.unwrap_or(0);
+                let req_text = String::from_utf8_lossy(&buf[..n]).to_string();
+                let _ = tx.send(req_text).await;
+                let response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}";
+                let _ = socket.write_all(response.as_bytes()).await;
+            }
+        });
+
+        let mut config = RegistryClientConfig::default();
+        config.trusted_hosts.insert(format!("127.0.0.1:{port}"));
+        config.auth_tokens.insert(format!("//127.0.0.1:{port}/"), "my-same-origin-token".into());
+
+        let client = RegistryClient::with_config(config).unwrap();
+        let initial_url = Url::parse(&format!("http://127.0.0.1:{port}/first")).unwrap();
+        let res = client
+            .execute_request_loop_with_body(
+                Method::POST,
+                initial_url,
+                Some("application/json"),
+                Some("application/json"),
+                Some("998877"),
+                b"{}".to_vec(),
+            )
+            .await;
+        assert!(res.is_ok());
+
+        let first_req = rx.recv().await.unwrap();
+        assert!(first_req.contains("npm-otp: 998877"));
+
+        let second_req = rx.recv().await.unwrap();
+        // Same-origin redirect MUST retain the OTP header!
+        assert!(second_req.contains("npm-otp: 998877"));
+        assert!(second_req.contains("authorization: Bearer my-same-origin-token"));
+    }
+
+    #[test]
+    fn test_https_to_http_downgrade_strips_auth_and_otp_even_with_explicit_token() {
+        let initial_url = Url::parse("https://registry.example.com/api").unwrap();
+        let downgrade_url = Url::parse("http://registry.example.com/api").unwrap();
+        let downgrade_untrusted_url = Url::parse("http://insecure.example.com/api").unwrap();
+
+        let mut config = RegistryClientConfig::default();
+        config.trusted_hosts.insert("registry.example.com".into());
+        config.trusted_hosts.insert("insecure.example.com".into());
+        config.auth_tokens.insert("//registry.example.com/".into(), "secret-token-1".into());
+        config.auth_tokens.insert("//insecure.example.com/".into(), "secret-token-2".into());
+
+        let client = RegistryClient::with_config(config).unwrap();
+
+        // HTTPS -> HTTP downgrade MUST NEVER be trusted, even if destination has explicit token
+        assert!(!client.is_trusted_target(&initial_url, &downgrade_url));
+        assert!(!client.is_trusted_target(&initial_url, &downgrade_untrusted_url));
+
+        // Same origin HTTPS -> HTTPS is trusted
+        let same_origin_https = Url::parse("https://registry.example.com/api/v2").unwrap();
+        assert!(client.is_trusted_target(&initial_url, &same_origin_https));
+    }
+
+    #[test]
+    fn test_same_origin_edge_cases() {
+        let url_default_port = Url::parse("https://registry.example.com/api").unwrap();
+        let url_explicit_port = Url::parse("https://registry.example.com:443/api").unwrap();
+        let url_upper = Url::parse("https://REGISTRY.EXAMPLE.COM/api").unwrap();
+        let url_ipv6_1 = Url::parse("https://[::1]:8443/api").unwrap();
+        let url_ipv6_2 = Url::parse("https://[::1]:8443/other").unwrap();
+        let url_ipv6_diff_port = Url::parse("https://[::1]:8444/api").unwrap();
+
+        let mut config = RegistryClientConfig::default();
+        config.trusted_hosts.insert("registry.example.com".into());
+        config.trusted_hosts.insert("[::1]:8443".into());
+        let client = RegistryClient::with_config(config).unwrap();
+
+        // Origin checks
+        assert!(client.is_same_origin(&url_default_port, &url_explicit_port));
+        assert!(client.is_same_origin(&url_explicit_port, &url_default_port));
+        assert!(client.is_same_origin(&url_default_port, &url_upper));
+        assert!(client.is_same_origin(&url_ipv6_1, &url_ipv6_2));
+        assert!(!client.is_same_origin(&url_ipv6_1, &url_ipv6_diff_port));
+
+        // Default port matching (443 implicit vs explicit)
+        assert!(client.is_trusted_target(&url_default_port, &url_explicit_port));
+        assert!(client.is_trusted_target(&url_explicit_port, &url_default_port));
+
+        // Case-insensitive host
+        assert!(client.is_trusted_target(&url_default_port, &url_upper));
+
+        // IPv6 same origin
+        assert!(client.is_trusted_target(&url_ipv6_1, &url_ipv6_2));
+
+        // IPv6 different port (cross origin)
+        assert!(!client.is_trusted_target(&url_ipv6_1, &url_ipv6_diff_port));
+    }
+
+    #[test]
+    fn test_scoped_tls_longest_prefix_matching() {
+        // Test prefix generation
+        let prefixes = generate_path_prefixes("/npm/v1/packages/pkg");
+        assert_eq!(
+            prefixes,
+            vec![
+                "/npm/v1/packages/pkg/",
+                "/npm/v1/packages/pkg",
+                "/npm/v1/packages/",
+                "/npm/v1/packages",
+                "/npm/v1/",
+                "/npm/v1",
+                "/npm/",
+                "/npm",
+                "/",
+                "",
+            ]
+        );
+
+        // Test URI prefix normalization
+        assert_eq!(
+            normalize_uri_prefix("https://registry.example.com/npm"),
+            "//registry.example.com/npm/"
+        );
+        assert_eq!(
+            normalize_uri_prefix("//REGISTRY.EXAMPLE.COM"),
+            "//registry.example.com/"
+        );
+        assert_eq!(
+            normalize_uri_prefix("//registry.example.com:8443/custom"),
+            "//registry.example.com:8443/custom/"
+        );
+
+        // Configure scoped TLS with longest-prefix precedence
+        let mut config = RegistryClientConfig::default();
+        config.scoped_tls.insert(
+            "//registry.example.com/".into(),
+            ScopedTlsConfig::from_pem(TEST_CERT_PEM_1, TEST_KEY_PEM_1),
+        );
+        config.scoped_tls.insert(
+            "//registry.example.com/npm/".into(),
+            ScopedTlsConfig::from_pem(TEST_CERT_PEM_2, TEST_KEY_PEM_2),
+        );
+
+        let client = RegistryClient::with_config(config).unwrap();
+
+        // /npm/ subpath matches the more specific scoped config (longest prefix)
+        let npm_url = Url::parse("https://registry.example.com/npm/packages/pkg").unwrap();
+        assert!(client.has_scoped_tls_for_url(&npm_url));
+        assert!(client.match_scoped_client(&npm_url).is_some());
+
+        // /other subpath matches the root scoped config
+        let other_url = Url::parse("https://registry.example.com/other/pkg").unwrap();
+        assert!(client.has_scoped_tls_for_url(&other_url));
+        assert!(client.match_scoped_client(&other_url).is_some());
+
+        // Different host does not match any scoped config
+        let diff_host = Url::parse("https://other-registry.com/npm/pkg").unwrap();
+        assert!(!client.has_scoped_tls_for_url(&diff_host));
+        assert!(client.match_scoped_client(&diff_host).is_none());
+    }
+
+    #[test]
+    fn test_scoped_tls_fallback_to_global_and_no_leak() {
+        let mut config = RegistryClientConfig {
+            cert: Some(TEST_CERT_PEM_1.into()),
+            key: Some(TEST_KEY_PEM_1.into()),
+            ..Default::default()
+        };
+        config.trusted_hosts.insert("global-registry.example.com".into());
+        config.scoped_tls.insert(
+            "//scoped-registry.example.com/".into(),
+            ScopedTlsConfig::from_pem(TEST_CERT_PEM_2, TEST_KEY_PEM_2),
+        );
+
+        let client = RegistryClient::with_config(config).unwrap();
+        assert!(client.has_global_tls());
+
+        let scoped_url = Url::parse("https://scoped-registry.example.com/pkg").unwrap();
+        let global_url = Url::parse("https://global-registry.example.com/pkg").unwrap();
+        let untrusted_url = Url::parse("https://untrusted-redirect.evil.com/pkg").unwrap();
+        let other_reg_url = Url::parse("https://other-registry.org/pkg").unwrap();
+
+        // Scoped registry gets its own client
+        assert!(client.has_scoped_tls_for_url(&scoped_url));
+
+        // Global registry falls back to global TLS client because host is trusted
+        assert!(!client.has_scoped_tls_for_url(&global_url));
+        let _global_c = client.client_for_url(&global_url);
+        // It uses global_client (not base unauthenticated client)
+        assert!(client.is_trusted_host(&global_url));
+
+        // Untrusted redirect NEVER receives scoped or global TLS client certificate!
+        assert!(!client.has_scoped_tls_for_url(&untrusted_url));
+        assert!(!client.is_trusted_host(&untrusted_url));
+        let untrusted_c = client.client_for_url(&untrusted_url);
+        // Untrusted host receives the base unauthenticated client
+        assert!(std::ptr::eq(untrusted_c, &client.client));
+
+        // Other untrusted registry also never receives scoped cert
+        let other_c = client.client_for_url(&other_reg_url);
+        assert!(std::ptr::eq(other_c, &client.client));
+    }
+
+    #[test]
+    fn test_scoped_tls_certfile_keyfile_from_disk_and_error_handling() {
+        use std::io::Write;
+
+        // 1. Valid certfile and keyfile on disk
+        let mut cert_file = tempfile::NamedTempFile::new().unwrap();
+        cert_file.write_all(TEST_CERT_PEM_1.as_bytes()).unwrap();
+        let mut key_file = tempfile::NamedTempFile::new().unwrap();
+        key_file.write_all(TEST_KEY_PEM_1.as_bytes()).unwrap();
+
+        let config = RegistryClientConfig {
+            certfile: Some(cert_file.path().to_path_buf()),
+            keyfile: Some(key_file.path().to_path_buf()),
+            ..Default::default()
+        };
+
+        let client = RegistryClient::with_config(config);
+        assert!(client.is_ok(), "Failed to build client with certfile and keyfile");
+
+        // 2. Missing certfile returns clear error
+        let config_missing_cert = RegistryClientConfig {
+            certfile: Some(PathBuf::from("nonexistent_cert_12345.pem")),
+            keyfile: Some(key_file.path().to_path_buf()),
+            ..Default::default()
+        };
+        match RegistryClient::with_config(config_missing_cert) {
+            Err(RegistryError::Other(msg)) => {
+                assert!(msg.contains("Failed to read certfile at 'nonexistent_cert_12345.pem'"));
+            }
+            Err(other) => panic!("Expected RegistryError::Other, got {other:?}"),
+            Ok(_) => panic!("Expected error for missing certfile"),
+        }
+
+        // 3. Missing keyfile returns clear error
+        let config_missing_key = RegistryClientConfig {
+            certfile: Some(cert_file.path().to_path_buf()),
+            keyfile: Some(PathBuf::from("nonexistent_key_12345.pem")),
+            ..Default::default()
+        };
+        match RegistryClient::with_config(config_missing_key) {
+            Err(RegistryError::Other(msg)) => {
+                assert!(msg.contains("Failed to read keyfile at 'nonexistent_key_12345.pem'"));
+            }
+            Err(other) => panic!("Expected RegistryError::Other, got {other:?}"),
+            Ok(_) => panic!("Expected error for missing keyfile"),
+        }
+
+        // 4. Invalid PEM returns clear error
+        let config_invalid_pem = RegistryClientConfig {
+            cert: Some("not a valid pem cert".into()),
+            key: Some("not a valid pem key".into()),
+            ..Default::default()
+        };
+        match RegistryClient::with_config(config_invalid_pem) {
+            Err(RegistryError::Other(msg)) => {
+                assert!(msg.contains("Failed to parse client certificate and key into Identity"));
+            }
+            Err(other) => panic!("Expected RegistryError::Other, got {other:?}"),
+            Ok(_) => panic!("Expected error for invalid PEM"),
+        }
+
+        // 5. Cert without key returns clear error
+        let config_cert_no_key = RegistryClientConfig {
+            cert: Some(TEST_CERT_PEM_1.into()),
+            key: None,
+            ..Default::default()
+        };
+        match RegistryClient::with_config(config_cert_no_key) {
+            Err(RegistryError::Other(msg)) => {
+                assert!(msg.contains("both cert and key are required"));
+            }
+            Err(other) => panic!("Expected RegistryError::Other, got {other:?}"),
+            Ok(_) => panic!("Expected error for cert without key"),
+        }
+
+        // 6. Key without cert returns clear error
+        let config_key_no_cert = RegistryClientConfig {
+            cert: None,
+            key: Some(TEST_KEY_PEM_1.into()),
+            ..Default::default()
+        };
+        match RegistryClient::with_config(config_key_no_cert) {
+            Err(RegistryError::Other(msg)) => {
+                assert!(msg.contains("both cert and key are required"));
+            }
+            Err(other) => panic!("Expected RegistryError::Other, got {other:?}"),
+            Ok(_) => panic!("Expected error for key without cert"),
+        }
     }
 }
