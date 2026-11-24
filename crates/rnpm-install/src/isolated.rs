@@ -50,18 +50,27 @@ const KECCAK_PILN: [usize; 24] = [
     10, 7, 11, 17, 18, 3, 5, 16, 8, 21, 24, 4, 15, 23, 19, 13, 12, 2, 20, 14, 22, 9, 6, 1,
 ];
 
+#[inline(always)]
 fn keccak_f(st: &mut [u64; 25]) {
-    for rc in KECCAK_RC {
-        let mut bc = [0u64; 5];
-        for i in 0..5 {
-            bc[i] = st[i] ^ st[i + 5] ^ st[i + 10] ^ st[i + 15] ^ st[i + 20];
-        }
-        for i in 0..5 {
-            let t = bc[(i + 4) % 5] ^ bc[(i + 1) % 5].rotate_left(1);
-            for j in (0..25).step_by(5) {
-                st[j + i] ^= t;
-            }
-        }
+    for &rc in &KECCAK_RC {
+        let bc0 = st[0] ^ st[5] ^ st[10] ^ st[15] ^ st[20];
+        let bc1 = st[1] ^ st[6] ^ st[11] ^ st[16] ^ st[21];
+        let bc2 = st[2] ^ st[7] ^ st[12] ^ st[17] ^ st[22];
+        let bc3 = st[3] ^ st[8] ^ st[13] ^ st[18] ^ st[23];
+        let bc4 = st[4] ^ st[9] ^ st[14] ^ st[19] ^ st[24];
+
+        let d0 = bc4 ^ bc1.rotate_left(1);
+        let d1 = bc0 ^ bc2.rotate_left(1);
+        let d2 = bc1 ^ bc3.rotate_left(1);
+        let d3 = bc2 ^ bc4.rotate_left(1);
+        let d4 = bc3 ^ bc0.rotate_left(1);
+
+        st[0] ^= d0; st[5] ^= d0; st[10] ^= d0; st[15] ^= d0; st[20] ^= d0;
+        st[1] ^= d1; st[6] ^= d1; st[11] ^= d1; st[16] ^= d1; st[21] ^= d1;
+        st[2] ^= d2; st[7] ^= d2; st[12] ^= d2; st[17] ^= d2; st[22] ^= d2;
+        st[3] ^= d3; st[8] ^= d3; st[13] ^= d3; st[18] ^= d3; st[23] ^= d3;
+        st[4] ^= d4; st[9] ^= d4; st[14] ^= d4; st[19] ^= d4; st[24] ^= d4;
+
         let mut t = st[1];
         for i in 0..24 {
             let j = KECCAK_PILN[i];
@@ -69,47 +78,103 @@ fn keccak_f(st: &mut [u64; 25]) {
             st[j] = t.rotate_left(KECCAK_ROTC[i]);
             t = tmp;
         }
+
         for j in (0..25).step_by(5) {
-            let row = [st[j], st[j + 1], st[j + 2], st[j + 3], st[j + 4]];
-            for i in 0..5 {
-                st[j + i] = row[i] ^ (!row[(i + 1) % 5] & row[(i + 2) % 5]);
-            }
+            let s0 = st[j];
+            let s1 = st[j + 1];
+            let s2 = st[j + 2];
+            let s3 = st[j + 3];
+            let s4 = st[j + 4];
+            st[j] = s0 ^ (!s1 & s2);
+            st[j + 1] = s1 ^ (!s2 & s3);
+            st[j + 2] = s2 ^ (!s3 & s4);
+            st[j + 3] = s3 ^ (!s4 & s0);
+            st[j + 4] = s4 ^ (!s0 & s1);
         }
         st[0] ^= rc;
     }
 }
 
+const RATE: usize = 136;
+
+#[inline(always)]
+fn absorb_block(st: &mut [u64; 25], block: &[u8]) {
+    let (lanes, _) = block.as_chunks::<8>();
+    for (i, lane) in lanes.iter().enumerate().take(17) {
+        st[i] ^= u64::from_le_bytes(*lane);
+    }
+    keccak_f(st);
+}
+
+/// Streaming SHAKE256 hasher to avoid allocating intermediate strings when hashing entry lists.
+#[derive(Clone)]
+pub struct Shake256Stream {
+    st: [u64; 25],
+    buf: [u8; RATE],
+    len: usize,
+}
+
+impl Shake256Stream {
+    pub fn new() -> Self {
+        Self {
+            st: [0u64; 25],
+            buf: [0u8; RATE],
+            len: 0,
+        }
+    }
+
+    pub fn update(&mut self, mut data: &[u8]) {
+        if self.len > 0 {
+            let needed = RATE - self.len;
+            if data.len() < needed {
+                self.buf[self.len..self.len + data.len()].copy_from_slice(data);
+                self.len += data.len();
+                return;
+            }
+            self.buf[self.len..RATE].copy_from_slice(&data[..needed]);
+            absorb_block(&mut self.st, &self.buf);
+            self.len = 0;
+            data = &data[needed..];
+        }
+
+        let (blocks, rest) = data.as_chunks::<RATE>();
+        for block in blocks {
+            absorb_block(&mut self.st, block);
+        }
+        self.buf[..rest.len()].copy_from_slice(rest);
+        self.len = rest.len();
+    }
+
+    pub fn finalize(mut self) -> [u8; 16] {
+        let mut last = [0u8; RATE];
+        last[..self.len].copy_from_slice(&self.buf[..self.len]);
+        last[self.len] ^= 0x1f;
+        last[RATE - 1] ^= 0x80;
+        absorb_block(&mut self.st, &last);
+        let mut out = [0u8; 16];
+        out[..8].copy_from_slice(&self.st[0].to_le_bytes());
+        out[8..].copy_from_slice(&self.st[1].to_le_bytes());
+        out
+    }
+}
+
+impl Default for Shake256Stream {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// SHAKE256 with a 16-byte output (`createHash('shake256', { outputLength: 16 })`).
 pub fn shake256_16(data: &[u8]) -> [u8; 16] {
-    const RATE: usize = 136;
-    let mut st = [0u64; 25];
-    let absorb = |st: &mut [u64; 25], block: &[u8]| {
-        for (i, lane) in block.chunks(8).enumerate() {
-            let mut b = [0u8; 8];
-            b[..lane.len()].copy_from_slice(lane);
-            st[i] ^= u64::from_le_bytes(b);
-        }
-        keccak_f(st);
-    };
-    let (blocks, rest) = data.as_chunks::<RATE>();
-    for block in blocks {
-        absorb(&mut st, block);
-    }
-    let mut last = [0u8; RATE];
-    last[..rest.len()].copy_from_slice(rest);
-    last[rest.len()] ^= 0x1f;
-    last[RATE - 1] ^= 0x80;
-    absorb(&mut st, &last);
-    let mut out = [0u8; 16];
-    out[..8].copy_from_slice(&st[0].to_le_bytes());
-    out[8..].copy_from_slice(&st[1].to_le_bytes());
-    out
+    let mut stream = Shake256Stream::new();
+    stream.update(data);
+    stream.finalize()
 }
 
 // ---------------------------------------------------------------------------
 // The isolated graph.
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 enum Target {
     /// A registry (or tarball) package, by its hoisted lockfile location.
     External(String),
@@ -169,12 +234,14 @@ fn is_external_location(loc: &str) -> bool {
     loc.starts_with("node_modules/") || loc.contains("/node_modules/")
 }
 
-fn package_name(loc: &str, pkg: &LockfilePackage) -> String {
-    pkg.name.clone().unwrap_or_else(|| {
-        loc.rsplit_once("node_modules/")
-            .map(|(_, n)| n.to_string())
-            .unwrap_or_else(|| loc.rsplit('/').next().unwrap_or(loc).to_string())
-    })
+fn package_name<'a>(loc: &'a str, pkg: &'a LockfilePackage) -> &'a str {
+    if let Some(ref name) = pkg.name {
+        name.as_str()
+    } else if let Some((_, n)) = loc.rsplit_once("node_modules/") {
+        n
+    } else {
+        loc.rsplit('/').next().unwrap_or(loc)
+    }
 }
 
 fn bin_entries(pkg: &LockfilePackage, name: &str) -> Vec<(String, String)> {
@@ -295,6 +362,11 @@ impl<'a> Builder<'a> {
     }
 
     fn walk(&mut self, start: Target) {
+        if self.deps.contains_key(&start) {
+            return;
+        }
+        let mut queued: HashSet<Target> = HashSet::new();
+        queued.insert(start.clone());
         let mut queue = vec![start];
         while let Some(node) = queue.pop() {
             if self.deps.contains_key(&node) {
@@ -304,77 +376,193 @@ impl<'a> Builder<'a> {
                 Target::External(loc) => self.edges(loc, false, false),
                 Target::Local(loc) => self.edges(loc, true, loc.is_empty()),
             };
-            queue.extend(deps.iter().map(|d| d.target.clone()));
-            self.deps.insert(node, deps);
+            // Pre-partition into arborist's `dependencies` order:
+            // 1. external non-optional
+            // 2. local non-optional
+            // 3. optional
+            // preserving relative order within each category.
+            let mut partitioned = Vec::with_capacity(deps.len());
+            for d in &deps {
+                if !d.optional && matches!(d.target, Target::External(_)) {
+                    partitioned.push(d.clone());
+                }
+            }
+            for d in &deps {
+                if !d.optional && matches!(d.target, Target::Local(_)) {
+                    partitioned.push(d.clone());
+                }
+            }
+            for d in &deps {
+                if d.optional {
+                    partitioned.push(d.clone());
+                }
+            }
+            for d in &partitioned {
+                if !self.deps.contains_key(&d.target) && queued.insert(d.target.clone()) {
+                    queue.push(d.target.clone());
+                }
+            }
+            self.deps.insert(node, partitioned);
         }
     }
 
     /// arborist's `dependencies` order: external non-optional, local
     /// non-optional, then optional.
-    fn children(&self, node: &Target) -> Vec<&Dep> {
-        let deps = self.deps.get(node).map(Vec::as_slice).unwrap_or_default();
-        let ext = deps
-            .iter()
-            .filter(|d| !d.optional && matches!(d.target, Target::External(_)));
-        let local = deps
-            .iter()
-            .filter(|d| !d.optional && matches!(d.target, Target::Local(_)));
-        let optional = deps.iter().filter(|d| d.optional);
-        ext.chain(local).chain(optional).collect()
+    #[inline]
+    fn children(&self, node: &Target) -> &[Dep] {
+        self.deps.get(node).map(Vec::as_slice).unwrap_or(&[])
     }
 
-    fn identity(&self, node: &Target) -> (String, String, String) {
+    fn identity<'b>(&'b self, node: &'b Target) -> (&'b str, &'b str, &'b str) {
         match node {
             Target::External(loc) => {
                 let pkg = &self.lock.packages[loc];
                 (
                     package_name(loc, pkg),
-                    pkg.version.clone().unwrap_or_else(|| "undefined".into()),
-                    pkg.resolved.clone().unwrap_or_else(|| "undefined".into()),
+                    pkg.version.as_deref().unwrap_or("undefined"),
+                    pkg.resolved.as_deref().unwrap_or("undefined"),
                 )
             }
             Target::Local(loc) => {
                 let pkg = self.lock.packages.get(loc);
                 let name = pkg
-                    .and_then(|p| p.name.clone())
-                    .unwrap_or_else(|| loc.rsplit('/').next().unwrap_or(loc).to_string());
+                    .and_then(|p| p.name.as_deref())
+                    .unwrap_or_else(|| loc.rsplit('/').next().unwrap_or(loc));
                 // A workspace proxy carries no version, and its node no resolved.
-                (name, "undefined".into(), "null".into())
+                (name, "undefined", "null")
             }
         }
     }
 
     /// arborist's getKey: a depth-first walk (each node visited once)
     /// recording `a@1->b@2::resolved`, sorted, hashed with SHAKE256.
-    fn key(&self, start: &Target) -> String {
-        let mut entries = Vec::new();
-        let mut seen = HashSet::new();
-        let mut branch: Vec<String> = Vec::new();
-        self.key_visit(start, &mut seen, &mut branch, &mut entries);
-        entries.sort();
-        let digest = shake256_16(entries.join(",").as_bytes());
-        let hash = data_encoding::BASE64URL_NOPAD.encode(&digest);
-        let (name, version, _) = self.identity(start);
-        format!("{name}@{version}-{hash}")
+    #[allow(dead_code)]
+    pub fn key(&self, start: &Target) -> String {
+        let mut nodes: Vec<Target> = self.deps.keys().cloned().collect();
+        nodes.sort_unstable();
+        let target_to_idx: HashMap<&Target, usize> =
+            nodes.iter().enumerate().map(|(i, t)| (t, i)).collect();
+        let mut computer = KeyComputer::new(self, &nodes, &target_to_idx);
+        if let Some(&idx) = target_to_idx.get(start) {
+            computer.compute_key(idx)
+        } else {
+            let (name, version, resolved) = self.identity(start);
+            let entry = format!("{name}@{version}::{resolved}");
+            let digest = shake256_16(entry.as_bytes());
+            let hash = data_encoding::BASE64URL_NOPAD.encode(&digest);
+            format!("{name}@{version}-{hash}")
+        }
+    }
+}
+
+struct NodeData<'a> {
+    name: &'a str,
+    version: &'a str,
+    resolved: &'a str,
+    pkg_id: String,
+    children: Vec<usize>,
+}
+
+struct KeyComputer<'a> {
+    node_data: Vec<NodeData<'a>>,
+    seen_epoch: Vec<u32>,
+    epoch: u32,
+    branch_buf: String,
+    entries: Vec<String>,
+}
+
+impl<'a> KeyComputer<'a> {
+    fn new(
+        builder: &'a Builder<'a>,
+        nodes: &'a [Target],
+        target_to_idx: &HashMap<&Target, usize>,
+    ) -> Self {
+        let mut node_data = Vec::with_capacity(nodes.len());
+        for target in nodes {
+            let (name, version, resolved) = builder.identity(target);
+            let pkg_id = format!("{name}@{version}");
+            let children: Vec<usize> = builder
+                .children(target)
+                .iter()
+                .filter_map(|dep| target_to_idx.get(&dep.target).copied())
+                .collect();
+            node_data.push(NodeData {
+                name,
+                version,
+                resolved,
+                pkg_id,
+                children,
+            });
+        }
+        let num_nodes = nodes.len();
+        Self {
+            node_data,
+            seen_epoch: vec![0; num_nodes],
+            epoch: 0,
+            branch_buf: String::with_capacity(256),
+            entries: Vec::with_capacity(num_nodes),
+        }
     }
 
-    fn key_visit(
-        &self,
-        node: &Target,
-        seen: &mut HashSet<Target>,
-        branch: &mut Vec<String>,
-        entries: &mut Vec<String>,
-    ) {
-        if !seen.insert(node.clone()) {
-            return;
+    fn compute_key(&mut self, start_idx: usize) -> String {
+        let node = &self.node_data[start_idx];
+        if node.children.is_empty() {
+            let mut entry = String::with_capacity(node.pkg_id.len() + 2 + node.resolved.len());
+            entry.push_str(&node.pkg_id);
+            entry.push_str("::");
+            entry.push_str(node.resolved);
+            let digest = shake256_16(entry.as_bytes());
+            let hash = data_encoding::BASE64URL_NOPAD.encode(&digest);
+            return format!("{}@{}-{}", node.name, node.version, hash);
         }
-        let (name, version, resolved) = self.identity(node);
-        branch.push(format!("{name}@{version}"));
-        entries.push(format!("{}::{resolved}", branch.join("->")));
-        for dep in self.children(node) {
-            self.key_visit(&dep.target, seen, branch, entries);
+
+        self.epoch += 1;
+        let current_epoch = self.epoch;
+        self.entries.clear();
+        self.branch_buf.clear();
+
+        self.seen_epoch[start_idx] = current_epoch;
+        self.dfs(start_idx, current_epoch);
+
+        self.entries.sort_unstable();
+
+        let mut hasher = Shake256Stream::new();
+        for (i, entry) in self.entries.iter().enumerate() {
+            if i > 0 {
+                hasher.update(b",");
+            }
+            hasher.update(entry.as_bytes());
         }
-        branch.pop();
+        let digest = hasher.finalize();
+        let hash = data_encoding::BASE64URL_NOPAD.encode(&digest);
+        let node = &self.node_data[start_idx];
+        format!("{}@{}-{}", node.name, node.version, hash)
+    }
+
+    fn dfs(&mut self, node_idx: usize, current_epoch: u32) {
+        let prev_len = self.branch_buf.len();
+        let node = &self.node_data[node_idx];
+        if !self.branch_buf.is_empty() {
+            self.branch_buf.push_str("->");
+        }
+        self.branch_buf.push_str(&node.pkg_id);
+
+        let mut entry = String::with_capacity(self.branch_buf.len() + 2 + node.resolved.len());
+        entry.push_str(&self.branch_buf);
+        entry.push_str("::");
+        entry.push_str(node.resolved);
+        self.entries.push(entry);
+
+        let num_children = self.node_data[node_idx].children.len();
+        for c_i in 0..num_children {
+            let child_idx = self.node_data[node_idx].children[c_i];
+            if self.seen_epoch[child_idx] != current_epoch {
+                self.seen_epoch[child_idx] = current_epoch;
+                self.dfs(child_idx, current_epoch);
+            }
+        }
+
+        self.branch_buf.truncate(prev_len);
     }
 }
 
@@ -406,12 +594,18 @@ pub fn plan(lock: &LockfileV3, omit: Omit, manifests: &HashMap<String, Value>) -
         builder.walk(Target::Local(dir.clone()));
     }
 
-    let mut keys: HashMap<Target, String> = HashMap::new();
     let mut nodes: Vec<Target> = builder.deps.keys().cloned().collect();
-    nodes.sort_by(|a, b| format!("{a:?}").cmp(&format!("{b:?}")));
-    for node in &nodes {
+    // Zero-allocation comparator preserving exact Debug ordering
+    nodes.sort_unstable();
+
+    let target_to_idx: HashMap<&Target, usize> =
+        nodes.iter().enumerate().map(|(i, t)| (t, i)).collect();
+    let mut key_computer = KeyComputer::new(&builder, &nodes, &target_to_idx);
+
+    let mut keys: HashMap<Target, String> = HashMap::with_capacity(nodes.len());
+    for (idx, node) in nodes.iter().enumerate() {
         if let Target::External(_) = node {
-            keys.insert(node.clone(), builder.key(node));
+            keys.insert(node.clone(), key_computer.compute_key(idx));
         }
     }
 
@@ -426,8 +620,8 @@ pub fn plan(lock: &LockfileV3, omit: Omit, manifests: &HashMap<String, Value>) -
         store.entry(location.clone()).or_insert_with(|| StoreEntry {
             location,
             store_dir,
-            bin: bin_entries(pkg, &name),
-            package_name: name,
+            bin: bin_entries(pkg, name),
+            package_name: name.to_string(),
             resolved: pkg.resolved.clone(),
             integrity: pkg.integrity.clone(),
             optional: pkg.optional == Some(true),
@@ -436,9 +630,10 @@ pub fn plan(lock: &LockfileV3, omit: Omit, manifests: &HashMap<String, Value>) -
     }
 
     let target_location = |t: &Target| match t {
-        Target::External(_) => {
+        Target::External(loc) => {
             let key = &keys[t];
-            let (name, _, _) = builder.identity(t);
+            let pkg = &lock.packages[loc];
+            let name = package_name(loc, pkg);
             format!("node_modules/.store/{key}/node_modules/{name}")
         }
         Target::Local(loc) => loc.clone(),
@@ -446,24 +641,24 @@ pub fn plan(lock: &LockfileV3, omit: Omit, manifests: &HashMap<String, Value>) -
 
     // Links: from the root, each workspace, and each store package.
     let mut links: BTreeMap<String, PlannedLink> = BTreeMap::new();
-    let mut from_nodes: Vec<(Target, String)> = vec![(Target::Local(String::new()), "node_modules".into())];
+    let mut add_links_from = |node: &Target, nm: &str| {
+        for dep in builder.children(node) {
+            let location = join(nm, &dep.name);
+            let target = target_location(&dep.target);
+            if location != target {
+                links.insert(location.clone(), PlannedLink { location, target });
+            }
+        }
+    };
+
+    add_links_from(&Target::Local(String::new()), "node_modules");
     for dir in &local_dirs {
-        from_nodes.push((Target::Local(dir.clone()), format!("{dir}/node_modules")));
+        add_links_from(&Target::Local(dir.clone()), &format!("{dir}/node_modules"));
     }
     for node in &nodes {
         if let Target::External(_) = node {
             let key = &keys[node];
-            from_nodes.push((node.clone(), format!("node_modules/.store/{key}/node_modules")));
-        }
-    }
-    for (node, nm) in &from_nodes {
-        for dep in builder.children(node) {
-            let location = join(nm, &dep.name);
-            let target = target_location(&dep.target);
-            if location == target {
-                continue;
-            }
-            links.insert(location.clone(), PlannedLink { location, target });
+            add_links_from(node, &format!("node_modules/.store/{key}/node_modules"));
         }
     }
 
@@ -825,37 +1020,52 @@ impl crate::Installer {
             }
         }
 
-        // Link every edge.
+        // Link every edge with parent directory deduplication.
+        let mut created_parents: HashSet<std::path::PathBuf> = HashSet::new();
         for link in &plan.links {
             let target = project.join(&link.target);
             if !target.exists() {
                 continue;
             }
-            ensure_link(&project.join(&link.location), &target)?;
+            let link_path = project.join(&link.location);
+            if rnpm_fs::junction::junction_points_to(&link_path, &target) {
+                continue;
+            }
+            if let Some(parent) = link_path.parent() {
+                if created_parents.insert(parent.to_path_buf()) {
+                    std::fs::create_dir_all(parent)?;
+                }
+            }
+            crate::linked::create_or_replace_junction(&link_path, &target)?;
         }
 
         // Bins go in the `.bin` beside each package and each link.
         if self.options.bin_links {
-            let bins_of: HashMap<String, Vec<(String, String)>> = plan
-                .store
+            let local_bins: Vec<Vec<(String, String)>> = plan
+                .local_dirs
                 .iter()
-                .map(|e| (e.location.clone(), e.bin.clone()))
-                .chain(plan.local_dirs.iter().map(|d| {
-                    let bins = lock
-                        .packages
+                .map(|d| {
+                    lock.packages
                         .get(d)
                         .map(|p| bin_entries(p, p.name.as_deref().unwrap_or(d)))
-                        .unwrap_or_default();
-                    (d.clone(), bins)
-                }))
+                        .unwrap_or_default()
+                })
                 .collect();
+            let mut bins_of: HashMap<&str, &[(String, String)]> =
+                HashMap::with_capacity(plan.store.len() + plan.local_dirs.len());
+            for e in &plan.store {
+                bins_of.insert(e.location.as_str(), &e.bin);
+            }
+            for (i, d) in plan.local_dirs.iter().enumerate() {
+                bins_of.insert(d.as_str(), &local_bins[i]);
+            }
             let placed = plan
                 .store
                 .iter()
-                .map(|e| (e.location.clone(), e.location.clone()))
-                .chain(plan.links.iter().map(|l| (l.location.clone(), l.target.clone())));
+                .map(|e| (e.location.as_str(), e.location.as_str()))
+                .chain(plan.links.iter().map(|l| (l.location.as_str(), l.target.as_str())));
             for (location, target) in placed {
-                let Some(bins) = bins_of.get(&target).filter(|b| !b.is_empty()) else {
+                let Some(bins) = bins_of.get(target).copied().filter(|b| !b.is_empty()) else {
                     continue;
                 };
                 let Some((folder, name)) = location.rsplit_once("/node_modules/").or_else(|| {
@@ -866,7 +1076,7 @@ impl crate::Installer {
                 let bin_dir = project.join(join(folder, "node_modules")).join(".bin");
                 for (bin_name, script) in bins {
                     let script = script.trim_start_matches("./");
-                    let _ = rnpm_shim::normalize_shebang(&project.join(&target).join(script));
+                    let _ = rnpm_shim::normalize_shebang(&project.join(target).join(script));
                     rnpm_shim::create_shims_with_force(
                         &bin_dir,
                         bin_name,
@@ -1014,5 +1224,288 @@ mod tests {
             },
             &HashMap::new(),
         )
+    }
+
+    #[test]
+    fn test_target_sort_matches_format_debug() {
+        let mut targets = vec![
+            Target::Local("".to_string()),
+            Target::External("node_modules/z".to_string()),
+            Target::External("node_modules/a".to_string()),
+            Target::External("node_modules/@scope/pkg".to_string()),
+            Target::Local("packages/nested".to_string()),
+            Target::Local("packages/app".to_string()),
+            Target::External("node_modules/b".to_string()),
+        ];
+        let mut debug_sorted = targets.clone();
+        debug_sorted.sort_by(|a, b| format!("{a:?}").cmp(&format!("{b:?}")));
+
+        targets.sort_unstable();
+        assert_eq!(
+            targets, debug_sorted,
+            "Derived Ord on Target must match format debug order 100%"
+        );
+    }
+
+    #[test]
+    fn test_diamond_graph_deterministic_store_keys_and_layout() {
+        let lock_json = r#"{
+            "name": "diamond-root",
+            "lockfileVersion": 3,
+            "requires": true,
+            "packages": {
+                "": { "name": "diamond-root", "dependencies": { "a": "1.0.0" } },
+                "node_modules/a": {
+                    "version": "1.0.0",
+                    "resolved": "https://r/a.tgz",
+                    "dependencies": { "b": "1.0.0", "c": "1.0.0" }
+                },
+                "node_modules/b": {
+                    "version": "1.0.0",
+                    "resolved": "https://r/b.tgz",
+                    "dependencies": { "d": "1.0.0" }
+                },
+                "node_modules/c": {
+                    "version": "1.0.0",
+                    "resolved": "https://r/c.tgz",
+                    "dependencies": { "d": "1.0.0" }
+                },
+                "node_modules/d": {
+                    "version": "1.0.0",
+                    "resolved": "https://r/d.tgz",
+                    "dependencies": { "e": "1.0.0" }
+                },
+                "node_modules/e": {
+                    "version": "1.0.0",
+                    "resolved": "https://r/e.tgz"
+                }
+            }
+        }"#;
+        let lock = LockfileV3::from_json_str(lock_json).unwrap();
+        let plan1 = plan(
+            &lock,
+            Omit {
+                dev: false,
+                optional: false,
+                peer: false,
+                skipped: HashSet::new(),
+            },
+            &HashMap::new(),
+        );
+        let plan2 = plan(
+            &lock,
+            Omit {
+                dev: false,
+                optional: false,
+                peer: false,
+                skipped: HashSet::new(),
+            },
+            &HashMap::new(),
+        );
+
+        // Verify determinism across multiple runs
+        assert_eq!(plan1.store.len(), 5);
+        for (s1, s2) in plan1.store.iter().zip(plan2.store.iter()) {
+            assert_eq!(s1.location, s2.location);
+            assert_eq!(s1.store_dir, s2.store_dir);
+        }
+        assert_eq!(plan1.links.len(), plan2.links.len());
+        for (l1, l2) in plan1.links.iter().zip(plan2.links.iter()) {
+            assert_eq!(l1.location, l2.location);
+            assert_eq!(l1.target, l2.target);
+        }
+
+        // Verify diamond structure
+        let a = plan1.store.iter().find(|e| e.package_name == "a").unwrap();
+        let b = plan1.store.iter().find(|e| e.package_name == "b").unwrap();
+        let c = plan1.store.iter().find(|e| e.package_name == "c").unwrap();
+        let d = plan1.store.iter().find(|e| e.package_name == "d").unwrap();
+        let e = plan1.store.iter().find(|e| e.package_name == "e").unwrap();
+
+        let link = |loc: &str| {
+            plan1
+                .links
+                .iter()
+                .find(|l| l.location == loc)
+                .map(|l| l.target.as_str())
+        };
+        assert_eq!(link("node_modules/a"), Some(a.location.as_str()));
+        assert_eq!(
+            link(&format!("{}/node_modules/b", a.store_dir)),
+            Some(b.location.as_str())
+        );
+        assert_eq!(
+            link(&format!("{}/node_modules/c", a.store_dir)),
+            Some(c.location.as_str())
+        );
+        assert_eq!(
+            link(&format!("{}/node_modules/d", b.store_dir)),
+            Some(d.location.as_str())
+        );
+        assert_eq!(
+            link(&format!("{}/node_modules/d", c.store_dir)),
+            Some(d.location.as_str())
+        );
+        assert_eq!(
+            link(&format!("{}/node_modules/e", d.store_dir)),
+            Some(e.location.as_str())
+        );
+    }
+
+    #[test]
+    fn test_cyclic_graph_deterministic_store_keys_and_layout() {
+        let lock_json = r#"{
+            "name": "cyclic-root",
+            "lockfileVersion": 3,
+            "requires": true,
+            "packages": {
+                "": { "name": "cyclic-root", "dependencies": { "a": "1.0.0" } },
+                "node_modules/a": {
+                    "version": "1.0.0",
+                    "resolved": "https://r/a.tgz",
+                    "dependencies": { "b": "1.0.0" }
+                },
+                "node_modules/b": {
+                    "version": "1.0.0",
+                    "resolved": "https://r/b.tgz",
+                    "dependencies": { "c": "1.0.0" }
+                },
+                "node_modules/c": {
+                    "version": "1.0.0",
+                    "resolved": "https://r/c.tgz",
+                    "dependencies": { "a": "1.0.0" }
+                }
+            }
+        }"#;
+        let lock = LockfileV3::from_json_str(lock_json).unwrap();
+        let plan1 = plan(
+            &lock,
+            Omit {
+                dev: false,
+                optional: false,
+                peer: false,
+                skipped: HashSet::new(),
+            },
+            &HashMap::new(),
+        );
+        let plan2 = plan(
+            &lock,
+            Omit {
+                dev: false,
+                optional: false,
+                peer: false,
+                skipped: HashSet::new(),
+            },
+            &HashMap::new(),
+        );
+
+        assert_eq!(plan1.store.len(), 3);
+        assert_eq!(plan1.links.len(), 4); // root -> a, a -> b, b -> c, c -> a
+        for (s1, s2) in plan1.store.iter().zip(plan2.store.iter()) {
+            assert_eq!(s1.location, s2.location);
+            assert_eq!(s1.store_dir, s2.store_dir);
+        }
+        for (l1, l2) in plan1.links.iter().zip(plan2.links.iter()) {
+            assert_eq!(l1.location, l2.location);
+            assert_eq!(l1.target, l2.target);
+        }
+
+        let a = plan1.store.iter().find(|e| e.package_name == "a").unwrap();
+        let b = plan1.store.iter().find(|e| e.package_name == "b").unwrap();
+        let c = plan1.store.iter().find(|e| e.package_name == "c").unwrap();
+
+        let link = |loc: &str| {
+            plan1
+                .links
+                .iter()
+                .find(|l| l.location == loc)
+                .map(|l| l.target.as_str())
+        };
+        assert_eq!(link("node_modules/a"), Some(a.location.as_str()));
+        assert_eq!(
+            link(&format!("{}/node_modules/b", a.store_dir)),
+            Some(b.location.as_str())
+        );
+        assert_eq!(
+            link(&format!("{}/node_modules/c", b.store_dir)),
+            Some(c.location.as_str())
+        );
+        assert_eq!(
+            link(&format!("{}/node_modules/a", c.store_dir)),
+            Some(a.location.as_str())
+        );
+    }
+
+    #[test]
+    fn test_200_node_diamond_graph_builds_fast() {
+        let mut packages = serde_json::Map::new();
+        packages.insert(
+            "".to_string(),
+            serde_json::json!({
+                "name": "diamond-root",
+                "dependencies": {
+                    "layer_0_a": "1.0.0",
+                    "layer_0_b": "1.0.0"
+                }
+            }),
+        );
+
+        // 100 layers of 2 nodes = 200 nodes total, plus 2 leaf nodes at layer 100 = 202 nodes.
+        // Unpruned paths from top to bottom = 2^100!
+        for i in 0..100 {
+            let next_a = format!("layer_{}_a", i + 1);
+            let next_b = format!("layer_{}_b", i + 1);
+            for suffix in ["a", "b"] {
+                let name = format!("layer_{i}_{suffix}");
+                packages.insert(
+                    format!("node_modules/{name}"),
+                    serde_json::json!({
+                        "version": "1.0.0",
+                        "resolved": format!("https://r/{name}.tgz"),
+                        "dependencies": {
+                            next_a.clone(): "1.0.0",
+                            next_b.clone(): "1.0.0"
+                        }
+                    }),
+                );
+            }
+        }
+        for suffix in ["a", "b"] {
+            let name = format!("layer_100_{suffix}");
+            packages.insert(
+                format!("node_modules/{name}"),
+                serde_json::json!({
+                    "version": "1.0.0",
+                    "resolved": format!("https://r/{name}.tgz")
+                }),
+            );
+        }
+
+        let lock_val = serde_json::json!({
+            "name": "diamond-root",
+            "lockfileVersion": 3,
+            "requires": true,
+            "packages": packages
+        });
+        let lock: LockfileV3 = serde_json::from_value(lock_val).unwrap();
+
+        let start = std::time::Instant::now();
+        let plan = plan(
+            &lock,
+            Omit {
+                dev: false,
+                optional: false,
+                peer: false,
+                skipped: HashSet::new(),
+            },
+            &HashMap::new(),
+        );
+        let elapsed = start.elapsed();
+
+        assert_eq!(plan.store.len(), 202);
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "200-node diamond graph must build fast without exponential blowup, took {elapsed:?}"
+        );
     }
 }
