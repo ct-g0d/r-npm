@@ -1598,3 +1598,150 @@ fn test_pkg_bracket_escaping_and_append_validation() {
     assert!(content.contains(r#""keywords": ["#) || content.contains(r#""keywords":["#));
     assert!(content.contains(r#""cli""#));
 }
+
+#[test]
+fn test_manifest_single_pass_and_lazy_ordered_json() {
+    let raw = r#"{
+  "name": "perf-pkg",
+  "version": "1.0.0",
+  "dependencies": {
+    "zebra": "^1.0.0",
+    "alpha": "^2.0.0",
+    "beta": "^3.0.0"
+  },
+  "devDependencies": {
+    "omega": "^9.0.0",
+    "gamma": "^4.0.0"
+  }
+}
+"#;
+
+    // Single pass parse from str
+    let mut manifest = Manifest::from_str(raw).unwrap();
+    // Raw JSON is lazy (None on load) to avoid building heavy IndexMap DOM
+    assert!(manifest.raw_json.is_none());
+    assert_eq!(manifest.raw_text.as_deref(), Some(raw));
+
+    // Exact declaration order is preserved
+    assert_eq!(
+        manifest.dependency_order,
+        vec!["zebra".to_string(), "alpha".to_string(), "beta".to_string()]
+    );
+    assert_eq!(
+        manifest.dev_dependency_order,
+        vec!["omega".to_string(), "gamma".to_string()]
+    );
+
+    // BTreeMap has sorted keys
+    let dep_keys: Vec<&String> = manifest.dependencies.keys().collect();
+    assert_eq!(dep_keys, vec!["alpha", "beta", "zebra"]);
+
+    // Saving preserves byte-for-byte fidelity and formatting
+    let output = manifest.to_json_string().unwrap();
+    assert_eq!(output, raw);
+
+    // ensure_raw_json parses on demand
+    let raw_val = manifest.ensure_raw_json();
+    assert!(raw_val.is_some());
+    assert!(manifest.raw_json.is_some());
+}
+
+#[test]
+fn test_overrides_indexed_fast_reject_and_precompiled_specs() {
+    use crate::overrides::Overrides;
+    use std::collections::BTreeMap;
+
+    let json = serde_json::json!({
+        "debug@^2.0.0": "2.6.9",
+        "foo > bar": "2.0.0",
+        "nested > a > b@workspace:^1.0.0": "1.2.3",
+        "url-pkg@#semver:^4.0.0": "4.1.2"
+    });
+
+    let overrides = Overrides::from_json_value(Some(&json), BTreeMap::new());
+
+    // 1. Fast O(1) rejection: package not in overrides at all
+    assert!(!overrides.mentions("unrelated-pkg"));
+    assert_eq!(
+        overrides
+            .resolve_override("unrelated-pkg", "^1.0.0", &[])
+            .unwrap(),
+        None
+    );
+    assert_eq!(
+        overrides
+            .resolve_override("unrelated-pkg", "^1.0.0", &["foo", "bar", "baz"])
+            .unwrap(),
+        None
+    );
+
+    // 2. Pre-parsed spec matching (debug@^2.0.0)
+    assert!(overrides.mentions("debug"));
+    assert_eq!(
+        overrides
+            .resolve_override("debug", "^2.1.0", &[])
+            .unwrap(),
+        Some("2.6.9".to_string())
+    );
+    assert_eq!(
+        overrides
+            .resolve_override("debug", "^4.0.0", &[])
+            .unwrap(),
+        None
+    );
+
+    // 3. Pre-parsed workspace: prefix stripping
+    assert!(overrides.mentions("b"));
+    assert_eq!(
+        overrides
+            .resolve_override("b", "^1.0.0", &["nested", "a"])
+            .unwrap(),
+        Some("1.2.3".to_string())
+    );
+
+    // 4. Pre-parsed #semver: decoded spec
+    assert!(overrides.mentions("url-pkg"));
+    assert_eq!(
+        overrides
+            .resolve_override("url-pkg", "^4.0.0", &[])
+            .unwrap(),
+        Some("4.1.2".to_string())
+    );
+}
+
+#[test]
+fn test_workspace_deep_glob_no_backtracking_and_order_preservation() {
+    use crate::workspace::match_glob_patterns;
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+
+    // Create deep directories: depth 6
+    let deep_dir = root.join("packages/deep/a/b/c/pkg");
+    std::fs::create_dir_all(&deep_dir).unwrap();
+    std::fs::write(deep_dir.join("package.json"), r#"{"name":"deep-pkg"}"#).unwrap();
+
+    let tools_dir = root.join("tools/cli");
+    std::fs::create_dir_all(&tools_dir).unwrap();
+    std::fs::write(tools_dir.join("package.json"), r#"{"name":"cli-tool"}"#).unwrap();
+
+    let git_dir = root.join("packages/.git/inner");
+    std::fs::create_dir_all(&git_dir).unwrap();
+    std::fs::write(git_dir.join("package.json"), r#"{"name":"git-pkg"}"#).unwrap();
+
+    let nm_dir = root.join("packages/node_modules/inner");
+    std::fs::create_dir_all(&nm_dir).unwrap();
+    std::fs::write(nm_dir.join("package.json"), r#"{"name":"nm-pkg"}"#).unwrap();
+
+    // Patterns with ** and declaration order: tools first, then packages/**
+    let patterns = vec![
+        "tools/*".to_string(),
+        "packages/**/pkg".to_string(),
+        "!packages/**/ignored".to_string(),
+    ];
+
+    let matched = match_glob_patterns(root, &patterns).unwrap();
+    assert_eq!(matched.len(), 2);
+    // Tools declared first, so cli-tool should be first
+    assert_eq!(matched[0], tools_dir);
+    assert_eq!(matched[1], deep_dir);
+}
