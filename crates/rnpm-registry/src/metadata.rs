@@ -102,6 +102,32 @@ where
                             serde_json::Value::Object(map) => {
                                 map.retain(|_, v| v.is_string());
                             }
+                            serde_json::Value::Array(arr) => {
+                                // npm parity (@npmcli/package-json & rnpm-core/manifest.rs):
+                                // Array of executable paths e.g. ["bin/foo", "bin/bar"] is normalized
+                                // to a map {"foo": "bin/foo", "bar": "bin/bar"} using the basename.
+                                let mut map = serde_json::Map::new();
+                                for item in arr {
+                                    if let Some(path_str) = item.as_str() {
+                                        let name = path_str
+                                            .rsplit(&['/', '\\'])
+                                            .next()
+                                            .unwrap_or(path_str)
+                                            .trim();
+                                        if !name.is_empty() {
+                                            map.insert(
+                                                name.to_string(),
+                                                serde_json::Value::String(path_str.to_string()),
+                                            );
+                                        }
+                                    }
+                                }
+                                if map.is_empty() {
+                                    object.remove("bin");
+                                } else {
+                                    *bin_val = serde_json::Value::Object(map);
+                                }
+                            }
                             _ => {
                                 object.remove("bin");
                             }
@@ -837,11 +863,17 @@ mod tests {
                     "dependencies": { "valid-dep": "^1.0.0", "numeric-dep": 2 },
                     "bin": "cli.js",
                     "dist": { "tarball": "https://registry.npmjs.org/quirky-pkg/-/quirky-pkg-1.0.1.tgz" }
+                },
+                "1.0.2": {
+                    "name": "quirky-pkg",
+                    "version": "1.0.2",
+                    "bin": ["./bin/tool.js", "bin/runner"],
+                    "dist": { "tarball": "https://registry.npmjs.org/quirky-pkg/-/quirky-pkg-1.0.2.tgz" }
                 }
             }
         }"#;
         let meta3: AbbreviatedPackageMetadata = serde_json::from_str(version_json).unwrap();
-        assert_eq!(meta3.versions.len(), 2);
+        assert_eq!(meta3.versions.len(), 3);
         let v0 = meta3.versions.get("1.0.0").unwrap();
         assert!(v0.dependencies.is_empty());
         assert!(v0.dev_dependencies.is_empty());
@@ -855,6 +887,17 @@ mod tests {
         assert_eq!(
             v1.bin.as_ref().unwrap().clone().into_map("quirky-pkg"),
             [("quirky-pkg".to_string(), "cli.js".to_string())].into_iter().collect()
+        );
+
+        let v2 = meta3.versions.get("1.0.2").unwrap();
+        assert_eq!(
+            v2.bin.as_ref().unwrap().clone().into_map("quirky-pkg"),
+            [
+                ("tool.js".to_string(), "./bin/tool.js".to_string()),
+                ("runner".to_string(), "bin/runner".to_string())
+            ]
+            .into_iter()
+            .collect()
         );
     }
 }

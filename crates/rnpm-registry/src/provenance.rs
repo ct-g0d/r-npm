@@ -1119,10 +1119,14 @@ pub fn verify_fulcio_certificate_chain(
     }
 
     if is_leaf_self_signed {
-        let matches_trusted = parsed_roots.iter().any(|r| r.raw_der == leaf.raw_der);
+        let matches_trusted = parsed_roots.iter().any(|r| {
+            r.raw_der == leaf.raw_der
+                && (integrated_time <= 0
+                    || (integrated_time >= r.not_before && integrated_time <= r.not_after))
+        });
         if !matches_trusted {
             return Err(RegistryError::InvalidSigstoreBundle(
-                "Self-signed leaf certificate is not in trusted Fulcio root authorities".into(),
+                "Self-signed leaf certificate is not in trusted Fulcio root authorities or is not valid at integratedTime".into(),
             ));
         }
         return Ok(leaf.clone());
@@ -1147,6 +1151,11 @@ pub fn verify_fulcio_certificate_chain(
     // The topmost certificate in chain (or leaf if chain length is 1) must be signed by or match a trusted root
     let mut trusted = false;
     for root in &parsed_roots {
+        if integrated_time > 0
+            && (integrated_time < root.not_before || integrated_time > root.not_after)
+        {
+            continue;
+        }
         if current.raw_der == root.raw_der {
             trusted = true;
             break;
@@ -2349,6 +2358,7 @@ fn current_time_ms() -> i64 {
         if let Some(integrity_str) = tarball_integrity {
             let trimmed = integrity_str.trim();
 
+            let mut checked_any = false;
             for token in trimmed.split_whitespace() {
                 if let Some((algo, b64)) = token.split_once('-') {
                     let algo_lower = algo.to_ascii_lowercase();
@@ -2366,7 +2376,7 @@ fn current_time_ms() -> i64 {
                                     actual: actual_hex,
                                 });
                             }
-                            return Ok(());
+                            checked_any = true;
                         }
                     } else if algo_lower == "sha256" {
                         if let Some(expected_256) = subject_sha256 {
@@ -2377,10 +2387,14 @@ fn current_time_ms() -> i64 {
                                     actual: actual_hex,
                                 });
                             }
-                            return Ok(());
+                            checked_any = true;
                         }
                     }
                 }
+            }
+
+            if checked_any {
+                return Ok(());
             }
 
             if trimmed.len() == 128 && trimmed.chars().all(|c| c.is_ascii_hexdigit()) {
@@ -3937,7 +3951,7 @@ pub(crate) mod tests {
         let sha512_b64 = BASE64.encode(&Sha512::digest(tarball_bytes));
 
         let mut digests = HashMap::new();
-        digests.insert("sha512".to_string(), sha512_hex);
+        digests.insert("sha512".to_string(), sha512_hex.clone());
         let subject = InTotoSubject {
             name: "pkg@1.0.0".into(),
             digest: digests,
@@ -3951,5 +3965,25 @@ pub(crate) mod tests {
             None
         )
         .is_ok());
+
+        // Multi-digest integrity where one token is tampered must fail
+        let sha256_hex = HEXLOWER.encode(&Sha256::digest(tarball_bytes));
+        let mut digests_both = HashMap::new();
+        digests_both.insert("sha512".to_string(), sha512_hex);
+        digests_both.insert("sha256".to_string(), sha256_hex);
+        let subject_both = InTotoSubject {
+            name: "pkg@1.0.0".into(),
+            digest: digests_both,
+        };
+
+        let bad_sha256_b64 = BASE64.encode(&Sha256::digest(b"corrupted"));
+        let multi_integrity_tampered = format!("sha512-{sha512_b64} sha256-{bad_sha256_b64}");
+        let err = ProvenanceVerifier::verify_subject_digest(
+            &subject_both,
+            Some(&multi_integrity_tampered),
+            None,
+        )
+        .unwrap_err();
+        assert!(matches!(err, RegistryError::AttestationDigestMismatch { .. }));
     }
 }
