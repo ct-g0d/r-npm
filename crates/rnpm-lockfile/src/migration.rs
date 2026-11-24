@@ -553,18 +553,79 @@ pub fn migrate_to_v3(raw: AnyLockfile) -> Result<LockfileV3, LockfileError> {
     }
 }
 
+#[derive(Default, Debug)]
+pub(crate) struct MapPresence {
+    pub(crate) has_entries: bool,
+}
+
+impl<'de> Deserialize<'de> for MapPresence {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct MapPresenceVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for MapPresenceVisitor {
+            type Value = MapPresence;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("a map")
+            }
+
+            fn visit_map<M>(self, mut access: M) -> Result<Self::Value, M::Error>
+            where
+                M: serde::de::MapAccess<'de>,
+            {
+                if let Some((_k, _v)) =
+                    access.next_entry::<serde::de::IgnoredAny, serde::de::IgnoredAny>()?
+                {
+                    while let Some((_k, _v)) =
+                        access.next_entry::<serde::de::IgnoredAny, serde::de::IgnoredAny>()?
+                    {}
+                    Ok(MapPresence { has_entries: true })
+                } else {
+                    Ok(MapPresence { has_entries: false })
+                }
+            }
+        }
+
+        deserializer.deserialize_map(MapPresenceVisitor)
+    }
+}
+
+#[derive(Deserialize)]
+struct LockfileHeaderSniff {
+    #[serde(
+        rename = "lockfileVersion",
+        default = "default_lockfile_version",
+        deserialize_with = "deserialize_lockfile_version"
+    )]
+    pub lockfile_version: u32,
+    #[serde(default)]
+    pub packages: Option<MapPresence>,
+    #[serde(default)]
+    pub dependencies: Option<MapPresence>,
+}
+
 /// Parse a lockfile JSON string of any version (1, 2, or 3) and migrate to v3.
 pub fn parse_and_migrate(json_str: &str) -> Result<LockfileV3, LockfileError> {
-    let raw: AnyLockfile = serde_json::from_str(json_str)?;
-    if raw.lockfile_version == 3 {
-        if (raw.packages.is_none() || raw.packages.as_ref().is_some_and(|p| p.is_empty()))
-            && raw.dependencies.is_some()
-        {
-            return migrate_to_v3(raw);
+    let sniff: LockfileHeaderSniff = serde_json::from_str(json_str)?;
+    match sniff.lockfile_version {
+        3 => {
+            let packages_empty = sniff.packages.as_ref().is_none_or(|p| !p.has_entries);
+            let has_deps = sniff.dependencies.as_ref().is_some_and(|d| d.has_entries);
+            if packages_empty && has_deps {
+                let raw: AnyLockfile = serde_json::from_str(json_str)?;
+                return migrate_to_v3(raw);
+            }
+            LockfileV3::from_json_str(json_str)
         }
-        return LockfileV3::from_json_str(json_str);
+        1 | 2 => {
+            let raw: AnyLockfile = serde_json::from_str(json_str)?;
+            migrate_to_v3(raw)
+        }
+        other => Err(LockfileError::UnsupportedVersion(other)),
     }
-    migrate_to_v3(raw)
 }
 
 /// Load a lockfile from disk and migrate to v3 if necessary.

@@ -1477,6 +1477,7 @@ impl LockfileV3 {
 
         // Check direct overrides
         let overrides = rnpm_core::overrides::Overrides::from_manifest(manifest).ok();
+        let mut key_buf = String::with_capacity(64);
 
         if let Some(ref ov) = overrides {
             for rule_key in ov.rules.keys() {
@@ -1497,8 +1498,10 @@ impl LockfileV3 {
                     })
                     .unwrap_or_else(|| rule_key.clone());
 
-                let key = format!("node_modules/{dep_name}");
-                if let Some(pkg) = self.packages.get(&key) {
+                key_buf.clear();
+                key_buf.push_str("node_modules/");
+                key_buf.push_str(&dep_name);
+                if let Some(pkg) = self.packages.get(key_buf.as_str()) {
                     let req_spec = pkg.version.as_deref().unwrap_or("*");
                     if let Ok(Some(eff_spec)) = ov.resolve_override(&dep_name, req_spec, &[]) {
                         if !Self::package_satisfies_spec(&dep_name, pkg, &eff_spec) {
@@ -1515,8 +1518,10 @@ impl LockfileV3 {
             if manifest.optional_dependencies.contains_key(dep) {
                 continue;
             }
-            let key = format!("node_modules/{dep}");
-            let Some(pkg) = self.packages.get(&key) else {
+            key_buf.clear();
+            key_buf.push_str("node_modules/");
+            key_buf.push_str(dep);
+            let Some(pkg) = self.packages.get(key_buf.as_str()) else {
                 return false;
             };
             let eff_spec = if let Some(ref ov) = overrides {
@@ -1546,8 +1551,10 @@ impl LockfileV3 {
         // 8. Verify direct devDependencies exist in packages map and satisfy specs
         if include_dev {
             for (dep, spec) in &manifest.dev_dependencies {
-                let key = format!("node_modules/{dep}");
-                let Some(pkg) = self.packages.get(&key) else {
+                key_buf.clear();
+                key_buf.push_str("node_modules/");
+                key_buf.push_str(dep);
+                let Some(pkg) = self.packages.get(key_buf.as_str()) else {
                     return false;
                 };
                 let eff_spec = if let Some(ref ov) = overrides {
@@ -1577,8 +1584,10 @@ impl LockfileV3 {
 
         // 9. Verify optional dependencies in packages map satisfy specs if present
         for (dep, spec) in &manifest.optional_dependencies {
-            let key = format!("node_modules/{dep}");
-            if let Some(pkg) = self.packages.get(&key) {
+            key_buf.clear();
+            key_buf.push_str("node_modules/");
+            key_buf.push_str(dep);
+            if let Some(pkg) = self.packages.get(key_buf.as_str()) {
                 let eff_spec = if let Some(ref ov) = overrides {
                     ov.resolve_override(dep, spec, &[])
                         .ok()
@@ -1612,7 +1621,9 @@ impl LockfileV3 {
                 .map(|m| m.optional)
                 .unwrap_or_else(|| root_pkg.is_peer_dep_optional(dep));
 
-            let key = format!("node_modules/{dep}");
+            key_buf.clear();
+            key_buf.push_str("node_modules/");
+            key_buf.push_str(dep);
             let eff_spec = if let Some(ref ov) = overrides {
                 ov.resolve_override(dep, spec, &[])
                     .ok()
@@ -1632,7 +1643,7 @@ impl LockfileV3 {
                     }
                 }
             }
-            if let Some(pkg) = self.packages.get(&key) {
+            if let Some(pkg) = self.packages.get(key_buf.as_str()) {
                 if !Self::package_satisfies_spec(dep, pkg, &eff_spec) {
                     return false;
                 }
@@ -2340,6 +2351,8 @@ impl LockfileV3 {
             return false;
         }
 
+        let mut key_buf = String::with_capacity(64);
+
         for (k, manifest_spec) in manifest_map {
             let Some(lock_spec) = lock.get(k) else {
                 return false;
@@ -2402,8 +2415,10 @@ impl LockfileV3 {
                 if m_name != l_name {
                     return false;
                 }
-                let key = format!("node_modules/{k}");
-                let Some(pkg) = packages.get(&key) else {
+                key_buf.clear();
+                key_buf.push_str("node_modules/");
+                key_buf.push_str(k);
+                let Some(pkg) = packages.get(key_buf.as_str()) else {
                     return false;
                 };
                 if !Self::package_satisfies_spec(k, pkg, manifest_spec) {
@@ -2411,8 +2426,10 @@ impl LockfileV3 {
                 }
                 continue;
             }
-            let key = format!("node_modules/{k}");
-            let Some(pkg) = packages.get(&key) else {
+            key_buf.clear();
+            key_buf.push_str("node_modules/");
+            key_buf.push_str(k);
+            let Some(pkg) = packages.get(key_buf.as_str()) else {
                 return false;
             };
             if !Self::package_satisfies_spec(k, pkg, manifest_spec) {
@@ -2469,83 +2486,14 @@ impl LockfileV3 {
     /// Guarantees strict LF line endings and normalized POSIX forward-slash package keys.
     /// Fast-path avoids cloning the entire package tree when all keys are already normalized POSIX paths.
     pub fn to_json_string(&self) -> Result<String, LockfileError> {
-        let mut root = serde_json::Map::new();
-        root.insert("name".into(), serde_json::Value::String(self.name.clone()));
-        if let Some(v) = &self.version {
-            root.insert("version".into(), serde_json::Value::String(v.clone()));
-        }
-        root.insert(
-            "lockfileVersion".into(),
-            serde_json::Value::Number(self.lockfile_version.into()),
-        );
-        if let Some(r) = self.requires {
-            root.insert("requires".into(), serde_json::Value::Bool(r));
-        }
-        let mut packages = serde_json::Map::new();
-        for (k, v) in &self.packages {
-            let mut pkg = v.clone();
-            pkg.normalize_flags();
-            let pkg_val = if let Some(ref raw) = pkg.raw_value {
-                raw.clone()
-            } else {
-                serde_json::to_value(&pkg)?
-            };
-            packages.insert(to_posix_path(k), pkg_val);
-        }
-        root.insert("packages".into(), serde_json::Value::Object(packages));
-        let mut out = String::new();
-        stringify_npm_nice(&serde_json::Value::Object(root), 0, &mut out);
-        if !out.ends_with('\n') {
-            out.push('\n');
-        }
-        let lf_json = out.replace("\r\n", "\n");
-        Ok(lf_json)
+        self.to_json_string_formatted(&rnpm_core::ManifestFormat::default())
     }
 
     pub fn to_json_string_formatted(
         &self,
         format: &rnpm_core::ManifestFormat,
     ) -> Result<String, LockfileError> {
-        let mut root = serde_json::Map::new();
-        root.insert("name".into(), serde_json::Value::String(self.name.clone()));
-        if let Some(v) = &self.version {
-            root.insert("version".into(), serde_json::Value::String(v.clone()));
-        }
-        root.insert(
-            "lockfileVersion".into(),
-            serde_json::Value::Number(self.lockfile_version.into()),
-        );
-        if let Some(r) = self.requires {
-            root.insert("requires".into(), serde_json::Value::Bool(r));
-        }
-        let mut packages = serde_json::Map::new();
-        for (k, v) in &self.packages {
-            let mut pkg = v.clone();
-            pkg.normalize_flags();
-            let pkg_val = if let Some(ref raw) = pkg.raw_value {
-                raw.clone()
-            } else {
-                serde_json::to_value(&pkg)?
-            };
-            packages.insert(to_posix_path(k), pkg_val);
-        }
-        root.insert("packages".into(), serde_json::Value::Object(packages));
-        let mut out = String::new();
-        stringify_npm_nice_indent(
-            &serde_json::Value::Object(root),
-            &format.indent,
-            0,
-            &mut out,
-        );
-        if !out.ends_with('\n') {
-            out.push('\n');
-        }
-        let final_json = if format.newline == "\r\n" {
-            out.replace("\r\n", "\n").replace('\n', "\r\n")
-        } else {
-            out.replace("\r\n", "\n")
-        };
-        Ok(final_json)
+        self.to_npm_json_string_formatted(format, true)
     }
 
     /// Serialize using npm's requested lockfile format.  The resolver keeps a
@@ -2560,110 +2508,29 @@ impl LockfileV3 {
         version: u32,
         format: &rnpm_core::ManifestFormat,
     ) -> Result<String, LockfileError> {
-        match version {
-            3 => self.to_json_string_formatted(format),
-            1 | 2 => {
-                let mut root = serde_json::Map::new();
-                root.insert("name".into(), serde_json::Value::String(self.name.clone()));
-                if let Some(v) = &self.version {
-                    root.insert("version".into(), serde_json::Value::String(v.clone()));
-                }
-                root.insert(
-                    "lockfileVersion".into(),
-                    serde_json::Value::Number(version.into()),
-                );
-                root.insert("requires".into(), serde_json::Value::Bool(true));
-
-                let legacy = self.to_legacy_dependencies();
-                if version == 1 {
-                    root.insert("dependencies".into(), legacy);
-                } else {
-                    let packages = self.to_v3_packages_value()?;
-                    root.insert("packages".into(), packages);
-                    root.insert("dependencies".into(), legacy);
-                }
-                let mut out = String::new();
-                stringify_npm_nice_indent(
-                    &serde_json::Value::Object(root),
-                    &format.indent,
-                    0,
-                    &mut out,
-                );
-                if !out.ends_with('\n') {
-                    out.push('\n');
-                }
-                let final_json = if format.newline == "\r\n" {
-                    out.replace("\r\n", "\n").replace('\n', "\r\n")
-                } else {
-                    out.replace("\r\n", "\n")
-                };
-                Ok(final_json)
-            }
-            other => Err(LockfileError::UnsupportedVersion(other)),
+        if version != 1 && version != 2 && version != 3 {
+            return Err(LockfileError::UnsupportedVersion(version));
         }
+        let mut out = String::with_capacity(self.packages.len() * 200);
+        let writer = LockfileWriter::new(&format.indent, &format.newline, false, true);
+        writer.write_lockfile(self, version, &mut out)?;
+        Ok(out)
     }
 
     /// Serialize to compact single-line JSON without indentation or trailing newline.
     pub fn to_json_string_compact(&self) -> Result<String, LockfileError> {
-        let mut root = serde_json::Map::new();
-        root.insert("name".into(), serde_json::Value::String(self.name.clone()));
-        if let Some(v) = &self.version {
-            root.insert("version".into(), serde_json::Value::String(v.clone()));
-        }
-        root.insert(
-            "lockfileVersion".into(),
-            serde_json::Value::Number(self.lockfile_version.into()),
-        );
-        if let Some(r) = self.requires {
-            root.insert("requires".into(), serde_json::Value::Bool(r));
-        }
-        let mut packages = serde_json::Map::new();
-        for (k, v) in &self.packages {
-            let mut pkg = v.clone();
-            pkg.normalize_flags();
-            let pkg_val = if let Some(ref raw) = pkg.raw_value {
-                raw.clone()
-            } else {
-                serde_json::to_value(&pkg)?
-            };
-            packages.insert(to_posix_path(k), pkg_val);
-        }
-        root.insert("packages".into(), serde_json::Value::Object(packages));
-        let mut out = String::new();
-        stringify_npm_compact(&serde_json::Value::Object(root), &mut out);
-        Ok(out)
+        self.to_json_string_version_compact(self.lockfile_version)
     }
 
     /// Serialize using npm's requested lockfile format (1, 2, or 3) in compact single-line JSON.
     pub fn to_json_string_version_compact(&self, version: u32) -> Result<String, LockfileError> {
-        match version {
-            3 => self.to_json_string_compact(),
-            1 | 2 => {
-                let mut root = serde_json::Map::new();
-                root.insert("name".into(), serde_json::Value::String(self.name.clone()));
-                if let Some(v) = &self.version {
-                    root.insert("version".into(), serde_json::Value::String(v.clone()));
-                }
-                root.insert(
-                    "lockfileVersion".into(),
-                    serde_json::Value::Number(version.into()),
-                );
-                root.insert("requires".into(), serde_json::Value::Bool(true));
-
-                let legacy = self.to_legacy_dependencies();
-                if version == 1 {
-                    root.insert("dependencies".into(), legacy);
-                } else {
-                    let packages = self.to_v3_packages_value()?;
-                    root.insert("packages".into(), packages);
-                    root.insert("dependencies".into(), legacy);
-                }
-                let mut out = String::new();
-                stringify_npm_compact(&serde_json::Value::Object(root), &mut out);
-                Ok(out)
-            }
-            other => Err(LockfileError::UnsupportedVersion(other)),
+        if version != 1 && version != 2 && version != 3 {
+            return Err(LockfileError::UnsupportedVersion(version));
         }
+        let mut out = String::with_capacity(self.packages.len() * 100);
+        let writer = LockfileWriter::new("", "", true, true);
+        writer.write_lockfile(self, version, &mut out)?;
+        Ok(out)
     }
 
     pub fn to_json_string_version_formatted_options(
@@ -2738,19 +2605,6 @@ impl LockfileV3 {
         };
         let format_package_lock = is_format_package_lock_enabled(root_dir);
         self.save_to_file_version_formatted_option(path, version, format_package_lock)
-    }
-
-    fn to_v3_packages_value(&self) -> Result<serde_json::Value, LockfileError> {
-        let mut packages = serde_json::Map::new();
-        for (key, package) in &self.packages {
-            let pkg_val = if let Some(ref raw) = package.raw_value {
-                raw.clone()
-            } else {
-                serde_json::to_value(package)?
-            };
-            packages.insert(to_posix_path(key), pkg_val);
-        }
-        Ok(serde_json::Value::Object(packages))
     }
 
     fn to_legacy_dependencies(&self) -> serde_json::Value {
@@ -2910,20 +2764,22 @@ impl LockfileV3 {
     }
 
     /// Load and parse a v3 lockfile from a string, normalizing all package keys to POSIX paths.
+    /// Preserves untouched `raw_value` JSON values on packages for 100% round-trip fidelity.
     pub fn from_json_str(s: &str) -> Result<Self, LockfileError> {
         let mut lockfile: Self = serde_json::from_str(s)?;
-        let raw_val: Option<serde_json::Value> = serde_json::from_str(s).ok();
-        let raw_packages = raw_val
-            .as_ref()
-            .and_then(|v| v.get("packages"))
-            .and_then(|p| p.as_object());
+        let mut raw_val: Option<serde_json::Value> = serde_json::from_str(s).ok();
+        let mut raw_packages = raw_val
+            .as_mut()
+            .and_then(|v| v.get_mut("packages"))
+            .and_then(|p| p.as_object_mut())
+            .map(std::mem::take);
         let packages = std::mem::take(&mut lockfile.packages);
         for (k, mut v) in packages {
             v.normalize_flags();
             let posix_k = to_posix_path(&k);
-            if let Some(raw_pkgs) = raw_packages {
-                if let Some(raw_p) = raw_pkgs.get(&k).or_else(|| raw_pkgs.get(&posix_k)) {
-                    v.raw_value = Some(raw_p.clone());
+            if let Some(ref mut raw_pkgs) = raw_packages {
+                if let Some(raw_p) = raw_pkgs.remove(&k).or_else(|| raw_pkgs.remove(&posix_k)) {
+                    v.raw_value = Some(raw_p);
                 }
             }
             lockfile.packages.insert(posix_k, v);
@@ -2931,10 +2787,38 @@ impl LockfileV3 {
         Ok(lockfile)
     }
 
+    /// Parse a v3 lockfile in a single serde pass without building `serde_json::Value`
+    /// or populating `raw_value`. Zero extra DOM allocations (ideal for `ci` / `fast_path` / `ls`).
+    pub fn from_json_str_readonly(content: &str) -> Result<Self, LockfileError> {
+        let mut lockfile: Self = serde_json::from_str(content)?;
+        let packages = std::mem::take(&mut lockfile.packages);
+        for (k, mut v) in packages {
+            v.normalize_flags();
+            lockfile.packages.insert(to_posix_path(&k), v);
+        }
+        Ok(lockfile)
+    }
+
+    /// Read and parse a v3 lockfile from disk in a single pass without populating `raw_value`.
+    pub fn from_file_readonly(path: &Path) -> Result<Self, LockfileError> {
+        let content = fs::read_to_string(path)?;
+        Self::from_json_str_readonly(&content)
+    }
+
+    /// Alias for `from_file_readonly`.
+    pub fn load_from_file_readonly(path: &Path) -> Result<Self, LockfileError> {
+        Self::from_file_readonly(path)
+    }
+
     /// Load and parse a v3 lockfile from disk.
     pub fn load_from_file(path: &Path) -> Result<Self, LockfileError> {
         let content = fs::read_to_string(path)?;
         Self::from_json_str(&content)
+    }
+
+    /// Alias for `load_from_file`.
+    pub fn from_file(path: &Path) -> Result<Self, LockfileError> {
+        Self::load_from_file(path)
     }
 
     /// Load the hidden lockfile from `<project_dir>/node_modules/.package-lock.json`.
@@ -3017,68 +2901,19 @@ impl LockfileV3 {
         self.to_npm_json_string_formatted(&rnpm_core::ManifestFormat::default(), true)
     }
 
-    fn to_npm_json_string_formatted(
+    pub fn to_npm_json_string_formatted(
         &self,
         format: &rnpm_core::ManifestFormat,
         root_metadata: bool,
     ) -> Result<String, LockfileError> {
-        let has_any_raw = self.packages.values().any(|p| p.raw_value.is_some());
-        let mut value = if has_any_raw {
-            let mut root = serde_json::Map::new();
-            root.insert("name".into(), serde_json::Value::String(self.name.clone()));
-            if let Some(v) = &self.version {
-                root.insert("version".into(), serde_json::Value::String(v.clone()));
-            }
-            root.insert(
-                "lockfileVersion".into(),
-                serde_json::Value::Number(self.lockfile_version.into()),
-            );
-            if let Some(r) = self.requires {
-                root.insert("requires".into(), serde_json::Value::Bool(r));
-            }
-            let mut packages = serde_json::Map::new();
-            for (k, v) in &self.packages {
-                let mut pkg = v.clone();
-                pkg.normalize_flags();
-                let pkg_val = if let Some(ref raw) = pkg.raw_value {
-                    raw.clone()
-                } else {
-                    serde_json::to_value(&pkg)?
-                };
-                packages.insert(to_posix_path(k), pkg_val);
-            }
-            root.insert("packages".into(), serde_json::Value::Object(packages));
-            serde_json::Value::Object(root)
-        } else {
-            let mut normalized_packages = BTreeMap::new();
-            for (k, v) in &self.packages {
-                let mut pkg = v.clone();
-                pkg.normalize_flags();
-                normalized_packages.insert(to_posix_path(k), pkg);
-            }
-            let mut copy = self.clone();
-            copy.packages = normalized_packages;
-            serde_json::to_value(&copy)?
-        };
-        if !root_metadata {
-            if let Some(root) = value.as_object_mut() {
-                root.remove("name");
-                root.remove("version");
-            }
-        }
-        let mut out = String::new();
-        stringify_npm_nice_indent(&value, &format.indent, 0, &mut out);
-        if !out.ends_with('\n') {
-            out.push('\n');
-        }
-        if format.newline == "\r\n" {
-            out = out.replace("\r\n", "\n").replace('\n', "\r\n");
-        }
+        let mut out = String::with_capacity(self.packages.len() * 200);
+        let writer = LockfileWriter::new(&format.indent, &format.newline, false, root_metadata);
+        writer.write_lockfile(self, self.lockfile_version, &mut out)?;
         Ok(out)
     }
 }
 
-const SW_KEY_ORDER: &[&str] = &[
+pub const SW_KEY_ORDER: &[&str] = &[
     "name",
     "version",
     "lockfileVersion",
@@ -3089,9 +2924,302 @@ const SW_KEY_ORDER: &[&str] = &[
     "dependencies",
 ];
 
-fn indent_spaces(out: &mut String, indent: &str, level: usize) {
-    for _ in 0..level {
-        out.push_str(indent);
+#[inline]
+pub(crate) fn write_json_str(s: &str, out: &mut String) {
+    let bytes = s.as_bytes();
+    if bytes.iter().all(|&b| b >= 0x20 && b != b'"' && b != b'\\') {
+        out.push('"');
+        out.push_str(s);
+        out.push('"');
+    } else {
+        let escaped = serde_json::to_string(s).unwrap_or_default();
+        out.push_str(&escaped);
+    }
+}
+
+/// Streaming serializer for npm lockfiles preserving 100% npm 11 key order,
+/// collation, formatting, and raw value fidelity without intermediate DOM allocations.
+#[derive(Debug, Clone)]
+pub struct LockfileWriter<'a> {
+    indent: &'a str,
+    newline: &'a str,
+    compact: bool,
+    root_metadata: bool,
+}
+
+impl<'a> LockfileWriter<'a> {
+    pub fn new(
+        indent: &'a str,
+        newline: &'a str,
+        compact: bool,
+        root_metadata: bool,
+    ) -> Self {
+        Self {
+            indent,
+            newline,
+            compact,
+            root_metadata,
+        }
+    }
+
+    #[inline]
+    fn write_indent(&self, out: &mut String, level: usize) {
+        if !self.compact {
+            for _ in 0..level {
+                out.push_str(self.indent);
+            }
+        }
+    }
+
+    #[inline]
+    fn write_newline(&self, out: &mut String) {
+        if !self.compact {
+            out.push_str(self.newline);
+        }
+    }
+
+    #[inline]
+    fn colon_sep(&self) -> &'static str {
+        if self.compact {
+            ":"
+        } else {
+            ": "
+        }
+    }
+
+    pub fn write_value(&self, val: &serde_json::Value, level: usize, out: &mut String) {
+        match val {
+            serde_json::Value::Null => out.push_str("null"),
+            serde_json::Value::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
+            serde_json::Value::Number(n) => out.push_str(&n.to_string()),
+            serde_json::Value::String(s) => write_json_str(s, out),
+            serde_json::Value::Array(arr) => {
+                if arr.is_empty() {
+                    out.push_str("[]");
+                } else if self.compact {
+                    out.push('[');
+                    for (i, item) in arr.iter().enumerate() {
+                        self.write_value(item, 0, out);
+                        if i + 1 < arr.len() {
+                            out.push(',');
+                        }
+                    }
+                    out.push(']');
+                } else {
+                    out.push('[');
+                    out.push_str(self.newline);
+                    for (i, item) in arr.iter().enumerate() {
+                        self.write_indent(out, level + 1);
+                        self.write_value(item, level + 1, out);
+                        if i + 1 < arr.len() {
+                            out.push(',');
+                        }
+                        out.push_str(self.newline);
+                    }
+                    self.write_indent(out, level);
+                    out.push(']');
+                }
+            }
+            serde_json::Value::Object(map) => {
+                if map.is_empty() {
+                    out.push_str("{}");
+                } else {
+                    let mut entries: Vec<(&String, &serde_json::Value)> = map.iter().collect();
+                    let is_obj = |v: &serde_json::Value| -> bool { v.is_object() };
+                    let key_priority =
+                        |k: &str| -> Option<usize> { SW_KEY_ORDER.iter().position(|&p| p == k) };
+                    entries.sort_by(|(ak, av), (bk, bv)| {
+                        let a_obj = is_obj(av);
+                        let b_obj = is_obj(bv);
+                        if a_obj != b_obj {
+                            if a_obj {
+                                std::cmp::Ordering::Greater
+                            } else {
+                                std::cmp::Ordering::Less
+                            }
+                        } else {
+                            match (key_priority(ak), key_priority(bk)) {
+                                (Some(pa), Some(pb)) => pa.cmp(&pb),
+                                (Some(_), None) => std::cmp::Ordering::Less,
+                                (None, Some(_)) => std::cmp::Ordering::Greater,
+                                (None, None) => npm_key_compare(ak, bk),
+                            }
+                        }
+                    });
+
+                    if self.compact {
+                        out.push('{');
+                        for (i, (k, v)) in entries.iter().enumerate() {
+                            write_json_str(k, out);
+                            out.push(':');
+                            self.write_value(v, 0, out);
+                            if i + 1 < entries.len() {
+                                out.push(',');
+                            }
+                        }
+                        out.push('}');
+                    } else {
+                        out.push('{');
+                        out.push_str(self.newline);
+                        for (i, (k, v)) in entries.iter().enumerate() {
+                            self.write_indent(out, level + 1);
+                            write_json_str(k, out);
+                            out.push_str(": ");
+                            self.write_value(v, level + 1, out);
+                            if i + 1 < entries.len() {
+                                out.push(',');
+                            }
+                            out.push_str(self.newline);
+                        }
+                        self.write_indent(out, level);
+                        out.push('}');
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn write_lockfile(
+        &self,
+        lockfile: &LockfileV3,
+        target_version: u32,
+        out: &mut String,
+    ) -> Result<(), LockfileError> {
+        out.push('{');
+        self.write_newline(out);
+
+        let mut first_field = true;
+
+        // 1. name (if root_metadata)
+        if self.root_metadata {
+            first_field = false;
+            self.write_indent(out, 1);
+            write_json_str("name", out);
+            out.push_str(self.colon_sep());
+            write_json_str(&lockfile.name, out);
+        }
+
+        // 2. version (if root_metadata and Some)
+        if self.root_metadata {
+            if let Some(ref v) = lockfile.version {
+                if !first_field {
+                    out.push(',');
+                    self.write_newline(out);
+                }
+                first_field = false;
+                self.write_indent(out, 1);
+                write_json_str("version", out);
+                out.push_str(self.colon_sep());
+                write_json_str(v, out);
+            }
+        }
+
+        // 3. lockfileVersion
+        if !first_field {
+            out.push(',');
+            self.write_newline(out);
+        }
+        self.write_indent(out, 1);
+        write_json_str("lockfileVersion", out);
+        out.push_str(self.colon_sep());
+        out.push_str(&target_version.to_string());
+
+        // 4. requires
+        match target_version {
+            1 | 2 => {
+                out.push(',');
+                self.write_newline(out);
+                self.write_indent(out, 1);
+                write_json_str("requires", out);
+                out.push_str(self.colon_sep());
+                out.push_str("true");
+            }
+            3 => {
+                if let Some(r) = lockfile.requires {
+                    out.push(',');
+                    self.write_newline(out);
+                    self.write_indent(out, 1);
+                    write_json_str("requires", out);
+                    out.push_str(self.colon_sep());
+                    out.push_str(if r { "true" } else { "false" });
+                }
+            }
+            _ => {}
+        }
+
+        // 5. packages (v2 or v3)
+        if target_version == 2 || target_version == 3 {
+            out.push(',');
+            self.write_newline(out);
+            self.write_indent(out, 1);
+            write_json_str("packages", out);
+            out.push_str(self.colon_sep());
+
+            if lockfile.packages.is_empty() {
+                out.push_str("{}");
+            } else {
+                out.push('{');
+                self.write_newline(out);
+
+                let mut pkg_entries: Vec<(std::borrow::Cow<'_, str>, &LockfilePackage)> =
+                    lockfile
+                        .packages
+                        .iter()
+                        .map(|(k, v)| {
+                            if k.contains('\\') {
+                                (std::borrow::Cow::Owned(to_posix_path(k)), v)
+                            } else {
+                                (std::borrow::Cow::Borrowed(k.as_str()), v)
+                            }
+                        })
+                        .collect();
+                pkg_entries.sort_by(|(k1, _), (k2, _)| npm_key_compare(k1, k2));
+
+                for (i, (k, pkg)) in pkg_entries.iter().enumerate() {
+                    self.write_indent(out, 2);
+                    write_json_str(k, out);
+                    out.push_str(self.colon_sep());
+
+                    if let Some(ref raw) = pkg.raw_value {
+                        self.write_value(raw, 2, out);
+                    } else {
+                        let mut p = (*pkg).clone();
+                        p.normalize_flags();
+                        let pkg_val = serde_json::to_value(&p)?;
+                        self.write_value(&pkg_val, 2, out);
+                    }
+
+                    if i + 1 < pkg_entries.len() {
+                        out.push(',');
+                    }
+                    self.write_newline(out);
+                }
+
+                self.write_indent(out, 1);
+                out.push('}');
+            }
+        }
+
+        // 6. dependencies (v1 or v2)
+        if target_version == 1 || target_version == 2 {
+            out.push(',');
+            self.write_newline(out);
+            self.write_indent(out, 1);
+            write_json_str("dependencies", out);
+            out.push_str(self.colon_sep());
+            let legacy = lockfile.to_legacy_dependencies();
+            self.write_value(&legacy, 1, out);
+        }
+
+        // Close root
+        self.write_newline(out);
+        out.push('}');
+
+        if !self.compact {
+            out.push_str(self.newline);
+        }
+
+        Ok(())
     }
 }
 
@@ -3213,151 +3341,26 @@ pub fn npm_key_compare(a: &str, b: &str) -> std::cmp::Ordering {
     }).then_with(|| a.cmp(b))
 }
 
+#[allow(dead_code)]
 pub(crate) fn stringify_npm_nice(val: &serde_json::Value, indent_level: usize, out: &mut String) {
     stringify_npm_nice_indent(val, "  ", indent_level, out);
 }
 
+#[allow(dead_code)]
 pub(crate) fn stringify_npm_nice_indent(
     val: &serde_json::Value,
     indent: &str,
     indent_level: usize,
     out: &mut String,
 ) {
-    match val {
-        serde_json::Value::Null => out.push_str("null"),
-        serde_json::Value::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
-        serde_json::Value::Number(n) => out.push_str(&n.to_string()),
-        serde_json::Value::String(s) => {
-            out.push_str(&serde_json::to_string(s).unwrap_or_default());
-        }
-        serde_json::Value::Array(arr) => {
-            if arr.is_empty() {
-                out.push_str("[]");
-            } else {
-                out.push_str("[\n");
-                for (i, item) in arr.iter().enumerate() {
-                    indent_spaces(out, indent, indent_level + 1);
-                    stringify_npm_nice_indent(item, indent, indent_level + 1, out);
-                    if i + 1 < arr.len() {
-                        out.push(',');
-                    }
-                    out.push('\n');
-                }
-                indent_spaces(out, indent, indent_level);
-                out.push(']');
-            }
-        }
-        serde_json::Value::Object(map) => {
-            if map.is_empty() {
-                out.push_str("{}");
-            } else {
-                out.push_str("{\n");
-                let mut entries: Vec<(&String, &serde_json::Value)> = map.iter().collect();
-
-                let is_obj = |v: &serde_json::Value| -> bool { v.is_object() };
-
-                let key_priority =
-                    |k: &str| -> Option<usize> { SW_KEY_ORDER.iter().position(|&p| p == k) };
-
-                entries.sort_by(|(ak, av), (bk, bv)| {
-                    let a_obj = is_obj(av);
-                    let b_obj = is_obj(bv);
-                    if a_obj != b_obj {
-                        if a_obj {
-                            return std::cmp::Ordering::Greater;
-                        } else {
-                            return std::cmp::Ordering::Less;
-                        }
-                    }
-                    match (key_priority(ak), key_priority(bk)) {
-                        (Some(pa), Some(pb)) => pa.cmp(&pb),
-                        (Some(_), None) => std::cmp::Ordering::Less,
-                        (None, Some(_)) => std::cmp::Ordering::Greater,
-                        (None, None) => npm_key_compare(ak, bk),
-                    }
-                });
-
-                for (i, (k, v)) in entries.iter().enumerate() {
-                    indent_spaces(out, indent, indent_level + 1);
-                    out.push_str(&serde_json::to_string(k).unwrap_or_default());
-                    out.push_str(": ");
-                    stringify_npm_nice_indent(v, indent, indent_level + 1, out);
-                    if i + 1 < entries.len() {
-                        out.push(',');
-                    }
-                    out.push('\n');
-                }
-                indent_spaces(out, indent, indent_level);
-                out.push('}');
-            }
-        }
-    }
+    let writer = LockfileWriter::new(indent, "\n", false, true);
+    writer.write_value(val, indent_level, out);
 }
 
+#[allow(dead_code)]
 pub(crate) fn stringify_npm_compact(val: &serde_json::Value, out: &mut String) {
-    match val {
-        serde_json::Value::Null => out.push_str("null"),
-        serde_json::Value::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
-        serde_json::Value::Number(n) => out.push_str(&n.to_string()),
-        serde_json::Value::String(s) => {
-            out.push_str(&serde_json::to_string(s).unwrap_or_default());
-        }
-        serde_json::Value::Array(arr) => {
-            if arr.is_empty() {
-                out.push_str("[]");
-            } else {
-                out.push('[');
-                for (i, item) in arr.iter().enumerate() {
-                    stringify_npm_compact(item, out);
-                    if i + 1 < arr.len() {
-                        out.push(',');
-                    }
-                }
-                out.push(']');
-            }
-        }
-        serde_json::Value::Object(map) => {
-            if map.is_empty() {
-                out.push_str("{}");
-            } else {
-                out.push('{');
-                let mut entries: Vec<(&String, &serde_json::Value)> = map.iter().collect();
-
-                let is_obj = |v: &serde_json::Value| -> bool { v.is_object() };
-
-                let key_priority =
-                    |k: &str| -> Option<usize> { SW_KEY_ORDER.iter().position(|&p| p == k) };
-
-                entries.sort_by(|(ak, av), (bk, bv)| {
-                    let a_obj = is_obj(av);
-                    let b_obj = is_obj(bv);
-                    if a_obj != b_obj {
-                        if a_obj {
-                            return std::cmp::Ordering::Greater;
-                        } else {
-                            return std::cmp::Ordering::Less;
-                        }
-                    }
-                    match (key_priority(ak), key_priority(bk)) {
-                        (Some(pa), Some(pb)) => pa.cmp(&pb),
-                        (Some(_), None) => std::cmp::Ordering::Less,
-                        (None, Some(_)) => std::cmp::Ordering::Greater,
-                        (None, None) => npm_key_compare(ak, bk),
-                    }
-                });
-
-                for (i, (k, v)) in entries.iter().enumerate() {
-                    out.push_str(&serde_json::to_string(k).unwrap_or_default());
-                    out.push(':');
-                    stringify_npm_compact(v, out);
-                    if i + 1 < entries.len() {
-                        out.push(',');
-                    }
-                }
-                out.push('}');
-            }
-        }
-    }
+    let writer = LockfileWriter::new("", "", true, true);
+    writer.write_value(val, 0, out);
 }
 
 pub(crate) fn is_platform_incompatible(pkg: &LockfilePackage) -> bool {
