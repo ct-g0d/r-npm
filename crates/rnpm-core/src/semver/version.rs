@@ -11,12 +11,14 @@ pub enum PrereleaseId {
 }
 
 impl PartialOrd for PrereleaseId {
+    #[inline]
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
     }
 }
 
 impl Ord for PrereleaseId {
+    #[inline]
     fn cmp(&self, other: &Self) -> Ordering {
         match (self, other) {
             (PrereleaseId::Numeric(a), PrereleaseId::Numeric(b)) => a.cmp(b),
@@ -46,7 +48,81 @@ pub struct Version {
     pub build: Vec<String>,
 }
 
+#[inline]
+pub(crate) fn parse_u64_segment(bytes: &[u8]) -> Option<u64> {
+    if bytes.is_empty() {
+        return None;
+    }
+    // SemVer 2.0.0 §2: Numeric segments MUST NOT contain leading zeroes
+    if bytes.len() > 1 && bytes[0] == b'0' {
+        return None;
+    }
+    let mut val: u64 = 0;
+    for &b in bytes {
+        if !b.is_ascii_digit() {
+            return None;
+        }
+        val = val.checked_mul(10)?.checked_add((b - b'0') as u64)?;
+    }
+    Some(val)
+}
+
+#[inline]
+pub(crate) fn parse_loose_u64_segment(bytes: &[u8]) -> Option<u64> {
+    if bytes.is_empty() {
+        return None;
+    }
+    let mut val: u64 = 0;
+    for &b in bytes {
+        if !b.is_ascii_digit() {
+            return None;
+        }
+        val = val.checked_mul(10)?.checked_add((b - b'0') as u64)?;
+    }
+    Some(val)
+}
+
+/// Zero-allocation parser for pure `MAJOR.MINOR.PATCH` with no prerelease/build metadata.
+#[inline]
+pub(crate) fn parse_fast_u64_triplet(s: &str) -> Option<(u64, u64, u64)> {
+    let bytes = s.as_bytes();
+    if bytes.is_empty() {
+        return None;
+    }
+
+    let mut dot1 = None;
+    let mut dot2 = None;
+
+    for (i, &b) in bytes.iter().enumerate() {
+        if b == b'.' {
+            if dot1.is_none() {
+                dot1 = Some(i);
+            } else if dot2.is_none() {
+                dot2 = Some(i);
+            } else {
+                return None; // More than 2 dots
+            }
+        } else if !b.is_ascii_digit() {
+            return None; // Any non-digit (including -, +, whitespace)
+        }
+    }
+
+    let d1 = dot1?;
+    let d2 = dot2?;
+
+    let s0 = &bytes[..d1];
+    let s1 = &bytes[d1 + 1..d2];
+    let s2 = &bytes[d2 + 1..];
+
+    let major = parse_u64_segment(s0)?;
+    let minor = parse_u64_segment(s1)?;
+    let patch = parse_u64_segment(s2)?;
+
+    Some((major, minor, patch))
+}
+
 impl Version {
+    #[inline]
     pub fn new(major: u64, minor: u64, patch: u64) -> Self {
         Self {
             major,
@@ -67,7 +143,25 @@ impl Version {
             .unwrap_or(s);
         let s = s.trim();
         // node-semver never accepts inner whitespace: "2.5.0 - 3" is a range.
-        if s.is_empty() || s.contains(char::is_whitespace) {
+        if s.is_empty() || s.chars().any(char::is_whitespace) {
+            return Err(SemverError::InvalidVersion(input.to_string()));
+        }
+
+        // Fast path: pure major.minor.patch with zero heap allocations (95% common case)
+        if let Some((major, minor, patch)) = parse_fast_u64_triplet(s) {
+            return Ok(Self {
+                major,
+                minor,
+                patch,
+                prerelease: Vec::new(),
+                build: Vec::new(),
+            });
+        }
+
+        // If string contains only digits and dots, but failed parse_fast_u64_triplet,
+        // it means it had leading zeroes ("01.2.3"), too many/few dots ("1.2" or "1.2.3.4"),
+        // or numeric overflow. Without '-' or '+', it is definitively an invalid version.
+        if s.bytes().all(|b| b.is_ascii_digit() || b == b'.') {
             return Err(SemverError::InvalidVersion(input.to_string()));
         }
 
@@ -121,35 +215,25 @@ impl Version {
             (ver_pre, Vec::new())
         };
 
-        // Parse major.minor.patch
-        let parts: Vec<&str> = ver_part.split('.').collect();
-        if parts.len() != 3 {
+        // Parse major.minor.patch without allocating a Vec
+        let mut split = ver_part.split('.');
+        let p0 = split.next();
+        let p1 = split.next();
+        let p2 = split.next();
+        if split.next().is_some() {
             return Err(SemverError::InvalidVersion(input.to_string()));
         }
+        let (p0, p1, p2) = match (p0, p1, p2) {
+            (Some(a), Some(b), Some(c)) => (a, b, c),
+            _ => return Err(SemverError::InvalidVersion(input.to_string())),
+        };
 
-        for p in &parts {
-            let p = p.trim();
-            if p.is_empty() || !p.chars().all(|c| c.is_ascii_digit()) {
-                return Err(SemverError::InvalidVersion(input.to_string()));
-            }
-            // SemVer 2.0.0 §2: Numeric segments MUST NOT contain leading zeroes
-            if p.len() > 1 && p.starts_with('0') {
-                return Err(SemverError::InvalidVersion(input.to_string()));
-            }
-        }
-
-        let major = parts[0]
-            .trim()
-            .parse::<u64>()
-            .map_err(|_| SemverError::InvalidVersion(input.to_string()))?;
-        let minor = parts[1]
-            .trim()
-            .parse::<u64>()
-            .map_err(|_| SemverError::InvalidVersion(input.to_string()))?;
-        let patch = parts[2]
-            .trim()
-            .parse::<u64>()
-            .map_err(|_| SemverError::InvalidVersion(input.to_string()))?;
+        let major = parse_u64_segment(p0.trim().as_bytes())
+            .ok_or_else(|| SemverError::InvalidVersion(input.to_string()))?;
+        let minor = parse_u64_segment(p1.trim().as_bytes())
+            .ok_or_else(|| SemverError::InvalidVersion(input.to_string()))?;
+        let patch = parse_u64_segment(p2.trim().as_bytes())
+            .ok_or_else(|| SemverError::InvalidVersion(input.to_string()))?;
 
         Ok(Self {
             major,
@@ -168,8 +252,41 @@ impl Version {
         let s = trimmed.trim_start_matches(['v', 'V', '=', ' ']);
         let s = s.trim();
         // node-semver never accepts inner whitespace: "2.5.0 - 3" is a range.
-        if s.is_empty() || s.contains(char::is_whitespace) {
+        if s.is_empty() || s.chars().any(char::is_whitespace) {
             return Err(SemverError::InvalidVersion(input.to_string()));
+        }
+
+        // Fast path: if s contains only digits and dots, parse 1..=3 segments directly
+        if s.bytes().all(|b| b.is_ascii_digit() || b == b'.') {
+            let mut split = s.split('.');
+            let p0 = split.next();
+            let p1 = split.next();
+            let p2 = split.next();
+            if split.next().is_some() {
+                return Err(SemverError::InvalidVersion(input.to_string()));
+            }
+            let p0 = p0.ok_or_else(|| SemverError::InvalidVersion(input.to_string()))?;
+            let major = parse_loose_u64_segment(p0.as_bytes())
+                .ok_or_else(|| SemverError::InvalidVersion(input.to_string()))?;
+            let minor = if let Some(p1) = p1 {
+                parse_loose_u64_segment(p1.as_bytes())
+                    .ok_or_else(|| SemverError::InvalidVersion(input.to_string()))?
+            } else {
+                0
+            };
+            let patch = if let Some(p2) = p2 {
+                parse_loose_u64_segment(p2.as_bytes())
+                    .ok_or_else(|| SemverError::InvalidVersion(input.to_string()))?
+            } else {
+                0
+            };
+            return Ok(Self {
+                major,
+                minor,
+                patch,
+                prerelease: Vec::new(),
+                build: Vec::new(),
+            });
         }
 
         // Split off build metadata first '+'
@@ -207,29 +324,30 @@ impl Version {
             (ver_pre, Vec::new())
         };
 
-        // Parse major[.minor[.patch]]
-        let parts: Vec<&str> = ver_part.split('.').collect();
-        if parts.is_empty() || parts.len() > 3 {
+        // Parse major[.minor[.patch]] without allocating a Vec
+        let mut split = ver_part.split('.');
+        let p0 = split.next();
+        let p1 = split.next();
+        let p2 = split.next();
+        if split.next().is_some() {
             return Err(SemverError::InvalidVersion(input.to_string()));
         }
-
-        let major = parts[0]
+        let p0 = p0.ok_or_else(|| SemverError::InvalidVersion(input.to_string()))?;
+        let major = p0
             .trim()
             .parse::<u64>()
             .map_err(|_| SemverError::InvalidVersion(input.to_string()))?;
 
-        let minor = if parts.len() > 1 {
-            parts[1]
-                .trim()
+        let minor = if let Some(p1) = p1 {
+            p1.trim()
                 .parse::<u64>()
                 .map_err(|_| SemverError::InvalidVersion(input.to_string()))?
         } else {
             0
         };
 
-        let patch = if parts.len() > 2 {
-            parts[2]
-                .trim()
+        let patch = if let Some(p2) = p2 {
+            p2.trim()
                 .parse::<u64>()
                 .map_err(|_| SemverError::InvalidVersion(input.to_string()))?
         } else {
@@ -245,6 +363,7 @@ impl Version {
         })
     }
 
+    #[inline]
     pub fn is_prerelease(&self) -> bool {
         !self.prerelease.is_empty()
     }
@@ -390,14 +509,15 @@ impl Version {
 }
 
 impl PartialOrd for Version {
+    #[inline]
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
     }
 }
 
 impl Ord for Version {
+    #[inline]
     fn cmp(&self, other: &Self) -> Ordering {
-        // Compare major, minor, patch
         match self.major.cmp(&other.major) {
             Ordering::Equal => {}
             ord => return ord,
@@ -409,6 +529,11 @@ impl Ord for Version {
         match self.patch.cmp(&other.patch) {
             Ordering::Equal => {}
             ord => return ord,
+        }
+
+        // Fast path: if neither has prerelease, versions are equal
+        if self.prerelease.is_empty() && other.prerelease.is_empty() {
+            return Ordering::Equal;
         }
 
         // Compare prereleases
@@ -432,14 +557,19 @@ impl Ord for Version {
 }
 
 impl PartialEq for Version {
+    #[inline]
     fn eq(&self, other: &Self) -> bool {
-        self.cmp(other) == Ordering::Equal
+        self.major == other.major
+            && self.minor == other.minor
+            && self.patch == other.patch
+            && self.prerelease == other.prerelease
     }
 }
 
 impl Eq for Version {}
 
 impl std::hash::Hash for Version {
+    #[inline]
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         self.major.hash(state);
         self.minor.hash(state);
@@ -494,7 +624,23 @@ impl<'de> Deserialize<'de> for Version {
     where
         D: Deserializer<'de>,
     {
-        let s = String::deserialize(deserializer)?;
-        Version::parse(&s).map_err(serde::de::Error::custom)
+        struct VersionVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for VersionVisitor {
+            type Value = Version;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("a semver version string")
+            }
+
+            fn visit_str<E>(self, v: &str) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                Version::parse(v).map_err(serde::de::Error::custom)
+            }
+        }
+
+        deserializer.deserialize_str(VersionVisitor)
     }
 }

@@ -1,7 +1,8 @@
 use super::comparator::{Comparator, Op};
-use super::version::{PrereleaseId, Version};
+use super::version::{parse_fast_u64_triplet, PrereleaseId, Version};
 use crate::error::SemverError;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use std::borrow::Cow;
 use std::fmt;
 use std::str::FromStr;
 
@@ -11,6 +12,7 @@ pub struct ComparatorSet {
 }
 
 impl ComparatorSet {
+    #[inline]
     pub fn matches(&self, version: &Version) -> bool {
         // node-semver prerelease rule:
         // If a version has a prerelease tag, it will only satisfy a comparator set
@@ -28,8 +30,12 @@ impl ComparatorSet {
             }
         }
 
-        // All comparators in the set must match
-        self.comparators.iter().all(|c| c.matches(version))
+        // Hot path: evaluate small comparator sets directly without iterator overhead
+        match self.comparators.as_slice() {
+            [c] => c.matches(version),
+            [c1, c2] => c1.matches(version) && c2.matches(version),
+            comps => comps.iter().all(|c| c.matches(version)),
+        }
     }
 }
 
@@ -39,16 +45,152 @@ pub struct Range {
     pub sets: Vec<ComparatorSet>,
 }
 
+#[inline]
+fn is_wildcard_comp(comp: &Comparator) -> bool {
+    comp.op == Op::Gte
+        && comp.version.major == 0
+        && comp.version.minor == 0
+        && comp.version.patch == 0
+        && comp.version.prerelease.is_empty()
+}
+
+#[inline]
+fn fast_caret(major: u64, minor: u64, patch: u64, input: &str) -> Result<ComparatorSet, SemverError> {
+    let lower = Version::new(major, minor, patch);
+    let upper = if major > 0 {
+        let next_major = major.checked_add(1).ok_or_else(|| {
+            SemverError::InvalidRange(format!("Version number overflow: {input}"))
+        })?;
+        upper_bound_version(next_major, 0, 0)
+    } else if minor > 0 {
+        let next_minor = minor.checked_add(1).ok_or_else(|| {
+            SemverError::InvalidRange(format!("Version number overflow: {input}"))
+        })?;
+        upper_bound_version(0, next_minor, 0)
+    } else {
+        let next_patch = patch.checked_add(1).ok_or_else(|| {
+            SemverError::InvalidRange(format!("Version number overflow: {input}"))
+        })?;
+        upper_bound_version(0, 0, next_patch)
+    };
+    Ok(ComparatorSet {
+        comparators: vec![
+            Comparator::new(Op::Gte, lower),
+            Comparator::new(Op::Lt, upper),
+        ],
+    })
+}
+
+#[inline]
+fn fast_tilde(major: u64, minor: u64, patch: u64, input: &str) -> Result<ComparatorSet, SemverError> {
+    let lower = Version::new(major, minor, patch);
+    let next_minor = minor.checked_add(1).ok_or_else(|| {
+        SemverError::InvalidRange(format!("Version number overflow: {input}"))
+    })?;
+    let upper = upper_bound_version(major, next_minor, 0);
+    Ok(ComparatorSet {
+        comparators: vec![
+            Comparator::new(Op::Gte, lower),
+            Comparator::new(Op::Lt, upper),
+        ],
+    })
+}
+
+#[inline]
+fn fast_exact(major: u64, minor: u64, patch: u64) -> ComparatorSet {
+    ComparatorSet {
+        comparators: vec![Comparator::new(Op::Eq, Version::new(major, minor, patch))],
+    }
+}
+
+#[inline]
+fn fast_gte(major: u64, minor: u64, patch: u64) -> ComparatorSet {
+    ComparatorSet {
+        comparators: vec![Comparator::new(Op::Gte, Version::new(major, minor, patch))],
+    }
+}
+
+#[inline]
+fn fast_lte(major: u64, minor: u64, patch: u64) -> ComparatorSet {
+    ComparatorSet {
+        comparators: vec![Comparator::new(Op::Lte, Version::new(major, minor, patch))],
+    }
+}
+
+#[inline]
+fn fast_gt(major: u64, minor: u64, patch: u64) -> ComparatorSet {
+    ComparatorSet {
+        comparators: vec![Comparator::new(Op::Gt, Version::new(major, minor, patch))],
+    }
+}
+
+#[inline]
+fn fast_lt(major: u64, minor: u64, patch: u64) -> ComparatorSet {
+    ComparatorSet {
+        comparators: vec![Comparator::new(Op::Lt, Version::new(major, minor, patch))],
+    }
+}
+
+/// Fast path for single standard comparator sets without spaces, prereleases, or hyphens.
+fn try_fast_comparator_set(s: &str, input_for_err: &str) -> Option<Result<ComparatorSet, SemverError>> {
+    let s = s.trim();
+    if s.is_empty() || s == "*" || s == "x" || s == "X" {
+        return Some(Ok(ComparatorSet {
+            comparators: vec![Comparator::new(Op::Gte, Version::new(0, 0, 0))],
+        }));
+    }
+
+    if let Some(rest) = s.strip_prefix('^') {
+        let v_str = rest.trim_start_matches(['v', 'V', '=']);
+        if let Some((maj, min, pat)) = parse_fast_u64_triplet(v_str) {
+            return Some(fast_caret(maj, min, pat, input_for_err));
+        }
+    } else if let Some(rest) = s.strip_prefix("~>").or_else(|| s.strip_prefix('~')) {
+        let v_str = rest.trim_start_matches(['v', 'V', '=']);
+        if let Some((maj, min, pat)) = parse_fast_u64_triplet(v_str) {
+            return Some(fast_tilde(maj, min, pat, input_for_err));
+        }
+    } else if let Some(rest) = s.strip_prefix(">=") {
+        let v_str = rest.trim_start_matches(['v', 'V', '=']);
+        if let Some((maj, min, pat)) = parse_fast_u64_triplet(v_str) {
+            return Some(Ok(fast_gte(maj, min, pat)));
+        }
+    } else if let Some(rest) = s.strip_prefix("<=") {
+        let v_str = rest.trim_start_matches(['v', 'V', '=']);
+        if let Some((maj, min, pat)) = parse_fast_u64_triplet(v_str) {
+            return Some(Ok(fast_lte(maj, min, pat)));
+        }
+    } else if let Some(rest) = s.strip_prefix('>') {
+        let v_str = rest.trim_start_matches(['v', 'V', '=']);
+        if let Some((maj, min, pat)) = parse_fast_u64_triplet(v_str) {
+            return Some(Ok(fast_gt(maj, min, pat)));
+        }
+    } else if let Some(rest) = s.strip_prefix('<') {
+        let v_str = rest.trim_start_matches(['v', 'V', '=']);
+        if let Some((maj, min, pat)) = parse_fast_u64_triplet(v_str) {
+            return Some(Ok(fast_lt(maj, min, pat)));
+        }
+    } else {
+        let v_str = s.trim_start_matches(['v', 'V', '=']);
+        if let Some((maj, min, pat)) = parse_fast_u64_triplet(v_str) {
+            return Some(Ok(fast_exact(maj, min, pat)));
+        }
+    }
+
+    None
+}
+
 impl Range {
     pub fn parse(input: &str) -> Result<Self, SemverError> {
         let trimmed = input.trim();
-        let raw = trimmed.to_string();
 
         if trimmed.len() > 65536 {
             return Err(SemverError::InvalidRange(
                 "Range string exceeds maximum length".to_string(),
             ));
         }
+
+        let raw = trimmed.to_string();
 
         if trimmed.is_empty() || trimmed == "*" || trimmed == "x" || trimmed == "X" {
             // Matches any version >= 0.0.0
@@ -60,12 +202,22 @@ impl Range {
             });
         }
 
+        // Fast path for single range expression (no || and no whitespace-separated comparators)
+        if !trimmed.contains("||") && !trimmed.contains(char::is_whitespace) {
+            if let Some(res) = try_fast_comparator_set(trimmed, input) {
+                let set = res?;
+                return Ok(Self {
+                    raw,
+                    sets: vec![set],
+                });
+            }
+        }
+
         // Sets are separated by '||'
-        let or_parts: Vec<&str> = trimmed.split("||").collect();
         let mut sets = Vec::new();
         let mut has_wildcard_set = false;
 
-        for or_part in or_parts {
+        for or_part in trimmed.split("||") {
             let set_str = or_part.trim();
             if set_str.is_empty() {
                 // In node-semver, an empty set in an || union represents a wildcard >=0.0.0
@@ -76,14 +228,20 @@ impl Range {
                 continue;
             }
 
+            // Fast path for simple single expressions within an || union
+            if !set_str.contains(char::is_whitespace) {
+                if let Some(res) = try_fast_comparator_set(set_str, input) {
+                    let set = res?;
+                    if set.comparators.len() == 1 && is_wildcard_comp(&set.comparators[0]) {
+                        has_wildcard_set = true;
+                    }
+                    sets.push(set);
+                    continue;
+                }
+            }
+
             let comparators = parse_comparator_set(set_str)?;
-            if comparators.len() == 1
-                && comparators[0].op == Op::Gte
-                && comparators[0].version.major == 0
-                && comparators[0].version.minor == 0
-                && comparators[0].version.patch == 0
-                && comparators[0].version.prerelease.is_empty()
-            {
+            if comparators.len() == 1 && is_wildcard_comp(&comparators[0]) {
                 has_wildcard_set = true;
             }
             sets.push(ComparatorSet { comparators });
@@ -104,23 +262,26 @@ impl Range {
     }
 
     /// Checks if this range normalizes to node-semver's ANY wildcard (`*`, `""`, `x`, `*.*`, `>=0.0.0`, etc.).
+    #[inline]
     pub fn is_wildcard(&self) -> bool {
         self.sets.len() == 1
             && self.sets[0].comparators.len() == 1
-            && self.sets[0].comparators[0].op == Op::Gte
-            && self.sets[0].comparators[0].version.major == 0
-            && self.sets[0].comparators[0].version.minor == 0
-            && self.sets[0].comparators[0].version.patch == 0
-            && self.sets[0].comparators[0].version.prerelease.is_empty()
+            && is_wildcard_comp(&self.sets[0].comparators[0])
     }
 
+    #[inline]
     pub fn satisfies(&self, version: &Version) -> bool {
         // Any set matching satisfies the range (OR)
-        self.sets.iter().any(|set| set.matches(version))
+        if self.sets.len() == 1 {
+            self.sets[0].matches(version)
+        } else {
+            self.sets.iter().any(|set| set.matches(version))
+        }
     }
 }
 
 impl Version {
+    #[inline]
     pub fn satisfies(&self, range: &Range) -> bool {
         range.satisfies(self)
     }
@@ -135,6 +296,7 @@ struct PartialVersion {
     prerelease: Vec<PrereleaseId>,
 }
 
+#[inline]
 fn is_wildcard(s: &str) -> bool {
     s == "*" || s.eq_ignore_ascii_case("x")
 }
@@ -200,18 +362,26 @@ fn parse_partial_version(input: &str) -> Result<PartialVersion, SemverError> {
         (s, Vec::new())
     };
 
-    let parts: Vec<&str> = ver_part.split('.').collect();
-    if parts.is_empty() || parts.len() > 3 {
+    let mut parts_iter = ver_part.split('.');
+    let p0 = parts_iter.next();
+    let p1 = parts_iter.next();
+    let p2 = parts_iter.next();
+    if parts_iter.next().is_some() {
         return Err(SemverError::InvalidRange(input.to_string()));
     }
+    let p0 = match p0 {
+        Some(p) => p,
+        None => return Err(SemverError::InvalidRange(input.to_string())),
+    };
+    let parts_count = 1 + (p1.is_some() as usize) + (p2.is_some() as usize);
 
     // SemVer 2.0.0 / node-semver rule:
     // Prereleases on partial versions (e.g. 1.2-alpha, ^1.2-alpha, 1.x-alpha) are invalid ranges
     if !prerelease.is_empty()
-        && (parts.len() < 3
-            || is_wildcard(parts[0].trim())
-            || is_wildcard(parts[1].trim())
-            || is_wildcard(parts[2].trim()))
+        && (parts_count < 3
+            || is_wildcard(p0.trim())
+            || p1.is_some_and(|p| is_wildcard(p.trim()))
+            || p2.is_some_and(|p| is_wildcard(p.trim())))
     {
         return Err(SemverError::InvalidRange(input.to_string()));
     }
@@ -232,16 +402,14 @@ fn parse_partial_version(input: &str) -> Result<PartialVersion, SemverError> {
             .map_err(|_| SemverError::InvalidRange(input.to_string()))
     };
 
-    let major = parse_segment(parts[0])?;
-    let minor = if parts.len() > 1 {
-        parse_segment(parts[1])?
-    } else {
-        None
+    let major = parse_segment(p0)?;
+    let minor = match p1 {
+        Some(p) => parse_segment(p)?,
+        None => None,
     };
-    let patch = if parts.len() > 2 {
-        parse_segment(parts[2])?
-    } else {
-        None
+    let patch = match p2 {
+        Some(p) => parse_segment(p)?,
+        None => None,
     };
 
     Ok(PartialVersion {
@@ -252,6 +420,7 @@ fn parse_partial_version(input: &str) -> Result<PartialVersion, SemverError> {
     })
 }
 
+#[inline]
 fn make_version_with_pre(major: u64, minor: u64, patch: u64, pre: Vec<PrereleaseId>) -> Version {
     Version {
         major,
@@ -262,6 +431,7 @@ fn make_version_with_pre(major: u64, minor: u64, patch: u64, pre: Vec<Prerelease
     }
 }
 
+#[inline]
 fn upper_bound_version(major: u64, minor: u64, patch: u64) -> Version {
     // node-semver uses <X.Y.Z-0 to exclude prereleases of the upper bound
     Version {
@@ -277,11 +447,11 @@ fn parse_comparator_set(input: &str) -> Result<Vec<Comparator>, SemverError> {
     // Check for hyphen range: e.g. "1.2.3 - 2.3.4"
     // Note: hyphen ranges have whitespace around '-'
     let tokens = tokenize_set(input);
-    let mut comparators = Vec::new();
+    let mut comparators = Vec::with_capacity(tokens.len() * 2);
 
     let mut i = 0;
     while i < tokens.len() {
-        if i + 2 < tokens.len() && tokens[i + 1] == "-" {
+        if i + 2 < tokens.len() && tokens[i + 1].as_ref() == "-" {
             // Hyphen range: token[i] - token[i+2]
             let from = parse_partial_version(&tokens[i])?;
             let to = parse_partial_version(&tokens[i + 2])?;
@@ -341,22 +511,21 @@ fn parse_comparator_set(input: &str) -> Result<Vec<Comparator>, SemverError> {
     Ok(comparators)
 }
 
-fn tokenize_set(input: &str) -> Vec<String> {
-    let raw_parts: Vec<&str> = input.split_whitespace().collect();
-    let mut tokens = Vec::new();
+fn tokenize_set<'a>(input: &'a str) -> Vec<Cow<'a, str>> {
+    let raw_parts: Vec<&'a str> = input.split_whitespace().collect();
+    let mut tokens = Vec::with_capacity(raw_parts.len());
     let mut i = 0;
     while i < raw_parts.len() {
         let part = raw_parts[i];
 
-        // Check if part is a prefix operator or combination
-        let mut op = String::new();
+        let mut op: Option<&'static str> = None;
         let mut consumed = 0;
 
         if (part == ">" || part == "<") && i + 1 < raw_parts.len() && raw_parts[i + 1] == "=" {
-            op = format!("{}=", part);
+            op = Some(if part == ">" { ">=" } else { "<=" });
             consumed = 2;
         } else if part == "~" && i + 1 < raw_parts.len() && raw_parts[i + 1] == ">" {
-            op = "~>".to_string();
+            op = Some("~>");
             consumed = 2;
         } else if part == ">="
             || part == "<="
@@ -367,26 +536,39 @@ fn tokenize_set(input: &str) -> Vec<String> {
             || part == "^"
             || part == "~>"
         {
-            op = part.to_string();
+            op = Some(match part {
+                ">=" => ">=",
+                "<=" => "<=",
+                ">" => ">",
+                "<" => "<",
+                "=" => "=",
+                "~" => "~",
+                "^" => "^",
+                "~>" => "~>",
+                _ => unreachable!(),
+            });
             consumed = 1;
         }
 
-        if !op.is_empty() {
+        if let Some(op_str) = op {
             // Check if there is a next part that is NOT a hyphen range separator
             if i + consumed < raw_parts.len() && raw_parts[i + consumed] != "-" {
                 let next_part = raw_parts[i + consumed];
-                tokens.push(format!("{}{}", op, next_part));
+                let mut combined = String::with_capacity(op_str.len() + next_part.len());
+                combined.push_str(op_str);
+                combined.push_str(next_part);
+                tokens.push(Cow::Owned(combined));
                 i += consumed + 1;
                 continue;
             } else {
-                tokens.push(op);
+                tokens.push(Cow::Borrowed(op_str));
                 i += consumed;
                 continue;
             }
         }
 
-        // Not a prefix operator, push as-is
-        tokens.push(part.to_string());
+        // Not a prefix operator, push as borrowed!
+        tokens.push(Cow::Borrowed(part));
         i += 1;
     }
     tokens
@@ -730,7 +912,23 @@ impl<'de> Deserialize<'de> for Range {
     where
         D: Deserializer<'de>,
     {
-        let s = String::deserialize(deserializer)?;
-        Range::parse(&s).map_err(serde::de::Error::custom)
+        struct RangeVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for RangeVisitor {
+            type Value = Range;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("a semver range string")
+            }
+
+            fn visit_str<E>(self, v: &str) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                Range::parse(v).map_err(serde::de::Error::custom)
+            }
+        }
+
+        deserializer.deserialize_str(RangeVisitor)
     }
 }
