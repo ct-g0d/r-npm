@@ -1,6 +1,7 @@
 use rnpm_registry::{
     AbbreviatedPackageMetadata, BytesFetchResult, CircuitBreakerState, MetadataFetchResult,
-    RegistryClient, RegistryClientConfig, RegistryError, TarballFetchResult, NPM_INSTALL_V1_JSON,
+    RegistryClient, RegistryClientConfig, RegistryError, TarballFetchResult, NPM_INSTALL_ACCEPT,
+    NPM_INSTALL_V1_JSON,
 };
 use std::collections::HashSet;
 use std::net::SocketAddr;
@@ -1667,4 +1668,174 @@ async fn test_direct_remote_tarball_url_download_and_auth_security() {
     assert_eq!(not_found_err.status_code(), Some(404));
 
     cdn_server.stop();
+}
+
+#[tokio::test]
+async fn test_get_package_metadata_install_accept_header_and_spawn_blocking() {
+    let mut versions_json = Vec::new();
+    for i in 1..=120 {
+        versions_json.push(format!(
+            r#""1.0.{i}": {{
+                "name": "big-pkg",
+                "version": "1.0.{i}",
+                "description": "Some description to be dropped",
+                "readme": "A large readme text to inflate bytes and test memory efficiency and spawn_blocking offloading across multiple threads",
+                "maintainers": [{{"name": "dev{i}", "email": "dev{i}@example.com"}}],
+                "dist": {{
+                    "tarball": "https://registry.npmjs.org/big-pkg/-/big-pkg-1.0.{i}.tgz",
+                    "shasum": "0123456789abcdef0123456789abcdef01234567"
+                }},
+                "dependencies": {{ "dep-pkg": "^1.0.0" }},
+                "license": "MIT"
+            }}"#
+        ));
+    }
+    let full_doc = format!(
+        r#"{{
+            "name": "big-pkg",
+            "dist-tags": {{ "latest": "1.0.120" }},
+            "readme": "Huge root readme text inflating the JSON payload past 64KB threshold for tokio spawn_blocking verification",
+            "versions": {{
+                {}
+            }}
+        }}"#,
+        versions_json.join(",\n")
+    );
+    let doc_bytes = full_doc.into_bytes();
+    assert!(doc_bytes.len() > 64 * 1024, "Doc size must exceed 64KB, got {}", doc_bytes.len());
+
+    let doc_bytes_clone = doc_bytes.clone();
+    let server = MockHttpServer::start(move |req| {
+        if req.contains("GET /big-pkg") {
+            assert!(req.contains(NPM_INSTALL_ACCEPT));
+            (
+                200,
+                vec![
+                    ("Content-Type", "application/json".to_string()),
+                    ("ETag", "\"big-pkg-etag-v1\"".to_string()),
+                    ("Content-Length", doc_bytes_clone.len().to_string()),
+                ],
+                doc_bytes_clone.clone(),
+            )
+        } else {
+            (404, vec![], b"Not found".to_vec())
+        }
+    })
+    .await;
+
+    let config = RegistryClientConfig {
+        default_registry: server.url(),
+        timeout: Duration::from_secs(5),
+        ..Default::default()
+    };
+    let client = RegistryClient::with_config(config).unwrap();
+
+    let meta = client.get_package_metadata_install("big-pkg").await.unwrap();
+    assert_eq!(meta.name, "big-pkg");
+    assert_eq!(meta.dist_tags.get("latest"), Some(&"1.0.120".to_string()));
+    assert_eq!(meta.versions.len(), 120);
+
+    let v1 = &meta.versions["1.0.1"];
+    assert_eq!(v1.name, "big-pkg");
+    assert_eq!(v1.version, "1.0.1");
+    assert_eq!(v1.dependencies.get("dep-pkg"), Some(&"^1.0.0".to_string()));
+    assert_eq!(v1.license, Some("MIT".to_string()));
+    assert!(!v1.extra.contains_key("readme"));
+    assert!(!v1.extra.contains_key("maintainers"));
+    assert!(!v1.extra.contains_key("description"));
+
+    let cond = client
+        .get_package_metadata_install_conditional("big-pkg", Some("\"big-pkg-etag-v1\""))
+        .await
+        .unwrap();
+    assert!(cond.is_fresh());
+
+    server.stop();
+}
+
+#[tokio::test]
+async fn test_get_package_metadata_install_fallback_on_404() {
+    let mock_json = br#"{
+        "name": "fallback-pkg",
+        "dist-tags": { "latest": "1.0.0" },
+        "versions": {
+            "1.0.0": {
+                "name": "fallback-pkg",
+                "version": "1.0.0",
+                "dist": { "tarball": "https://registry.npmjs.org/fallback-pkg/-/fallback-pkg-1.0.0.tgz" }
+            }
+        }
+    }"#.to_vec();
+
+    let server = MockHttpServer::start(move |req| {
+        if req.contains("application/vnd.npm.install-v1+json") {
+            (404, vec![], b"Abbreviated packuments not supported".to_vec())
+        } else {
+            (
+                200,
+                vec![
+                    ("Content-Type", "application/json".to_string()),
+                    ("Content-Length", mock_json.len().to_string()),
+                ],
+                mock_json.clone(),
+            )
+        }
+    })
+    .await;
+
+    let config = RegistryClientConfig {
+        default_registry: server.url(),
+        timeout: Duration::from_secs(5),
+        ..Default::default()
+    };
+    let client = RegistryClient::with_config(config).unwrap();
+
+    let meta = client.get_package_metadata_install("fallback-pkg").await.unwrap();
+    assert_eq!(meta.name, "fallback-pkg");
+    assert_eq!(meta.dist_tags.get("latest"), Some(&"1.0.0".to_string()));
+
+    server.stop();
+}
+
+#[tokio::test]
+async fn test_get_package_metadata_install_concurrent() {
+    let doc1 = br#"{"name":"pkg-a","dist-tags":{"latest":"1.0.0"},"versions":{"1.0.0":{"name":"pkg-a","version":"1.0.0","dist":{"tarball":"https://example.com/pkg-a.tgz"}}}}"#.to_vec();
+    let doc2 = br#"{"name":"pkg-b","dist-tags":{"latest":"2.0.0"},"versions":{"2.0.0":{"name":"pkg-b","version":"2.0.0","dist":{"tarball":"https://example.com/pkg-b.tgz"}}}}"#.to_vec();
+
+    let doc1_clone = doc1.clone();
+    let doc2_clone = doc2.clone();
+    let server = MockHttpServer::start(move |req| {
+        if req.contains("GET /pkg-a") {
+            (200, vec![("Content-Length", doc1_clone.len().to_string())], doc1_clone.clone())
+        } else if req.contains("GET /pkg-b") {
+            (200, vec![("Content-Length", doc2_clone.len().to_string())], doc2_clone.clone())
+        } else {
+            (404, vec![], b"Not found".to_vec())
+        }
+    })
+    .await;
+
+    let config = RegistryClientConfig {
+        default_registry: server.url(),
+        timeout: Duration::from_secs(5),
+        ..Default::default()
+    };
+    let client = RegistryClient::with_config(config).unwrap();
+
+    let results = client.get_package_metadata_install_concurrent(&["pkg-a", "pkg-b"]).await;
+    assert_eq!(results.len(), 2);
+    assert_eq!(results[0].as_ref().unwrap().name, "pkg-a");
+    assert_eq!(results[1].as_ref().unwrap().name, "pkg-b");
+
+    let cond_results = client
+        .get_package_metadata_install_conditional_concurrent(&[
+            ("pkg-a", None),
+            ("pkg-b", Some("\"etag-b\"".to_string())),
+        ])
+        .await;
+    assert_eq!(cond_results.len(), 2);
+    assert!(cond_results[0].is_ok());
+    assert!(cond_results[1].is_ok());
+
+    server.stop();
 }
