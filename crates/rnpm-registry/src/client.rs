@@ -772,6 +772,19 @@ pub fn normalize_uri_prefix(prefix: &str) -> String {
     format!("//{host_lower}{normalized_path}")
 }
 
+fn is_empty_or_null_path(p: &Path) -> bool {
+    let s = p.to_string_lossy();
+    let trimmed = s.trim();
+    trimmed.is_empty()
+        || trimmed.eq_ignore_ascii_case("null")
+        || trimmed.eq_ignore_ascii_case("undefined")
+}
+
+fn clean_pem_str(s: Option<&str>) -> Option<&str> {
+    s.map(|v| v.trim())
+        .filter(|t| !t.is_empty() && !t.eq_ignore_ascii_case("null") && !t.eq_ignore_ascii_case("undefined"))
+}
+
 /// Helper to load and parse an X.509 client certificate and private key into a reqwest Identity.
 pub fn load_tls_identity(
     certfile: Option<&Path>,
@@ -779,6 +792,11 @@ pub fn load_tls_identity(
     keyfile: Option<&Path>,
     key_str: Option<&str>,
 ) -> Result<Option<reqwest::Identity>, RegistryError> {
+    let certfile = certfile.filter(|p| !is_empty_or_null_path(p));
+    let keyfile = keyfile.filter(|p| !is_empty_or_null_path(p));
+    let cert_str = clean_pem_str(cert_str);
+    let key_str = clean_pem_str(key_str);
+
     let cert_content = if let Some(path) = certfile {
         Some(std::fs::read_to_string(path).map_err(|err| {
             RegistryError::Other(format!("Failed to read certfile at '{}': {err}", path.display()))
@@ -811,6 +829,15 @@ pub fn load_tls_identity(
         None
     };
 
+    let cert_content = cert_content.filter(|s| {
+        let t = s.trim();
+        !t.is_empty() && !t.eq_ignore_ascii_case("null") && !t.eq_ignore_ascii_case("undefined")
+    });
+    let key_content = key_content.filter(|s| {
+        let t = s.trim();
+        !t.is_empty() && !t.eq_ignore_ascii_case("null") && !t.eq_ignore_ascii_case("undefined")
+    });
+
     match (cert_content, key_content) {
         (Some(cert), Some(key)) => {
             let combined_pem = format!("{}\n{}", cert.trim(), key.trim());
@@ -821,14 +848,46 @@ pub fn load_tls_identity(
             })?;
             Ok(Some(identity))
         }
-        (Some(_), None) => Err(RegistryError::Other(
-            "Client certificate configured without corresponding private key (both cert and key are required)".to_string(),
-        )),
+        (Some(cert), None) => {
+            if let Ok(identity) = reqwest::Identity::from_pem(cert.trim().as_bytes()) {
+                Ok(Some(identity))
+            } else {
+                Err(RegistryError::Other(
+                    "Client certificate configured without corresponding private key (both cert and key are required, or cert must contain a combined cert + private key PEM bundle)".to_string(),
+                ))
+            }
+        }
         (None, Some(_)) => Err(RegistryError::Other(
             "Client private key configured without corresponding certificate (both cert and key are required)".to_string(),
         )),
         (None, None) => Ok(None),
     }
+}
+
+fn clean_pathbuf(p: Option<&PathBuf>) -> Option<PathBuf> {
+    p.filter(|path| !is_empty_or_null_path(path)).cloned()
+}
+
+fn clean_string(s: Option<&String>) -> Option<String> {
+    s.map(|v| v.trim())
+        .filter(|t| !t.is_empty() && !t.eq_ignore_ascii_case("null") && !t.eq_ignore_ascii_case("undefined"))
+        .map(|t| t.to_string())
+}
+
+/// Helper to extract parent path prefixes for a normalized URI prefix (e.g. `/a/b/` -> `["/a/", "/"]`).
+pub fn get_parent_path_prefixes(path: &str) -> Vec<String> {
+    let trimmed = path.trim().trim_matches('/');
+    if trimmed.is_empty() {
+        return Vec::new();
+    }
+    let segments: Vec<&str> = trimmed.split('/').filter(|s| !s.is_empty()).collect();
+    let mut parents = Vec::new();
+    for i in (1..segments.len()).rev() {
+        let sub = segments[..i].join("/");
+        parents.push(format!("/{sub}/"));
+    }
+    parents.push("/".to_string());
+    parents
 }
 
 /// Builds a reqwest Client configured per RegistryClientConfig, optionally with a client TLS Identity.
@@ -1099,24 +1158,96 @@ impl RegistryClient {
             None
         };
 
-        // Load and build scoped clients
+        // Pre-normalize and clean scoped configs to enable parent-prefix inheritance on the same host
+        let mut normalized_scoped: std::collections::BTreeMap<String, ScopedTlsConfig> =
+            std::collections::BTreeMap::new();
+        for (prefix, scoped_cfg) in &config.scoped_tls {
+            let norm = normalize_uri_prefix(prefix);
+            let cleaned = ScopedTlsConfig {
+                certfile: clean_pathbuf(scoped_cfg.certfile.as_ref()),
+                cert: clean_string(scoped_cfg.cert.as_ref()),
+                keyfile: clean_pathbuf(scoped_cfg.keyfile.as_ref()),
+                key: clean_string(scoped_cfg.key.as_ref()),
+            };
+            normalized_scoped.insert(norm, cleaned);
+        }
+
+        // Load and build scoped clients with parent-prefix inheritance within the same host
         let mut scoped_clients = std::collections::BTreeMap::new();
         for (prefix, scoped_cfg) in &config.scoped_tls {
-            let certfile = scoped_cfg.certfile.as_deref().or(config.certfile.as_deref());
-            let cert = scoped_cfg.cert.as_deref().or(config.cert.as_deref());
-            let keyfile = scoped_cfg.keyfile.as_deref().or(config.keyfile.as_deref());
-            let key = scoped_cfg.key.as_deref().or(config.key.as_deref());
+            let norm = normalize_uri_prefix(prefix);
+            let mut certfile = clean_pathbuf(scoped_cfg.certfile.as_ref());
+            let mut cert = clean_string(scoped_cfg.cert.as_ref());
+            let mut keyfile = clean_pathbuf(scoped_cfg.keyfile.as_ref());
+            let mut key = clean_string(scoped_cfg.key.as_ref());
 
-            let scoped_identity = load_tls_identity(certfile, cert, keyfile, key)?;
-            if let Some(id) = scoped_identity {
-                let scoped_client = build_http_client(&config, &headers, Some(id))?;
-                let norm = normalize_uri_prefix(prefix);
-                scoped_clients.insert(norm.clone(), scoped_client.clone());
-                if norm.ends_with('/') {
-                    let no_slash = norm.trim_end_matches('/').to_string();
-                    scoped_clients.insert(no_slash, scoped_client.clone());
+            // If cert or key is missing, check parent prefixes of the SAME host in config.scoped_tls
+            let rest = norm.strip_prefix("//").unwrap_or(&norm);
+            let (host_part, path_part) = match rest.find('/') {
+                Some(i) => (&rest[..i], &rest[i..]),
+                None => (rest, "/"),
+            };
+
+            let parent_paths = get_parent_path_prefixes(path_part);
+            for parent_path in &parent_paths {
+                if (certfile.is_some() || cert.is_some()) && (keyfile.is_some() || key.is_some()) {
+                    break;
                 }
-                scoped_clients.insert(prefix.clone(), scoped_client);
+                let cand_parent = format!("//{host_part}{parent_path}");
+                if let Some(parent_cfg) = normalized_scoped.get(&cand_parent) {
+                    if certfile.is_none() && cert.is_none() {
+                        certfile = parent_cfg.certfile.clone();
+                        cert = parent_cfg.cert.clone();
+                    }
+                    if keyfile.is_none() && key.is_none() {
+                        keyfile = parent_cfg.keyfile.clone();
+                        key = parent_cfg.key.clone();
+                    }
+                }
+            }
+
+            // If a scoped entry has neither cert nor key after filtering empty/"null", skip it cleanly
+            if certfile.is_none() && cert.is_none() && keyfile.is_none() && key.is_none() {
+                continue;
+            }
+
+            // Check if this entry has descendants in scoped_tls that could inherit its partial credentials
+            let has_scoped_descendant = normalized_scoped.keys().any(|other_norm| {
+                other_norm != &norm && other_norm.starts_with(&norm)
+            });
+
+            // Do NOT fall back to global config.cert/config.key for scoped entries!
+            match load_tls_identity(
+                certfile.as_deref(),
+                cert.as_deref(),
+                keyfile.as_deref(),
+                key.as_deref(),
+            ) {
+                Ok(Some(id)) => {
+                    let scoped_client = build_http_client(&config, &headers, Some(id))?;
+                    scoped_clients.insert(norm.clone(), scoped_client.clone());
+                    if norm.ends_with('/') {
+                        let no_slash = norm.trim_end_matches('/').to_string();
+                        scoped_clients.insert(no_slash, scoped_client.clone());
+                    }
+                    scoped_clients.insert(prefix.clone(), scoped_client);
+                }
+                Ok(None) => {}
+                Err(err) => {
+                    // If this is a parent prefix providing partial config to descendants, don't fail if only key/cert is missing
+                    if has_scoped_descendant {
+                        let has_cert = certfile.is_some() || cert.is_some();
+                        let has_key = keyfile.is_some() || key.is_some();
+                        if has_cert != has_key {
+                            if let RegistryError::Other(ref msg) = err {
+                                if msg.contains("both cert and key are required") {
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+                    return Err(err);
+                }
             }
         }
 
@@ -1262,27 +1393,6 @@ impl RegistryClient {
                 {
                     return true;
                 }
-            }
-        }
-
-        for prefix in self.config.scoped_tls.keys() {
-            let norm = normalize_uri_prefix(prefix);
-            let trimmed = norm.trim_start_matches('/');
-            let host_part = if let Some(slash_idx) = trimmed.find('/') {
-                &trimmed[..slash_idx]
-            } else {
-                trimmed
-            };
-            if let Some((shost, sport)) = host_part.split_once(':') {
-                if shost.eq_ignore_ascii_case(&host) {
-                    if let Ok(p) = sport.parse::<u16>() {
-                        if url.port_or_known_default() == Some(p) {
-                            return true;
-                        }
-                    }
-                }
-            } else if host_part.eq_ignore_ascii_case(&host) {
-                return true;
             }
         }
 
@@ -1512,6 +1622,10 @@ impl RegistryClient {
     ///   configured with the global identity is returned.
     /// - Otherwise, the unauthenticated client (no client certificate) is returned.
     pub fn client_for_url(&self, url: &Url) -> &Client {
+        if url.scheme() != "https" {
+            return &self.client;
+        }
+
         if self.scoped_clients.is_empty() && self.global_client.is_none() {
             return &self.client;
         }
@@ -1531,7 +1645,7 @@ impl RegistryClient {
 
     /// Match a target URL against scoped TLS identities using longest-prefix-first precedence.
     pub fn match_scoped_client(&self, url: &Url) -> Option<&Client> {
-        if self.scoped_clients.is_empty() {
+        if url.scheme() != "https" || self.scoped_clients.is_empty() {
             return None;
         }
 
@@ -5152,16 +5266,34 @@ nB99xJBcpcklOhB/x8L3Vb9kw8ZPzUvYKI7lj0+yjYJannulkI7H7LB4hxKnVKp5\n\
         let npm_url = Url::parse("https://registry.example.com/npm/packages/pkg").unwrap();
         assert!(client.has_scoped_tls_for_url(&npm_url));
         assert!(client.match_scoped_client(&npm_url).is_some());
+        let npm_c = client.client_for_url(&npm_url);
 
         // /other subpath matches the root scoped config
         let other_url = Url::parse("https://registry.example.com/other/pkg").unwrap();
         assert!(client.has_scoped_tls_for_url(&other_url));
         assert!(client.match_scoped_client(&other_url).is_some());
+        let other_c = client.client_for_url(&other_url);
 
-        // Different host does not match any scoped config
+        // /npm2/pkg has prefix /npm2/ which does not match /npm/, so it matches root /
+        let npm2_url = Url::parse("https://registry.example.com/npm2/pkg").unwrap();
+        assert!(client.has_scoped_tls_for_url(&npm2_url));
+        assert!(client.match_scoped_client(&npm2_url).is_some());
+        let npm2_c = client.client_for_url(&npm2_url);
+
+        // Pointers must be distinct for different scoped clients, not base unauthenticated client
+        assert!(!std::ptr::eq(npm_c, other_c));
+        assert!(!std::ptr::eq(npm_c, &client.client));
+        assert!(!std::ptr::eq(other_c, &client.client));
+
+        // /npm2/pkg matches root scoped client, NOT /npm/ client
+        assert!(std::ptr::eq(npm2_c, other_c));
+        assert!(!std::ptr::eq(npm2_c, npm_c));
+
+        // Different host does not match any scoped config and returns base client
         let diff_host = Url::parse("https://other-registry.com/npm/pkg").unwrap();
         assert!(!client.has_scoped_tls_for_url(&diff_host));
         assert!(client.match_scoped_client(&diff_host).is_none());
+        assert!(std::ptr::eq(client.client_for_url(&diff_host), &client.client));
     }
 
     #[test]
@@ -5173,37 +5305,51 @@ nB99xJBcpcklOhB/x8L3Vb9kw8ZPzUvYKI7lj0+yjYJannulkI7H7LB4hxKnVKp5\n\
         };
         config.trusted_hosts.insert("global-registry.example.com".into());
         config.scoped_tls.insert(
-            "//scoped-registry.example.com/".into(),
+            "//scoped-registry.example.com/scoped_prefix/".into(),
             ScopedTlsConfig::from_pem(TEST_CERT_PEM_2, TEST_KEY_PEM_2),
         );
 
         let client = RegistryClient::with_config(config).unwrap();
         assert!(client.has_global_tls());
 
-        let scoped_url = Url::parse("https://scoped-registry.example.com/pkg").unwrap();
+        let scoped_url = Url::parse("https://scoped-registry.example.com/scoped_prefix/pkg").unwrap();
+        let unscoped_on_scoped_host = Url::parse("https://scoped-registry.example.com/other/pkg").unwrap();
         let global_url = Url::parse("https://global-registry.example.com/pkg").unwrap();
         let untrusted_url = Url::parse("https://untrusted-redirect.evil.com/pkg").unwrap();
         let other_reg_url = Url::parse("https://other-registry.org/pkg").unwrap();
 
-        // Scoped registry gets its own client
+        // 1. Scoped registry prefix gets its own client (neither base client nor global client)
         assert!(client.has_scoped_tls_for_url(&scoped_url));
+        let scoped_c = client.client_for_url(&scoped_url);
+        assert!(!std::ptr::eq(scoped_c, &client.client));
 
-        // Global registry falls back to global TLS client because host is trusted
+        // 2. Global registry falls back to global TLS client because host is trusted
         assert!(!client.has_scoped_tls_for_url(&global_url));
-        let _global_c = client.client_for_url(&global_url);
-        // It uses global_client (not base unauthenticated client)
+        let global_c = client.client_for_url(&global_url);
+        assert!(!std::ptr::eq(global_c, &client.client));
+        assert!(!std::ptr::eq(global_c, scoped_c));
         assert!(client.is_trusted_host(&global_url));
 
-        // Untrusted redirect NEVER receives scoped or global TLS client certificate!
+        // 3. Untrusted redirect NEVER receives scoped or global TLS client certificate!
         assert!(!client.has_scoped_tls_for_url(&untrusted_url));
         assert!(!client.is_trusted_host(&untrusted_url));
         let untrusted_c = client.client_for_url(&untrusted_url);
-        // Untrusted host receives the base unauthenticated client
         assert!(std::ptr::eq(untrusted_c, &client.client));
 
-        // Other untrusted registry also never receives scoped cert
+        // 4. Other untrusted registry also never receives scoped cert
         let other_c = client.client_for_url(&other_reg_url);
         assert!(std::ptr::eq(other_c, &client.client));
+
+        // 5. http:// URL (even on trusted or scoped host) returns &client.client
+        let http_scoped = Url::parse("http://scoped-registry.example.com/scoped_prefix/pkg").unwrap();
+        let http_global = Url::parse("http://global-registry.example.com/pkg").unwrap();
+        assert!(std::ptr::eq(client.client_for_url(&http_scoped), &client.client));
+        assert!(std::ptr::eq(client.client_for_url(&http_global), &client.client));
+
+        // 6. Unscoped path on a scoped-TLS host returns &client.client (does NOT leak global_client!)
+        assert!(!client.has_scoped_tls_for_url(&unscoped_on_scoped_host));
+        let unscoped_c = client.client_for_url(&unscoped_on_scoped_host);
+        assert!(std::ptr::eq(unscoped_c, &client.client));
     }
 
     #[test]
@@ -5294,5 +5440,150 @@ nB99xJBcpcklOhB/x8L3Vb9kw8ZPzUvYKI7lj0+yjYJannulkI7H7LB4hxKnVKp5\n\
             Err(other) => panic!("Expected RegistryError::Other, got {other:?}"),
             Ok(_) => panic!("Expected error for key without cert"),
         }
+    }
+
+    #[test]
+    fn test_scoped_tls_empty_and_null_ignored_cleanly() {
+        let mut config = RegistryClientConfig::default();
+        config.scoped_tls.insert(
+            "//registry.example.com/null_entry/".into(),
+            ScopedTlsConfig {
+                cert: Some("null".into()),
+                key: Some("undefined".into()),
+                certfile: Some(PathBuf::from("")),
+                keyfile: Some(PathBuf::from("   ")),
+            },
+        );
+        config.scoped_tls.insert(
+            "//registry.example.com/empty_entry/".into(),
+            ScopedTlsConfig {
+                cert: Some("".into()),
+                key: Some("   ".into()),
+                certfile: None,
+                keyfile: None,
+            },
+        );
+
+        let client = RegistryClient::with_config(config);
+        assert!(client.is_ok(), "Client init should succeed with empty/null TLS config");
+        let client = client.unwrap();
+
+        // The empty/null scoped entries should have been cleanly skipped
+        let url_null = Url::parse("https://registry.example.com/null_entry/pkg").unwrap();
+        let url_empty = Url::parse("https://registry.example.com/empty_entry/pkg").unwrap();
+        assert!(!client.has_scoped_tls_for_url(&url_null));
+        assert!(!client.has_scoped_tls_for_url(&url_empty));
+        assert!(std::ptr::eq(client.client_for_url(&url_null), &client.client));
+        assert!(std::ptr::eq(client.client_for_url(&url_empty), &client.client));
+    }
+
+    #[test]
+    fn test_scoped_tls_combined_pem_bundle() {
+        use std::io::Write;
+
+        let combined_pem = format!("{}\n{}", TEST_CERT_PEM_1.trim(), TEST_KEY_PEM_1.trim());
+
+        // 1. Via inline combined cert string without key
+        let mut config_inline = RegistryClientConfig::default();
+        config_inline.scoped_tls.insert(
+            "//registry.example.com/inline/".into(),
+            ScopedTlsConfig {
+                cert: Some(combined_pem.clone()),
+                key: None,
+                certfile: None,
+                keyfile: None,
+            },
+        );
+        let client_inline = RegistryClient::with_config(config_inline);
+        assert!(client_inline.is_ok(), "Combined PEM string should initialize successfully");
+        let client_inline = client_inline.unwrap();
+        let inline_url = Url::parse("https://registry.example.com/inline/pkg").unwrap();
+        assert!(client_inline.has_scoped_tls_for_url(&inline_url));
+        assert!(!std::ptr::eq(client_inline.client_for_url(&inline_url), &client_inline.client));
+
+        // 2. Via combined certfile on disk without keyfile
+        let mut combined_file = tempfile::NamedTempFile::new().unwrap();
+        combined_file.write_all(combined_pem.as_bytes()).unwrap();
+
+        let mut config_file = RegistryClientConfig::default();
+        config_file.scoped_tls.insert(
+            "//registry.example.com/file/".into(),
+            ScopedTlsConfig {
+                cert: None,
+                key: None,
+                certfile: Some(combined_file.path().to_path_buf()),
+                keyfile: None,
+            },
+        );
+        let client_file = RegistryClient::with_config(config_file);
+        assert!(client_file.is_ok(), "Combined PEM certfile should initialize successfully");
+        let client_file = client_file.unwrap();
+        let file_url = Url::parse("https://registry.example.com/file/pkg").unwrap();
+        assert!(client_file.has_scoped_tls_for_url(&file_url));
+        assert!(!std::ptr::eq(client_file.client_for_url(&file_url), &client_file.client));
+    }
+
+    #[test]
+    fn test_scoped_tls_parent_prefix_inheritance() {
+        use std::io::Write;
+
+        let mut cert_file = tempfile::NamedTempFile::new().unwrap();
+        cert_file.write_all(TEST_CERT_PEM_1.as_bytes()).unwrap();
+
+        let mut key_file = tempfile::NamedTempFile::new().unwrap();
+        key_file.write_all(TEST_KEY_PEM_1.as_bytes()).unwrap();
+
+        let mut config = RegistryClientConfig::default();
+        // Root of host defines certfile
+        config.scoped_tls.insert(
+            "//registry.example.com/".into(),
+            ScopedTlsConfig {
+                certfile: Some(cert_file.path().to_path_buf()),
+                cert: None,
+                keyfile: None,
+                key: None,
+            },
+        );
+        // Subpath defines only keyfile, inherits certfile from parent //registry.example.com/
+        config.scoped_tls.insert(
+            "//registry.example.com/sub/".into(),
+            ScopedTlsConfig {
+                certfile: None,
+                cert: None,
+                keyfile: Some(key_file.path().to_path_buf()),
+                key: None,
+            },
+        );
+
+        let client = RegistryClient::with_config(config);
+        assert!(client.is_ok(), "Subpath should inherit certfile from parent prefix on the same host");
+        let client = client.unwrap();
+
+        let sub_url = Url::parse("https://registry.example.com/sub/packages/pkg").unwrap();
+        assert!(client.has_scoped_tls_for_url(&sub_url));
+        assert!(!std::ptr::eq(client.client_for_url(&sub_url), &client.client));
+
+        // Different host does NOT inherit certfile from registry.example.com
+        let mut config_diff = RegistryClientConfig::default();
+        config_diff.scoped_tls.insert(
+            "//registry.example.com/".into(),
+            ScopedTlsConfig {
+                certfile: Some(cert_file.path().to_path_buf()),
+                cert: None,
+                keyfile: None,
+                key: None,
+            },
+        );
+        config_diff.scoped_tls.insert(
+            "//other-registry.com/sub/".into(),
+            ScopedTlsConfig {
+                certfile: None,
+                cert: None,
+                keyfile: Some(key_file.path().to_path_buf()),
+                key: None,
+            },
+        );
+        let client_diff = RegistryClient::with_config(config_diff);
+        assert!(client_diff.is_err(), "Different host must NOT inherit certfile from another host");
     }
 }
