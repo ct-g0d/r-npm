@@ -1466,3 +1466,71 @@ fn test_create_shim_trio_overwriting_readonly_shims() {
     let trio2 = generator::create_shim_trio(&target, &bin_dir, "mytool");
     assert!(trio2.is_ok(), "Overwriting read-only shims must succeed");
 }
+
+#[cfg(windows)]
+#[test]
+fn test_windows_junction_and_directory_bin_collision() {
+    let temp = tempdir().unwrap();
+    let root = temp.path();
+
+    // 1. A real directory is still refused with EEXIST even with force = true
+    let local_bin_dir = root.join("node_modules").join(".bin");
+    fs::create_dir_all(&local_bin_dir).unwrap();
+
+    let real_dir = local_bin_dir.join("real_dir_tool");
+    fs::create_dir_all(&real_dir).unwrap();
+
+    let target_js = root.join("node_modules").join("my-pkg").join("cli.js");
+    fs::create_dir_all(target_js.parent().unwrap()).unwrap();
+    fs::write(&target_js, b"#!/usr/bin/env node\nconsole.log(1);").unwrap();
+
+    let err = create_shims_with_force(&local_bin_dir, "real_dir_tool", "my-pkg/cli.js", true)
+        .expect_err("Real directory must be refused even with force = true");
+    let err_msg = err.to_string();
+    assert!(
+        err_msg.contains("EEXIST"),
+        "Error must contain EEXIST, got: {err_msg}"
+    );
+    assert!(real_dir.is_dir());
+
+    // 2. A foreign Windows directory junction in a global bin dir with force = false is refused with EEXIST
+    let global_bin_dir = root.join("global_bin");
+    fs::create_dir_all(&global_bin_dir).unwrap();
+
+    let target_dir = root.join("external_target_dir");
+    fs::create_dir_all(&target_dir).unwrap();
+    let canary_file = target_dir.join("canary.txt");
+    fs::write(&canary_file, b"important data that must not be deleted").unwrap();
+
+    let global_junction = global_bin_dir.join("mytool");
+    rnpm_fs::create_junction(&global_junction, &target_dir).unwrap();
+    assert!(global_junction.exists());
+
+    let err_global = create_shims_with_force(&global_bin_dir, "mytool", "my-pkg/cli.js", false)
+        .expect_err("Foreign directory junction in global bin with force = false must be refused");
+    assert!(
+        err_global.to_string().contains("EEXIST"),
+        "Must fail with EEXIST, got: {err_global}"
+    );
+    assert!(canary_file.exists(), "Canary file inside target must still exist");
+
+    // 3. A Windows directory junction in .bin (or global bin with force = true) is cleanly unlinked
+    // and replaced by create_shims_with_force WITHOUT deleting any files inside the junction's target directory.
+    // First, in local .bin:
+    let local_junction = local_bin_dir.join("junc_tool");
+    rnpm_fs::create_junction(&local_junction, &target_dir).unwrap();
+    assert!(local_junction.exists());
+
+    let res_local = create_shims_with_force(&local_bin_dir, "junc_tool", "my-pkg/cli.js", false);
+    assert!(res_local.is_ok(), "Junction in local .bin must be replaced: {:?}", res_local.err());
+    assert!(local_bin_dir.join("junc_tool.cmd").exists());
+    assert!(local_bin_dir.join("junc_tool.ps1").exists());
+    assert!(canary_file.exists(), "Target directory files must NEVER be deleted when junction is unlinked");
+
+    // Second, in global bin with force = true:
+    let res_global = create_shims_with_force(&global_bin_dir, "mytool", "my-pkg/cli.js", true);
+    assert!(res_global.is_ok(), "Junction in global bin with force = true must be replaced: {:?}", res_global.err());
+    assert!(global_bin_dir.join("mytool.cmd").exists());
+    assert!(global_bin_dir.join("mytool.ps1").exists());
+    assert!(canary_file.exists(), "Target directory files must NEVER be deleted when junction is unlinked");
+}

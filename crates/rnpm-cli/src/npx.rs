@@ -284,6 +284,54 @@ pub fn translate_npx_args(tokens: &[String]) -> Vec<String> {
     result
 }
 
+/// Pure lookup implementation for finding the companion `rnpm` or `npm` binary.
+///
+/// Sibling/parent directories of `current_exe` check `["rnpm.exe", "npm.exe"]` (or `["rnpm", "npm"]`)
+/// to seamlessly support drop-in installation setups where the binary was named `npm`.
+///
+/// However, when searching `PATH`, lookup is STRICTLY restricted to `rnpm` / `rnpm.exe`.
+/// This prevents standalone Rust `npx` from delegating to Node's JS `/usr/local/bin/npm` if Node's npm
+/// appears earlier in `PATH`.
+pub fn find_rnpm_executable_in(
+    current_exe: Option<&std::path::Path>,
+    path_dirs: &[PathBuf],
+) -> Option<PathBuf> {
+    let sibling_candidates = if cfg!(windows) {
+        &["rnpm.exe", "npm.exe"][..]
+    } else {
+        &["rnpm", "npm"][..]
+    };
+
+    if let Some(current_exe) = current_exe {
+        if let Some(dir) = current_exe.parent() {
+            for name in sibling_candidates {
+                let candidate = dir.join(name);
+                if candidate.is_file() {
+                    return Some(candidate);
+                }
+            }
+            if let Some(parent) = dir.parent() {
+                for name in sibling_candidates {
+                    let candidate = parent.join(name);
+                    if candidate.is_file() {
+                        return Some(candidate);
+                    }
+                }
+            }
+        }
+    }
+
+    let path_bin = if cfg!(windows) { "rnpm.exe" } else { "rnpm" };
+    for dir in path_dirs {
+        let candidate = dir.join(path_bin);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+
+    None
+}
+
 /// Locate sibling `rnpm` or `rnpm.exe` binary.
 #[allow(dead_code)]
 pub fn find_rnpm_executable() -> Option<PathBuf> {
@@ -296,43 +344,12 @@ pub fn find_rnpm_executable() -> Option<PathBuf> {
         }
     }
 
-    let candidates = if cfg!(windows) {
-        &["rnpm.exe", "npm.exe"][..]
-    } else {
-        &["rnpm", "npm"][..]
-    };
+    let current = std::env::current_exe().ok();
+    let path_dirs: Vec<PathBuf> = std::env::var_os("PATH")
+        .map(|p| std::env::split_paths(&p).collect())
+        .unwrap_or_default();
 
-    if let Ok(current_exe) = std::env::current_exe() {
-        if let Some(dir) = current_exe.parent() {
-            for name in candidates {
-                let candidate = dir.join(name);
-                if candidate.is_file() {
-                    return Some(candidate);
-                }
-            }
-            if let Some(parent) = dir.parent() {
-                for name in candidates {
-                    let candidate = parent.join(name);
-                    if candidate.is_file() {
-                        return Some(candidate);
-                    }
-                }
-            }
-        }
-    }
-
-    if let Some(path_var) = std::env::var_os("PATH") {
-        for dir in std::env::split_paths(&path_var) {
-            for name in candidates {
-                let candidate = dir.join(name);
-                if candidate.is_file() {
-                    return Some(candidate);
-                }
-            }
-        }
-    }
-
-    None
+    find_rnpm_executable_in(current.as_deref(), &path_dirs)
 }
 
 /// Standalone `npx` execution handler.
@@ -612,5 +629,47 @@ mod tests {
             translate_npx_args(&["-h".into()]),
             vec!["exec", "--help"]
         );
+    }
+
+    #[test]
+    fn test_find_rnpm_executable_lookup_behavior() {
+        use std::fs;
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+
+        let sibling_name = if cfg!(windows) { "npm.exe" } else { "npm" };
+        let rnpm_name = if cfg!(windows) { "rnpm.exe" } else { "rnpm" };
+
+        // 1. Sibling fallback to npm when rnpm is absent
+        let install_dir = root.join("install");
+        fs::create_dir_all(&install_dir).unwrap();
+        let fake_npx = install_dir.join(if cfg!(windows) { "npx.exe" } else { "npx" });
+        let fake_npm = install_dir.join(sibling_name);
+        fs::write(&fake_npx, b"binary").unwrap();
+        fs::write(&fake_npm, b"binary").unwrap();
+
+        let found = find_rnpm_executable_in(Some(&fake_npx), &[]);
+        assert_eq!(found, Some(fake_npm));
+
+        // 2. PATH search ignores foreign npm and only finds rnpm
+        let node_bin_dir = root.join("node_bin");
+        let rnpm_bin_dir = root.join("rnpm_bin");
+        fs::create_dir_all(&node_bin_dir).unwrap();
+        fs::create_dir_all(&rnpm_bin_dir).unwrap();
+
+        // Node's npm is earlier in PATH
+        let node_npm = node_bin_dir.join(sibling_name);
+        let actual_rnpm = rnpm_bin_dir.join(rnpm_name);
+        fs::write(&node_npm, b"node_npm").unwrap();
+        fs::write(&actual_rnpm, b"actual_rnpm").unwrap();
+
+        let search_path = vec![node_bin_dir.clone(), rnpm_bin_dir];
+        let found = find_rnpm_executable_in(None, &search_path);
+        // Must NOT pick node's npm, must pick rnpm
+        assert_eq!(found, Some(actual_rnpm));
+
+        // If only node's npm is on PATH without rnpm, returns None
+        let found_none = find_rnpm_executable_in(None, &[node_bin_dir]);
+        assert_eq!(found_none, None);
     }
 }
