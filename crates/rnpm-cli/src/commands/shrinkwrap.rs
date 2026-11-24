@@ -21,6 +21,11 @@ fn walk_nm(
     lock: &mut rnpm_lockfile::LockfileV3,
     visited: &mut HashSet<PathBuf>,
 ) -> Result<()> {
+    if let Ok(canon_dir) = std::fs::canonicalize(dir) {
+        if !visited.insert(canon_dir) {
+            return Ok(());
+        }
+    }
     for entry in std::fs::read_dir(dir)?.flatten() {
         let path = entry.path();
         let Ok(sym_meta) = std::fs::symlink_metadata(&path) else {

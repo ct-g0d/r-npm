@@ -5526,31 +5526,49 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
         Some(d) => d,
         None => std::env::current_dir()?,
     };
-    let current_dir = if matches!(
-        cli.command,
-        Commands::Run { .. }
-            | Commands::Test { .. }
-            | Commands::Start { .. }
-            | Commands::Restart { .. }
-            | Commands::Stop { .. }
-    ) {
-        let cli_overrides = rnpm_config::get_process_cli_overrides();
-        apply_cli_prefix(current_dir, cli_overrides.as_ref())
-    } else {
-        current_dir
+    let cli_overrides = rnpm_config::get_process_cli_overrides();
+    let current_dir = match &cli.command {
+        Commands::Install { prefix: Some(_), .. }
+        | Commands::Uninstall { prefix: Some(_), .. }
+        | Commands::List { prefix: Some(_), .. } => current_dir,
+        _ => apply_cli_prefix(current_dir, cli_overrides.as_ref()),
     };
 
     let silent = rnpm_config::Config::load(Some(&current_dir))?.get("loglevel") == Some("silent");
 
     // Clean up any leftover .rnpm-trash-* directories only for commands that mutate node_modules or clean cache
     if should_cleanup_trash(&cli.command) {
-        rnpm_install::trash::cleanup_leftover_trash(&current_dir);
+        let trash_dir = match &cli.command {
+            Commands::Install { prefix: Some(p), .. }
+            | Commands::Uninstall { prefix: Some(p), .. }
+            | Commands::List { prefix: Some(p), .. } => {
+                if p.is_absolute() {
+                    p.clone()
+                } else {
+                    current_dir.join(p)
+                }
+            }
+            _ => current_dir.clone(),
+        };
+        rnpm_install::trash::cleanup_leftover_trash(&trash_dir);
     }
 
     // npm checks devEngines before arborist commands and `run`, never for
     // global operations.
     if checks_dev_engines(&cli.command) {
-        enforce_dev_engines(&current_dir)?;
+        let dev_engines_dir = match &cli.command {
+            Commands::Install { prefix: Some(p), .. }
+            | Commands::Uninstall { prefix: Some(p), .. }
+            | Commands::List { prefix: Some(p), .. } => {
+                if p.is_absolute() {
+                    p.clone()
+                } else {
+                    current_dir.join(p)
+                }
+            }
+            _ => current_dir.clone(),
+        };
+        enforce_dev_engines(&dev_engines_dir)?;
     }
 
     match cli.command {
@@ -6223,7 +6241,6 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             workspace_root,
         } => {
             let cli_overrides = rnpm_config::get_process_cli_overrides();
-            let current_dir = apply_cli_prefix(current_dir, cli_overrides.as_ref());
             let has_script_overrides = cli_overrides
                 .as_ref()
                 .map(|o| {
@@ -7964,6 +7981,15 @@ fn execute_run_sync(
         ));
     }
     let mut manifest = Manifest::from_file(&manifest_path)?;
+    let config = rnpm_config::Config::load(Some(&current_dir))?;
+    if config.get("script-shell") == Some("true") {
+        eprintln!("npm error code ENOENT\nnpm error syscall spawn true");
+        std::process::exit(1);
+    }
+    let ignore_scripts = ignore_scripts || config.get_bool("ignore-scripts").unwrap_or(false);
+    let foreground_scripts =
+        foreground_scripts || config.get_bool("foreground-scripts").unwrap_or(false);
+
     if !manifest.scripts.contains_key(&script) {
         if script == "start" && current_dir.join("server.js").exists() {
             manifest
@@ -8026,14 +8052,6 @@ fn execute_run_sync(
             anyhow::bail!("npm error Missing script: \"{script}\"\nnpm error\nnpm error To see a list of scripts, run:\nnpm error   npm run");
         }
     }
-    let config = rnpm_config::Config::load(Some(&current_dir))?;
-    if config.get("script-shell") == Some("true") {
-        eprintln!("npm error code ENOENT\nnpm error syscall spawn true");
-        std::process::exit(1);
-    }
-    let ignore_scripts = ignore_scripts || config.get_bool("ignore-scripts").unwrap_or(false);
-    let foreground_scripts =
-        foreground_scripts || config.get_bool("foreground-scripts").unwrap_or(false);
     let is_silent = config.get("loglevel") == Some("silent");
     let pre = format!("pre{script}");
     let post = format!("post{script}");
@@ -8478,21 +8496,28 @@ fn main() {
 
     // Ultra-fast path for standard `rnpm run <script>` without clap AST building
     if filtered_args.get(1).map(|s| s.as_str()) == Some("run")
-        && !filtered_args.iter().any(|a| {
-            a == "--help"
-                || a == "-h"
-                || a == "--workspaces"
-                || a == "-ws"
-                || a == "-w"
-                || a == "--workspace"
-                || a.starts_with("--workspace=")
-                || a == "--filter"
-                || a.starts_with("--filter=")
-                || a == "--scope"
-                || a.starts_with("--scope=")
-                || a == "--workspace-root"
-                || a == "--include-workspace-root"
-        })
+        && !filtered_args
+            .iter()
+            .take_while(|a| a.as_str() != "--")
+            .any(|a| {
+                a == "--help"
+                    || a == "-h"
+                    || a == "--workspaces"
+                    || a == "-ws"
+                    || a.starts_with("--workspaces=")
+                    || a == "-w"
+                    || a.starts_with("-w=")
+                    || a == "--workspace"
+                    || a.starts_with("--workspace=")
+                    || a == "--filter"
+                    || a.starts_with("--filter=")
+                    || a == "--scope"
+                    || a.starts_with("--scope=")
+                    || a == "--workspace-root"
+                    || a.starts_with("--workspace-root=")
+                    || a == "--include-workspace-root"
+                    || a.starts_with("--include-workspace-root=")
+            })
     {
         let mut script_name = None;
         let mut script_args = Vec::new();
@@ -8692,11 +8717,11 @@ fn main() {
         ignore_scripts,
         foreground_scripts,
         strict_sandbox,
-        workspace_root: _,
+        workspace_root,
     } = cli.command
     {
         let has_filter = !workspace.is_empty() || !filter.is_empty() || !scope.is_empty();
-        if !workspaces && !has_filter && script.is_some() {
+        if !workspaces && !has_filter && !workspace_root && script.is_some() {
             let cli_overrides = rnpm_config::get_process_cli_overrides();
             let current_dir = apply_cli_prefix(
                 std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),

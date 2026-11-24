@@ -173,9 +173,13 @@ pub(super) fn run(json: bool, long: bool, dir: &Path) -> Result<()> {
                 if env_k
                     .get(..11)
                     .is_some_and(|prefix| prefix.eq_ignore_ascii_case("npm_config_"))
-                    && env_k.len() > 11
                 {
-                    let raw = &env_k[11..];
+                    let Some(raw) = env_k.get(11..) else {
+                        continue;
+                    };
+                    if raw.is_empty() {
+                        continue;
+                    }
                     let norm = if raw.starts_with("//") {
                         raw.to_string()
                     } else {

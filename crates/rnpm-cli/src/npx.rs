@@ -304,9 +304,9 @@ fn is_native_companion_binary(path: &std::path::Path) -> bool {
         return false;
     };
     let mut header = [0u8; 2];
-    match file.read(&mut header) {
-        Ok(2) => &header != b"#!",
-        _ => true,
+    match file.read_exact(&mut header) {
+        Ok(()) => &header != b"#!",
+        Err(_) => false,
     }
 }
 
@@ -698,5 +698,33 @@ mod tests {
         // If only node's npm is on PATH without rnpm, returns None
         let found_none = find_rnpm_executable_in(None, &[node_bin_dir]);
         assert_eq!(found_none, None);
+    }
+
+    #[test]
+    fn test_find_rnpm_executable_skips_shebang_js_npm_and_selects_rnpm() {
+        use std::fs;
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+
+        let sibling_name = if cfg!(windows) { "npm.exe" } else { "npm" };
+        let rnpm_name = if cfg!(windows) { "rnpm.exe" } else { "rnpm" };
+
+        let install_dir = root.join("install");
+        let path_dir = root.join("path_dir");
+        fs::create_dir_all(&install_dir).unwrap();
+        fs::create_dir_all(&path_dir).unwrap();
+
+        let fake_npx = install_dir.join(if cfg!(windows) { "npx.exe" } else { "npx" });
+        // Sibling npm is a JS script starting with #!
+        let fake_npm_script = install_dir.join(sibling_name);
+        fs::write(&fake_npx, b"binary").unwrap();
+        fs::write(&fake_npm_script, b"#!/usr/bin/env node\nconsole.log('hi');").unwrap();
+
+        // Valid rnpm in PATH
+        let actual_rnpm = path_dir.join(rnpm_name);
+        fs::write(&actual_rnpm, b"native_binary").unwrap();
+
+        let found = find_rnpm_executable_in(Some(&fake_npx), &[path_dir]);
+        assert_eq!(found, Some(actual_rnpm), "Should skip #! JS npm and pick native rnpm");
     }
 }
