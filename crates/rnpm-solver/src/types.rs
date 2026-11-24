@@ -41,11 +41,19 @@ pub struct PackageVersionMetadata {
     pub has_install_script: bool,
     #[serde(default)]
     pub deprecated: Option<String>,
+    /// Cached parsed semver for fast zero-allocation evaluation.
+    #[serde(skip, default)]
+    pub parsed_version: Option<Version>,
     #[serde(flatten, default)]
     pub extra: BTreeMap<String, serde_json::Value>,
 }
 
 impl PackageVersionMetadata {
+    #[inline]
+    pub fn semver(&self) -> Option<&Version> {
+        self.parsed_version.as_ref()
+    }
+
     /// Parse PackageVersionMetadata from a package manifest (package.json).
     pub fn from_manifest(manifest: &rnpm_core::manifest::Manifest) -> Self {
         // npm treats optionalDependencies as the authoritative declaration
@@ -58,9 +66,13 @@ impl PackageVersionMetadata {
             dependencies.remove(name);
         }
 
+        let version_str = manifest.version.clone().unwrap_or_default();
+        let parsed_version = Version::parse(&version_str).ok();
+
         Self {
             name: manifest.name.clone().unwrap_or_default(),
-            version: manifest.version.clone().unwrap_or_default(),
+            version: version_str,
+            parsed_version,
             dist_tarball: None,
             dist_integrity: None,
             dependency_order: dependencies.keys().cloned().collect(),
@@ -113,6 +125,17 @@ pub struct PackageMetadata {
     pub dist_tags: BTreeMap<String, String>,
     #[serde(default)]
     pub versions: BTreeMap<String, PackageVersionMetadata>,
+}
+
+impl PackageMetadata {
+    /// Pre-parse all version SemVers if not already parsed.
+    pub fn ensure_parsed_versions(&mut self) {
+        for (v_str, v_meta) in &mut self.versions {
+            if v_meta.parsed_version.is_none() {
+                v_meta.parsed_version = Version::parse(v_str).ok();
+            }
+        }
+    }
 }
 
 /// Abstract provider for retrieving package metadata from a registry, cache, or mock source.
@@ -196,9 +219,11 @@ impl InMemoryPackageProvider {
             }
         }
 
+        let parsed_version = Version::parse(&version_str).ok();
         let mut v_meta = PackageVersionMetadata {
             name: name_str.clone(),
             version: version_str.clone(),
+            parsed_version,
             ..Default::default()
         };
         configure(&mut v_meta);

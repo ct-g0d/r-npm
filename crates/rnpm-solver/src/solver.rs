@@ -7,7 +7,10 @@ use tracing::{debug, warn};
 use crate::aliases::DependencySpec;
 use crate::error::SolverError;
 use crate::graph::{DependencyEdge, DependencyGraph, DependencyType, Node, NodeFlags};
-use crate::hoisting::{determine_placement_with_peers, PlacementDecision};
+use crate::hoisting::{
+    cached_parse_package_target, cached_parse_version, determine_placement_with_peers,
+    PlacementDecision,
+};
 use crate::overrides::Overrides;
 use crate::peer::PeerContext;
 use crate::platform::Platform;
@@ -87,6 +90,124 @@ struct ResolveTask {
     is_root: bool,
 }
 
+/// Tiered queue that eliminates O(Q) cross-depth element shifting and maintains
+/// strict Arborist collation order within each depth level.
+#[derive(Debug, Clone, Default)]
+struct TaskQueue {
+    levels: Vec<VecDeque<ResolveTask>>,
+    len: usize,
+    pending_root: std::collections::HashMap<String, usize>,
+}
+
+impl TaskQueue {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    #[inline]
+    fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    fn push_task(&mut self, task: ResolveTask) {
+        if task.parent_location.is_empty() {
+            *self.pending_root.entry(task.install_name.clone()).or_default() += 1;
+        }
+        let depth = task.parent_depth;
+        if depth >= self.levels.len() {
+            self.levels.resize_with(depth + 1, VecDeque::new);
+        }
+        let level = &mut self.levels[depth];
+        let pos = level
+            .binary_search_by(|queued| {
+                arborist_compare(&queued.parent_location, &task.parent_location)
+                    .then_with(|| arborist_compare(&queued.install_name, &task.install_name))
+            })
+            .unwrap_or_else(|e| e);
+        level.insert(pos, task);
+        self.len += 1;
+    }
+
+    fn push_back(&mut self, task: ResolveTask) {
+        if task.parent_location.is_empty() {
+            *self.pending_root.entry(task.install_name.clone()).or_default() += 1;
+        }
+        let depth = task.parent_depth;
+        if depth >= self.levels.len() {
+            self.levels.resize_with(depth + 1, VecDeque::new);
+        }
+        self.levels[depth].push_back(task);
+        self.len += 1;
+    }
+
+    #[inline]
+    fn has_pending_root(&self, name: &str) -> bool {
+        self.pending_root.get(name).copied().unwrap_or(0) > 0
+    }
+
+    fn pop_front(&mut self) -> Option<ResolveTask> {
+        for level in &mut self.levels {
+            if let Some(task) = level.pop_front() {
+                self.len -= 1;
+                if task.parent_location.is_empty() {
+                    if let Some(count) = self.pending_root.get_mut(&task.install_name) {
+                        if *count > 1 {
+                            *count -= 1;
+                        } else {
+                            self.pending_root.remove(&task.install_name);
+                        }
+                    }
+                }
+                return Some(task);
+            }
+        }
+        None
+    }
+
+    fn front(&self) -> Option<&ResolveTask> {
+        for level in &self.levels {
+            if let Some(task) = level.front() {
+                return Some(task);
+            }
+        }
+        None
+    }
+
+    fn retain<F>(&mut self, mut f: F)
+    where
+        F: FnMut(&ResolveTask) -> bool,
+    {
+        for level in &mut self.levels {
+            level.retain(|task| {
+                let keep = f(task);
+                if !keep {
+                    self.len = self.len.saturating_sub(1);
+                    if task.parent_location.is_empty() {
+                        if let Some(count) = self.pending_root.get_mut(&task.install_name) {
+                            if *count > 1 {
+                                *count -= 1;
+                            } else {
+                                self.pending_root.remove(&task.install_name);
+                            }
+                        }
+                    }
+                }
+                keep
+            });
+        }
+    }
+
+    fn drain_all(&mut self) -> Vec<ResolveTask> {
+        let mut all = Vec::with_capacity(self.len);
+        for level in &mut self.levels {
+            all.extend(level.drain(..));
+        }
+        self.len = 0;
+        self.pending_root.clear();
+        all
+    }
+}
+
 /// Main solver coordinator for building the dependency graph.
 pub struct Solver<'a, P: PackageMetadataProvider> {
     provider: &'a P,
@@ -94,7 +215,7 @@ pub struct Solver<'a, P: PackageMetadataProvider> {
     overrides: Overrides,
     peer_ctx: PeerContext,
     graph: DependencyGraph,
-    queue: VecDeque<ResolveTask>,
+    queue: TaskQueue,
     /// Link targets normally wait for resolveLinks, but an invalidated edge
     /// can put a workspace into the node queue before that pass.
     deferred_workspaces: BTreeMap<String, Vec<ResolveTask>>,
@@ -154,7 +275,7 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
             overrides,
             peer_ctx: PeerContext::new(),
             graph,
-            queue: VecDeque::new(),
+            queue: TaskQueue::new(),
             deferred_workspaces: BTreeMap::new(),
             deferred_optional_peers: BTreeMap::new(),
             preplaced: std::collections::HashSet::new(),
@@ -170,6 +291,7 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
     /// Attaches an existing base graph to the solver (e.g. pre-populated workspace graph).
     pub fn with_graph(mut self, mut graph: DependencyGraph) -> Self {
         graph.legacy_peer_deps = self.options.legacy_peer_deps;
+        graph.rebuild_indices();
         self.graph = graph;
         self
     }
@@ -240,34 +362,26 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
     }
 
     fn push_task(&mut self, task: ResolveTask) {
-        let pos = self
-            .queue
-            .binary_search_by(|queued| {
-                queued
-                    .parent_depth
-                    .cmp(&task.parent_depth)
-                    .then_with(|| arborist_compare(&queued.parent_location, &task.parent_location))
-                    .then_with(|| arborist_compare(&queued.install_name, &task.install_name))
-            })
-            .unwrap_or_else(|e| e);
-        self.queue.insert(pos, task);
+        self.queue.push_task(task);
     }
 
     /// Hold workspace targets for Arborist's resolveLinks pass. A newly
     /// placed provider may activate one earlier by invalidating its edge.
     pub fn defer_workspace_tasks(&mut self) {
-        let mut root_tasks = VecDeque::new();
-        for task in std::mem::take(&mut self.queue) {
+        let mut root_tasks = Vec::new();
+        for task in self.queue.drain_all() {
             if !task.parent_location.is_empty() && !task.parent_location.contains("node_modules") {
                 self.deferred_workspaces
                     .entry(task.parent_location.clone())
                     .or_default()
                     .push(task);
             } else {
-                root_tasks.push_back(task);
+                root_tasks.push(task);
             }
         }
-        self.queue = root_tasks;
+        for task in root_tasks {
+            self.queue.push_task(task);
+        }
     }
 
     fn activate_invalidated_workspaces(&mut self, provider_location: &str) {
@@ -380,10 +494,10 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
     }
 
     /// Extracts the resolved dependency graph.
-    pub fn into_graph(self) -> DependencyGraph {
-        let mut graph = self.graph;
-        graph.normalize_dependency_flags();
-        graph
+    pub fn into_graph(mut self) -> DependencyGraph {
+        self.graph.normalize_dependency_flags();
+        self.graph.rebuild_indices();
+        self.graph
     }
 
     /// Resolves the dependency graph starting from a root manifest.
@@ -456,7 +570,7 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                 extra
             },
         };
-        self.graph.nodes.insert(String::new(), root_node);
+        self.graph.add_node(String::new(), root_node);
 
         // Collect effective root dependency types, then place their edges
         // in name order. Arborist's node queue uses depth and path rather
@@ -594,6 +708,7 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
         }
 
         self.graph.normalize_dependency_flags();
+        self.graph.rebuild_indices();
         Ok(self.graph)
     }
 
@@ -683,11 +798,8 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
             task.dep_type == DependencyType::Peer || task.dep_type == DependencyType::PeerOptional;
         let mut replace_transitive_root_peer = false;
         if is_peer
-            && self.queue.iter().any(|queued| {
-                queued.parent_location.is_empty()
-                    && (queued.install_name == task.install_name
-                        || queued.install_name == dep_spec.package_name)
-            })
+            && (self.queue.has_pending_root(&task.install_name)
+                || self.queue.has_pending_root(&dep_spec.package_name))
         {
             // A depth-first subtree can encounter a peer before the root's
             // direct dependency that is meant to satisfy it.  Defer that
@@ -758,7 +870,7 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                         }
                     }
 
-                    self.graph.edges.push(DependencyEdge {
+                    self.graph.add_edge(DependencyEdge {
                         from_location: task.parent_location,
                         to_location: existing.location.clone(),
                         install_name: task.install_name,
@@ -789,7 +901,7 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                             "Peer dependency '{}@{}' satisfied by existing node at '{}'",
                             dep_spec.package_name, effective_spec, existing.location
                         );
-                        self.graph.edges.push(DependencyEdge {
+                        self.graph.add_edge(DependencyEdge {
                             from_location: task.parent_location,
                             to_location: existing.location.clone(),
                             install_name: task.install_name,
@@ -840,7 +952,7 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                             );
                             // npm warns "ERESOLVE overriding peer dependency"
                             // and keeps the visible node; the edge stays invalid.
-                            self.graph.edges.push(DependencyEdge {
+                            self.graph.add_edge(DependencyEdge {
                                 from_location: task.parent_location,
                                 to_location: existing.location.clone(),
                                 install_name: task.install_name,
@@ -907,7 +1019,7 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                         {
                             // Keep the invalid edge so the permitted conflict
                             // still produces npm's overridden-peer warning.
-                            self.graph.edges.push(DependencyEdge {
+                            self.graph.add_edge(DependencyEdge {
                                 from_location: task.parent_location,
                                 to_location: existing.location.clone(),
                                 install_name: task.install_name,
@@ -989,23 +1101,53 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
             .map(|(scope, _)| scope)
             .unwrap_or("");
         let mut peer_advisories: Vec<PackageTarget> = if is_peer {
-            self.graph
-                .nodes
-                .values()
-                .filter(|node| {
-                    node.location
+            let mut advisories = Vec::new();
+            if !self.graph.nodes_by_dep_name.is_empty() {
+                if let Some(locs) = self.graph.nodes_by_dep_name.get(&task.install_name) {
+                    for loc in locs {
+                        if let Some(node) = self.graph.nodes.get(loc) {
+                            let scope = node
+                                .location
+                                .rsplit_once("/node_modules/")
+                                .map(|(s, _)| s)
+                                .unwrap_or("");
+                            if scope == peer_scope
+                                && node
+                                    .peer_dependencies_meta
+                                    .get(&task.install_name)
+                                    .is_some_and(|meta| meta.optional)
+                            {
+                                if let Some(spec) = node.peer_dependencies.get(&task.install_name) {
+                                    if let Some(target) = cached_parse_package_target(spec) {
+                                        advisories.push(target);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            } else {
+                for node in self.graph.nodes.values() {
+                    let scope = node
+                        .location
                         .rsplit_once("/node_modules/")
-                        .map(|(scope, _)| scope)
-                        .unwrap_or("")
-                        == peer_scope
+                        .map(|(s, _)| s)
+                        .unwrap_or("");
+                    if scope == peer_scope
                         && node
                             .peer_dependencies_meta
                             .get(&task.install_name)
                             .is_some_and(|meta| meta.optional)
-                })
-                .filter_map(|node| node.peer_dependencies.get(&task.install_name))
-                .filter_map(|spec| PackageTarget::parse(spec).ok())
-                .collect()
+                    {
+                        if let Some(spec) = node.peer_dependencies.get(&task.install_name) {
+                            if let Some(target) = cached_parse_package_target(spec) {
+                                advisories.push(target);
+                            }
+                        }
+                    }
+                }
+            }
+            advisories
         } else {
             Vec::new()
         };
@@ -1019,29 +1161,53 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                 if !seen.insert(location.clone()) {
                     continue;
                 }
-                for incoming in self
-                    .graph
-                    .edges
-                    .iter()
-                    .filter(|edge| edge.to_location == location)
-                {
-                    if matches!(
-                        incoming.dep_type,
-                        DependencyType::Peer | DependencyType::PeerOptional
-                    ) {
-                        // All members loaded by loadPeerSet share the original
-                        // virtual parent, including peers of peers.
-                        sources.push_back(incoming.from_location.clone());
-                    } else if let Some(source) = self.graph.nodes.get(&incoming.from_location) {
-                        let dev = (!source.location.contains("node_modules") && self.options.dev)
-                            .then(|| source.dev_dependencies.get(&task.install_name))
-                            .flatten();
-                        if let Some(spec) = dev
-                            .or_else(|| source.optional_dependencies.get(&task.install_name))
-                            .or_else(|| source.dependencies.get(&task.install_name))
-                        {
-                            if let Ok(target) = PackageTarget::parse(spec) {
-                                peer_advisories.push(target);
+                if !self.graph.incoming_edges_by_location.is_empty() {
+                    if let Some(incoming_indices) = self.graph.incoming_edges_by_location.get(&location) {
+                        for &idx in incoming_indices {
+                            let incoming = &self.graph.edges[idx];
+                            if matches!(
+                                incoming.dep_type,
+                                DependencyType::Peer | DependencyType::PeerOptional
+                            ) {
+                                sources.push_back(incoming.from_location.clone());
+                            } else if let Some(source) = self.graph.nodes.get(&incoming.from_location) {
+                                let dev = (!source.location.contains("node_modules") && self.options.dev)
+                                    .then(|| source.dev_dependencies.get(&task.install_name))
+                                    .flatten();
+                                if let Some(spec) = dev
+                                    .or_else(|| source.optional_dependencies.get(&task.install_name))
+                                    .or_else(|| source.dependencies.get(&task.install_name))
+                                {
+                                    if let Some(target) = cached_parse_package_target(spec) {
+                                        peer_advisories.push(target);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    for incoming in self
+                        .graph
+                        .edges
+                        .iter()
+                        .filter(|edge| edge.to_location == location)
+                    {
+                        if matches!(
+                            incoming.dep_type,
+                            DependencyType::Peer | DependencyType::PeerOptional
+                        ) {
+                            sources.push_back(incoming.from_location.clone());
+                        } else if let Some(source) = self.graph.nodes.get(&incoming.from_location) {
+                            let dev = (!source.location.contains("node_modules") && self.options.dev)
+                                .then(|| source.dev_dependencies.get(&task.install_name))
+                                .flatten();
+                            if let Some(spec) = dev
+                                .or_else(|| source.optional_dependencies.get(&task.install_name))
+                                .or_else(|| source.dependencies.get(&task.install_name))
+                            {
+                                if let Some(target) = cached_parse_package_target(spec) {
+                                    peer_advisories.push(target);
+                                }
                             }
                         }
                     }
@@ -1049,7 +1215,7 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
             }
         }
         if let Some(advisory) = task.advisory.as_deref() {
-            if let Ok(target) = PackageTarget::parse(advisory) {
+            if let Some(target) = cached_parse_package_target(advisory) {
                 peer_advisories.push(target);
             }
         }
@@ -1333,16 +1499,32 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
             placement = PlacementDecision::PlaceNew(root_slot.clone());
         } else if replace_transitive_root_peer {
             if let Some(existing) = self.graph.nodes.get(&root_slot) {
-                let pinned_by_peer = self.graph.edges.iter().any(|edge| {
-                    edge.to_location == root_slot
-                        && matches!(
-                            edge.dep_type,
-                            DependencyType::Peer | DependencyType::PeerOptional
-                        )
-                        && PackageTarget::parse(&edge.spec).is_ok_and(|target| {
-                            crate::hoisting::node_satisfies_target(existing, &target)
+                let pinned_by_peer = if !self.graph.incoming_edges_by_location.is_empty() {
+                    if let Some(incoming) = self.graph.incoming_edges_by_location.get(&root_slot) {
+                        incoming.iter().any(|&i| {
+                            let edge = &self.graph.edges[i];
+                            matches!(
+                                edge.dep_type,
+                                DependencyType::Peer | DependencyType::PeerOptional
+                            ) && cached_parse_package_target(&edge.spec).is_some_and(|target| {
+                                crate::hoisting::node_satisfies_target(existing, &target)
+                            })
                         })
-                });
+                    } else {
+                        false
+                    }
+                } else {
+                    self.graph.edges.iter().any(|edge| {
+                        edge.to_location == root_slot
+                            && matches!(
+                                edge.dep_type,
+                                DependencyType::Peer | DependencyType::PeerOptional
+                            )
+                            && cached_parse_package_target(&edge.spec).is_some_and(|target| {
+                                crate::hoisting::node_satisfies_target(existing, &target)
+                            })
+                    })
+                };
                 if pinned_by_peer && self.peer_conflict_is_fatal(task.is_mine) {
                     return Err(SolverError::peer_conflict(
                         &task.parent_package_name,
@@ -1389,7 +1571,7 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                     self.graph.skipped.insert(dep_spec.package_name.clone());
                     self.graph.skipped.insert(task.install_name.clone());
                 }
-                self.graph.edges.push(DependencyEdge {
+                self.graph.add_edge(DependencyEdge {
                     from_location: task.parent_location,
                     to_location: existing_loc,
                     install_name: task.install_name,
@@ -1453,7 +1635,10 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                     link: false,
                 };
 
-                let parsed_ver = Version::parse(&chosen_version.version).ok();
+                let parsed_ver = chosen_version
+                    .parsed_version
+                    .clone()
+                    .or_else(|| cached_parse_version(&chosen_version.version));
                 let node = Node {
                     location: target_loc.clone(),
                     install_name: task.install_name.clone(),
@@ -1486,7 +1671,7 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                     },
                 };
 
-                self.graph.nodes.insert(target_loc.clone(), node);
+                self.graph.add_node(target_loc.clone(), node);
                 self.activate_invalidated_workspaces(&target_loc);
                 self.activate_deferred_optional_peers(&target_loc);
                 if target_loc == root_slot {
@@ -1503,7 +1688,7 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                     self.graph.skipped.insert(task.install_name.clone());
                 }
 
-                self.graph.edges.push(DependencyEdge {
+                self.graph.add_edge(DependencyEdge {
                     from_location: task.parent_location,
                     to_location: target_loc.clone(),
                     install_name: task.install_name.clone(),
@@ -1836,6 +2021,7 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
         self.graph
             .edges
             .retain(|edge| !detached.contains(&edge.from_location));
+        self.graph.rebuild_indices();
         // Work queued for the detached nodes belongs to the old version; the
         // replacement enqueues its own dependencies.
         self.queue
@@ -1875,7 +2061,7 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
         let compatible_edges: Vec<_> = incoming
             .iter()
             .filter(|edge| {
-                PackageTarget::parse(&edge.spec)
+                cached_parse_package_target(&edge.spec)
                     .map(|target| crate::hoisting::node_satisfies_target(&existing_node, &target))
                     .unwrap_or(false)
             })
@@ -1936,7 +2122,7 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
             }
 
             if edge.to_location == root_location {
-                let keep_nested = PackageTarget::parse(&edge.spec)
+                let keep_nested = cached_parse_package_target(&edge.spec)
                     .map(|target| crate::hoisting::node_satisfies_target(&existing_node, &target))
                     .unwrap_or(false);
                 if keep_nested {
@@ -1947,9 +2133,11 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                 edge.to_location = format!("{nested}{suffix}");
             }
         }
+        self.graph.rebuild_indices();
+
         // Children waiting to expand still belong to the moved package.
         // Reinsert them because depth and path determine queue ordering.
-        for mut task in std::mem::take(&mut self.queue) {
+        for mut task in self.queue.drain_all() {
             if task.parent_location == root_location || task.parent_location.starts_with(&prefix) {
                 task.parent_location =
                     format!("{nested}{}", &task.parent_location[root_location.len()..]);
@@ -1978,31 +2166,37 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
         install_name: &str,
         target: &PackageTarget,
     ) {
-        let candidates: Vec<String> = self
-            .graph
-            .nodes
-            .iter()
-            .filter(|(location, node)| {
-                *location != root_location
-                    && location.ends_with(&format!("/node_modules/{install_name}"))
-                    && node.name == package_name
-                    && crate::hoisting::node_satisfies_target(node, target)
-                    && !self
-                        .graph
-                        .nodes
-                        .keys()
-                        .any(|child| child.starts_with(&format!("{location}/node_modules/")))
-            })
-            .map(|(location, _)| location.clone())
-            .collect();
-        for candidate in candidates {
-            self.graph.edges.iter_mut().for_each(|edge| {
-                if edge.to_location == candidate {
-                    edge.to_location = root_location.to_string();
-                }
-            });
-            self.graph.nodes.remove(&candidate);
+        let candidates: Vec<String> = if let Some(locs) = self.graph.nodes_by_install_name.get(install_name) {
+            locs.iter()
+                .filter(|location| {
+                    *location != root_location
+                        && self.graph.nodes.get(*location).is_some_and(|node| {
+                            node.name == package_name
+                                && crate::hoisting::node_satisfies_target(node, target)
+                        })
+                        && !self.graph.has_children(location)
+                })
+                .cloned()
+                .collect()
+        } else {
+            Vec::new()
+        };
+
+        if candidates.is_empty() {
+            return;
         }
+
+        for candidate in &candidates {
+            if let Some(edge_indices) = self.graph.incoming_edges_by_location.get(candidate).cloned() {
+                for idx in edge_indices {
+                    if let Some(edge) = self.graph.edges.get_mut(idx) {
+                        edge.to_location = root_location.to_string();
+                    }
+                }
+            }
+            self.graph.remove_node(candidate);
+        }
+        self.graph.rebuild_edge_indices();
     }
 
     /// Selects the highest version matching target constraint in a single linear pass (O(N), zero Vec allocations, zero metadata clones).
@@ -2088,9 +2282,9 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                 if *root_type == DependencyType::PeerOptional {
                     continue;
                 }
-                let (Ok(root_dep), Ok(peer_target)) = (
-                    DependencySpec::parse(peer, root_spec),
-                    PackageTarget::parse(peer_spec),
+                let (Some(root_dep), Some(peer_target)) = (
+                    DependencySpec::parse(peer, root_spec).ok(),
+                    cached_parse_package_target(peer_spec),
                 ) else {
                     continue;
                 };
@@ -2207,7 +2401,7 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
             .graph
             .nodes
             .get(&format!("node_modules/{peer}"))
-            .zip(PackageTarget::parse(required_spec).ok())
+            .zip(cached_parse_package_target(required_spec))
             .is_some_and(|(node, target)| crate::hoisting::node_satisfies_target(node, &target))
     }
 
@@ -2580,12 +2774,18 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                     Some(v)
                 } else {
                     meta.versions.iter().find_map(|(ver_str, v_meta)| {
-                        if let Ok(parsed) = Version::parse(ver_str) {
-                            if &parsed == expected {
-                                return Some(v_meta);
-                            }
+                        let matches = if let Some(ref pv) = v_meta.parsed_version {
+                            pv == expected
+                        } else if let Some(ref cv) = cached_parse_version(ver_str) {
+                            cv == expected
+                        } else {
+                            false
+                        };
+                        if matches {
+                            Some(v_meta)
+                        } else {
+                            None
                         }
-                        None
                     })
                 }
             }
@@ -2601,7 +2801,12 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                     let mut versions: Vec<(&PackageVersionMetadata, Version)> = meta
                         .versions
                         .values()
-                        .filter_map(|vm| Version::parse(&vm.version).ok().map(|parsed| (vm, parsed)))
+                        .filter_map(|vm| {
+                            vm.parsed_version
+                                .clone()
+                                .or_else(|| cached_parse_version(&vm.version))
+                                .map(|parsed| (vm, parsed))
+                        })
                         .collect();
                     versions.sort_by(|a, b| b.1.cmp(&a.1));
                     if let Some((vm, _)) = versions.iter().find(|(_, parsed)| !parsed.is_prerelease()) {
@@ -2637,7 +2842,12 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                     ) {
                         if let Some(existing_node) = self.graph.nodes.get(loc) {
                             if existing_node.name == pkg_name {
-                                if let Ok(parsed) = Version::parse(&existing_node.version) {
+                                if let Some(parsed) = existing_node
+                                    .parsed_version
+                                    .as_ref()
+                                    .cloned()
+                                    .or_else(|| cached_parse_version(&existing_node.version))
+                                {
                                     if range.satisfies(&parsed)
                                         && is_safe(&parsed)
                                         && advisories.iter().all(|target| {
@@ -2662,41 +2872,48 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                         None;
                     let mut best_placed: Option<(&'b PackageVersionMetadata, Version)> = None;
 
-                    for node in self.graph.nodes.values() {
-                        if node.name == pkg_name {
-                            if let Ok(parsed) = Version::parse(&node.version) {
-                                if range.satisfies(&parsed)
-                                    && is_safe(&parsed)
-                                    && advisories.iter().all(|target| {
-                                        crate::hoisting::version_satisfies_target(
-                                            &node.version,
-                                            target,
-                                        )
-                                    })
+                    if let Some(locs) = self.graph.nodes_by_name.get(pkg_name) {
+                        for loc in locs {
+                            if let Some(node) = self.graph.nodes.get(loc) {
+                                if let Some(parsed) = node
+                                    .parsed_version
+                                    .as_ref()
+                                    .cloned()
+                                    .or_else(|| cached_parse_version(&node.version))
                                 {
-                                    if let Some(v_meta) = meta.versions.get(&node.version) {
-                                        if v_meta.deprecated.is_none() {
-                                            match &best_placed_undeprecated {
-                                                Some((_, best_v)) => {
-                                                    if &parsed > best_v {
+                                    if range.satisfies(&parsed)
+                                        && is_safe(&parsed)
+                                        && advisories.iter().all(|target| {
+                                            crate::hoisting::version_satisfies_target(
+                                                &node.version,
+                                                target,
+                                            )
+                                        })
+                                    {
+                                        if let Some(v_meta) = meta.versions.get(&node.version) {
+                                            if v_meta.deprecated.is_none() {
+                                                match &best_placed_undeprecated {
+                                                    Some((_, best_v)) => {
+                                                        if &parsed > best_v {
+                                                            best_placed_undeprecated =
+                                                                Some((v_meta, parsed.clone()));
+                                                        }
+                                                    }
+                                                    None => {
                                                         best_placed_undeprecated =
                                                             Some((v_meta, parsed.clone()));
                                                     }
                                                 }
-                                                None => {
-                                                    best_placed_undeprecated =
-                                                        Some((v_meta, parsed.clone()));
-                                                }
                                             }
-                                        }
-                                        match &best_placed {
-                                            Some((_, best_v)) => {
-                                                if &parsed > best_v {
+                                            match &best_placed {
+                                                Some((_, best_v)) => {
+                                                    if &parsed > best_v {
+                                                        best_placed = Some((v_meta, parsed));
+                                                    }
+                                                }
+                                                None => {
                                                     best_placed = Some((v_meta, parsed));
                                                 }
-                                            }
-                                            None => {
-                                                best_placed = Some((v_meta, parsed));
                                             }
                                         }
                                     }
@@ -2719,7 +2936,12 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                 // compatible release.
                 if let Some(latest_version) = meta.dist_tags.get("latest") {
                     if let Some(latest) = meta.versions.get(latest_version) {
-                        if let Ok(v) = Version::parse(&latest.version) {
+                        if let Some(v) = latest
+                            .parsed_version
+                            .as_ref()
+                            .cloned()
+                            .or_else(|| cached_parse_version(&latest.version))
+                        {
                             if range.satisfies(&v)
                                 && is_safe(&v)
                                 && latest.deprecated.is_none()
@@ -2742,7 +2964,12 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                 let mut best_any: Option<(&'b PackageVersionMetadata, Version)> = None;
 
                 for (ver_str, v_meta) in &meta.versions {
-                    if let Ok(parsed) = Version::parse(ver_str) {
+                    if let Some(parsed) = v_meta
+                        .parsed_version
+                        .as_ref()
+                        .cloned()
+                        .or_else(|| cached_parse_version(ver_str))
+                    {
                         if range.satisfies(&parsed)
                             && advisories.iter().all(|target| {
                                 crate::hoisting::version_satisfies_target(ver_str, target)
@@ -2853,7 +3080,12 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                 } else if let Ok(range) = rnpm_core::semver::Range::parse(s) {
                     let mut best: Option<(&'b PackageVersionMetadata, Version)> = None;
                     for (ver_str, v_meta) in &meta.versions {
-                        if let Ok(parsed) = Version::parse(ver_str) {
+                        if let Some(parsed) = v_meta
+                            .parsed_version
+                            .as_ref()
+                            .cloned()
+                            .or_else(|| cached_parse_version(ver_str))
+                        {
                             if range.satisfies(&parsed) {
                                 match &best {
                                     Some((_, best_v)) => {
@@ -2882,7 +3114,12 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
 fn select_max_semver_version<'b>(meta: &'b PackageMetadata) -> Option<&'b PackageVersionMetadata> {
     let mut best: Option<(&'b PackageVersionMetadata, Version)> = None;
     for (ver_str, v_meta) in &meta.versions {
-        if let Ok(parsed) = Version::parse(ver_str) {
+        if let Some(parsed) = v_meta
+            .parsed_version
+            .as_ref()
+            .cloned()
+            .or_else(|| cached_parse_version(ver_str))
+        {
             match &best {
                 Some((_, best_v)) => {
                     if &parsed > best_v {

@@ -1,10 +1,10 @@
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 /// Context tracker for detecting and breaking cyclic peer dependency relationships of any depth.
 #[derive(Debug, Clone, Default)]
 pub struct PeerContext {
     /// Active peer edges: dependent_package -> set of peer_packages being resolved
-    active_graph: BTreeMap<String, BTreeSet<String>>,
+    active_graph: HashMap<String, Vec<String>>,
 }
 
 impl PeerContext {
@@ -34,7 +34,7 @@ impl PeerContext {
         }
 
         // Cycle exists if `dependent` (or alias) is reachable from `peer` (or alias) in active graph
-        let mut visited = BTreeSet::new();
+        let mut visited = HashSet::new();
         let mut queue = VecDeque::new();
         queue.push_back(peer);
         visited.insert(peer);
@@ -87,9 +87,9 @@ impl PeerContext {
         }
 
         // BFS with predecessor map to reconstruct shortest path from `peer` (or alias) to `dependent`
-        let mut visited = BTreeSet::new();
+        let mut visited = HashSet::new();
         let mut queue = VecDeque::new();
-        let mut parent_map: BTreeMap<&str, &str> = BTreeMap::new();
+        let mut parent_map: HashMap<&str, &str> = HashMap::new();
 
         queue.push_back(peer);
         visited.insert(peer);
@@ -175,17 +175,17 @@ impl PeerContext {
 
     /// Mark a peer edge as actively being resolved.
     pub fn enter(&mut self, dependent: &str, peer: &str) {
-        self.active_graph
-            .entry(dependent.to_string())
-            .or_default()
-            .insert(peer.to_string());
+        let neighbors = self.active_graph.entry(dependent.to_string()).or_default();
+        if !neighbors.iter().any(|p| p == peer) {
+            neighbors.push(peer.to_string());
+        }
     }
 
     /// Mark a peer edge as finished.
     pub fn leave(&mut self, dependent: &str, peer: &str) {
-        if let Some(set) = self.active_graph.get_mut(dependent) {
-            set.remove(peer);
-            if set.is_empty() {
+        if let Some(neighbors) = self.active_graph.get_mut(dependent) {
+            neighbors.retain(|p| p != peer);
+            if neighbors.is_empty() {
                 self.active_graph.remove(dependent);
             }
         }

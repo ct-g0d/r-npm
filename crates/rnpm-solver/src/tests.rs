@@ -6753,3 +6753,184 @@ fn test_repro_octokit_types_hoisting() {
         ]
     );
 }
+
+#[test]
+fn test_secondary_graph_indices_consistency() {
+    use crate::graph::{DependencyEdge, DependencyGraph, Node};
+    use rnpm_core::semver::Version;
+
+    let mut graph = DependencyGraph::new();
+
+    // 1. Add node A at root node_modules
+    let mut node_a = Node {
+        location: "node_modules/pkg-a".to_string(),
+        install_name: "pkg-a".to_string(),
+        name: "pkg-a".to_string(),
+        version: "1.0.0".to_string(),
+        parsed_version: Version::parse("1.0.0").ok(),
+        ..Default::default()
+    };
+    node_a.dependencies.insert("dep-x".to_string(), "^1.0.0".to_string());
+    node_a.dependencies.insert("dep-y".to_string(), "^1.0.0".to_string());
+    node_a.optional_dependencies.insert("dep-opt".to_string(), "1.0.0".to_string());
+
+    graph.add_node("node_modules/pkg-a".to_string(), node_a);
+
+    assert_eq!(graph.nodes_by_name["pkg-a"], vec!["node_modules/pkg-a"]);
+    assert_eq!(graph.nodes_by_install_name["pkg-a"], vec!["node_modules/pkg-a"]);
+    assert!(graph.nodes_by_dep_name["dep-x"].contains(&"node_modules/pkg-a".to_string()));
+    assert!(graph.nodes_by_dep_name["dep-y"].contains(&"node_modules/pkg-a".to_string()));
+    assert!(graph.nodes_by_dep_name["dep-opt"].contains(&"node_modules/pkg-a".to_string()));
+    assert!(!graph.has_children("node_modules/pkg-a"));
+
+    // 2. Add nested node B under node A
+    let mut node_b = Node {
+        location: "node_modules/pkg-a/node_modules/pkg-b".to_string(),
+        install_name: "pkg-b".to_string(),
+        name: "pkg-b".to_string(),
+        version: "1.0.0".to_string(),
+        parsed_version: Version::parse("1.0.0").ok(),
+        ..Default::default()
+    };
+    node_b.dependencies.insert("dep-z".to_string(), "^2.0.0".to_string());
+
+    graph.add_node("node_modules/pkg-a/node_modules/pkg-b".to_string(), node_b);
+
+    assert!(graph.has_children("node_modules/pkg-a"));
+    assert!(!graph.has_children("node_modules/pkg-a/node_modules/pkg-b"));
+    assert_eq!(
+        graph.children_by_parent["node_modules/pkg-a"],
+        vec!["node_modules/pkg-a/node_modules/pkg-b"]
+    );
+    assert!(graph.nodes_by_dep_name["dep-z"].contains(&"node_modules/pkg-a/node_modules/pkg-b".to_string()));
+
+    // 3. Add edges
+    graph.add_edge(DependencyEdge {
+        from_location: String::new(),
+        to_location: "node_modules/pkg-a".to_string(),
+        install_name: "pkg-a".to_string(),
+        package_name: "pkg-a".to_string(),
+        spec: "^1.0.0".to_string(),
+        dep_type: DependencyType::Prod,
+    });
+    graph.add_edge(DependencyEdge {
+        from_location: "node_modules/pkg-a".to_string(),
+        to_location: "node_modules/pkg-a/node_modules/pkg-b".to_string(),
+        install_name: "pkg-b".to_string(),
+        package_name: "pkg-b".to_string(),
+        spec: "^1.0.0".to_string(),
+        dep_type: DependencyType::Prod,
+    });
+
+    assert_eq!(graph.get_outgoing_edges("node_modules/pkg-a").len(), 1);
+    assert_eq!(graph.get_outgoing_edges("node_modules/pkg-a")[0].install_name, "pkg-b");
+    assert_eq!(graph.edges_by_install_name["pkg-a"], vec![0]);
+    assert_eq!(graph.edges_by_install_name["pkg-b"], vec![1]);
+    assert_eq!(graph.incoming_edges_by_location["node_modules/pkg-a"], vec![0]);
+    assert_eq!(graph.incoming_edges_by_location["node_modules/pkg-a/node_modules/pkg-b"], vec![1]);
+
+    // 4. Replace node A with updated dependencies
+    let mut updated_node_a = Node {
+        location: "node_modules/pkg-a".to_string(),
+        install_name: "pkg-a".to_string(),
+        name: "pkg-a".to_string(),
+        version: "2.0.0".to_string(),
+        parsed_version: Version::parse("2.0.0").ok(),
+        ..Default::default()
+    };
+    updated_node_a.dependencies.insert("dep-w".to_string(), "^1.0.0".to_string());
+
+    graph.add_node("node_modules/pkg-a".to_string(), updated_node_a);
+
+    assert_eq!(graph.nodes["node_modules/pkg-a"].version, "2.0.0");
+    assert!(!graph.nodes_by_dep_name.get("dep-x").is_some_and(|v| v.contains(&"node_modules/pkg-a".to_string())));
+    assert!(graph.nodes_by_dep_name["dep-w"].contains(&"node_modules/pkg-a".to_string()));
+    // Children relationship must still persist
+    assert!(graph.has_children("node_modules/pkg-a"));
+
+    // 5. Remove node B and verify secondary index cleanup
+    let removed = graph.remove_node("node_modules/pkg-a/node_modules/pkg-b");
+    assert!(removed.is_some());
+    assert!(!graph.has_children("node_modules/pkg-a"));
+    assert!(!graph.nodes_by_install_name.get("pkg-b").is_some_and(|v| !v.is_empty()));
+    assert!(!graph.nodes_by_dep_name.get("dep-z").is_some_and(|v| !v.is_empty()));
+
+    // 6. Remove edge and verify edge indices
+    let removed_edge = graph.remove_edge(1);
+    assert!(removed_edge.is_some());
+    assert!(graph.get_outgoing_edges("node_modules/pkg-a").is_empty());
+    assert!(!graph.incoming_edges_by_location.get("node_modules/pkg-a/node_modules/pkg-b").is_some_and(|v| !v.is_empty()));
+
+    // 7. Full rebuild test comparison
+    let mut cloned_graph = graph.clone();
+    cloned_graph.rebuild_indices();
+    assert_eq!(graph, cloned_graph);
+}
+
+#[test]
+fn test_large_graph_resolution_benchmark() {
+    let mut provider = InMemoryPackageProvider::new();
+    const NUM_PACKAGES: usize = 250;
+
+    for i in 0..NUM_PACKAGES {
+        let pkg_name = format!("bench-pkg-{i}");
+        // Add 1.0.0
+        provider.add_version(&pkg_name, "1.0.0", |v| {
+            if i + 1 < NUM_PACKAGES {
+                v.dependencies.insert(format!("bench-pkg-{}", i + 1), "^1.0.0".to_string());
+            }
+            if i + 2 < NUM_PACKAGES {
+                v.dependencies.insert(format!("bench-pkg-{}", i + 2), "^1.0.0".to_string());
+            }
+            if i % 10 == 0 && i + 5 < NUM_PACKAGES {
+                v.peer_dependencies.insert(format!("bench-pkg-{}", i + 5), "^1.0.0".to_string());
+            }
+        });
+        // Add 2.0.0 for some packages to create version choices
+        if i % 3 == 0 {
+            provider.add_version(&pkg_name, "2.0.0", |v| {
+                if i + 1 < NUM_PACKAGES {
+                    v.dependencies.insert(format!("bench-pkg-{}", i + 1), "^1.0.0".to_string());
+                }
+            });
+        }
+    }
+
+    let mut manifest = Manifest::default();
+    manifest.dependencies.insert("bench-pkg-0".to_string(), "^1.0.0".to_string());
+    manifest.dependencies.insert("bench-pkg-50".to_string(), "^1.0.0".to_string());
+    manifest.dependencies.insert("bench-pkg-100".to_string(), "^1.0.0".to_string());
+    manifest.dependencies.insert("bench-pkg-150".to_string(), "^1.0.0".to_string());
+    manifest.dependencies.insert("bench-pkg-200".to_string(), "^1.0.0".to_string());
+
+    let options = ResolverOptions::default();
+    let start = std::time::Instant::now();
+    let graph = resolve_dependency_graph(&manifest, &provider, &options).expect("large resolution must succeed");
+    let elapsed = start.elapsed();
+
+    // Verify performance: 250 packages with diamond & peer deps resolves in < 500ms
+    assert!(
+        elapsed.as_millis() < 500,
+        "Large graph resolution took too long: {}ms (expected < 500ms)",
+        elapsed.as_millis()
+    );
+
+    // Verify graph size and indices integrity
+    assert!(
+        graph.nodes.len() >= 250,
+        "Expected at least 250 nodes in resolved graph, got {}",
+        graph.nodes.len()
+    );
+
+    for (loc, node) in &graph.nodes {
+        if loc.is_empty() {
+            continue;
+        }
+        assert!(
+            graph.nodes_by_name.get(&node.name).is_some_and(|locs| locs.contains(loc)),
+            "Node at {} not found in nodes_by_name for {}",
+            loc,
+            node.name
+        );
+    }
+}
