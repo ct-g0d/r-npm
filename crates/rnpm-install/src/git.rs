@@ -757,8 +757,19 @@ pub fn normalize_clone_url_for_git(url: &str) -> String {
 
 /// Returns true if the git URL or path refers to a local repository or file:// protocol.
 pub fn is_file_or_local_git_url(url: &str) -> bool {
-    let clean = url.strip_prefix("git+").unwrap_or(url);
-    if clean.starts_with("file:") || clean.contains("file://") {
+    let trimmed = url.trim();
+    let clean = if trimmed
+        .get(..4)
+        .is_some_and(|p| p.eq_ignore_ascii_case("git+"))
+    {
+        &trimmed[4..]
+    } else {
+        trimmed
+    };
+    if clean
+        .get(..5)
+        .is_some_and(|p| p.eq_ignore_ascii_case("file:"))
+    {
         return true;
     }
     if clean.starts_with("./")
