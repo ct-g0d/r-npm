@@ -356,17 +356,27 @@ fn test_run_with_prefix_executes_in_prefix_and_preserves_init_cwd() {
     let expected_init = fs::canonicalize(tmp.path()).unwrap_or_else(|_| tmp.path().to_path_buf());
     let expected_sub = fs::canonicalize(&sub).unwrap_or_else(|_| sub.clone());
     let norm = |p: &std::path::Path| {
-        let s = p.to_string_lossy().to_string();
+        let canon = fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+        let s = canon.to_string_lossy().to_string();
         s.strip_prefix(r"\\?\").unwrap_or(&s).to_ascii_lowercase()
     };
-    let stdout_lower = stdout.to_ascii_lowercase();
-    assert!(
-        stdout_lower.contains(&format!("init={}", norm(&expected_init))),
+    let actual_init = stdout
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("INIT="))
+        .unwrap_or_else(|| panic!("Missing INIT= line in stdout:\n{stdout}"));
+    let actual_cwd = stdout
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("CWD="))
+        .unwrap_or_else(|| panic!("Missing CWD= line in stdout:\n{stdout}"));
+    assert_eq!(
+        norm(std::path::Path::new(actual_init)),
+        norm(&expected_init),
         "INIT_CWD should be outer invocation dir '{}', got:\n{stdout}",
         norm(&expected_init)
     );
-    assert!(
-        stdout_lower.contains(&format!("cwd={}", norm(&expected_sub))),
+    assert_eq!(
+        norm(std::path::Path::new(actual_cwd)),
+        norm(&expected_sub),
         "process.cwd() should be prefix dir '{}', got:\n{stdout}",
         norm(&expected_sub)
     );

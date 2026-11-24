@@ -371,7 +371,7 @@ impl ScriptNode<'_> {
             } else {
                 key
             };
-            let key_clean = clean_file_path(key_path);
+            let key_clean = clean_file_path(key_path).replace('\\', "/");
             let key_abs = normalize_path(&self.project_dir.join(key_clean));
             let node_target = self
                 .resolved
@@ -382,7 +382,7 @@ impl ScriptNode<'_> {
                     } else {
                         r
                     };
-                    clean_file_path(r_path)
+                    clean_file_path(r_path).replace('\\', "/")
                 })
                 .map(|r| normalize_path(&self.project_dir.join(r)))
                 .or_else(|| {

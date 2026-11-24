@@ -49,11 +49,11 @@ fn test_completion_stdout_hashbang_line1() {
     let line1 = lines.next().expect("Expected at least one line");
     let line2 = lines.next().expect("Expected at least two lines");
 
-    assert_eq!(line1, "#!/bin/bash", "Line 1 must be '#!/bin/bash'");
     assert_eq!(
-        line2, "###-begin-npm-completion-###",
-        "Line 2 must be '###-begin-npm-completion-###'"
+        line1, "###-begin-npm-completion-###",
+        "Line 1 must match npm 11.20.0 completion.js (which strips leading #! shebang)"
     );
+    assert_eq!(line2, "#", "Line 2 must be '#'");
 }
 
 #[test]
