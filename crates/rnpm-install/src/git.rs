@@ -200,7 +200,13 @@ impl GitFetcher {
 
         // pacote resolves the remote refs before attempting a clone. Preserve
         // that command's stderr and status rather than reporting clone errors.
-        let args = ["--no-replace-objects", "ls-remote", &normalized_url];
+        let ls_remote_url =
+            if clone_url.starts_with("file://") || clone_url.starts_with("git+file://") {
+                clone_url.strip_prefix("git+").unwrap_or(clone_url).to_string()
+            } else {
+                normalized_url.clone()
+            };
+        let args = ["--no-replace-objects", "ls-remote", &ls_remote_url];
         let output = match tokio::process::Command::new("git")
             .args(args)
             .env("GIT_TERMINAL_PROMPT", "0")
@@ -221,11 +227,11 @@ impl GitFetcher {
         };
 
         if !output.status.success() {
-            let scrubbed_url = rnpm_config::scrub_credentials(&normalized_url);
+            let scrubbed_url = rnpm_config::scrub_credentials(&ls_remote_url);
             let display_args: Vec<_> = args
                 .iter()
                 .map(|a| {
-                    if *a == normalized_url.as_str() || *a == clone_url {
+                    if *a == ls_remote_url.as_str() || *a == normalized_url.as_str() || *a == clone_url {
                         scrubbed_url.as_str()
                     } else {
                         *a

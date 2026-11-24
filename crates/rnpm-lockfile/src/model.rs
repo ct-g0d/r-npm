@@ -1372,6 +1372,22 @@ impl LockfileV3 {
             }
 
             if let Some(members) = workspace_members {
+                // Collect explicit local `file:` dependency targets declared in the root manifest.
+                // Real npm `ci` allows dangling links for explicitly declared `file:` dependencies
+                // whose target folder is missing on disk (e.g. `ci-missing-link-target`).
+                let explicit_file_targets: BTreeSet<String> = manifest
+                    .dependencies
+                    .values()
+                    .chain(manifest.dev_dependencies.values())
+                    .chain(manifest.optional_dependencies.values())
+                    .filter_map(|spec| {
+                        let raw = spec.strip_prefix("file:")?;
+                        let posix = raw.replace('\\', "/");
+                        let trimmed = posix.strip_prefix("./").unwrap_or(&posix).trim_end_matches('/');
+                        Some(trimmed.to_string())
+                    })
+                    .collect();
+
                 // Workspace discovery is available (caller supplied workspace_members).
                 // 1. Every discovered member on disk must exist in the lockfile
                 for member in members {
@@ -1386,6 +1402,7 @@ impl LockfileV3 {
                 // 2. Every member path in lockfile matching workspace patterns must exist on disk (detects stale / deleted members)
                 for member_path in &lockfile_member_paths {
                     if Self::path_matches_workspace_patterns(member_path, &patterns)
+                        && !explicit_file_targets.contains(member_path)
                         && !members.iter().any(|m| m.relative_path == *member_path)
                     {
                         return false;
@@ -1395,6 +1412,7 @@ impl LockfileV3 {
                 // 3. Every available link target that matches workspace patterns must exist on disk
                 for link_target in &available_link_targets {
                     if Self::path_matches_workspace_patterns(link_target, &patterns)
+                        && !explicit_file_targets.contains(link_target)
                         && !members.iter().any(|m| m.relative_path == *link_target)
                     {
                         return false;

@@ -96,19 +96,7 @@ pub(super) fn run(json: bool, long: bool, dir: &Path) -> Result<()> {
                         .display()
                         .to_string()
                 }),
-            "userconfig" => rnpm_config::get_process_userconfig()
-                .map(|p| p.display().to_string())
-                .or_else(|| std::env::var("NPM_CONFIG_USERCONFIG").ok())
-                .or_else(|| std::env::var("npm_config_userconfig").ok())
-                .or_else(|| {
-                    detailed
-                        .layers
-                        .iter()
-                        .find(|l| l.name == "user")
-                        .and_then(|l| l.source.as_ref())
-                        .map(|p| p.display().to_string())
-                })
-                .unwrap_or_else(|| Path::new(&home).join(".npmrc").display().to_string()),
+            "userconfig" => Path::new(&home).join(".npmrc").display().to_string(),
             "init.module" => Path::new(&home).join(".npm-init.js").display().to_string(),
             "node-gyp" => npm_dir
                 .join("node_modules")
@@ -240,6 +228,12 @@ pub(super) fn run(json: bool, long: bool, dir: &Path) -> Result<()> {
     }
     if long {
         cli.data.insert("long".into(), Value::Bool(true));
+    }
+    if let Some(userconfig) = rnpm_config::get_process_userconfig() {
+        cli.data.insert(
+            "userconfig".into(),
+            Value::String(userconfig.display().to_string()),
+        );
     }
     let mut owners = BTreeMap::new();
     for (i, layer) in layers.iter().enumerate() {
