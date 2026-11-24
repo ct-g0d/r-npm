@@ -304,14 +304,24 @@ fn is_native_companion_binary(path: &std::path::Path) -> bool {
     let Ok(mut file) = std::fs::File::open(path) else {
         return false;
     };
-    let mut header = [0u8; 2];
+    let mut header = [0u8; 4];
     let Ok(()) = file.read_exact(&mut header) else {
         return false;
     };
     if cfg!(windows) {
-        &header == b"MZ"
+        &header[..2] == b"MZ"
     } else {
-        &header != b"#!"
+        // Accept native ELF or Mach-O executables only (reject `#!` scripts and plain text wrappers)
+        header == *b"\x7fELF"
+            || matches!(
+                header,
+                [0xFE, 0xED, 0xFA, 0xCE]
+                    | [0xFE, 0xED, 0xFA, 0xCF]
+                    | [0xCE, 0xFA, 0xED, 0xFE]
+                    | [0xCF, 0xFA, 0xED, 0xFE]
+                    | [0xCA, 0xFE, 0xBA, 0xBE]
+                    | [0xBE, 0xBA, 0xFE, 0xCA]
+            )
     }
 }
 
@@ -322,42 +332,38 @@ pub fn find_rnpm_executable_in(
     let rnpm_name = if cfg!(windows) { "rnpm.exe" } else { "rnpm" };
     let npm_name = if cfg!(windows) { "npm.exe" } else { "npm" };
 
-    // 1. Prefer `rnpm` everywhere first (sibling, parent, then PATH)
+    // 1. Check co-located binaries beside `npx` first (`rnpm`, then native companion `npm`),
+    //    then parent directory (`rnpm`, then native companion `npm`).
+    //    `is_native_companion_binary` rejects `#!` JS npm launchers and batch wrappers so
+    //    standalone Rust `npx` never silently falls back to Node's JS npm.
     if let Some(current_exe) = current_exe {
         if let Some(dir) = current_exe.parent() {
-            let sibling = dir.join(rnpm_name);
-            if sibling.is_file() {
-                return Some(sibling);
+            let sibling_rnpm = dir.join(rnpm_name);
+            if sibling_rnpm.is_file() {
+                return Some(sibling_rnpm);
             }
-            if let Some(parent) = dir.parent() {
-                let parent_bin = parent.join(rnpm_name);
-                if parent_bin.is_file() {
-                    return Some(parent_bin);
-                }
-            }
-        }
-    }
-
-    for dir in path_dirs {
-        let candidate = dir.join(rnpm_name);
-        if candidate.is_file() {
-            return Some(candidate);
-        }
-    }
-
-    // 2. Fall back to a renamed native companion `npm` binary beside `npx` (never a `#!` JS launcher)
-    if let Some(current_exe) = current_exe {
-        if let Some(dir) = current_exe.parent() {
             let sibling_npm = dir.join(npm_name);
             if is_native_companion_binary(&sibling_npm) {
                 return Some(sibling_npm);
             }
             if let Some(parent) = dir.parent() {
+                let parent_rnpm = parent.join(rnpm_name);
+                if parent_rnpm.is_file() {
+                    return Some(parent_rnpm);
+                }
                 let parent_npm = parent.join(npm_name);
                 if is_native_companion_binary(&parent_npm) {
                     return Some(parent_npm);
                 }
             }
+        }
+    }
+
+    // 2. Search PATH strictly for `rnpm` (never foreign `npm` on PATH)
+    for dir in path_dirs {
+        let candidate = dir.join(rnpm_name);
+        if candidate.is_file() {
+            return Some(candidate);
         }
     }
 
@@ -731,8 +737,28 @@ mod tests {
         let actual_rnpm = path_dir.join(rnpm_name);
         fs::write(&actual_rnpm, native_bytes).unwrap();
 
-        let found = find_rnpm_executable_in(Some(&fake_npx), &[path_dir]);
-        assert_eq!(found, Some(actual_rnpm), "Should skip #! JS npm and pick native rnpm");
+        // Must reject #! JS npm even when PATH is empty
+        assert_eq!(
+            find_rnpm_executable_in(Some(&fake_npx), &[]),
+            None,
+            "Must reject co-located #! JS npm script"
+        );
+
+        let found = find_rnpm_executable_in(Some(&fake_npx), std::slice::from_ref(&path_dir));
+        assert_eq!(
+            found,
+            Some(actual_rnpm),
+            "Should skip #! JS npm and fall back to native rnpm on PATH"
+        );
+
+        // When co-located npm IS a real native binary, it beats unrelated PATH rnpm
+        fs::write(&fake_npm_script, native_bytes).unwrap();
+        let found_native = find_rnpm_executable_in(Some(&fake_npx), &[path_dir]);
+        assert_eq!(
+            found_native,
+            Some(fake_npm_script),
+            "Native co-located companion npm must take precedence over unrelated PATH rnpm"
+        );
     }
 
     #[test]
@@ -756,10 +782,21 @@ mod tests {
         fs::write(&fake_npx, native_bytes).unwrap();
         fs::write(&fake_npm_script, b"@echo off\r\nnode npm-cli.js\r\n").unwrap();
 
+        // Must reject batch/text wrapper even when PATH is empty
+        assert_eq!(
+            find_rnpm_executable_in(Some(&fake_npx), &[]),
+            None,
+            "Must reject co-located batch/text wrapper npm"
+        );
+
         let actual_rnpm = path_dir.join(rnpm_name);
         fs::write(&actual_rnpm, native_bytes).unwrap();
 
         let found = find_rnpm_executable_in(Some(&fake_npx), &[path_dir]);
-        assert_eq!(found, Some(actual_rnpm), "Should skip batch script npm and pick native rnpm");
+        assert_eq!(
+            found,
+            Some(actual_rnpm),
+            "Should skip batch script npm and pick native rnpm on PATH"
+        );
     }
 }
