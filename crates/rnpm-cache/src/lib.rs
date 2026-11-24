@@ -524,6 +524,12 @@ mod tests {
         std::fs::write(&lock_path, format!("pid={dead_pid} time=999999\n")).unwrap();
         assert!(lock_path.exists());
 
+        // Verify is_lock_stale identifies dead PID immediately despite 3600s threshold
+        assert!(
+            CacheLock::is_lock_stale(&lock_path, Duration::from_secs(3600)),
+            "Lock with dead PID must be recognized as stale despite 3600s threshold"
+        );
+
         // Attempting to acquire lock should immediately detect dead PID and reclaim without waiting 3600s
         let start = std::time::Instant::now();
         let lock_res = CacheLock::acquire_exclusive_with_options(
@@ -540,8 +546,8 @@ mod tests {
             elapsed
         );
         assert!(
-            elapsed < Duration::from_secs(5),
-            "Reclamation must be immediate without waiting for the 3600s stale threshold; elapsed: {:?}",
+            elapsed < Duration::from_secs(2),
+            "Reclamation must be immediate without waiting for timeout or 3600s stale threshold; elapsed: {:?}",
             elapsed
         );
 
