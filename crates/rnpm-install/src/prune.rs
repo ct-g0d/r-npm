@@ -194,7 +194,7 @@ fn collect_transitive_dependencies(
 
     // Source A: on-disk package.json
     let disk_manifest_path = project_dir.join(pkg_path).join("package.json");
-    if let Ok(m) = Manifest::from_file(&disk_manifest_path) {
+    if let Ok(m) = Manifest::from_file_readonly(&disk_manifest_path) {
         for name in m.dependencies.keys() {
             deps.insert(name.clone());
         }
@@ -219,7 +219,7 @@ fn collect_transitive_dependencies(
             if lock_pkg.link == Some(true) {
                 if let Some(target_rel) = &lock_pkg.resolved {
                     let target_manifest = project_dir.join(target_rel).join("package.json");
-                    if let Ok(m) = Manifest::from_file(&target_manifest) {
+                    if let Ok(m) = Manifest::from_file_readonly(&target_manifest) {
                         for name in m.dependencies.keys() {
                             deps.insert(name.clone());
                         }
@@ -382,10 +382,21 @@ fn scan_nm_directory(
             continue;
         }
 
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        let is_symlink = file_type.is_symlink();
+        if !file_type.is_dir() && !is_symlink {
+            continue;
+        }
+
         let entry_path = entry.path();
-        let is_junc = is_junction(&entry_path).unwrap_or(false);
-        let is_dir = entry_path.is_dir() || is_junc;
-        if !is_dir {
+        let is_junc = if is_symlink {
+            is_junction(&entry_path).unwrap_or(false)
+        } else {
+            false
+        };
+        if !file_type.is_dir() && !is_junc {
             continue;
         }
 
@@ -403,10 +414,21 @@ fn scan_nm_directory(
                     continue;
                 }
 
+                let Ok(sub_ft) = scope_entry.file_type() else {
+                    continue;
+                };
+                let sub_symlink = sub_ft.is_symlink();
+                if !sub_ft.is_dir() && !sub_symlink {
+                    continue;
+                }
+
                 let sub_path = scope_entry.path();
-                let sub_junc = is_junction(&sub_path).unwrap_or(false);
-                let sub_is_dir = sub_path.is_dir() || sub_junc;
-                if !sub_is_dir {
+                let sub_junc = if sub_symlink {
+                    is_junction(&sub_path).unwrap_or(false)
+                } else {
+                    false
+                };
+                if !sub_ft.is_dir() && !sub_junc {
                     continue;
                 }
 
@@ -457,7 +479,7 @@ pub fn discover_extraneous_packages(
             manifest_path.display()
         ));
     }
-    let manifest = Manifest::from_file(&manifest_path).with_context(|| {
+    let manifest = Manifest::from_file_readonly(&manifest_path).with_context(|| {
         format!(
             "Failed to read root manifest at {}",
             manifest_path.display()
@@ -482,7 +504,7 @@ pub fn discover_extraneous_packages(
         if !reachable_packages.contains(&normalized_path) {
             let full_path = project_dir.join(&normalized_path);
             let manifest_file = full_path.join("package.json");
-            let (name, version) = if let Ok(m) = Manifest::from_file(&manifest_file) {
+            let (name, version) = if let Ok(m) = Manifest::from_file_readonly(&manifest_file) {
                 let pkg_name = m
                     .name
                     .unwrap_or_else(|| extract_package_name_from_path(&normalized_path));
@@ -522,7 +544,7 @@ pub fn discover_extraneous_packages(
 pub fn load_lockfile_if_exists(project_dir: &Path) -> Option<LockfileV3> {
     let (lockfile_path, _) = crate::resolve_lockfile_path(project_dir);
     if lockfile_path.is_file() {
-        if let Ok(lock) = LockfileV3::load_from_file(&lockfile_path) {
+        if let Ok(lock) = LockfileV3::load_from_file_readonly(&lockfile_path) {
             return Some(lock);
         }
     }
@@ -556,7 +578,7 @@ pub fn execute_prune(project_dir: &Path, extraneous: &[ExtraneousPackage]) -> Re
             info!("Pruning package {}", pkg.path);
             // Remove binary shims from enclosing .bin if package had bin entries
             let pkg_manifest = pkg.full_path.join("package.json");
-            if let Ok(m) = Manifest::from_file(&pkg_manifest) {
+            if let Ok(m) = Manifest::from_file_readonly(&pkg_manifest) {
                 let enclosing_bin_dir = if let Some(parent) = pkg.full_path.parent() {
                     let maybe_scoped = parent
                         .file_name()
@@ -594,6 +616,7 @@ pub fn execute_prune(project_dir: &Path, extraneous: &[ExtraneousPackage]) -> Re
             } else if pkg.full_path.is_dir() {
                 let nm_dir = project_dir.join("node_modules");
                 crate::trash::fast_trash_delete(&pkg.full_path, &nm_dir).is_ok()
+                    || rnpm_fs::remove_dir_all_safe(&pkg.full_path).is_ok()
             } else {
                 std::fs::remove_file(&pkg.full_path).is_ok()
             };
@@ -657,7 +680,7 @@ pub fn execute_prune(project_dir: &Path, extraneous: &[ExtraneousPackage]) -> Re
     let updated_lockfile_path = if lockfile_path.is_file() {
         if let Ok(mut lockfile) = LockfileV3::load_from_file(&lockfile_path) {
             let manifest_path = project_dir.join("package.json");
-            if let Ok(manifest) = Manifest::from_file(&manifest_path) {
+            if let Ok(manifest) = Manifest::from_file_readonly(&manifest_path) {
                 crate::prune_lockfile(&mut lockfile, &manifest);
                 let _ = lockfile.save_to_file(&lockfile_path);
                 let _ = lockfile.save_hidden(project_dir);
@@ -669,7 +692,7 @@ pub fn execute_prune(project_dir: &Path, extraneous: &[ExtraneousPackage]) -> Re
             None
         }
     } else {
-        let manifest = Manifest::from_file(project_dir.join("package.json"))?;
+        let manifest = Manifest::from_file_readonly(project_dir.join("package.json"))?;
         // With no dependency graph to reconstruct, npm still saves a root lockfile.
         if manifest.dependencies.is_empty()
             && manifest.dev_dependencies.is_empty()
