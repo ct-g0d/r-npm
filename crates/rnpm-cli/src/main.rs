@@ -1808,6 +1808,88 @@ pub(crate) enum Commands {
     },
 }
 
+impl Commands {
+    pub(crate) fn command_name(&self) -> &'static str {
+        match self {
+            Commands::Install { .. } => "install",
+            Commands::Ci { .. } => "ci",
+            Commands::Test { .. } => "test",
+            Commands::Start { .. } => "start",
+            Commands::Restart { .. } => "restart",
+            Commands::Stop { .. } => "stop",
+            Commands::Run { .. } => "run",
+            Commands::Exec { .. } => "exec",
+            Commands::Pack { .. } => "pack",
+            Commands::Uninstall { .. } => "uninstall",
+            Commands::Update { .. } => "update",
+            Commands::Audit { .. } => "audit",
+            Commands::Prune { .. } => "prune",
+            Commands::Dedupe { .. } => "dedupe",
+            Commands::FindDupes { .. } => "find-dupes",
+            Commands::Rebuild { .. } => "rebuild",
+            Commands::Pkg { .. } => "pkg",
+            Commands::Init { .. } => "init",
+            Commands::Cache { .. } => "cache",
+            Commands::Diff { .. } => "diff",
+            Commands::Sbom { .. } => "sbom",
+            Commands::Version { .. } => "version",
+            Commands::List { .. } => "list",
+            Commands::Outdated { .. } => "outdated",
+            Commands::View { .. } => "view",
+            Commands::Query { .. } => "query",
+            Commands::Publish { .. } => "publish",
+            Commands::Whoami { .. } => "whoami",
+            Commands::Ping { .. } => "ping",
+            Commands::Login { .. } => "login",
+            Commands::Adduser { .. } => "adduser",
+            Commands::Logout { .. } => "logout",
+            Commands::Token { .. } => "token",
+            Commands::ApproveScripts { .. } => "approve-scripts",
+            Commands::DenyScripts { .. } => "deny-scripts",
+            Commands::Completion { .. } => "completion",
+            Commands::DistTag { .. } => "dist-tag",
+            Commands::Owner { .. } => "owner",
+            Commands::Unpublish { .. } => "unpublish",
+            Commands::Deprecate { .. } => "deprecate",
+            Commands::Undeprecate { .. } => "undeprecate",
+            Commands::Access { .. } => "access",
+            Commands::Profile { .. } => "profile",
+            Commands::Org { .. } => "org",
+            Commands::Team { .. } => "team",
+            Commands::Doctor { .. } => "doctor",
+            Commands::Fund { .. } => "fund",
+            Commands::Explain { .. } => "explain",
+            Commands::Search { .. } => "search",
+            Commands::Stars { .. } => "stars",
+            Commands::Star { .. } => "star",
+            Commands::Unstar { .. } => "unstar",
+            Commands::Fix { .. } => "fix",
+            Commands::Bugs { .. } => "bugs",
+            Commands::Docs { .. } => "docs",
+            Commands::Repo { .. } => "repo",
+            Commands::Edit { .. } => "edit",
+            Commands::Explore { .. } => "explore",
+            Commands::HelpSearch { .. } => "help-search",
+            Commands::Stage { .. } => "stage",
+            Commands::InstallCiTest { .. } => "install-ci-test",
+            Commands::InstallScripts { .. } => "install-scripts",
+            Commands::InstallTest { .. } => "install-test",
+            Commands::Hook { .. } => "hook",
+            Commands::Shrinkwrap => "shrinkwrap",
+            Commands::Trust { .. } => "trust",
+            Commands::Get { .. } => "get",
+            Commands::Set { .. } => "set",
+            Commands::Config { .. } => "config",
+            Commands::Link { .. } => "link",
+            Commands::Unlink { .. } => "unlink",
+            Commands::Prefix { .. } => "prefix",
+            Commands::Root { .. } => "root",
+            Commands::Bin { .. } => "bin",
+            Commands::Help { .. } => "help",
+        }
+    }
+}
+
 #[derive(Subcommand, Debug, Clone)]
 pub(crate) enum TokenAction {
     /// List active authentication tokens
@@ -2345,15 +2427,18 @@ pub(crate) async fn execute_run(
     strict_sandbox: bool,
     workspace_root: bool,
 ) -> anyhow::Result<()> {
-    let current_dir = if workspace_root
+    let (current_dir, config) = if workspace_root
         && !workspaces
         && workspace.is_empty()
         && filter.is_empty()
         && scope.is_empty()
     {
-        rnpm_config::find_workspace_root(&current_dir).unwrap_or(current_dir)
+        let root = rnpm_config::find_workspace_root(&current_dir).unwrap_or(current_dir);
+        let cfg = rnpm_config::Config::load(Some(&root)).unwrap_or_default();
+        (root, cfg)
     } else {
-        current_dir
+        let cfg = rnpm_config::Config::load(Some(&current_dir)).unwrap_or_default();
+        (current_dir, cfg)
     };
     let manifest_path = current_dir.join("package.json");
     if !manifest_path.exists() {
@@ -2417,14 +2502,15 @@ pub(crate) async fn execute_run(
     let has_filter = !workspace.is_empty() || !filter.is_empty() || !scope.is_empty();
     if workspaces || has_filter {
         // Fail before any member runs, not as one member's script failure.
-        enforce_run_dev_engines_once(&current_dir)?;
+        enforce_run_dev_engines_once_with_config(&current_dir, &config)?;
         let mut filters = workspace;
         filters.extend(filter);
         filters.extend(scope);
         let members = select_workspace_members(&current_dir, &filters, workspace_root)?;
         let mut failed = false;
         for member in members {
-            let result = execute_run_sync(
+            let member_config = rnpm_config::Config::load(Some(&member.path)).unwrap_or_else(|_| config.clone());
+            let result = execute_run_sync_with_config(
                 member.path.clone(),
                 script.clone(),
                 args.clone(),
@@ -2432,6 +2518,7 @@ pub(crate) async fn execute_run(
                 ignore_scripts,
                 foreground_scripts,
                 strict_sandbox,
+                &member_config,
             );
             if let Err(err) = result {
                 if failed {
@@ -2472,7 +2559,7 @@ pub(crate) async fn execute_run(
         }
         Ok(())
     } else {
-        execute_run_sync(
+        execute_run_sync_with_config(
             current_dir,
             script,
             args,
@@ -2480,6 +2567,7 @@ pub(crate) async fn execute_run(
             ignore_scripts,
             foreground_scripts,
             strict_sandbox,
+            &config,
         )
     }
 }
@@ -5459,17 +5547,28 @@ fn should_cleanup_trash(cmd: &Commands) -> bool {
 }
 
 /// The devEngines gate for `run`, applied once per process.
-fn enforce_run_dev_engines_once(project_dir: &std::path::Path) -> anyhow::Result<()> {
+fn enforce_run_dev_engines_once_with_config(
+    project_dir: &std::path::Path,
+    config: &rnpm_config::Config,
+) -> anyhow::Result<()> {
     static CHECKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     if CHECKED.swap(true, std::sync::atomic::Ordering::SeqCst) {
         return Ok(());
     }
-    enforce_dev_engines(project_dir)
+    enforce_dev_engines_with_config(project_dir, config)
+}
+
+#[allow(dead_code)]
+fn enforce_run_dev_engines_once(project_dir: &std::path::Path) -> anyhow::Result<()> {
+    let config = rnpm_config::Config::load(Some(project_dir))?;
+    enforce_run_dev_engines_once_with_config(project_dir, &config)
 }
 
 /// npm's devEngines gate for the current (non-global) project.
-fn enforce_dev_engines(current_dir: &std::path::Path) -> anyhow::Result<()> {
-    let config = rnpm_config::Config::load(Some(current_dir))?;
+fn enforce_dev_engines_with_config(
+    current_dir: &std::path::Path,
+    config: &rnpm_config::Config,
+) -> anyhow::Result<()> {
     // Arguments after `--` belong to the script, not to npm.
     let argv: Vec<String> = std::env::args().take_while(|a| a != "--").collect();
     let has = |flags: &[&str]| argv.iter().any(|a| flags.contains(&a.as_str()));
@@ -5484,6 +5583,12 @@ fn enforce_dev_engines(current_dir: &std::path::Path) -> anyhow::Result<()> {
         .find(|d| d.join("package.json").is_file() || d.join("node_modules").is_dir())
         .unwrap_or(current_dir);
     rnpm_install::policy::check_dev_engines(local_prefix, force)
+}
+
+#[allow(dead_code)]
+fn enforce_dev_engines(current_dir: &std::path::Path) -> anyhow::Result<()> {
+    let config = rnpm_config::Config::load(Some(current_dir))?;
+    enforce_dev_engines_with_config(current_dir, &config)
 }
 
 /// npm's ArboristCmd subclasses, which set `checkDevEngines` (`run` checks in
@@ -5531,7 +5636,16 @@ pub(crate) fn format_duration(d: std::time::Duration) -> String {
     format!("{ms}ms")
 }
 
+#[allow(dead_code)]
 pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()> {
+    run_cli_with_config(cli, dir, None).await
+}
+
+pub(crate) async fn run_cli_with_config(
+    cli: Cli,
+    dir: Option<PathBuf>,
+    loaded_config: Option<rnpm_config::Config>,
+) -> anyhow::Result<()> {
     let current_dir = match dir {
         Some(d) => d,
         None => std::env::current_dir()?,
@@ -5551,7 +5665,11 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
         _ => apply_cli_prefix(current_dir, cli_overrides.as_ref()),
     };
 
-    let silent = rnpm_config::Config::load(Some(&current_dir))?.get("loglevel") == Some("silent");
+    let config = match loaded_config {
+        Some(c) => c,
+        None => rnpm_config::Config::load(Some(&current_dir))?,
+    };
+    let silent = config.get("loglevel") == Some("silent");
 
     // Clean up any leftover .rnpm-trash-* directories only for commands that mutate node_modules or clean cache
     if should_cleanup_trash(&cli.command) {
@@ -5599,7 +5717,7 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             }
             _ => current_dir.clone(),
         };
-        enforce_dev_engines(&dev_engines_dir)?;
+        enforce_dev_engines_with_config(&dev_engines_dir, &config)?;
     }
 
     match cli.command {
@@ -7638,26 +7756,31 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             }
         }
         Commands::Help { topic } => {
-            let topic_str = topic.join("-").to_ascii_lowercase();
-            if topic_str == "install-strategy" || topic_str == "install_strategy" {
-                print_help_install_strategy();
-            } else if topic.is_empty() {
-                print!("{}", npm_usage());
-            } else {
-                let cmd = Cli::command();
-                if let Some(sub) = cmd.find_subcommand(&topic[0]) {
-                    let mut sub = sub.clone();
-                    sub.print_help()?;
-                    println!();
-                } else {
-                    let mut cmd = cmd;
-                    cmd.print_help()?;
-                    println!();
-                }
-            }
+            execute_sync_help(&topic)?;
         }
     }
 
+    Ok(())
+}
+
+fn execute_sync_help(topic: &[String]) -> anyhow::Result<()> {
+    let topic_str = topic.join("-").to_ascii_lowercase();
+    if topic_str == "install-strategy" || topic_str == "install_strategy" {
+        print_help_install_strategy();
+    } else if topic.is_empty() {
+        print!("{}", npm_usage());
+    } else {
+        let cmd = Cli::command();
+        if let Some(sub) = cmd.find_subcommand(&topic[0]) {
+            let mut sub = sub.clone();
+            sub.print_help()?;
+            println!();
+        } else {
+            let mut cmd = cmd;
+            cmd.print_help()?;
+            println!();
+        }
+    }
     Ok(())
 }
 
@@ -7898,6 +8021,15 @@ pub(crate) fn is_loglevel_silent(dir: &Path) -> bool {
             .is_some_and(|c| c.get("loglevel") == Some("silent"))
 }
 
+pub(crate) fn is_loglevel_silent_with_config(config: &rnpm_config::Config) -> bool {
+    let overrides = rnpm_config::get_process_cli_overrides();
+    overrides
+        .as_ref()
+        .and_then(|o| o.get("loglevel"))
+        .map(|s| s == "silent")
+        .unwrap_or_else(|| config.get("loglevel") == Some("silent"))
+}
+
 pub(crate) fn print_pack_notices(summary: &rnpm_fs::PackSummary) {
     eprintln!("npm notice");
     let unicode = use_unicode(&std::env::current_dir().unwrap_or_default());
@@ -7992,7 +8124,8 @@ fn apply_cli_prefix(
     }
 }
 
-fn execute_run_sync(
+#[allow(clippy::too_many_arguments)]
+fn execute_run_sync_with_config(
     current_dir: PathBuf,
     script: String,
     args: Vec<String>,
@@ -8000,10 +8133,11 @@ fn execute_run_sync(
     ignore_scripts: bool,
     foreground_scripts: bool,
     strict_sandbox: bool,
+    config: &rnpm_config::Config,
 ) -> anyhow::Result<()> {
     // `npm run` (and test/start/stop/restart, which run through it) checks
     // devEngines once, at the project prefix, before any script.
-    enforce_run_dev_engines_once(&current_dir)?;
+    enforce_run_dev_engines_once_with_config(&current_dir, config)?;
     let manifest_path = current_dir.join("package.json");
     if !manifest_path.exists() {
         return Err(anyhow::anyhow!(
@@ -8012,7 +8146,6 @@ fn execute_run_sync(
         ));
     }
     let mut manifest = Manifest::from_file(&manifest_path)?;
-    let config = rnpm_config::Config::load(Some(&current_dir))?;
     if config.get("script-shell") == Some("true") {
         eprintln!("npm error code ENOENT\nnpm error syscall spawn true");
         std::process::exit(1);
@@ -8031,7 +8164,7 @@ fn execute_run_sync(
             // prerestart -> stop (--if-present) -> start -> postrestart,
             // without shelling out to an external `npm` on PATH.
             if !ignore_scripts && manifest.scripts.contains_key("prerestart") {
-                execute_run_sync(
+                execute_run_sync_with_config(
                     current_dir.clone(),
                     "prerestart".to_string(),
                     Vec::new(),
@@ -8039,9 +8172,10 @@ fn execute_run_sync(
                     true,
                     foreground_scripts,
                     strict_sandbox,
+                    config,
                 )?;
             }
-            execute_run_sync(
+            execute_run_sync_with_config(
                 current_dir.clone(),
                 "stop".to_string(),
                 args.clone(),
@@ -8049,8 +8183,9 @@ fn execute_run_sync(
                 ignore_scripts,
                 foreground_scripts,
                 strict_sandbox,
+                config,
             )?;
-            execute_run_sync(
+            execute_run_sync_with_config(
                 current_dir.clone(),
                 "start".to_string(),
                 args,
@@ -8058,9 +8193,10 @@ fn execute_run_sync(
                 ignore_scripts,
                 foreground_scripts,
                 strict_sandbox,
+                config,
             )?;
             if !ignore_scripts && manifest.scripts.contains_key("postrestart") {
-                execute_run_sync(
+                execute_run_sync_with_config(
                     current_dir,
                     "postrestart".to_string(),
                     Vec::new(),
@@ -8068,6 +8204,7 @@ fn execute_run_sync(
                     true,
                     foreground_scripts,
                     strict_sandbox,
+                    config,
                 )?;
             }
             return Ok(());
@@ -8086,6 +8223,18 @@ fn execute_run_sync(
     let is_silent = config.get("loglevel") == Some("silent");
     let pre = format!("pre{script}");
     let post = format!("post{script}");
+
+    // Precompute lifecycle environment once across all hooks of this package!
+    let cfg_env = lifecycle_config_env_from_config(&current_dir, config);
+    let base_env = rnpm_lifecycle::precompute_lifecycle_env(
+        &current_dir,
+        &current_dir,
+        manifest.name.as_deref().unwrap_or(""),
+        manifest.version.as_deref(),
+        config,
+        Some(&cfg_env),
+    );
+
     for hook in [&pre, &script, &post] {
         if ignore_scripts && hook != &script {
             continue;
@@ -8119,22 +8268,22 @@ fn execute_run_sync(
                 if id.is_empty() { id } else { format!("{id} ") }
             );
         }
-        let mut ctx = LifecycleContext::new(
+        let mut ctx = LifecycleContext::new_with_config(
             &current_dir,
             &current_dir,
             manifest.name.as_deref().unwrap_or(""),
             hook,
             &full_cmd,
+            config.clone(),
         );
         ctx.package_version = manifest.version.clone();
         ctx.foreground_scripts = foreground_scripts;
-        ctx.extra_env = lifecycle_config_env(&current_dir);
-        if let Ok(inv_cwd) = std::env::current_dir() {
-            ctx.extra_env
-                .insert("INIT_CWD".into(), inv_cwd.to_string_lossy().to_string());
-        }
-        ctx.extra_env
-            .insert("npm_lifecycle_script".into(), cmd.clone());
+
+        let mut hook_env = base_env.clone();
+        hook_env.insert("npm_lifecycle_event".into(), hook.to_string());
+        hook_env.insert("npm_lifecycle_script".into(), cmd.clone());
+        ctx.precomputed_env = Some(hook_env);
+
         if let Some(shell) = config.get("script-shell") {
             let trimmed = shell.trim().trim_matches('"');
             if !trimmed.is_empty() && trimmed != "null" && shell != "null" {
@@ -8184,41 +8333,70 @@ fn execute_run_sync(
     Ok(())
 }
 
-fn lifecycle_config_env(dir: &Path) -> std::collections::HashMap<String, String> {
+#[allow(dead_code)]
+fn execute_run_sync(
+    current_dir: PathBuf,
+    script: String,
+    args: Vec<String>,
+    if_present: bool,
+    ignore_scripts: bool,
+    foreground_scripts: bool,
+    strict_sandbox: bool,
+) -> anyhow::Result<()> {
+    let config = rnpm_config::Config::load(Some(&current_dir))?;
+    execute_run_sync_with_config(
+        current_dir,
+        script,
+        args,
+        if_present,
+        ignore_scripts,
+        foreground_scripts,
+        strict_sandbox,
+        &config,
+    )
+}
+
+fn lifecycle_config_env_from_config(_dir: &Path, config: &rnpm_config::Config) -> std::collections::HashMap<String, String> {
     let mut env = std::collections::HashMap::new();
     if let Ok(cwd) = std::env::current_dir() {
         env.insert("INIT_CWD".into(), cwd.to_string_lossy().into_owned());
     }
-    if let Ok(detailed) =
-        rnpm_config::Config::load_detailed(rnpm_config::ConfigOptions::new().project_dir(dir))
-    {
-        let mut winning: std::collections::BTreeMap<String, (&str, String)> =
-            std::collections::BTreeMap::new();
-        for layer in detailed.layers {
-            let source = if layer.name == "env" { "env" } else { "other" };
-            for (key, value) in layer.settings {
-                winning.insert(key, (source, value));
-            }
+    let mut winning: std::collections::BTreeMap<String, (&str, String)> =
+        std::collections::BTreeMap::new();
+    for layer in &config.layers {
+        let source = if layer.name == "env" { "env" } else { "other" };
+        for (key, value) in &layer.settings {
+            winning.insert(key.clone(), (source, value.clone()));
         }
-        for (key, (source, value)) in winning {
-            if source != "env" {
-                env.insert(format!("npm_config_{}", key.replace('-', "_")), value);
-            }
+    }
+    for (key, (source, value)) in winning {
+        if source != "env" {
+            env.insert(format!("npm_config_{}", key.replace('-', "_")), value);
         }
     }
     env
 }
 
-/// `--json` (or `json=true` config) is in effect for this invocation.
-fn json_error_requested() -> bool {
+fn lifecycle_config_env(dir: &Path) -> std::collections::HashMap<String, String> {
+    let config = rnpm_config::Config::load(Some(dir)).unwrap_or_default();
+    lifecycle_config_env_from_config(dir, &config)
+}
+
+fn json_error_requested_with_config(config: Option<&rnpm_config::Config>) -> bool {
     std::env::args()
         .skip(1)
         .any(|a| a == "--json" || a == "--json=true")
-        || std::env::current_dir()
-            .ok()
-            .and_then(|d| rnpm_config::Config::load(Some(&d)).ok())
+        || config
             .and_then(|c| c.get_bool("json"))
             .unwrap_or(false)
+}
+
+/// `--json` (or `json=true` config) is in effect for this invocation.
+fn json_error_requested() -> bool {
+    let ambient = std::env::current_dir()
+        .ok()
+        .and_then(|d| rnpm_config::Config::load(Some(&d)).ok());
+    json_error_requested_with_config(ambient.as_ref())
 }
 
 /// npm's `jsonError`: `{ error: { code?, summary, detail } }` built from a
@@ -8379,8 +8557,8 @@ fn finish_cli_error(err: &anyhow::Error) -> ! {
 fn write_error_log(err: &anyhow::Error) {
     use std::io::Write;
     let cwd = std::env::current_dir().unwrap_or_default();
-    let silent = is_loglevel_silent(&cwd);
     let config = rnpm_config::Config::load(Some(&cwd)).unwrap_or_default();
+    let silent = is_loglevel_silent_with_config(&config);
     if let Some(max) = config
         .get("logs-max")
         .filter(|v| v.parse::<i64>().is_ok_and(|n| n <= 0))
@@ -8462,6 +8640,159 @@ fn write_error_log(err: &anyhow::Error) {
     }
 }
 
+fn execute_sync_command(
+    cli: &mut Cli,
+    current_dir: &Path,
+    config: &rnpm_config::Config,
+) -> Option<anyhow::Result<()>> {
+    match &mut cli.command {
+        Commands::Prefix { global } => {
+            if *global {
+                let p = rnpm_config::find_global_prefix();
+                println!("{}", p.display());
+            } else {
+                let p = rnpm_config::find_local_prefix(current_dir);
+                println!("{}", p.display());
+            }
+            Some(Ok(()))
+        }
+        Commands::Root { global } => {
+            if *global {
+                let p = rnpm_config::find_global_node_modules(&rnpm_config::find_global_prefix());
+                println!("{}", p.display());
+            } else {
+                let p = rnpm_config::find_local_node_modules(current_dir);
+                println!("{}", p.display());
+            }
+            Some(Ok(()))
+        }
+        Commands::Bin { global } => {
+            if *global {
+                let p = rnpm_config::find_global_bin_dir(&rnpm_config::find_global_prefix());
+                println!("{}", p.display());
+            } else {
+                let p = rnpm_config::find_local_bin_dir(current_dir);
+                println!("{}", p.display());
+            }
+            Some(Ok(()))
+        }
+        Commands::Help { topic } => {
+            Some(execute_sync_help(topic))
+        }
+        Commands::Completion { args } => {
+            Some(commands::completion::run(args.clone(), current_dir))
+        }
+        Commands::Version {
+            newversion,
+            json,
+            workspace,
+            workspaces,
+            ..
+        } if newversion.is_none() && !*workspaces && workspace.is_empty() => {
+            Some(crate::version::execute_bare_version(current_dir, *json).map_err(commands::version::wrap_version_error))
+        }
+        Commands::List {
+            packages,
+            depth,
+            all,
+            json,
+            long,
+            parseable,
+            package_lock_only,
+            omit,
+            global,
+            prefix,
+            workspace,
+            workspaces,
+            workspace_root,
+        } => {
+            let is_global = *global || prefix.is_some();
+            let target_dir = if let Some(p) = prefix {
+                if p.is_absolute() {
+                    p.clone()
+                } else {
+                    current_dir.join(p)
+                }
+            } else if *global {
+                let pfx = rnpm_config::find_global_prefix();
+                if cfg!(windows) {
+                    pfx
+                } else {
+                    pfx.join("lib")
+                }
+            } else {
+                current_dir.to_path_buf()
+            };
+
+            if *package_lock_only && !target_dir.join("package-lock.json").is_file() {
+                eprintln!("npm error code ENOLOCK\nnpm error ls This command requires an existing lockfile.\nnpm error ls Try creating one first with: npm i --package-lock-only");
+                std::process::exit(1);
+            }
+
+            if let Err(e) = enforce_dev_engines_with_config(&target_dir, config) {
+                return Some(Err(e));
+            }
+
+            let cli_overrides = rnpm_config::get_process_cli_overrides();
+            let ws_in_overrides = *workspaces
+                || !workspace.is_empty()
+                || cli_overrides
+                    .as_ref()
+                    .map(|o| {
+                        o.get("workspaces")
+                            .map(|v| v != "false" && v != "0")
+                            .unwrap_or(false)
+                            || o.contains_key("workspace")
+                    })
+                    .unwrap_or(false);
+            if ws_in_overrides {
+                let ws_filters = if !workspace.is_empty() {
+                    workspace.clone()
+                } else if let Some(ref o) = cli_overrides {
+                    o.get("workspace")
+                        .map(|w| vec![w.clone()])
+                        .unwrap_or_default()
+                } else {
+                    Vec::new()
+                };
+                let members = match select_workspace_members(&target_dir, &ws_filters, *workspace_root) {
+                    Ok(m) => m,
+                    Err(e) => return Some(Err(e)),
+                };
+                if packages.is_empty() {
+                    packages.extend(members.into_iter().map(|m| m.name));
+                }
+            }
+
+            let opts = list::ListOptions {
+                packages: packages.clone(),
+                depth: *depth,
+                all: *all,
+                json: *json,
+                long: *long,
+                parseable: *parseable,
+                package_lock_only: *package_lock_only,
+                omit: omit.clone(),
+                is_global,
+            };
+            let code = if ws_in_overrides {
+                list::run_workspace_list(&target_dir, &opts)
+            } else {
+                list::run_list(&target_dir, &opts)
+            };
+            match code {
+                Ok(0) => Some(Ok(())),
+                Ok(c) => Some(Err(anyhow::Error::from(rnpm_lifecycle::ScriptExitError {
+                    exit_code: c,
+                    message: "list finished with problems".to_string(),
+                }))),
+                Err(e) => Some(Err(e)),
+            }
+        }
+        _ => None,
+    }
+}
+
 fn main() {
     // Suppress mimalloc warning output on stderr under high memory pressure
     if std::env::var("MIMALLOC_SHOW_ERRORS").is_err() {
@@ -8517,12 +8848,10 @@ fn main() {
     }
 
     let filtered_args = preprocess_cli_args(filtered_args);
-    if warn_workspaces {
-        let config =
-            rnpm_config::Config::load(std::env::current_dir().ok().as_deref()).unwrap_or_default();
-        if !matches!(config.get("loglevel"), Some("silent" | "error")) {
-            eprintln!("npm warn -ws is not a valid single-hyphen cli flag and will be removed in the future");
-        }
+    let inv_cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let ambient_config = rnpm_config::Config::load(Some(&inv_cwd)).unwrap_or_default();
+    if warn_workspaces && !matches!(ambient_config.get("loglevel"), Some("silent" | "error")) {
+        eprintln!("npm warn -ws is not a valid single-hyphen cli flag and will be removed in the future");
     }
 
     // Ultra-fast path for standard `rnpm run <script>` without clap AST building
@@ -8646,7 +8975,7 @@ fn main() {
                 (ignore_scripts, foreground_scripts, strict_sandbox)
             };
 
-            if let Err(err) = execute_run_sync(
+            if let Err(err) = execute_run_sync_with_config(
                 current_dir,
                 script,
                 script_args,
@@ -8654,6 +8983,7 @@ fn main() {
                 effective_ignore,
                 effective_foreground,
                 effective_strict,
+                &ambient_config,
             ) {
                 finish_cli_error(&err);
             }
@@ -8688,28 +9018,19 @@ fn main() {
         }
     };
 
-    if let Some(command) = Cli::command()
-        .try_get_matches_from(&filtered_args)
-        .ok()
-        .and_then(|matches| matches.subcommand_name().map(str::to_owned))
+    let command_name = cli.command.command_name();
+    let mut agent = ambient_config
+        .npmrc
+        .settings
+        .get("user-agent")
+        .cloned()
+        .unwrap_or_else(rnpm_lifecycle::npm_user_agent);
+    if ambient_config.get_bool("workspaces") == Some(true)
+        || ambient_config.get("workspace").is_some_and(|v| !v.is_empty())
     {
-        let config = std::env::current_dir()
-            .ok()
-            .and_then(|dir| rnpm_config::Config::load(Some(&dir)).ok())
-            .unwrap_or_default();
-        let mut agent = config
-            .npmrc
-            .settings
-            .get("user-agent")
-            .cloned()
-            .unwrap_or_else(rnpm_lifecycle::npm_user_agent);
-        if config.get_bool("workspaces") == Some(true)
-            || config.get("workspace").is_some_and(|v| !v.is_empty())
-        {
-            agent = agent.replace("workspaces/false", "workspaces/true");
-        }
-        rnpm_registry::client::set_cli_request_context(command, agent);
+        agent = agent.replace("workspaces/false", "workspaces/true");
     }
+    rnpm_registry::client::set_cli_request_context(command_name.to_string(), agent);
 
     // npm warns whenever force is in effect, whatever the command.
     {
@@ -8720,11 +9041,7 @@ fn main() {
         let forced = raw
             .iter()
             .any(|a| a == "--force" || a == "-f" || a == "--force=true")
-            || std::env::current_dir()
-                .ok()
-                .and_then(|d| rnpm_config::Config::load(Some(&d)).ok())
-                .and_then(|c| c.get_bool("force"))
-                .unwrap_or(false);
+            || ambient_config.get_bool("force").unwrap_or(false);
         if forced && !silent {
             eprintln!("npm warn using --force Recommended protections disabled.");
         }
@@ -8812,7 +9129,7 @@ fn main() {
                 (ignore_scripts, foreground_scripts, strict_sandbox)
             };
 
-            if let Err(err) = execute_run_sync(
+            if let Err(err) = execute_run_sync_with_config(
                 current_dir,
                 script.as_ref().unwrap().clone(),
                 args.clone(),
@@ -8820,6 +9137,7 @@ fn main() {
                 effective_ignore,
                 effective_foreground,
                 effective_strict,
+                &ambient_config,
             ) {
                 finish_cli_error(&err);
             }
@@ -8827,12 +9145,22 @@ fn main() {
         }
     }
 
+    // Fast path: synchronous commands executing directly on the main thread without spinning up Tokio
+    let cli_overrides = rnpm_config::get_process_cli_overrides();
+    let current_dir = apply_cli_prefix(inv_cwd, cli_overrides.as_ref());
+    if let Some(res) = execute_sync_command(&mut cli, &current_dir, &ambient_config) {
+        if let Err(err) = res {
+            finish_cli_error(&err);
+        }
+        std::process::exit(0);
+    }
+
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .expect("Failed to initialize async runtime");
 
-    if let Err(err) = rt.block_on(run_cli(cli, None)) {
+    if let Err(err) = rt.block_on(run_cli_with_config(cli, None, Some(ambient_config))) {
         if err.is::<audit::AuditThresholdError>() {
             std::process::exit(1);
         }

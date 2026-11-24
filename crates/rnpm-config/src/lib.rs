@@ -8,7 +8,7 @@ pub mod npmrc;
 pub mod release_age;
 
 pub use config::{
-    delete_config_value_from_file, find_global_bin_dir, find_global_node_modules,
+    clear_workspace_root_cache, delete_config_value_from_file, find_global_bin_dir, find_global_node_modules,
     find_global_npmrc, find_global_npmrc_with_env, find_global_prefix, find_global_prefix_with_env,
     find_local_bin_dir, find_local_node_modules, find_local_prefix, find_user_npmrc,
     find_user_npmrc_with_env, find_workspace_root, fix_npmrc_content, get_default_global_npmrc,
@@ -32,6 +32,14 @@ pub use npmrc::{
 pub use release_age::{is_release_age_excluded, match_package_pattern};
 
 use url::Url;
+
+/// Get the cached parsed default npm registry URL.
+pub fn default_registry_url() -> Url {
+    static DEFAULT_URL: std::sync::OnceLock<Url> = std::sync::OnceLock::new();
+    DEFAULT_URL
+        .get_or_init(|| Url::parse(DEFAULT_REGISTRY).expect("default registry URL is valid"))
+        .clone()
+}
 
 /// Parse a scoped registry key or CLI flag into a normalized scope name (e.g. `@scope`).
 ///

@@ -463,6 +463,7 @@ pub struct LifecycleContext {
     pub node_gyp: Option<PathBuf>,
     pub offline: bool,
     pub config: Option<rnpm_config::Config>,
+    pub precomputed_env: Option<HashMap<String, String>>,
 }
 
 impl LifecycleContext {
@@ -533,6 +534,7 @@ impl LifecycleContext {
             node_gyp,
             offline: false,
             config: None,
+            precomputed_env: None,
         }
     }
 
@@ -583,7 +585,13 @@ impl LifecycleContext {
             node_gyp,
             offline: false,
             config: Some(config),
+            precomputed_env: None,
         }
+    }
+
+    pub fn with_precomputed_env(mut self, env: HashMap<String, String>) -> Self {
+        self.precomputed_env = Some(env);
+        self
     }
 
     pub fn from_config(
@@ -1115,41 +1123,34 @@ pub fn node_entrypoint() -> Option<PathBuf> {
 }
 
 /// Config npm exports to scripts (@npmcli/config set-envs): non-default
-/// non-env settings, plus global/local prefix, node-gyp and npm version.
-fn npm_config_env(project_root: &Path, trusted_config: Option<&rnpm_config::Config>) -> Vec<(String, String)> {
+/// non-env settings, plus global/local prefix, node-gyp and npm version,
+/// built directly from a preloaded Config without disk re-reads.
+pub fn npm_config_env_from_config(
+    project_root: &Path,
+    config: &rnpm_config::Config,
+) -> Vec<(String, String)> {
     let mut out = Vec::new();
-    let loaded_config;
-    let config = if let Some(cfg) = trusted_config {
-        cfg
-    } else {
-        loaded_config = rnpm_config::Config::load(Some(project_root)).unwrap_or_default();
-        &loaded_config
-    };
-    if trusted_config.is_none() {
-        if let Ok(detailed) = rnpm_config::Config::load_detailed(
-            rnpm_config::ConfigOptions::new().project_dir(project_root),
-        ) {
-            let mut winning: std::collections::BTreeMap<String, (&str, String)> =
-                std::collections::BTreeMap::new();
-            for layer in detailed.layers {
-                let source = if layer.name == "env" { "env" } else { "other" };
-                for (key, value) in layer.settings {
-                    winning.insert(key, (source, value));
-                }
+    if !config.layers.is_empty() {
+        let mut winning: std::collections::BTreeMap<String, (&str, &String)> =
+            std::collections::BTreeMap::new();
+        for layer in &config.layers {
+            let source = if layer.name == "env" { "env" } else { "other" };
+            for (key, value) in &layer.settings {
+                winning.insert(key.clone(), (source, value));
             }
-            for (key, (source, value)) in winning {
-                if source == "env"
-                    || key.starts_with(['/', '@', '_'])
-                    || key.contains(":_")
-                    || key.contains("//")
-                {
-                    continue;
-                }
-                out.push((
-                    format!("npm_config_{}", key.replace('-', "_").to_ascii_lowercase()),
-                    value,
-                ));
+        }
+        for (key, (source, value)) in winning {
+            if source == "env"
+                || key.starts_with(['/', '@', '_'])
+                || key.contains(":_")
+                || key.contains("//")
+            {
+                continue;
             }
+            out.push((
+                format!("npm_config_{}", key.replace('-', "_").to_ascii_lowercase()),
+                value.clone(),
+            ));
         }
     } else {
         for (key, value) in &config.npmrc.settings {
@@ -1182,8 +1183,23 @@ fn npm_config_env(project_root: &Path, trusted_config: Option<&rnpm_config::Conf
     out
 }
 
-/// Builds the scrubbed and populated environment map for the lifecycle script.
-pub fn build_lifecycle_env(ctx: &LifecycleContext) -> HashMap<String, String> {
+pub fn npm_config_env(
+    project_root: &Path,
+    trusted_config: Option<&rnpm_config::Config>,
+) -> Vec<(String, String)> {
+    if let Some(cfg) = trusted_config {
+        npm_config_env_from_config(project_root, cfg)
+    } else {
+        let loaded_config = rnpm_config::Config::load(Some(project_root)).unwrap_or_default();
+        npm_config_env_from_config(project_root, &loaded_config)
+    }
+}
+
+/// Builds the scrubbed and populated environment map for the lifecycle script using a preloaded Config.
+pub fn build_lifecycle_env_with_config(
+    ctx: &LifecycleContext,
+    config: &rnpm_config::Config,
+) -> HashMap<String, String> {
     let mut env: HashMap<String, String> = HashMap::new();
 
     // 1. Inherit existing environment while scrubbing sensitive credentials
@@ -1208,7 +1224,7 @@ pub fn build_lifecycle_env(ctx: &LifecycleContext) -> HashMap<String, String> {
     } else {
         env.insert("npm_config_user_agent".to_string(), npm_user_agent());
     }
-    for (key, value) in npm_config_env(&ctx.project_root, ctx.config.as_ref()) {
+    for (key, value) in npm_config_env_from_config(&ctx.project_root, config) {
         env.entry(key).or_insert(value);
     }
 
@@ -1512,12 +1528,56 @@ pub fn build_lifecycle_env(ctx: &LifecycleContext) -> HashMap<String, String> {
     env
 }
 
-/// Spawns and executes a lifecycle script synchronously within the specified context,
-/// enforcing process-tree containment so child and grandchild processes terminate on exit.
-/// The process environment follows npm's current package-field contract. Keep
-/// build_lifecycle_env's full manifest expansion available to existing callers.
-fn build_process_env(ctx: &LifecycleContext) -> HashMap<String, String> {
-    let mut env = build_lifecycle_env(ctx);
+/// Builds the scrubbed and populated environment map for the lifecycle script.
+pub fn build_lifecycle_env(ctx: &LifecycleContext) -> HashMap<String, String> {
+    let loaded_config;
+    let config = if let Some(ref cfg) = ctx.config {
+        cfg
+    } else {
+        loaded_config = rnpm_config::Config::load(Some(&ctx.project_root)).unwrap_or_default();
+        &loaded_config
+    };
+    build_lifecycle_env_with_config(ctx, config)
+}
+
+/// The process environment follows npm's current package-field contract.
+pub fn build_script_env_with_config(
+    ctx: &LifecycleContext,
+    config: &rnpm_config::Config,
+) -> HashMap<String, String> {
+    if let Some(ref precomputed) = ctx.precomputed_env {
+        let mut env = precomputed.clone();
+        let cmd = match ctx.event.as_str() {
+            "preinstall" | "install" | "postinstall" => "install",
+            "prepack" | "postpack" => "pack",
+            "prepublish" | "publish" | "postpublish" | "prepublishOnly" => "publish",
+            "test" | "pretest" | "posttest" => "test",
+            "start" | "prestart" | "poststart" => "start",
+            "restart" | "prerestart" | "postrestart" => "restart",
+            "stop" | "prestop" | "poststop" => "stop",
+            _ => "run",
+        };
+        env.insert("npm_command".to_string(), cmd.to_string());
+        env.insert("npm_lifecycle_event".to_string(), ctx.event.clone());
+        env.insert("npm_lifecycle_script".to_string(), ctx.script_cmd.clone());
+        for (k, v) in &ctx.extra_env {
+            if !is_sensitive_credential_key(k) {
+                env.insert(k.clone(), v.clone());
+            }
+        }
+        if let Some(ref gyp) = ctx.node_gyp {
+            env.insert(
+                "npm_config_node_gyp".to_string(),
+                gyp.to_string_lossy().to_string(),
+            );
+        }
+        if let Some(script) = ctx.extra_env.get("npm_lifecycle_script") {
+            env.insert("npm_lifecycle_script".into(), script.clone());
+        }
+        return env;
+    }
+
+    let mut env = build_lifecycle_env_with_config(ctx, config);
     env.retain(|key, _| {
         !key.starts_with("npm_package_")
             || matches!(
@@ -1557,26 +1617,24 @@ fn build_process_env(ctx: &LifecycleContext) -> HashMap<String, String> {
             }
         }
     }
-    if let Some(ref config) = ctx.config {
-        for (key, value) in &config.npmrc.settings {
-            if !is_sensitive_credential_key(key) {
-                env.insert(format!("npm_config_{}", key.replace('-', "_")), value.clone());
-            }
-        }
-    } else if let Ok(detailed) = rnpm_config::Config::load_detailed(
-        rnpm_config::ConfigOptions::new().project_dir(&ctx.package_dir),
-    ) {
-        let mut winning: std::collections::BTreeMap<String, (&str, String)> =
+    if !config.layers.is_empty() {
+        let mut winning: std::collections::BTreeMap<String, (&str, &String)> =
             std::collections::BTreeMap::new();
-        for layer in detailed.layers {
+        for layer in &config.layers {
             let source = if layer.name == "env" { "env" } else { "other" };
-            for (key, value) in layer.settings {
-                winning.insert(key, (source, value));
+            for (key, value) in &layer.settings {
+                winning.insert(key.clone(), (source, value));
             }
         }
         for (key, (source, value)) in winning {
             if source != "env" && !is_sensitive_credential_key(&key) {
-                env.insert(format!("npm_config_{}", key.replace('-', "_")), value);
+                env.insert(format!("npm_config_{}", key.replace('-', "_")), value.clone());
+            }
+        }
+    } else {
+        for (key, value) in &config.npmrc.settings {
+            if !is_sensitive_credential_key(key) {
+                env.insert(format!("npm_config_{}", key.replace('-', "_")), value.clone());
             }
         }
     }
@@ -1615,6 +1673,56 @@ fn build_process_env(ctx: &LifecycleContext) -> HashMap<String, String> {
         env.insert("npm_lifecycle_script".into(), script.clone());
     }
     env
+}
+
+/// Precompute the shared environment for a package's lifecycle scripts (PATH,
+/// npm_package_*, and npm_config_*), avoiding re-walking ancestor directories and
+/// re-reading package.json across pre*, main, and post* hooks.
+pub fn precompute_lifecycle_env(
+    package_dir: &Path,
+    project_root: &Path,
+    package_name: &str,
+    package_version: Option<&str>,
+    config: &rnpm_config::Config,
+    base_extra_env: Option<&HashMap<String, String>>,
+) -> HashMap<String, String> {
+    let dummy_ctx = LifecycleContext {
+        project_root: project_root.to_path_buf(),
+        package_dir: package_dir.to_path_buf(),
+        package_name: package_name.to_string(),
+        package_version: package_version.map(|v| v.to_string()),
+        event: "run".to_string(),
+        script_cmd: String::new(),
+        node_execpath: None,
+        npm_execpath: None,
+        extra_env: base_extra_env.cloned().unwrap_or_default(),
+        timeout: None,
+        capture_output: false,
+        foreground_scripts: false,
+        captured_output: std::sync::Arc::new(std::sync::Mutex::new(None)),
+        sandbox_policy: ScriptSandboxPolicy::default(),
+        script_shell: None,
+        node_gyp: None,
+        offline: false,
+        config: Some(config.clone()),
+        precomputed_env: None,
+    };
+    build_script_env_with_config(&dummy_ctx, config)
+}
+
+/// Spawns and executes a lifecycle script synchronously within the specified context,
+/// enforcing process-tree containment so child and grandchild processes terminate on exit.
+/// The process environment follows npm's current package-field contract. Keep
+/// build_lifecycle_env's full manifest expansion available to existing callers.
+fn build_process_env(ctx: &LifecycleContext) -> HashMap<String, String> {
+    if let Some(ref cfg) = ctx.config {
+        build_script_env_with_config(ctx, cfg)
+    } else {
+        let loaded = rnpm_config::Config::load(Some(&ctx.package_dir))
+            .or_else(|_| rnpm_config::Config::load(Some(&ctx.project_root)))
+            .unwrap_or_default();
+        build_script_env_with_config(ctx, &loaded)
+    }
 }
 
 pub fn is_cmd_shell(shell: &str) -> bool {
@@ -2899,11 +3007,35 @@ async fn execute_dependency_hooks_with_abort(
         );
     }
 
+    let root_config = get_trusted_config().unwrap_or_else(|| {
+        rnpm_config::Config::load(Some(&opts.root_dir)).unwrap_or_default()
+    });
+
     // Execute dependency hooks in bottom-up order:
     // Hooks: preinstall -> install -> postinstall -> prepare (for local / git / tarball dependencies)
     // Note: Registry dependencies NEVER run `prepare` per docs/lifecycle-contract.md!
     for node in ordered {
         let hooks = node.source.lifecycle_hooks();
+        let has_matching_hooks = hooks.iter().any(|h| node.manifest.scripts.contains_key(*h));
+        let precomputed = if has_matching_hooks {
+            let mut base_extra = HashMap::new();
+            if !opts.init_cwd.as_os_str().is_empty() {
+                base_extra.insert(
+                    "INIT_CWD".to_string(),
+                    opts.init_cwd.to_string_lossy().to_string(),
+                );
+            }
+            Some(precompute_lifecycle_env(
+                &node.disk_path,
+                &opts.root_dir,
+                node.manifest.name.as_deref().unwrap_or("unknown"),
+                node.manifest.version.as_deref(),
+                &root_config,
+                Some(&base_extra),
+            ))
+        } else {
+            None
+        };
 
         for &hook in hooks {
             if let Some(script_cmd) = node.manifest.scripts.get(hook) {
@@ -2915,13 +3047,15 @@ async fn execute_dependency_hooks_with_abort(
                     }
                 }
 
-                let mut ctx = LifecycleContext::new(
+                let mut ctx = LifecycleContext::new_with_config(
                     &opts.root_dir,
                     &node.disk_path,
                     node.manifest.name.as_deref().unwrap_or("unknown"),
                     hook,
                     script_cmd,
+                    root_config.clone(),
                 );
+                ctx.precomputed_env = precomputed.clone();
                 if !opts.init_cwd.as_os_str().is_empty() {
                     ctx.extra_env.insert(
                         "INIT_CWD".to_string(),
@@ -3039,6 +3173,34 @@ async fn execute_root_hooks_with_abort(
         "prepare",
         "postprepare",
     ];
+
+    let root_config = get_trusted_config().unwrap_or_else(|| {
+        rnpm_config::Config::load(Some(&opts.root_dir)).unwrap_or_default()
+    });
+
+    let root_has_hooks = root_hooks.iter().any(|h| root_manifest.scripts.contains_key(*h));
+    let root_precomputed = if root_has_hooks {
+        let mut base_extra = HashMap::new();
+        if !opts.init_cwd.as_os_str().is_empty() {
+            base_extra.insert(
+                "INIT_CWD".to_string(),
+                opts.init_cwd.to_string_lossy().to_string(),
+            );
+        }
+        Some(precompute_lifecycle_env(
+            &opts.root_dir,
+            &opts.root_dir,
+            root_manifest.name.as_deref().unwrap_or("root"),
+            root_manifest.version.as_deref(),
+            &root_config,
+            Some(&base_extra),
+        ))
+    } else {
+        None
+    };
+
+    let is_silent = root_config.get("loglevel") == Some("silent");
+
     for hook in root_hooks {
         if let Some(script_cmd) = root_manifest.scripts.get(hook) {
             if let Some(ref rx) = abort_rx {
@@ -3049,13 +3211,15 @@ async fn execute_root_hooks_with_abort(
                 }
             }
 
-            let mut ctx = LifecycleContext::new(
+            let mut ctx = LifecycleContext::new_with_config(
                 &opts.root_dir,
                 &opts.root_dir,
                 root_manifest.name.as_deref().unwrap_or("root"),
                 hook,
                 script_cmd,
+                root_config.clone(),
             );
+            ctx.precomputed_env = root_precomputed.clone();
             if !opts.init_cwd.as_os_str().is_empty() {
                 ctx.extra_env.insert(
                     "INIT_CWD".to_string(),
@@ -3063,13 +3227,6 @@ async fn execute_root_hooks_with_abort(
                 );
             }
             ctx.package_version = root_manifest.version.clone();
-            let is_silent = if let Some(trusted) = get_trusted_config() {
-                trusted.get("loglevel") == Some("silent")
-            } else {
-                rnpm_config::Config::load(Some(&opts.root_dir))
-                    .map(|c| c.get("loglevel") == Some("silent"))
-                    .unwrap_or(false)
-            };
             if !is_silent {
                 let name = root_manifest.name.as_deref().unwrap_or("");
                 let id = root_manifest
