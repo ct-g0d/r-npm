@@ -4,6 +4,8 @@ use rnpm_core::spec::PackageTarget;
 use std::cell::RefCell;
 use std::collections::HashMap;
 
+const MAX_CACHE_ENTRIES: usize = 8192;
+
 thread_local! {
     static TARGET_CACHE: RefCell<HashMap<String, Option<PackageTarget>>> = RefCell::new(HashMap::with_capacity(1024));
     static VERSION_CACHE: RefCell<HashMap<String, Option<Version>>> = RefCell::new(HashMap::with_capacity(2048));
@@ -18,6 +20,9 @@ pub fn cached_parse_package_target(spec: &str) -> Option<PackageTarget> {
             return target.clone();
         }
         let parsed = PackageTarget::parse(spec).ok();
+        if map.len() >= MAX_CACHE_ENTRIES {
+            map.clear();
+        }
         map.insert(spec.to_string(), parsed.clone());
         parsed
     })
@@ -32,6 +37,9 @@ pub fn cached_parse_version(version_str: &str) -> Option<Version> {
             return v.clone();
         }
         let parsed = Version::parse(version_str).ok();
+        if map.len() >= MAX_CACHE_ENTRIES {
+            map.clear();
+        }
         map.insert(version_str.to_string(), parsed.clone());
         parsed
     })
@@ -241,10 +249,10 @@ pub fn node_satisfies_target(node: &crate::graph::Node, target: &PackageTarget) 
         _ => {}
     }
 
-    if let Some(parsed) = &node.parsed_version {
+    if let Some(parsed) = cached_parse_version(&node.version) {
         match target {
-            PackageTarget::Version(expected) => parsed == expected,
-            PackageTarget::Range(range) => range.satisfies(parsed),
+            PackageTarget::Version(expected) => &parsed == expected,
+            PackageTarget::Range(range) => range.satisfies(&parsed),
             PackageTarget::Tag(_) => true,
             PackageTarget::Alias { name, target } => {
                 node.name == *name && node_satisfies_target(node, target)
@@ -257,9 +265,9 @@ pub fn node_satisfies_target(node: &crate::graph::Node, target: &PackageTarget) 
                 if s == "*" || s == "^" || s == "~" || s.is_empty() {
                     true
                 } else if let Ok(range) = rnpm_core::semver::Range::parse(s) {
-                    range.satisfies(parsed)
+                    range.satisfies(&parsed)
                 } else if let Some(expected) = cached_parse_version(s) {
-                    parsed == &expected
+                    parsed == expected
                 } else {
                     true
                 }
@@ -787,7 +795,6 @@ pub fn provider_accepts_version(graph: &DependencyGraph, location: &str, version
     };
     let replacement = crate::graph::Node {
         version: version.to_string(),
-        parsed_version: cached_parse_version(version),
         resolved: None,
         integrity: None,
         ..existing.clone()
@@ -985,7 +992,6 @@ mod tests {
             install_name: name.to_string(),
             name: name.to_string(),
             version: version.to_string(),
-            parsed_version: Version::parse(version).ok(),
             ..Default::default()
         }
     }

@@ -296,6 +296,14 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
         self
     }
 
+    pub fn graph(&self) -> &DependencyGraph {
+        &self.graph
+    }
+
+    pub fn graph_mut(&mut self) -> &mut DependencyGraph {
+        &mut self.graph
+    }
+
     /// Enqueue an external dependency resolution task.
     pub fn enqueue_task(
         &mut self,
@@ -1635,16 +1643,12 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                     link: false,
                 };
 
-                let parsed_ver = chosen_version
-                    .parsed_version
-                    .clone()
-                    .or_else(|| cached_parse_version(&chosen_version.version));
                 let node = Node {
                     location: target_loc.clone(),
                     install_name: task.install_name.clone(),
                     name: dep_spec.package_name.clone(),
                     version: chosen_version.version.clone(),
-                    parsed_version: parsed_ver,
+                    parsed_version: cached_parse_version(&chosen_version.version),
                     resolved: chosen_version.dist_tarball.clone(),
                     integrity: chosen_version.dist_integrity.clone(),
                     flags,
@@ -2159,7 +2163,7 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
         true
     }
 
-    fn dedupe_nested_compatible_nodes(
+    pub(crate) fn dedupe_nested_compatible_nodes(
         &mut self,
         root_location: &str,
         package_name: &str,
@@ -2170,6 +2174,9 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
             locs.iter()
                 .filter(|location| {
                     *location != root_location
+                        && location
+                            .strip_suffix(install_name)
+                            .is_some_and(|prefix| prefix.ends_with("/node_modules/"))
                         && self.graph.nodes.get(*location).is_some_and(|node| {
                             node.name == package_name
                                 && crate::hoisting::node_satisfies_target(node, target)
@@ -2774,18 +2781,12 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                     Some(v)
                 } else {
                     meta.versions.iter().find_map(|(ver_str, v_meta)| {
-                        let matches = if let Some(ref pv) = v_meta.parsed_version {
-                            pv == expected
-                        } else if let Some(ref cv) = cached_parse_version(ver_str) {
-                            cv == expected
-                        } else {
-                            false
-                        };
-                        if matches {
-                            Some(v_meta)
-                        } else {
-                            None
+                        if let Some(cv) = cached_parse_version(ver_str) {
+                            if &cv == expected {
+                                return Some(v_meta);
+                            }
                         }
+                        None
                     })
                 }
             }
@@ -2802,10 +2803,7 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                         .versions
                         .values()
                         .filter_map(|vm| {
-                            vm.parsed_version
-                                .clone()
-                                .or_else(|| cached_parse_version(&vm.version))
-                                .map(|parsed| (vm, parsed))
+                            cached_parse_version(&vm.version).map(|parsed| (vm, parsed))
                         })
                         .collect();
                     versions.sort_by(|a, b| b.1.cmp(&a.1));
@@ -2842,12 +2840,7 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                     ) {
                         if let Some(existing_node) = self.graph.nodes.get(loc) {
                             if existing_node.name == pkg_name {
-                                if let Some(parsed) = existing_node
-                                    .parsed_version
-                                    .as_ref()
-                                    .cloned()
-                                    .or_else(|| cached_parse_version(&existing_node.version))
-                                {
+                                if let Some(parsed) = cached_parse_version(&existing_node.version) {
                                     if range.satisfies(&parsed)
                                         && is_safe(&parsed)
                                         && advisories.iter().all(|target| {
@@ -2872,53 +2865,60 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                         None;
                     let mut best_placed: Option<(&'b PackageVersionMetadata, Version)> = None;
 
-                    if let Some(locs) = self.graph.nodes_by_name.get(pkg_name) {
-                        for loc in locs {
-                            if let Some(node) = self.graph.nodes.get(loc) {
-                                if let Some(parsed) = node
-                                    .parsed_version
-                                    .as_ref()
-                                    .cloned()
-                                    .or_else(|| cached_parse_version(&node.version))
+                    let mut consider_node = |node: &Node| {
+                        if node.name == pkg_name {
+                            if let Some(parsed) = cached_parse_version(&node.version) {
+                                if range.satisfies(&parsed)
+                                    && is_safe(&parsed)
+                                    && advisories.iter().all(|target| {
+                                        crate::hoisting::version_satisfies_target(
+                                            &node.version,
+                                            target,
+                                        )
+                                    })
                                 {
-                                    if range.satisfies(&parsed)
-                                        && is_safe(&parsed)
-                                        && advisories.iter().all(|target| {
-                                            crate::hoisting::version_satisfies_target(
-                                                &node.version,
-                                                target,
-                                            )
-                                        })
-                                    {
-                                        if let Some(v_meta) = meta.versions.get(&node.version) {
-                                            if v_meta.deprecated.is_none() {
-                                                match &best_placed_undeprecated {
-                                                    Some((_, best_v)) => {
-                                                        if &parsed > best_v {
-                                                            best_placed_undeprecated =
-                                                                Some((v_meta, parsed.clone()));
-                                                        }
-                                                    }
-                                                    None => {
+                                    if let Some(v_meta) = meta.versions.get(&node.version) {
+                                        if v_meta.deprecated.is_none() {
+                                            match &best_placed_undeprecated {
+                                                Some((_, best_v)) => {
+                                                    if &parsed > best_v {
                                                         best_placed_undeprecated =
                                                             Some((v_meta, parsed.clone()));
                                                     }
                                                 }
-                                            }
-                                            match &best_placed {
-                                                Some((_, best_v)) => {
-                                                    if &parsed > best_v {
-                                                        best_placed = Some((v_meta, parsed));
-                                                    }
-                                                }
                                                 None => {
+                                                    best_placed_undeprecated =
+                                                        Some((v_meta, parsed.clone()));
+                                                }
+                                            }
+                                        }
+                                        match &best_placed {
+                                            Some((_, best_v)) => {
+                                                if &parsed > best_v {
                                                     best_placed = Some((v_meta, parsed));
                                                 }
+                                            }
+                                            None => {
+                                                best_placed = Some((v_meta, parsed));
                                             }
                                         }
                                     }
                                 }
                             }
+                        }
+                    };
+
+                    if !self.graph.nodes_by_name.is_empty() {
+                        if let Some(locs) = self.graph.nodes_by_name.get(pkg_name) {
+                            for loc in locs {
+                                if let Some(node) = self.graph.nodes.get(loc) {
+                                    consider_node(node);
+                                }
+                            }
+                        }
+                    } else {
+                        for node in self.graph.nodes.values() {
+                            consider_node(node);
                         }
                     }
 
@@ -2936,12 +2936,7 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                 // compatible release.
                 if let Some(latest_version) = meta.dist_tags.get("latest") {
                     if let Some(latest) = meta.versions.get(latest_version) {
-                        if let Some(v) = latest
-                            .parsed_version
-                            .as_ref()
-                            .cloned()
-                            .or_else(|| cached_parse_version(&latest.version))
-                        {
+                        if let Some(v) = cached_parse_version(&latest.version) {
                             if range.satisfies(&v)
                                 && is_safe(&v)
                                 && latest.deprecated.is_none()
@@ -2964,12 +2959,7 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                 let mut best_any: Option<(&'b PackageVersionMetadata, Version)> = None;
 
                 for (ver_str, v_meta) in &meta.versions {
-                    if let Some(parsed) = v_meta
-                        .parsed_version
-                        .as_ref()
-                        .cloned()
-                        .or_else(|| cached_parse_version(ver_str))
-                    {
+                    if let Some(parsed) = cached_parse_version(ver_str) {
                         if range.satisfies(&parsed)
                             && advisories.iter().all(|target| {
                                 crate::hoisting::version_satisfies_target(ver_str, target)
@@ -3080,12 +3070,7 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                 } else if let Ok(range) = rnpm_core::semver::Range::parse(s) {
                     let mut best: Option<(&'b PackageVersionMetadata, Version)> = None;
                     for (ver_str, v_meta) in &meta.versions {
-                        if let Some(parsed) = v_meta
-                            .parsed_version
-                            .as_ref()
-                            .cloned()
-                            .or_else(|| cached_parse_version(ver_str))
-                        {
+                        if let Some(parsed) = cached_parse_version(ver_str) {
                             if range.satisfies(&parsed) {
                                 match &best {
                                     Some((_, best_v)) => {
@@ -3114,12 +3099,7 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
 fn select_max_semver_version<'b>(meta: &'b PackageMetadata) -> Option<&'b PackageVersionMetadata> {
     let mut best: Option<(&'b PackageVersionMetadata, Version)> = None;
     for (ver_str, v_meta) in &meta.versions {
-        if let Some(parsed) = v_meta
-            .parsed_version
-            .as_ref()
-            .cloned()
-            .or_else(|| cached_parse_version(ver_str))
-        {
+        if let Some(parsed) = cached_parse_version(ver_str) {
             match &best {
                 Some((_, best_v)) => {
                     if &parsed > best_v {
