@@ -788,10 +788,14 @@ pub(crate) fn isolate_global_dependencies(graph: &mut DependencyGraph, manifest:
                     if let Some(target_node) = graph.nodes.get(target_orig_loc) {
                         // Compute new nested location under top_loc:
                         // node_modules/<dep> -> node_modules/<top-pkg>/node_modules/<dep>
-                        let rel = target_orig_loc
-                            .strip_prefix("node_modules/")
-                            .unwrap_or(target_orig_loc);
-                        let target_new_loc = format!("{top_loc}/node_modules/{rel}");
+                        let target_new_loc = if target_orig_loc.starts_with(&format!("{top_loc}/node_modules/")) {
+                            target_orig_loc.clone()
+                        } else {
+                            let rel = target_orig_loc
+                                .strip_prefix("node_modules/")
+                                .unwrap_or(target_orig_loc);
+                            format!("{top_loc}/node_modules/{rel}")
+                        };
                         loc_map.insert(target_orig_loc.clone(), target_new_loc.clone());
 
                         let mut new_node = target_node.clone();
@@ -2622,6 +2626,14 @@ impl Installer {
                 if let Ok(strat) = strat_str.parse::<InstallStrategy>() {
                     options.install_strategy = strat;
                 }
+            } else if config.get_bool("legacy-bundling").unwrap_or(false)
+                || config.get_bool("legacy_bundling").unwrap_or(false)
+            {
+                options.install_strategy = InstallStrategy::Nested;
+            } else if config.get_bool("global-style").unwrap_or(false)
+                || config.get_bool("global_style").unwrap_or(false)
+            {
+                options.install_strategy = InstallStrategy::Shallow;
             }
         }
 
@@ -4707,17 +4719,36 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                     let git_fetcher = crate::git::GitFetcher::new(self.cache.root());
                     let target = PackageTarget::parse(res)
                         .map_err(|e| anyhow!("Failed to parse git target: {e}"))?;
-                    let checkout_dir = git_fetcher
+                    let is_opt = node.flags.optional || node.flags.dev_optional;
+                    let checkout_dir = match git_fetcher
                         .checkout_git_dependency(&target, self.options.offline)
-                        .await?;
+                        .await
+                    {
+                        Ok(d) => d,
+                        Err(e) => {
+                            if is_opt {
+                                warn!("Failed to checkout optional git dependency '{}': {e}; skipping", loc);
+                                continue;
+                            }
+                            return Err(e);
+                        }
+                    };
 
                     let mat_opts = self.options.git_materialize_options();
-                    crate::git::materialize_git_dependency_with_options(
+                    if let Err(e) = crate::git::materialize_git_dependency_with_options(
                         &checkout_dir,
                         &dest_dir,
                         &mat_opts,
                     )
-                    .await?;
+                    .await
+                    {
+                        if is_opt {
+                            warn!("Failed to materialize optional git dependency '{}': {e}; skipping", loc);
+                            let _ = std::fs::remove_dir_all(&dest_dir);
+                            continue;
+                        }
+                        return Err(e);
+                    }
                     packages_installed += 1;
                     cache_hits += 1;
 
@@ -6619,23 +6650,44 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                 let git_fetcher = crate::git::GitFetcher::new(self.cache.root());
                 let target = PackageTarget::parse(resolved_url)
                     .map_err(|e| anyhow!("Failed to parse git target in lockfile: {e}"))?;
+                let is_opt = pkg_info.is_effective_optional() || pkg_info.is_peer_optional();
                 let t_fetch = std::time::Instant::now();
                 let _f_span = tracing::info_span!("fetch", package = %pkg_key).entered();
-                let checkout_dir = git_fetcher
+                let checkout_dir = match git_fetcher
                     .checkout_git_dependency(&target, self.options.offline)
-                    .await?;
+                    .await
+                {
+                    Ok(d) => d,
+                    Err(e) => {
+                        drop(_f_span);
+                        if is_opt {
+                            warn!("Failed to checkout optional git dependency '{}': {e}; skipping", pkg_key);
+                            continue;
+                        }
+                        return Err(e);
+                    }
+                };
                 drop(_f_span);
                 collector.record_phase(Phase::Fetch, t_fetch.elapsed());
 
                 let t_mat = std::time::Instant::now();
                 let _mat_span = tracing::info_span!("materialize", package = %pkg_key).entered();
                 let mat_opts = self.options.git_materialize_options();
-                crate::git::materialize_git_dependency_with_options(
+                if let Err(e) = crate::git::materialize_git_dependency_with_options(
                     &checkout_dir,
                     &full_target,
                     &mat_opts,
                 )
-                .await?;
+                .await
+                {
+                    drop(_mat_span);
+                    if is_opt {
+                        warn!("Failed to materialize optional git dependency '{}': {e}; skipping", pkg_key);
+                        let _ = std::fs::remove_dir_all(&full_target);
+                        continue;
+                    }
+                    return Err(e);
+                }
                 drop(_mat_span);
                 collector.record_phase(Phase::Materialize, t_mat.elapsed());
 
@@ -8315,12 +8367,29 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                 _ => None,
             };
 
+            let is_optional = manifest.optional_dependencies.contains_key(name);
             if let Some(git_target) = git_target_opt {
-                policy::check_source_gate(&self.source_policy, policy::SourceKind::Git, is_root)?;
+                if let Err(e) = policy::check_source_gate(&self.source_policy, policy::SourceKind::Git, is_root) {
+                    if is_optional {
+                        warn!("Skipping optional git dependency '{name}': {e}");
+                        continue;
+                    }
+                    return Err(e);
+                }
                 let git_fetcher = crate::git::GitFetcher::new(self.cache.root());
-                let resolved = git_fetcher
+                let resolved = match git_fetcher
                     .resolve_git_dependency(&git_target, self.options.offline)
-                    .await?;
+                    .await
+                {
+                    Ok(r) => r,
+                    Err(e) => {
+                        if is_optional {
+                            warn!("Failed to resolve optional git dependency '{name}': {e}; continuing without it");
+                            continue;
+                        }
+                        return Err(e);
+                    }
+                };
 
                 let m = resolved.manifest;
                 let version = m.version.clone().unwrap_or_else(|| "1.0.0".to_string());
@@ -9431,7 +9500,7 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
         let mut removed_packages = Vec::new();
 
         // Determine which sections to target
-        let target_all = !options.save_dev && !options.save_optional && !options.save_prod;
+        let target_all = !options.save_dev && !options.save_optional && !options.save_prod && !options.save_peer;
 
         for raw_pkg in &options.packages {
             let pkg = raw_pkg.trim();
@@ -9459,8 +9528,30 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                     removed = true;
                 }
 
-                if target_all && manifest.peer_dependencies.remove(pkg).is_some() {
+                if (options.save_peer || target_all) && manifest.peer_dependencies.remove(pkg).is_some() {
                     removed = true;
+                }
+
+                if let Some(ref mut bundled) = manifest.bundled_dependencies {
+                    match bundled {
+                        rnpm_core::BundledDependencies::List(list) => {
+                            let old_len = list.len();
+                            list.retain(|x| x != pkg);
+                            if list.len() != old_len {
+                                removed = true;
+                            }
+                        }
+                        rnpm_core::BundledDependencies::Boolean(_) => {}
+                    }
+                }
+                if let Some(rnpm_core::BundledDependencies::List(list)) = &manifest.bundled_dependencies {
+                    if list.is_empty() {
+                        manifest.bundled_dependencies = None;
+                        if let Some(rnpm_core::OrderedJsonValue::Object(map)) = &mut manifest.raw_json {
+                            map.shift_remove("bundleDependencies");
+                            map.shift_remove("bundledDependencies");
+                        }
+                    }
                 }
             }
 
@@ -9480,8 +9571,30 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                     removed = true;
                 }
 
-                if target_all && m.peer_dependencies.remove(pkg).is_some() {
+                if (options.save_peer || target_all) && m.peer_dependencies.remove(pkg).is_some() {
                     removed = true;
+                }
+
+                if let Some(ref mut bundled) = m.bundled_dependencies {
+                    match bundled {
+                        rnpm_core::BundledDependencies::List(list) => {
+                            let old_len = list.len();
+                            list.retain(|x| x != pkg);
+                            if list.len() != old_len {
+                                removed = true;
+                            }
+                        }
+                        rnpm_core::BundledDependencies::Boolean(_) => {}
+                    }
+                }
+                if let Some(rnpm_core::BundledDependencies::List(list)) = &m.bundled_dependencies {
+                    if list.is_empty() {
+                        m.bundled_dependencies = None;
+                        if let Some(rnpm_core::OrderedJsonValue::Object(map)) = &mut m.raw_json {
+                            map.shift_remove("bundleDependencies");
+                            map.shift_remove("bundledDependencies");
+                        }
+                    }
                 }
             }
 
@@ -9822,6 +9935,7 @@ pub struct UninstallOptions {
     pub save_dev: bool,
     pub save_optional: bool,
     pub save_prod: bool,
+    pub save_peer: bool,
     pub is_global: bool,
     pub workspace: Vec<String>,
     pub workspaces: bool,
@@ -10103,6 +10217,9 @@ pub fn prune_lockfile(lockfile: &mut LockfileV3, manifest: &Manifest) -> HashSet
     for name in manifest.optional_dependencies.keys() {
         root_dep_names.insert(name.clone());
     }
+    for name in manifest.peer_dependencies.keys() {
+        root_dep_names.insert(name.clone());
+    }
 
     // 2. Breadth-First-Search from root to mark reachable lockfile keys
     let mut reachable_keys = HashSet::new();
@@ -10143,6 +10260,9 @@ pub fn prune_lockfile(lockfile: &mut LockfileV3, manifest: &Manifest) -> HashSet
             }
             if let Some(opt_deps) = &pkg.optional_dependencies {
                 all_deps.extend(opt_deps.keys().cloned());
+            }
+            if let Some(peer_deps) = &pkg.peer_dependencies {
+                all_deps.extend(peer_deps.keys().cloned());
             }
 
             for dep_name in all_deps {

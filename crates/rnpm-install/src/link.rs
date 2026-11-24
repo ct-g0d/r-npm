@@ -36,10 +36,14 @@ pub fn link_package(current_dir: &Path, global_prefix: &Path) -> Result<PathBuf>
         std::fs::create_dir_all(parent)?;
     }
 
-    if target_link.exists() || is_junction(&target_link).unwrap_or(false) {
-        if is_junction(&target_link).unwrap_or(false) {
-            remove_junction(&target_link)?;
-        } else if target_link.is_dir() {
+    if let Ok(meta) = std::fs::symlink_metadata(&target_link) {
+        if meta.file_type().is_symlink() || is_junction(&target_link).unwrap_or(false) {
+            let _ = remove_junction(&target_link);
+            #[cfg(unix)]
+            let _ = std::fs::remove_file(&target_link);
+            #[cfg(windows)]
+            let _ = std::fs::remove_dir(&target_link).or_else(|_| std::fs::remove_file(&target_link));
+        } else if meta.is_dir() {
             remove_dir_all_safe(&target_link)?;
         } else {
             let _ = std::fs::remove_file(&target_link);
@@ -96,10 +100,14 @@ pub fn link_package_from_global(
         std::fs::create_dir_all(parent)?;
     }
 
-    if target_link.exists() || is_junction(&target_link).unwrap_or(false) {
-        if is_junction(&target_link).unwrap_or(false) {
-            remove_junction(&target_link)?;
-        } else if target_link.is_dir() {
+    if let Ok(meta) = std::fs::symlink_metadata(&target_link) {
+        if meta.file_type().is_symlink() || is_junction(&target_link).unwrap_or(false) {
+            let _ = remove_junction(&target_link);
+            #[cfg(unix)]
+            let _ = std::fs::remove_file(&target_link);
+            #[cfg(windows)]
+            let _ = std::fs::remove_dir(&target_link).or_else(|_| std::fs::remove_file(&target_link));
+        } else if meta.is_dir() {
             remove_dir_all_safe(&target_link)?;
         } else {
             let _ = std::fs::remove_file(&target_link);
@@ -168,12 +176,18 @@ pub fn unlink_package(current_dir: &Path, global_prefix: &Path) -> Result<Option
         }
     }
 
-    if is_junction(&target_link).unwrap_or(false) {
-        remove_junction(&target_link)?;
-    } else if target_link.is_dir() {
-        remove_dir_all_safe(&target_link)?;
-    } else if target_link.exists() {
-        let _ = std::fs::remove_file(&target_link);
+    if let Ok(meta) = std::fs::symlink_metadata(&target_link) {
+        if meta.file_type().is_symlink() || is_junction(&target_link).unwrap_or(false) {
+            let _ = remove_junction(&target_link);
+            #[cfg(unix)]
+            let _ = std::fs::remove_file(&target_link);
+            #[cfg(windows)]
+            let _ = std::fs::remove_dir(&target_link).or_else(|_| std::fs::remove_file(&target_link));
+        } else if meta.is_dir() {
+            remove_dir_all_safe(&target_link)?;
+        } else {
+            let _ = std::fs::remove_file(&target_link);
+        }
     }
 
     // Clean up empty scoped directory (e.g. @scope)
@@ -215,12 +229,18 @@ pub fn unlink_package_from_consumer(
         }
     }
 
-    if is_junction(&target_link).unwrap_or(false) {
-        remove_junction(&target_link)?;
-    } else if target_link.is_dir() {
-        remove_dir_all_safe(&target_link)?;
-    } else if target_link.exists() {
-        let _ = std::fs::remove_file(&target_link);
+    if let Ok(meta) = std::fs::symlink_metadata(&target_link) {
+        if meta.file_type().is_symlink() || is_junction(&target_link).unwrap_or(false) {
+            let _ = remove_junction(&target_link);
+            #[cfg(unix)]
+            let _ = std::fs::remove_file(&target_link);
+            #[cfg(windows)]
+            let _ = std::fs::remove_dir(&target_link).or_else(|_| std::fs::remove_file(&target_link));
+        } else if meta.is_dir() {
+            remove_dir_all_safe(&target_link)?;
+        } else {
+            let _ = std::fs::remove_file(&target_link);
+        }
     }
 
     // Clean up empty scoped directory (e.g. @scope)

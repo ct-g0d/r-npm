@@ -527,8 +527,15 @@ pub fn ensure_link(link: &Path, target: &Path) -> Result<()> {
     if let Some(parent) = link.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    crate::linked::create_or_replace_junction(link, target)
-        .map_err(|e| anyhow!("Failed to link {} to {}: {e}", link.display(), target.display()))
+    if let Err(e) = crate::linked::create_or_replace_junction(link, target) {
+        tracing::warn!(
+            "Failed to link {} to {}: {e}; falling back to copy",
+            link.display(),
+            target.display()
+        );
+        crate::linked::copy_dir_recursive(target, link)?;
+    }
+    Ok(())
 }
 
 /// Tarball bytes for a store package: the cache first, then the registry.
@@ -726,13 +733,22 @@ impl crate::Installer {
                     let _ = std::fs::remove_dir_all(&dest);
                 }
                 std::fs::create_dir_all(&dest)?;
-                rnpm_fs::extract_tarball_direct(
+                if let Err(e) = rnpm_fs::extract_tarball_direct(
                     std::io::Cursor::new(&bytes),
                     &dest,
                     None,
                     Some(&writer_cfg),
-                )
-                .map_err(|e| anyhow!("Failed to extract {}: {e}", entry.hoisted))?;
+                ) {
+                    if entry.optional {
+                        tracing::warn!(
+                            "Failed to extract optional store package {}: {e}; skipping",
+                            entry.hoisted
+                        );
+                        let _ = std::fs::remove_dir_all(&dest);
+                        continue;
+                    }
+                    return Err(anyhow!("Failed to extract {}: {e}", entry.hoisted));
+                }
                 added += 1;
             }
             let pkg = &lock.packages[&entry.hoisted];
