@@ -471,7 +471,9 @@ where
             let mut map = BTreeMap::new();
             let mut order = Vec::new();
             while let Some((k, v)) = access.next_entry::<String, String>()? {
-                order.push(k.clone());
+                if !map.contains_key(&k) {
+                    order.push(k.clone());
+                }
                 map.insert(k, v);
             }
             Ok((map, order))
@@ -696,9 +698,15 @@ impl Manifest {
                 line: err.line(),
                 column: err.column(),
             })?;
+        let value: crate::ordered_json::OrderedJsonValue = serde_json::from_str(clean_str)
+            .map_err(|err| ManifestError::MalformedJson {
+                message: err.to_string(),
+                line: err.line(),
+                column: err.column(),
+            })?;
         manifest.format = format;
         manifest.raw_text = Some(clean_str.to_string());
-        manifest.raw_json = None;
+        manifest.raw_json = Some(value);
         Ok(manifest)
     }
 
@@ -710,6 +718,48 @@ impl Manifest {
             source: err,
         })?;
         Self::from_slice(&bytes)
+    }
+
+    /// Parse manifest in read-only mode without building the heavy OrderedJsonValue DOM.
+    /// Runs in a pure single pass and sets `raw_json: None` and `raw_text: None`.
+    pub fn from_str_readonly(s: &str) -> Result<Self, ManifestError> {
+        let format = ManifestFormat::detect(s);
+        let clean_str = s.strip_prefix('\u{feff}').unwrap_or(s);
+        let mut manifest: Self =
+            serde_json::from_str(clean_str).map_err(|err| ManifestError::MalformedJson {
+                message: err.to_string(),
+                line: err.line(),
+                column: err.column(),
+            })?;
+        manifest.format = format;
+        manifest.raw_text = None;
+        manifest.raw_json = None;
+        Ok(manifest)
+    }
+
+    /// Parse manifest from raw bytes in read-only mode, with tolerance for UTF-8 BOM.
+    pub fn from_slice_readonly(bytes: &[u8]) -> Result<Self, ManifestError> {
+        let clean_bytes = if bytes.starts_with(b"\xEF\xBB\xBF") {
+            &bytes[3..]
+        } else {
+            bytes
+        };
+        let s = std::str::from_utf8(clean_bytes).map_err(|_| ManifestError::MalformedJson {
+            message: "invalid utf-8".to_string(),
+            line: 0,
+            column: 0,
+        })?;
+        Self::from_str_readonly(s)
+    }
+
+    /// Read and parse a package.json file from disk in read-only mode without building OrderedJsonValue.
+    pub fn from_file_readonly(path: impl AsRef<Path>) -> Result<Self, ManifestError> {
+        let path = path.as_ref();
+        let bytes = fs::read(path).map_err(|err| ManifestError::Io {
+            path: path.to_path_buf(),
+            source: err,
+        })?;
+        Self::from_slice_readonly(&bytes)
     }
 
     /// Lazily parse and return a mutable reference to raw_json if raw_text is present.

@@ -241,11 +241,25 @@ impl PrecompiledNode {
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PrecompiledOverrides {
     pub all_target_names: HashSet<String>,
     pub root_node: PrecompiledNode,
+    pub rules_snapshot: BTreeMap<String, OverrideValue>,
+    pub rules_len: usize,
     pub compiled: bool,
+}
+
+impl Default for PrecompiledOverrides {
+    fn default() -> Self {
+        Self {
+            all_target_names: HashSet::new(),
+            root_node: PrecompiledNode::default(),
+            rules_snapshot: BTreeMap::new(),
+            rules_len: 0,
+            compiled: true,
+        }
+    }
 }
 
 impl PrecompiledOverrides {
@@ -255,19 +269,33 @@ impl PrecompiledOverrides {
         Self {
             all_target_names: all_targets,
             root_node,
+            rules_snapshot: rules.clone(),
+            rules_len: rules.len(),
             compiled: true,
         }
+    }
+
+    pub fn matches_rules(&self, rules: &BTreeMap<String, OverrideValue>) -> bool {
+        self.compiled && self.rules_len == rules.len() && &self.rules_snapshot == rules
     }
 }
 
 /// Overrides engine implementing npm RFC 36 package overrides.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default)]
 pub struct Overrides {
     pub rules: BTreeMap<String, OverrideValue>,
     /// Root dependencies map (for reference overrides like `"$foo"`).
     pub root_dependencies: BTreeMap<String, String>,
     indexed: PrecompiledOverrides,
 }
+
+impl PartialEq for Overrides {
+    fn eq(&self, other: &Self) -> bool {
+        self.rules == other.rules && self.root_dependencies == other.root_dependencies
+    }
+}
+
+impl Eq for Overrides {}
 
 impl Overrides {
     pub fn new(
@@ -387,7 +415,7 @@ impl Overrides {
         }
 
         let fallback_indexed;
-        let indexed = if self.indexed.compiled {
+        let indexed = if self.indexed.matches_rules(&self.rules) {
             &self.indexed
         } else {
             fallback_indexed = PrecompiledOverrides::compile(&self.rules);
@@ -642,7 +670,7 @@ fn insert_override_rule(
 impl Overrides {
     /// Whether any rule, at any depth, names `name`.
     pub fn mentions(&self, name: &str) -> bool {
-        if self.indexed.compiled {
+        if self.indexed.matches_rules(&self.rules) {
             return self.indexed.all_target_names.contains(name);
         }
         fn walk(rules: &BTreeMap<String, OverrideValue>, name: &str) -> bool {

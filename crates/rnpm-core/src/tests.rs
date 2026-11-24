@@ -1600,7 +1600,7 @@ fn test_pkg_bracket_escaping_and_append_validation() {
 }
 
 #[test]
-fn test_manifest_single_pass_and_lazy_ordered_json() {
+fn test_manifest_raw_json_contract_and_readonly() {
     let raw = r#"{
   "name": "perf-pkg",
   "version": "1.0.0",
@@ -1616,10 +1616,9 @@ fn test_manifest_single_pass_and_lazy_ordered_json() {
 }
 "#;
 
-    // Single pass parse from str
+    // Single pass parse from str: raw_json is always populated for callers needing DOM
     let mut manifest = Manifest::from_str(raw).unwrap();
-    // Raw JSON is lazy (None on load) to avoid building heavy IndexMap DOM
-    assert!(manifest.raw_json.is_none());
+    assert!(manifest.raw_json.is_some());
     assert_eq!(manifest.raw_text.as_deref(), Some(raw));
 
     // Exact declaration order is preserved
@@ -1640,10 +1639,77 @@ fn test_manifest_single_pass_and_lazy_ordered_json() {
     let output = manifest.to_json_string().unwrap();
     assert_eq!(output, raw);
 
-    // ensure_raw_json parses on demand
+    // ensure_raw_json returns existing raw_json
     let raw_val = manifest.ensure_raw_json();
     assert!(raw_val.is_some());
-    assert!(manifest.raw_json.is_some());
+
+    // Readonly parsing bypasses raw_json DOM creation
+    let ro_manifest = Manifest::from_str_readonly(raw).unwrap();
+    assert!(ro_manifest.raw_json.is_none());
+    assert!(ro_manifest.raw_text.is_none());
+    assert_eq!(ro_manifest.dependency_order, manifest.dependency_order);
+    assert_eq!(ro_manifest.dev_dependency_order, manifest.dev_dependency_order);
+    assert_eq!(ro_manifest.dependencies, manifest.dependencies);
+    assert_eq!(ro_manifest.dev_dependencies, manifest.dev_dependencies);
+}
+
+#[test]
+fn test_manifest_duplicate_dependencies_preserves_first_order_last_wins_value() {
+    let raw = r#"{
+  "name": "dup-pkg",
+  "dependencies": {
+    "react": "^17.0.0",
+    "lodash": "^4.0.0",
+    "react": "^18.2.0"
+  }
+}
+"#;
+    let manifest = Manifest::from_str(raw).unwrap();
+    // Unique keys in dependency_order, preserving first occurrence
+    assert_eq!(
+        manifest.dependency_order,
+        vec!["react".to_string(), "lodash".to_string()]
+    );
+    // Last-wins value in dependencies map
+    assert_eq!(manifest.dependencies.get("react").unwrap(), "^18.2.0");
+    assert_eq!(manifest.dependencies.get("lodash").unwrap(), "^4.0.0");
+    assert_eq!(manifest.dependency_order.len(), manifest.dependencies.len());
+
+    let ro = Manifest::from_str_readonly(raw).unwrap();
+    assert_eq!(ro.dependency_order, manifest.dependency_order);
+    assert_eq!(ro.dependencies, manifest.dependencies);
+}
+
+#[test]
+fn test_overrides_equality_default_and_mutation_index_invalidation() {
+    use crate::overrides::{OverrideValue, Overrides};
+    use std::collections::BTreeMap;
+
+    // Overrides::default() == Overrides::new(BTreeMap::new(), BTreeMap::new())
+    let default_ov = Overrides::default();
+    let new_ov = Overrides::new(BTreeMap::new(), BTreeMap::new());
+    assert_eq!(default_ov, new_ov);
+
+    // Direct mutation of rules must invalidate/re-check the index
+    let mut overrides = Overrides::default();
+    overrides.rules.insert(
+        "foo".to_string(),
+        OverrideValue::Exact("1.2.3".to_string()),
+    );
+
+    // Mentions and resolve_override must pick up the newly inserted rule
+    assert!(overrides.mentions("foo"));
+    assert_eq!(
+        overrides.resolve_override("foo", "^1.0.0", &[]).unwrap(),
+        Some("1.2.3".to_string())
+    );
+
+    // Unrelated package not mentioned
+    assert!(!overrides.mentions("bar"));
+    assert_eq!(
+        overrides.resolve_override("bar", "^1.0.0", &[]).unwrap(),
+        None
+    );
 }
 
 #[test]
