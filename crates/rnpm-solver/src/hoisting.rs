@@ -513,7 +513,10 @@ fn candidate_shadows_ancestor_dep(
     let Some(ancestor_node) = graph.nodes.get(ancestor) else {
         return false;
     };
-    let is_top = ancestor.is_empty() || !ancestor.contains("node_modules");
+    let is_top = ancestor.is_empty()
+        || !ancestor
+            .split(['/', '\\'])
+            .any(|segment| segment == "node_modules");
     let dep_spec = ancestor_node
         .dependencies
         .get(install_name)
