@@ -41,7 +41,7 @@ pub(crate) fn parse_key_values(args: &[String]) -> Vec<(String, String)> {
         if let Some((k, v)) = args[i].split_once('=') {
             kv.push((k.trim().to_string(), v.trim().to_string()));
             i += 1;
-        } else if i + 1 < args.len() && !args[i + 1].contains('=') {
+        } else if i + 1 < args.len() {
             kv.push((args[i].trim().to_string(), args[i + 1].trim().to_string()));
             i += 2;
         } else {

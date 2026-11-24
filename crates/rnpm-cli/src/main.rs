@@ -402,11 +402,11 @@ pub(crate) enum Commands {
         args: Vec<String>,
 
         /// Run script across all workspace packages in topological order
-        #[arg(long = "workspaces", short = 'w', alias = "ws")]
+        #[arg(long = "workspaces", alias = "ws")]
         workspaces: bool,
 
         /// Run script in specific workspace package(s)
-        #[arg(long = "workspace")]
+        #[arg(short = 'w', long = "workspace")]
         workspace: Vec<String>,
 
         /// If true, do not fail if a package does not declare the script
@@ -437,11 +437,11 @@ pub(crate) enum Commands {
         args: Vec<String>,
 
         /// Run script across all workspace packages in topological order
-        #[arg(long = "workspaces", short = 'w', alias = "ws")]
+        #[arg(long = "workspaces", alias = "ws")]
         workspaces: bool,
 
         /// Run script in specific workspace package(s)
-        #[arg(long = "workspace")]
+        #[arg(short = 'w', long = "workspace")]
         workspace: Vec<String>,
 
         /// If true, do not fail if a package does not declare the script
@@ -472,11 +472,11 @@ pub(crate) enum Commands {
         args: Vec<String>,
 
         /// Run script across all workspace packages in topological order
-        #[arg(long = "workspaces", short = 'w', alias = "ws")]
+        #[arg(long = "workspaces", alias = "ws")]
         workspaces: bool,
 
         /// Run script in specific workspace package(s)
-        #[arg(long = "workspace")]
+        #[arg(short = 'w', long = "workspace")]
         workspace: Vec<String>,
 
         /// If true, do not fail if a package does not declare the script
@@ -507,11 +507,11 @@ pub(crate) enum Commands {
         args: Vec<String>,
 
         /// Run script across all workspace packages in topological order
-        #[arg(long = "workspaces", short = 'w', alias = "ws")]
+        #[arg(long = "workspaces", alias = "ws")]
         workspaces: bool,
 
         /// Run script in specific workspace package(s)
-        #[arg(long = "workspace")]
+        #[arg(short = 'w', long = "workspace")]
         workspace: Vec<String>,
 
         /// If true, do not fail if a package does not declare the script
@@ -546,11 +546,11 @@ pub(crate) enum Commands {
         args: Vec<String>,
 
         /// Run script across all workspace packages in topological order
-        #[arg(long = "workspaces", short = 'w', alias = "ws")]
+        #[arg(long = "workspaces", alias = "ws")]
         workspaces: bool,
 
         /// Run script in specific workspace package(s)
-        #[arg(long = "workspace")]
+        #[arg(short = 'w', long = "workspace")]
         workspace: Vec<String>,
 
         /// Filter workspace packages by name, scope (@scope, @scope/*), glob (ui-*), or path
@@ -1212,7 +1212,12 @@ pub(crate) enum Commands {
         registry: Option<String>,
 
         /// Tells npm whether or not to expect results from the command
-        #[arg(long = "expect-results", num_args = 0..=1, default_missing_value = "true")]
+        #[arg(
+            long = "expect-results",
+            num_args = 0..=1,
+            default_missing_value = "true",
+            conflicts_with = "expect_result_count"
+        )]
         expect_results: Option<bool>,
 
         /// Tells npm how many results to expect from the command

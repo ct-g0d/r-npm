@@ -613,6 +613,18 @@ pub async fn run_query(project_dir: &Path, options: &QueryOptions) -> anyhow::Re
             .map(|v| v == "true" || v == "1")
     });
 
+    let expect_result_count = options.expect_result_count.or_else(|| {
+        config
+            .get("expect-result-count")
+            .filter(|v| *v != "null")
+            .and_then(|v| v.parse::<usize>().ok())
+    });
+
+    if expect_results.is_some() && expect_result_count.is_some() {
+        eprintln!("npm error --expect-result-count cannot be provided when using --expect-results");
+        return Ok(1);
+    }
+
     if let Some(expected) = expect_results {
         let actual = entries > 0;
         if actual != expected {
@@ -622,22 +634,13 @@ pub async fn run_query(project_dir: &Path, options: &QueryOptions) -> anyhow::Re
             );
             return Ok(1);
         }
-    } else {
-        let expect_result_count = options.expect_result_count.or_else(|| {
-            config
-                .get("expect-result-count")
-                .filter(|v| *v != "null")
-                .and_then(|v| v.parse::<usize>().ok())
-        });
-
-        if let Some(expected_count) = expect_result_count {
-            if expected_count != entries {
-                eprintln!(
-                    "npm warn query Expected {expected_count} result{}, got {entries}",
-                    if expected_count == 1 { "" } else { "s" }
-                );
-                return Ok(1);
-            }
+    } else if let Some(expected_count) = expect_result_count {
+        if expected_count != entries {
+            eprintln!(
+                "npm warn query Expected {expected_count} result{}, got {entries}",
+                if expected_count == 1 { "" } else { "s" }
+            );
+            return Ok(1);
         }
     }
 

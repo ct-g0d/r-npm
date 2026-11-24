@@ -64,6 +64,20 @@ fn test_config_set_multiple_key_value_pairs() {
 
     let content = fs::read_to_string(&npmrc_path).unwrap();
     assert!(content.contains("hello=world"), "Expected hello=world in {content}");
+
+    // 4. Test space-separated where value contains '='
+    let out = rnpm(
+        tmp.path(),
+        &["config", "set", "mykey", "val=123", "--location=project"],
+    );
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let content = fs::read_to_string(&npmrc_path).unwrap();
+    assert!(content.contains("mykey=val=123"), "Expected mykey=val=123 in {content}");
 }
 
 #[test]
@@ -113,6 +127,34 @@ fn test_lifecycle_default_env() {
             || stdout.contains("PATH=")
             || stdout.contains("Path="),
         "Expected environment output, got: {stdout}"
+    );
+}
+
+#[test]
+fn test_lifecycle_default_restart() {
+    let tmp = tempdir().unwrap();
+    fs::write(
+        tmp.path().join("package.json"),
+        r#"{
+  "name": "test-restart-pkg",
+  "version": "1.0.0",
+  "scripts": {
+    "start": "node -e \"console.log('RESTART_DEFAULT_START_PASS')\""
+  }
+}"#,
+    )
+    .unwrap();
+
+    let out = rnpm(tmp.path(), &["restart"]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("RESTART_DEFAULT_START_PASS"),
+        "Expected RESTART_DEFAULT_START_PASS in stdout: {stdout}"
     );
 }
 
@@ -209,13 +251,7 @@ fn test_query_expect_result_count_and_expect_results() {
     .unwrap();
 
     // 1. Count expectation matches (1 node :root) -> success exit 0
-    let out = rnpm(tmp.path(), &[":root", "query", "--expect-result-count=1"]);
-    // or `query :root --expect-result-count=1`
-    let out = if !out.status.success() {
-        rnpm(tmp.path(), &["query", ":root", "--expect-result-count=1"])
-    } else {
-        out
-    };
+    let out = rnpm(tmp.path(), &["query", ":root", "--expect-result-count=1"]);
     assert!(
         out.status.success(),
         "stderr: {}",
@@ -238,5 +274,20 @@ fn test_query_expect_result_count_and_expect_results() {
     assert!(
         stderr.contains("npm warn query Expected no results, got 1"),
         "stderr: {stderr}"
+    );
+
+    // 4. Mutual exclusion between --expect-results and --expect-result-count -> exit non-zero
+    let out = rnpm(
+        tmp.path(),
+        &[
+            "query",
+            ":root",
+            "--expect-results",
+            "--expect-result-count=1",
+        ],
+    );
+    assert!(
+        !out.status.success(),
+        "Expected failure when both flags provided"
     );
 }
