@@ -1,8 +1,12 @@
 use crate::error::OverrideError;
 use crate::manifest::Manifest;
-use crate::semver::{Range, Version};
+use crate::semver::{
+    comparator::{Comparator, Op},
+    range::ComparatorSet,
+    Range, Version,
+};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// Value in an override definition: either an exact spec string or a nested map of overrides.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -166,18 +170,27 @@ impl Overrides {
             }
         };
 
-        // 4. Resolve reference override ($pkg) if present
-        if let Some(ref_name) = raw_override.strip_prefix('$') {
-            if let Some(ref_spec) = reference_root.get(ref_name) {
-                Ok(Some(ref_spec.clone()))
-            } else if let Some(caller_spec) = caller_specs.and_then(|specs| specs.get(ref_name)) {
-                Ok(Some(caller_spec.clone()))
-            } else {
-                Err(OverrideError::UnresolvableReference(ref_name.to_string()))
+        // 4. Resolve reference override ($pkg) if present, following chained references with cycle detection
+        let mut current_spec = raw_override;
+        let mut visited_refs = BTreeSet::new();
+
+        while let Some(ref_name) = current_spec.strip_prefix('$') {
+            if !visited_refs.insert(ref_name.to_string()) {
+                return Err(OverrideError::UnresolvableReference(format!(
+                    "cyclic reference override ${ref_name}"
+                )));
             }
-        } else {
-            Ok(Some(raw_override))
+
+            if let Some(ref_spec) = reference_root.get(ref_name) {
+                current_spec = ref_spec.clone();
+            } else if let Some(caller_spec) = caller_specs.and_then(|specs| specs.get(ref_name)) {
+                current_spec = caller_spec.clone();
+            } else {
+                return Err(OverrideError::UnresolvableReference(ref_name.to_string()));
+            }
         }
+
+        Ok(Some(current_spec))
     }
 
     fn find_direct<'a>(
@@ -231,13 +244,15 @@ impl Overrides {
             if matches_parent {
                 if let OverrideValue::Nested(nested_map) = v {
                     if ancestors.len() > 1 {
-                        if let Some(res) = self.find_in_nested(
-                            nested_map,
-                            &ancestors[1..],
-                            dep_name,
-                            requested_spec,
-                        ) {
-                            return Some(res);
+                        for next_idx in 1..ancestors.len() {
+                            if let Some(res) = self.find_in_nested(
+                                nested_map,
+                                &ancestors[next_idx..],
+                                dep_name,
+                                requested_spec,
+                            ) {
+                                return Some(res);
+                            }
                         }
                     }
                     if let Some(res) = self.find_direct(nested_map, dep_name, requested_spec) {
@@ -463,44 +478,187 @@ fn parse_key_and_spec(key: &str) -> Option<(&str, &str)> {
     }
 }
 
+/// Determines if two semver comparators intersect (can be simultaneously satisfied).
+fn comparator_intersects(c1: &Comparator, c2: &Comparator) -> bool {
+    // If either comparator is equality:
+    if c1.op == Op::Eq {
+        if c1.version.is_prerelease() {
+            let has_matching_prerelease = c2.version.is_prerelease()
+                && c2.version.major == c1.version.major
+                && c2.version.minor == c1.version.minor
+                && c2.version.patch == c1.version.patch;
+            if !has_matching_prerelease {
+                return false;
+            }
+        }
+        return c2.matches(&c1.version);
+    }
+    if c2.op == Op::Eq {
+        if c2.version.is_prerelease() {
+            let has_matching_prerelease = c1.version.is_prerelease()
+                && c1.version.major == c2.version.major
+                && c1.version.minor == c2.version.minor
+                && c1.version.patch == c2.version.patch;
+            if !has_matching_prerelease {
+                return false;
+            }
+        }
+        return c1.matches(&c2.version);
+    }
+
+    // Both are increasing (> or >=)
+    let c1_inc = matches!(c1.op, Op::Gt | Op::Gte);
+    let c2_inc = matches!(c2.op, Op::Gt | Op::Gte);
+    if c1_inc && c2_inc {
+        return true;
+    }
+
+    // Both are decreasing (< or <=)
+    let c1_dec = matches!(c1.op, Op::Lt | Op::Lte);
+    let c2_dec = matches!(c2.op, Op::Lt | Op::Lte);
+    if c1_dec && c2_dec {
+        return true;
+    }
+
+    // Same version and both inclusive (>= and <=)
+    if c1.version == c2.version
+        && matches!(c1.op, Op::Gte | Op::Lte)
+        && matches!(c2.op, Op::Gte | Op::Lte)
+    {
+        return true;
+    }
+
+    // Opposite directions: c1 increasing, c2 decreasing
+    if c1_inc && c2_dec {
+        if c2.version.is_prerelease()
+            && !c1.version.is_prerelease()
+            && c1.version.major == c2.version.major
+            && c1.version.minor == c2.version.minor
+            && c1.version.patch == c2.version.patch
+        {
+            return false;
+        }
+        if c1.version < c2.version {
+            return true;
+        }
+    }
+
+    // Opposite directions: c1 decreasing, c2 increasing
+    if c1_dec && c2_inc {
+        if c1.version.is_prerelease()
+            && !c2.version.is_prerelease()
+            && c1.version.major == c2.version.major
+            && c1.version.minor == c2.version.minor
+            && c1.version.patch == c2.version.patch
+        {
+            return false;
+        }
+        if c1.version > c2.version {
+            return true;
+        }
+    }
+
+    false
+}
+
+/// Checks whether all comparators within a ComparatorSet can be simultaneously satisfied.
+fn comparator_set_is_satisfiable(cs: &ComparatorSet) -> bool {
+    for i in 0..cs.comparators.len() {
+        for j in (i + 1)..cs.comparators.len() {
+            if !comparator_intersects(&cs.comparators[i], &cs.comparators[j]) {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// Checks if two ComparatorSets intersect (their conjunction is satisfiable).
+fn comparator_sets_intersect(cs1: &ComparatorSet, cs2: &ComparatorSet) -> bool {
+    if !comparator_set_is_satisfiable(cs1) || !comparator_set_is_satisfiable(cs2) {
+        return false;
+    }
+    for c1 in &cs1.comparators {
+        for c2 in &cs2.comparators {
+            if !comparator_intersects(c1, c2) {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// Checks if two semver Ranges intersect, matching node-semver `semver.intersects(r1, r2)`.
+pub fn ranges_intersect(r1: &Range, r2: &Range) -> bool {
+    if r1.sets.is_empty() || r2.sets.is_empty() {
+        return false;
+    }
+    for s1 in &r1.sets {
+        for s2 in &r2.sets {
+            if comparator_sets_intersect(s1, s2) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// Determines if the requested spec matches the pattern spec in a spec-targeted override.
 fn spec_matches(pattern_spec: &str, requested_spec: &str) -> bool {
     let p = pattern_spec.trim();
-    let r = requested_spec.trim();
+    let mut r = requested_spec.trim();
     if p == r {
         return true;
     }
 
     // Strip workspace: prefix if present, e.g. workspace:^1.0.0 -> ^1.0.0
-    let r_clean = r.strip_prefix("workspace:").unwrap_or(r).trim();
-    let r_clean = if r_clean == "*" || r_clean == "^" || r_clean == "~" || r_clean.is_empty() {
-        "*"
-    } else {
-        r_clean
-    };
-    if p == r_clean {
+    r = r.strip_prefix("workspace:").unwrap_or(r).trim();
+    if r == "*" || r == "^" || r == "~" || r.is_empty() {
+        r = "*";
+    }
+    if p == r {
+        return true;
+    }
+
+    // If requested_spec is an alias, e.g. "npm:react@^18.0.0" or "npm:@scope/pkg@^18.0.0"
+    if let Some(rest) = r.strip_prefix("npm:") {
+        if let Some((_, sub_spec)) = parse_key_and_spec(rest) {
+            r = sub_spec;
+        } else if let Some(at_idx) = rest.rfind('@') {
+            r = &rest[at_idx + 1..];
+        } else {
+            // Bare alias like "npm:react" defaults to "*"
+            r = "*";
+        }
+    }
+
+    // If requested_spec contains #semver:
+    if let Some(idx) = r.find("#semver:") {
+        r = &r[idx + 8..];
+    }
+
+    if p == r {
         return true;
     }
 
     // Wildcards: "*" or "x" or "X" match anything
-    if p == "*" || p.eq_ignore_ascii_case("x") {
+    if p == "*" || p.eq_ignore_ascii_case("x") || r == "*" || r.eq_ignore_ascii_case("x") {
         return true;
     }
 
-    // Try semver range matching if requested_spec is an exact version
-    if let (Ok(p_range), Ok(r_ver)) = (Range::parse(p), Version::parse(r_clean)) {
+    // If both can be parsed as ranges, test for intersection
+    if let (Ok(p_range), Ok(r_range)) = (Range::parse(p), Range::parse(r)) {
+        return ranges_intersect(&p_range, &r_range);
+    }
+
+    // If requested is exact version and pattern is range
+    if let (Ok(p_range), Ok(r_ver)) = (Range::parse(p), Version::parse(r)) {
         return p_range.satisfies(&r_ver);
     }
 
-    // If both can be parsed as ranges, check if requested range's lower bound satisfies pattern range
-    if let (Ok(p_range), Ok(r_range)) = (Range::parse(p), Range::parse(r_clean)) {
-        if let Some(first_set) = r_range.sets.first() {
-            if let Some(first_comp) = first_set.comparators.first() {
-                if p_range.satisfies(&first_comp.version) {
-                    return true;
-                }
-            }
-        }
+    // If pattern is exact version and requested is range
+    if let (Ok(p_ver), Ok(r_range)) = (Version::parse(p), Range::parse(r)) {
+        return r_range.satisfies(&p_ver);
     }
 
     false
@@ -790,5 +948,111 @@ mod tests {
             overrides.resolve_override("zeta", "*", &["epsilon"]).unwrap(),
             Some("5.0.0".to_string())
         );
+    }
+
+    #[test]
+    fn test_chained_and_cyclic_reference_overrides() {
+        let json = serde_json::json!({
+            "pkg-a": "$pkg-b",
+            "pkg-c": "$pkg-d",
+            "pkg-d": "$pkg-c"
+        });
+        let mut root_deps = BTreeMap::new();
+        root_deps.insert("pkg-b".to_string(), "$pkg-final".to_string());
+        root_deps.insert("pkg-final".to_string(), "1.2.3".to_string());
+        root_deps.insert("pkg-c".to_string(), "$pkg-d".to_string());
+        root_deps.insert("pkg-d".to_string(), "$pkg-c".to_string());
+
+        let overrides = Overrides::from_json_value(Some(&json), root_deps);
+
+        // Chained reference $pkg-a -> $pkg-b -> $pkg-final -> 1.2.3
+        let res = overrides.resolve_override("pkg-a", "^1.0.0", &[]).unwrap();
+        assert_eq!(res, Some("1.2.3".to_string()));
+
+        // Cyclic reference $pkg-c -> $pkg-d -> $pkg-c must return error, not hang or panic
+        let err = overrides.resolve_override("pkg-c", "^1.0.0", &[]);
+        assert!(err.is_err());
+        assert!(err.unwrap_err().to_string().contains("cyclic"));
+    }
+
+    #[test]
+    fn test_selector_range_intersection() {
+        let json = serde_json::json!({
+            "debug@1.2.0": "2.0.0",
+            "foo@>=1.5.0 <2.0.0": "3.0.0"
+        });
+        let overrides = Overrides::from_json_value(Some(&json), BTreeMap::new());
+
+        // debug@1.2.0 intersects with requested ^1.0.0
+        assert_eq!(
+            overrides.resolve_override("debug", "^1.0.0", &[]).unwrap(),
+            Some("2.0.0".to_string())
+        );
+
+        // foo@>=1.5.0 <2.0.0 intersects with requested ^1.0.0
+        assert_eq!(
+            overrides.resolve_override("foo", "^1.0.0", &[]).unwrap(),
+            Some("3.0.0".to_string())
+        );
+
+        // Does not match non-intersecting range
+        assert_eq!(
+            overrides.resolve_override("debug", "^2.0.0", &[]).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn test_aliased_dependency_spec_override() {
+        let json = serde_json::json!({
+            "my-react@^18.0.0": "18.3.1"
+        });
+        let overrides = Overrides::from_json_value(Some(&json), BTreeMap::new());
+
+        // Alias spec "npm:react@^18.2.0" unwraps and intersects with ^18.0.0
+        let res = overrides
+            .resolve_override("my-react", "npm:react@^18.2.0", &[])
+            .unwrap();
+        assert_eq!(res, Some("18.3.1".to_string()));
+    }
+
+    #[test]
+    fn test_nested_override_with_intermediate_packages() {
+        let json = serde_json::json!({
+            "parent > target": "9.9.9"
+        });
+        let overrides = Overrides::from_json_value(Some(&json), BTreeMap::new());
+
+        // Ancestor chain has an intermediate package: ["parent", "intermediate"]
+        let res = overrides
+            .resolve_override("target", "1.0.0", &["parent", "intermediate"])
+            .unwrap();
+        assert_eq!(res, Some("9.9.9".to_string()));
+    }
+
+    #[test]
+    fn test_ranges_intersect_prerelease_exclusion() {
+        let r1 = Range::parse("^1.0.0").unwrap();
+        let r_pre = Range::parse("2.0.0-alpha.1").unwrap();
+        // ^1.0.0 must NOT intersect with 2.0.0-alpha.1 per node-semver prerelease rule
+        assert!(!ranges_intersect(&r1, &r_pre));
+
+        let r2 = Range::parse("<2.0.0-beta.1").unwrap();
+        // <2.0.0-beta.1 explicitly targets 2.0.0 prereleases, so it DOES intersect
+        assert!(ranges_intersect(&r2, &r_pre));
+    }
+
+    #[test]
+    fn test_bare_alias_spec_override() {
+        let json = serde_json::json!({
+            "my-react@*": "18.3.1"
+        });
+        let overrides = Overrides::from_json_value(Some(&json), BTreeMap::new());
+
+        // Bare alias "npm:react" defaults to "*"
+        let res = overrides
+            .resolve_override("my-react", "npm:react", &[])
+            .unwrap();
+        assert_eq!(res, Some("18.3.1".to_string()));
     }
 }

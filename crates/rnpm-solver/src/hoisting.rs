@@ -211,7 +211,9 @@ pub fn node_satisfies_target(node: &crate::graph::Node, target: &PackageTarget) 
             PackageTarget::Version(expected) => parsed == expected,
             PackageTarget::Range(range) => range.satisfies(parsed),
             PackageTarget::Tag(_) => true,
-            PackageTarget::Alias { target, .. } => node_satisfies_target(node, target),
+            PackageTarget::Alias { name, target } => {
+                node.name == *name && node_satisfies_target(node, target)
+            }
             PackageTarget::File(_) => true,
             PackageTarget::Git { .. } => true,
             PackageTarget::Url(_) => true,

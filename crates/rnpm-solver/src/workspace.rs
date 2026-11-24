@@ -24,6 +24,9 @@ pub struct WorkspaceDependencyGraph {
     /// Directed development dependencies among workspace members:
     /// member_name -> (sibling_name -> resolved_constraint)
     pub dev_dependencies: BTreeMap<String, BTreeMap<String, String>>,
+    /// Directed peer dependencies among workspace members:
+    /// member_name -> (sibling_name -> resolved_constraint)
+    pub peer_dependencies: BTreeMap<String, BTreeMap<String, String>>,
     /// Deterministic topological order of workspace members (leaf dependencies first).
     pub topological_order: Vec<String>,
 }
@@ -42,11 +45,13 @@ impl WorkspaceDependencyGraph {
 
         let mut prod_deps: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
         let mut dev_deps: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
+        let mut peer_deps: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
 
         // 1. Resolve workspace dependencies for each member
         for member in members {
             let mut member_prod: BTreeMap<String, String> = BTreeMap::new();
             let mut member_dev: BTreeMap<String, String> = BTreeMap::new();
+            let mut member_peer: BTreeMap<String, String> = BTreeMap::new();
 
             // Collect production dependencies (dependencies + optional_dependencies)
             let mut raw_prod = BTreeMap::new();
@@ -115,8 +120,25 @@ impl WorkspaceDependencyGraph {
                 }
             }
 
+            // Collect peer_dependencies
+            for (dep_name, dep_spec) in &member.manifest.peer_dependencies {
+                let trimmed_spec = dep_spec.trim();
+
+                if let Some(ws_spec) = trimmed_spec.strip_prefix("workspace:") {
+                    if let Some(sibling) = member_map.get(dep_name) {
+                        validate_workspace_protocol_constraint(member, sibling, ws_spec, dep_spec)?;
+                        member_peer.insert(dep_name.clone(), dep_spec.clone());
+                    }
+                } else if let Some(sibling) = member_map.get(dep_name) {
+                    if is_sibling_compatible(sibling, trimmed_spec) {
+                        member_peer.insert(dep_name.clone(), dep_spec.clone());
+                    }
+                }
+            }
+
             prod_deps.insert(member.name.clone(), member_prod);
             dev_deps.insert(member.name.clone(), member_dev);
+            peer_deps.insert(member.name.clone(), member_peer);
         }
 
         // 2. Topological order. npm installs cyclic workspaces, so a
@@ -134,6 +156,7 @@ impl WorkspaceDependencyGraph {
             members: member_map,
             dependencies: prod_deps,
             dev_dependencies: dev_deps,
+            peer_dependencies: peer_deps,
             topological_order,
         })
     }
@@ -159,6 +182,11 @@ impl WorkspaceDependencyGraph {
                 .get(member)
                 .map(|d| d.contains_key(sibling_name))
                 .unwrap_or(false)
+            || self
+                .peer_dependencies
+                .get(member)
+                .map(|d| d.contains_key(sibling_name))
+                .unwrap_or(false)
     }
 
     /// Returns all sibling dependencies (both prod and dev) declared by member.
@@ -169,6 +197,11 @@ impl WorkspaceDependencyGraph {
         }
         if let Some(dev_deps) = self.dev_dependencies.get(member) {
             for (k, v) in dev_deps {
+                all.entry(k.clone()).or_insert_with(|| v.clone());
+            }
+        }
+        if let Some(peer_deps) = self.peer_dependencies.get(member) {
+            for (k, v) in peer_deps {
                 all.entry(k.clone()).or_insert_with(|| v.clone());
             }
         }
@@ -717,10 +750,49 @@ pub fn resolve_workspace_graph<P: PackageMetadataProvider>(
                 }
             }
         }
+
+        // Add peer edges between workspace members
+        if let Some(sibling_peer_deps) = ws_graph.peer_dependencies.get(&member.name) {
+            for (sibling_name, spec) in sibling_peer_deps {
+                let sibling_link_loc = format!("node_modules/{sibling_name}");
+                let is_opt = member
+                    .manifest
+                    .peer_dependencies_meta
+                    .get(sibling_name)
+                    .map(|m| m.optional)
+                    .unwrap_or(false);
+                let dep_type = if is_opt {
+                    DependencyType::PeerOptional
+                } else {
+                    DependencyType::Peer
+                };
+                if !graph.edges.iter().any(|e| {
+                    e.from_location == member_loc
+                        && e.to_location == sibling_link_loc
+                        && e.install_name == *sibling_name
+                }) {
+                    graph.edges.push(DependencyEdge {
+                        from_location: member_loc.clone(),
+                        to_location: sibling_link_loc,
+                        install_name: sibling_name.clone(),
+                        package_name: sibling_name.clone(),
+                        spec: spec.clone(),
+                        dep_type,
+                    });
+                }
+            }
+        }
     }
 
     // 4. Resolve external third-party dependencies from root and all workspace members
-    let overrides = Overrides::from_manifest(root_manifest)?;
+    let mut root_refs = Overrides::reference_specs(root_manifest);
+    for member in members {
+        let mem_ver = member.version.as_deref().unwrap_or("*");
+        root_refs
+            .entry(member.name.clone())
+            .or_insert_with(|| format!("workspace:{mem_ver}"));
+    }
+    let overrides = Overrides::from_json_value(root_manifest.extra.get("overrides"), root_refs);
     let mut solver = Solver::new(provider, options.clone(), overrides).with_graph(graph);
 
     let root_ancestors = std::sync::Arc::new(vec![root_name.clone()]);
