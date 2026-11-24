@@ -103,10 +103,15 @@ impl Range {
         Ok(Self { raw, sets })
     }
 
-    /// Checks if this range is a wildcard (*, "", x, X), matching any version.
+    /// Checks if this range normalizes to node-semver's ANY wildcard (`*`, `""`, `x`, `*.*`, `>=0.0.0`, etc.).
     pub fn is_wildcard(&self) -> bool {
-        let t = self.raw.trim();
-        t.is_empty() || t == "*" || t.eq_ignore_ascii_case("x")
+        self.sets.len() == 1
+            && self.sets[0].comparators.len() == 1
+            && self.sets[0].comparators[0].op == Op::Gte
+            && self.sets[0].comparators[0].version.major == 0
+            && self.sets[0].comparators[0].version.minor == 0
+            && self.sets[0].comparators[0].version.patch == 0
+            && self.sets[0].comparators[0].version.prerelease.is_empty()
     }
 
     pub fn satisfies(&self, version: &Version) -> bool {

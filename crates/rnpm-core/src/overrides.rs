@@ -643,13 +643,17 @@ fn extract_semver_range_from_spec(spec: &str) -> Option<String> {
 
 /// Determines if the requested spec matches the pattern spec in a spec-targeted override.
 fn spec_matches(pattern_spec: &str, requested_spec: &str) -> bool {
-    let p = pattern_spec.trim();
+    let mut p = pattern_spec.trim();
     let mut r = requested_spec.trim();
     if p == r {
         return true;
     }
 
-    // Strip workspace: prefix if present, e.g. workspace:^1.0.0 -> ^1.0.0
+    // Strip workspace: prefix if present on either side, e.g. workspace:^1.0.0 -> ^1.0.0
+    p = p.strip_prefix("workspace:").unwrap_or(p).trim();
+    if p == "*" || p == "^" || p == "~" || p.is_empty() {
+        p = "*";
+    }
     r = r.strip_prefix("workspace:").unwrap_or(r).trim();
     if r == "*" || r == "^" || r == "~" || r.is_empty() {
         r = "*";
@@ -1125,8 +1129,10 @@ mod tests {
         // Reverse direction: exact prerelease against wildcard does not intersect in node-semver:
         assert!(!ranges_intersect(&r_pre, &r_empty1));
         assert!(!ranges_intersect(&r_pre, &r_star));
-        // Non-wildcard >=0.0.0 does NOT intersect with prereleases:
-        assert!(!ranges_intersect(&Range::parse(">=0.0.0").unwrap(), &r_pre));
+        // node-semver normalizes >=0.0.0 (and *.*, x.x.x) to ANY, while >=0.0.0-0 has a prerelease:
+        assert!(ranges_intersect(&Range::parse(">=0.0.0").unwrap(), &r_pre));
+        assert!(!ranges_intersect(&r_pre, &Range::parse(">=0.0.0").unwrap()));
+        assert!(!ranges_intersect(&Range::parse(">=0.0.0-0").unwrap(), &r_pre));
 
         // >=1.0.0-0 checks:
         let r_ge_zero = Range::parse(">=1.0.0-0").unwrap();
@@ -1187,5 +1193,17 @@ mod tests {
             "^2.0.0",
             "git+https://github.com/org/repo.git#semver%3A^1.0.0"
         ));
+
+        // Symmetric workspace: prefix stripping in spec_matches:
+        assert!(spec_matches("workspace:^1.0.0", "^1.2.0"));
+        assert!(spec_matches("workspace:^1.0.0", "workspace:^1.2.0"));
+        assert!(spec_matches("workspace:*", "^1.0.0"));
+        assert!(!spec_matches("workspace:^2.0.0", "^1.2.0"));
+
+        // Normalized wildcard variants (*.*, x.x.x) intersect with prereleases on the left:
+        let r_pre = Range::parse("1.0.0-alpha.1").unwrap();
+        assert!(ranges_intersect(&Range::parse("*.*").unwrap(), &r_pre));
+        assert!(ranges_intersect(&Range::parse("x.x.x").unwrap(), &r_pre));
+        assert!(!ranges_intersect(&r_pre, &Range::parse("*.*").unwrap()));
     }
 }

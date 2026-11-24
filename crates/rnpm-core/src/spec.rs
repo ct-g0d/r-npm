@@ -33,18 +33,31 @@ pub fn is_scp_git_url(s: &str) -> bool {
 }
 
 impl PackageTarget {
-    /// Checks if a string is an SCP-syntax git URL, e.g. `git@github.com:org/repo.git`.
+    /// Checks if a string is an SCP-syntax git URL, e.g. `git@github.com:org/repo.git`
+    /// or `deploy@gitlab.com:org/repo.git`.
     ///
-    /// An SCP URL must start with `git@` and contain a colon `:` separating the host
-    /// from the repository path, with non-empty host and path without invalid characters.
-    /// This prevents misclassifying registry specs like `git@1.0.0` or `git@latest` as git URLs.
+    /// Requires a non-empty SSH user before `@` (preventing scoped packages like `@org/pkg`),
+    /// followed by a dotted hostname and colon `:` separating the host from a non-empty repository
+    /// path (matching `npm-package-arg`: `/^[^@]+@[^:.]+\.[^:]+:.+$/i`).
+    /// This prevents misclassifying registry specs like `git@1.0.0`, `git@npm:other`, or `git@file:./foo` as git URLs.
     pub fn is_scp_git_url(s: &str) -> bool {
-        if let Some(rest) = s.strip_prefix("git@") {
+        if let Some((user, rest)) = s.split_once('@') {
+            if user.is_empty()
+                || user.contains('/')
+                || user.contains('\\')
+                || user.contains(':')
+                || user.chars().any(|c| c.is_whitespace())
+            {
+                return false;
+            }
             if let Some((host, path)) = rest.split_once(':') {
-                return !host.is_empty()
+                let valid_host = host
+                    .split_once('.')
+                    .is_some_and(|(left, right)| !left.is_empty() && !right.is_empty())
                     && !host.contains('/')
                     && !host.contains('\\')
-                    && !host.chars().any(|c| c.is_whitespace())
+                    && !host.chars().any(|c| c.is_whitespace());
+                return valid_host
                     && !path.is_empty()
                     && !path.chars().any(|c| c.is_whitespace());
             }
@@ -840,5 +853,17 @@ mod unsupported_protocol_tests {
             }
             _ => panic!("Expected PackageTarget::Git"),
         }
+
+        // Non-git SSH users with dotted hostnames parse as SCP git URLs (matching npm-package-arg),
+        // while dotless hosts such as `git@npm:other` or `git@file:./foo` do not:
+        assert!(PackageTarget::is_scp_git_url("deploy@gitlab.com:org/repo.git"));
+        assert!(!PackageTarget::is_scp_git_url("git@npm:other"));
+        assert!(!PackageTarget::is_scp_git_url("git@file:./foo"));
+        assert!(!PackageTarget::is_scp_git_url("user@localhost:org/repo.git"));
+        assert!(!PackageTarget::is_scp_git_url("@org/pkg:foo"));
+
+        let deploy_spec = PackageSpec::parse("deploy@gitlab.com:org/repo.git").unwrap();
+        assert_eq!(deploy_spec.name, "repo");
+        assert!(matches!(deploy_spec.target, PackageTarget::Git { .. }));
     }
 }

@@ -1529,9 +1529,10 @@ impl LockfileV3 {
             };
             if let Some(ref lock_deps) = root_pkg.dependencies {
                 if let Some(lock_spec) = lock_deps.get(dep) {
-                    if Self::is_non_registry_spec(&eff_spec)
-                        && Self::is_non_registry_spec(lock_spec)
-                        && !Self::non_registry_specs_match(&eff_spec, lock_spec)
+                    let eff_non_reg = Self::is_non_registry_spec(&eff_spec);
+                    let lock_non_reg = Self::is_non_registry_spec(lock_spec);
+                    if eff_non_reg != lock_non_reg
+                        || (eff_non_reg && !Self::non_registry_specs_match(&eff_spec, lock_spec))
                     {
                         return false;
                     }
@@ -1559,9 +1560,10 @@ impl LockfileV3 {
                 };
                 if let Some(ref lock_dev) = root_pkg.dev_dependencies {
                     if let Some(lock_spec) = lock_dev.get(dep) {
-                        if Self::is_non_registry_spec(&eff_spec)
-                            && Self::is_non_registry_spec(lock_spec)
-                            && !Self::non_registry_specs_match(&eff_spec, lock_spec)
+                        let eff_non_reg = Self::is_non_registry_spec(&eff_spec);
+                        let lock_non_reg = Self::is_non_registry_spec(lock_spec);
+                        if eff_non_reg != lock_non_reg
+                            || (eff_non_reg && !Self::non_registry_specs_match(&eff_spec, lock_spec))
                         {
                             return false;
                         }
@@ -1587,9 +1589,10 @@ impl LockfileV3 {
                 };
                 if let Some(ref lock_opt) = root_pkg.optional_dependencies {
                     if let Some(lock_spec) = lock_opt.get(dep) {
-                        if Self::is_non_registry_spec(&eff_spec)
-                            && Self::is_non_registry_spec(lock_spec)
-                            && !Self::non_registry_specs_match(&eff_spec, lock_spec)
+                        let eff_non_reg = Self::is_non_registry_spec(&eff_spec);
+                        let lock_non_reg = Self::is_non_registry_spec(lock_spec);
+                        if eff_non_reg != lock_non_reg
+                            || (eff_non_reg && !Self::non_registry_specs_match(&eff_spec, lock_spec))
                         {
                             return false;
                         }
@@ -1620,9 +1623,10 @@ impl LockfileV3 {
             };
             if let Some(ref lock_peer) = root_pkg.peer_dependencies {
                 if let Some(lock_spec) = lock_peer.get(dep) {
-                    if Self::is_non_registry_spec(&eff_spec)
-                        && Self::is_non_registry_spec(lock_spec)
-                        && !Self::non_registry_specs_match(&eff_spec, lock_spec)
+                    let eff_non_reg = Self::is_non_registry_spec(&eff_spec);
+                    let lock_non_reg = Self::is_non_registry_spec(lock_spec);
+                    if eff_non_reg != lock_non_reg
+                        || (eff_non_reg && !Self::non_registry_specs_match(&eff_spec, lock_spec))
                     {
                         return false;
                     }
@@ -2100,7 +2104,7 @@ impl LockfileV3 {
         // as well as GitHub shorthands paired against SCP/ssh specs.
         let is_git_like = |s: &str, parsed: &Result<PackageTarget, _>| {
             matches!(parsed, Ok(PackageTarget::Git { .. }))
-                || s.starts_with("git@")
+                || rnpm_core::is_scp_git_url(s)
                 || s.starts_with("ssh://")
                 || s.starts_with("git:")
                 || s.starts_with("git+")
@@ -3797,5 +3801,35 @@ mod platform_field_tests {
             "/workspace/sibling",
             &file_sibling
         ));
+
+        // Switching a dependency between a file: link and a registry range must be detected as drift:
+        let mut lock_pkg_root = super::LockfilePackage::default();
+        lock_pkg_root.dependencies = Some(std::collections::BTreeMap::from([(
+            "sibling".to_string(),
+            "file:../sibling".to_string(),
+        )]));
+        let mut lock_pkg_link = super::LockfilePackage::default();
+        lock_pkg_link.resolved = Some("../sibling".to_string());
+        lock_pkg_link.link = Some(true);
+        let lockfile = super::LockfileV3 {
+            name: "root".to_string(),
+            version: Some("1.0.0".to_string()),
+            lockfile_version: 3,
+            requires: Some(true),
+            packages: std::collections::BTreeMap::from([
+                (String::new(), lock_pkg_root),
+                ("node_modules/sibling".to_string(), lock_pkg_link),
+            ]),
+        };
+        let manifest_registry = rnpm_core::manifest::Manifest {
+            name: Some("root".to_string()),
+            version: Some("1.0.0".to_string()),
+            dependencies: std::collections::BTreeMap::from([(
+                "sibling".to_string(),
+                "^1.0.0".to_string(),
+            )]),
+            ..Default::default()
+        };
+        assert!(!lockfile.matches_manifest(&manifest_registry, true));
     }
 }
