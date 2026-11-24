@@ -326,6 +326,11 @@ fn enrich_packages_from_legacy(
                 if pkg.link.is_none() {
                     pkg.link = Some(true);
                 }
+                pkg.dev = None;
+                pkg.optional = None;
+                pkg.dev_optional = None;
+                pkg.peer = None;
+                pkg.peer_optional = None;
                 if pkg.resolved.is_none() {
                     let raw_target = dep.version.strip_prefix("file:").unwrap().trim_matches('/');
                     let raw_target = raw_target

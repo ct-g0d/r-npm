@@ -1558,10 +1558,23 @@ impl LockfileV3 {
             return false;
         };
         if pkg.link == Some(true) {
-            if let PackageTarget::Alias { ref name, .. } = target {
-                if pkg.name.as_deref() != Some(name) {
-                    return false;
+            match &target {
+                PackageTarget::Alias { name, target } => {
+                    if pkg.name.as_deref() != Some(name) {
+                        return false;
+                    }
+                    if let PackageTarget::File(_) = &**target {
+                        if let Some(ref res) = pkg.resolved {
+                            return Self::target_matches_resolved(res, target);
+                        }
+                    }
                 }
+                PackageTarget::File(_) => {
+                    if let Some(ref res) = pkg.resolved {
+                        return Self::target_matches_resolved(res, &target);
+                    }
+                }
+                _ => {}
             }
             return true;
         }
@@ -1598,6 +1611,7 @@ impl LockfileV3 {
 
     fn canonicalize_git_identity(raw: &str) -> String {
         let s = raw.split('#').next().unwrap_or(raw).trim();
+        let s = s.split('?').next().unwrap_or(s).trim();
         let s = s.strip_prefix("git+").unwrap_or(s);
 
         let expanded = if let Some(rest) = s.strip_prefix("github:") {
@@ -1667,11 +1681,13 @@ impl LockfileV3 {
                     .strip_prefix("./")
                     .unwrap_or(&clean_res)
                     .trim_end_matches('/');
+                let clean_res = if clean_res == "." { "" } else { clean_res };
                 let clean_p = p.to_str().unwrap_or("").replace('\\', "/");
                 let clean_p = clean_p
                     .strip_prefix("./")
                     .unwrap_or(&clean_p)
                     .trim_end_matches('/');
+                let clean_p = if clean_p == "." { "" } else { clean_p };
 
                 let res_abs = Self::is_posix_path_absolute(clean_res);
                 let p_abs = Self::is_posix_path_absolute(clean_p);
@@ -1696,7 +1712,7 @@ impl LockfileV3 {
                 }
                 if let Some(ref c) = committish {
                     let res_frag = resolved.split('#').nth(1).unwrap_or("");
-                    if c.len() == 40 && c.chars().all(|ch| ch.is_ascii_hexdigit()) {
+                    if (c.len() == 40 || c.len() == 64) && c.chars().all(|ch| ch.is_ascii_hexdigit()) {
                         if !res_frag.eq_ignore_ascii_case(c) {
                             return false;
                         }

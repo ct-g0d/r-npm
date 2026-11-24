@@ -1879,22 +1879,56 @@ fn test_git_shorthand_matches_full_resolved_urls() {
 fn test_git_committish_drift_detected() {
     let pkg = LockfilePackage {
         version: Some("1.0.0".to_string()),
-        resolved: Some("git+https://github.com/org/repo.git#1111111111111111111111111111111111111111".to_string()),
+        resolved: Some("git+https://github.com/org/repo.git#1a2b3c4d5e6f1a2b3c4d5e6f1a2b3c4d5e6f1a2b".to_string()),
         ..Default::default()
     };
     // Spec with different committish
     assert!(
-        !LockfileV3::package_satisfies_spec("repo", &pkg, "git+https://github.com/org/repo.git#2222222222222222222222222222222222222222"),
+        !LockfileV3::package_satisfies_spec("repo", &pkg, "git+https://github.com/org/repo.git#2a2b3c4d5e6f1a2b3c4d5e6f1a2b3c4d5e6f1a2b"),
         "Mismatched committish must be detected as drift"
     );
     // Spec with matching committish (case-insensitive)
     assert!(
-        LockfileV3::package_satisfies_spec("repo", &pkg, "git+https://github.com/org/repo.git#1111111111111111111111111111111111111111"),
+        LockfileV3::package_satisfies_spec("repo", &pkg, "git+https://github.com/org/repo.git#1a2b3c4d5e6f1a2b3c4d5e6f1a2b3c4d5e6f1a2b"),
         "Matching committish must satisfy spec"
     );
     assert!(
-        LockfileV3::package_satisfies_spec("repo", &pkg, "git+https://github.com/org/repo.git#1111111111111111111111111111111111111111"),
+        LockfileV3::package_satisfies_spec("repo", &pkg, "git+https://github.com/org/repo.git#1A2B3C4D5E6F1A2B3C4D5E6F1A2B3C4D5E6F1A2B"),
         "Case-insensitive committish must satisfy spec"
+    );
+
+    // 64-character SHA-256 committish
+    let pkg_sha256 = LockfilePackage {
+        version: Some("1.0.0".to_string()),
+        resolved: Some("git+https://github.com/org/repo.git#aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string()),
+        ..Default::default()
+    };
+    assert!(
+        LockfileV3::package_satisfies_spec("repo", &pkg_sha256, "git+https://github.com/org/repo.git#AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"),
+        "64-character SHA-256 case-insensitive committish must satisfy spec"
+    );
+    assert!(
+        !LockfileV3::package_satisfies_spec("repo", &pkg_sha256, "git+https://github.com/org/repo.git#bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+        "Mismatched 64-char SHA-256 committish must be detected as drift"
+    );
+}
+
+#[test]
+fn test_symlink_drift_detection_with_link_flag() {
+    let pkg = LockfilePackage {
+        link: Some(true),
+        resolved: Some("packages/local-a".to_string()),
+        ..Default::default()
+    };
+    // Matching path
+    assert!(
+        LockfileV3::package_satisfies_spec("local-pkg", &pkg, "file:./packages/local-a"),
+        "Matching symlink target must satisfy spec"
+    );
+    // Drifted path
+    assert!(
+        !LockfileV3::package_satisfies_spec("local-pkg", &pkg, "file:./packages/local-b"),
+        "Drifted symlink target must be detected as drift even when link: true"
     );
 }
 
@@ -1968,4 +2002,34 @@ fn test_legacy_dependencies_windows_backslashes_in_link() {
     let json = lock.to_json_string_version(2).unwrap();
     let val: serde_json::Value = serde_json::from_str(&json).unwrap();
     assert_eq!(val["dependencies"]["my-ws"]["requires"]["chalk"], "5.0.0");
+}
+
+#[test]
+fn test_enrich_packages_from_legacy_clears_link_flags() {
+    let v2_json = r#"{
+        "name": "v2-link-flags",
+        "version": "1.0.0",
+        "lockfileVersion": 2,
+        "packages": {
+            "": {
+                "name": "v2-link-flags",
+                "version": "1.0.0"
+            },
+            "node_modules/my-link": {
+                "resolved": "packages/my-link",
+                "link": true
+            }
+        },
+        "dependencies": {
+            "my-link": {
+                "version": "file:packages/my-link",
+                "dev": true
+            }
+        }
+    }"#;
+
+    let v3 = parse_and_migrate(v2_json).expect("Must migrate v2 file: links");
+    let link = v3.packages.get("node_modules/my-link").expect("Link node must exist");
+    assert_eq!(link.link, Some(true));
+    assert!(link.dev.is_none(), "Link node must not have dev flag");
 }
