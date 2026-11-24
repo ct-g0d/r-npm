@@ -1493,3 +1493,38 @@ async fn test_allow_registry_root_npm_alias_zero_requests_to_alias_name() {
     let content = std::fs::read_to_string(&installed_pkg_json).unwrap();
     assert!(content.contains("\"name\": \"real-pkg\"") || content.contains("\"name\":\"real-pkg\""), "Content should match real-pkg");
 }
+
+// -----------------------------------------------------------------------------
+// Test 20: UTF-8 spec (e.g. ./中文) under allow-remote=root does not panic
+// -----------------------------------------------------------------------------
+#[tokio::test]
+async fn test_allow_remote_root_utf8_spec_does_not_panic() {
+    let project_dir = tempdir().unwrap();
+    let cache_dir = tempdir().unwrap();
+
+    let zh_dir = project_dir.path().join("中文");
+    std::fs::create_dir_all(&zh_dir).unwrap();
+    std::fs::write(
+        zh_dir.join("package.json"),
+        r#"{"name":"chinese-local","version":"1.0.0"}"#,
+    ).unwrap();
+
+    setup_test_project(
+        project_dir.path(),
+        &serde_json::json!({
+            "chinese-local": "./中文"
+        }),
+        "allow-remote=root\n",
+    );
+
+    let options = InstallOptions {
+        project_dir: project_dir.path().to_path_buf(),
+        cache_dir: Some(cache_dir.path().to_path_buf()),
+        ..Default::default()
+    };
+
+    let mut installer = Installer::new(options).unwrap();
+    let result = installer.install().await;
+
+    assert!(result.is_ok(), "Expected install with ./中文 under allow-remote=root to succeed, got: {:?}", result.err());
+}

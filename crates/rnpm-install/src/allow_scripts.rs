@@ -53,8 +53,23 @@ pub fn is_path_spec(key: &str) -> bool {
         || lower.starts_with("../")
         || lower.starts_with("..\\")
         || lower.starts_with('/')
+        || lower.starts_with('\\')
         || lower.starts_with('~')
-        || (key.len() > 2 && key.as_bytes()[1] == b':' && key.as_bytes()[0].is_ascii_alphabetic())
+        || (key.len() >= 2 && key.as_bytes()[1] == b':' && key.as_bytes()[0].is_ascii_alphabetic())
+}
+
+pub fn clean_file_path(p: &str) -> &str {
+    let mut p = p.trim();
+    if p.starts_with('/') {
+        let stripped = p.trim_start_matches('/');
+        if stripped.len() >= 2
+            && stripped.as_bytes()[1] == b':'
+            && stripped.as_bytes()[0].is_ascii_alphabetic()
+        {
+            p = stripped;
+        }
+    }
+    p
 }
 
 pub fn is_range_like(spec: &str) -> bool {
@@ -205,30 +220,72 @@ pub fn normalize_path(path: &Path) -> String {
 pub fn git_identity(spec: &str) -> Option<(String, String)> {
     let spec = spec.trim();
     let (body, committish) = spec.split_once('#').unwrap_or((spec, ""));
-    let mut body = body.trim();
+    let body = body.trim();
     let lower_body = body.to_ascii_lowercase();
-    for p in ["git+ssh://", "git+https://", "git+http://", "git+file://", "git://", "ssh://", "https://", "http://", "git@"] {
-        if lower_body.starts_with(p) {
-            body = &body[p.len()..];
-            break;
-        }
-    }
-    let body = if body.get(..7).is_some_and(|p| p.eq_ignore_ascii_case("github:")) {
+
+    let body_str = if lower_body.starts_with("github:") {
         format!("github.com/{}", &body[7..])
-    } else if body.get(..7).is_some_and(|p| p.eq_ignore_ascii_case("gitlab:")) {
+    } else if lower_body.starts_with("gitlab:") {
         format!("gitlab.com/{}", &body[7..])
-    } else if body.get(..10).is_some_and(|p| p.eq_ignore_ascii_case("bitbucket:")) {
+    } else if lower_body.starts_with("bitbucket:") {
         format!("bitbucket.org/{}", &body[10..])
-    } else if body.get(..5).is_some_and(|p| p.eq_ignore_ascii_case("gist:")) {
+    } else if lower_body.starts_with("gist:") {
         format!("gist.github.com/{}", &body[5..])
+    } else if !spec.starts_with('@')
+        && !spec.starts_with('.')
+        && !spec.starts_with('/')
+        && !spec.starts_with('\\')
+        && !spec.starts_with('~')
+        && !(spec.len() >= 2 && spec.as_bytes()[1] == b':' && spec.as_bytes()[0].is_ascii_alphabetic())
+        && body.split_once('/').is_some_and(|(u, r)| {
+            !u.is_empty()
+                && !r.is_empty()
+                && !r.contains('/')
+                && !u.contains(':')
+                && u.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+                && r.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
+        })
+    {
+        // GitHub shorthand "user/repo"
+        format!("github.com/{body}")
     } else {
-        body.replacen(':', "/", 1)
+        let mut b = body;
+        if let Some(rest) = b.strip_prefix("git+") {
+            b = rest;
+        } else if let Some(rest) = b.strip_prefix("GIT+") {
+            b = rest;
+        }
+        let lower_b = b.to_ascii_lowercase();
+        for p in ["ssh://", "https://", "http://", "file://", "git://"] {
+            if lower_b.starts_with(p) {
+                b = &b[p.len()..];
+                break;
+            }
+        }
+        if let Some((user, rest)) = b.split_once('@') {
+            if !user.contains('/') {
+                b = rest;
+            }
+        }
+        if let Some((host, path)) = b.split_once(':') {
+            if !host.contains('/')
+                && !path.starts_with('/')
+                && !path.chars().next().is_some_and(|c| c.is_ascii_digit())
+            {
+                format!("{host}/{path}")
+            } else {
+                b.to_string()
+            }
+        } else {
+            b.to_string()
+        }
     };
-    let body = body
-        .trim_end_matches('/')
-        .trim_end_matches(".git")
-        .to_ascii_lowercase();
-    (!body.is_empty()).then(|| (body, committish.to_string()))
+
+    let mut repo = body_str.trim_end_matches('/').to_ascii_lowercase();
+    if repo.ends_with(".git") {
+        repo.truncate(repo.len() - 4);
+    }
+    (!repo.is_empty()).then(|| (repo, committish.to_string()))
 }
 
 impl ScriptNode<'_> {
@@ -313,16 +370,18 @@ impl ScriptNode<'_> {
             } else {
                 key
             };
-            let key_abs = normalize_path(&self.project_dir.join(key_path.trim()));
+            let key_clean = clean_file_path(key_path);
+            let key_abs = normalize_path(&self.project_dir.join(key_clean));
             let node_target = self
                 .resolved
                 .map(|r| {
                     let r = r.trim();
-                    if r.get(..5).is_some_and(|p| p.eq_ignore_ascii_case("file:")) {
+                    let r_path = if r.get(..5).is_some_and(|p| p.eq_ignore_ascii_case("file:")) {
                         &r[5..]
                     } else {
                         r
-                    }
+                    };
+                    clean_file_path(r_path)
                 })
                 .map(|r| normalize_path(&self.project_dir.join(r)))
                 .or_else(|| {
@@ -452,6 +511,7 @@ pub fn strict_preflight(
     if !policy.strict || policy.allow_all || ignore_scripts {
         return Ok(());
     }
+    let norm_ws: HashSet<String> = workspace_paths.iter().map(|p| p.replace('\\', "/")).collect();
     let mut unreviewed = Vec::new();
     for (location, pkg) in &lockfile.packages {
         if location.is_empty() || !location.contains("node_modules/") {
@@ -468,11 +528,11 @@ pub fn strict_preflight(
                     None
                 }
             })
-            .map(|r| base_dir.join(r))
+            .map(|r| base_dir.join(clean_file_path(r)))
             .filter(|d| d.is_dir());
         let dir: PathBuf = if pkg.link == Some(true) {
             match pkg.resolved.as_deref() {
-                Some(target) if !workspace_paths.contains(&target.replace('\\', "/")) => base_dir.join(target),
+                Some(target) if !norm_ws.contains(&target.replace('\\', "/")) => base_dir.join(clean_file_path(target)),
                 _ => continue,
             }
         } else if let Some(local) = local_dir {
@@ -569,18 +629,34 @@ pub fn unreviewed_scripts_warning(
     if policy.allow_all {
         return None;
     }
+    let norm_ws: HashSet<String> = workspace_paths.iter().map(|p| p.replace('\\', "/")).collect();
     let mut found: Vec<(String, String)> = Vec::new();
     let mut names = Vec::new();
     for (location, pkg) in &lockfile.packages {
         if location.is_empty() || !location.contains("node_modules/") {
             continue;
         }
+        let local_dir = pkg
+            .resolved
+            .as_deref()
+            .and_then(|r| {
+                let r = r.trim();
+                if r.get(..5).is_some_and(|p| p.eq_ignore_ascii_case("file:")) {
+                    Some(&r[5..])
+                } else {
+                    None
+                }
+            })
+            .map(|r| base_dir.join(clean_file_path(r)))
+            .filter(|d| d.is_dir());
         // A link stands for its target directory; workspaces are skipped.
         let dir: PathBuf = if pkg.link == Some(true) {
             match pkg.resolved.as_deref() {
-                Some(target) if !workspace_paths.contains(&target.replace('\\', "/")) => base_dir.join(target),
+                Some(target) if !norm_ws.contains(&target.replace('\\', "/")) => base_dir.join(clean_file_path(target)),
                 _ => continue,
             }
+        } else if let Some(local) = local_dir {
+            local
         } else {
             base_dir.join(location)
         };

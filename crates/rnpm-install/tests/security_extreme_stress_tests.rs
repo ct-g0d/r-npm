@@ -1245,3 +1245,253 @@ fn test_git_identity_non_ascii_prefix_boundary_safety() {
     assert!(node.matches("github:用户/仓库#main", false));
     assert!(node.matches("git+https://github.com/用户/仓库.git#main", false));
 }
+
+#[test]
+fn test_utf8_boundary_specs_no_panic() {
+    // 1. parse_source_kind on multi-byte UTF-8 specs
+    assert_eq!(parse_source_kind("./中文"), SourceKind::Directory);
+    assert_eq!(parse_source_kind(".\\中文"), SourceKind::Directory);
+    assert_eq!(parse_source_kind("/中文"), SourceKind::Directory);
+    assert_eq!(parse_source_kind("\\中文"), SourceKind::Directory);
+    assert_eq!(parse_source_kind("~/中文"), SourceKind::Directory);
+    assert_eq!(parse_source_kind("~\\中文"), SourceKind::Directory);
+    assert_eq!(parse_source_kind("./中文/pkg.tgz"), SourceKind::File);
+    assert_eq!(parse_source_kind(".\\中文\\pkg.tgz"), SourceKind::File);
+    assert_eq!(parse_source_kind("npm:中文@./中文"), SourceKind::Directory);
+    assert_eq!(parse_source_kind("npm:中文@.\\中文"), SourceKind::Directory);
+    assert_eq!(parse_source_kind("npm:中文@^1.0.0"), SourceKind::Registry);
+    assert_eq!(parse_source_kind("npm:中文"), SourceKind::Registry);
+
+    // 2. check_sources with multi-byte UTF-8 spec in root_declared and lockfile
+    let mut root_declared = HashSet::new();
+    root_declared.insert("./中文".to_string());
+    root_declared.insert(".\\中文".to_string());
+    root_declared.insert("npm:中文@./中文".to_string());
+    root_declared.insert("chinese-dep".to_string());
+
+    let mut packages = BTreeMap::new();
+    let mut root_deps = BTreeMap::new();
+    root_deps.insert("chinese-dep".to_string(), "./中文".to_string());
+    packages.insert(
+        String::new(),
+        LockfilePackage {
+            dependencies: Some(root_deps),
+            ..Default::default()
+        },
+    );
+    packages.insert(
+        "node_modules/chinese-dep".to_string(),
+        LockfilePackage {
+            resolved: Some("./中文".to_string()),
+            ..Default::default()
+        },
+    );
+
+    let lockfile = LockfileV3 {
+        name: "test-utf8".to_string(),
+        version: None,
+        lockfile_version: 3,
+        requires: None,
+        packages,
+    };
+    let workspace_paths = HashSet::new();
+    let policy = SourcePolicy {
+        directory: AllowMode::All,
+        remote: AllowMode::None,
+        ..Default::default()
+    };
+
+    // Must NOT panic and must succeed!
+    let res = check_sources(&lockfile, &root_declared, &workspace_paths, &policy);
+    assert!(res.is_ok(), "Expected check_sources with UTF-8 to succeed, got: {:?}", res.err());
+}
+
+#[test]
+fn test_nested_npm_aliases_unpacking_and_smuggling_blocking() {
+    // 1. Unpacking nested aliases
+    assert_eq!(
+        parse_source_kind("npm:foo@npm:bar@https://evil.com/payload.tgz"),
+        SourceKind::Remote
+    );
+    assert_eq!(
+        parse_source_kind("npm:foo@npm:bar@git+https://evil.com/repo.git"),
+        SourceKind::Git
+    );
+    assert_eq!(
+        parse_source_kind("npm:foo@npm:bar@file:./local.tgz"),
+        SourceKind::File
+    );
+    assert_eq!(
+        parse_source_kind("npm:foo@npm:bar@./local-dir"),
+        SourceKind::Directory
+    );
+    assert_eq!(
+        parse_source_kind("npm:foo@npm:bar@^1.0.0"),
+        SourceKind::Registry
+    );
+    assert_eq!(
+        parse_source_kind("npm:foo@npm:bar"),
+        SourceKind::Registry
+    );
+    assert_eq!(
+        parse_source_kind("npm:@scope/foo@npm:@scope/bar@git+https://evil.com/repo.git"),
+        SourceKind::Git
+    );
+
+    // 2. Gating nested alias smuggling attempt under allow-remote=none
+    let mut root_declared = HashSet::new();
+    root_declared.insert("smuggled".to_string());
+    root_declared.insert("npm:foo@npm:bar@https://evil.com/payload.tgz".to_string());
+
+    let mut packages = BTreeMap::new();
+    let mut root_deps = BTreeMap::new();
+    root_deps.insert("smuggled".to_string(), "npm:foo@npm:bar@https://evil.com/payload.tgz".to_string());
+    packages.insert(
+        String::new(),
+        LockfilePackage {
+            dependencies: Some(root_deps),
+            ..Default::default()
+        },
+    );
+    packages.insert(
+        "node_modules/smuggled".to_string(),
+        LockfilePackage {
+            resolved: Some("https://evil.com/payload.tgz".to_string()),
+            ..Default::default()
+        },
+    );
+
+    let lockfile = LockfileV3 {
+        name: "test-nested".to_string(),
+        version: None,
+        lockfile_version: 3,
+        requires: None,
+        packages,
+    };
+    let workspace_paths = HashSet::new();
+    let policy = SourcePolicy {
+        remote: AllowMode::None,
+        ..Default::default()
+    };
+
+    let res = check_sources(&lockfile, &root_declared, &workspace_paths, &policy);
+    assert!(res.is_err(), "Expected nested remote alias to be blocked under allow-remote=none");
+    let err = res.unwrap_err().to_string();
+    assert!(err.contains("EALLOWREMOTE"), "Expected EALLOWREMOTE, got: {err}");
+}
+
+#[test]
+fn test_windows_unc_and_backslash_and_drive_paths() {
+    // 1. parse_source_kind with UNC, backslash, and drive paths
+    assert_eq!(parse_source_kind(r"\\server\share\pkg"), SourceKind::Directory);
+    assert_eq!(parse_source_kind(r"\\server\share\pkg.tgz"), SourceKind::File);
+    assert_eq!(parse_source_kind(r"\local\folder"), SourceKind::Directory);
+    assert_eq!(parse_source_kind(r"C:\local\folder"), SourceKind::Directory);
+    assert_eq!(parse_source_kind(r"c:\local\folder"), SourceKind::Directory);
+    assert_eq!(parse_source_kind(r"D:\archive.tgz"), SourceKind::File);
+    assert_eq!(parse_source_kind(r"d:\archive.tar.gz"), SourceKind::File);
+    assert_eq!(parse_source_kind("C:"), SourceKind::Directory);
+
+    // 2. allow_scripts is_path_spec
+    assert!(is_path_spec(r"\\server\share\pkg"));
+    assert!(is_path_spec(r"\local\folder"));
+    assert!(is_path_spec(r"C:\local\folder"));
+    assert!(is_path_spec(r"c:\local\folder"));
+    assert!(is_path_spec("file:///C:/Users/foo"));
+
+    // 3. ScriptNode path matching across file:/// and drive letter
+    let temp = tempdir().unwrap();
+    let node = ScriptNode {
+        location: "node_modules/local-dep",
+        resolved: Some("file:./local-dep"),
+        lock_name: None,
+        in_bundle: false,
+        link: false,
+        project_dir: temp.path(),
+    };
+    assert!(node.matches("./local-dep", false));
+    assert!(node.matches("file:./local-dep", false));
+    assert!(node.matches(r".\local-dep", false));
+}
+
+#[test]
+fn test_hosted_git_without_dot_git_and_shorthand_allow_scripts_matching() {
+    // 1. Hosted git URLs without .git extension are parsed as Git
+    assert_eq!(parse_source_kind("https://github.com/foo/bar"), SourceKind::Git);
+    assert_eq!(parse_source_kind("http://github.com/foo/bar"), SourceKind::Git);
+    assert_eq!(parse_source_kind("https://gitlab.com/foo/bar"), SourceKind::Git);
+    assert_eq!(parse_source_kind("https://bitbucket.org/foo/bar"), SourceKind::Git);
+    assert_eq!(parse_source_kind("https://github.com/foo/bar#v1.0.0"), SourceKind::Git);
+
+    // Tarball archives on github are Remote, not Git
+    assert_eq!(parse_source_kind("https://github.com/foo/bar/archive/v1.0.0.tar.gz"), SourceKind::Remote);
+    assert_eq!(parse_source_kind("https://github.com/foo/bar/releases/download/v1.0.0/foo.tgz"), SourceKind::Remote);
+
+    // 2. ScriptNode::matches for GitHub shorthand and git+ssh normalized matching
+    let temp = tempdir().unwrap();
+    let full_sha = "0123456789abcdef0123456789abcdef01234567";
+    let node = ScriptNode {
+        location: "node_modules/git-dep",
+        resolved: Some(&format!("git+ssh://git@github.com/foo/bar.git#{full_sha}")),
+        lock_name: None,
+        in_bundle: false,
+        link: false,
+        project_dir: temp.path(),
+    };
+
+    assert!(node.matches("github:foo/bar", false));
+    assert!(node.matches("foo/bar", false));
+    assert!(node.matches("git+ssh://git@github.com/foo/bar.git", false));
+    assert!(node.matches("git+https://github.com/foo/bar.git", false));
+    assert!(node.matches("https://github.com/foo/bar", false));
+    assert!(node.matches("github:foo/bar#0123456", false));
+    assert!(node.matches("foo/bar#0123456", false));
+    assert!(!node.matches("github:foo/bar#wrong", false));
+    assert!(!node.matches("github:other/repo", false));
+}
+
+#[test]
+fn test_lockfile_smuggling_prevention_under_allow_remote_root() {
+    let mut root_declared = HashSet::new();
+    // package.json declared "innocent": "^1.0.0"
+    root_declared.insert("innocent".to_string());
+    root_declared.insert("^1.0.0".to_string());
+
+    // Attacker forged lockfile to resolve "innocent" to a remote malicious tarball
+    let mut packages = BTreeMap::new();
+    let mut root_deps = BTreeMap::new();
+    root_deps.insert("innocent".to_string(), "^1.0.0".to_string());
+    packages.insert(
+        String::new(),
+        LockfilePackage {
+            dependencies: Some(root_deps),
+            ..Default::default()
+        },
+    );
+    packages.insert(
+        "node_modules/innocent".to_string(),
+        LockfilePackage {
+            resolved: Some("https://evil.com/malicious.tgz".to_string()),
+            ..Default::default()
+        },
+    );
+
+    let lockfile = LockfileV3 {
+        name: "test-smuggle".to_string(),
+        version: None,
+        lockfile_version: 3,
+        requires: None,
+        packages,
+    };
+    let workspace_paths = HashSet::new();
+    let policy = SourcePolicy {
+        remote: AllowMode::Root,
+        ..Default::default()
+    };
+
+    // Must FAIL because innocent was declared as registry ^1.0.0, but resolved as remote!
+    let res = check_sources(&lockfile, &root_declared, &workspace_paths, &policy);
+    assert!(res.is_err(), "Expected lockfile smuggling of remote dep to fail under allow-remote=root");
+    let err = res.unwrap_err().to_string();
+    assert!(err.contains("EALLOWREMOTE"), "Expected EALLOWREMOTE, got: {err}");
+}
