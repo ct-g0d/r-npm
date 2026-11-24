@@ -85,17 +85,37 @@ pub fn normalize_shebang_file(file_path: &Path) -> Result<bool, ShimError> {
 
     let (normalized, changed) = normalize_shebang_bytes(&bytes);
     if changed {
+        #[cfg(unix)]
+        let mut orig_unix_mode: Option<u32> = None;
+
         if let Ok(metadata) = std::fs::metadata(file_path) {
             let mut perms = metadata.permissions();
             if perms.readonly() {
-                perms.set_readonly(false);
-                let _ = std::fs::set_permissions(file_path, perms);
+                #[cfg(windows)]
+                {
+                    perms.set_readonly(false);
+                    let _ = std::fs::set_permissions(file_path, perms);
+                }
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let mode = perms.mode();
+                    orig_unix_mode = Some(mode);
+                    perms.set_mode(mode | 0o200);
+                    let _ = std::fs::set_permissions(file_path, perms);
+                }
             }
         }
-        std::fs::write(file_path, &normalized).map_err(|e| ShimError::Io {
+        let write_res = std::fs::write(file_path, &normalized).map_err(|e| ShimError::Io {
             path: file_path.to_path_buf(),
             source: e,
-        })?;
+        });
+        #[cfg(unix)]
+        if let Some(mode) = orig_unix_mode {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(file_path, std::fs::Permissions::from_mode(mode));
+        }
+        write_res?;
     }
 
     Ok(changed)

@@ -414,11 +414,7 @@ fn matches_simple(
             "optional" => node.optional,
             "peer" => node.peer,
             "prod" => !node.dev && !node.optional && !node.peer,
-            "workspace" => {
-                node.is_workspace
-                    || node.location.starts_with("packages/")
-                    || node.location.starts_with("workspaces/")
-            }
+            "workspace" => node.is_workspace,
             _ => false,
         },
         SimpleSelector::PseudoClass { name, arg } => match name.as_str() {
@@ -438,11 +434,7 @@ fn matches_simple(
             "empty" => node.to.is_empty(),
             "deduped" => node.deduped,
             "overridden" => node.overridden,
-            "workspace" => {
-                node.is_workspace
-                    || node.location.starts_with("packages/")
-                    || node.location.starts_with("workspaces/")
-            }
+            "workspace" => node.is_workspace,
             "link" => node.is_link,
             "attr" => arg
                 .as_deref()

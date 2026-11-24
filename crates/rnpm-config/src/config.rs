@@ -544,7 +544,10 @@ impl Config {
 
         let mut env_layer_settings = BTreeMap::new();
         for (raw_key, value) in all_env {
-            let rest_opt = if raw_key.len() > 11 && raw_key[..11].eq_ignore_ascii_case("npm_config_") {
+            let rest_opt = if raw_key
+                .get(..11)
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case("npm_config_"))
+            {
                 Some(&raw_key[11..])
             } else {
                 None
@@ -637,18 +640,26 @@ impl Config {
             }
         }
 
-        // Standard proxy env vars fallback if not set in any config layer
-        if !base_npmrc.settings.contains_key("https-proxy") && !base_npmrc.settings.contains_key("https_proxy") {
+        // Standard proxy env vars fallback if not set in any config layer.
+        // Explicit `.npmrc` `proxy` takes precedence over ambient `HTTPS_PROXY`/`HTTP_PROXY`,
+        // and `HTTP_PROXY` only fills `http-proxy` so it does not hijack HTTPS requests.
+        if !base_npmrc.settings.contains_key("https-proxy")
+            && !base_npmrc.settings.contains_key("https_proxy")
+            && !base_npmrc.settings.contains_key("proxy")
+        {
             if let Some(hp) = env_lookup("HTTPS_PROXY").or_else(|| env_lookup("https_proxy")) {
                 if !hp.is_empty() {
                     let _ = base_npmrc.set("https-proxy", &hp);
                 }
             }
         }
-        if !base_npmrc.settings.contains_key("proxy") && !base_npmrc.settings.contains_key("http-proxy") && !base_npmrc.settings.contains_key("http_proxy") {
+        if !base_npmrc.settings.contains_key("proxy")
+            && !base_npmrc.settings.contains_key("http-proxy")
+            && !base_npmrc.settings.contains_key("http_proxy")
+        {
             if let Some(p) = env_lookup("HTTP_PROXY").or_else(|| env_lookup("http_proxy")) {
                 if !p.is_empty() {
-                    let _ = base_npmrc.set("proxy", &p);
+                    let _ = base_npmrc.set("http-proxy", &p);
                 }
             }
         }
@@ -960,6 +971,31 @@ pub fn get_default_user_npmrc() -> PathBuf {
     PathBuf::from(".npmrc")
 }
 
+/// Encodes an `.npmrc` INI value so comment delimiters (`#`, `;`), quotes, and
+/// backslashes survive a round-trip through `decode_ini_field`.
+fn encode_ini_value(val: &str) -> String {
+    let needs_quotes = val.starts_with('"')
+        || val.starts_with('\'')
+        || val.contains('#')
+        || val.contains(';')
+        || val.contains('\\')
+        || val.contains('"');
+    if !needs_quotes {
+        return val.to_string();
+    }
+    let mut out = String::with_capacity(val.len() + 2);
+    out.push('"');
+    for ch in val.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            other => out.push(other),
+        }
+    }
+    out.push('"');
+    out
+}
+
 /// Updates or appends a key-value setting in an .npmrc file on disk.
 /// Preserves comments and existing lines.
 pub fn set_config_value_in_file(path: &Path, key: &str, value: &str) -> Result<(), ConfigError> {
@@ -1004,7 +1040,7 @@ pub fn set_config_value_in_file(path: &Path, key: &str, value: &str) -> Result<(
                 };
 
                 if line_key == key_trimmed || line_key.eq_ignore_ascii_case(key_trimmed) {
-                    lines.push(format!("{key_trimmed}={value_trimmed}"));
+                    lines.push(format!("{key_trimmed}={}", encode_ini_value(value_trimmed)));
                     updated = true;
                     continue;
                 }
@@ -1014,7 +1050,7 @@ pub fn set_config_value_in_file(path: &Path, key: &str, value: &str) -> Result<(
     }
 
     if !updated {
-        lines.push(format!("{key_trimmed}={value_trimmed}"));
+        lines.push(format!("{key_trimmed}={}", encode_ini_value(value_trimmed)));
     }
 
     let mut out_str = lines.join("\n");

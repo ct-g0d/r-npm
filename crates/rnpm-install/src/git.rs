@@ -550,8 +550,8 @@ impl GitFetcher {
                 return Err(anyhow!(
                     "Failed to checkout git commit '{}' from '{}': {}",
                     commit_sha,
-                    clone_url,
-                    checkout_err
+                    rnpm_config::scrub_credentials(clone_url),
+                    rnpm_config::scrub_credentials(&checkout_err)
                 ));
             }
         } else {
@@ -566,8 +566,8 @@ impl GitFetcher {
                 return Err(anyhow!(
                     "Failed to checkout commit '{}' in '{}': {}",
                     commit_sha,
-                    clone_url,
-                    co_err
+                    rnpm_config::scrub_credentials(clone_url),
+                    rnpm_config::scrub_credentials(&co_err)
                 ));
             }
         }
@@ -588,41 +588,14 @@ impl GitFetcher {
 
             let (subm_ok, _, subm_err) = run_git_cmd(&subm_args, Some(&checkout_dir)).await?;
             if !subm_ok {
-                if is_file_proto
-                    && (subm_err.contains("protocol") || subm_err.contains("transport 'file'"))
-                {
-                    let (retry_ok, _, retry_err) = run_git_cmd(
-                        &[
-                            "-c",
-                            "protocol.file.allow=always",
-                            "submodule",
-                            "update",
-                            "--init",
-                            "--recursive",
-                        ],
-                        Some(&checkout_dir),
-                    )
-                    .await?;
-                    if !retry_ok {
-                        let _ = safe_remove_dir_all(&checkout_dir);
-                        let _ = std::fs::remove_file(&marker_file);
-                        return Err(anyhow!(
-                            "Failed to update git submodules for '{}' at commit '{}': {}",
-                            clone_url,
-                            commit_sha,
-                            retry_err
-                        ));
-                    }
-                } else {
-                    let _ = safe_remove_dir_all(&checkout_dir);
-                    let _ = std::fs::remove_file(&marker_file);
-                    return Err(anyhow!(
-                        "Failed to update git submodules for '{}' at commit '{}': {}",
-                        clone_url,
-                        commit_sha,
-                        subm_err
-                    ));
-                }
+                let _ = safe_remove_dir_all(&checkout_dir);
+                let _ = std::fs::remove_file(&marker_file);
+                return Err(anyhow!(
+                    "Failed to update git submodules for '{}' at commit '{}': {}",
+                    rnpm_config::scrub_credentials(clone_url),
+                    commit_sha,
+                    rnpm_config::scrub_credentials(&subm_err)
+                ));
             }
         }
 

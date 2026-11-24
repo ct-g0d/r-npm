@@ -254,9 +254,11 @@ pub fn git_identity(spec: &str) -> Option<(String, String)> {
             b = &b[4..];
         }
         let lower_b = b.to_ascii_lowercase();
+        let mut had_scheme = false;
         for p in ["ssh://", "https://", "http://", "file://", "git://"] {
             if lower_b.starts_with(p) {
                 b = &b[p.len()..];
+                had_scheme = true;
                 break;
             }
         }
@@ -265,12 +267,13 @@ pub fn git_identity(spec: &str) -> Option<(String, String)> {
                 b = rest;
             }
         }
-        if let Some((host, path)) = b.split_once(':') {
-            let is_port = path
-                .split_once('/')
-                .is_some_and(|(port, _)| !port.is_empty() && port.chars().all(|c| c.is_ascii_digit()));
-            if !host.contains('/') && !path.starts_with('/') && !is_port {
-                format!("{host}/{path}")
+        if !had_scheme {
+            if let Some((host, path)) = b.split_once(':') {
+                if !host.contains('/') && !path.starts_with('/') {
+                    format!("{host}/{path}")
+                } else {
+                    b.to_string()
+                }
             } else {
                 b.to_string()
             }

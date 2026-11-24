@@ -228,7 +228,7 @@ pub fn compute_project_fingerprint(project_dir: &Path, options: &InstallOptions)
             options.foreground_scripts,
             options.audit,
             options.fund,
-            options.source_policy_override.is_some(),
+            options.source_policy_override,
             options.force_non_root_policy,
             options.config_override.is_some(),
         )
@@ -333,6 +333,7 @@ pub fn validate_hidden_lockfile(project_dir: &Path, options: Option<&InstallOpti
 
     // Direct top-level packages declared on root
     let mut direct_top_level_deps: HashSet<String> = HashSet::new();
+    let mut optional_or_opt_peer_direct_deps: HashSet<String> = HashSet::new();
     if let Some(root_pkg) = lockfile.packages.get("") {
         if let Some(deps) = &root_pkg.dependencies {
             for name in deps.keys() {
@@ -356,7 +357,9 @@ pub fn validate_hidden_lockfile(project_dir: &Path, options: Option<&InstallOpti
         if !omit_optional {
             if let Some(opt_deps) = &root_pkg.optional_dependencies {
                 for name in opt_deps.keys() {
-                    direct_top_level_deps.insert(format!("node_modules/{name}"));
+                    let key = format!("node_modules/{name}");
+                    direct_top_level_deps.insert(key.clone());
+                    optional_or_opt_peer_direct_deps.insert(key);
                 }
             }
         }
@@ -371,7 +374,11 @@ pub fn validate_hidden_lockfile(project_dir: &Path, options: Option<&InstallOpti
                         .and_then(|v| v.as_bool())
                         .unwrap_or(false);
                     if !is_opt_peer || !omit_optional {
-                        direct_top_level_deps.insert(format!("node_modules/{name}"));
+                        let key = format!("node_modules/{name}");
+                        direct_top_level_deps.insert(key.clone());
+                        if is_opt_peer {
+                            optional_or_opt_peer_direct_deps.insert(key);
+                        }
                     }
                 }
             }
@@ -389,14 +396,20 @@ pub fn validate_hidden_lockfile(project_dir: &Path, options: Option<&InstallOpti
         }
         if !omit_optional {
             for name in manifest.optional_dependencies.keys() {
-                direct_top_level_deps.insert(format!("node_modules/{name}"));
+                let key = format!("node_modules/{name}");
+                direct_top_level_deps.insert(key.clone());
+                optional_or_opt_peer_direct_deps.insert(key);
             }
         }
         if !omit_peer {
             for name in manifest.peer_dependencies.keys() {
                 let is_opt_peer = manifest.peer_dependencies_meta.get(name).map(|pm| pm.optional).unwrap_or(false);
                 if !is_opt_peer || !omit_optional {
-                    direct_top_level_deps.insert(format!("node_modules/{name}"));
+                    let key = format!("node_modules/{name}");
+                    direct_top_level_deps.insert(key.clone());
+                    if is_opt_peer {
+                        optional_or_opt_peer_direct_deps.insert(key);
+                    }
                 }
             }
         }
@@ -407,6 +420,13 @@ pub fn validate_hidden_lockfile(project_dir: &Path, options: Option<&InstallOpti
         let pkg_info = lockfile.packages.get(dep_key)
             .or_else(|| lockfile.packages.get(&dep_key.replace('/', "\\")));
         let Some(pkg_info) = pkg_info else {
+            // Platform-skipped optional / optional-peer direct dependencies (e.g. fsevents on Windows/Linux)
+            // are stripped from `node_modules/.package-lock.json` by `save_hidden` and are not on disk.
+            if optional_or_opt_peer_direct_deps.contains(dep_key)
+                && !project_dir.join(dep_key).exists()
+            {
+                continue;
+            }
             debug!(
                 "Hidden lockfile invalid: declared direct dependency '{}' missing from hidden lockfile",
                 dep_key

@@ -5526,6 +5526,19 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
         Some(d) => d,
         None => std::env::current_dir()?,
     };
+    let current_dir = if matches!(
+        cli.command,
+        Commands::Run { .. }
+            | Commands::Test { .. }
+            | Commands::Start { .. }
+            | Commands::Restart { .. }
+            | Commands::Stop { .. }
+    ) {
+        let cli_overrides = rnpm_config::get_process_cli_overrides();
+        apply_cli_prefix(current_dir, cli_overrides.as_ref())
+    } else {
+        current_dir
+    };
 
     let silent = rnpm_config::Config::load(Some(&current_dir))?.get("loglevel") == Some("silent");
 
@@ -7957,10 +7970,50 @@ fn execute_run_sync(
                 .scripts
                 .insert("start".to_string(), "node server.js".to_string());
         } else if script == "restart" {
-            manifest.scripts.insert(
-                "restart".to_string(),
-                "npm stop --if-present && npm start".to_string(),
-            );
+            // Execute npm's default implicit restart sequence in-process:
+            // prerestart -> stop (--if-present) -> start -> postrestart,
+            // without shelling out to an external `npm` on PATH.
+            if !ignore_scripts && manifest.scripts.contains_key("prerestart") {
+                execute_run_sync(
+                    current_dir.clone(),
+                    "prerestart".to_string(),
+                    Vec::new(),
+                    true,
+                    true,
+                    foreground_scripts,
+                    strict_sandbox,
+                )?;
+            }
+            execute_run_sync(
+                current_dir.clone(),
+                "stop".to_string(),
+                args.clone(),
+                true,
+                ignore_scripts,
+                foreground_scripts,
+                strict_sandbox,
+            )?;
+            execute_run_sync(
+                current_dir.clone(),
+                "start".to_string(),
+                args,
+                if_present,
+                ignore_scripts,
+                foreground_scripts,
+                strict_sandbox,
+            )?;
+            if !ignore_scripts && manifest.scripts.contains_key("postrestart") {
+                execute_run_sync(
+                    current_dir,
+                    "postrestart".to_string(),
+                    Vec::new(),
+                    true,
+                    true,
+                    foreground_scripts,
+                    strict_sandbox,
+                )?;
+            }
+            return Ok(());
         } else if script == "env" {
             let env_cmd = if cfg!(windows) { "SET" } else { "env" };
             manifest
@@ -8433,6 +8486,12 @@ fn main() {
                 || a == "-w"
                 || a == "--workspace"
                 || a.starts_with("--workspace=")
+                || a == "--filter"
+                || a.starts_with("--filter=")
+                || a == "--scope"
+                || a.starts_with("--scope=")
+                || a == "--workspace-root"
+                || a == "--include-workspace-root"
         })
     {
         let mut script_name = None;

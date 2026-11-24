@@ -1228,13 +1228,13 @@ impl RegistryClient {
                     && self.config.auth_tokens.contains_key(&format!("//{host}/")))
         };
 
-        if has_explicit_token {
-            return true;
-        }
-
         // Never forward authorization headers across an HTTPS -> HTTP downgrade!
         if initial_url.scheme() == "https" && current_url.scheme() == "http" {
             return false;
+        }
+
+        if has_explicit_token {
+            return true;
         }
 
         // To receive the registry auth token, BOTH initial_url and current_url MUST be trusted hosts!
@@ -1608,15 +1608,22 @@ impl RegistryClient {
                     req = req.header(ACCEPT, accept);
                 }
 
-                // Security check: only send auth and OTP headers if the target is trusted (same origin or in trusted_hosts)
+                // Security check: only send auth headers if the target is trusted (same origin or in trusted_hosts),
+                // and ONLY send npm-otp to the exact initial origin (an OTP belongs strictly to the origin it was issued for).
                 let should_send_auth = self.is_trusted_target(&initial_url, &current_url);
+                let is_same_origin = initial_url.scheme() == current_url.scheme()
+                    && initial_url.host_str().map(|s| s.to_ascii_lowercase())
+                        == current_url.host_str().map(|s| s.to_ascii_lowercase())
+                    && initial_url.port_or_known_default() == current_url.port_or_known_default();
 
                 if should_send_auth {
                     if let Some(auth) = self.auth_header_for_url(&current_url) {
                         req = req.header(AUTHORIZATION, auth);
                     }
-                    if let Some(otp_code) = otp {
-                        req = req.header("npm-otp", otp_code);
+                    if is_same_origin {
+                        if let Some(otp_code) = otp {
+                            req = req.header("npm-otp", otp_code);
+                        }
                     }
                 } else {
                     debug!(

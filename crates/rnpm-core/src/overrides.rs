@@ -1,7 +1,7 @@
 use crate::error::OverrideError;
 use crate::manifest::Manifest;
 use crate::semver::{
-    comparator::{Comparator, Op},
+    comparator::Op,
     range::ComparatorSet,
     Range, Version,
 };
@@ -478,114 +478,108 @@ fn parse_key_and_spec(key: &str) -> Option<(&str, &str)> {
     }
 }
 
-/// Determines if two semver comparators intersect (can be simultaneously satisfied).
-fn comparator_intersects(c1: &Comparator, c2: &Comparator) -> bool {
-    // If either comparator is equality:
-    if c1.op == Op::Eq {
-        if c1.version.is_prerelease() {
-            let has_matching_prerelease = c2.version.is_prerelease()
-                && c2.version.major == c1.version.major
-                && c2.version.minor == c1.version.minor
-                && c2.version.patch == c1.version.patch;
-            if !has_matching_prerelease {
-                return false;
-            }
-        }
-        return c2.matches(&c1.version);
-    }
-    if c2.op == Op::Eq {
-        if c2.version.is_prerelease() {
-            let has_matching_prerelease = c1.version.is_prerelease()
-                && c1.version.major == c2.version.major
-                && c1.version.minor == c2.version.minor
-                && c1.version.patch == c2.version.patch;
-            if !has_matching_prerelease {
-                return false;
-            }
-        }
-        return c1.matches(&c2.version);
-    }
-
-    // Both are increasing (> or >=)
-    let c1_inc = matches!(c1.op, Op::Gt | Op::Gte);
-    let c2_inc = matches!(c2.op, Op::Gt | Op::Gte);
-    if c1_inc && c2_inc {
-        return true;
-    }
-
-    // Both are decreasing (< or <=)
-    let c1_dec = matches!(c1.op, Op::Lt | Op::Lte);
-    let c2_dec = matches!(c2.op, Op::Lt | Op::Lte);
-    if c1_dec && c2_dec {
-        return true;
-    }
-
-    // Same version and both inclusive (>= and <=)
-    if c1.version == c2.version
-        && matches!(c1.op, Op::Gte | Op::Lte)
-        && matches!(c2.op, Op::Gte | Op::Lte)
-    {
-        return true;
-    }
-
-    // Opposite directions: c1 increasing, c2 decreasing
-    if c1_inc && c2_dec {
-        if c2.version.is_prerelease()
-            && !c1.version.is_prerelease()
-            && c1.version.major == c2.version.major
-            && c1.version.minor == c2.version.minor
-            && c1.version.patch == c2.version.patch
-        {
-            return false;
-        }
-        if c1.version < c2.version {
-            return true;
-        }
-    }
-
-    // Opposite directions: c1 decreasing, c2 increasing
-    if c1_dec && c2_inc {
-        if c1.version.is_prerelease()
-            && !c2.version.is_prerelease()
-            && c1.version.major == c2.version.major
-            && c1.version.minor == c2.version.minor
-            && c1.version.patch == c2.version.patch
-        {
-            return false;
-        }
-        if c1.version > c2.version {
-            return true;
-        }
-    }
-
-    false
+/// Returns true if `cs` allows matching prerelease version `v` under npm semver rules:
+/// non-prereleases are always allowed; prereleases require at least one comparator in `cs`
+/// to also be a prerelease with the exact same `(major, minor, patch)` tuple.
+fn set_allows_prerelease(cs: &ComparatorSet, v: &Version) -> bool {
+    !v.is_prerelease()
+        || cs.comparators.iter().any(|c| {
+            c.version.is_prerelease()
+                && c.version.major == v.major
+                && c.version.minor == v.minor
+                && c.version.patch == v.patch
+        })
 }
 
-/// Checks whether all comparators within a ComparatorSet can be simultaneously satisfied.
-fn comparator_set_is_satisfiable(cs: &ComparatorSet) -> bool {
-    for i in 0..cs.comparators.len() {
-        for j in (i + 1)..cs.comparators.len() {
-            if !comparator_intersects(&cs.comparators[i], &cs.comparators[j]) {
-                return false;
-            }
-        }
-    }
-    true
+/// Returns true if `v` satisfies every comparator in `cs` including npm's prerelease tuple rule.
+fn set_matches_version(cs: &ComparatorSet, v: &Version) -> bool {
+    set_allows_prerelease(cs, v) && cs.comparators.iter().all(|c| c.matches(v))
 }
 
-/// Checks if two ComparatorSets intersect (their conjunction is satisfiable).
+/// Checks if two ComparatorSets intersect (their conjunction is satisfiable),
+/// matching node-semver `semver.intersects(r1, r2)` including prerelease tuple rules.
 fn comparator_sets_intersect(cs1: &ComparatorSet, cs2: &ComparatorSet) -> bool {
-    if !comparator_set_is_satisfiable(cs1) || !comparator_set_is_satisfiable(cs2) {
+    // 1. If any comparator in either set is `=`, that exact version is the only possible witness.
+    for c in cs1.comparators.iter().chain(cs2.comparators.iter()) {
+        if c.op == Op::Eq {
+            return set_matches_version(cs1, &c.version) && set_matches_version(cs2, &c.version);
+        }
+    }
+
+    // 2. Otherwise every comparator is a strict/inclusive inequality. Compute the tightest
+    //    [max_lo, min_hi] interval across the conjunction of both sets.
+    let mut max_lo: Option<(&Version, bool)> = None; // (version, inclusive)
+    let mut min_hi: Option<(&Version, bool)> = None; // (version, inclusive)
+
+    for c in cs1.comparators.iter().chain(cs2.comparators.iter()) {
+        match c.op {
+            Op::Gt | Op::Gte => {
+                let inc = c.op == Op::Gte;
+                let replace = match max_lo {
+                    None => true,
+                    Some((cur, cur_inc)) => c.version > *cur || (c.version == *cur && cur_inc && !inc),
+                };
+                if replace {
+                    max_lo = Some((&c.version, inc));
+                }
+            }
+            Op::Lt | Op::Lte => {
+                let inc = c.op == Op::Lte;
+                let replace = match min_hi {
+                    None => true,
+                    Some((cur, cur_inc)) => c.version < *cur || (c.version == *cur && cur_inc && !inc),
+                };
+                if replace {
+                    min_hi = Some((&c.version, inc));
+                }
+            }
+            Op::Eq => unreachable!("handled above"),
+        }
+    }
+
+    let Some((hi, hi_inc)) = min_hi else {
+        // Unbounded above: infinitely many stable versions satisfy any lower bound.
+        return true;
+    };
+
+    let Some((lo, lo_inc)) = max_lo else {
+        // Unbounded below: check if any stable version (0.0.0) or valid prerelease satisfies hi.
+        let zero = Version::new(0, 0, 0);
+        if hi > &zero || (hi_inc && hi == &zero) {
+            return true;
+        }
+        // Only possible if hi is a 0.0.0-pre prerelease; requires both sets to allow (0,0,0) prereleases.
+        return hi.is_prerelease()
+            && set_allows_prerelease(cs1, hi)
+            && set_allows_prerelease(cs2, hi)
+            && (hi_inc
+                || hi.prerelease.len() > 1
+                || hi.prerelease.first().is_some_and(|p| p.to_string() != "0"));
+    };
+
+    if lo > hi {
         return false;
     }
-    for c1 in &cs1.comparators {
-        for c2 in &cs2.comparators {
-            if !comparator_intersects(c1, c2) {
-                return false;
-            }
-        }
+    if lo == hi {
+        return lo_inc && hi_inc && set_matches_version(cs1, lo) && set_matches_version(cs2, lo);
     }
-    true
+
+    // Now lo < hi. First check if a stable (non-prerelease) version exists in the interval.
+    let smallest_stable = if lo.is_prerelease() {
+        Version::new(lo.major, lo.minor, lo.patch)
+    } else if lo_inc {
+        lo.clone()
+    } else {
+        Version::new(lo.major, lo.minor, lo.patch.saturating_add(1))
+    };
+    if smallest_stable < *hi || (hi_inc && smallest_stable == *hi) {
+        return true;
+    }
+
+    // No stable version lies between lo and hi, which only happens when lo is a prerelease
+    // sharing (major, minor, patch) with hi. A prerelease witness exists iff both sets permit
+    // prereleases on that (major, minor, patch) tuple.
+    lo.is_prerelease() && set_allows_prerelease(cs1, lo) && set_allows_prerelease(cs2, lo)
 }
 
 /// Checks if two semver Ranges intersect, matching node-semver `semver.intersects(r1, r2)`.

@@ -59,9 +59,17 @@ fn prepare_shim_destination(path: &Path) {
                 return;
             }
         }
+        #[cfg(windows)]
         if meta.permissions().readonly() {
             let mut perms = meta.permissions();
             perms.set_readonly(false);
+            let _ = std::fs::set_permissions(path, perms);
+        }
+        #[cfg(unix)]
+        if meta.permissions().readonly() {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = meta.permissions();
+            perms.set_mode(perms.mode() | 0o200);
             let _ = std::fs::set_permissions(path, perms);
         }
     }

@@ -112,6 +112,7 @@ pub fn translate_npx_args(tokens: &[String]) -> Vec<String> {
                     i += 1;
                     continue;
                 }
+                // Match npm 11.20.0 bin/npx-cli.js (`case 'no-install': process.argv[i] = '--yes=false'`)
                 "no-install" => {
                     result.push("--no-yes".to_string());
                     i += 1;
@@ -292,40 +293,66 @@ pub fn translate_npx_args(tokens: &[String]) -> Vec<String> {
 /// However, when searching `PATH`, lookup is STRICTLY restricted to `rnpm` / `rnpm.exe`.
 /// This prevents standalone Rust `npx` from delegating to Node's JS `/usr/local/bin/npm` if Node's npm
 /// appears earlier in `PATH`.
+fn is_native_companion_binary(path: &std::path::Path) -> bool {
+    if !path.is_file() {
+        return false;
+    }
+    // Reject text/script launchers (e.g. Node's `#!/usr/bin/env node` npm script) so
+    // standalone Rust `npx` never silently falls back to Node's JS npm.
+    use std::io::Read;
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return false;
+    };
+    let mut header = [0u8; 2];
+    match file.read(&mut header) {
+        Ok(2) => &header != b"#!",
+        _ => true,
+    }
+}
+
 pub fn find_rnpm_executable_in(
     current_exe: Option<&std::path::Path>,
     path_dirs: &[PathBuf],
 ) -> Option<PathBuf> {
-    let sibling_candidates = if cfg!(windows) {
-        &["rnpm.exe", "npm.exe"][..]
-    } else {
-        &["rnpm", "npm"][..]
-    };
+    let rnpm_name = if cfg!(windows) { "rnpm.exe" } else { "rnpm" };
+    let npm_name = if cfg!(windows) { "npm.exe" } else { "npm" };
 
+    // 1. Prefer `rnpm` everywhere first (sibling, parent, then PATH)
     if let Some(current_exe) = current_exe {
         if let Some(dir) = current_exe.parent() {
-            for name in sibling_candidates {
-                let candidate = dir.join(name);
-                if candidate.is_file() {
-                    return Some(candidate);
-                }
+            let sibling = dir.join(rnpm_name);
+            if sibling.is_file() {
+                return Some(sibling);
             }
             if let Some(parent) = dir.parent() {
-                for name in sibling_candidates {
-                    let candidate = parent.join(name);
-                    if candidate.is_file() {
-                        return Some(candidate);
-                    }
+                let parent_bin = parent.join(rnpm_name);
+                if parent_bin.is_file() {
+                    return Some(parent_bin);
                 }
             }
         }
     }
 
-    let path_bin = if cfg!(windows) { "rnpm.exe" } else { "rnpm" };
     for dir in path_dirs {
-        let candidate = dir.join(path_bin);
+        let candidate = dir.join(rnpm_name);
         if candidate.is_file() {
             return Some(candidate);
+        }
+    }
+
+    // 2. Fall back to a renamed native companion `npm` binary beside `npx` (never a `#!` JS launcher)
+    if let Some(current_exe) = current_exe {
+        if let Some(dir) = current_exe.parent() {
+            let sibling_npm = dir.join(npm_name);
+            if is_native_companion_binary(&sibling_npm) {
+                return Some(sibling_npm);
+            }
+            if let Some(parent) = dir.parent() {
+                let parent_npm = parent.join(npm_name);
+                if is_native_companion_binary(&parent_npm) {
+                    return Some(parent_npm);
+                }
+            }
         }
     }
 

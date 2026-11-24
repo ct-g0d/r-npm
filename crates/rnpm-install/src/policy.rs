@@ -692,33 +692,71 @@ pub fn check_sources_with_root_context(
 
         // Gate overrides in pkg.extra if present
         if let Some(overrides) = pkg.extra.get("overrides") {
+            let direct_dep_names: HashSet<&str> = pkg
+                .dependencies
+                .iter()
+                .flat_map(|m| m.keys().map(String::as_str))
+                .chain(pkg.dev_dependencies.iter().flat_map(|m| m.keys().map(String::as_str)))
+                .chain(pkg.optional_dependencies.iter().flat_map(|m| m.keys().map(String::as_str)))
+                .chain(pkg.peer_dependencies.iter().flat_map(|m| m.keys().map(String::as_str)))
+                .collect();
+
             fn check_overrides_recursive(
                 val: &serde_json::Value,
                 policy: &SourcePolicy,
                 is_root_edge: bool,
+                root_declared: &HashSet<String>,
+                direct_dep_names: Option<&HashSet<&str>>,
             ) -> Result<()> {
                 match val {
                     serde_json::Value::String(spec) => {
                         if !spec.starts_with('$') {
                             let kind = parse_source_kind(spec);
-                            check_source_gate(policy, kind, is_root_edge)?;
+                            let actual_root = is_root_edge
+                                && (kind == SourceKind::Registry
+                                    || is_declared_root_spec(spec, kind, root_declared));
+                            check_source_gate(policy, kind, actual_root)?;
                         }
                     }
                     serde_json::Value::Object(map) => {
-                        for v in map.values() {
-                            check_overrides_recursive(v, policy, false)?;
+                        for (k, v) in map {
+                            let child_is_root = if let Some(direct_names) = direct_dep_names {
+                                // Top-level override map: only entries targeting a direct root dep are root edges.
+                                let pkg_name = if let Some(stripped) = k.strip_prefix('@') {
+                                    match stripped.find('/') {
+                                        Some(slash) => match stripped[slash + 1..].find('@') {
+                                            Some(at) => &k[..1 + slash + 1 + at],
+                                            None => k.as_str(),
+                                        },
+                                        None => k.as_str(),
+                                    }
+                                } else {
+                                    k.split_once('@').map(|(n, _)| n).unwrap_or(k.as_str())
+                                };
+                                is_root_edge && direct_names.contains(pkg_name)
+                            } else {
+                                // Nested override object: "." applies to the parent package itself; any other key targets a child (non-root).
+                                is_root_edge && k == "."
+                            };
+                            check_overrides_recursive(v, policy, child_is_root, root_declared, None)?;
                         }
                     }
                     serde_json::Value::Array(arr) => {
                         for v in arr {
-                            check_overrides_recursive(v, policy, is_root_edge)?;
+                            check_overrides_recursive(v, policy, is_root_edge, root_declared, None)?;
                         }
                     }
                     _ => {}
                 }
                 Ok(())
             }
-            check_overrides_recursive(overrides, policy, is_root_edge)?;
+            check_overrides_recursive(
+                overrides,
+                policy,
+                is_root_edge,
+                root_declared,
+                is_root_edge.then_some(&direct_dep_names),
+            )?;
         }
     }
 

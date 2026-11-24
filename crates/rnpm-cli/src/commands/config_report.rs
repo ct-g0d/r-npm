@@ -170,7 +170,11 @@ pub(super) fn run(json: bool, long: bool, dir: &Path) -> Result<()> {
             let mut remaining = layer.settings;
             remaining.remove("globalconfig");
             for (env_k, _) in std::env::vars() {
-                if env_k.len() > 11 && env_k[..11].eq_ignore_ascii_case("npm_config_") {
+                if env_k
+                    .get(..11)
+                    .is_some_and(|prefix| prefix.eq_ignore_ascii_case("npm_config_"))
+                    && env_k.len() > 11
+                {
                     let raw = &env_k[11..];
                     let norm = if raw.starts_with("//") {
                         raw.to_string()

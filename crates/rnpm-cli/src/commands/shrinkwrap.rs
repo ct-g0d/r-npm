@@ -1,4 +1,5 @@
 use anyhow::{anyhow, Result};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 fn populate_from_node_modules(root: &Path, lock: &mut rnpm_lockfile::LockfileV3) -> Result<()> {
@@ -6,14 +7,28 @@ fn populate_from_node_modules(root: &Path, lock: &mut rnpm_lockfile::LockfileV3)
     if !nm_root.is_dir() {
         return Ok(());
     }
-    walk_nm(&nm_root, root, lock)?;
+    let mut visited = HashSet::new();
+    if let Ok(canon) = std::fs::canonicalize(root) {
+        visited.insert(canon);
+    }
+    walk_nm(&nm_root, root, lock, &mut visited)?;
     Ok(())
 }
 
-fn walk_nm(dir: &Path, root: &Path, lock: &mut rnpm_lockfile::LockfileV3) -> Result<()> {
+fn walk_nm(
+    dir: &Path,
+    root: &Path,
+    lock: &mut rnpm_lockfile::LockfileV3,
+    visited: &mut HashSet<PathBuf>,
+) -> Result<()> {
     for entry in std::fs::read_dir(dir)?.flatten() {
         let path = entry.path();
-        if !path.is_dir() {
+        let Ok(sym_meta) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        let is_symlink_or_junction =
+            sym_meta.file_type().is_symlink() || rnpm_fs::is_junction(&path).unwrap_or(false);
+        if !is_symlink_or_junction && !sym_meta.is_dir() {
             continue;
         }
         let file_name = match path.file_name().and_then(|n| n.to_str()) {
@@ -24,17 +39,49 @@ fn walk_nm(dir: &Path, root: &Path, lock: &mut rnpm_lockfile::LockfileV3) -> Res
             continue;
         }
         if file_name.starts_with('@') {
-            walk_nm(&path, root, lock)?;
+            if !is_symlink_or_junction {
+                walk_nm(&path, root, lock, visited)?;
+            }
             continue;
+        }
+        let rel = path
+            .strip_prefix(root)
+            .unwrap_or(&path)
+            .to_string_lossy()
+            .replace('\\', "/");
+        if is_symlink_or_junction {
+            let resolved = std::fs::canonicalize(&path)
+                .ok()
+                .and_then(|target| {
+                    let canon_root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+                    target
+                        .strip_prefix(&canon_root)
+                        .ok()
+                        .map(|p| p.to_string_lossy().replace('\\', "/"))
+                })
+                .or_else(|| {
+                    std::fs::read_link(&path)
+                        .ok()
+                        .map(|t| t.to_string_lossy().replace('\\', "/"))
+                });
+            lock.packages.insert(
+                rel,
+                rnpm_lockfile::LockfilePackage {
+                    resolved,
+                    link: Some(true),
+                    ..Default::default()
+                },
+            );
+            continue;
+        }
+        if let Ok(canon) = std::fs::canonicalize(&path) {
+            if !visited.insert(canon) {
+                continue;
+            }
         }
         let manifest_path = path.join("package.json");
         if manifest_path.is_file() {
             if let Ok(manifest) = rnpm_core::Manifest::from_file(&manifest_path) {
-                let rel = path
-                    .strip_prefix(root)
-                    .unwrap_or(&path)
-                    .to_string_lossy()
-                    .replace('\\', "/");
                 let pkg = rnpm_lockfile::LockfilePackage {
                     version: manifest.version.clone(),
                     dependencies: if manifest.dependencies.is_empty() {
@@ -42,11 +89,8 @@ fn walk_nm(dir: &Path, root: &Path, lock: &mut rnpm_lockfile::LockfileV3) -> Res
                     } else {
                         Some(manifest.dependencies.clone())
                     },
-                    dev_dependencies: if manifest.dev_dependencies.is_empty() {
-                        None
-                    } else {
-                        Some(manifest.dev_dependencies.clone())
-                    },
+                    // npm lockfile v3 omits devDependencies on installed node_modules/* entries.
+                    dev_dependencies: None,
                     peer_dependencies: if manifest.peer_dependencies.is_empty() {
                         None
                     } else {
@@ -63,7 +107,7 @@ fn walk_nm(dir: &Path, root: &Path, lock: &mut rnpm_lockfile::LockfileV3) -> Res
             }
             let nested = path.join("node_modules");
             if nested.is_dir() {
-                walk_nm(&nested, root, lock)?;
+                walk_nm(&nested, root, lock, visited)?;
             }
         }
     }
@@ -87,10 +131,12 @@ pub(crate) fn run(current_dir: PathBuf) -> Result<()> {
             .map_err(|e| anyhow!("npm error code EJSONPARSE\n{}", e))?;
         let mut lock = rnpm_lockfile::LockfileV3::from_manifest(&manifest);
 
-        if let Ok(hidden) = rnpm_lockfile::LockfileV3::load_hidden(&current_dir) {
-            for (k, v) in hidden.packages {
-                if !k.is_empty() {
-                    lock.packages.insert(k, v);
+        if rnpm_install::fast_path::validate_hidden_lockfile_simple(&current_dir) {
+            if let Ok(hidden) = rnpm_lockfile::LockfileV3::load_hidden(&current_dir) {
+                for (k, v) in hidden.packages {
+                    if !k.is_empty() {
+                        lock.packages.insert(k, v);
+                    }
                 }
             }
         }
