@@ -1809,3 +1809,91 @@ fn test_case_insensitive_git_sha_and_windows_backslash_clean_file_path() {
     let res = check_sources(&lockfile, &root_declared, &workspace_paths, &policy);
     assert!(res.is_ok(), "Expected case-insensitive git SHA comparison to pass under allow-git=root, got: {:?}", res.err());
 }
+
+#[test]
+fn test_numeric_org_git_scp_parsing_and_remote_fragment_and_registry_root_smuggling() {
+    // 1. Git SCP parsing for numeric orgs like 0xPolygon or 42school
+    let (repo_poly, ref_poly) = git_identity("git@github.com:0xPolygon/contracts.git#v1.0").unwrap();
+    assert_eq!(repo_poly, "github.com/0xpolygon/contracts");
+    assert_eq!(ref_poly, "v1.0");
+
+    let (repo_42, _) = git_identity("git@gitlab.com:42school/lib.git").unwrap();
+    assert_eq!(repo_42, "gitlab.com/42school/lib");
+
+    // Real port is preserved/not treated as org
+    let (repo_port, _) = git_identity("ssh://git@example.com:2222/group/repo.git").unwrap();
+    assert_eq!(repo_port, "example.com:2222/group/repo");
+
+    // 2. Remote URL with fragment declared in package.json matching clean lockfile spec
+    let mut root_declared = HashSet::new();
+    root_declared.insert("remote-frag-pkg".to_string());
+    root_declared.insert("https://example.com/tarball.tgz#sha512-abc123".to_string());
+
+    let mut packages = BTreeMap::new();
+    let mut root_deps = BTreeMap::new();
+    root_deps.insert("remote-frag-pkg".to_string(), "https://example.com/tarball.tgz".to_string());
+    packages.insert(
+        String::new(),
+        LockfilePackage {
+            dependencies: Some(root_deps),
+            ..Default::default()
+        },
+    );
+    packages.insert(
+        "node_modules/remote-frag-pkg".to_string(),
+        LockfilePackage {
+            resolved: Some("https://example.com/tarball.tgz".to_string()),
+            ..Default::default()
+        },
+    );
+
+    let lockfile = LockfileV3 {
+        name: "test-frag".to_string(),
+        version: None,
+        lockfile_version: 3,
+        requires: None,
+        packages,
+    };
+    let workspace_paths = HashSet::new();
+    let policy = SourcePolicy {
+        remote: AllowMode::Root,
+        ..Default::default()
+    };
+    let res = check_sources(&lockfile, &root_declared, &workspace_paths, &policy);
+    assert!(res.is_ok(), "Expected remote URL with fragment in package.json to match clean lockfile URL, got: {:?}", res.err());
+
+    // 3. Forged registry root dep injection blocked under allow-registry=root
+    let root_declared_empty = HashSet::new(); // package.json declares nothing
+    let mut packages_forged = BTreeMap::new();
+    let mut root_deps_forged = BTreeMap::new();
+    root_deps_forged.insert("injected-registry-pkg".to_string(), "^1.0.0".to_string());
+    packages_forged.insert(
+        String::new(),
+        LockfilePackage {
+            dependencies: Some(root_deps_forged),
+            ..Default::default()
+        },
+    );
+    packages_forged.insert(
+        "node_modules/injected-registry-pkg".to_string(),
+        LockfilePackage {
+            resolved: Some("https://registry.npmjs.org/injected-registry-pkg/-/injected-registry-pkg-1.0.0.tgz".to_string()),
+            ..Default::default()
+        },
+    );
+    let lockfile_forged = LockfileV3 {
+        name: "test-forged-reg".to_string(),
+        version: None,
+        lockfile_version: 3,
+        requires: None,
+        packages: packages_forged,
+    };
+    let policy_reg_root = SourcePolicy {
+        registry: AllowMode::Root,
+        ..Default::default()
+    };
+    let res_forged = check_sources(&lockfile_forged, &root_declared_empty, &workspace_paths, &policy_reg_root);
+    assert!(res_forged.is_err(), "Expected undeclared registry package injected into lockfile root to fail under allow-registry=root");
+    let err = res_forged.unwrap_err().to_string();
+    assert!(err.contains("EALLOWREGISTRY"), "Expected EALLOWREGISTRY, got: {err}");
+}

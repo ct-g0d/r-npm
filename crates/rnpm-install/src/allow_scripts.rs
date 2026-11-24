@@ -266,10 +266,10 @@ pub fn git_identity(spec: &str) -> Option<(String, String)> {
             }
         }
         if let Some((host, path)) = b.split_once(':') {
-            if !host.contains('/')
-                && !path.starts_with('/')
-                && !path.chars().next().is_some_and(|c| c.is_ascii_digit())
-            {
+            let is_port = path
+                .split_once('/')
+                .is_some_and(|(port, _)| !port.is_empty() && port.chars().all(|c| c.is_ascii_digit()));
+            if !host.contains('/') && !path.starts_with('/') && !is_port {
                 format!("{host}/{path}")
             } else {
                 b.to_string()

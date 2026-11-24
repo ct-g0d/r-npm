@@ -367,10 +367,19 @@ fn is_declared_root_spec(spec: &str, kind: SourceKind, root_declared: &HashSet<S
     let extracted = unpack_alias(spec);
     let norm_spec = spec.replace('\\', "/");
     let norm_extracted = extracted.replace('\\', "/");
+    let spec_base = spec.split_once('#').map(|(b, _)| b).unwrap_or(spec);
+    let extracted_base = extracted.split_once('#').map(|(b, _)| b).unwrap_or(extracted);
+    let norm_spec_base = norm_spec.split_once('#').map(|(b, _)| b).unwrap_or(&norm_spec);
+    let norm_extracted_base = norm_extracted.split_once('#').map(|(b, _)| b).unwrap_or(&norm_extracted);
+
     if root_declared.contains(spec)
         || root_declared.contains(extracted)
         || root_declared.contains(&norm_spec)
         || root_declared.contains(&norm_extracted)
+        || root_declared.contains(spec_base)
+        || root_declared.contains(extracted_base)
+        || root_declared.contains(norm_spec_base)
+        || root_declared.contains(norm_extracted_base)
     {
         return true;
     }
@@ -403,11 +412,20 @@ fn is_declared_root_spec(spec: &str, kind: SourceKind, root_declared: &HashSet<S
         let d_unpacked = unpack_alias(d);
         let d_norm = d.replace('\\', "/");
         let d_unpacked_norm = d_unpacked.replace('\\', "/");
+        let d_base = d.split_once('#').map(|(b, _)| b).unwrap_or(d);
+        let d_unpacked_base = d_unpacked.split_once('#').map(|(b, _)| b).unwrap_or(d_unpacked);
+        let d_norm_base = d_norm.split_once('#').map(|(b, _)| b).unwrap_or(&d_norm);
+        let d_unpacked_norm_base = d_unpacked_norm.split_once('#').map(|(b, _)| b).unwrap_or(&d_unpacked_norm);
+
         d == spec
             || d == extracted
             || d_norm == norm_spec
             || d_unpacked_norm == norm_extracted
             || d_unpacked == extracted
+            || d_base == spec_base
+            || d_unpacked_base == extracted_base
+            || d_norm_base == norm_spec_base
+            || d_unpacked_norm_base == norm_extracted_base
     })
 }
 
@@ -439,7 +457,11 @@ fn is_direct_root_dep(
             if let Some(spec) = map.get(name) {
                 let spec_kind = parse_source_kind(spec);
                 if spec_kind == kind {
-                    if kind != SourceKind::Registry && !is_declared_root_spec(spec, kind, root_declared) {
+                    if kind != SourceKind::Registry {
+                        if !is_declared_root_spec(spec, kind, root_declared) {
+                            return false;
+                        }
+                    } else if !root_declared.contains(name) {
                         return false;
                     }
                     return true;
