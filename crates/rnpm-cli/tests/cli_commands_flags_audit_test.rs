@@ -291,3 +291,53 @@ fn test_query_expect_result_count_and_expect_results() {
         "Expected failure when both flags provided"
     );
 }
+
+#[test]
+fn test_test_command_filter_forwarding() {
+    let tmp = tempdir().unwrap();
+    let echo_script = tmp.path().join("echo_args.js");
+    fs::write(
+        &echo_script,
+        r#"
+const fs = require('fs');
+fs.writeFileSync('args_out.json', JSON.stringify(process.argv.slice(2)));
+console.log("ARGS_RECEIVED:" + JSON.stringify(process.argv.slice(2)));
+"#,
+    )
+    .unwrap();
+
+    fs::write(
+        tmp.path().join("package.json"),
+        r#"{
+  "name": "test-filter-forwarding",
+  "version": "1.0.0",
+  "scripts": {
+    "test": "node echo_args.js"
+  }
+}"#,
+    )
+    .unwrap();
+
+    let out = rnpm(
+        tmp.path(),
+        &["test", "--filter", "my-spec", "--scope", "my-scope"],
+    );
+    assert!(
+        out.status.success(),
+        "stderr: {}\nstdout: {}",
+        String::from_utf8_lossy(&out.stderr),
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains(r#"ARGS_RECEIVED:["--filter","my-spec","--scope","my-scope"]"#),
+        "Expected forwarded filter and scope in stdout: {stdout}"
+    );
+
+    let recorded = fs::read_to_string(tmp.path().join("args_out.json")).unwrap();
+    let args: Vec<String> = serde_json::from_str(&recorded).unwrap();
+    assert_eq!(
+        args,
+        vec!["--filter", "my-spec", "--scope", "my-scope"]
+    );
+}

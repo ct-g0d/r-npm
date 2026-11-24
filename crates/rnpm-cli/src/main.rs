@@ -3234,22 +3234,42 @@ fn preprocess_run_args(
                 i += 1;
                 continue;
             }
-            if token == "--filter" || token == "--scope" {
-                clap_flags.push(token.clone());
-                if let Some(next) = next_token {
-                    if !next.starts_with('-') {
-                        clap_flags.push(next.to_string());
-                        i += 2;
-                        continue;
+            if is_run {
+                if token == "--filter" || token == "--scope" {
+                    clap_flags.push(token.clone());
+                    if let Some(next) = next_token {
+                        if !next.starts_with('-') {
+                            clap_flags.push(next.to_string());
+                            i += 2;
+                            continue;
+                        }
                     }
+                    i += 1;
+                    continue;
                 }
-                i += 1;
-                continue;
-            }
-            if token.starts_with("--filter=") || token.starts_with("--scope=") {
-                clap_flags.push(token.clone());
-                i += 1;
-                continue;
+                if token.starts_with("--filter=") || token.starts_with("--scope=") {
+                    clap_flags.push(token.clone());
+                    i += 1;
+                    continue;
+                }
+            } else if is_lifecycle {
+                if token == "--filter" || token == "--scope" {
+                    script_positional_args.push(token.clone());
+                    if let Some(next) = next_token {
+                        if !next.starts_with('-') {
+                            script_positional_args.push(next.to_string());
+                            i += 2;
+                            continue;
+                        }
+                    }
+                    i += 1;
+                    continue;
+                }
+                if token.starts_with("--filter=") || token.starts_with("--scope=") {
+                    script_positional_args.push(token.clone());
+                    i += 1;
+                    continue;
+                }
             }
         }
 
