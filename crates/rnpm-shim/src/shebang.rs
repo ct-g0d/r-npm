@@ -87,12 +87,15 @@ pub fn normalize_shebang_file(file_path: &Path) -> Result<bool, ShimError> {
     if changed {
         #[cfg(unix)]
         let mut orig_unix_mode: Option<u32> = None;
+        #[cfg(windows)]
+        let mut orig_readonly = false;
 
         if let Ok(metadata) = std::fs::metadata(file_path) {
             let mut perms = metadata.permissions();
             if perms.readonly() {
                 #[cfg(windows)]
                 {
+                    orig_readonly = true;
                     perms.set_readonly(false);
                     let _ = std::fs::set_permissions(file_path, perms);
                 }
@@ -114,6 +117,14 @@ pub fn normalize_shebang_file(file_path: &Path) -> Result<bool, ShimError> {
         if let Some(mode) = orig_unix_mode {
             use std::os::unix::fs::PermissionsExt;
             let _ = std::fs::set_permissions(file_path, std::fs::Permissions::from_mode(mode));
+        }
+        #[cfg(windows)]
+        if orig_readonly {
+            if let Ok(meta) = std::fs::metadata(file_path) {
+                let mut perms = meta.permissions();
+                perms.set_readonly(true);
+                let _ = std::fs::set_permissions(file_path, perms);
+            }
         }
         write_res?;
     }

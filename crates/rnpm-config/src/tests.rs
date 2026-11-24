@@ -1511,3 +1511,170 @@ fn test_config_standard_proxy_env_fallbacks() {
     assert_eq!(cfg.https_proxy(), Some("http://env-proxy:8080"));
     assert_eq!(cfg.no_proxy(), Some("localhost,127.0.0.1"));
 }
+
+#[test]
+fn test_config_unicode_env_vars_crossing_byte_boundary() {
+    let mut env_map = std::collections::BTreeMap::new();
+    // Character crossing byte 11:
+    // "npm_con" (7 bytes) + 🦀 (4 bytes: 7..11) -> boundary falls inside 🦀
+    env_map.insert("npm_con\u{1f980}".to_string(), "crab_val".to_string());
+    // "npm_conf" (8 bytes) + é (2 bytes: 8..10) + "_abc" -> boundary at 11 is valid
+    env_map.insert("npm_conf\u{00e9}_abc".to_string(), "accent_val".to_string());
+    // Valid npm_config_ prefix with unicode key afterwards
+    env_map.insert("npm_config_\u{1f980}".to_string(), "unicode_setting".to_string());
+    env_map.insert("npm_config_test_\u{1f980}_end".to_string(), "unicode_mid".to_string());
+
+    let opts = ConfigOptions::new().env_vars(env_map);
+    let cfg = Config::load_with_options(opts).expect("Unicode env vars must not panic during config loading");
+
+    assert_eq!(cfg.get("\u{1f980}"), Some("unicode_setting"));
+    assert_eq!(cfg.get("test-\u{1f980}-end"), Some("unicode_mid"));
+}
+
+#[test]
+fn test_config_proxy_precedence_and_http_proxy_isolation() {
+    // 1. .npmrc `proxy` takes precedence over ambient HTTPS_PROXY
+    let temp = tempfile::tempdir().unwrap();
+    let npmrc_path = temp.path().join(".npmrc");
+    std::fs::write(&npmrc_path, "proxy = http://npmrc-proxy:8080\n").unwrap();
+
+    let mut env_map = std::collections::BTreeMap::new();
+    env_map.insert("HTTPS_PROXY".to_string(), "http://ambient-https:8443".to_string());
+    env_map.insert("HTTP_PROXY".to_string(), "http://ambient-http:8080".to_string());
+
+    let opts = ConfigOptions::new()
+        .userconfig(npmrc_path)
+        .env_vars(env_map);
+    let cfg = Config::load_with_options(opts).unwrap();
+
+    assert_eq!(cfg.proxy(), Some("http://npmrc-proxy:8080"));
+    // Explicit .npmrc proxy prevents ambient HTTPS_PROXY from setting https-proxy
+    assert_eq!(cfg.https_proxy(), None);
+
+    let https_registry = Url::parse("https://registry.npmjs.org/").unwrap();
+    assert_eq!(
+        cfg.npmrc.get_proxy_for_registry(&https_registry),
+        Some("http://npmrc-proxy:8080")
+    );
+
+    // 2. HTTP_PROXY sets `http-proxy` only and does NOT populate HTTPS proxy
+    let mut env_map_http = std::collections::BTreeMap::new();
+    env_map_http.insert("HTTP_PROXY".to_string(), "http://ambient-http-only:8080".to_string());
+
+    let opts_http = ConfigOptions::new()
+        .userconfig(std::path::PathBuf::from("false"))
+        .env_vars(env_map_http);
+    let cfg_http = Config::load_with_options(opts_http).unwrap();
+
+    assert_eq!(cfg_http.http_proxy(), Some("http://ambient-http-only:8080"));
+    assert_eq!(cfg_http.proxy(), None);
+    assert_eq!(cfg_http.https_proxy(), None);
+
+    // HTTPS requests must NOT be proxied by HTTP_PROXY
+    assert_eq!(cfg_http.npmrc.get_proxy_for_registry(&https_registry), None);
+
+    // HTTP requests DO use http-proxy
+    let http_registry = Url::parse("http://registry.internal.org/").unwrap();
+    assert_eq!(
+        cfg_http.npmrc.get_proxy_for_registry(&http_registry),
+        Some("http://ambient-http-only:8080")
+    );
+}
+
+#[test]
+fn test_config_set_roundtrip_special_characters_and_deletion() {
+    use crate::set_config_value_in_file;
+
+    let temp = tempfile::tempdir().unwrap();
+    let npmrc_path = temp.path().join(".npmrc");
+
+    let test_cases = [
+        ("key_hash", "foo#bar"),
+        ("key_semi", "foo;bar"),
+        ("key_backslash", "foo\\bar\\baz"),
+        ("key_quote", "foo\"bar\"baz"),
+        ("key_single", "it's a 'quoted' value"),
+        ("key_equals", "foo=bar=baz"),
+        ("key_url", "https://github.com/org/repo#v1.2.3"),
+        ("key_spaces", "   leading and trailing spaces   "),
+    ];
+
+    for (k, v) in &test_cases {
+        set_config_value_in_file(&npmrc_path, k, v).unwrap();
+    }
+
+    // Reload with Npmrc::from_file
+    let loaded_npmrc = Npmrc::from_file(&npmrc_path).unwrap();
+    for (k, v) in &test_cases {
+        assert_eq!(
+            loaded_npmrc.settings.get(*k).map(|s| s.as_str()),
+            Some(*v),
+            "Failed round-trip for key: {k}"
+        );
+    }
+
+    // Reload through Config::load_with_options
+    let opts = ConfigOptions::new()
+        .userconfig(npmrc_path.clone())
+        .env_vars(std::collections::BTreeMap::new());
+    let cfg = Config::load_with_options(opts).unwrap();
+    for (k, v) in &test_cases {
+        assert_eq!(cfg.get(k), Some(*v), "Failed Config::get for key: {k}");
+    }
+
+    // Empty value deletes key matching npm 11.20.0 behavior
+    set_config_value_in_file(&npmrc_path, "key_spaces", "").unwrap();
+    let reloaded = Npmrc::from_file(&npmrc_path).unwrap();
+    assert_eq!(reloaded.settings.get("key_spaces"), None);
+    // Other keys remain intact
+    assert_eq!(
+        reloaded.settings.get("key_url").map(|s| s.as_str()),
+        Some("https://github.com/org/repo#v1.2.3")
+    );
+}
+
+#[test]
+fn test_npmrc_scoped_tls_entries_and_longest_prefix_precedence() {
+    let content = r#"
+    //registry.example.com/:certfile = /path/to/root.crt
+    //registry.example.com/:keyfile = /path/to/root.key
+    //registry.example.com/scoped/:cert = scoped_inline_cert
+    //registry.example.com/scoped/:key = scoped_inline_key
+    "#;
+
+    let npmrc = Npmrc::parse(content).unwrap();
+
+    // 1. scoped_tls_entries extraction
+    let entries = npmrc.scoped_tls_entries();
+    assert_eq!(entries.len(), 2);
+
+    assert_eq!(entries[0].prefix, "//registry.example.com/");
+    assert_eq!(entries[0].certfile.as_deref(), Some("/path/to/root.crt"));
+    assert_eq!(entries[0].keyfile.as_deref(), Some("/path/to/root.key"));
+    assert_eq!(entries[0].cert, None);
+    assert_eq!(entries[0].key, None);
+
+    assert_eq!(entries[1].prefix, "//registry.example.com/scoped/");
+    assert_eq!(entries[1].cert.as_deref(), Some("scoped_inline_cert"));
+    assert_eq!(entries[1].key.as_deref(), Some("scoped_inline_key"));
+    assert_eq!(entries[1].certfile, None);
+    assert_eq!(entries[1].keyfile, None);
+
+    // 2. scoped_tls_configs tuples
+    let tuples = npmrc.scoped_tls_configs();
+    assert_eq!(tuples.len(), 2);
+    assert_eq!(tuples[0].0, "//registry.example.com/");
+    assert_eq!(tuples[0].2.as_deref(), Some("/path/to/root.crt"));
+    assert_eq!(tuples[1].0, "//registry.example.com/scoped/");
+    assert_eq!(tuples[1].1.as_deref(), Some("scoped_inline_cert"));
+
+    // 3. Longest-prefix precedence: scoped prefix /scoped/ wins over root /
+    let scoped_pkg_url = Url::parse("https://registry.example.com/scoped/sub/package").unwrap();
+    assert_eq!(npmrc.get_cert(&scoped_pkg_url), Some("scoped_inline_cert"));
+    assert_eq!(npmrc.get_key(&scoped_pkg_url), Some("scoped_inline_key"));
+
+    // Root prefix fallback for non-scoped path
+    let other_pkg_url = Url::parse("https://registry.example.com/other/package").unwrap();
+    assert_eq!(npmrc.get_cert(&other_pkg_url), Some("/path/to/root.crt"));
+    assert_eq!(npmrc.get_key(&other_pkg_url), Some("/path/to/root.key"));
+}

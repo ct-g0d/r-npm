@@ -544,11 +544,12 @@ impl Config {
 
         let mut env_layer_settings = BTreeMap::new();
         for (raw_key, value) in all_env {
-            let rest_opt = if raw_key
-                .get(..11)
-                .is_some_and(|prefix| prefix.eq_ignore_ascii_case("npm_config_"))
-            {
-                Some(&raw_key[11..])
+            let rest_opt = if let Some(prefix) = raw_key.get(..11) {
+                if prefix.eq_ignore_ascii_case("npm_config_") {
+                    raw_key.get(11..)
+                } else {
+                    None
+                }
             } else {
                 None
             };
@@ -568,8 +569,8 @@ impl Config {
                     base_npmrc.set(rest, &value)?;
                 } else {
                     let lower = rest.to_ascii_lowercase();
-                    let (prefix, body) = if lower.starts_with('_') {
-                        ("_", &lower[1..])
+                    let (prefix, body) = if let Some(stripped) = lower.strip_prefix('_') {
+                        ("_", stripped)
                     } else {
                         ("", lower.as_str())
                     };
@@ -606,8 +607,8 @@ impl Config {
             for (key, value) in cli_map {
                 let clean_key = key.strip_prefix("--").unwrap_or(&key);
                 let lower_clean = clean_key.to_ascii_lowercase();
-                let (prefix, body) = if lower_clean.starts_with('_') {
-                    ("_", &lower_clean[1..])
+                let (prefix, body) = if let Some(stripped) = lower_clean.strip_prefix('_') {
+                    ("_", stripped)
                 } else {
                     ("", lower_clean.as_str())
                 };
@@ -976,10 +977,14 @@ pub fn get_default_user_npmrc() -> PathBuf {
 fn encode_ini_value(val: &str) -> String {
     let needs_quotes = val.starts_with('"')
         || val.starts_with('\'')
+        || val.starts_with(char::is_whitespace)
+        || val.ends_with(char::is_whitespace)
         || val.contains('#')
         || val.contains(';')
         || val.contains('\\')
-        || val.contains('"');
+        || val.contains('"')
+        || val.contains('\'')
+        || val.contains('=');
     if !needs_quotes {
         return val.to_string();
     }
@@ -997,8 +1002,19 @@ fn encode_ini_value(val: &str) -> String {
 }
 
 /// Updates or appends a key-value setting in an .npmrc file on disk.
-/// Preserves comments and existing lines.
+/// Preserves comments and existing lines. If `value` is empty, the key is deleted
+/// matching npm 11.20.0 behavior.
 pub fn set_config_value_in_file(path: &Path, key: &str, value: &str) -> Result<(), ConfigError> {
+    let key_trimmed = key.trim();
+    if key_trimmed.is_empty() {
+        return Err(ConfigError::InvalidLine("Empty key".to_string()));
+    }
+
+    if value.is_empty() {
+        let _ = delete_config_value_from_file(path, key_trimmed)?;
+        return Ok(());
+    }
+
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
             std::fs::create_dir_all(parent).map_err(|e| ConfigError::Io {
@@ -1008,13 +1024,10 @@ pub fn set_config_value_in_file(path: &Path, key: &str, value: &str) -> Result<(
         }
     }
 
-    let key_trimmed = key.trim();
-    let value_trimmed = value.trim();
-
     if key_trimmed.contains('\n')
         || key_trimmed.contains('\r')
-        || value_trimmed.contains('\n')
-        || value_trimmed.contains('\r')
+        || value.contains('\n')
+        || value.contains('\r')
     {
         return Err(ConfigError::InvalidLine(
             "Newline in key or value".to_string(),
@@ -1040,7 +1053,7 @@ pub fn set_config_value_in_file(path: &Path, key: &str, value: &str) -> Result<(
                 };
 
                 if line_key == key_trimmed || line_key.eq_ignore_ascii_case(key_trimmed) {
-                    lines.push(format!("{key_trimmed}={}", encode_ini_value(value_trimmed)));
+                    lines.push(format!("{key_trimmed}={}", encode_ini_value(value)));
                     updated = true;
                     continue;
                 }
@@ -1050,7 +1063,7 @@ pub fn set_config_value_in_file(path: &Path, key: &str, value: &str) -> Result<(
     }
 
     if !updated {
-        lines.push(format!("{key_trimmed}={}", encode_ini_value(value_trimmed)));
+        lines.push(format!("{key_trimmed}={}", encode_ini_value(value)));
     }
 
     let mut out_str = lines.join("\n");

@@ -1534,3 +1534,84 @@ fn test_windows_junction_and_directory_bin_collision() {
     assert!(global_bin_dir.join("mytool.ps1").exists());
     assert!(canary_file.exists(), "Target directory files must NEVER be deleted when junction is unlinked");
 }
+
+#[test]
+fn test_readonly_file_replacement_and_mode_preservation() {
+    let dir = tempdir().unwrap();
+
+    // 1. normalize_shebang_file on a readonly file with CRLF
+    let script = dir.path().join("readonly_cli.js");
+    fs::write(&script, b"#!/usr/bin/env node\r\nconsole.log('readonly');\r\n").unwrap();
+
+    let mut perms = fs::metadata(&script).unwrap().permissions();
+    perms.set_readonly(true);
+    fs::set_permissions(&script, perms).unwrap();
+    assert!(fs::metadata(&script).unwrap().permissions().readonly());
+
+    let changed = crate::shebang::normalize_shebang_file(&script).unwrap();
+    assert!(changed, "CRLF shebang on readonly file should be normalized");
+
+    let content = fs::read(&script).unwrap();
+    assert!(
+        content.starts_with(b"#!/usr/bin/env node\n"),
+        "Shebang line must be converted to LF"
+    );
+
+    #[cfg(windows)]
+    assert!(
+        fs::metadata(&script).unwrap().permissions().readonly(),
+        "Windows readonly attribute must be preserved after shebang normalization"
+    );
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = fs::metadata(&script).unwrap().permissions().mode();
+        assert_eq!(
+            mode & 0o222,
+            0,
+            "Unix mode must restore readonly (never leave write bits 0o222 enabled)"
+        );
+    }
+
+    // 2. Overwrite existing readonly shim files via create_shim_trio
+    let bin_dir = dir.path().join("bin");
+    fs::create_dir_all(&bin_dir).unwrap();
+
+    let sh_path = bin_dir.join("mytool");
+    let cmd_path = bin_dir.join("mytool.cmd");
+    let ps1_path = bin_dir.join("mytool.ps1");
+
+    fs::write(&sh_path, b"stale_posix").unwrap();
+    fs::write(&cmd_path, b"stale_cmd").unwrap();
+    fs::write(&ps1_path, b"stale_ps1").unwrap();
+
+    for p in [&sh_path, &cmd_path, &ps1_path] {
+        let mut p_perms = fs::metadata(p).unwrap().permissions();
+        p_perms.set_readonly(true);
+        fs::set_permissions(p, p_perms).unwrap();
+        assert!(fs::metadata(p).unwrap().permissions().readonly());
+    }
+
+    let target_js = dir.path().join("pkg").join("cli.js");
+    fs::create_dir_all(target_js.parent().unwrap()).unwrap();
+    fs::write(&target_js, b"#!/usr/bin/env node\nconsole.log(1);\n").unwrap();
+
+    let trio_res = crate::generator::create_shim_trio(&target_js, &bin_dir, "mytool");
+    assert!(
+        trio_res.is_ok(),
+        "create_shim_trio must succeed even when existing destination files are readonly: {:?}",
+        trio_res.err()
+    );
+
+    let new_sh = fs::read_to_string(&sh_path).unwrap();
+    let new_cmd = fs::read_to_string(&cmd_path).unwrap();
+    let new_ps1 = fs::read_to_string(&ps1_path).unwrap();
+
+    assert_ne!(new_sh, "stale_posix");
+    assert_ne!(new_cmd, "stale_cmd");
+    assert_ne!(new_ps1, "stale_ps1");
+    assert!(new_sh.starts_with("#!/bin/sh"));
+    assert!(new_cmd.starts_with("@ECHO off"));
+    assert!(new_ps1.starts_with("#!/usr/bin/env pwsh"));
+}
