@@ -322,7 +322,7 @@ pub fn read_directory_files(dir: &Path) -> anyhow::Result<BTreeMap<String, Vec<u
     let mut files = BTreeMap::new();
     let manifest_path = dir.join("package.json");
     if manifest_path.is_file() {
-        let manifest = rnpm_core::manifest::Manifest::from_file(&manifest_path)?;
+        let manifest = rnpm_core::manifest::Manifest::from_file_readonly(&manifest_path)?;
         let pack_files = rnpm_fs::collect_pack_files(dir, &manifest)?;
         for (rel_path, full_path) in pack_files {
             let data = std::fs::read(&full_path)?;
@@ -492,7 +492,7 @@ pub async fn resolve_spec_files(
                 current_dir.display()
             ));
         }
-        let manifest = rnpm_core::manifest::Manifest::from_file(&manifest_path)?;
+        let manifest = rnpm_core::manifest::Manifest::from_file_readonly(&manifest_path)?;
         let pkg_name = manifest.name.ok_or_else(|| {
             anyhow::anyhow!("npm error package.json has no 'name' field to resolve version spec")
         })?;
@@ -677,7 +677,7 @@ pub async fn run_diff(
                     current_dir.display()
                 ));
             }
-            let manifest = rnpm_core::manifest::Manifest::from_file(&manifest_path)?;
+            let manifest = rnpm_core::manifest::Manifest::from_file_readonly(&manifest_path)?;
             let name = manifest
                 .name
                 .ok_or_else(|| anyhow::anyhow!("npm error package.json has no 'name' field"))?;

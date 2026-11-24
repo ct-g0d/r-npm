@@ -989,7 +989,7 @@ pub fn count_funding_packages(project_dir: &Path) -> usize {
                             let manifest_p = sub_p.join("package.json");
                             if manifest_p.exists() {
                                 if let Ok(manifest) =
-                                    rnpm_core::manifest::Manifest::from_file(&manifest_p)
+                                    rnpm_core::manifest::Manifest::from_file_readonly(&manifest_p)
                                 {
                                     if manifest.extra.contains_key("funding") {
                                         count += 1;
@@ -1001,7 +1001,7 @@ pub fn count_funding_packages(project_dir: &Path) -> usize {
                 } else if !name.starts_with('.') {
                     let manifest_p = p.join("package.json");
                     if manifest_p.exists() {
-                        if let Ok(manifest) = rnpm_core::manifest::Manifest::from_file(&manifest_p)
+                        if let Ok(manifest) = rnpm_core::manifest::Manifest::from_file_readonly(&manifest_p)
                         {
                             if manifest.extra.contains_key("funding") {
                                 count += 1;

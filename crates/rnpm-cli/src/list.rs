@@ -578,7 +578,18 @@ pub fn format_tree_json(root: &InspectedNode, max_depth: usize, long: bool) -> V
 }
 
 fn augment_long_json(map: &mut serde_json::Map<String, Value>, node: &InspectedNode) {
-    if let Some(raw) = node.raw_manifest.as_ref().and_then(Value::as_object) {
+    let raw_val: Option<Value> = if let Some(raw) = &node.raw_manifest {
+        Some(raw.clone())
+    } else if let Some(p) = &node.path {
+        let manifest_path = p.join("package.json");
+        std::fs::read_to_string(&manifest_path)
+            .ok()
+            .and_then(|c| serde_json::from_str(&c).ok())
+    } else {
+        None
+    };
+
+    if let Some(raw) = raw_val.as_ref().and_then(Value::as_object) {
         for (key, value) in raw.iter().filter(|(key, _)| key.as_str() != "dependencies") {
             map.insert(key.clone(), value.clone());
         }

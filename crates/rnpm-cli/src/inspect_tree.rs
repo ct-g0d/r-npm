@@ -151,7 +151,18 @@ impl InspectedNode {
     pub fn to_query_json(&self) -> Value {
         let mut map = serde_json::Map::new();
 
-        if let Some(Value::Object(raw)) = &self.raw_manifest {
+        let raw_val: Option<Value> = if let Some(raw) = &self.raw_manifest {
+            Some(raw.clone())
+        } else if let Some(p) = &self.path {
+            let manifest_path = p.join("package.json");
+            std::fs::read_to_string(&manifest_path)
+                .ok()
+                .and_then(|c| serde_json::from_str(&c).ok())
+        } else {
+            None
+        };
+
+        if let Some(Value::Object(raw)) = &raw_val {
             for (k, v) in raw {
                 if !matches!(
                     k.as_str(),
@@ -275,12 +286,28 @@ pub(crate) struct DiskPackage {
     pub version: Option<String>,
     pub manifest: Option<Manifest>,
     pub raw_json: Option<Value>,
+    pub is_link: bool,
 }
 
+impl DiskPackage {
+    pub fn raw_json_or_load(&self) -> Value {
+        if let Some(ref r) = self.raw_json {
+            return r.clone();
+        }
+        let manifest_path = self.dir_path.join("package.json");
+        std::fs::read_to_string(&manifest_path)
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_else(|| serde_json::json!({}))
+    }
+}
+
+#[derive(Clone)]
 struct RawDiskEntry {
     location: String,
     dir_path: PathBuf,
     fallback_name: String,
+    is_link: bool,
 }
 
 /// Scan `node_modules` directory recursively on disk and return map of location -> DiskPackage.
@@ -328,8 +355,10 @@ pub(crate) fn scan_disk_packages(project_dir: &Path) -> HashMap<String, DiskPack
             }
 
             let entry_path = entry.path();
+            let is_symlink = entry.file_type().map(|ft| ft.is_symlink()).unwrap_or(false);
             let is_junc = is_junction(&entry_path).unwrap_or(false);
-            if !entry_path.is_dir() && !is_junc {
+            let is_link = is_symlink || is_junc;
+            if !entry_path.is_dir() && !is_link {
                 continue;
             }
 
@@ -343,14 +372,16 @@ pub(crate) fn scan_disk_packages(project_dir: &Path) -> HashMap<String, DiskPack
                             continue;
                         }
                         let sub_path = scoped_entry.path();
+                        let sub_symlink = scoped_entry.file_type().map(|ft| ft.is_symlink()).unwrap_or(false);
                         let sub_junc = is_junction(&sub_path).unwrap_or(false);
-                        if !sub_path.is_dir() && !sub_junc {
+                        let sub_is_link = sub_symlink || sub_junc;
+                        if !sub_path.is_dir() && !sub_is_link {
                             continue;
                         }
 
                         let loc = format!("{nm_rel}/{name_str}/{sub_name_str}");
                         let pkg_name = format!("{name_str}/{sub_name_str}");
-                        if sub_junc {
+                        if sub_is_link {
                             scan_link_target(&mut nm_queue, &sub_path);
                         } else if sub_path.join("node_modules").is_dir() {
                             nm_queue.push_back(format!("{loc}/node_modules"));
@@ -359,13 +390,14 @@ pub(crate) fn scan_disk_packages(project_dir: &Path) -> HashMap<String, DiskPack
                             location: loc,
                             dir_path: sub_path,
                             fallback_name: pkg_name,
+                            is_link: sub_is_link,
                         });
                     }
                 }
             } else {
                 let loc = format!("{nm_rel}/{name_str}");
                 let pkg_name = name_str.to_string();
-                if is_junc {
+                if is_link {
                     scan_link_target(&mut nm_queue, &entry_path);
                 } else if entry_path.join("node_modules").is_dir() {
                     nm_queue.push_back(format!("{loc}/node_modules"));
@@ -374,6 +406,7 @@ pub(crate) fn scan_disk_packages(project_dir: &Path) -> HashMap<String, DiskPack
                     location: loc,
                     dir_path: entry_path,
                     fallback_name: pkg_name,
+                    is_link,
                 });
             }
         }
@@ -383,52 +416,61 @@ pub(crate) fn scan_disk_packages(project_dir: &Path) -> HashMap<String, DiskPack
         return HashMap::new();
     }
 
-    let num_threads = std::thread::available_parallelism()
-        .map(|n| n.get().clamp(4, 16))
-        .unwrap_or(8)
-        .min(raw_entries.len());
+    let parse_entry = |item: &RawDiskEntry| {
+        let (manifest, raw_json, version) = load_package_manifest(&item.dir_path);
+        let name = manifest
+            .as_ref()
+            .and_then(|m| m.name.clone())
+            .unwrap_or_else(|| item.fallback_name.clone());
 
-    let chunk_size = raw_entries.len().div_ceil(num_threads);
+        (
+            item.location.clone(),
+            DiskPackage {
+                location: item.location.clone(),
+                dir_path: item.dir_path.clone(),
+                name,
+                version,
+                manifest,
+                raw_json,
+                is_link: item.is_link,
+            },
+        )
+    };
 
-    let parsed_chunks: Vec<Vec<(String, DiskPackage)>> = std::thread::scope(|scope| {
-        let mut handles = Vec::with_capacity(num_threads);
-        for chunk in raw_entries.chunks(chunk_size) {
-            handles.push(scope.spawn(move || {
-                let mut out = Vec::with_capacity(chunk.len());
-                for item in chunk {
-                    let (manifest, raw_json, version) = load_package_manifest(&item.dir_path);
-                    let name = manifest
-                        .as_ref()
-                        .and_then(|m| m.name.clone())
-                        .unwrap_or_else(|| item.fallback_name.clone());
+    let parsed_entries: Vec<(String, DiskPackage)> = if raw_entries.len() <= 32 {
+        raw_entries.iter().map(parse_entry).collect()
+    } else {
+        let num_threads = std::thread::available_parallelism()
+            .map(|n| n.get().clamp(4, 16))
+            .unwrap_or(8)
+            .min(raw_entries.len());
 
-                    out.push((
-                        item.location.clone(),
-                        DiskPackage {
-                            location: item.location.clone(),
-                            dir_path: item.dir_path.clone(),
-                            name,
-                            version,
-                            manifest,
-                            raw_json,
-                        },
-                    ));
-                }
-                out
-            }));
-        }
+        let chunk_size = raw_entries.len().div_ceil(num_threads);
 
-        handles
-            .into_iter()
-            .map(|h| h.join().unwrap_or_default())
-            .collect()
-    });
+        let parsed_chunks: Vec<Vec<(String, DiskPackage)>> = std::thread::scope(|scope| {
+            let mut handles = Vec::with_capacity(num_threads);
+            for chunk in raw_entries.chunks(chunk_size) {
+                handles.push(scope.spawn(move || {
+                    let mut out = Vec::with_capacity(chunk.len());
+                    for item in chunk {
+                        out.push(parse_entry(item));
+                    }
+                    out
+                }));
+            }
 
-    let mut result = HashMap::with_capacity(raw_entries.len());
-    for chunk in parsed_chunks {
-        for (loc, pkg) in chunk {
-            result.insert(loc, pkg);
-        }
+            handles
+                .into_iter()
+                .map(|h| h.join().unwrap_or_default())
+                .collect()
+        });
+
+        parsed_chunks.into_iter().flatten().collect()
+    };
+
+    let mut result = HashMap::with_capacity(parsed_entries.len());
+    for (loc, pkg) in parsed_entries {
+        result.insert(loc, pkg);
     }
     result
 }
@@ -447,18 +489,9 @@ fn project_relative_realpath(project_dir: &Path, link: &Path) -> Option<String> 
 fn load_package_manifest(dir: &Path) -> (Option<Manifest>, Option<Value>, Option<String>) {
     let manifest_path = dir.join("package.json");
     if let Ok(content) = std::fs::read_to_string(&manifest_path) {
-        let manifest = serde_json::from_str::<Manifest>(&content).ok();
+        let manifest = Manifest::from_str_readonly(&content).ok();
         let raw_json = serde_json::from_str::<Value>(&content).ok();
-        let version = manifest
-            .as_ref()
-            .and_then(|m| m.version.clone())
-            .or_else(|| {
-                raw_json
-                    .as_ref()
-                    .and_then(|j| j.get("version"))
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string())
-            });
+        let version = manifest.as_ref().and_then(|m| m.version.clone());
         return (manifest, raw_json, version);
     }
     (None, None, None)
@@ -489,7 +522,7 @@ pub fn build_dependency_tree(
     let (root_manifest, root_raw) = if manifest_path.exists() {
         let content = std::fs::read_to_string(&manifest_path)?;
         let clean = content.strip_prefix('\u{feff}').unwrap_or(&content);
-        let m = Manifest::from_str(clean).ok();
+        let m = Manifest::from_str_readonly(clean).ok();
         let j = serde_json::from_str::<Value>(clean).ok();
         (m, j)
     } else {
@@ -526,7 +559,7 @@ pub fn build_dependency_tree(
 
     let lockfile_path = project_dir.join("package-lock.json");
     let lockfile = if lockfile_path.exists() {
-        LockfileV3::load_from_file(&lockfile_path).ok()
+        LockfileV3::load_from_file_readonly(&lockfile_path).ok()
     } else {
         None
     };
@@ -955,20 +988,22 @@ fn create_node_from_disk(
         .manifest
         .as_ref()
         .and_then(|m| m.description.clone());
-    let license = disk_pkg.raw_json.as_ref().and_then(|j| {
-        j.get("license")
+    let license = disk_pkg.manifest.as_ref().and_then(|m| {
+        m.extra
+            .get("license")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string())
     });
-    let homepage = disk_pkg.raw_json.as_ref().and_then(|j| {
-        j.get("homepage")
+    let homepage = disk_pkg.manifest.as_ref().and_then(|m| {
+        m.extra
+            .get("homepage")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string())
     });
     let repo = disk_pkg
-        .raw_json
+        .manifest
         .as_ref()
-        .and_then(|j| j.get("repository").cloned());
+        .and_then(|m| m.extra.get("repository").cloned());
     let engines = disk_pkg.manifest.as_ref().and_then(|m| {
         if m.engines.is_empty() {
             None
@@ -982,11 +1017,17 @@ fn create_node_from_disk(
         }
     });
 
-    let realpath = std::fs::canonicalize(&disk_pkg.dir_path)
-        .ok()
-        .map(|p| PathBuf::from(p.display().to_string().trim_start_matches(r"\\?\")))
-        .unwrap_or_else(|| disk_pkg.dir_path.clone());
-    let resolved = if realpath != disk_pkg.dir_path {
+    let (realpath, is_link) = if disk_pkg.is_link {
+        let rp = std::fs::canonicalize(&disk_pkg.dir_path)
+            .ok()
+            .map(|p| PathBuf::from(p.display().to_string().trim_start_matches(r"\\?\")))
+            .unwrap_or_else(|| disk_pkg.dir_path.clone());
+        let is_lnk = rp != disk_pkg.dir_path;
+        (rp, is_lnk)
+    } else {
+        (disk_pkg.dir_path.clone(), false)
+    };
+    let resolved = if is_link {
         realpath
             .strip_prefix(_project_dir)
             .ok()
@@ -1007,7 +1048,7 @@ fn create_node_from_disk(
         id: Some(pkgid.clone()),
         pkgid: Some(pkgid),
         is_workspace: false,
-        is_link: realpath != disk_pkg.dir_path,
+        is_link,
         location: disk_pkg.location.clone(),
         path: Some(disk_pkg.dir_path.clone()),
         realpath: Some(realpath),

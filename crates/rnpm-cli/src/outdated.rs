@@ -120,7 +120,7 @@ pub async fn run_outdated_inner(
     } else {
         std::fs::read_to_string(&manifest_path)?
     };
-    let manifest: Manifest = serde_json::from_str(&manifest_content)
+    let manifest = Manifest::from_str_readonly(&manifest_content)
         .map_err(|e| anyhow::anyhow!("Failed to parse package.json: {e}"))?;
 
     let root_name = if options.global {
@@ -259,7 +259,7 @@ pub async fn run_outdated_inner(
     // If options.all is true, also scan lockfile or nested node_modules for transitive dependencies
     let lockfile_path = project_dir.join("package-lock.json");
     let lockfile = if lockfile_path.exists() {
-        LockfileV3::load_from_file(&lockfile_path).ok()
+        LockfileV3::load_from_file_readonly(&lockfile_path).ok()
     } else {
         None
     };
@@ -859,18 +859,14 @@ fn find_installed_on_disk(
     pkg_json_path = pkg_json_path.join("package.json");
 
     if pkg_json_path.is_file() {
-        if let Ok(content) = std::fs::read_to_string(&pkg_json_path) {
-            if let Ok(val) = serde_json::from_str::<serde_json::Value>(&content) {
-                let version = val
-                    .get("version")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string());
-                let homepage = val
-                    .get("homepage")
-                    .and_then(|h| h.as_str())
-                    .map(|s| s.to_string());
-                return (version, homepage);
-            }
+        if let Ok(manifest) = Manifest::from_file_readonly(&pkg_json_path) {
+            let version = manifest.version;
+            let homepage = manifest
+                .extra
+                .get("homepage")
+                .and_then(|h| h.as_str())
+                .map(|s| s.to_string());
+            return (version, homepage);
         }
     }
     (None, None)
