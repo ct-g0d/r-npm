@@ -2033,3 +2033,330 @@ fn test_enrich_packages_from_legacy_clears_link_flags() {
     assert_eq!(link.link, Some(true));
     assert!(link.dev.is_none(), "Link node must not have dev flag");
 }
+
+// =========================================================================
+// 12. Opus 5.5 Findings Regression Tests (Swarm Worker 17)
+// =========================================================================
+
+#[test]
+fn test_opus_finding_1_non_registry_git_and_path_ref_flipping_drift() {
+    // 1. user/repo#v1 -> user/repo#v2 drift
+    let mut manifest_v1 = Manifest {
+        name: Some("test-app".to_string()),
+        version: Some("1.0.0".to_string()),
+        ..Default::default()
+    };
+    manifest_v1.dependencies.insert("shorthand-dep".to_string(), "foo/bar#v1".to_string());
+    let mut lockfile = LockfileV3::from_manifest(&manifest_v1);
+    lockfile.insert_package(
+        "node_modules/shorthand-dep",
+        LockfilePackage {
+            version: Some("1.0.0".to_string()),
+            resolved: Some("git+ssh://git@github.com/foo/bar.git#7971714392a83cfd5d0eb871638ecf15b8822557".to_string()),
+            ..Default::default()
+        },
+    );
+    assert!(
+        lockfile.matches_manifest_for_ci(&manifest_v1, true),
+        "in-sync shorthand git dependency must pass CI"
+    );
+    let mut manifest_v2 = manifest_v1.clone();
+    manifest_v2.dependencies.insert("shorthand-dep".to_string(), "foo/bar#v2".to_string());
+    assert!(
+        !lockfile.matches_manifest_for_ci(&manifest_v2, true),
+        "user/repo#v1 -> #v2 must be detected as drift"
+    );
+
+    // 2. github:user/repo#v1 -> github:user/repo#v2 drift
+    let mut manifest_gh1 = Manifest {
+        name: Some("test-app".to_string()),
+        version: Some("1.0.0".to_string()),
+        ..Default::default()
+    };
+    manifest_gh1.dependencies.insert("gh-dep".to_string(), "github:foo/bar#v1".to_string());
+    let mut lockfile_gh = LockfileV3::from_manifest(&manifest_gh1);
+    lockfile_gh.insert_package(
+        "node_modules/gh-dep",
+        LockfilePackage {
+            version: Some("1.0.0".to_string()),
+            resolved: Some("git+ssh://git@github.com/foo/bar.git#7971714392a83cfd5d0eb871638ecf15b8822557".to_string()),
+            ..Default::default()
+        },
+    );
+    assert!(
+        lockfile_gh.matches_manifest_for_ci(&manifest_gh1, true),
+        "in-sync github: spec must pass CI"
+    );
+    let mut manifest_gh2 = manifest_gh1.clone();
+    manifest_gh2.dependencies.insert("gh-dep".to_string(), "github:foo/bar#v2".to_string());
+    assert!(
+        !lockfile_gh.matches_manifest_for_ci(&manifest_gh2, true),
+        "github:user/repo#v1 -> #v2 must be detected as drift"
+    );
+
+    // 3. gitlab:user/repo#v1 -> gitlab:user/repo#v2 drift
+    let mut manifest_gl1 = Manifest {
+        name: Some("test-app".to_string()),
+        version: Some("1.0.0".to_string()),
+        ..Default::default()
+    };
+    manifest_gl1.dependencies.insert("gl-dep".to_string(), "gitlab:foo/bar#v1".to_string());
+    let mut lockfile_gl = LockfileV3::from_manifest(&manifest_gl1);
+    lockfile_gl.insert_package(
+        "node_modules/gl-dep",
+        LockfilePackage {
+            version: Some("1.0.0".to_string()),
+            resolved: Some("git+https://gitlab.com/foo/bar.git#7971714392a83cfd5d0eb871638ecf15b8822557".to_string()),
+            ..Default::default()
+        },
+    );
+    assert!(
+        lockfile_gl.matches_manifest_for_ci(&manifest_gl1, true),
+        "in-sync gitlab: spec must pass CI"
+    );
+    let mut manifest_gl2 = manifest_gl1.clone();
+    manifest_gl2.dependencies.insert("gl-dep".to_string(), "gitlab:foo/bar#v2".to_string());
+    assert!(
+        !lockfile_gl.matches_manifest_for_ci(&manifest_gl2, true),
+        "gitlab:user/repo#v1 -> #v2 must be detected as drift"
+    );
+
+    // 4. git@github.com:user/repo#v1 -> git@github.com:user/repo#v2 drift
+    let mut manifest_ssh1 = Manifest {
+        name: Some("test-app".to_string()),
+        version: Some("1.0.0".to_string()),
+        ..Default::default()
+    };
+    manifest_ssh1.dependencies.insert("ssh-dep".to_string(), "git@github.com:foo/bar.git#v1".to_string());
+    let mut lockfile_ssh = LockfileV3::from_manifest(&manifest_ssh1);
+    lockfile_ssh.insert_package(
+        "node_modules/ssh-dep",
+        LockfilePackage {
+            version: Some("1.0.0".to_string()),
+            resolved: Some("git+ssh://git@github.com/foo/bar.git#7971714392a83cfd5d0eb871638ecf15b8822557".to_string()),
+            ..Default::default()
+        },
+    );
+    assert!(
+        lockfile_ssh.matches_manifest_for_ci(&manifest_ssh1, true),
+        "in-sync git@host spec must pass CI"
+    );
+    let mut manifest_ssh2 = manifest_ssh1.clone();
+    manifest_ssh2.dependencies.insert("ssh-dep".to_string(), "git@github.com:foo/bar.git#v2".to_string());
+    assert!(
+        !lockfile_ssh.matches_manifest_for_ci(&manifest_ssh2, true),
+        "git@host#v1 -> #v2 must be detected as drift"
+    );
+
+    // 5. Local path ./a -> ./b drift
+    let mut manifest_path_a = Manifest {
+        name: Some("test-app".to_string()),
+        version: Some("1.0.0".to_string()),
+        ..Default::default()
+    };
+    manifest_path_a.dependencies.insert("local-dep".to_string(), "./a".to_string());
+    let mut lockfile_path = LockfileV3::from_manifest(&manifest_path_a);
+    lockfile_path.insert_package(
+        "node_modules/local-dep",
+        LockfilePackage {
+            version: Some("file:./a".to_string()),
+            resolved: Some("file:./a".to_string()),
+            ..Default::default()
+        },
+    );
+    assert!(
+        lockfile_path.matches_manifest_for_ci(&manifest_path_a, true),
+        "in-sync ./a spec must pass CI"
+    );
+    let mut manifest_path_b = manifest_path_a.clone();
+    manifest_path_b.dependencies.insert("local-dep".to_string(), "./b".to_string());
+    assert!(
+        !lockfile_path.matches_manifest_for_ci(&manifest_path_b, true),
+        "./a -> ./b path change must be detected as drift"
+    );
+}
+
+#[test]
+fn test_opus_finding_1_canonical_matching_non_registry_specs_pass_ci() {
+    let manifest = Manifest {
+        name: Some("canon-app".to_string()),
+        version: Some("1.0.0".to_string()),
+        dependencies: {
+            let mut m = BTreeMap::new();
+            // Manifest uses shorthand foo/bar#v1
+            m.insert("git-dep".to_string(), "foo/bar#v1".to_string());
+            // Manifest uses bare relative path ./local-pkg
+            m.insert("file-dep".to_string(), "./local-pkg".to_string());
+            // Manifest uses npm alias with git target
+            m.insert("alias-dep".to_string(), "npm:real-dep@foo/bar#v1".to_string());
+            m
+        },
+        ..Default::default()
+    };
+
+    let mut lockfile = LockfileV3::new("canon-app", Some("1.0.0".to_string()));
+    let mut root_deps = BTreeMap::new();
+    // Lockfile root has github: expansion
+    root_deps.insert("git-dep".to_string(), "github:foo/bar#v1".to_string());
+    // Lockfile root has file: prefix
+    root_deps.insert("file-dep".to_string(), "file:./local-pkg".to_string());
+    // Lockfile root has npm alias with github: expansion
+    root_deps.insert("alias-dep".to_string(), "npm:real-dep@github:foo/bar#v1".to_string());
+    lockfile.root_package_mut().unwrap().dependencies = Some(root_deps);
+
+    lockfile.insert_package(
+        "node_modules/git-dep",
+        LockfilePackage {
+            version: Some("1.0.0".to_string()),
+            resolved: Some("git+ssh://git@github.com/foo/bar.git#7971714392a83cfd5d0eb871638ecf15b8822557".to_string()),
+            ..Default::default()
+        },
+    );
+    lockfile.insert_package(
+        "node_modules/file-dep",
+        LockfilePackage {
+            version: Some("file:./local-pkg".to_string()),
+            resolved: Some("file:./local-pkg".to_string()),
+            ..Default::default()
+        },
+    );
+    lockfile.insert_package(
+        "node_modules/alias-dep",
+        LockfilePackage {
+            name: Some("real-dep".to_string()),
+            version: Some("1.0.0".to_string()),
+            resolved: Some("git+ssh://git@github.com/foo/bar.git#7971714392a83cfd5d0eb871638ecf15b8822557".to_string()),
+            ..Default::default()
+        },
+    );
+
+    assert!(
+        lockfile.matches_manifest_for_ci(&manifest, true),
+        "canonically identical non-registry specs (shorthand vs expanded, ./ vs file:./) must pass CI"
+    );
+}
+
+#[test]
+fn test_opus_bonus_finding_is_direct_dependency_aliased_and_hoisted() {
+    let mut lock = LockfileV3::new("bonus-test", Some("1.0.0".to_string()));
+    let mut root_deps = BTreeMap::new();
+    root_deps.insert("real-pkg".to_string(), "^1.0.0".to_string());
+    root_deps.insert("my-alias".to_string(), "npm:real-pkg@^2.0.0".to_string());
+    lock.root_package_mut().unwrap().dependencies = Some(root_deps);
+
+    // Direct dependency 1: node_modules/real-pkg
+    lock.insert_package(
+        "node_modules/real-pkg",
+        LockfilePackage {
+            name: Some("real-pkg".to_string()),
+            version: Some("1.0.0".to_string()),
+            resolved: Some("https://registry.npmjs.org/real-pkg/-/real-pkg-1.0.0.tgz".to_string()),
+            integrity: Some("sha512-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==".to_string()),
+            ..Default::default()
+        },
+    );
+
+    // Direct dependency 2: node_modules/my-alias (aliased to real-pkg)
+    lock.insert_package(
+        "node_modules/my-alias",
+        LockfilePackage {
+            name: Some("real-pkg".to_string()),
+            version: Some("2.0.0".to_string()),
+            resolved: Some("https://registry.npmjs.org/real-pkg/-/real-pkg-2.0.0.tgz".to_string()),
+            integrity: Some("sha512-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==".to_string()),
+            ..Default::default()
+        },
+    );
+
+    // Transitive dependency: node_modules/transitive-evil
+    // Its internal name happens to be "real-pkg", but it is installed at "node_modules/transitive-evil"
+    // and uses an untrusted git source!
+    lock.insert_package(
+        "node_modules/transitive-evil",
+        LockfilePackage {
+            name: Some("real-pkg".to_string()),
+            version: Some("3.0.0".to_string()),
+            resolved: Some("git+https://github.com/evil/real-pkg.git#1111111111111111111111111111111111111111".to_string()),
+            integrity: Some("sha512-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==".to_string()),
+            ..Default::default()
+        },
+    );
+
+    let policy = IntegrityPolicy {
+        allow_transitive_git: false,
+        ..Default::default()
+    };
+
+    let res = verify_lockfile_integrity(&lock, &policy);
+    assert!(
+        res.is_err(),
+        "transitive package in node_modules/transitive-evil must NOT be misclassified as direct dependency just because its name is 'real-pkg'"
+    );
+
+    match res.unwrap_err() {
+        LockfileError::PoisonedDependency { package, reason } => {
+            assert_eq!(package, "node_modules/transitive-evil");
+            assert!(reason.contains("untrusted git source"), "reason was: {reason}");
+        }
+        other => panic!("expected PoisonedDependency error, got: {other:?}"),
+    }
+}
+
+#[test]
+fn test_missing_root_dep_in_packages_root_is_always_ci_drift_even_if_node_modules_exists() {
+    // Lockfile has packages[""].dependencies with only "a" -> "^1.0.0"
+    let mut lockfile = LockfileV3::new("test-app", Some("1.0.0".to_string()));
+    let mut root_deps = BTreeMap::new();
+    root_deps.insert("a".to_string(), "^1.0.0".to_string());
+    lockfile.root_package_mut().unwrap().dependencies = Some(root_deps);
+
+    // node_modules/a exists in lockfile
+    lockfile.insert_package(
+        "node_modules/a",
+        LockfilePackage {
+            version: Some("1.0.0".to_string()),
+            resolved: Some("https://registry.npmjs.org/a/-/a-1.0.0.tgz".to_string()),
+            integrity: Some("sha512-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==".to_string()),
+            ..Default::default()
+        },
+    );
+
+    // node_modules/b also exists in lockfile (e.g. hoisted transitive of a, or former devDependency)
+    lockfile.insert_package(
+        "node_modules/b",
+        LockfilePackage {
+            version: Some("1.0.0".to_string()),
+            resolved: Some("https://registry.npmjs.org/b/-/b-1.0.0.tgz".to_string()),
+            integrity: Some("sha512-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==".to_string()),
+            dev: Some(true),
+            ..Default::default()
+        },
+    );
+
+    // Initial manifest has only "a" -> matches CI
+    let mut manifest = Manifest {
+        name: Some("test-app".to_string()),
+        version: Some("1.0.0".to_string()),
+        dependencies: {
+            let mut m = BTreeMap::new();
+            m.insert("a".to_string(), "^1.0.0".to_string());
+            m
+        },
+        ..Default::default()
+    };
+    assert!(
+        lockfile.matches_manifest_for_ci(&manifest, true),
+        "initial manifest with 'a' matches CI lockfile"
+    );
+
+    // User adds "b": "^1.0.0" to package.json dependencies without updating package-lock.json
+    manifest.dependencies.insert("b".to_string(), "^1.0.0".to_string());
+
+    // Even though node_modules/b exists in lockfile and version 1.0.0 satisfies ^1.0.0,
+    // lockfile.packages[""].dependencies is missing "b".
+    // matches_manifest_for_ci MUST return false (drift detected)!
+    assert!(
+        !lockfile.matches_manifest_for_ci(&manifest, true),
+        "adding 'b' to manifest when packages[''].dependencies omits 'b' must reject CI even if node_modules/b exists"
+    );
+}
