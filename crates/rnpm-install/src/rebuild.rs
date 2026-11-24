@@ -264,7 +264,7 @@ pub async fn execute_rebuild(options: &RebuildOptions) -> Result<RebuildSummary>
 
     let lifecycle_opts = LifecycleOptions {
         root_dir: project_dir.clone(),
-        init_cwd: project_dir.clone(),
+        init_cwd: std::env::current_dir().unwrap_or_else(|_| project_dir.clone()),
         ignore_scripts: options.ignore_scripts,
         capture_output: !options.foreground_scripts,
         foreground_scripts: options.foreground_scripts,

@@ -1852,6 +1852,7 @@ fn process_installed_pkg_manifest_without_bins(
 #[derive(Debug, Clone)]
 pub struct InstallOptions {
     pub project_dir: PathBuf,
+    pub init_cwd: Option<PathBuf>,
     pub registry_url: Option<String>,
     pub cache_dir: Option<PathBuf>,
     pub offline: bool,
@@ -2007,6 +2008,7 @@ impl Default for InstallOptions {
     fn default() -> Self {
         Self {
             project_dir: PathBuf::from("."),
+            init_cwd: None,
             registry_url: None,
             cache_dir: None,
             offline: false,
@@ -2956,7 +2958,11 @@ impl Installer {
             });
         LifecycleOptions {
             root_dir: self.options.project_dir.clone(),
-            init_cwd: self.options.project_dir.clone(),
+            init_cwd: self
+                .options
+                .init_cwd
+                .clone()
+                .unwrap_or_else(|| self.options.project_dir.clone()),
             ignore_scripts: false,
             capture_output: !self.options.foreground_scripts,
             foreground_scripts: self.options.foreground_scripts,

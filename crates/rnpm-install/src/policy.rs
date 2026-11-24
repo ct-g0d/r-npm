@@ -363,10 +363,85 @@ fn split_parent_and_name(location: &str) -> Option<(&str, &str)> {
     None
 }
 
+fn is_hex_str(s: &str) -> bool {
+    !s.is_empty() && s.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+fn is_full_commit_sha(s: &str) -> bool {
+    (s.len() == 40 || s.len() == 64) && is_hex_str(s)
+}
+
+fn is_git_ref_match(d_ref: &str, spec_ref: &str) -> bool {
+    // Exact ref equality (case-sensitive for branches/tags like #v1)
+    if d_ref == spec_ref {
+        return true;
+    }
+    // Case-insensitive for hex SHAs
+    if is_hex_str(d_ref) && is_hex_str(spec_ref) && d_ref.eq_ignore_ascii_case(spec_ref) {
+        return true;
+    }
+    // Short >=7-char hex prefix ONLY when one side is a full 40/64-char hex commit SHA
+    if (is_full_commit_sha(d_ref) && is_hex_str(spec_ref) && spec_ref.len() >= 7)
+        || (is_full_commit_sha(spec_ref) && is_hex_str(d_ref) && d_ref.len() >= 7)
+    {
+        let d_lower = d_ref.to_ascii_lowercase();
+        let spec_lower = spec_ref.to_ascii_lowercase();
+        if d_lower.starts_with(&spec_lower) || spec_lower.starts_with(&d_lower) {
+            return true;
+        }
+    }
+    // Allowing any lockfile commit SHA ONLY when the authored package.json spec itself has NO #ref
+    if d_ref.is_empty() {
+        if spec_ref.is_empty() {
+            return true;
+        }
+        if is_hex_str(spec_ref) && spec_ref.len() >= 7 {
+            return true;
+        }
+    }
+    false
+}
+
 fn is_declared_root_spec(spec: &str, kind: SourceKind, root_declared: &HashSet<String>) -> bool {
     let extracted = unpack_alias(spec);
     let norm_spec = spec.replace('\\', "/");
     let norm_extracted = extracted.replace('\\', "/");
+
+    if kind == SourceKind::Git {
+        let spec_ident = git_identity(extracted).or_else(|| git_identity(spec));
+        if let Some((spec_repo, spec_ref)) = spec_ident {
+            let matched = root_declared.iter().any(|d| {
+                let d_unpacked = unpack_alias(d);
+                let d_ident = git_identity(d_unpacked).or_else(|| git_identity(d));
+                if let Some((d_repo, d_ref)) = d_ident {
+                    if d_repo.eq_ignore_ascii_case(&spec_repo) {
+                        return is_git_ref_match(&d_ref, &spec_ref);
+                    }
+                }
+                false
+            });
+            if matched {
+                return true;
+            }
+        }
+        // Fallback for git specs that might not be parsed by git_identity:
+        // ONLY exact match without stripping `#`
+        return root_declared.contains(spec)
+            || root_declared.contains(extracted)
+            || root_declared.contains(&norm_spec)
+            || root_declared.contains(&norm_extracted)
+            || root_declared.iter().any(|d| {
+                let d_unpacked = unpack_alias(d);
+                let d_norm = d.replace('\\', "/");
+                let d_unpacked_norm = d_unpacked.replace('\\', "/");
+                d == spec
+                    || d == extracted
+                    || d_norm == norm_spec
+                    || d_unpacked_norm == norm_extracted
+                    || d_unpacked == extracted
+            });
+    }
+
     let spec_base = spec.split_once('#').map(|(b, _)| b).unwrap_or(spec);
     let extracted_base = extracted.split_once('#').map(|(b, _)| b).unwrap_or(extracted);
     let norm_spec_base = norm_spec.split_once('#').map(|(b, _)| b).unwrap_or(&norm_spec);
@@ -383,31 +458,7 @@ fn is_declared_root_spec(spec: &str, kind: SourceKind, root_declared: &HashSet<S
     {
         return true;
     }
-    if kind == SourceKind::Git {
-        let spec_ident = git_identity(extracted).or_else(|| git_identity(spec));
-        if let Some((spec_repo, spec_ref)) = spec_ident {
-            let matched = root_declared.iter().any(|d| {
-                let d_unpacked = unpack_alias(d);
-                let d_ident = git_identity(d_unpacked).or_else(|| git_identity(d));
-                if let Some((d_repo, d_ref)) = d_ident {
-                    if d_repo.eq_ignore_ascii_case(&spec_repo) {
-                        let d_ref_lower = d_ref.to_ascii_lowercase();
-                        let spec_ref_lower = spec_ref.to_ascii_lowercase();
-                        return d_ref.is_empty()
-                            || d_ref_lower == spec_ref_lower
-                            || (d_ref.len() >= 7
-                                && spec_ref.len() >= 7
-                                && (d_ref_lower.starts_with(&spec_ref_lower)
-                                    || spec_ref_lower.starts_with(&d_ref_lower)));
-                    }
-                }
-                false
-            });
-            if matched {
-                return true;
-            }
-        }
-    }
+
     root_declared.iter().any(|d| {
         let d_unpacked = unpack_alias(d);
         let d_norm = d.replace('\\', "/");
@@ -422,16 +473,18 @@ fn is_declared_root_spec(spec: &str, kind: SourceKind, root_declared: &HashSet<S
             || d_norm == norm_spec
             || d_unpacked_norm == norm_extracted
             || d_unpacked == extracted
-            || d_base == spec_base
-            || d_unpacked_base == extracted_base
-            || d_norm_base == norm_spec_base
-            || d_unpacked_norm_base == norm_extracted_base
+            || (!is_git_spec(spec)
+                && !is_git_spec(d)
+                && (d_base == spec_base
+                    || d_unpacked_base == extracted_base
+                    || d_norm_base == norm_spec_base
+                    || d_unpacked_norm_base == norm_extracted_base))
     })
 }
 
 fn is_direct_root_dep(
     location: &str,
-    packages: &std::collections::BTreeMap<String, LockfilePackage>,
+    normalized_packages: &std::collections::HashMap<String, &LockfilePackage>,
     workspace_paths: &HashSet<String>,
     root_declared: &HashSet<String>,
     kind: SourceKind,
@@ -472,15 +525,7 @@ fn is_direct_root_dep(
     };
 
     let get_pkg = |loc: &str| -> Option<&LockfilePackage> {
-        packages.get(loc).or_else(|| {
-            packages.iter().find_map(|(k, v)| {
-                if k.replace('\\', "/") == loc {
-                    Some(v)
-                } else {
-                    None
-                }
-            })
-        })
+        normalized_packages.get(loc).copied()
     };
 
     if parent.is_empty() {
@@ -570,6 +615,12 @@ pub fn check_sources_with_root_context(
 
     let norm_workspace_paths: HashSet<String> =
         workspace_paths.iter().map(|p| p.replace('\\', "/")).collect();
+
+    let normalized_packages: std::collections::HashMap<String, &LockfilePackage> = lockfile
+        .packages
+        .iter()
+        .map(|(k, v)| (k.replace('\\', "/"), v))
+        .collect();
 
     // 1. Collect all explicit remote URLs from root_declared and lockfile specs.
     let mut explicit_remote_specs = HashSet::new();
@@ -697,7 +748,7 @@ pub fn check_sources_with_root_context(
         } else if norm_workspace_paths.contains(&norm_loc) {
             true
         } else {
-            is_direct_root_dep(&norm_loc, &lockfile.packages, &norm_workspace_paths, root_declared, kind)
+            is_direct_root_dep(&norm_loc, &normalized_packages, &norm_workspace_paths, root_declared, kind)
         };
         check_source_gate(policy, kind, is_root)?;
     }
