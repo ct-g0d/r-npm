@@ -8006,6 +8006,10 @@ fn execute_run_sync(
         ctx.package_version = manifest.version.clone();
         ctx.foreground_scripts = foreground_scripts;
         ctx.extra_env = lifecycle_config_env(&current_dir);
+        if let Ok(inv_cwd) = std::env::current_dir() {
+            ctx.extra_env
+                .insert("INIT_CWD".into(), inv_cwd.to_string_lossy().to_string());
+        }
         ctx.extra_env
             .insert("npm_lifecycle_script".into(), cmd.clone());
         if let Some(shell) = config.get("script-shell") {

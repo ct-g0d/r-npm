@@ -750,6 +750,15 @@ pub fn check_sources_with_root_context(
         } else {
             is_direct_root_dep(&norm_loc, &normalized_packages, &norm_workspace_paths, root_declared, kind)
         };
+        let is_root = if is_root && (kind == SourceKind::Git || kind == SourceKind::Remote) {
+            if let Some(resolved) = pkg.resolved.as_deref() {
+                is_declared_root_spec(resolved, kind, root_declared)
+            } else {
+                true
+            }
+        } else {
+            is_root
+        };
         check_source_gate(policy, kind, is_root)?;
     }
     Ok(())
