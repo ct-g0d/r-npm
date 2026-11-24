@@ -130,8 +130,9 @@ pub fn match_glob_patterns(
             let neg_clean = neg_clean.strip_prefix("./").unwrap_or(neg_clean);
             let neg_clean = neg_clean.strip_prefix(".\\").unwrap_or(neg_clean);
             let posix_neg = neg_clean.replace('\\', "/");
+            let posix_neg = posix_neg.trim_end_matches('/');
 
-            if matches_neg_pattern(&posix_neg, &posix_rel) {
+            if matches_neg_pattern(posix_neg, &posix_rel) {
                 excluded = true;
                 break;
             }
@@ -271,6 +272,8 @@ pub fn wildcard_match(pattern: &str, text: &str) -> bool {
 }
 
 fn matches_neg_pattern(neg_pattern: &str, rel_path: &str) -> bool {
+    let neg_pattern = neg_pattern.trim_end_matches('/');
+    let rel_path = rel_path.trim_end_matches('/');
     if neg_pattern == rel_path {
         return true;
     }
@@ -289,7 +292,15 @@ fn matches_neg_pattern(neg_pattern: &str, rel_path: &str) -> bool {
             return true;
         }
     }
-    wildcard_match(neg_pattern, rel_path)
+    if wildcard_match(neg_pattern, rel_path) {
+        return true;
+    }
+    let neg_segs: Vec<&str> = neg_pattern.split('/').filter(|s| !s.is_empty()).collect();
+    let path_segs: Vec<&str> = rel_path.split('/').filter(|s| !s.is_empty()).collect();
+    if !neg_segs.is_empty() && match_segments(&neg_segs, &path_segs) {
+        return true;
+    }
+    false
 }
 
 fn match_segments(pat_segs: &[&str], path_segs: &[&str]) -> bool {
@@ -424,4 +435,23 @@ pub fn path_matches_workspace_patterns(path: &str, patterns: &[String]) -> bool 
     }
 
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_negation_pattern_with_trailing_slash() {
+        assert!(matches_neg_pattern("packages/ignored/", "packages/ignored"));
+        assert!(matches_neg_pattern("packages/ignored", "packages/ignored/"));
+        assert!(matches_neg_pattern("packages/*/ignored/", "packages/a/ignored"));
+
+        let patterns = vec![
+            "packages/*".to_string(),
+            "!packages/ignored/".to_string(),
+        ];
+        assert!(path_matches_workspace_patterns("packages/pkg-a", &patterns));
+        assert!(!path_matches_workspace_patterns("packages/ignored", &patterns));
+    }
 }
