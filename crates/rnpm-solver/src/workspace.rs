@@ -171,6 +171,17 @@ impl WorkspaceDependencyGraph {
         self.members.get(name)
     }
 
+    /// Check whether a specific dependency spec on `sibling_name` is satisfied by the local workspace sibling.
+    pub fn has_compatible_sibling(&self, sibling_name: &str, raw_spec: &str) -> bool {
+        let trimmed = raw_spec.trim();
+        if trimmed.starts_with("workspace:") {
+            return true;
+        }
+        self.members
+            .get(sibling_name)
+            .is_some_and(|sibling| is_sibling_compatible(sibling, trimmed))
+    }
+
     /// Check if member has an inter-workspace sibling dependency on sibling_name.
     pub fn has_sibling_edge(&self, member: &str, sibling_name: &str) -> bool {
         self.dependencies
@@ -858,32 +869,24 @@ pub fn resolve_workspace_graph<P: PackageMetadataProvider>(
 
         if options.dev {
             for (k, v) in &member.manifest.dev_dependencies {
-                let is_ws = ws_graph.has_sibling_edge(&member.name, k)
-                    || v.trim().starts_with("workspace:");
-                if !is_ws {
+                if !ws_graph.has_compatible_sibling(k, v) {
                     member_deps.insert(k.clone(), (v.clone(), DependencyType::Dev));
                 }
             }
         }
         for (k, v) in &member.manifest.dependencies {
-            let is_ws =
-                ws_graph.has_sibling_edge(&member.name, k) || v.trim().starts_with("workspace:");
-            if !is_ws {
+            if !ws_graph.has_compatible_sibling(k, v) {
                 member_deps.insert(k.clone(), (v.clone(), DependencyType::Prod));
             }
         }
         for (k, v) in &member.manifest.optional_dependencies {
-            let is_ws =
-                ws_graph.has_sibling_edge(&member.name, k) || v.trim().starts_with("workspace:");
-            if !is_ws {
+            if !ws_graph.has_compatible_sibling(k, v) {
                 member_deps.insert(k.clone(), (v.clone(), DependencyType::Optional));
             }
         }
         if !options.legacy_peer_deps {
             for (k, v) in &member.manifest.peer_dependencies {
-                let is_ws = ws_graph.has_sibling_edge(&member.name, k)
-                    || v.trim().starts_with("workspace:");
-                if !is_ws {
+                if !ws_graph.has_compatible_sibling(k, v) {
                     let is_opt_peer = member
                         .manifest
                         .peer_dependencies_meta

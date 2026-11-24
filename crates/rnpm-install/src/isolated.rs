@@ -521,6 +521,13 @@ pub fn plan(lock: &LockfileV3, omit: Omit, manifests: &HashMap<String, Value>) -
 
 /// Makes `link` a directory link to `target`, replacing whatever is there.
 pub fn ensure_link(link: &Path, target: &Path) -> Result<()> {
+    if !target.exists() {
+        anyhow::bail!(
+            "Cannot link '{}' to nonexistent target '{}'",
+            link.display(),
+            target.display()
+        );
+    }
     if rnpm_fs::junction::junction_points_to(link, target) {
         return Ok(());
     }

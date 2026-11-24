@@ -1693,17 +1693,6 @@ impl LockfileV3 {
                         if target_is_sha {
                             return Self::git_refs_equal(res_frag, target_frag);
                         }
-                        if let Some(ver_str) = pkg.version.as_deref() {
-                            let clean = target_frag.strip_prefix(['v', 'V']).unwrap_or(target_frag);
-                            if let (Ok(range), Ok(ver)) = (
-                                rnpm_core::semver::Range::parse(clean.trim()),
-                                Version::parse(ver_str),
-                            ) {
-                                if !range.satisfies(&ver) {
-                                    return false;
-                                }
-                            }
-                        }
                         return res_is_sha;
                     }
                     return true;
@@ -2290,17 +2279,6 @@ impl LockfileV3 {
                         return false;
                     };
                     return range.satisfies(&v);
-                }
-                if let Some(c) = committish.as_deref() {
-                    let clean = c.strip_prefix(['v', 'V']).unwrap_or(c);
-                    if let (Ok(range), Ok(v)) = (
-                        rnpm_core::semver::Range::parse(clean.trim()),
-                        Version::parse(ver_str),
-                    ) {
-                        if !range.satisfies(&v) {
-                            return false;
-                        }
-                    }
                 }
                 true
             }
@@ -3766,24 +3744,48 @@ mod platform_field_tests {
             "abcdef0123456789abcdef0123456789abcdef01"
         ));
 
-        // Finding 5: named git branch/tag drift rejection
-        let pkg_v1 = super::LockfilePackage {
-            version: Some("1.0.0".to_string()),
+        // Git tags and branch names are independent of package.json version:
+        // a tag #v1.0.0 whose commit has package.json version 0.9.0 must pass,
+        // while changing package.json from #v1.0.0 to #v2.0.0 triggers drift via lock_spec.
+        let pkg_v09 = super::LockfilePackage {
+            version: Some("0.9.0".to_string()),
             resolved: Some("git+https://github.com/org/repo.git#1a2b3c4d5e6f1a2b3c4d5e6f1a2b3c4d5e6f1a2b".to_string()),
             ..Default::default()
         };
-        // Target specifies #v2.0.0 but locked package is 1.0.0: must reject!
-        assert!(!super::LockfileV3::package_satisfies_spec(
-            "repo",
-            &pkg_v1,
-            "git+https://github.com/org/repo.git#v2.0.0"
-        ));
-        // Target specifies #v1.0.0 and locked package is 1.0.0: must accept!
         assert!(super::LockfileV3::package_satisfies_spec(
             "repo",
-            &pkg_v1,
+            &pkg_v09,
             "git+https://github.com/org/repo.git#v1.0.0"
         ));
+        let mut git_lock = super::LockfileV3::new("git-tag-app", Some("1.0.0".to_string()));
+        if let Some(root) = git_lock.packages.get_mut("") {
+            root.dependencies = Some(std::collections::BTreeMap::from([(
+                "repo".to_string(),
+                "git+https://github.com/org/repo.git#v1.0.0".to_string(),
+            )]));
+        }
+        git_lock.insert_package("node_modules/repo", pkg_v09);
+        let mut git_manifest = rnpm_core::Manifest {
+            name: Some("git-tag-app".to_string()),
+            version: Some("1.0.0".to_string()),
+            ..Default::default()
+        };
+        git_manifest.dependencies.insert(
+            "repo".to_string(),
+            "git+https://github.com/org/repo.git#v1.0.0".to_string(),
+        );
+        assert!(
+            git_lock.matches_manifest(&git_manifest, true),
+            "git tag #v1.0.0 with package.json version 0.9.0 must match valid lockfile"
+        );
+        git_manifest.dependencies.insert(
+            "repo".to_string(),
+            "git+https://github.com/org/repo.git#v2.0.0".to_string(),
+        );
+        assert!(
+            !git_lock.matches_manifest(&git_manifest, true),
+            "changing package.json git tag from #v1.0.0 to #v2.0.0 must trigger lockfile drift"
+        );
 
         // Finding 6: target_matches_resolved for file:../ rejects arbitrary absolute paths
         let file_parent = rnpm_core::spec::PackageTarget::File(PathBuf::from("../"));
