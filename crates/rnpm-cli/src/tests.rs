@@ -1557,46 +1557,46 @@ fn test_cli_parse_shortcuts_and_bare_run() {
     // rnpm test and aliases
     let parsed = Cli::try_parse_from(["rnpm", "test"]).unwrap();
     match parsed.command {
-        Commands::Test { args } => assert!(args.is_empty()),
+        Commands::Test { args, .. } => assert!(args.is_empty()),
         _ => panic!("Expected Commands::Test"),
     }
 
     let parsed = Cli::try_parse_from(["rnpm", "t"]).unwrap();
     match parsed.command {
-        Commands::Test { args } => assert!(args.is_empty()),
+        Commands::Test { args, .. } => assert!(args.is_empty()),
         _ => panic!("Expected Commands::Test via 't' alias"),
     }
 
     let parsed = Cli::try_parse_from(["rnpm", "tst"]).unwrap();
     match parsed.command {
-        Commands::Test { args } => assert!(args.is_empty()),
+        Commands::Test { args, .. } => assert!(args.is_empty()),
         _ => panic!("Expected Commands::Test via 'tst' alias"),
     }
 
     let parsed = Cli::try_parse_from(["rnpm", "test", "--", "--reporter", "spec"]).unwrap();
     match parsed.command {
-        Commands::Test { args } => assert_eq!(args, vec!["--reporter", "spec"]),
+        Commands::Test { args, .. } => assert_eq!(args, vec!["--reporter", "spec"]),
         _ => panic!("Expected Commands::Test with forwarded args"),
     }
 
     // rnpm start
     let parsed = Cli::try_parse_from(["rnpm", "start", "--port", "3000"]).unwrap();
     match parsed.command {
-        Commands::Start { args } => assert_eq!(args, vec!["--port", "3000"]),
+        Commands::Start { args, .. } => assert_eq!(args, vec!["--port", "3000"]),
         _ => panic!("Expected Commands::Start"),
     }
 
     // rnpm restart
     let parsed = Cli::try_parse_from(["rnpm", "restart"]).unwrap();
     match parsed.command {
-        Commands::Restart { args } => assert!(args.is_empty()),
+        Commands::Restart { args, .. } => assert!(args.is_empty()),
         _ => panic!("Expected Commands::Restart"),
     }
 
     // rnpm stop
     let parsed = Cli::try_parse_from(["rnpm", "stop"]).unwrap();
     match parsed.command {
-        Commands::Stop { args } => assert!(args.is_empty()),
+        Commands::Stop { args, .. } => assert!(args.is_empty()),
         _ => panic!("Expected Commands::Stop"),
     }
 
@@ -2527,12 +2527,9 @@ fn test_thread5_cli_command_parsing() {
     let cli = Cli::try_parse_from(["rnpm", "config", "set", "foo", "bar"]).unwrap();
     match cli.command {
         Commands::Config {
-            action: ConfigAction::Set {
-                key, value, global, ..
-            },
+            action: ConfigAction::Set { args, global, .. },
         } => {
-            assert_eq!(key, "foo");
-            assert_eq!(value.as_deref(), Some("bar"));
+            assert_eq!(args, vec!["foo", "bar"]);
             assert!(!global);
         }
         _ => panic!("Expected Config Set"),
