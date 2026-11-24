@@ -200,7 +200,7 @@ impl GitFetcher {
 
         // pacote resolves the remote refs before attempting a clone. Preserve
         // that command's stderr and status rather than reporting clone errors.
-        let args = ["--no-replace-objects", "ls-remote", clone_url];
+        let args = ["--no-replace-objects", "ls-remote", &normalized_url];
         let output = match tokio::process::Command::new("git")
             .args(args)
             .env("GIT_TERMINAL_PROMPT", "0")
@@ -721,6 +721,10 @@ pub fn format_git_resolved_url(target: &PackageTarget, commit_sha: &str) -> Stri
 /// Normalizes clone URL for git command execution on current platform.
 pub fn normalize_clone_url_for_git(url: &str) -> String {
     let clean = url.strip_prefix("git+").unwrap_or(url);
+    if let Some(rest) = clean.strip_prefix("github:") {
+        let repo = rest.trim_end_matches(".git");
+        return format!("https://github.com/{repo}.git");
+    }
     if clean.starts_with("file://") {
         if let Ok(path) = url::Url::parse(clean).and_then(|u| {
             u.to_file_path()
@@ -728,12 +732,6 @@ pub fn normalize_clone_url_for_git(url: &str) -> String {
         }) {
             return path.to_string_lossy().replace('\\', "/");
         }
-    }
-    if let Some(rest) = clean.strip_prefix("ssh://git@github.com/") {
-        return format!("https://github.com/{rest}");
-    }
-    if let Some(rest) = clean.strip_prefix("git@github.com:") {
-        return format!("https://github.com/{rest}");
     }
     if let Some(rest) = clean.strip_prefix("file://") {
         let rest_trimmed = rest.trim_start_matches('/');
@@ -1437,6 +1435,40 @@ mod tests {
         assert_eq!(
             normalize_clone_url_for_git("https://github.com/user/repo.git"),
             "https://github.com/user/repo.git"
+        );
+
+        // Explicit SSH URLs must be preserved, not rewritten to HTTPS
+        assert_eq!(
+            normalize_clone_url_for_git("ssh://git@github.com/org/private.git"),
+            "ssh://git@github.com/org/private.git"
+        );
+        assert_eq!(
+            normalize_clone_url_for_git("git+ssh://git@github.com/org/private.git"),
+            "ssh://git@github.com/org/private.git"
+        );
+        assert_eq!(
+            normalize_clone_url_for_git("git@github.com:org/private.git"),
+            "git@github.com:org/private.git"
+        );
+        assert_eq!(
+            normalize_clone_url_for_git("git+git@github.com:org/private.git"),
+            "git@github.com:org/private.git"
+        );
+
+        // GitHub shorthand must use HTTPS matching pacote/hosted-git-info
+        assert_eq!(
+            normalize_clone_url_for_git("github:org/repo"),
+            "https://github.com/org/repo.git"
+        );
+        assert_eq!(
+            normalize_clone_url_for_git("git+github:org/repo"),
+            "https://github.com/org/repo.git"
+        );
+
+        // Explicit HTTPS URLs are preserved
+        assert_eq!(
+            normalize_clone_url_for_git("git+https://github.com/org/repo.git"),
+            "https://github.com/org/repo.git"
         );
 
         #[cfg(windows)]
