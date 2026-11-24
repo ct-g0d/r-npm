@@ -1187,10 +1187,11 @@ fn normalize_git_url(raw: &str) -> String {
         format!("git+https://gist.github.com/{id}.git")
     } else if url_part.starts_with("git@") {
         if let Some((user_host, path)) = url_part.split_once(':') {
-            let path_with_git = if path.ends_with(".git") {
-                path.to_string()
+            let clean_path = path.trim_start_matches('/');
+            let path_with_git = if clean_path.ends_with(".git") {
+                clean_path.to_string()
             } else {
-                format!("{path}.git")
+                format!("{clean_path}.git")
             };
             format!("git+ssh://{user_host}/{path_with_git}")
         } else {
@@ -1199,6 +1200,7 @@ fn normalize_git_url(raw: &str) -> String {
     } else if url_part.starts_with("git+ssh://")
         || url_part.starts_with("git+file://")
         || url_part.starts_with("git://")
+        || url_part.starts_with("ssh://")
     {
         url_part.to_string()
     } else if let Some(rest) = url_part.strip_prefix("git+https://") {
@@ -1213,7 +1215,11 @@ fn normalize_git_url(raw: &str) -> String {
             if host == "github.com" || host == "gitlab.com" || host == "bitbucket.org" {
                 let path = parsed.path().trim_start_matches('/').trim_end_matches(".git");
                 let scheme = parsed.scheme();
-                format!("git+{scheme}://{host}/{path}.git")
+                if let Some(port) = parsed.port() {
+                    format!("git+{scheme}://{host}:{port}/{path}.git")
+                } else {
+                    format!("git+{scheme}://{host}/{path}.git")
+                }
             } else {
                 url_part.to_string()
             }

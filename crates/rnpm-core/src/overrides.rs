@@ -1,7 +1,7 @@
 use crate::error::OverrideError;
 use crate::manifest::Manifest;
 use crate::semver::{
-    comparator::Op,
+    comparator::{Comparator, Op},
     range::ComparatorSet,
     Range, Version,
 };
@@ -478,108 +478,99 @@ fn parse_key_and_spec(key: &str) -> Option<(&str, &str)> {
     }
 }
 
-/// Returns true if `cs` allows matching prerelease version `v` under npm semver rules:
-/// non-prereleases are always allowed; prereleases require at least one comparator in `cs`
-/// to also be a prerelease with the exact same `(major, minor, patch)` tuple.
-fn set_allows_prerelease(cs: &ComparatorSet, v: &Version) -> bool {
-    !v.is_prerelease()
-        || cs.comparators.iter().any(|c| {
-            c.version.is_prerelease()
-                && c.version.major == v.major
-                && c.version.minor == v.minor
-                && c.version.patch == v.patch
-        })
-}
-
-/// Returns true if `v` satisfies every comparator in `cs` including npm's prerelease tuple rule.
-fn set_matches_version(cs: &ComparatorSet, v: &Version) -> bool {
-    set_allows_prerelease(cs, v) && cs.comparators.iter().all(|c| c.matches(v))
-}
-
-/// Checks if two ComparatorSets intersect (their conjunction is satisfiable),
-/// matching node-semver `semver.intersects(r1, r2)` including prerelease tuple rules.
-fn comparator_sets_intersect(cs1: &ComparatorSet, cs2: &ComparatorSet) -> bool {
-    // 1. If any comparator in either set is `=`, that exact version is the only possible witness.
-    for c in cs1.comparators.iter().chain(cs2.comparators.iter()) {
-        if c.op == Op::Eq {
-            return set_matches_version(cs1, &c.version) && set_matches_version(cs2, &c.version);
-        }
-    }
-
-    // 2. Otherwise every comparator is a strict/inclusive inequality. Compute the tightest
-    //    [max_lo, min_hi] interval across the conjunction of both sets.
-    let mut max_lo: Option<(&Version, bool)> = None; // (version, inclusive)
-    let mut min_hi: Option<(&Version, bool)> = None; // (version, inclusive)
-
-    for c in cs1.comparators.iter().chain(cs2.comparators.iter()) {
-        match c.op {
-            Op::Gt | Op::Gte => {
-                let inc = c.op == Op::Gte;
-                let replace = match max_lo {
-                    None => true,
-                    Some((cur, cur_inc)) => c.version > *cur || (c.version == *cur && cur_inc && !inc),
-                };
-                if replace {
-                    max_lo = Some((&c.version, inc));
-                }
-            }
-            Op::Lt | Op::Lte => {
-                let inc = c.op == Op::Lte;
-                let replace = match min_hi {
-                    None => true,
-                    Some((cur, cur_inc)) => c.version < *cur || (c.version == *cur && cur_inc && !inc),
-                };
-                if replace {
-                    min_hi = Some((&c.version, inc));
-                }
-            }
-            Op::Eq => unreachable!("handled above"),
-        }
-    }
-
-    let Some((hi, hi_inc)) = min_hi else {
-        // Unbounded above: infinitely many stable versions satisfy any lower bound.
-        return true;
-    };
-
-    let Some((lo, lo_inc)) = max_lo else {
-        // Unbounded below: check if any stable version (0.0.0) or valid prerelease satisfies hi.
-        let zero = Version::new(0, 0, 0);
-        if hi > &zero || (hi_inc && hi == &zero) {
-            return true;
-        }
-        // Only possible if hi is a 0.0.0-pre prerelease; requires both sets to allow (0,0,0) prereleases.
-        return hi.is_prerelease()
-            && set_allows_prerelease(cs1, hi)
-            && set_allows_prerelease(cs2, hi)
-            && (hi_inc
-                || hi.prerelease.len() > 1
-                || hi.prerelease.first().is_some_and(|p| p.to_string() != "0"));
-    };
-
-    if lo > hi {
+/// Tests whether version `v` satisfies comparator `c` under node-semver rules:
+/// - `v` must satisfy the comparison operator `c.op`
+/// - If `v` is a prerelease, `c` must also have a prerelease with the same (major, minor, patch) tuple
+fn single_comparator_matches(c: &Comparator, v: &Version) -> bool {
+    if !c.matches(v) {
         return false;
     }
-    if lo == hi {
-        return lo_inc && hi_inc && set_matches_version(cs1, lo) && set_matches_version(cs2, lo);
+    if v.is_prerelease() {
+        return c.version.is_prerelease()
+            && c.version.major == v.major
+            && c.version.minor == v.minor
+            && c.version.patch == v.patch;
+    }
+    true
+}
+
+/// Determines if two semver comparators intersect, matching node-semver `Comparator.prototype.intersects`.
+fn comparator_intersects(c1: &Comparator, c2: &Comparator) -> bool {
+    // 1. If either comparator is equality / exact version:
+    if c1.op == Op::Eq {
+        return single_comparator_matches(c2, &c1.version);
+    }
+    if c2.op == Op::Eq {
+        return single_comparator_matches(c1, &c2.version);
     }
 
-    // Now lo < hi. First check if a stable (non-prerelease) version exists in the interval.
-    let smallest_stable = if lo.is_prerelease() {
-        Version::new(lo.major, lo.minor, lo.patch)
-    } else if lo_inc {
-        lo.clone()
-    } else {
-        Version::new(lo.major, lo.minor, lo.patch.saturating_add(1))
-    };
-    if smallest_stable < *hi || (hi_inc && smallest_stable == *hi) {
+    // 2. Special case: <0.0.0 or <0.0.0-0 can match no version in semver
+    if (c1.op == Op::Lt && c1.version.major == 0 && c1.version.minor == 0 && c1.version.patch == 0)
+        || (c2.op == Op::Lt && c2.version.major == 0 && c2.version.minor == 0 && c2.version.patch == 0)
+    {
+        return false;
+    }
+
+    // 3. Same direction increasing (> or >=)
+    let c1_inc = matches!(c1.op, Op::Gt | Op::Gte);
+    let c2_inc = matches!(c2.op, Op::Gt | Op::Gte);
+    if c1_inc && c2_inc {
         return true;
     }
 
-    // No stable version lies between lo and hi, which only happens when lo is a prerelease
-    // sharing (major, minor, patch) with hi. A prerelease witness exists iff both sets permit
-    // prereleases on that (major, minor, patch) tuple.
-    lo.is_prerelease() && set_allows_prerelease(cs1, lo) && set_allows_prerelease(cs2, lo)
+    // 4. Same direction decreasing (< or <=)
+    let c1_dec = matches!(c1.op, Op::Lt | Op::Lte);
+    let c2_dec = matches!(c2.op, Op::Lt | Op::Lte);
+    if c1_dec && c2_dec {
+        return true;
+    }
+
+    // 5. Same SemVer and both sides are inclusive (<= or >=)
+    if c1.version == c2.version
+        && matches!(c1.op, Op::Gte | Op::Lte)
+        && matches!(c2.op, Op::Gte | Op::Lte)
+    {
+        return true;
+    }
+
+    // 6. Opposite directions: increasing < decreasing
+    if c1_inc && c2_dec && c1.version < c2.version {
+        return true;
+    }
+    if c1_dec && c2_inc && c1.version > c2.version {
+        return true;
+    }
+
+    false
+}
+
+/// Checks if a comparator set is internally satisfiable, matching node-semver `isSatisfiable`.
+fn is_set_satisfiable(cs: &ComparatorSet) -> bool {
+    let comps = &cs.comparators;
+    for i in 0..comps.len() {
+        for j in i + 1..comps.len() {
+            if !comparator_intersects(&comps[i], &comps[j]) {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// Checks if two ComparatorSets intersect (every pair across sets intersects and both are satisfiable),
+/// matching node-semver `Range.prototype.intersects`.
+fn comparator_sets_intersect(cs1: &ComparatorSet, cs2: &ComparatorSet) -> bool {
+    if !is_set_satisfiable(cs1) || !is_set_satisfiable(cs2) {
+        return false;
+    }
+    for c1 in &cs1.comparators {
+        for c2 in &cs2.comparators {
+            if !comparator_intersects(c1, c2) {
+                return false;
+            }
+        }
+    }
+    true
 }
 
 /// Checks if two semver Ranges intersect, matching node-semver `semver.intersects(r1, r2)`.
@@ -1048,5 +1039,59 @@ mod tests {
             .resolve_override("my-react", "npm:react", &[])
             .unwrap();
         assert_eq!(res, Some("18.3.1".to_string()));
+    }
+
+    #[test]
+    fn test_node_semver_intersection_full_suite() {
+        // Prerelease tuple matching against caret ranges:
+        let r_caret = Range::parse("^1.0.0-alpha.1").unwrap();
+        assert!(!ranges_intersect(&r_caret, &Range::parse("1.0.0-alpha.1").unwrap()));
+        assert!(!ranges_intersect(&r_caret, &Range::parse("1.0.0-alpha.2").unwrap()));
+        assert!(!ranges_intersect(&r_caret, &Range::parse("1.0.0-beta.1").unwrap()));
+        assert!(ranges_intersect(&r_caret, &Range::parse("1.0.0").unwrap()));
+        assert!(!ranges_intersect(&r_caret, &Range::parse("2.0.0").unwrap()));
+
+        // Empty ranges & wildcards:
+        let r_empty1 = Range::parse("").unwrap();
+        let r_empty2 = Range::parse("").unwrap();
+        let r_star = Range::parse("*").unwrap();
+        let r_stable = Range::parse("1.0.0").unwrap();
+        let r_pre = Range::parse("1.0.0-alpha.1").unwrap();
+        assert!(ranges_intersect(&r_empty1, &r_empty2));
+        assert!(ranges_intersect(&r_empty1, &r_star));
+        assert!(ranges_intersect(&r_empty1, &r_stable));
+        assert!(!ranges_intersect(&r_empty1, &r_pre));
+        assert!(!ranges_intersect(&r_star, &r_pre));
+
+        // >=1.0.0-0 checks:
+        let r_ge_zero = Range::parse(">=1.0.0-0").unwrap();
+        assert!(ranges_intersect(&r_ge_zero, &Range::parse("<1.0.0").unwrap()));
+        assert!(ranges_intersect(&r_ge_zero, &Range::parse(">=1.0.0").unwrap()));
+        assert!(!ranges_intersect(&r_ge_zero, &Range::parse("<1.0.0-0").unwrap()));
+
+        // Non-overlapping prerelease range vs wider stable range:
+        let r_alpha_beta = Range::parse(">1.0.0-alpha.1 <1.0.0-beta.1").unwrap();
+        let r_wide = Range::parse(">0.9.0 <2.0.0").unwrap();
+        assert!(ranges_intersect(&r_alpha_beta, &r_wide));
+
+        // Overlapping lower bounds:
+        let r_alpha1_lt1 = Range::parse(">=1.0.0-alpha.1 <1.0.0").unwrap();
+        let r_alpha2 = Range::parse(">=1.0.0-alpha.2").unwrap();
+        assert!(ranges_intersect(&r_alpha1_lt1, &r_alpha2));
+
+        // Multi-comparator OR ranges:
+        let r_or = Range::parse("1.0.0 || 2.0.0").unwrap();
+        assert!(ranges_intersect(&r_or, &Range::parse("2.0.0").unwrap()));
+        assert!(!ranges_intersect(&r_or, &Range::parse("3.0.0").unwrap()));
+
+        // Strict less than vs greater-or-equal on exact same version:
+        let r_lt_alpha = Range::parse("<1.0.0-alpha.1").unwrap();
+        let r_gte_alpha = Range::parse(">=1.0.0-alpha.1").unwrap();
+        assert!(!ranges_intersect(&r_lt_alpha, &r_gte_alpha));
+
+        // Impossible ranges <0.0.0:
+        let r_impossible = Range::parse("<0.0.0").unwrap();
+        assert!(!ranges_intersect(&r_impossible, &r_star));
+        assert!(!ranges_intersect(&r_impossible, &Range::parse(">=0.0.0").unwrap()));
     }
 }

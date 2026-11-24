@@ -71,6 +71,9 @@ impl PackageTarget {
             "git+rsync://",
             "git+ftp://",
             "git://",
+            "ssh://",
+            "git@",
+            "git:",
             "github:",
             "gitlab:",
             "bitbucket:",
@@ -368,6 +371,9 @@ impl PackageSpec {
             "git+rsync://",
             "git+ftp://",
             "git://",
+            "ssh://",
+            "git@",
+            "git:",
             "github:",
             "gitlab:",
             "bitbucket:",
@@ -695,6 +701,7 @@ pub fn unsupported_protocol(spec: &str) -> Option<String> {
         "git+ftp",
         "git+file",
         "git+ssh",
+        "ssh",
         "http",
         "https",
     ];
@@ -731,8 +738,53 @@ mod unsupported_protocol_tests {
             "latest",
             "u/r",
             "git://h/r.git",
+            "ssh://git@github.com/12345/repo.git",
         ] {
             assert_eq!(unsupported_protocol(spec), None, "{spec}");
         }
+    }
+
+    #[test]
+    fn test_git_spec_parsing_scp_and_ssh() {
+        use crate::spec::{PackageSpec, PackageTarget};
+
+        let scp = "git@github.com:12345/repo.git#main";
+        let target_scp = PackageTarget::parse(scp).unwrap();
+        match &target_scp {
+            PackageTarget::Git {
+                url,
+                committish,
+                subdir,
+            } => {
+                assert_eq!(url, "git@github.com:12345/repo.git");
+                assert_eq!(committish.as_deref(), Some("main"));
+                assert_eq!(*subdir, None);
+            }
+            _ => panic!("Expected PackageTarget::Git"),
+        }
+
+        let spec_scp = PackageSpec::parse(scp).unwrap();
+        assert_eq!(spec_scp.name, "repo");
+        assert_eq!(spec_scp.target, target_scp);
+
+        let ssh = "ssh://git@github.com/12345/repo.git#main";
+        let target_ssh = PackageTarget::parse(ssh).unwrap();
+        match &target_ssh {
+            PackageTarget::Git {
+                url,
+                committish,
+                subdir,
+            } => {
+                assert_eq!(url, "ssh://git@github.com/12345/repo.git");
+                assert_eq!(committish.as_deref(), Some("main"));
+                assert_eq!(*subdir, None);
+            }
+            _ => panic!("Expected PackageTarget::Git"),
+        }
+
+        let spec_ssh = PackageSpec::parse(ssh).unwrap();
+        assert_eq!(spec_ssh.name, "repo");
+        assert_eq!(spec_ssh.target, target_ssh);
+        assert_eq!(unsupported_protocol(ssh), None);
     }
 }
