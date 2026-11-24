@@ -12,6 +12,8 @@ use rnpm_lifecycle::{
 pub struct RebuildOptions {
     /// Project root directory. Defaults to ".".
     pub project_dir: PathBuf,
+    /// Caller invocation working directory (used for `INIT_CWD`). Defaults to `project_dir`.
+    pub init_cwd: Option<PathBuf>,
     /// Specific package names or specs to rebuild. If empty, rebuilds all installed packages.
     pub packages: Vec<String>,
     /// Skip running lifecycle build scripts.
@@ -26,6 +28,7 @@ impl Default for RebuildOptions {
     fn default() -> Self {
         Self {
             project_dir: PathBuf::from("."),
+            init_cwd: None,
             packages: Vec::new(),
             ignore_scripts: false,
             foreground_scripts: false,
@@ -236,12 +239,7 @@ pub async fn execute_rebuild(options: &RebuildOptions) -> Result<RebuildSummary>
     }
 
     // 3. Sort candidates bottom-up (deeper nesting first, dependencies before dependents)
-    // Deeper paths have more `/node_modules/` segments
-    candidate_nodes.sort_by(|a, b| {
-        let count_a = a.package_path.matches("/node_modules/").count();
-        let count_b = b.package_path.matches("/node_modules/").count();
-        count_b.cmp(&count_a)
-    });
+    sort_lifecycle_nodes_bottom_up(&mut candidate_nodes);
 
     // 4. Configure lifecycle execution options
     let sandbox_policy = if options.strict_sandbox {
@@ -269,7 +267,10 @@ pub async fn execute_rebuild(options: &RebuildOptions) -> Result<RebuildSummary>
 
     let lifecycle_opts = LifecycleOptions {
         root_dir: project_dir.clone(),
-        init_cwd: project_dir.clone(),
+        init_cwd: options
+            .init_cwd
+            .clone()
+            .unwrap_or_else(|| project_dir.clone()),
         ignore_scripts: options.ignore_scripts,
         capture_output: !options.foreground_scripts,
         foreground_scripts: options.foreground_scripts,
@@ -286,4 +287,16 @@ pub async fn execute_rebuild(options: &RebuildOptions) -> Result<RebuildSummary>
     Ok(RebuildSummary {
         rebuilt_packages: candidate_names,
     })
+}
+
+/// Sort candidates bottom-up (deeper nesting first, dependencies before dependents).
+/// Deeper paths have more `/node_modules/` segments. Normalizes backslashes for Windows path safety.
+pub(crate) fn sort_lifecycle_nodes_bottom_up(nodes: &mut [LifecyclePackageNode]) {
+    nodes.sort_by(|a, b| {
+        let norm_a = a.package_path.replace('\\', "/");
+        let norm_b = b.package_path.replace('\\', "/");
+        let count_a = norm_a.matches("/node_modules/").count();
+        let count_b = norm_b.matches("/node_modules/").count();
+        count_b.cmp(&count_a).then_with(|| norm_b.cmp(&norm_a))
+    });
 }

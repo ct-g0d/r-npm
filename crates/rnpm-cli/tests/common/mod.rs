@@ -109,6 +109,9 @@ impl IsolatedNpmEnv {
                 || lower == "prefix"
                 || lower == "userconfig"
                 || lower == "globalconfig"
+                || lower == "http_proxy"
+                || lower == "https_proxy"
+                || lower == "all_proxy"
             {
                 cmd.env_remove(s);
             }
@@ -144,7 +147,10 @@ impl IsolatedNpmEnv {
             .env("APPDATA", &self.appdata)
             .env("LOCALAPPDATA", &self.localappdata)
             .env("NPM_CONFIG_LOGS_DIR", &self.logs_dir)
-            .env("npm_config_logs_dir", &self.logs_dir);
+            .env("npm_config_logs_dir", &self.logs_dir)
+            .env("NO_PROXY", "127.0.0.1,localhost")
+            .env("no_proxy", "127.0.0.1,localhost")
+            .env("npm_config_noproxy", "127.0.0.1,localhost");
 
         cmd
     }

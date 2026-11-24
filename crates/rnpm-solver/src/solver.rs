@@ -214,7 +214,10 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
     }
 
     fn activate_deferred_optional_peers(&mut self, provider_location: &str) {
-        let name = self.graph.nodes[provider_location].install_name.clone();
+        let Some(provider_node) = self.graph.nodes.get(provider_location) else {
+            return;
+        };
+        let name = provider_node.install_name.clone();
         let Some(tasks) = self.deferred_optional_peers.remove(&name) else {
             return;
         };
@@ -268,7 +271,9 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
     }
 
     fn activate_invalidated_workspaces(&mut self, provider_location: &str) {
-        let provider = &self.graph.nodes[provider_location];
+        let Some(provider) = self.graph.nodes.get(provider_location) else {
+            return;
+        };
         let mut scope_buffer = String::new();
         let locations: Vec<_> = self
             .deferred_workspaces
@@ -287,7 +292,12 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                         let overridden = if self.overrides.rules.is_empty() {
                             None
                         } else {
-                            let caller = self.graph.nodes[*location].all_dependency_specs();
+                            let caller = self
+                                .graph
+                                .nodes
+                                .get(*location)
+                                .map(|n| n.all_dependency_specs())
+                                .unwrap_or_default();
                             self.overrides
                                 .resolve_override_with_caller(
                                     &task.install_name,
@@ -315,8 +325,10 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
             .map(|(location, _)| location.clone())
             .collect();
         for location in locations {
-            for task in self.deferred_workspaces.remove(&location).unwrap() {
-                self.push_task(task);
+            if let Some(tasks) = self.deferred_workspaces.remove(&location) {
+                for task in tasks {
+                    self.push_task(task);
+                }
             }
         }
     }
@@ -1320,33 +1332,34 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
             self.detach_subtree(&root_slot);
             placement = PlacementDecision::PlaceNew(root_slot.clone());
         } else if replace_transitive_root_peer {
-            let existing = &self.graph.nodes[&root_slot];
-            let pinned_by_peer = self.graph.edges.iter().any(|edge| {
-                edge.to_location == root_slot
-                    && matches!(
-                        edge.dep_type,
-                        DependencyType::Peer | DependencyType::PeerOptional
+            if let Some(existing) = self.graph.nodes.get(&root_slot) {
+                let pinned_by_peer = self.graph.edges.iter().any(|edge| {
+                    edge.to_location == root_slot
+                        && matches!(
+                            edge.dep_type,
+                            DependencyType::Peer | DependencyType::PeerOptional
+                        )
+                        && PackageTarget::parse(&edge.spec).is_ok_and(|target| {
+                            crate::hoisting::node_satisfies_target(existing, &target)
+                        })
+                });
+                if pinned_by_peer && self.peer_conflict_is_fatal(task.is_mine) {
+                    return Err(SolverError::peer_conflict(
+                        &task.parent_package_name,
+                        &dep_spec.package_name,
+                        &effective_spec,
+                        Some(existing.version.clone()),
+                        Some(existing.location.clone()),
+                        (*task.ancestors).clone(),
+                        "Cannot move a peer provider beneath its consumer".to_string(),
                     )
-                    && PackageTarget::parse(&edge.spec).is_ok_and(|target| {
-                        crate::hoisting::node_satisfies_target(existing, &target)
-                    })
-            });
-            if pinned_by_peer && self.peer_conflict_is_fatal(task.is_mine) {
-                return Err(SolverError::peer_conflict(
-                    &task.parent_package_name,
-                    &dep_spec.package_name,
-                    &effective_spec,
-                    Some(existing.version.clone()),
-                    Some(existing.location.clone()),
-                    (*task.ancestors).clone(),
-                    "Cannot move a peer provider beneath its consumer".to_string(),
-                )
-                .with_eresolve(self.explain_placed_peer_conflict(
-                    &task,
-                    &dep_spec,
-                    &effective_spec,
-                    &existing.location,
-                )));
+                    .with_eresolve(self.explain_placed_peer_conflict(
+                        &task,
+                        &dep_spec,
+                        &effective_spec,
+                        &existing.location,
+                    )));
+                }
             }
             if !self.rehome_transitive_root_node(&root_slot, &dep_spec.install_name) {
                 return Ok(());
@@ -1659,7 +1672,9 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                         // loadPeerSet: when the peer would land beside a root or workspace
                         // edge for the same name, resolve that edge now,
                         // with the peer range as the advisory second edge.
-                        let parent = &self.graph.nodes[peer_scope];
+                        let Some(parent) = self.graph.nodes.get(peer_scope) else {
+                            continue;
+                        };
                         let name = child_task.install_name.clone();
                         // arborist loads peer, prod, optional, then dev edges, a
                         // later type replacing an earlier one for the same name.
@@ -1700,6 +1715,12 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                             });
                         if let Some((raw_spec, dep_type)) = parent_edge {
                             let is_peer_scope_root = !peer_scope.contains("node_modules");
+                            let root_pkg_name = self
+                                .graph
+                                .nodes
+                                .get("")
+                                .map(|n| n.name.clone())
+                                .unwrap_or_else(|| "root".to_string());
                             let root_task = ResolveTask {
                                 parent_location: peer_scope.to_string(),
                                 parent_package_name: parent.name.clone(),
@@ -1714,7 +1735,7 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                                 ancestors: std::sync::Arc::new(if peer_scope.is_empty() {
                                     vec![parent.name.clone()]
                                 } else {
-                                    vec![self.graph.nodes[""].name.clone(), parent.name.clone()]
+                                    vec![root_pkg_name, parent.name.clone()]
                                 }),
                                 advisory: Some(child_task.raw_spec.clone()),
                                 is_mine: true,
@@ -2136,13 +2157,19 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                     conflict: None,
                 }
                 .render(&self.graph, self.options.strict_peer_deps);
+                let root_name = self
+                    .graph
+                    .nodes
+                    .get("")
+                    .map(|n| n.name.clone())
+                    .unwrap_or_else(|| "root".to_string());
                 let conflict = SolverError::peer_conflict(
                     name,
                     peer,
                     peer_spec,
                     Some(root_choice.version.clone()),
                     Some(format!("node_modules/{peer}")),
-                    vec![self.graph.nodes[""].name.clone(), name.clone()],
+                    vec![root_name, name.clone()],
                     format!(
                         "Root dependency {peer}@{} does not satisfy peer constraint '{peer_spec}'",
                         root_choice.version
@@ -2563,8 +2590,28 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                 }
             }
             PackageTarget::Tag(tag) => {
-                let tagged_version = meta.dist_tags.get(tag)?;
-                meta.versions.get(tagged_version)
+                if let Some(tagged_version) = meta.dist_tags.get(tag) {
+                    if let Some(v) = meta.versions.get(tagged_version) {
+                        return Some(v);
+                    }
+                }
+                // Fallback for "latest" when dist_tags.latest was published after a --before / min-release-age cutoff
+                // or omitted in filtered metadata: pick highest available version.
+                if tag == "latest" {
+                    let mut versions: Vec<(&PackageVersionMetadata, Version)> = meta
+                        .versions
+                        .values()
+                        .filter_map(|vm| Version::parse(&vm.version).ok().map(|parsed| (vm, parsed)))
+                        .collect();
+                    versions.sort_by(|a, b| b.1.cmp(&a.1));
+                    if let Some((vm, _)) = versions.iter().find(|(_, parsed)| !parsed.is_prerelease()) {
+                        return Some(*vm);
+                    }
+                    if let Some((vm, _)) = versions.first() {
+                        return Some(*vm);
+                    }
+                }
+                None
             }
             PackageTarget::Range(range) => {
                 let vuln_ranges = self

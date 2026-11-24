@@ -78,13 +78,13 @@ $env:PATH = "D:\AppData\user2\.cargo\bin;" + $env:PATH
 - **`test` / `start` / `restart` / `stop`** (aliases: `t`, `tst`): Dedicated script execution shortcuts forwarding trailing arguments.
 - **`run` / `run-script`**: Run package scripts or enumerate available scripts when invoked with no arguments (`rnpm run`).
   - Flags: `-w`/`--workspaces`/`ws`, `--workspace`, `--filter`, `--scope`, `--if-present`, `--ignore-scripts`.
-- **`exec` / `npx`** (alias: `x`): Dynamic ephemeral package execution.
+- **`exec` / `npx`** (alias: `x`): Dynamic ephemeral package execution, available through `rnpm exec`, `rnpm x`, or the standalone `npx` binary.
 - **`pack`**: Build canonical npm `.tgz` package archives with files/ignore filtering.
 - **`uninstall`** (aliases: `remove`, `rm`, `r`, `un`): Remove packages, clean unused transitive dependencies, update lockfile.
 - **`update`** (alias: `up`): Update registry dependencies within declared semver ranges.
 - **`prune`**: Remove extraneous packages from `node_modules` (`--omit`, `-p`/`--production`, `--dry-run`, `--json`).
 - **`pkg`**: Manifest inspection and manipulation (`get`, `set`, `delete`, `--prefix`, `--json`).
-- **`audit`**: Security advisory audit queries against registry endpoint with threshold exit codes (`--audit-level`, `--json`, `--dry-run`).
+- **`audit`**: Security advisory audit queries against registry endpoint with threshold exit codes (`--audit-level`, `--json`, `--dry-run`), signature verification (`audit signatures`), and cryptographic SLSA provenance verification (`dist.attestations`).
 - **`cache`**: Content-addressable cache verification and purge (`clean [--force]`, `verify`).
 - **Inspection and metadata**: `list`/`ls`/`ll`, `outdated`, `view`/`info`/`show`, and CSS-like `query` selectors.
 - **Package operations**: `dedupe`/`find-dupes`, `rebuild`, `init`/`create`, `diff`, `sbom`, and `version`.
@@ -100,10 +100,10 @@ $env:PATH = "D:\AppData\user2\.cargo\bin;" + $env:PATH
 ### Building
 
 ```powershell
-cargo build --release --bin rnpm
+cargo build --release --bin rnpm --bin npx
 ```
 
-The resulting binary is located at `target/release/rnpm.exe`.
+The resulting binaries are located at `target/release/rnpm.exe` and `target/release/npx.exe`.
 
 ### Running Tests
 

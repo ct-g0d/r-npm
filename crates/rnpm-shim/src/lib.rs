@@ -244,7 +244,8 @@ pub fn normalize_shebang(file_path: &Path) -> std::io::Result<()> {
 fn cmd_shim_shebang(target: &Path) -> Option<(String, String, String)> {
     let data = fs::read(target).ok()?;
     let text = String::from_utf8_lossy(&data);
-    let line = text
+    let clean_text = text.strip_prefix('\u{feff}').unwrap_or(&text);
+    let line = clean_text
         .trim()
         .split('\n')
         .next()
@@ -548,8 +549,19 @@ pub fn check_existing_bin_collision(
         }
     };
 
-    // 1. Directory collision: ALWAYS refuse, even with force
+    // 1. Directory collision: ALWAYS refuse, even with force (unless it is a reparse point/junction on Windows)
     if meta.is_dir() {
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::MetadataExt;
+            if meta.file_attributes() & 0x400 == 0 {
+                anyhow::bail!(
+                    "EEXIST: refusing to overwrite existing directory {} with bin link",
+                    link_path.display()
+                );
+            }
+        }
+        #[cfg(not(windows))]
         anyhow::bail!(
             "EEXIST: refusing to overwrite existing directory {} with bin link",
             link_path.display()

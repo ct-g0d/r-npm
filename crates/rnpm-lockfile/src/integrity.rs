@@ -168,7 +168,7 @@ pub fn verify_lockfile_integrity(
             .unwrap_or_else(|| extract_package_name_from_path(pkg_path));
 
         // Determine if this package is a direct root dependency or transitive
-        let is_direct = is_direct_dependency(pkg_path, &inferred_name, &direct_deps);
+        let is_direct = is_direct_dependency(pkg_path, &direct_deps);
 
         // 1. Audit integrity hash presence and strength
         audit_integrity(pkg_path, pkg, policy)?;
@@ -432,10 +432,10 @@ fn extract_package_name_from_path(pkg_path: &str) -> String {
 
 fn is_direct_dependency(
     pkg_path: &str,
-    inferred_name: &str,
     direct_deps: &HashSet<String>,
 ) -> bool {
     let clean = pkg_path.replace('\\', "/");
+    let clean = clean.trim_end_matches('/');
 
     // If path contains multiple node_modules segments, it's definitely nested (transitive)
     let nm_count = clean.split("node_modules").count() - 1;
@@ -443,10 +443,10 @@ fn is_direct_dependency(
         return false;
     }
 
-    // Direct dependencies are located at `node_modules/<name>` and listed in direct_deps
-    let direct_path = format!("node_modules/{inferred_name}");
-    if clean == direct_path && direct_deps.contains(inferred_name) {
-        return true;
+    if let Some(folder_name) = clean.strip_prefix("node_modules/") {
+        if direct_deps.contains(folder_name) {
+            return true;
+        }
     }
 
     false

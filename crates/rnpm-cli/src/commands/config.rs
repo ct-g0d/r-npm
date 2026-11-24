@@ -8,25 +8,19 @@ use std::path::{Path, PathBuf};
 pub(crate) fn run(action: ConfigAction, current_dir: PathBuf) -> Result<()> {
     match action {
         ConfigAction::Set {
-            key,
-            value,
+            args,
             global,
             location,
-        } => run_set(
-            &key,
-            value.as_deref(),
-            global,
-            location.as_deref(),
-            &current_dir,
-        )?,
+        } => run_set_args(&args, global, location.as_deref(), &current_dir)?,
         ConfigAction::Get { key, extra_keys } => {
             run_get_keys(key.as_deref(), &extra_keys, &current_dir)?
         }
         ConfigAction::Delete {
             key,
+            extra_keys,
             global,
             location,
-        } => run_delete(&key, global, location.as_deref(), &current_dir)?,
+        } => run_delete_keys(&key, &extra_keys, global, location.as_deref(), &current_dir)?,
         ConfigAction::List { json, long } => report::run(json, long, &current_dir)?,
         ConfigAction::Edit {
             editor,
@@ -40,6 +34,43 @@ pub(crate) fn run(action: ConfigAction, current_dir: PathBuf) -> Result<()> {
     Ok(())
 }
 
+pub(crate) fn parse_key_values(args: &[String]) -> Vec<(String, String)> {
+    let mut kv = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        if let Some((k, v)) = args[i].split_once('=') {
+            kv.push((k.trim().to_string(), v.trim().to_string()));
+            i += 1;
+        } else if i + 1 < args.len() {
+            kv.push((args[i].trim().to_string(), args[i + 1].trim().to_string()));
+            i += 2;
+        } else {
+            kv.push((args[i].trim().to_string(), String::new()));
+            i += 1;
+        }
+    }
+    kv
+}
+
+pub(crate) fn run_set_args(
+    args: &[String],
+    global: bool,
+    location: Option<&str>,
+    current_dir: &Path,
+) -> Result<()> {
+    let pairs = parse_key_values(args);
+    let target_path = resolve_target_npmrc(global, location, current_dir);
+    for (k, v) in pairs {
+        if v.is_empty() {
+            let _ = rnpm_config::delete_config_value_from_file(&target_path, &k)?;
+        } else {
+            rnpm_config::set_config_value_in_file(&target_path, &k, &v)?;
+        }
+    }
+    Ok(())
+}
+
+#[allow(dead_code)]
 pub(crate) fn run_set(
     key: &str,
     value: Option<&str>,
@@ -58,7 +89,11 @@ pub(crate) fn run_set(
         }
     };
     let target_path = resolve_target_npmrc(global, location, current_dir);
-    rnpm_config::set_config_value_in_file(&target_path, real_key, real_val)?;
+    if real_val.is_empty() {
+        let _ = rnpm_config::delete_config_value_from_file(&target_path, real_key)?;
+    } else {
+        rnpm_config::set_config_value_in_file(&target_path, real_key, real_val)?;
+    }
     Ok(())
 }
 
@@ -96,14 +131,28 @@ pub(crate) fn run_get(key: Option<&str>, current_dir: &Path) -> Result<()> {
     Ok(())
 }
 
+#[allow(dead_code)]
 pub(crate) fn run_delete(
     key: &str,
     global: bool,
     location: Option<&str>,
     current_dir: &Path,
 ) -> Result<()> {
+    run_delete_keys(key, &[], global, location, current_dir)
+}
+
+pub(crate) fn run_delete_keys(
+    key: &str,
+    extra_keys: &[String],
+    global: bool,
+    location: Option<&str>,
+    current_dir: &Path,
+) -> Result<()> {
     let target_path = resolve_target_npmrc(global, location, current_dir);
     let _ = rnpm_config::delete_config_value_from_file(&target_path, key)?;
+    for extra in extra_keys {
+        let _ = rnpm_config::delete_config_value_from_file(&target_path, extra)?;
+    }
     Ok(())
 }
 

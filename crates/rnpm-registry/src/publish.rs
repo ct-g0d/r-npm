@@ -140,6 +140,13 @@ pub fn create_publish_payload(opts: &PublishPayloadOptions) -> serde_json::Value
     if let Some(desc) = opts.description {
         doc.insert("description".into(), serde_json::json!(desc));
     }
+    if let Some(readme) = opts
+        .manifest
+        .get("readme")
+        .filter(|v| v.as_str().is_some_and(|s| !s.is_empty() && s != "ERROR: No README data found!"))
+    {
+        doc.insert("readme".into(), readme.clone());
+    }
     doc.insert(
         "dist-tags".into(),
         serde_json::json!({ opts.tag: opts.version }),

@@ -69,7 +69,7 @@ impl GitFetcher {
         if !manifest_path.exists() {
             return Err(anyhow!(
                 "package.json not found in git dependency '{}' at commit '{}'",
-                clone_url,
+                rnpm_config::scrub_credentials(&clone_url),
                 commit_sha
             ));
         }
@@ -77,7 +77,7 @@ impl GitFetcher {
         let manifest = Manifest::from_file(&manifest_path).with_context(|| {
             format!(
                 "Failed to parse package.json from git dependency '{}' at '{}'",
-                clone_url,
+                rnpm_config::scrub_credentials(&clone_url),
                 manifest_path.display()
             )
         })?;
@@ -121,7 +121,7 @@ impl GitFetcher {
         if !manifest_path.exists() {
             return Err(anyhow!(
                 "package.json not found in git dependency '{}' at commit '{}'",
-                clone_url,
+                rnpm_config::scrub_credentials(&clone_url),
                 commit_sha
             ));
         }
@@ -160,12 +160,15 @@ impl GitFetcher {
             if offline {
                 debug!(
                     "Using cached git repository for '{}' (offline mode)",
-                    clone_url
+                    rnpm_config::scrub_credentials(clone_url)
                 );
                 return Ok(remote_dir);
             }
 
-            debug!("Updating cached git repository for '{}'", clone_url);
+            debug!(
+                "Updating cached git repository for '{}'",
+                rnpm_config::scrub_credentials(clone_url)
+            );
             let remote_dir_str = remote_dir.to_string_lossy();
             let (fetch_ok, _, fetch_err) = run_git_cmd(
                 &[
@@ -184,7 +187,8 @@ impl GitFetcher {
             if !fetch_ok {
                 warn!(
                     "Failed to fetch updates for git repository '{}': {}; continuing with cached refs",
-                    clone_url, fetch_err
+                    rnpm_config::scrub_credentials(clone_url),
+                    rnpm_config::scrub_credentials(&fetch_err)
                 );
             }
 
@@ -194,27 +198,58 @@ impl GitFetcher {
         if offline {
             return Err(anyhow!(
                 "Cannot clone git dependency '{}' in offline mode: repository is not cached",
-                clone_url
+                rnpm_config::scrub_credentials(clone_url)
             ));
         }
 
         // pacote resolves the remote refs before attempting a clone. Preserve
         // that command's stderr and status rather than reporting clone errors.
-        let args = ["--no-replace-objects", "ls-remote", clone_url];
-        let output = tokio::process::Command::new("git")
+        let ls_remote_url =
+            if clone_url.starts_with("file://") || clone_url.starts_with("git+file://") {
+                clone_url.strip_prefix("git+").unwrap_or(clone_url).to_string()
+            } else {
+                normalized_url.clone()
+            };
+        let args = ["--no-replace-objects", "ls-remote", &ls_remote_url];
+        let output = match tokio::process::Command::new("git")
             .args(args)
             .env("GIT_TERMINAL_PROMPT", "0")
             .env("GIT_ASKPASS", "")
             .env("SSH_ASKPASS", "")
             .output()
-            .await?;
+            .await
+        {
+            Ok(out) => out,
+            Err(e) => {
+                if e.kind() == std::io::ErrorKind::NotFound {
+                    return Err(anyhow!(
+                        "npm error code ENOENT\nnpm error syscall spawn git\nnpm error path git\nnpm error spawn git ENOENT"
+                    ));
+                }
+                return Err(e.into());
+            }
+        };
+
         if !output.status.success() {
+            let scrubbed_url = rnpm_config::scrub_credentials(&ls_remote_url);
+            let display_args: Vec<_> = args
+                .iter()
+                .map(|a| {
+                    if *a == ls_remote_url.as_str() || *a == normalized_url.as_str() || *a == clone_url {
+                        scrubbed_url.as_str()
+                    } else {
+                        *a
+                    }
+                })
+                .collect();
             let mut block = format!(
                 "npm error code {}\nnpm error An unknown git error occurred\nnpm error command git {}",
-                output.status.code().unwrap_or(128), args.join(" ")
+                output.status.code().unwrap_or(128),
+                display_args.join(" ")
             );
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            for line in stderr.trim().lines() {
+            let raw_stderr = String::from_utf8_lossy(&output.stderr);
+            let scrubbed_stderr = rnpm_config::scrub_credentials(&raw_stderr);
+            for line in scrubbed_stderr.trim().lines() {
                 block.push_str("\nnpm error");
                 if !line.is_empty() {
                     block.push(' ');
@@ -228,22 +263,12 @@ impl GitFetcher {
             std::fs::create_dir_all(parent)?;
         }
 
-        info!("Cloning git repository '{}'", clone_url);
+        info!("Cloning git repository '{}'", rnpm_config::scrub_credentials(clone_url));
         let remote_dir_str = remote_dir.to_string_lossy();
 
         // 1. Try mirror clone
-        let (mirror_ok, _, mirror_err) = run_git_cmd(
-            &[
-                "clone",
-                "--config",
-                "core.longpaths=true",
-                "--mirror",
-                &normalized_url,
-                &remote_dir_str,
-            ],
-            None,
-        )
-        .await?;
+        let mirror_args = build_git_clone_args(&normalized_url, &remote_dir_str, true);
+        let (mirror_ok, _, mirror_err) = run_git_cmd(&mirror_args, None).await?;
 
         if mirror_ok {
             return Ok(remote_dir);
@@ -251,18 +276,8 @@ impl GitFetcher {
 
         // 2. Fallback to bare clone if mirror fails
         let _ = safe_remove_dir_all(&remote_dir);
-        let (bare_ok, _, bare_err) = run_git_cmd(
-            &[
-                "clone",
-                "--config",
-                "core.longpaths=true",
-                "--bare",
-                &normalized_url,
-                &remote_dir_str,
-            ],
-            None,
-        )
-        .await?;
+        let bare_args = build_git_clone_args(&normalized_url, &remote_dir_str, false);
+        let (bare_ok, _, bare_err) = run_git_cmd(&bare_args, None).await?;
 
         if bare_ok {
             return Ok(remote_dir);
@@ -274,10 +289,12 @@ impl GitFetcher {
         } else {
             bare_err
         };
+        let scrubbed_err = rnpm_config::scrub_credentials(&err_msg);
+        let scrubbed_clone = rnpm_config::scrub_credentials(clone_url);
         Err(anyhow!(
             "Failed to clone git repository '{}': {}",
-            clone_url,
-            err_msg
+            scrubbed_clone,
+            scrubbed_err
         ))
     }
 
@@ -318,7 +335,7 @@ impl GitFetcher {
 
                 return Err(anyhow!(
                     "Failed to resolve default HEAD commit in git repository '{}'",
-                    clone_url
+                    rnpm_config::scrub_credentials(clone_url)
                 ));
             }
             Some(r) => r,
@@ -327,7 +344,10 @@ impl GitFetcher {
         // 2. Semver range over tags: e.g. semver:^1.0.0
         if let Some(range_str) = ref_name.strip_prefix("semver:") {
             let range = Range::parse(range_str.trim()).map_err(|e| {
-                anyhow!("Invalid semver range '{range_str}' in git dependency '{clone_url}': {e}")
+                anyhow!(
+                    "Invalid semver range '{range_str}' in git dependency '{}': {e}",
+                    rnpm_config::scrub_credentials(clone_url)
+                )
             })?;
 
             let (ok, stdout, stderr) =
@@ -336,8 +356,8 @@ impl GitFetcher {
             if !ok {
                 return Err(anyhow!(
                     "Failed to list tags in git repository '{}': {}",
-                    clone_url,
-                    stderr
+                    rnpm_config::scrub_credentials(clone_url),
+                    rnpm_config::scrub_credentials(&stderr)
                 ));
             }
 
@@ -362,7 +382,7 @@ impl GitFetcher {
                 return Err(anyhow!(
                     "No matching git tag found for semver range '{}' in '{}'",
                     range_str,
-                    clone_url
+                    rnpm_config::scrub_credentials(clone_url)
                 ));
             }
 
@@ -379,8 +399,8 @@ impl GitFetcher {
             return Err(anyhow!(
                 "Failed to resolve commit for git tag '{}' in '{}': {}",
                 best_tag,
-                clone_url,
-                stderr
+                rnpm_config::scrub_credentials(clone_url),
+                rnpm_config::scrub_credentials(&stderr)
             ));
         }
 
@@ -427,7 +447,7 @@ impl GitFetcher {
         Err(anyhow!(
             "Git ref, tag, or commit '{}' not found in repository '{}'",
             ref_name,
-            clone_url
+            rnpm_config::scrub_credentials(clone_url)
         ))
     }
 
@@ -476,11 +496,7 @@ impl GitFetcher {
             )
         })?;
 
-        let is_file_proto = clone_url.starts_with("file:")
-            || clone_url.starts_with("git+file:")
-            || Path::new(clone_url).is_absolute()
-            || clone_url.contains("file://")
-            || (clone_url.len() >= 2 && clone_url.as_bytes()[1] == b':');
+        let is_file_proto = is_file_or_local_git_url(clone_url);
 
         // 1. Preferred method: git archive (clean, fast, no .git directory overhead)
         let archive_bytes = run_git_archive(remote_dir, commit_sha).await;
@@ -541,8 +557,8 @@ impl GitFetcher {
                 return Err(anyhow!(
                     "Failed to checkout git commit '{}' from '{}': {}",
                     commit_sha,
-                    clone_url,
-                    checkout_err
+                    rnpm_config::scrub_credentials(clone_url),
+                    rnpm_config::scrub_credentials(&checkout_err)
                 ));
             }
         } else {
@@ -557,8 +573,8 @@ impl GitFetcher {
                 return Err(anyhow!(
                     "Failed to checkout commit '{}' in '{}': {}",
                     commit_sha,
-                    clone_url,
-                    co_err
+                    rnpm_config::scrub_credentials(clone_url),
+                    rnpm_config::scrub_credentials(&co_err)
                 ));
             }
         }
@@ -579,39 +595,14 @@ impl GitFetcher {
 
             let (subm_ok, _, subm_err) = run_git_cmd(&subm_args, Some(&checkout_dir)).await?;
             if !subm_ok {
-                if subm_err.contains("protocol") || subm_err.contains("transport 'file'") {
-                    let (retry_ok, _, retry_err) = run_git_cmd(
-                        &[
-                            "-c",
-                            "protocol.file.allow=always",
-                            "submodule",
-                            "update",
-                            "--init",
-                            "--recursive",
-                        ],
-                        Some(&checkout_dir),
-                    )
-                    .await?;
-                    if !retry_ok {
-                        let _ = safe_remove_dir_all(&checkout_dir);
-                        let _ = std::fs::remove_file(&marker_file);
-                        return Err(anyhow!(
-                            "Failed to update git submodules for '{}' at commit '{}': {}",
-                            clone_url,
-                            commit_sha,
-                            retry_err
-                        ));
-                    }
-                } else {
-                    let _ = safe_remove_dir_all(&checkout_dir);
-                    let _ = std::fs::remove_file(&marker_file);
-                    return Err(anyhow!(
-                        "Failed to update git submodules for '{}' at commit '{}': {}",
-                        clone_url,
-                        commit_sha,
-                        subm_err
-                    ));
-                }
+                let _ = safe_remove_dir_all(&checkout_dir);
+                let _ = std::fs::remove_file(&marker_file);
+                return Err(anyhow!(
+                    "Failed to update git submodules for '{}' at commit '{}': {}",
+                    rnpm_config::scrub_credentials(clone_url),
+                    commit_sha,
+                    rnpm_config::scrub_credentials(&subm_err)
+                ));
             }
         }
 
@@ -715,21 +706,20 @@ pub fn format_git_resolved_url(target: &PackageTarget, commit_sha: &str) -> Stri
 
 /// Normalizes clone URL for git command execution on current platform.
 pub fn normalize_clone_url_for_git(url: &str) -> String {
-    if url.starts_with("file://") {
-        if let Ok(path) = url::Url::parse(url).and_then(|url| {
-            url.to_file_path()
+    let clean = url.strip_prefix("git+").unwrap_or(url);
+    if let Some(rest) = clean.strip_prefix("github:") {
+        let repo = rest.trim_end_matches(".git");
+        return format!("https://github.com/{repo}.git");
+    }
+    if clean.starts_with("file://") {
+        if let Ok(path) = url::Url::parse(clean).and_then(|u| {
+            u.to_file_path()
                 .map_err(|_| url::ParseError::RelativeUrlWithoutBase)
         }) {
             return path.to_string_lossy().replace('\\', "/");
         }
     }
-    if let Some(rest) = url.strip_prefix("ssh://git@github.com/") {
-        return format!("https://github.com/{rest}");
-    }
-    if let Some(rest) = url.strip_prefix("git@github.com:") {
-        return format!("https://github.com/{rest}");
-    }
-    if let Some(rest) = url.strip_prefix("file://") {
+    if let Some(rest) = clean.strip_prefix("file://") {
         let rest_trimmed = rest.trim_start_matches('/');
         // If it starts with Windows drive letter (e.g. C: or D:)
         if rest_trimmed.len() >= 2 && rest_trimmed.chars().nth(1) == Some(':') {
@@ -746,7 +736,71 @@ pub fn normalize_clone_url_for_git(url: &str) -> String {
             return format!("/{rest_trimmed}");
         }
     }
-    url.to_string()
+    clean.to_string()
+}
+
+/// Returns true if the git URL or path refers to a local repository or file:// protocol.
+pub fn is_file_or_local_git_url(url: &str) -> bool {
+    let trimmed = url.trim();
+    let clean = if trimmed
+        .get(..4)
+        .is_some_and(|p| p.eq_ignore_ascii_case("git+"))
+    {
+        &trimmed[4..]
+    } else {
+        trimmed
+    };
+    if clean
+        .get(..5)
+        .is_some_and(|p| p.eq_ignore_ascii_case("file:"))
+    {
+        return true;
+    }
+    if clean.starts_with("./")
+        || clean.starts_with("../")
+        || clean.starts_with(".\\")
+        || clean.starts_with("..\\")
+        || clean.starts_with('/')
+        || clean.starts_with('\\')
+    {
+        return true;
+    }
+    let bytes = clean.as_bytes();
+    if bytes.len() >= 2
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && (bytes.len() == 2 || bytes[2] == b'\\' || bytes[2] == b'/')
+    {
+        return true;
+    }
+    Path::new(clean).is_absolute()
+}
+
+/// Builds the argument list for git clone.
+///
+/// Passes `-c protocol.file.allow=always` only when the clone URL is a local or file-based repository.
+/// For remote repositories (https://, http://, ssh://, git://), this option is omitted to prevent CVE-2022-39253 file protocol abuse.
+pub fn build_git_clone_args<'a>(
+    clone_url: &'a str,
+    target_dir: &'a str,
+    mirror: bool,
+) -> Vec<&'a str> {
+    let mut args = Vec::new();
+    if is_file_or_local_git_url(clone_url) {
+        args.push("-c");
+        args.push("protocol.file.allow=always");
+    }
+    args.push("clone");
+    args.push("--config");
+    args.push("core.longpaths=true");
+    if mirror {
+        args.push("--mirror");
+    } else {
+        args.push("--bare");
+    }
+    args.push(clone_url);
+    args.push(target_dir);
+    args
 }
 
 /// Path to the checkout marker file, placed as a sibling to the checkout directory
@@ -1247,7 +1301,12 @@ async fn run_git_cmd(args: &[&str], cwd: Option<&Path>) -> Result<(bool, String,
     let output = cmd
         .output()
         .await
-        .map_err(|e| anyhow!("Failed to execute 'git {}': {e}", args.join(" ")))?;
+        .map_err(|e| {
+            anyhow!(
+                "Failed to execute 'git {}': {e}",
+                rnpm_config::scrub_credentials(&args.join(" "))
+            )
+        })?;
 
     let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
@@ -1369,6 +1428,40 @@ mod tests {
             "https://github.com/user/repo.git"
         );
 
+        // Explicit SSH URLs must be preserved, not rewritten to HTTPS
+        assert_eq!(
+            normalize_clone_url_for_git("ssh://git@github.com/org/private.git"),
+            "ssh://git@github.com/org/private.git"
+        );
+        assert_eq!(
+            normalize_clone_url_for_git("git+ssh://git@github.com/org/private.git"),
+            "ssh://git@github.com/org/private.git"
+        );
+        assert_eq!(
+            normalize_clone_url_for_git("git@github.com:org/private.git"),
+            "git@github.com:org/private.git"
+        );
+        assert_eq!(
+            normalize_clone_url_for_git("git+git@github.com:org/private.git"),
+            "git@github.com:org/private.git"
+        );
+
+        // GitHub shorthand must use HTTPS matching pacote/hosted-git-info
+        assert_eq!(
+            normalize_clone_url_for_git("github:org/repo"),
+            "https://github.com/org/repo.git"
+        );
+        assert_eq!(
+            normalize_clone_url_for_git("git+github:org/repo"),
+            "https://github.com/org/repo.git"
+        );
+
+        // Explicit HTTPS URLs are preserved
+        assert_eq!(
+            normalize_clone_url_for_git("git+https://github.com/org/repo.git"),
+            "https://github.com/org/repo.git"
+        );
+
         #[cfg(windows)]
         {
             assert_eq!(
@@ -1466,5 +1559,46 @@ mod tests {
         copy_dir_all(&src_no_manifest, &dst_no_manifest).unwrap();
         assert!(dst_no_manifest.join("data.txt").exists());
         assert!(!dst_no_manifest.join(".rnpm_checkout_done").exists());
+    }
+
+    #[test]
+    fn test_build_git_clone_args_protocol_file_gating() {
+        // Remote URLs must NOT have protocol.file.allow=always (prevents CVE-2022-39253)
+        let remote_urls = [
+            "https://github.com/owner/repo.git",
+            "http://github.com/owner/repo.git",
+            "git+https://github.com/owner/repo.git",
+            "git+http://github.com/owner/repo.git",
+            "ssh://git@github.com/owner/repo.git",
+            "git@github.com:owner/repo.git",
+            "git://github.com/owner/repo.git",
+        ];
+        for url in remote_urls {
+            let args = build_git_clone_args(url, "/tmp/dir", true);
+            assert!(
+                !args.contains(&"protocol.file.allow=always"),
+                "Remote URL '{}' must NOT include protocol.file.allow=always",
+                url
+            );
+        }
+
+        // Local / file URLs MUST have protocol.file.allow=always
+        let local_urls = [
+            "file:///path/to/repo",
+            "git+file:///path/to/repo",
+            "/var/git/repo",
+            "C:/repos/my-repo",
+            "C:\\repos\\my-repo",
+            "./local-repo",
+            "../local-repo",
+        ];
+        for url in local_urls {
+            let args = build_git_clone_args(url, "/tmp/dir", true);
+            assert!(
+                args.contains(&"protocol.file.allow=always"),
+                "Local/file URL '{}' must include protocol.file.allow=always",
+                url
+            );
+        }
     }
 }

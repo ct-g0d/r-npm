@@ -74,6 +74,8 @@ pub(super) fn run(json: bool, long: bool, dir: &Path) -> Result<()> {
     };
     let home =
         std::env::var(if cfg!(windows) { "USERPROFILE" } else { "HOME" }).unwrap_or_default();
+    let detailed =
+        rnpm_config::Config::load_detailed(rnpm_config::ConfigOptions::new().project_dir(dir))?;
     let mut defaults: Map = serde_json::from_str::<Value>(include_str!("config_defaults.json"))?
         .as_object()
         .cloned()
@@ -129,8 +131,6 @@ pub(super) fn run(json: bool, long: bool, dir: &Path) -> Result<()> {
         };
         *value = Value::String(dynamic);
     }
-    let detailed =
-        rnpm_config::Config::load_detailed(rnpm_config::ConfigOptions::new().project_dir(dir))?;
     let mut layers = vec![Layer {
         name: "default".into(),
         source: "default values".into(),
@@ -170,8 +170,16 @@ pub(super) fn run(json: bool, long: bool, dir: &Path) -> Result<()> {
             let mut remaining = layer.settings;
             remaining.remove("globalconfig");
             for (env_k, _) in std::env::vars() {
-                if env_k.len() > 11 && env_k[..11].eq_ignore_ascii_case("npm_config_") {
-                    let raw = &env_k[11..];
+                if env_k
+                    .get(..11)
+                    .is_some_and(|prefix| prefix.eq_ignore_ascii_case("npm_config_"))
+                {
+                    let Some(raw) = env_k.get(11..) else {
+                        continue;
+                    };
+                    if raw.is_empty() {
+                        continue;
+                    }
                     let norm = if raw.starts_with("//") {
                         raw.to_string()
                     } else {
@@ -228,6 +236,12 @@ pub(super) fn run(json: bool, long: bool, dir: &Path) -> Result<()> {
     }
     if long {
         cli.data.insert("long".into(), Value::Bool(true));
+    }
+    if let Some(userconfig) = rnpm_config::get_process_userconfig() {
+        cli.data.insert(
+            "userconfig".into(),
+            Value::String(userconfig.display().to_string()),
+        );
     }
     let mut owners = BTreeMap::new();
     for (i, layer) in layers.iter().enumerate() {

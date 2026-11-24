@@ -384,7 +384,16 @@ pub async fn run_outdated_inner(
     // 5. Fetch packument metadata concurrently and determine wanted / latest
     let mut join_set = tokio::task::JoinSet::new();
     // `before` needs publish times, which only the full packument carries.
-    let before = config.before_cutoff();
+    let before = config.before_cutoff().or_else(|| {
+        config.get("before").and_then(|b| {
+            let trimmed = b.trim();
+            if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("null") {
+                None
+            } else {
+                rnpm_config::date::parse_js_date(trimmed)
+            }
+        })
+    });
     let excludes = config.min_release_age_exclude();
 
     for (dep, current, homepage) in installed_info {
@@ -413,8 +422,18 @@ pub async fn run_outdated_inner(
 
     while let Some(res) = join_set.join_next().await {
         let (dep, current, homepage, packument_res) = res?;
-        let packument = packument_res
-            .map_err(|e| anyhow::anyhow!("Failed to fetch metadata for {}: {e}", dep.name))?;
+        let packument = match packument_res {
+            Ok(p) => p,
+            Err(e) if e.is_not_found() || e.status_code() == Some(404) => {
+                // When querying metadata for an installed package returns 404
+                // (e.g. private/unregistered/local package), match npm 11.20.0
+                // by skipping it instead of aborting npm outdated with exit code 1!
+                continue;
+            }
+            Err(e) => {
+                return Err(anyhow::anyhow!("Failed to fetch metadata for {}: {e}", dep.name));
+            }
+        };
 
         let (wanted, latest) = resolve_wanted_and_latest(
             &dep.declared_spec,

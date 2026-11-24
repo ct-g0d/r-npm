@@ -91,6 +91,7 @@ async fn test_rebuild_executes_installed_lifecycle_scripts() {
 
     let opts = RebuildOptions {
         project_dir: root.to_path_buf(),
+        init_cwd: None,
         packages: vec![],
         ignore_scripts: false,
         foreground_scripts: false,
@@ -137,6 +138,7 @@ async fn test_rebuild_selective_packages() {
     // Rebuild only target-pkg
     let opts = RebuildOptions {
         project_dir: root.to_path_buf(),
+        init_cwd: None,
         packages: vec!["target-pkg".to_string()],
         ignore_scripts: false,
         foreground_scripts: false,
@@ -221,6 +223,7 @@ async fn test_rebuild_native_addon_with_binding_gyp() {
 
     let opts = RebuildOptions {
         project_dir: root.to_path_buf(),
+        init_cwd: None,
         packages: vec![],
         ignore_scripts: false,
         foreground_scripts: false,
@@ -260,6 +263,7 @@ async fn test_rebuild_ignore_scripts_flag() {
 
     let opts = RebuildOptions {
         project_dir: root.to_path_buf(),
+        init_cwd: None,
         packages: vec![],
         ignore_scripts: true,
         foreground_scripts: false,

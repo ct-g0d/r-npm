@@ -54,10 +54,13 @@ impl IndexEntry {
             .join(p1)
             .join(p2)
             .join(&hash[4..]);
+        let legacy_style = cache_dir.join("index-v5").join(p1).join(p2).join(&hash);
         if npm_style.exists() {
             npm_style
+        } else if legacy_style.exists() {
+            legacy_style
         } else {
-            cache_dir.join("index-v5").join(p1).join(p2).join(&hash)
+            npm_style
         }
     }
 }

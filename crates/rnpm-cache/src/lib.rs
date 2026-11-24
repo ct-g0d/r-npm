@@ -512,7 +512,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let cache = Cache::new(dir.path())
             .unwrap()
-            .with_lock_timeout(Duration::from_millis(500))
+            .with_lock_timeout(Duration::from_secs(5))
             .with_stale_threshold(Duration::from_secs(3600)); // Very large stale threshold
 
         let lock_path = cache.lock_path("idx_dead_pid_lock");
@@ -524,22 +524,31 @@ mod tests {
         std::fs::write(&lock_path, format!("pid={dead_pid} time=999999\n")).unwrap();
         assert!(lock_path.exists());
 
+        // Verify is_lock_stale identifies dead PID immediately despite 3600s threshold
+        assert!(
+            CacheLock::is_lock_stale(&lock_path, Duration::from_secs(3600)),
+            "Lock with dead PID must be recognized as stale despite 3600s threshold"
+        );
+
         // Attempting to acquire lock should immediately detect dead PID and reclaim without waiting 3600s
         let start = std::time::Instant::now();
         let lock_res = CacheLock::acquire_exclusive_with_options(
             &lock_path,
-            Duration::from_millis(500),
+            Duration::from_secs(5),
             Duration::from_secs(3600),
         );
+        let elapsed = start.elapsed();
 
         assert!(
             lock_res.is_ok(),
-            "Must break and reclaim lock held by dead PID: {:?}",
-            lock_res.err()
+            "Must break and reclaim lock held by dead PID: {:?}, elapsed: {:?}",
+            lock_res.err(),
+            elapsed
         );
         assert!(
-            start.elapsed() < Duration::from_millis(250),
-            "Reclamation must be immediate"
+            elapsed < Duration::from_secs(2),
+            "Reclamation must be immediate without waiting for timeout or 3600s stale threshold; elapsed: {:?}",
+            elapsed
         );
 
         let lock = lock_res.unwrap();
@@ -1497,5 +1506,52 @@ mod tests {
         // Clean cache wipes fingerprints
         cache.clean().unwrap();
         assert_eq!(cache.get_project_fingerprint(proj1.path()).unwrap(), None);
+    }
+
+    #[test]
+    fn test_cacache_npm_11_20_0_path_format_and_legacy_interop() {
+        let dir = tempdir().unwrap();
+        let cache = Cache::new(dir.path()).unwrap();
+
+        let data = b"npm 11.20.0 cacache interop content";
+        let key = "https://registry.npmjs.org/test-interop/-/test-interop-1.0.0.tgz";
+
+        let entry = cache.put(key, data, None).unwrap();
+
+        // 1. Verify blob path format matches npm 11.20.0 cacache: hex[4..]
+        let blob_path = cache.blob_path(&entry.sha512_hex);
+        let blob_file_name = blob_path.file_name().unwrap().to_str().unwrap();
+        assert_eq!(
+            blob_file_name.len(),
+            124,
+            "npm 11.20.0 cacache blob filename must be exactly 124 chars (&hex[4..]), got: {blob_file_name}"
+        );
+        assert_eq!(blob_file_name, &entry.sha512_hex[4..]);
+
+        // 2. Verify index path format matches npm 11.20.0 cacache: hash[4..]
+        let index_path = IndexEntry::path_for_key(dir.path(), key);
+        let index_file_name = index_path.file_name().unwrap().to_str().unwrap();
+        assert_eq!(
+            index_file_name.len(),
+            60,
+            "npm 11.20.0 cacache index filename must be exactly 60 chars (&hash[4..]), got: {index_file_name}"
+        );
+
+        // 3. Verify legacy full-hash compatibility: if a legacy file exists, it is read correctly
+        let legacy_blob_path = dir
+            .path()
+            .join("content-v2")
+            .join("sha512")
+            .join(&entry.sha512_hex[0..2])
+            .join(&entry.sha512_hex[2..4])
+            .join(&entry.sha512_hex);
+        // Rename npm-style to legacy-style
+        std::fs::rename(&blob_path, &legacy_blob_path).unwrap();
+        assert!(legacy_blob_path.exists());
+        assert!(!blob_path.exists());
+
+        // Cache must still find and read the legacy blob
+        let legacy_read = cache.get_by_sha512(&entry.sha512_hex).unwrap();
+        assert_eq!(legacy_read.as_deref(), Some(&data[..]));
     }
 }

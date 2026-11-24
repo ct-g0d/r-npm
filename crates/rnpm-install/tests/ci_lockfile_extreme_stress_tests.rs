@@ -767,7 +767,9 @@ async fn test_ci_workspace_absent_root_metadata_differential() {
         res3.err()
     );
 
-    // 7. Delete all members from disk while workspaces field remains in package.json (Round 1 Finding 2 regression)
+    // 7. Delete all members from disk while workspaces field remains in package.json:
+    // Real npm 11.20.0 `ci` (e.g. `ci-missing-link-target` and published `eslint` tarballs)
+    // allows absent lockfile workspace folders and leaves dangling links instead of throwing ELOCKFILE_DRIFT.
     fs::remove_dir_all(project_dir.join("packages/member-a")).unwrap();
     fs::remove_dir_all(project_dir.join("packages/member-b")).unwrap();
 
@@ -777,14 +779,131 @@ async fn test_ci_workspace_absent_root_metadata_differential() {
         ..Default::default()
     })
     .unwrap();
-    let drift_empty = installer4.run_ci().await;
+    let res4 = installer4.run_ci().await;
     assert!(
-        drift_empty.is_err(),
-        "run_ci must fail with ELOCKFILE_DRIFT when all workspace members are deleted from disk"
+        res4.is_ok(),
+        "run_ci must match real npm 11.20.0 by allowing absent workspace folders in lockfile: {:?}",
+        res4.err()
     );
-    let err_msg4 = drift_empty.unwrap_err().to_string();
+}
+
+#[tokio::test]
+async fn test_ci_workspace_member_drift_detected_when_root_workspaces_match() {
+    let tmp = tempdir().unwrap();
+    let project_dir = tmp.path();
+
+    // 1. Root package.json with workspaces: ["packages/*"]
+    let mut manifest = Manifest::default();
+    manifest.name = Some("ws-drift-app".to_string());
+    manifest.version = Some("1.0.0".to_string());
+    manifest.workspaces = Some(rnpm_core::manifest::PackageWorkspaces::List(vec![
+        "packages/*".to_string(),
+    ]));
+    manifest
+        .save_to_file(project_dir.join("package.json"))
+        .unwrap();
+
+    // Create member-a on disk
+    fs::create_dir_all(project_dir.join("packages/member-a")).unwrap();
+    fs::write(
+        project_dir.join("packages/member-a/package.json"),
+        r#"{"name":"member-a","version":"1.0.0"}"#,
+    )
+    .unwrap();
+
+    // 2. Lockfile has root workspaces: ["packages/*"] matching package.json,
+    // but ONLY has packages/member-a (member-b is not in the lockfile).
+    let mut lockfile = LockfileV3::new("ws-drift-app", Some("1.0.0".to_string()));
+    lockfile.root_package_mut().unwrap().workspaces = Some(vec!["packages/*".to_string()]);
+    lockfile.insert_package(
+        "packages/member-a",
+        LockfilePackage {
+            version: Some("1.0.0".to_string()),
+            ..Default::default()
+        },
+    );
+    lockfile
+        .save_to_file(&project_dir.join("package-lock.json"))
+        .unwrap();
+
+    // 3. Now add member-b on disk without updating lockfile
+    fs::create_dir_all(project_dir.join("packages/member-b")).unwrap();
+    fs::write(
+        project_dir.join("packages/member-b/package.json"),
+        r#"{"name":"member-b","version":"1.0.0"}"#,
+    )
+    .unwrap();
+
+    // 4. rnpm ci must detect member-b is missing from lockfile and fail with ELOCKFILE_DRIFT
+    let mut installer = Installer::new(InstallOptions {
+        project_dir: project_dir.to_path_buf(),
+        offline: true,
+        ..Default::default()
+    })
+    .unwrap();
+
+    let res = installer.run_ci().await;
     assert!(
-        err_msg4.contains("ELOCKFILE_DRIFT"),
-        "error must be ELOCKFILE_DRIFT: {err_msg4}"
+        res.is_err(),
+        "run_ci must fail when a new workspace member on disk is missing from lockfile"
+    );
+    let err_msg = res.unwrap_err().to_string();
+    assert!(
+        err_msg.contains("ELOCKFILE_DRIFT"),
+        "error must be ELOCKFILE_DRIFT: {err_msg}"
+    );
+}
+
+#[tokio::test]
+async fn test_ci_non_registry_url_drift_detected() {
+    let tmp = tempdir().unwrap();
+    let project_dir = tmp.path();
+
+    // 1. package.json requires dep-a: https://example.com/dep-a-2.0.0.tgz
+    let mut manifest = Manifest::default();
+    manifest.name = Some("url-drift-app".to_string());
+    manifest.version = Some("1.0.0".to_string());
+    manifest
+        .dependencies
+        .insert("dep-a".to_string(), "https://example.com/dep-a-2.0.0.tgz".to_string());
+    manifest
+        .save_to_file(project_dir.join("package.json"))
+        .unwrap();
+
+    // 2. package-lock.json resolved dep-a to https://example.com/dep-a-1.0.0.tgz
+    let mut lockfile = LockfileV3::new("url-drift-app", Some("1.0.0".to_string()));
+    let mut deps = BTreeMap::new();
+    deps.insert("dep-a".to_string(), "https://example.com/dep-a-1.0.0.tgz".to_string());
+    lockfile.root_package_mut().unwrap().dependencies = Some(deps);
+    lockfile.insert_package(
+        "node_modules/dep-a",
+        LockfilePackage {
+            version: Some("1.0.0".to_string()),
+            resolved: Some("https://example.com/dep-a-1.0.0.tgz".to_string()),
+            integrity: Some("sha512-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==".to_string()),
+            ..Default::default()
+        },
+    );
+    lockfile
+        .save_to_file(&project_dir.join("package-lock.json"))
+        .unwrap();
+
+    // 3. rnpm ci must detect that dep-a URL diverged and fail with ELOCKFILE_DRIFT
+    let mut installer = Installer::new(InstallOptions {
+        project_dir: project_dir.to_path_buf(),
+        offline: true,
+        ..Default::default()
+    })
+    .unwrap();
+
+    let res = installer.run_ci().await;
+    assert!(
+        res.is_err(),
+        "run_ci must fail when non-registry dependency URL diverged"
+    );
+    let err_msg = res.unwrap_err().to_string();
+    assert!(
+        err_msg.contains("ELOCKFILE_DRIFT"),
+        "error must be ELOCKFILE_DRIFT: {err_msg}"
     );
 }

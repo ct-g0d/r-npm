@@ -6504,3 +6504,252 @@ fn test_prefer_dedupe_prefers_already_placed_compatible_version() {
         "1.0.0"
     );
 }
+
+#[test]
+fn test_cross_workspace_peer_dependencies() {
+    use crate::workspace::resolve_workspace_graph;
+    use rnpm_core::workspace::WorkspaceMember;
+    use std::path::PathBuf;
+
+    let provider = InMemoryPackageProvider::new();
+
+    let mut root_manifest = Manifest::default();
+    root_manifest.name = Some("monorepo-root".to_string());
+
+    // Member core-framework v2.1.0
+    let mut manifest_core = Manifest::default();
+    manifest_core.name = Some("core-framework".to_string());
+    manifest_core.version = Some("2.1.0".to_string());
+    let member_core = WorkspaceMember {
+        name: "core-framework".to_string(),
+        version: Some("2.1.0".to_string()),
+        path: PathBuf::from("packages/core"),
+        relative_path: "packages/core".to_string(),
+        manifest: manifest_core,
+    };
+
+    // Member ui-plugin has peerDependency on core-framework ^2.0.0
+    let mut manifest_ui = Manifest::default();
+    manifest_ui.name = Some("ui-plugin".to_string());
+    manifest_ui.version = Some("1.0.0".to_string());
+    manifest_ui
+        .peer_dependencies
+        .insert("core-framework".to_string(), "^2.0.0".to_string());
+    let member_ui = WorkspaceMember {
+        name: "ui-plugin".to_string(),
+        version: Some("1.0.0".to_string()),
+        path: PathBuf::from("packages/ui"),
+        relative_path: "packages/ui".to_string(),
+        manifest: manifest_ui,
+    };
+
+    let options = ResolverOptions::default();
+    let graph = resolve_workspace_graph(
+        &root_manifest,
+        &[member_core, member_ui],
+        &provider,
+        &options,
+    )
+    .expect("Cross-workspace peer dependency resolution should succeed");
+
+    // Peer dependency edge should link packages/ui to node_modules/core-framework
+    let peer_edge = graph.edges.iter().find(|e| {
+        e.from_location == "packages/ui"
+            && e.to_location == "node_modules/core-framework"
+            && e.package_name == "core-framework"
+    });
+    assert!(peer_edge.is_some(), "Peer edge between workspace members must be present in graph.edges");
+    assert_eq!(peer_edge.unwrap().dep_type, DependencyType::Peer);
+}
+
+#[test]
+fn test_latest_tag_cutoff_fallback() {
+    let mut provider = InMemoryPackageProvider::new();
+    provider.add_version("time-tested", "1.0.0", |_| {});
+    provider.add_version("time-tested", "1.5.0", |_| {});
+    // Simulate metadata where dist-tags.latest points to 2.0.0, which is not present in versions
+    provider.set_dist_tag("time-tested", "latest", "2.0.0");
+
+    let mut manifest = Manifest::default();
+    manifest
+        .dependencies
+        .insert("time-tested".to_string(), "latest".to_string());
+
+    let options = ResolverOptions::default();
+    let graph = resolve_dependency_graph(&manifest, &provider, &options)
+        .expect("Should fall back to highest available version when latest tag is cut off");
+
+    assert_eq!(
+        graph.nodes.get("node_modules/time-tested").unwrap().version,
+        "1.5.0"
+    );
+}
+
+#[test]
+fn test_workspace_member_reference_overrides() {
+    use crate::workspace::resolve_workspace_graph;
+    use rnpm_core::workspace::WorkspaceMember;
+    use std::path::PathBuf;
+
+    let mut provider = InMemoryPackageProvider::new();
+    provider.add_version("external-dep", "1.0.0", |_| {});
+    provider.add_version("external-dep", "2.0.0", |_| {});
+
+    let mut root_manifest = Manifest::default();
+    root_manifest.name = Some("monorepo-root".to_string());
+    // Root requests external-dep at ^1.0.0 (which would normally pick 1.0.0 or lowest compatible)
+    root_manifest
+        .dependencies
+        .insert("external-dep".to_string(), "^1.0.0".to_string());
+    // But override points external-dep to $ws-member (which is 2.0.0)
+    root_manifest.extra.insert(
+        "overrides".to_string(),
+        serde_json::json!({
+            "external-dep": "$ws-member"
+        }),
+    );
+
+    let mut ws_manifest = Manifest::default();
+    ws_manifest.name = Some("ws-member".to_string());
+    ws_manifest.version = Some("2.0.0".to_string());
+    let member = WorkspaceMember {
+        name: "ws-member".to_string(),
+        version: Some("2.0.0".to_string()),
+        path: PathBuf::from("packages/member"),
+        relative_path: "packages/member".to_string(),
+        manifest: ws_manifest,
+    };
+
+    let options = ResolverOptions::default();
+    let graph = resolve_workspace_graph(&root_manifest, &[member], &provider, &options)
+        .expect("Reference override $ws-member should resolve to workspace member spec");
+    assert!(graph.nodes.contains_key("node_modules/ws-member"));
+    // Verify that the override actually applied to external-dep, resolving it to 2.0.0 instead of 1.0.0!
+    assert_eq!(
+        graph.nodes.get("node_modules/external-dep").unwrap().version,
+        "2.0.0"
+    );
+}
+
+#[test]
+fn test_node_satisfies_target_alias_name_check() {
+    use crate::graph::Node;
+    use crate::hoisting::node_satisfies_target;
+    use rnpm_core::semver::{Range, Version};
+    use rnpm_core::spec::PackageTarget;
+
+    let node = Node {
+        name: "actual-package".to_string(),
+        version: "1.0.0".to_string(),
+        parsed_version: Version::parse("1.0.0").ok(),
+        ..Default::default()
+    };
+
+    let target_matching = PackageTarget::Alias {
+        name: "actual-package".to_string(),
+        target: Box::new(PackageTarget::Range(Range::parse("^1.0.0").unwrap())),
+    };
+    assert!(node_satisfies_target(&node, &target_matching));
+
+    let target_mismatched = PackageTarget::Alias {
+        name: "other-package".to_string(),
+        target: Box::new(PackageTarget::Range(Range::parse("^1.0.0").unwrap())),
+    };
+    assert!(!node_satisfies_target(&node, &target_mismatched));
+}
+
+#[test]
+fn test_repro_octokit_types_hoisting() {
+    let mut provider = InMemoryPackageProvider::new();
+
+    // Versions of @octokit/types
+    provider.add_version("@octokit/types", "18.0.0", |_| {});
+    provider.add_version("@octokit/types", "13.10.0", |_| {});
+
+    // Root octokit stack (occupies root node_modules with @octokit/types@18.0.0)
+    provider.add_version("@octokit/core", "7.0.2", |v| {
+        v.dependencies.insert("@octokit/types".into(), "^18.0.0".into());
+        v.dependencies.insert("@octokit/graphql".into(), "^9.0.0".into());
+        v.dependencies.insert("@octokit/request".into(), "^10.0.0".into());
+    });
+    provider.add_version("@octokit/graphql", "9.0.1", |_| {});
+    provider.add_version("@octokit/request", "10.0.2", |v| {
+        v.dependencies.insert("@octokit/request-error".into(), "^7.0.0".into());
+        v.dependencies.insert("@octokit/endpoint".into(), "^10.0.0".into());
+    });
+    provider.add_version("@octokit/request-error", "7.0.0", |_| {});
+    provider.add_version("@octokit/endpoint", "10.0.0", |_| {});
+    provider.add_version("@octokit/plugin-paginate-rest", "13.0.1", |_| {});
+    provider.add_version("@octokit/plugin-rest-endpoint-methods", "16.0.0", |_| {});
+
+    provider.add_version("@octokit/rest", "22.0.0", |v| {
+        v.dependencies.insert("@octokit/core".into(), "^7.0.0".into());
+        v.dependencies.insert("@octokit/plugin-paginate-rest".into(), "^13.0.0".into());
+        v.dependencies.insert("@octokit/plugin-rest-endpoint-methods".into(), "^16.0.0".into());
+    });
+
+    // Nested subtree under release-please:
+    // release-please has an uninstalled devDependency on @octokit/types@^9.0.0.
+    // In npm Arborist, non-root devDependencies are never installed and never shadow.
+    // Transitive dependencies (@octokit/types@13.10.0) must hoist to the common intermediate
+    // ancestor (node_modules/release-please/node_modules/@octokit/types), rather than nesting
+    // under each of the 7 child packages.
+    provider.add_version("release-please", "17.1.1", |v| {
+        v.dependencies.insert("@octokit/rest".into(), "^20.0.0".into());
+        v.dependencies.insert("@octokit/graphql".into(), "^7.0.0".into());
+        v.dependencies.insert("@octokit/request".into(), "^8.0.0".into());
+        v.dependencies.insert("@octokit/request-error".into(), "^5.0.0".into());
+        v.dev_dependencies.insert("@octokit/types".into(), "^9.0.0".into());
+    });
+
+    provider.add_version("@octokit/rest", "20.1.1", |v| {
+        v.dependencies.insert("@octokit/core".into(), "^5.0.0".into());
+        v.dependencies.insert("@octokit/plugin-paginate-rest".into(), "^11.0.0".into());
+        v.dependencies.insert("@octokit/plugin-rest-endpoint-methods".into(), "^13.0.0".into());
+    });
+
+    provider.add_version("@octokit/graphql", "7.0.0", |v| {
+        v.dependencies.insert("@octokit/types".into(), "^13.0.0".into());
+    });
+    provider.add_version("@octokit/request", "8.0.2", |v| {
+        v.dependencies.insert("@octokit/endpoint".into(), "^9.0.0".into());
+        v.dependencies.insert("@octokit/types".into(), "^13.1.0".into());
+    });
+    provider.add_version("@octokit/request-error", "5.0.0", |v| {
+        v.dependencies.insert("@octokit/types".into(), "^13.1.0".into());
+    });
+    provider.add_version("@octokit/endpoint", "9.0.0", |v| {
+        v.dependencies.insert("@octokit/types".into(), "^13.1.0".into());
+    });
+    provider.add_version("@octokit/core", "5.0.2", |v| {
+        v.dependencies.insert("@octokit/types".into(), "^13.0.0".into());
+    });
+    provider.add_version("@octokit/plugin-paginate-rest", "11.3.1", |v| {
+        v.dependencies.insert("@octokit/types".into(), "^13.7.0".into());
+    });
+    provider.add_version("@octokit/plugin-rest-endpoint-methods", "13.2.2", |v| {
+        v.dependencies.insert("@octokit/types".into(), "^13.8.0".into());
+    });
+
+    let mut manifest = Manifest::default();
+    manifest.dependencies.insert("@octokit/rest".into(), "22.0.0".into());
+    manifest.dependencies.insert("release-please".into(), "17.1.1".into());
+
+    let options = ResolverOptions::default();
+    let graph = resolve_dependency_graph(&manifest, &provider, &options).unwrap();
+
+    let mut types_locations: Vec<_> = graph
+        .nodes
+        .keys()
+        .filter(|k| k.ends_with("@octokit/types"))
+        .cloned()
+        .collect();
+    types_locations.sort();
+    assert_eq!(
+        types_locations,
+        vec![
+            "node_modules/@octokit/types".to_string(),
+            "node_modules/release-please/node_modules/@octokit/types".to_string(),
+        ]
+    );
+}

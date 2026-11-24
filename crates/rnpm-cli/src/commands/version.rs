@@ -17,6 +17,15 @@ pub(crate) struct VersionCommandArgs {
     pub include_workspace_root: bool,
 }
 
+fn wrap_version_error(err: anyhow::Error) -> anyhow::Error {
+    let msg = format!("{err:#}");
+    if msg.contains("package.json not found") || msg.starts_with("npm error ") {
+        err
+    } else {
+        anyhow::anyhow!("npm error {msg}")
+    }
+}
+
 pub(crate) async fn run(args: VersionCommandArgs, current_dir: PathBuf) -> Result<()> {
     let config = rnpm_config::Config::load(Some(&current_dir))?;
     let commit_hooks = if args.no_commit_hooks {
@@ -55,7 +64,9 @@ pub(crate) async fn run(args: VersionCommandArgs, current_dir: PathBuf) -> Resul
             println!("{}", member.name);
             let mut member_options = options.clone();
             member_options.git_tag_version = false;
-            crate::version::execute_version(&member.path, member_options).await?;
+            crate::version::execute_version(&member.path, member_options)
+                .await
+                .map_err(wrap_version_error)?;
         }
         if options.newversion.is_some() && config.get_bool("workspaces-update") != Some(false) {
             let silent = config.get("loglevel") == Some("silent");
@@ -93,7 +104,9 @@ pub(crate) async fn run(args: VersionCommandArgs, current_dir: PathBuf) -> Resul
             }
         }
     } else {
-        crate::version::execute_version(&current_dir, options).await?;
+        crate::version::execute_version(&current_dir, options)
+            .await
+            .map_err(wrap_version_error)?;
     }
 
     Ok(())

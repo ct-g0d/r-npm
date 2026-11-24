@@ -4522,3 +4522,127 @@ fn test_github_actions_sub_ci_tokens() {
     );
     assert_eq!(github_actions_sub_ci("", "github-hosted"), None);
 }
+
+#[tokio::test]
+async fn test_init_cwd_preservation() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("root");
+    let caller_dir = temp.path().join("caller");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::create_dir_all(&caller_dir).unwrap();
+
+    let mut ctx = LifecycleContext::new(
+        &root,
+        &root,
+        "test-init-cwd",
+        "custom-hook",
+        "echo test",
+    );
+
+    // 1. When not in extra_env, falls back to project_root
+    let env_default = build_lifecycle_env(&ctx);
+    assert_eq!(
+        env_default.get("INIT_CWD").unwrap(),
+        &root.to_string_lossy().to_string()
+    );
+
+    // 2. When provided in extra_env (e.g. from opts.init_cwd), it is preserved!
+    ctx.extra_env.insert(
+        "INIT_CWD".to_string(),
+        caller_dir.to_string_lossy().to_string(),
+    );
+    let env_custom = build_lifecycle_env(&ctx);
+    assert_eq!(
+        env_custom.get("INIT_CWD").unwrap(),
+        &caller_dir.to_string_lossy().to_string()
+    );
+}
+
+#[tokio::test]
+async fn test_init_cwd_stale_outer_env_not_leaked() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("root");
+    let outer_dir = temp.path().join("outer_stale");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::create_dir_all(&outer_dir).unwrap();
+
+    // Set a stale INIT_CWD in the process environment
+    std::env::set_var("INIT_CWD", &outer_dir);
+
+    let ctx = LifecycleContext::new(
+        &root,
+        &root,
+        "test-stale-init-cwd",
+        "custom-hook",
+        "echo test",
+    );
+
+    // build_lifecycle_env must NOT let the outer stale INIT_CWD leak!
+    // It should overwrite it with ctx.project_root.
+    let env = build_lifecycle_env(&ctx);
+    assert_ne!(
+        env.get("INIT_CWD").unwrap(),
+        &outer_dir.to_string_lossy().to_string(),
+        "Stale INIT_CWD from outer process must not leak!"
+    );
+    assert_eq!(
+        env.get("INIT_CWD").unwrap(),
+        &root.to_string_lossy().to_string(),
+        "INIT_CWD should default to project_root when not specified in extra_env"
+    );
+
+    // Clean up
+    std::env::remove_var("INIT_CWD");
+}
+
+#[tokio::test]
+async fn test_init_cwd_reflects_invocation_directory_not_prefix() {
+    let temp = tempfile::tempdir().unwrap();
+    let invocation_dir = temp.path().join("invocation");
+    let prefix_sub_dir = temp.path().join("invocation").join("sub_prefix");
+    std::fs::create_dir_all(&invocation_dir).unwrap();
+    std::fs::create_dir_all(&prefix_sub_dir).unwrap();
+
+    let opts = LifecycleOptions {
+        root_dir: prefix_sub_dir.clone(),
+        init_cwd: invocation_dir.clone(),
+        ..Default::default()
+    };
+
+    let manifest = rnpm_core::manifest::Manifest {
+        name: Some("sub-pkg".into()),
+        version: Some("1.0.0".into()),
+        scripts: [("postinstall".to_string(), "node -e 0".to_string())].into_iter().collect(),
+        ..Default::default()
+    };
+
+    let node = LifecyclePackageNode {
+        package_path: "sub-pkg".into(),
+        manifest: manifest.clone(),
+        disk_path: prefix_sub_dir.clone(),
+        source: PackageSource::Local,
+        dependencies: vec![],
+        optional: false,
+    };
+
+    // When executed through lifecycle runner, INIT_CWD in extra_env must reflect opts.init_cwd
+    let mut ctx = LifecycleContext::new(
+        &opts.root_dir,
+        &node.disk_path,
+        node.manifest.name.as_deref().unwrap_or("unknown"),
+        "postinstall",
+        "node -e 0",
+    );
+    if !opts.init_cwd.as_os_str().is_empty() {
+        ctx.extra_env.insert(
+            "INIT_CWD".to_string(),
+            opts.init_cwd.to_string_lossy().to_string(),
+        );
+    }
+    let env = build_lifecycle_env(&ctx);
+    assert_eq!(
+        env.get("INIT_CWD").unwrap(),
+        &invocation_dir.to_string_lossy().to_string(),
+        "INIT_CWD must reflect invocation_dir, NOT prefix_sub_dir"
+    );
+}

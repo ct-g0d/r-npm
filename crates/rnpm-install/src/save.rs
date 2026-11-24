@@ -157,7 +157,11 @@ pub fn member_relative_file_spec(spec: &str, member_relative_path: &str) -> Stri
     }
 }
 
-/// Inserts a dependency into the appropriate section of a Manifest.
+/// Inserts a dependency into the appropriate section of a Manifest matching npm's add-rm-pkg-deps rules:
+/// - prod: removes from devDependencies, peerDependencies, and optionalDependencies.
+/// - dev: removes from dependencies; preserves peerDependencies and optionalDependencies.
+/// - optional: removes from dependencies and peerDependencies; preserves devDependencies.
+/// - peer: removes from dependencies and optionalDependencies; preserves devDependencies.
 pub fn insert_manifest_dep(
     m: &mut Manifest,
     name: &str,
@@ -169,14 +173,22 @@ pub fn insert_manifest_dep(
     if save_dev {
         m.dev_dependencies
             .insert(name.to_string(), spec.to_string());
+        m.dependencies.remove(name);
     } else if save_optional {
         m.optional_dependencies
             .insert(name.to_string(), spec.to_string());
+        m.dependencies.remove(name);
+        m.peer_dependencies.remove(name);
     } else if save_peer {
         m.peer_dependencies
             .insert(name.to_string(), spec.to_string());
+        m.dependencies.remove(name);
+        m.optional_dependencies.remove(name);
     } else {
         m.dependencies.insert(name.to_string(), spec.to_string());
+        m.dev_dependencies.remove(name);
+        m.optional_dependencies.remove(name);
+        m.peer_dependencies.remove(name);
     }
 }
 

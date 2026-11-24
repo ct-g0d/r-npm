@@ -5902,3 +5902,335 @@ async fn test_run_ci_nested_workspace_incompatible_intermediate_fails() {
         "error message must report missing incompatible dependency: {err_msg}"
     );
 }
+
+#[test]
+fn test_fast_path_fingerprint_invalidated_by_options_and_npmrc() {
+    let tmp = tempdir().unwrap();
+    let root = tmp.path();
+    fs::write(root.join("package.json"), r#"{"name":"test-fp","version":"1.0.0"}"#).unwrap();
+    fs::write(root.join("package-lock.json"), r#"{"name":"test-fp","lockfileVersion":3,"packages":{"":{}}}"#).unwrap();
+
+    let opts1 = InstallOptions {
+        project_dir: root.to_path_buf(),
+        ..Default::default()
+    };
+    let fp1 = crate::fast_path::compute_project_fingerprint(root, &opts1).unwrap();
+
+    // 1. Changing ignore_scripts must invalidate fingerprint
+    let mut opts_scripts = opts1.clone();
+    opts_scripts.ignore_scripts = true;
+    let fp_scripts = crate::fast_path::compute_project_fingerprint(root, &opts_scripts).unwrap();
+    assert_ne!(fp1, fp_scripts, "fingerprint must change when ignore_scripts changes");
+
+    // 2. Changing before_cutoff must invalidate fingerprint
+    let mut opts_before = opts1.clone();
+    opts_before.before_cutoff = Some(1700000000);
+    let fp_before = crate::fast_path::compute_project_fingerprint(root, &opts_before).unwrap();
+    assert_ne!(fp1, fp_before, "fingerprint must change when before_cutoff changes");
+
+    // 3. Changing install_links must invalidate fingerprint
+    let mut opts_links = opts1.clone();
+    opts_links.install_links = true;
+    let fp_links = crate::fast_path::compute_project_fingerprint(root, &opts_links).unwrap();
+    assert_ne!(fp1, fp_links, "fingerprint must change when install_links changes");
+
+    // 4. Changing .npmrc file content must invalidate fingerprint
+    fs::write(root.join(".npmrc"), "legacy-bundling=true\n").unwrap();
+    let fp_npmrc = crate::fast_path::compute_project_fingerprint(root, &opts1).unwrap();
+    assert_ne!(fp1, fp_npmrc, "fingerprint must change when project .npmrc changes");
+}
+
+#[test]
+fn test_fast_path_validate_hidden_lockfile_catches_missing_package_json() {
+    let tmp = tempdir().unwrap();
+    let root = tmp.path();
+    let nm = root.join("node_modules");
+    fs::create_dir_all(nm.join("pkg-a")).unwrap();
+    fs::write(nm.join("pkg-a").join("package.json"), r#"{"name":"pkg-a","version":"1.0.0"}"#).unwrap();
+
+    let mut lock = LockfileV3::new("test-lock", None);
+    lock.insert_package("", LockfilePackage::default());
+    lock.insert_package(
+        "node_modules/pkg-a",
+        LockfilePackage {
+            version: Some("1.0.0".to_string()),
+            ..Default::default()
+        },
+    );
+    lock.save_hidden(root).unwrap();
+
+    let opts = InstallOptions {
+        project_dir: root.to_path_buf(),
+        ..Default::default()
+    };
+    assert!(crate::fast_path::validate_hidden_lockfile(root, Some(&opts)), "lockfile must be valid initially");
+
+    // Delete pkg-a/package.json -> must invalidate hidden lockfile
+    fs::remove_file(nm.join("pkg-a").join("package.json")).unwrap();
+    assert!(!crate::fast_path::validate_hidden_lockfile(root, Some(&opts)), "hidden lockfile must be invalid when package.json is missing");
+}
+
+#[test]
+fn test_fast_path_validate_hidden_lockfile_invalidated_by_extraneous_directory() {
+    let tmp = tempdir().unwrap();
+    let root = tmp.path();
+    let nm = root.join("node_modules");
+    fs::create_dir_all(nm.join("pkg-a")).unwrap();
+    fs::write(nm.join("pkg-a").join("package.json"), r#"{"name":"pkg-a","version":"1.0.0"}"#).unwrap();
+
+    let mut lock = LockfileV3::new("test-lock", None);
+    lock.insert_package("", LockfilePackage::default());
+    lock.insert_package(
+        "node_modules/pkg-a",
+        LockfilePackage {
+            version: Some("1.0.0".to_string()),
+            ..Default::default()
+        },
+    );
+    lock.save_hidden(root).unwrap();
+
+    let opts = InstallOptions {
+        project_dir: root.to_path_buf(),
+        ..Default::default()
+    };
+    assert!(crate::fast_path::validate_hidden_lockfile(root, Some(&opts)));
+
+    // Add extraneous directory to node_modules
+    fs::create_dir_all(nm.join("rogue-pkg")).unwrap();
+    fs::write(nm.join("rogue-pkg").join("package.json"), r#"{"name":"rogue-pkg"}"#).unwrap();
+    assert!(!crate::fast_path::validate_hidden_lockfile(root, Some(&opts)), "hidden lockfile must be invalid when extraneous package directory exists");
+}
+
+#[test]
+fn test_git_normalize_clone_url_handles_git_plus_file_and_ssh() {
+    let normalized = crate::git::normalize_clone_url_for_git("git+file:///path/to/repo");
+    assert!(!normalized.starts_with("git+"), "normalized url must strip git+ prefix");
+
+    let gh_ssh = crate::git::normalize_clone_url_for_git("git+ssh://git@github.com/foo/bar.git");
+    assert_eq!(gh_ssh, "ssh://git@github.com/foo/bar.git");
+
+    let gh_scp = crate::git::normalize_clone_url_for_git("git@github.com:foo/bar.git");
+    assert_eq!(gh_scp, "git@github.com:foo/bar.git");
+}
+
+#[test]
+fn test_save_insert_manifest_dep_coexistence_rules() {
+    let mut manifest = Manifest {
+        name: Some("test-save".to_string()),
+        ..Default::default()
+    };
+    manifest.dependencies.insert("dep-a".to_string(), "^1.0.0".to_string());
+    manifest.peer_dependencies.insert("peer-a".to_string(), "^1.0.0".to_string());
+
+    // 1. Installing with save_dev (-D) moves dep-a to dev_dependencies and removes from dependencies
+    // but crucially preserves peer_dependencies (npm coexistence idiom for plugins/libs)
+    crate::save::insert_manifest_dep(&mut manifest, "dep-a", "^2.0.0", true, false, false);
+    assert_eq!(manifest.dev_dependencies.get("dep-a").map(|s| s.as_str()), Some("^2.0.0"));
+    assert!(!manifest.dependencies.contains_key("dep-a"));
+    assert_eq!(manifest.peer_dependencies.get("peer-a").map(|s| s.as_str()), Some("^1.0.0"));
+
+    // Adding peer-a to dev_dependencies preserves peer-a in peer_dependencies
+    crate::save::insert_manifest_dep(&mut manifest, "peer-a", "^1.0.0", true, false, false);
+    assert_eq!(manifest.dev_dependencies.get("peer-a").map(|s| s.as_str()), Some("^1.0.0"));
+    assert_eq!(manifest.peer_dependencies.get("peer-a").map(|s| s.as_str()), Some("^1.0.0"));
+
+    // 2. Installing with save_peer (--save-peer) removes from dependencies and optionalDependencies
+    // but preserves dev_dependencies
+    crate::save::insert_manifest_dep(&mut manifest, "dep-b", "^1.0.0", false, false, false);
+    crate::save::insert_manifest_dep(&mut manifest, "dep-b", "^1.0.0", true, false, false);
+    assert!(manifest.dev_dependencies.contains_key("dep-b"));
+    crate::save::insert_manifest_dep(&mut manifest, "dep-b", "^1.0.0", false, false, true);
+    assert_eq!(manifest.peer_dependencies.get("dep-b").map(|s| s.as_str()), Some("^1.0.0"));
+    assert!(manifest.dev_dependencies.contains_key("dep-b"), "peer install must preserve dev_dependencies");
+
+    // 3. Installing with save_optional (-O) removes from dependencies and peer_dependencies
+    crate::save::insert_manifest_dep(&mut manifest, "dep-c", "^1.0.0", false, false, true);
+    assert!(manifest.peer_dependencies.contains_key("dep-c"));
+    crate::save::insert_manifest_dep(&mut manifest, "dep-c", "^1.0.0", false, true, false);
+    assert_eq!(manifest.optional_dependencies.get("dep-c").map(|s| s.as_str()), Some("^1.0.0"));
+    assert!(!manifest.peer_dependencies.contains_key("dep-c"), "optional install must remove peerDependencies");
+
+    // 4. Installing with save_prod (default) removes from dev_dependencies, optional_dependencies, and peer_dependencies
+    crate::save::insert_manifest_dep(&mut manifest, "dep-a", "^3.0.0", false, false, false);
+    assert_eq!(manifest.dependencies.get("dep-a").map(|s| s.as_str()), Some("^3.0.0"));
+    assert!(!manifest.dev_dependencies.contains_key("dep-a"));
+    assert!(!manifest.optional_dependencies.contains_key("dep-a"));
+    assert!(!manifest.peer_dependencies.contains_key("dep-a"));
+}
+
+#[test]
+fn test_save_compute_save_spec_git_hosted_shorthand() {
+    let git_target = rnpm_core::spec::PackageTarget::Git {
+        url: "github:owner/my-repo".to_string(),
+        committish: None,
+        subdir: None,
+    };
+    let spec = crate::save::compute_save_spec(&git_target, "1.0.0", false, None);
+    assert_eq!(spec, "github:owner/my-repo");
+
+    let git_target_tag = rnpm_core::spec::PackageTarget::Git {
+        url: "github:owner/my-repo".to_string(),
+        committish: Some("v1.2.3".to_string()),
+        subdir: None,
+    };
+    let spec_tag = crate::save::compute_save_spec(&git_target_tag, "1.2.3", false, None);
+    assert_eq!(spec_tag, "github:owner/my-repo#v1.2.3");
+
+    // Explicit URLs must be preserved, not converted to github: shorthand
+    let git_explicit = rnpm_core::spec::PackageTarget::Git {
+        url: "git+https://github.com/owner/my-repo.git".to_string(),
+        committish: None,
+        subdir: None,
+    };
+    let spec_explicit = crate::save::compute_save_spec(&git_explicit, "1.0.0", false, None);
+    assert_eq!(spec_explicit, "git+https://github.com/owner/my-repo.git");
+
+    let git_ssh = rnpm_core::spec::PackageTarget::Git {
+        url: "git+ssh://git@github.com/owner/my-repo.git".to_string(),
+        committish: Some("main".to_string()),
+        subdir: None,
+    };
+    let spec_ssh = crate::save::compute_save_spec(&git_ssh, "1.0.0", false, None);
+    assert_eq!(spec_ssh, "git+ssh://git@github.com/owner/my-repo.git#main");
+}
+
+#[test]
+fn test_prune_lockfile_retains_peer_dependencies() {
+    let mut manifest = Manifest {
+        name: Some("test-peer-prune".to_string()),
+        ..Default::default()
+    };
+    manifest.peer_dependencies.insert("peer-pkg".to_string(), "^1.0.0".to_string());
+
+    let mut lock = LockfileV3::new("test-peer-prune", None);
+    lock.insert_package("", LockfilePackage::default());
+    lock.insert_package(
+        "node_modules/peer-pkg",
+        LockfilePackage {
+            version: Some("1.0.0".to_string()),
+            ..Default::default()
+        },
+    );
+
+    let pruned = crate::prune_lockfile(&mut lock, &manifest);
+    assert!(!pruned.contains("node_modules/peer-pkg"), "prune_lockfile must not prune peer dependencies declared in manifest");
+    assert!(lock.packages.contains_key("node_modules/peer-pkg"));
+}
+
+#[test]
+fn test_uninstall_cleans_bundled_dependencies() {
+    let tmp = tempdir().unwrap();
+    let root = tmp.path();
+    let mut manifest = Manifest {
+        name: Some("test-uninst".to_string()),
+        version: Some("1.0.0".to_string()),
+        ..Default::default()
+    };
+    manifest.dependencies.insert("pkg-a".to_string(), "^1.0.0".to_string());
+    manifest.dependencies.insert("pkg-b".to_string(), "^1.0.0".to_string());
+    manifest.bundled_dependencies = Some(rnpm_core::BundledDependencies::List(vec!["pkg-a".to_string(), "pkg-b".to_string()]));
+    manifest.save_to_file(root.join("package.json")).unwrap();
+
+    let mut lock = LockfileV3::new("test-uninst", None);
+    lock.insert_package("", LockfilePackage::default());
+    lock.insert_package("node_modules/pkg-a", LockfilePackage {
+        version: Some("1.0.0".to_string()),
+        ..Default::default()
+    });
+    lock.insert_package("node_modules/pkg-b", LockfilePackage {
+        version: Some("1.0.0".to_string()),
+        ..Default::default()
+    });
+    lock.save_to_file(&root.join("package-lock.json")).unwrap();
+
+    let opts = InstallOptions {
+        project_dir: root.to_path_buf(),
+        ..Default::default()
+    };
+    let installer = Installer::new(opts).unwrap();
+
+    // 1. Uninstall pkg-a: leaves pkg-b in bundled_dependencies
+    let uninst = UninstallOptions {
+        packages: vec!["pkg-a".to_string()],
+        ..Default::default()
+    };
+    let _ = installer.uninstall(&uninst).unwrap();
+
+    let updated_manifest = Manifest::from_file(root.join("package.json")).unwrap();
+    assert!(!updated_manifest.dependencies.contains_key("pkg-a"));
+    assert_eq!(
+        updated_manifest.bundled_package_names(),
+        vec!["pkg-b".to_string()],
+        "uninstalled package must be removed from bundled_dependencies"
+    );
+
+    // 2. Uninstall pkg-b: empties bundled_dependencies, so it must become None (deleted)
+    let uninst_b = UninstallOptions {
+        packages: vec!["pkg-b".to_string()],
+        ..Default::default()
+    };
+    let _ = installer.uninstall(&uninst_b).unwrap();
+    let final_manifest = Manifest::from_file(root.join("package.json")).unwrap();
+    assert!(final_manifest.bundled_dependencies.is_none(), "empty bundledDependencies must be cleared to None");
+}
+
+#[test]
+fn test_rebuild_sorts_bottom_up_with_windows_paths() {
+    let mut nodes = [
+        rnpm_lifecycle::LifecyclePackageNode {
+            package_path: "node_modules\\a".to_string(),
+            disk_path: std::path::PathBuf::from("a"),
+            manifest: Manifest::default(),
+            source: rnpm_lifecycle::PackageSource::Registry,
+            dependencies: vec![],
+            optional: false,
+        },
+        rnpm_lifecycle::LifecyclePackageNode {
+            package_path: "node_modules\\a\\node_modules\\b".to_string(),
+            disk_path: std::path::PathBuf::from("b"),
+            manifest: Manifest::default(),
+            source: rnpm_lifecycle::PackageSource::Registry,
+            dependencies: vec![],
+            optional: false,
+        },
+    ];
+
+    crate::rebuild::sort_lifecycle_nodes_bottom_up(&mut nodes);
+
+    assert_eq!(nodes[0].package_path, "node_modules\\a\\node_modules\\b");
+    assert_eq!(nodes[1].package_path, "node_modules\\a");
+}
+
+#[test]
+fn test_fast_path_validate_hidden_lockfile_ignores_non_directory_files() {
+    let tmp = tempdir().unwrap();
+    let root = tmp.path();
+    let nm = root.join("node_modules");
+    fs::create_dir_all(nm.join("@scope").join("pkg-a")).unwrap();
+    fs::write(nm.join("@scope").join("pkg-a").join("package.json"), r#"{"name":"@scope/pkg-a","version":"1.0.0"}"#).unwrap();
+
+    // Add non-directory files like README.md and .DS_Store
+    fs::write(nm.join("README.txt"), "Documentation").unwrap();
+    fs::write(nm.join("@scope").join(".DS_Store"), "mock binary data").unwrap();
+    fs::write(nm.join("@scope").join("not-a-package.txt"), "notes").unwrap();
+
+    let mut lock = LockfileV3::new("test-lock", None);
+    lock.insert_package("", LockfilePackage::default());
+    lock.insert_package(
+        "node_modules/@scope/pkg-a",
+        LockfilePackage {
+            version: Some("1.0.0".to_string()),
+            ..Default::default()
+        },
+    );
+    lock.save_hidden(root).unwrap();
+
+    let opts = InstallOptions {
+        project_dir: root.to_path_buf(),
+        ..Default::default()
+    };
+    assert!(
+        crate::fast_path::validate_hidden_lockfile(root, Some(&opts)),
+        "hidden lockfile must ignore non-directory files like README.txt and @scope/.DS_Store"
+    );
+}

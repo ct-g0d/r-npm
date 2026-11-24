@@ -788,10 +788,14 @@ pub(crate) fn isolate_global_dependencies(graph: &mut DependencyGraph, manifest:
                     if let Some(target_node) = graph.nodes.get(target_orig_loc) {
                         // Compute new nested location under top_loc:
                         // node_modules/<dep> -> node_modules/<top-pkg>/node_modules/<dep>
-                        let rel = target_orig_loc
-                            .strip_prefix("node_modules/")
-                            .unwrap_or(target_orig_loc);
-                        let target_new_loc = format!("{top_loc}/node_modules/{rel}");
+                        let target_new_loc = if target_orig_loc.starts_with(&format!("{top_loc}/node_modules/")) {
+                            target_orig_loc.clone()
+                        } else {
+                            let rel = target_orig_loc
+                                .strip_prefix("node_modules/")
+                                .unwrap_or(target_orig_loc);
+                            format!("{top_loc}/node_modules/{rel}")
+                        };
                         loc_map.insert(target_orig_loc.clone(), target_new_loc.clone());
 
                         let mut new_node = target_node.clone();
@@ -1659,8 +1663,36 @@ pub fn apply_npmrc_to_client_config(
         client_config.cert = Some(cert_val.clone());
     }
 
+    if let Some(certfile_val) = npmrc
+        .settings
+        .get("certfile")
+        .or_else(|| npmrc.settings.get("cert_file"))
+    {
+        client_config.certfile = Some(PathBuf::from(certfile_val));
+    }
+
     if let Some(key_val) = npmrc.settings.get("key") {
         client_config.key = Some(key_val.clone());
+    }
+
+    if let Some(keyfile_val) = npmrc
+        .settings
+        .get("keyfile")
+        .or_else(|| npmrc.settings.get("key_file"))
+    {
+        client_config.keyfile = Some(PathBuf::from(keyfile_val));
+    }
+
+    for entry in npmrc.scoped_tls_entries() {
+        client_config.add_scoped_tls(
+            entry.prefix,
+            rnpm_registry::ScopedTlsConfig {
+                cert: entry.cert,
+                key: entry.key,
+                certfile: entry.certfile.map(PathBuf::from),
+                keyfile: entry.keyfile.map(PathBuf::from),
+            },
+        );
     }
 
     let timeout_ms = npmrc
@@ -1848,6 +1880,7 @@ fn process_installed_pkg_manifest_without_bins(
 #[derive(Debug, Clone)]
 pub struct InstallOptions {
     pub project_dir: PathBuf,
+    pub init_cwd: Option<PathBuf>,
     pub registry_url: Option<String>,
     pub cache_dir: Option<PathBuf>,
     pub offline: bool,
@@ -2003,6 +2036,7 @@ impl Default for InstallOptions {
     fn default() -> Self {
         Self {
             project_dir: PathBuf::from("."),
+            init_cwd: None,
             registry_url: None,
             cache_dir: None,
             offline: false,
@@ -2291,6 +2325,124 @@ fn lockfile_entry_omitted(
         || (options.omit_optional && is_optional && !dev_optional)
         || (options.omit_dev && options.omit_optional && dev_optional)
         || (options.omit_peer && is_peer)
+}
+
+fn is_file_or_local_spec(spec: &str) -> bool {
+    let s = spec.trim();
+    if s.starts_with("file:") {
+        return true;
+    }
+    match PackageTarget::parse(s) {
+        Ok(PackageTarget::File(_)) => true,
+        Ok(PackageTarget::Alias { ref target, .. }) => {
+            matches!(**target, PackageTarget::File(_))
+        }
+        _ => false,
+    }
+}
+
+pub fn lockfile_node_satisfies_spec(
+    lockfile: &LockfileV3,
+    dep_name: &str,
+    pkg: &LockfilePackage,
+    spec: &str,
+) -> bool {
+    if pkg.link == Some(true) {
+        if is_file_or_local_spec(spec) {
+            // For file/local path specs, match against the link node directly.
+            // Do NOT dereference to target_pkg, otherwise a mismatched file:./other
+            // would be falsely accepted.
+            return LockfileV3::package_satisfies_spec(dep_name, pkg, spec);
+        }
+
+        // Parse target to determine whether this spec is allowed to dereference a link node.
+        // ONLY dereference for semver/version/range/tag/workspace specs, or an Alias pointing to them.
+        // Never dereference for git specs, remote URLs, or file/bare path specs!
+        let parsed_target = PackageSpec::parse_dependency(dep_name, spec)
+            .map(|s| s.target)
+            .or_else(|_| PackageTarget::parse(spec));
+
+        let (can_dereference, maybe_alias_name) = match parsed_target {
+            Ok(
+                PackageTarget::Range(_)
+                | PackageTarget::Version(_)
+                | PackageTarget::Tag(_)
+                | PackageTarget::Workspace(_),
+            ) => (true, None),
+            Ok(PackageTarget::Alias { ref name, ref target }) => {
+                if matches!(
+                    **target,
+                    PackageTarget::Range(_) | PackageTarget::Version(_) | PackageTarget::Tag(_)
+                ) {
+                    (true, Some(name.clone()))
+                } else {
+                    (false, None)
+                }
+            }
+            _ => (false, None),
+        };
+
+        if !can_dereference {
+            // A local link cannot satisfy a remote git, tarball, or arbitrary non-semver spec.
+            return false;
+        }
+
+        // Follow link chains safely with a bounded loop (up to 8 hops) and cycle detection.
+        let mut current_pkg = pkg;
+        let mut hops = 0;
+        let mut visited = HashSet::new();
+
+        let final_target_pkg = loop {
+            if hops >= 8 {
+                return false;
+            }
+            hops += 1;
+
+            let Some(target_raw) = current_pkg.resolved.as_deref() else {
+                return false;
+            };
+            let norm_target = target_raw.replace('\\', "/");
+            let target_clean = norm_target
+                .strip_prefix("file:")
+                .unwrap_or(&norm_target)
+                .trim_end_matches('/');
+            let target_key =
+                if target_clean == "." || target_clean == "./" || target_clean.is_empty() {
+                    ""
+                } else {
+                    target_clean.strip_prefix("./").unwrap_or(target_clean)
+                };
+
+            if !visited.insert(target_key.to_string()) {
+                return false; // cycle detected
+            }
+
+            let target_pkg = lockfile
+                .packages
+                .get(target_key)
+                .or_else(|| lockfile.packages.get(&target_key.replace('/', "\\")));
+
+            let Some(target_pkg) = target_pkg else {
+                return false; // broken link: target package missing from lockfile
+            };
+
+            if target_pkg.link == Some(true) {
+                current_pkg = target_pkg;
+            } else {
+                break target_pkg;
+            }
+        };
+
+        if let Some(ref alias_name) = maybe_alias_name {
+            if final_target_pkg.name.as_deref() != Some(alias_name.as_str()) {
+                return false;
+            }
+        }
+
+        return LockfileV3::package_satisfies_spec(dep_name, final_target_pkg, spec);
+    }
+
+    LockfileV3::package_satisfies_spec(dep_name, pkg, spec)
 }
 
 /// Result of an update run.
@@ -2622,6 +2774,14 @@ impl Installer {
                 if let Ok(strat) = strat_str.parse::<InstallStrategy>() {
                     options.install_strategy = strat;
                 }
+            } else if config.get_bool("legacy-bundling").unwrap_or(false)
+                || config.get_bool("legacy_bundling").unwrap_or(false)
+            {
+                options.install_strategy = InstallStrategy::Nested;
+            } else if config.get_bool("global-style").unwrap_or(false)
+                || config.get_bool("global_style").unwrap_or(false)
+            {
+                options.install_strategy = InstallStrategy::Shallow;
             }
         }
 
@@ -2944,7 +3104,11 @@ impl Installer {
             });
         LifecycleOptions {
             root_dir: self.options.project_dir.clone(),
-            init_cwd: self.options.project_dir.clone(),
+            init_cwd: self
+                .options
+                .init_cwd
+                .clone()
+                .unwrap_or_else(|| self.options.project_dir.clone()),
             ignore_scripts: false,
             capture_output: !self.options.foreground_scripts,
             foreground_scripts: self.options.foreground_scripts,
@@ -4707,17 +4871,36 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                     let git_fetcher = crate::git::GitFetcher::new(self.cache.root());
                     let target = PackageTarget::parse(res)
                         .map_err(|e| anyhow!("Failed to parse git target: {e}"))?;
-                    let checkout_dir = git_fetcher
+                    let is_opt = node.flags.optional || node.flags.dev_optional;
+                    let checkout_dir = match git_fetcher
                         .checkout_git_dependency(&target, self.options.offline)
-                        .await?;
+                        .await
+                    {
+                        Ok(d) => d,
+                        Err(e) => {
+                            if is_opt {
+                                warn!("Failed to checkout optional git dependency '{}': {e}; skipping", loc);
+                                continue;
+                            }
+                            return Err(e);
+                        }
+                    };
 
                     let mat_opts = self.options.git_materialize_options();
-                    crate::git::materialize_git_dependency_with_options(
+                    if let Err(e) = crate::git::materialize_git_dependency_with_options(
                         &checkout_dir,
                         &dest_dir,
                         &mat_opts,
                     )
-                    .await?;
+                    .await
+                    {
+                        if is_opt {
+                            warn!("Failed to materialize optional git dependency '{}': {e}; skipping", loc);
+                            let _ = std::fs::remove_dir_all(&dest_dir);
+                            continue;
+                        }
+                        return Err(e);
+                    }
                     packages_installed += 1;
                     cache_hits += 1;
 
@@ -5979,12 +6162,15 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
         let lock_deps = root_pkg.dependencies.as_ref().unwrap_or(&empty_deps);
 
         for (dep_name, dep_spec) in &manifest.dependencies {
+            if manifest.optional_dependencies.contains_key(dep_name) {
+                continue;
+            }
             if let Some(lock_spec) = lock_deps.get(dep_name) {
                 if lock_spec != dep_spec {
                     let satisfies = if let Some(pkg) =
                         lockfile.packages.get(&format!("node_modules/{dep_name}"))
                     {
-                        LockfileV3::package_satisfies_spec(dep_name, pkg, dep_spec)
+                        lockfile_node_satisfies_spec(&lockfile, dep_name, pkg, dep_spec)
                     } else {
                         false
                     };
@@ -6013,7 +6199,7 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                     let satisfies = if let Some(pkg) =
                         lockfile.packages.get(&format!("node_modules/{dep_name}"))
                     {
-                        LockfileV3::package_satisfies_spec(dep_name, pkg, dep_spec)
+                        lockfile_node_satisfies_spec(&lockfile, dep_name, pkg, dep_spec)
                     } else {
                         false
                     };
@@ -6046,7 +6232,7 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                         let satisfies = if let Some(pkg) =
                             lockfile.packages.get(&format!("node_modules/{dep_name}"))
                         {
-                            LockfileV3::package_satisfies_spec(dep_name, pkg, dep_spec)
+                            lockfile_node_satisfies_spec(&lockfile, dep_name, pkg, dep_spec)
                         } else {
                             false
                         };
@@ -6068,7 +6254,23 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
         }
 
         // 4. Comprehensive lockfile validation via matches_manifest_for_ci
-        if !lockfile.matches_manifest_for_ci_with_workspaces(&manifest, true, Some(&workspace_members)) {
+        let effective_manifest = if manifest
+            .dependencies
+            .keys()
+            .any(|k| manifest.optional_dependencies.contains_key(k))
+        {
+            let mut m = manifest.clone();
+            m.dependencies
+                .retain(|k, _| !manifest.optional_dependencies.contains_key(k));
+            m
+        } else {
+            manifest.clone()
+        };
+        if !lockfile.matches_manifest_for_ci_with_workspaces(
+            &effective_manifest,
+            true,
+            Some(&workspace_members),
+        ) {
             return Err(anyhow!(
                 "rnpm ERR! code ELOCKFILE_DRIFT: package.json and {} are out of sync. Please run `rnpm install` to update your lockfile. (EUSAGE)",
                 lockfile_name
@@ -6083,7 +6285,7 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
             if platform_skipped_packages.contains(pkg_key) || pkg_info.is_extraneous() {
                 continue;
             }
-            if self.options.omit_dev && pkg_info.dev == Some(true) {
+            if lockfile_entry_omitted(&self.options, &lockfile, pkg_key, pkg_info) {
                 continue;
             }
             if let Some(deps) = &pkg_info.dependencies {
@@ -6116,7 +6318,12 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                         range_str.clone()
                     };
 
-                    let mut found_node: Option<&LockfilePackage> = None;
+                    let is_optional_dep = pkg_info
+                        .optional_dependencies
+                        .as_ref()
+                        .is_some_and(|od| od.contains_key(dep_name));
+
+                    let mut found_node: Option<(String, &LockfilePackage)> = None;
                     for scope in rnpm_solver::hoisting::iter_ancestor_scopes(pkg_key) {
                         let candidate_key = if scope.is_empty() {
                             format!("node_modules/{dep_name}")
@@ -6124,13 +6331,26 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                             format!("{scope}/node_modules/{dep_name}")
                         };
                         if let Some(p) = lockfile.packages.get(&candidate_key) {
-                            found_node = Some(p);
+                            found_node = Some((candidate_key, p));
                             break;
                         }
                     }
 
-                    let is_satisfied = if let Some(resolved_pkg) = found_node {
-                        LockfileV3::package_satisfies_spec(dep_name, resolved_pkg, &effective_range)
+                    if is_optional_dep {
+                        if self.options.omit_optional || found_node.is_none() {
+                            continue;
+                        }
+                        if let Some((ref cand_key, cand_pkg)) = found_node {
+                            if platform_skipped_packages.contains(cand_key)
+                                || lockfile_entry_omitted(&self.options, &lockfile, cand_key, cand_pkg)
+                            {
+                                continue;
+                            }
+                        }
+                    }
+
+                    let is_satisfied = if let Some((_, resolved_pkg)) = found_node {
+                        lockfile_node_satisfies_spec(&lockfile, dep_name, resolved_pkg, &effective_range)
                     } else {
                         false
                     };
@@ -6619,23 +6839,44 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                 let git_fetcher = crate::git::GitFetcher::new(self.cache.root());
                 let target = PackageTarget::parse(resolved_url)
                     .map_err(|e| anyhow!("Failed to parse git target in lockfile: {e}"))?;
+                let is_opt = pkg_info.is_effective_optional() || pkg_info.is_peer_optional();
                 let t_fetch = std::time::Instant::now();
                 let _f_span = tracing::info_span!("fetch", package = %pkg_key).entered();
-                let checkout_dir = git_fetcher
+                let checkout_dir = match git_fetcher
                     .checkout_git_dependency(&target, self.options.offline)
-                    .await?;
+                    .await
+                {
+                    Ok(d) => d,
+                    Err(e) => {
+                        drop(_f_span);
+                        if is_opt {
+                            warn!("Failed to checkout optional git dependency '{}': {e}; skipping", pkg_key);
+                            continue;
+                        }
+                        return Err(e);
+                    }
+                };
                 drop(_f_span);
                 collector.record_phase(Phase::Fetch, t_fetch.elapsed());
 
                 let t_mat = std::time::Instant::now();
                 let _mat_span = tracing::info_span!("materialize", package = %pkg_key).entered();
                 let mat_opts = self.options.git_materialize_options();
-                crate::git::materialize_git_dependency_with_options(
+                if let Err(e) = crate::git::materialize_git_dependency_with_options(
                     &checkout_dir,
                     &full_target,
                     &mat_opts,
                 )
-                .await?;
+                .await
+                {
+                    drop(_mat_span);
+                    if is_opt {
+                        warn!("Failed to materialize optional git dependency '{}': {e}; skipping", pkg_key);
+                        let _ = std::fs::remove_dir_all(&full_target);
+                        continue;
+                    }
+                    return Err(e);
+                }
                 drop(_mat_span);
                 collector.record_phase(Phase::Materialize, t_mat.elapsed());
 
@@ -8315,12 +8556,29 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                 _ => None,
             };
 
+            let is_optional = manifest.optional_dependencies.contains_key(name);
             if let Some(git_target) = git_target_opt {
-                policy::check_source_gate(&self.source_policy, policy::SourceKind::Git, is_root)?;
+                if let Err(e) = policy::check_source_gate(&self.source_policy, policy::SourceKind::Git, is_root) {
+                    if is_optional {
+                        warn!("Skipping optional git dependency '{name}': {e}");
+                        continue;
+                    }
+                    return Err(e);
+                }
                 let git_fetcher = crate::git::GitFetcher::new(self.cache.root());
-                let resolved = git_fetcher
+                let resolved = match git_fetcher
                     .resolve_git_dependency(&git_target, self.options.offline)
-                    .await?;
+                    .await
+                {
+                    Ok(r) => r,
+                    Err(e) => {
+                        if is_optional {
+                            warn!("Failed to resolve optional git dependency '{name}': {e}; continuing without it");
+                            continue;
+                        }
+                        return Err(e);
+                    }
+                };
 
                 let m = resolved.manifest;
                 let version = m.version.clone().unwrap_or_else(|| "1.0.0".to_string());
@@ -9431,7 +9689,7 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
         let mut removed_packages = Vec::new();
 
         // Determine which sections to target
-        let target_all = !options.save_dev && !options.save_optional && !options.save_prod;
+        let target_all = !options.save_dev && !options.save_optional && !options.save_prod && !options.save_peer;
 
         for raw_pkg in &options.packages {
             let pkg = raw_pkg.trim();
@@ -9459,8 +9717,30 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                     removed = true;
                 }
 
-                if target_all && manifest.peer_dependencies.remove(pkg).is_some() {
+                if (options.save_peer || target_all) && manifest.peer_dependencies.remove(pkg).is_some() {
                     removed = true;
+                }
+
+                if let Some(ref mut bundled) = manifest.bundled_dependencies {
+                    match bundled {
+                        rnpm_core::BundledDependencies::List(list) => {
+                            let old_len = list.len();
+                            list.retain(|x| x != pkg);
+                            if list.len() != old_len {
+                                removed = true;
+                            }
+                        }
+                        rnpm_core::BundledDependencies::Boolean(_) => {}
+                    }
+                }
+                if let Some(rnpm_core::BundledDependencies::List(list)) = &manifest.bundled_dependencies {
+                    if list.is_empty() {
+                        manifest.bundled_dependencies = None;
+                        if let Some(rnpm_core::OrderedJsonValue::Object(map)) = &mut manifest.raw_json {
+                            map.shift_remove("bundleDependencies");
+                            map.shift_remove("bundledDependencies");
+                        }
+                    }
                 }
             }
 
@@ -9480,8 +9760,30 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                     removed = true;
                 }
 
-                if target_all && m.peer_dependencies.remove(pkg).is_some() {
+                if (options.save_peer || target_all) && m.peer_dependencies.remove(pkg).is_some() {
                     removed = true;
+                }
+
+                if let Some(ref mut bundled) = m.bundled_dependencies {
+                    match bundled {
+                        rnpm_core::BundledDependencies::List(list) => {
+                            let old_len = list.len();
+                            list.retain(|x| x != pkg);
+                            if list.len() != old_len {
+                                removed = true;
+                            }
+                        }
+                        rnpm_core::BundledDependencies::Boolean(_) => {}
+                    }
+                }
+                if let Some(rnpm_core::BundledDependencies::List(list)) = &m.bundled_dependencies {
+                    if list.is_empty() {
+                        m.bundled_dependencies = None;
+                        if let Some(rnpm_core::OrderedJsonValue::Object(map)) = &mut m.raw_json {
+                            map.shift_remove("bundleDependencies");
+                            map.shift_remove("bundledDependencies");
+                        }
+                    }
                 }
             }
 
@@ -9822,6 +10124,7 @@ pub struct UninstallOptions {
     pub save_dev: bool,
     pub save_optional: bool,
     pub save_prod: bool,
+    pub save_peer: bool,
     pub is_global: bool,
     pub workspace: Vec<String>,
     pub workspaces: bool,
@@ -10103,6 +10406,9 @@ pub fn prune_lockfile(lockfile: &mut LockfileV3, manifest: &Manifest) -> HashSet
     for name in manifest.optional_dependencies.keys() {
         root_dep_names.insert(name.clone());
     }
+    for name in manifest.peer_dependencies.keys() {
+        root_dep_names.insert(name.clone());
+    }
 
     // 2. Breadth-First-Search from root to mark reachable lockfile keys
     let mut reachable_keys = HashSet::new();
@@ -10143,6 +10449,9 @@ pub fn prune_lockfile(lockfile: &mut LockfileV3, manifest: &Manifest) -> HashSet
             }
             if let Some(opt_deps) = &pkg.optional_dependencies {
                 all_deps.extend(opt_deps.keys().cloned());
+            }
+            if let Some(peer_deps) = &pkg.peer_dependencies {
+                all_deps.extend(peer_deps.keys().cloned());
             }
 
             for dep_name in all_deps {

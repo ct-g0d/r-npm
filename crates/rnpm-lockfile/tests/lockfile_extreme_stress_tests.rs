@@ -1539,3 +1539,824 @@ fn test_path_matches_workspace_patterns_comprehensive() {
     assert!(LockfileV3::path_matches_workspace_patterns("packages\\pkg-a", &patterns));
     assert!(LockfileV3::path_matches_workspace_patterns("packages/pkg-a/", &patterns));
 }
+
+#[test]
+fn test_engine_non_ascii_whitespace_boundary_no_panic() {
+    // Non-ASCII whitespace characters like U+00A0 (NBSP, 2 bytes) and U+3000 (ideographic space, 3 bytes)
+    // should not cause byte-indexing panics on character boundaries.
+    let json = r#"{
+        "name": "engine-test",
+        "version": "1.0.0",
+        "lockfileVersion": 3,
+        "packages": {
+            "": {
+                "name": "engine-test",
+                "version": "1.0.0",
+                "engines": [
+                    "node\u00A0>=18.0.0",
+                    "npm\u3000>=9.0.0"
+                ]
+            }
+        }
+    }"#;
+
+    let lock: LockfileV3 = serde_json::from_str(json).expect("Must parse engines with non-ASCII whitespace without panic");
+    let root = lock.packages.get("").expect("Root package must exist");
+    let map = root.engines_map().expect("Engines map must parse");
+    assert_eq!(map.get("node").map(|s| s.as_str()), Some(">=18.0.0"));
+    assert_eq!(map.get("npm").map(|s| s.as_str()), Some(">=9.0.0"));
+}
+
+#[test]
+fn test_license_deserialization_shapes() {
+    let json = r#"{
+        "name": "license-shapes",
+        "version": "1.0.0",
+        "lockfileVersion": 3,
+        "packages": {
+            "node_modules/obj-lic": {
+                "version": "1.0.0",
+                "license": { "type": "MIT", "url": "https://example.com" }
+            },
+            "node_modules/name-lic": {
+                "version": "1.0.0",
+                "license": { "name": "Apache-2.0" }
+            },
+            "node_modules/arr-lic": {
+                "version": "1.0.0",
+                "license": ["MIT", "Apache-2.0"]
+            },
+            "node_modules/str-lic": {
+                "version": "1.0.0",
+                "license": "BSD-3-Clause"
+            }
+        }
+    }"#;
+
+    let lock: LockfileV3 = serde_json::from_str(json).expect("Must parse object and array license shapes");
+    assert_eq!(lock.packages.get("node_modules/obj-lic").unwrap().license.as_deref(), Some("MIT"));
+    assert_eq!(lock.packages.get("node_modules/name-lic").unwrap().license.as_deref(), Some("Apache-2.0"));
+    assert_eq!(lock.packages.get("node_modules/arr-lic").unwrap().license.as_deref(), Some("MIT OR Apache-2.0"));
+    assert_eq!(lock.packages.get("node_modules/str-lic").unwrap().license.as_deref(), Some("BSD-3-Clause"));
+}
+
+#[test]
+fn test_integrity_and_shrinkwrap_aliases() {
+    let json = r#"{
+        "name": "alias-test",
+        "version": "1.0.0",
+        "lockfileVersion": 3,
+        "packages": {
+            "node_modules/aliased-pkg": {
+                "version": "1.0.0",
+                "_integrity": "sha512-test==",
+                "_hasShrinkwrap": true
+            }
+        }
+    }"#;
+
+    let lock: LockfileV3 = serde_json::from_str(json).expect("Must parse _integrity and _hasShrinkwrap aliases");
+    let pkg = lock.packages.get("node_modules/aliased-pkg").unwrap();
+    assert_eq!(pkg.integrity.as_deref(), Some("sha512-test=="));
+    assert_eq!(pkg.has_shrinkwrap, Some(true));
+}
+
+#[test]
+fn test_flag_mutations_clear_raw_value() {
+    let json = r#"{
+        "name": "raw-val-test",
+        "version": "1.0.0",
+        "lockfileVersion": 3,
+        "packages": {
+            "node_modules/foo": {
+                "version": "1.0.0",
+                "dev": true
+            }
+        }
+    }"#;
+
+    let mut lock = LockfileV3::from_json_str(json).unwrap();
+    let pkg = lock.packages.get_mut("node_modules/foo").unwrap();
+    assert!(pkg.raw_value.is_some(), "from_json_str must cache raw_value");
+
+    // Mutation via set_dev must clear raw_value
+    pkg.set_dev(false);
+    assert!(pkg.raw_value.is_none(), "set_dev must invalidate raw_value");
+
+    let out_json = lock.to_json_string().unwrap();
+    assert!(!out_json.contains("\"dev\": true"), "Output JSON must reflect mutated dev: false");
+}
+
+#[test]
+fn test_to_legacy_dependencies_link_parity() {
+    let mut lock = LockfileV3::new("link-test", Some("1.0.0".to_string()));
+    lock.lockfile_version = 2;
+
+    // Target workspace package
+    let mut target = LockfilePackage {
+        version: Some("1.2.3".to_string()),
+        ..Default::default()
+    };
+    let mut target_deps = BTreeMap::new();
+    target_deps.insert("chalk".to_string(), "^5.0.0".to_string());
+    target.dependencies = Some(target_deps);
+    lock.packages.insert("packages/my-ws".to_string(), target);
+
+    // Symlink node
+    let link_pkg = LockfilePackage {
+        resolved: Some("packages/my-ws".to_string()),
+        link: Some(true),
+        dev: Some(true),
+        ..Default::default()
+    };
+    lock.packages.insert("node_modules/my-ws".to_string(), link_pkg);
+
+    let json = lock.to_json_string_version(2).unwrap();
+    let val: serde_json::Value = serde_json::from_str(&json).unwrap();
+
+    let link_dep = &val["dependencies"]["my-ws"];
+    assert_eq!(link_dep["version"], "file:packages/my-ws");
+    assert!(link_dep.get("resolved").is_none(), "Link must NOT have resolved in legacy dependencies");
+    assert!(link_dep.get("integrity").is_none(), "Link must NOT have integrity in legacy dependencies");
+    assert!(link_dep.get("dev").is_none(), "Link must NOT have dev flag in legacy dependencies");
+    assert_eq!(link_dep["requires"]["chalk"], "^5.0.0", "Link requires must be populated from target package");
+}
+
+#[test]
+fn test_to_legacy_dependencies_requires_includes_optional_and_omits_dev_optional_when_dev() {
+    let mut lock = LockfileV3::new("requires-test", Some("1.0.0".to_string()));
+    lock.lockfile_version = 2;
+
+    let mut pkg = LockfilePackage {
+        version: Some("1.0.0".to_string()),
+        dev: Some(true),
+        dev_optional: Some(true), // redundant flag with dev
+        ..Default::default()
+    };
+    let mut deps = BTreeMap::new();
+    deps.insert("dep-prod".to_string(), "1.0.0".to_string());
+    pkg.dependencies = Some(deps);
+    let mut opt_deps = BTreeMap::new();
+    opt_deps.insert("dep-opt".to_string(), "2.0.0".to_string());
+    pkg.optional_dependencies = Some(opt_deps);
+
+    lock.packages.insert("node_modules/foo".to_string(), pkg);
+
+    let json = lock.to_json_string_version(2).unwrap();
+    let val: serde_json::Value = serde_json::from_str(&json).unwrap();
+
+    let foo = &val["dependencies"]["foo"];
+    assert_eq!(foo["dev"], true);
+    assert!(foo.get("devOptional").is_none(), "devOptional must be omitted when dev: true");
+    assert_eq!(foo["requires"]["dep-prod"], "1.0.0");
+    assert_eq!(foo["requires"]["dep-opt"], "2.0.0");
+}
+
+#[test]
+fn test_v1_to_v3_directory_link_migration() {
+    let v1_json = r#"{
+        "name": "v1-link-test",
+        "version": "1.0.0",
+        "lockfileVersion": 1,
+        "dependencies": {
+            "local-ws": {
+                "version": "file:packages/local-ws",
+                "requires": {
+                    "bar": "1.0.0"
+                }
+            }
+        }
+    }"#;
+
+    let v3 = parse_and_migrate(v1_json).expect("Must migrate v1 file: links to v3");
+    let link = v3.packages.get("node_modules/local-ws").expect("Must create node_modules link entry");
+    assert_eq!(link.link, Some(true));
+    assert_eq!(link.resolved.as_deref(), Some("packages/local-ws"));
+    assert!(link.version.is_none());
+
+    let target = v3.packages.get("packages/local-ws").expect("Must create target entry for workspace link");
+    assert_eq!(target.dependencies.as_ref().unwrap().get("bar").map(|s| s.as_str()), Some("1.0.0"));
+}
+
+#[test]
+fn test_integrity_audit_aliased_direct_dependency() {
+    let mut lock = LockfileV3::new("audit-alias-test", Some("1.0.0".to_string()));
+    let mut root_deps = BTreeMap::new();
+    root_deps.insert("my-alias".to_string(), "npm:chalk@5.0.0".to_string());
+    lock.root_package_mut().unwrap().dependencies = Some(root_deps);
+
+    let mut pkg = LockfilePackage {
+        name: Some("chalk".to_string()),
+        version: Some("5.0.0".to_string()),
+        resolved: Some("file:./local-chalk.tgz".to_string()),
+        integrity: Some("sha512-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==".to_string()),
+        ..Default::default()
+    };
+    pkg.normalize_flags();
+    lock.packages.insert("node_modules/my-alias".to_string(), pkg);
+
+    let policy = IntegrityPolicy {
+        allow_transitive_file: false, // Disallow transitive files, but direct files are allowed
+        require_integrity: false,
+        ..Default::default()
+    };
+
+    let res = verify_lockfile_integrity(&lock, &policy);
+    assert!(res.is_ok(), "Aliased direct dependency must be recognized as direct");
+}
+
+#[test]
+fn test_target_matches_resolved_path_boundary_no_false_positive() {
+    let pkg = LockfilePackage {
+        version: Some("1.0.0".to_string()),
+        resolved: Some("file:packages/client-app".to_string()),
+        ..Default::default()
+    };
+    // Spec asks for file:packages/app - should NOT match packages/client-app despite sharing suffix
+    assert!(
+        !LockfileV3::package_satisfies_spec("app", &pkg, "file:packages/app"),
+        "client-app should not match app via bare substring suffix"
+    );
+    // Spec asks for file:packages/client-app - SHOULD match
+    assert!(
+        LockfileV3::package_satisfies_spec("client-app", &pkg, "file:packages/client-app"),
+        "exact path match must succeed"
+    );
+}
+
+#[test]
+fn test_target_matches_resolved_relative_vs_relative_drift() {
+    let pkg = LockfilePackage {
+        version: Some("1.0.0".to_string()),
+        resolved: Some("file:other/pkg".to_string()),
+        ..Default::default()
+    };
+    // Drifted relative path file:./pkg vs file:other/pkg must NOT match
+    assert!(
+        !LockfileV3::package_satisfies_spec("pkg", &pkg, "file:./pkg"),
+        "file:./pkg must not match drifted relative file:other/pkg"
+    );
+    // Relative paths with ./ or trailing slash matching normalized path
+    let pkg_valid = LockfilePackage {
+        version: Some("1.0.0".to_string()),
+        resolved: Some("file:pkg".to_string()),
+        ..Default::default()
+    };
+    assert!(
+        LockfileV3::package_satisfies_spec("pkg", &pkg_valid, "file:./pkg/"),
+        "file:./pkg/ must match file:pkg"
+    );
+    assert!(
+        LockfileV3::package_satisfies_spec("pkg", &pkg_valid, "file:pkg"),
+        "file:pkg must match file:pkg"
+    );
+
+    // Absolute path matches valid relative suffix
+    let abs_pkg = LockfilePackage {
+        version: Some("1.0.0".to_string()),
+        resolved: Some("file:/workspace/project/packages/my-dep".to_string()),
+        ..Default::default()
+    };
+    assert!(
+        LockfileV3::package_satisfies_spec("my-dep", &abs_pkg, "file:packages/my-dep"),
+        "Absolute resolved path must match relative spec suffix"
+    );
+}
+
+#[test]
+fn test_git_shorthand_matches_full_resolved_urls() {
+    let pkg_ssh = LockfilePackage {
+        version: Some("1.0.0".to_string()),
+        resolved: Some("git+ssh://git@github.com/user/repo.git#1111111111111111111111111111111111111111".to_string()),
+        ..Default::default()
+    };
+    let pkg_https = LockfilePackage {
+        version: Some("1.0.0".to_string()),
+        resolved: Some("git+https://github.com/user/repo.git#1111111111111111111111111111111111111111".to_string()),
+        ..Default::default()
+    };
+
+    // github: shorthand matches git+ssh and git+https
+    assert!(
+        LockfileV3::package_satisfies_spec("repo", &pkg_ssh, "github:user/repo"),
+        "github:user/repo must match git+ssh"
+    );
+    assert!(
+        LockfileV3::package_satisfies_spec("repo", &pkg_https, "github:user/repo"),
+        "github:user/repo must match git+https"
+    );
+
+    // gitlab: shorthand matches git+https
+    let gitlab_pkg = LockfilePackage {
+        version: Some("1.0.0".to_string()),
+        resolved: Some("git+https://gitlab.com/group/project.git#1111111111111111111111111111111111111111".to_string()),
+        ..Default::default()
+    };
+    assert!(
+        LockfileV3::package_satisfies_spec("project", &gitlab_pkg, "gitlab:group/project"),
+        "gitlab:group/project must match git+https"
+    );
+
+    // bitbucket: shorthand matches git+https
+    let bb_pkg = LockfilePackage {
+        version: Some("1.0.0".to_string()),
+        resolved: Some("git+https://bitbucket.org/team/repo.git#1111111111111111111111111111111111111111".to_string()),
+        ..Default::default()
+    };
+    assert!(
+        LockfileV3::package_satisfies_spec("repo", &bb_pkg, "bitbucket:team/repo"),
+        "bitbucket:team/repo must match git+https"
+    );
+
+    // Rejects different repo
+    assert!(
+        !LockfileV3::package_satisfies_spec("repo", &pkg_ssh, "github:user/other"),
+        "github:user/other must not match user/repo"
+    );
+}
+
+#[test]
+fn test_git_committish_drift_detected() {
+    let pkg = LockfilePackage {
+        version: Some("1.0.0".to_string()),
+        resolved: Some("git+https://github.com/org/repo.git#1a2b3c4d5e6f1a2b3c4d5e6f1a2b3c4d5e6f1a2b".to_string()),
+        ..Default::default()
+    };
+    // Spec with different committish
+    assert!(
+        !LockfileV3::package_satisfies_spec("repo", &pkg, "git+https://github.com/org/repo.git#2a2b3c4d5e6f1a2b3c4d5e6f1a2b3c4d5e6f1a2b"),
+        "Mismatched committish must be detected as drift"
+    );
+    // Spec with matching committish (case-insensitive)
+    assert!(
+        LockfileV3::package_satisfies_spec("repo", &pkg, "git+https://github.com/org/repo.git#1a2b3c4d5e6f1a2b3c4d5e6f1a2b3c4d5e6f1a2b"),
+        "Matching committish must satisfy spec"
+    );
+    assert!(
+        LockfileV3::package_satisfies_spec("repo", &pkg, "git+https://github.com/org/repo.git#1A2B3C4D5E6F1A2B3C4D5E6F1A2B3C4D5E6F1A2B"),
+        "Case-insensitive committish must satisfy spec"
+    );
+
+    // 64-character SHA-256 committish
+    let pkg_sha256 = LockfilePackage {
+        version: Some("1.0.0".to_string()),
+        resolved: Some("git+https://github.com/org/repo.git#aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string()),
+        ..Default::default()
+    };
+    assert!(
+        LockfileV3::package_satisfies_spec("repo", &pkg_sha256, "git+https://github.com/org/repo.git#AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"),
+        "64-character SHA-256 case-insensitive committish must satisfy spec"
+    );
+    assert!(
+        !LockfileV3::package_satisfies_spec("repo", &pkg_sha256, "git+https://github.com/org/repo.git#bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+        "Mismatched 64-char SHA-256 committish must be detected as drift"
+    );
+}
+
+#[test]
+fn test_symlink_drift_detection_with_link_flag() {
+    let pkg = LockfilePackage {
+        link: Some(true),
+        resolved: Some("packages/local-a".to_string()),
+        ..Default::default()
+    };
+    // Matching path
+    assert!(
+        LockfileV3::package_satisfies_spec("local-pkg", &pkg, "file:./packages/local-a"),
+        "Matching symlink target must satisfy spec"
+    );
+    // Drifted path
+    assert!(
+        !LockfileV3::package_satisfies_spec("local-pkg", &pkg, "file:./packages/local-b"),
+        "Drifted symlink target must be detected as drift even when link: true"
+    );
+}
+
+#[test]
+fn test_migration_symlink_omits_duplicated_dependencies() {
+    let v1_json = r#"{
+        "name": "v1-symlink-clean",
+        "version": "1.0.0",
+        "lockfileVersion": 1,
+        "dependencies": {
+            "my-link": {
+                "version": "file:packages/my-link",
+                "requires": {
+                    "nested": "1.0.0"
+                }
+            }
+        }
+    }"#;
+
+    let v3 = parse_and_migrate(v1_json).expect("Must migrate v1 file: links");
+    let link = v3.packages.get("node_modules/my-link").expect("Link node must exist");
+    assert_eq!(link.link, Some(true));
+    assert_eq!(link.resolved.as_deref(), Some("packages/my-link"));
+    // Arborist parity: symlink node does not duplicate dependencies
+    assert!(link.dependencies.is_none(), "Symlink node must not duplicate dependencies");
+
+    let target = v3.packages.get("packages/my-link").expect("Target node must exist");
+    assert_eq!(target.dependencies.as_ref().unwrap().get("nested").map(|s| s.as_str()), Some("1.0.0"));
+}
+
+#[test]
+fn test_migration_file_dot_maps_to_root() {
+    let v1_json = r#"{
+        "name": "v1-self-link",
+        "version": "1.0.0",
+        "lockfileVersion": 1,
+        "dependencies": {
+            "self": {
+                "version": "file:."
+            }
+        }
+    }"#;
+
+    let v3 = parse_and_migrate(v1_json).expect("Must migrate v1 file:. link");
+    let link = v3.packages.get("node_modules/self").expect("Link node must exist");
+    assert_eq!(link.link, Some(true));
+    assert_eq!(link.resolved.as_deref(), Some(""));
+}
+
+#[test]
+fn test_legacy_dependencies_windows_backslashes_in_link() {
+    let mut lock = LockfileV3::new("win-link-test", Some("1.0.0".to_string()));
+    lock.lockfile_version = 2;
+
+    let mut target = LockfilePackage {
+        version: Some("1.0.0".to_string()),
+        ..Default::default()
+    };
+    let mut deps = BTreeMap::new();
+    deps.insert("chalk".to_string(), "5.0.0".to_string());
+    target.dependencies = Some(deps);
+    lock.packages.insert("packages/my-ws".to_string(), target);
+
+    let link_pkg = LockfilePackage {
+        resolved: Some("packages\\my-ws".to_string()),
+        link: Some(true),
+        ..Default::default()
+    };
+    lock.packages.insert("node_modules/my-ws".to_string(), link_pkg);
+
+    let json = lock.to_json_string_version(2).unwrap();
+    let val: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(val["dependencies"]["my-ws"]["requires"]["chalk"], "5.0.0");
+}
+
+#[test]
+fn test_enrich_packages_from_legacy_clears_link_flags() {
+    let v2_json = r#"{
+        "name": "v2-link-flags",
+        "version": "1.0.0",
+        "lockfileVersion": 2,
+        "packages": {
+            "": {
+                "name": "v2-link-flags",
+                "version": "1.0.0"
+            },
+            "node_modules/my-link": {
+                "resolved": "packages/my-link",
+                "link": true
+            }
+        },
+        "dependencies": {
+            "my-link": {
+                "version": "file:packages/my-link",
+                "dev": true
+            }
+        }
+    }"#;
+
+    let v3 = parse_and_migrate(v2_json).expect("Must migrate v2 file: links");
+    let link = v3.packages.get("node_modules/my-link").expect("Link node must exist");
+    assert_eq!(link.link, Some(true));
+    assert!(link.dev.is_none(), "Link node must not have dev flag");
+}
+
+// =========================================================================
+// 12. Opus 5.5 Findings Regression Tests (Swarm Worker 17)
+// =========================================================================
+
+#[test]
+fn test_opus_finding_1_non_registry_git_and_path_ref_flipping_drift() {
+    // 1. user/repo#v1 -> user/repo#v2 drift
+    let mut manifest_v1 = Manifest {
+        name: Some("test-app".to_string()),
+        version: Some("1.0.0".to_string()),
+        ..Default::default()
+    };
+    manifest_v1.dependencies.insert("shorthand-dep".to_string(), "foo/bar#v1".to_string());
+    let mut lockfile = LockfileV3::from_manifest(&manifest_v1);
+    lockfile.insert_package(
+        "node_modules/shorthand-dep",
+        LockfilePackage {
+            version: Some("1.0.0".to_string()),
+            resolved: Some("git+ssh://git@github.com/foo/bar.git#7971714392a83cfd5d0eb871638ecf15b8822557".to_string()),
+            ..Default::default()
+        },
+    );
+    assert!(
+        lockfile.matches_manifest_for_ci(&manifest_v1, true),
+        "in-sync shorthand git dependency must pass CI"
+    );
+    let mut manifest_v2 = manifest_v1.clone();
+    manifest_v2.dependencies.insert("shorthand-dep".to_string(), "foo/bar#v2".to_string());
+    assert!(
+        !lockfile.matches_manifest_for_ci(&manifest_v2, true),
+        "user/repo#v1 -> #v2 must be detected as drift"
+    );
+
+    // 2. github:user/repo#v1 -> github:user/repo#v2 drift
+    let mut manifest_gh1 = Manifest {
+        name: Some("test-app".to_string()),
+        version: Some("1.0.0".to_string()),
+        ..Default::default()
+    };
+    manifest_gh1.dependencies.insert("gh-dep".to_string(), "github:foo/bar#v1".to_string());
+    let mut lockfile_gh = LockfileV3::from_manifest(&manifest_gh1);
+    lockfile_gh.insert_package(
+        "node_modules/gh-dep",
+        LockfilePackage {
+            version: Some("1.0.0".to_string()),
+            resolved: Some("git+ssh://git@github.com/foo/bar.git#7971714392a83cfd5d0eb871638ecf15b8822557".to_string()),
+            ..Default::default()
+        },
+    );
+    assert!(
+        lockfile_gh.matches_manifest_for_ci(&manifest_gh1, true),
+        "in-sync github: spec must pass CI"
+    );
+    let mut manifest_gh2 = manifest_gh1.clone();
+    manifest_gh2.dependencies.insert("gh-dep".to_string(), "github:foo/bar#v2".to_string());
+    assert!(
+        !lockfile_gh.matches_manifest_for_ci(&manifest_gh2, true),
+        "github:user/repo#v1 -> #v2 must be detected as drift"
+    );
+
+    // 3. gitlab:user/repo#v1 -> gitlab:user/repo#v2 drift
+    let mut manifest_gl1 = Manifest {
+        name: Some("test-app".to_string()),
+        version: Some("1.0.0".to_string()),
+        ..Default::default()
+    };
+    manifest_gl1.dependencies.insert("gl-dep".to_string(), "gitlab:foo/bar#v1".to_string());
+    let mut lockfile_gl = LockfileV3::from_manifest(&manifest_gl1);
+    lockfile_gl.insert_package(
+        "node_modules/gl-dep",
+        LockfilePackage {
+            version: Some("1.0.0".to_string()),
+            resolved: Some("git+https://gitlab.com/foo/bar.git#7971714392a83cfd5d0eb871638ecf15b8822557".to_string()),
+            ..Default::default()
+        },
+    );
+    assert!(
+        lockfile_gl.matches_manifest_for_ci(&manifest_gl1, true),
+        "in-sync gitlab: spec must pass CI"
+    );
+    let mut manifest_gl2 = manifest_gl1.clone();
+    manifest_gl2.dependencies.insert("gl-dep".to_string(), "gitlab:foo/bar#v2".to_string());
+    assert!(
+        !lockfile_gl.matches_manifest_for_ci(&manifest_gl2, true),
+        "gitlab:user/repo#v1 -> #v2 must be detected as drift"
+    );
+
+    // 4. git@github.com:user/repo#v1 -> git@github.com:user/repo#v2 drift
+    let mut manifest_ssh1 = Manifest {
+        name: Some("test-app".to_string()),
+        version: Some("1.0.0".to_string()),
+        ..Default::default()
+    };
+    manifest_ssh1.dependencies.insert("ssh-dep".to_string(), "git@github.com:foo/bar.git#v1".to_string());
+    let mut lockfile_ssh = LockfileV3::from_manifest(&manifest_ssh1);
+    lockfile_ssh.insert_package(
+        "node_modules/ssh-dep",
+        LockfilePackage {
+            version: Some("1.0.0".to_string()),
+            resolved: Some("git+ssh://git@github.com/foo/bar.git#7971714392a83cfd5d0eb871638ecf15b8822557".to_string()),
+            ..Default::default()
+        },
+    );
+    assert!(
+        lockfile_ssh.matches_manifest_for_ci(&manifest_ssh1, true),
+        "in-sync git@host spec must pass CI"
+    );
+    let mut manifest_ssh2 = manifest_ssh1.clone();
+    manifest_ssh2.dependencies.insert("ssh-dep".to_string(), "git@github.com:foo/bar.git#v2".to_string());
+    assert!(
+        !lockfile_ssh.matches_manifest_for_ci(&manifest_ssh2, true),
+        "git@host#v1 -> #v2 must be detected as drift"
+    );
+
+    // 5. Local path ./a -> ./b drift
+    let mut manifest_path_a = Manifest {
+        name: Some("test-app".to_string()),
+        version: Some("1.0.0".to_string()),
+        ..Default::default()
+    };
+    manifest_path_a.dependencies.insert("local-dep".to_string(), "./a".to_string());
+    let mut lockfile_path = LockfileV3::from_manifest(&manifest_path_a);
+    lockfile_path.insert_package(
+        "node_modules/local-dep",
+        LockfilePackage {
+            version: Some("file:./a".to_string()),
+            resolved: Some("file:./a".to_string()),
+            ..Default::default()
+        },
+    );
+    assert!(
+        lockfile_path.matches_manifest_for_ci(&manifest_path_a, true),
+        "in-sync ./a spec must pass CI"
+    );
+    let mut manifest_path_b = manifest_path_a.clone();
+    manifest_path_b.dependencies.insert("local-dep".to_string(), "./b".to_string());
+    assert!(
+        !lockfile_path.matches_manifest_for_ci(&manifest_path_b, true),
+        "./a -> ./b path change must be detected as drift"
+    );
+}
+
+#[test]
+fn test_opus_finding_1_canonical_matching_non_registry_specs_pass_ci() {
+    let manifest = Manifest {
+        name: Some("canon-app".to_string()),
+        version: Some("1.0.0".to_string()),
+        dependencies: {
+            let mut m = BTreeMap::new();
+            // Manifest uses shorthand foo/bar#v1
+            m.insert("git-dep".to_string(), "foo/bar#v1".to_string());
+            // Manifest uses bare relative path ./local-pkg
+            m.insert("file-dep".to_string(), "./local-pkg".to_string());
+            // Manifest uses npm alias with git target
+            m.insert("alias-dep".to_string(), "npm:real-dep@foo/bar#v1".to_string());
+            m
+        },
+        ..Default::default()
+    };
+
+    let mut lockfile = LockfileV3::new("canon-app", Some("1.0.0".to_string()));
+    let mut root_deps = BTreeMap::new();
+    // Lockfile root has github: expansion
+    root_deps.insert("git-dep".to_string(), "github:foo/bar#v1".to_string());
+    // Lockfile root has file: prefix
+    root_deps.insert("file-dep".to_string(), "file:./local-pkg".to_string());
+    // Lockfile root has npm alias with github: expansion
+    root_deps.insert("alias-dep".to_string(), "npm:real-dep@github:foo/bar#v1".to_string());
+    lockfile.root_package_mut().unwrap().dependencies = Some(root_deps);
+
+    lockfile.insert_package(
+        "node_modules/git-dep",
+        LockfilePackage {
+            version: Some("1.0.0".to_string()),
+            resolved: Some("git+ssh://git@github.com/foo/bar.git#7971714392a83cfd5d0eb871638ecf15b8822557".to_string()),
+            ..Default::default()
+        },
+    );
+    lockfile.insert_package(
+        "node_modules/file-dep",
+        LockfilePackage {
+            version: Some("file:./local-pkg".to_string()),
+            resolved: Some("file:./local-pkg".to_string()),
+            ..Default::default()
+        },
+    );
+    lockfile.insert_package(
+        "node_modules/alias-dep",
+        LockfilePackage {
+            name: Some("real-dep".to_string()),
+            version: Some("1.0.0".to_string()),
+            resolved: Some("git+ssh://git@github.com/foo/bar.git#7971714392a83cfd5d0eb871638ecf15b8822557".to_string()),
+            ..Default::default()
+        },
+    );
+
+    assert!(
+        lockfile.matches_manifest_for_ci(&manifest, true),
+        "canonically identical non-registry specs (shorthand vs expanded, ./ vs file:./) must pass CI"
+    );
+}
+
+#[test]
+fn test_opus_bonus_finding_is_direct_dependency_aliased_and_hoisted() {
+    let mut lock = LockfileV3::new("bonus-test", Some("1.0.0".to_string()));
+    let mut root_deps = BTreeMap::new();
+    root_deps.insert("real-pkg".to_string(), "^1.0.0".to_string());
+    root_deps.insert("my-alias".to_string(), "npm:real-pkg@^2.0.0".to_string());
+    lock.root_package_mut().unwrap().dependencies = Some(root_deps);
+
+    // Direct dependency 1: node_modules/real-pkg
+    lock.insert_package(
+        "node_modules/real-pkg",
+        LockfilePackage {
+            name: Some("real-pkg".to_string()),
+            version: Some("1.0.0".to_string()),
+            resolved: Some("https://registry.npmjs.org/real-pkg/-/real-pkg-1.0.0.tgz".to_string()),
+            integrity: Some("sha512-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==".to_string()),
+            ..Default::default()
+        },
+    );
+
+    // Direct dependency 2: node_modules/my-alias (aliased to real-pkg)
+    lock.insert_package(
+        "node_modules/my-alias",
+        LockfilePackage {
+            name: Some("real-pkg".to_string()),
+            version: Some("2.0.0".to_string()),
+            resolved: Some("https://registry.npmjs.org/real-pkg/-/real-pkg-2.0.0.tgz".to_string()),
+            integrity: Some("sha512-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==".to_string()),
+            ..Default::default()
+        },
+    );
+
+    // Transitive dependency: node_modules/transitive-evil
+    // Its internal name happens to be "real-pkg", but it is installed at "node_modules/transitive-evil"
+    // and uses an untrusted git source!
+    lock.insert_package(
+        "node_modules/transitive-evil",
+        LockfilePackage {
+            name: Some("real-pkg".to_string()),
+            version: Some("3.0.0".to_string()),
+            resolved: Some("git+https://github.com/evil/real-pkg.git#1111111111111111111111111111111111111111".to_string()),
+            integrity: Some("sha512-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==".to_string()),
+            ..Default::default()
+        },
+    );
+
+    let policy = IntegrityPolicy {
+        allow_transitive_git: false,
+        ..Default::default()
+    };
+
+    let res = verify_lockfile_integrity(&lock, &policy);
+    assert!(
+        res.is_err(),
+        "transitive package in node_modules/transitive-evil must NOT be misclassified as direct dependency just because its name is 'real-pkg'"
+    );
+
+    match res.unwrap_err() {
+        LockfileError::PoisonedDependency { package, reason } => {
+            assert_eq!(package, "node_modules/transitive-evil");
+            assert!(reason.contains("untrusted git source"), "reason was: {reason}");
+        }
+        other => panic!("expected PoisonedDependency error, got: {other:?}"),
+    }
+}
+
+#[test]
+fn test_missing_root_dep_in_packages_root_is_always_ci_drift_even_if_node_modules_exists() {
+    // Lockfile has packages[""].dependencies with only "a" -> "^1.0.0"
+    let mut lockfile = LockfileV3::new("test-app", Some("1.0.0".to_string()));
+    let mut root_deps = BTreeMap::new();
+    root_deps.insert("a".to_string(), "^1.0.0".to_string());
+    lockfile.root_package_mut().unwrap().dependencies = Some(root_deps);
+
+    // node_modules/a exists in lockfile
+    lockfile.insert_package(
+        "node_modules/a",
+        LockfilePackage {
+            version: Some("1.0.0".to_string()),
+            resolved: Some("https://registry.npmjs.org/a/-/a-1.0.0.tgz".to_string()),
+            integrity: Some("sha512-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==".to_string()),
+            ..Default::default()
+        },
+    );
+
+    // node_modules/b also exists in lockfile (e.g. hoisted transitive of a, or former devDependency)
+    lockfile.insert_package(
+        "node_modules/b",
+        LockfilePackage {
+            version: Some("1.0.0".to_string()),
+            resolved: Some("https://registry.npmjs.org/b/-/b-1.0.0.tgz".to_string()),
+            integrity: Some("sha512-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==".to_string()),
+            dev: Some(true),
+            ..Default::default()
+        },
+    );
+
+    // Initial manifest has only "a" -> matches CI
+    let mut manifest = Manifest {
+        name: Some("test-app".to_string()),
+        version: Some("1.0.0".to_string()),
+        dependencies: {
+            let mut m = BTreeMap::new();
+            m.insert("a".to_string(), "^1.0.0".to_string());
+            m
+        },
+        ..Default::default()
+    };
+    assert!(
+        lockfile.matches_manifest_for_ci(&manifest, true),
+        "initial manifest with 'a' matches CI lockfile"
+    );
+
+    // User adds "b": "^1.0.0" to package.json dependencies without updating package-lock.json
+    manifest.dependencies.insert("b".to_string(), "^1.0.0".to_string());
+
+    // Even though node_modules/b exists in lockfile and version 1.0.0 satisfies ^1.0.0,
+    // lockfile.packages[""].dependencies is missing "b".
+    // matches_manifest_for_ci MUST return false (drift detected)!
+    assert!(
+        !lockfile.matches_manifest_for_ci(&manifest, true),
+        "adding 'b' to manifest when packages[''].dependencies omits 'b' must reject CI even if node_modules/b exists"
+    );
+}

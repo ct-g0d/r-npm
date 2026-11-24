@@ -3,7 +3,7 @@ use crate::semver::range::Range;
 use crate::semver::version::Version;
 use serde::{Deserialize, Serialize};
 use std::fmt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use url::Url;
 
@@ -27,7 +27,44 @@ pub enum PackageTarget {
     Url(Url),
 }
 
+/// Checks if a string is an SCP-syntax git URL, e.g. `git@github.com:org/repo.git`.
+pub fn is_scp_git_url(s: &str) -> bool {
+    PackageTarget::is_scp_git_url(s)
+}
+
 impl PackageTarget {
+    /// Checks if a string is an SCP-syntax git URL, e.g. `git@github.com:org/repo.git`
+    /// or `deploy@gitlab.com:org/repo.git`.
+    ///
+    /// Requires a non-empty SSH user before `@` (preventing scoped packages like `@org/pkg`),
+    /// followed by a dotted hostname and colon `:` separating the host from a non-empty repository
+    /// path (matching `npm-package-arg`: `/^[^@]+@[^:.]+\.[^:]+:.+$/i`).
+    /// This prevents misclassifying registry specs like `git@1.0.0`, `git@npm:other`, or `git@file:./foo` as git URLs.
+    pub fn is_scp_git_url(s: &str) -> bool {
+        if let Some((user, rest)) = s.split_once('@') {
+            if user.is_empty()
+                || user.contains('/')
+                || user.contains('\\')
+                || user.contains(':')
+                || user.chars().any(|c| c.is_whitespace())
+            {
+                return false;
+            }
+            if let Some((host, path)) = rest.split_once(':') {
+                let valid_host = host
+                    .split_once('.')
+                    .is_some_and(|(left, right)| !left.is_empty() && !right.is_empty())
+                    && !host.contains('/')
+                    && !host.contains('\\')
+                    && !host.chars().any(|c| c.is_whitespace());
+                return valid_host
+                    && !path.is_empty()
+                    && !path.chars().any(|c| c.is_whitespace());
+            }
+        }
+        false
+    }
+
     pub fn parse(spec: &str) -> Result<Self, SpecError> {
         let expanded = expand_github_shorthand(spec.trim());
         let s = expanded.as_str();
@@ -68,26 +105,30 @@ impl PackageTarget {
             "git+http://",
             "git+git://",
             "git+file://",
+            "git+rsync://",
+            "git+ftp://",
             "git://",
+            "ssh://",
+            "git:",
             "github:",
             "gitlab:",
             "bitbucket:",
+            "gist:",
         ];
-        for prefix in git_prefixes {
-            if s.starts_with(prefix) {
-                let (url_part, committish, subdir) = if let Some(hash_idx) = s.find('#') {
-                    let u = s[..hash_idx].trim().to_string();
-                    let (committish, subdir) = parse_git_fragment(&s[hash_idx + 1..]);
-                    (u, committish, subdir)
-                } else {
-                    (s.trim().to_string(), None, None)
-                };
-                return Ok(PackageTarget::Git {
-                    url: url_part,
-                    committish,
-                    subdir,
-                });
-            }
+        let is_git = git_prefixes.iter().any(|prefix| s.starts_with(prefix)) || Self::is_scp_git_url(s);
+        if is_git {
+            let (url_part, committish, subdir) = if let Some(hash_idx) = s.find('#') {
+                let u = s[..hash_idx].trim().to_string();
+                let (committish, subdir) = parse_git_fragment(&s[hash_idx + 1..]);
+                (u, committish, subdir)
+            } else {
+                (s.trim().to_string(), None, None)
+            };
+            return Ok(PackageTarget::Git {
+                url: url_part,
+                committish,
+                subdir,
+            });
         }
 
         // Direct HTTP/HTTPS remote tarball URL dependencies:
@@ -176,6 +217,10 @@ impl PackageTarget {
                 } else if let Some(rest) = url.strip_prefix("bitbucket:") {
                     let repo = rest.trim_end_matches(".git");
                     Some(format!("https://bitbucket.org/{repo}.git"))
+                } else if let Some(rest) = url.strip_prefix("gist:") {
+                    let clean = rest.trim_end_matches(".git");
+                    let id = clean.rsplit('/').next().unwrap_or(clean);
+                    Some(format!("https://gist.github.com/{id}.git"))
                 } else if let Some(rest) = url.strip_prefix("git+") {
                     Some(rest.to_string())
                 } else {
@@ -223,6 +268,34 @@ impl PackageTarget {
     /// Checks if this target is a direct URL dependency.
     pub fn is_url(&self) -> bool {
         matches!(self, PackageTarget::Url(_))
+    }
+
+    /// Returns the file path if this target is a local file or directory.
+    pub fn file_path(&self) -> Option<&Path> {
+        match self {
+            PackageTarget::File(p) => Some(p.as_path()),
+            _ => None,
+        }
+    }
+
+    /// Checks if this target is a local file or directory.
+    pub fn is_file(&self) -> bool {
+        matches!(self, PackageTarget::File(_))
+    }
+
+    /// Checks if this target is a tarball archive (e.g. .tgz, .tar.gz, .tar).
+    pub fn is_tarball_archive(&self) -> bool {
+        match self {
+            PackageTarget::File(p) => {
+                let s = p.to_string_lossy();
+                s.ends_with(".tgz") || s.ends_with(".tar.gz") || s.ends_with(".tar")
+            }
+            PackageTarget::Url(u) => {
+                let path = u.path();
+                path.ends_with(".tgz") || path.ends_with(".tar.gz") || path.ends_with(".tar")
+            }
+            _ => false,
+        }
     }
 
     fn parse_alias(alias_str: &str) -> Result<Self, SpecError> {
@@ -330,17 +403,22 @@ impl PackageSpec {
             "git+http://",
             "git+git://",
             "git+file://",
+            "git+rsync://",
+            "git+ftp://",
             "git://",
+            "ssh://",
+            "git:",
             "github:",
             "gitlab:",
             "bitbucket:",
+            "gist:",
         ];
-        for prefix in git_prefixes {
-            if trimmed.starts_with(prefix) {
-                let name = extract_git_repo_name(trimmed);
-                let target = PackageTarget::parse(trimmed)?;
-                return Ok(Self { name, target });
-            }
+        let is_git = git_prefixes.iter().any(|prefix| trimmed.starts_with(prefix))
+            || PackageTarget::is_scp_git_url(trimmed);
+        if is_git {
+            let name = extract_git_repo_name(trimmed);
+            let target = PackageTarget::parse(trimmed)?;
+            return Ok(Self { name, target });
         }
 
         // Direct HTTP/HTTPS remote tarball URL without name
@@ -657,6 +735,7 @@ pub fn unsupported_protocol(spec: &str) -> Option<String> {
         "git+ftp",
         "git+file",
         "git+ssh",
+        "ssh",
         "http",
         "https",
     ];
@@ -665,7 +744,8 @@ pub fn unsupported_protocol(spec: &str) -> Option<String> {
 
 #[cfg(test)]
 mod unsupported_protocol_tests {
-    use super::unsupported_protocol;
+    use super::*;
+    use crate::semver::{Range, Version};
 
     #[test]
     fn matches_npa_from_url() {
@@ -693,8 +773,97 @@ mod unsupported_protocol_tests {
             "latest",
             "u/r",
             "git://h/r.git",
+            "ssh://git@github.com/12345/repo.git",
         ] {
             assert_eq!(unsupported_protocol(spec), None, "{spec}");
         }
+    }
+
+    #[test]
+    fn test_git_spec_parsing_scp_and_ssh() {
+        use crate::spec::{PackageSpec, PackageTarget};
+
+        let scp = "git@github.com:12345/repo.git#main";
+        let target_scp = PackageTarget::parse(scp).unwrap();
+        match &target_scp {
+            PackageTarget::Git {
+                url,
+                committish,
+                subdir,
+            } => {
+                assert_eq!(url, "git@github.com:12345/repo.git");
+                assert_eq!(committish.as_deref(), Some("main"));
+                assert_eq!(*subdir, None);
+            }
+            _ => panic!("Expected PackageTarget::Git"),
+        }
+
+        let spec_scp = PackageSpec::parse(scp).unwrap();
+        assert_eq!(spec_scp.name, "repo");
+        assert_eq!(spec_scp.target, target_scp);
+
+        let ssh = "ssh://git@github.com/12345/repo.git#main";
+        let target_ssh = PackageTarget::parse(ssh).unwrap();
+        match &target_ssh {
+            PackageTarget::Git {
+                url,
+                committish,
+                subdir,
+            } => {
+                assert_eq!(url, "ssh://git@github.com/12345/repo.git");
+                assert_eq!(committish.as_deref(), Some("main"));
+                assert_eq!(*subdir, None);
+            }
+            _ => panic!("Expected PackageTarget::Git"),
+        }
+
+        let spec_ssh = PackageSpec::parse(ssh).unwrap();
+        assert_eq!(spec_ssh.name, "repo");
+        assert_eq!(spec_ssh.target, target_ssh);
+        assert_eq!(unsupported_protocol(ssh), None);
+    }
+
+    #[test]
+    fn test_git_package_named_git_vs_scp_url() {
+        // Real npm registry specs where package name is "git":
+        let spec_ver = PackageSpec::parse("git@1.0.0").unwrap();
+        assert_eq!(spec_ver.name, "git");
+        assert_eq!(spec_ver.target, PackageTarget::Version(Version::new(1, 0, 0)));
+
+        let spec_range = PackageSpec::parse("git@^2.0.0").unwrap();
+        assert_eq!(spec_range.name, "git");
+        assert_eq!(spec_range.target, PackageTarget::Range(Range::parse("^2.0.0").unwrap()));
+
+        let spec_tag = PackageSpec::parse("git@latest").unwrap();
+        assert_eq!(spec_tag.name, "git");
+        assert_eq!(spec_tag.target, PackageTarget::Tag("latest".to_string()));
+
+        // SCP git URL must parse as git dependency with repo name:
+        let scp = "git@github.com:12345/repo.git";
+        assert!(PackageTarget::is_scp_git_url(scp));
+        assert!(!PackageTarget::is_scp_git_url("git@1.0.0"));
+        assert!(!PackageTarget::is_scp_git_url("git@^2.0.0"));
+        assert!(!PackageTarget::is_scp_git_url("git@latest"));
+
+        let spec_scp = PackageSpec::parse(scp).unwrap();
+        assert_eq!(spec_scp.name, "repo");
+        match spec_scp.target {
+            PackageTarget::Git { url, .. } => {
+                assert_eq!(url, "git@github.com:12345/repo.git");
+            }
+            _ => panic!("Expected PackageTarget::Git"),
+        }
+
+        // Non-git SSH users with dotted hostnames parse as SCP git URLs (matching npm-package-arg),
+        // while dotless hosts such as `git@npm:other` or `git@file:./foo` do not:
+        assert!(PackageTarget::is_scp_git_url("deploy@gitlab.com:org/repo.git"));
+        assert!(!PackageTarget::is_scp_git_url("git@npm:other"));
+        assert!(!PackageTarget::is_scp_git_url("git@file:./foo"));
+        assert!(!PackageTarget::is_scp_git_url("user@localhost:org/repo.git"));
+        assert!(!PackageTarget::is_scp_git_url("@org/pkg:foo"));
+
+        let deploy_spec = PackageSpec::parse("deploy@gitlab.com:org/repo.git").unwrap();
+        assert_eq!(deploy_spec.name, "repo");
+        assert!(matches!(deploy_spec.target, PackageTarget::Git { .. }));
     }
 }

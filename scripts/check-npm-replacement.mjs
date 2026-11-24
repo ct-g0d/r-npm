@@ -172,7 +172,7 @@ const oracleEnv={...baseEnv,NPM_CONFIG_USERCONFIG:path.join(root,'empty.npmrc'),
 write(root,'empty.npmrc','');write(root,'global.npmrc','');
 for(const name of ['dep','parent','changing'])for(const version of ['1.0.0','1.1.0','2.0.0']){
   const dir=path.join(root,'tarballs',`${name}-${version}`);manifest(dir,{name,version,...(name==='parent'?{dependencies:{dep:'^1.0.0'}}:{})});write(dir,'index.js','module.exports = 1;\n');
-  const p=await run(process.execPath,[npmCli,'pack','--ignore-scripts','--silent'],dir,oracleEnv);if(p.exit!==0)throw new Error(p.stderr);
+  const p=await run(process.execPath,[npmCli,'pack','--ignore-scripts','--silent'],dir,oracleEnv);if(p.exit!==0)throw new Error(`pack ${name}-${version} failed: exit=${p.exit} err=${p.error} stdout=${p.stdout} stderr=${p.stderr}`);
   tarballs.set(`/${name}-${version}.tgz`,fs.readFileSync(path.join(dir,`${name}-${version}.tgz`)));
 }
 const cases=[];
@@ -632,7 +632,7 @@ for(const [name,versions] of Object.entries({
       manifest(path.join(dir,'node_modules/bundled-leaf/node_modules/bundled-transitive'),{name:'bundled-transitive',license:'ISC',bin:'bin/transitive.js'});
       write(path.join(dir,'node_modules/bundled-leaf/node_modules/bundled-transitive'),'bin/transitive.js','#!/usr/bin/env node\nconsole.log("bundled transitive");\n');
     }
-    const p=await run(process.execPath,[npmCli,'pack','--ignore-scripts','--silent'],dir,oracleEnv);if(p.exit!==0)throw new Error(p.stderr);
+    const p=await run(process.execPath,[npmCli,'pack','--ignore-scripts','--silent'],dir,oracleEnv);if(p.exit!==0)throw new Error(`pack ${name}-${version} failed: exit=${p.exit} err=${p.error} stdout=${p.stdout} stderr=${p.stderr}`);
     const bytes=fs.readFileSync(path.join(dir,`${name}-${version}.tgz`));tarballs.set(`/${name}-${version}.tgz`,bytes);
     packed[version]={name,version,...fields,dist:{tarball:`${registry}${name}-${version}.tgz`,integrity:'sha512-'+createHash('sha512').update(bytes).digest('base64')}};
   }
@@ -895,7 +895,7 @@ for(const [name,versions] of Object.entries({
   const file=name.replace(/^@/,'').replace('/','-');
   for(const [version,fields]of Object.entries(versions)){
     const dir=path.join(root,'tarballs',`${file}-${version}`);manifest(dir,{name,version,...fields});write(dir,'index.js','module.exports = 1;\n');
-    const p=await run(process.execPath,[npmCli,'pack','--ignore-scripts','--silent'],dir,oracleEnv);if(p.exit!==0)throw new Error(p.stderr);
+    const p=await run(process.execPath,[npmCli,'pack','--ignore-scripts','--silent'],dir,oracleEnv);if(p.exit!==0)throw new Error(`pack ${name}-${version} failed: exit=${p.exit} err=${p.error} stdout=${p.stdout} stderr=${p.stderr}`);
     const bytes=fs.readFileSync(path.join(dir,`${file}-${version}.tgz`));tarballs.set(`/${file}-${version}.tgz`,bytes);
     packed[version]={name,version,...fields,dist:{tarball:`${registry}${file}-${version}.tgz`,integrity:'sha512-'+createHash('sha512').update(bytes).digest('base64')}};
   }
@@ -967,13 +967,23 @@ const normalizeCleanupRace=str=>str.replace(/^npm warn cleanup .*\r?\n/gm,'');
 const normalize=(str,dir,config)=>normalizeJsFrames(normalizeCleanupRace(str)).replaceAll(dir.replaceAll('\\','\\\\'),'<fixture>').replaceAll(dir,'<fixture>').replaceAll(dir.replaceAll('\\','/'),'<fixture>').replaceAll(config.replaceAll('\\','\\\\'),'<config>').replaceAll(config,'<config>').replaceAll(config.replaceAll('\\','/'),'<config>').replaceAll(registry,'<registry>/').replace(/\bin \d+(?:\.\d+)?(?:ms|s|m|h)\b/g,'in <time>').replace(/("time": )\d+/g,'$10').replace(/PONG \d+ms/g,'PONG <time>').replace(/\d{4}-\d\d-\d\dT\d\d_\d\d_\d\d_\d{3}Z-debug-\d+\.log/g,'<timestamp>-debug-0.log').replace(/\d{4}-\d\d-\d\dT\d\d_\d\d_\d\d_\d{3}Z-eresolve-report\.txt/g,'<timestamp>-eresolve-report.txt').replace(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/g,'<uuid>').replace(/\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z/g,'<iso-time>').replace(/^(npm@\d+\.\d+\.\d+) .+$/m,'$1 <npm-root>').replace(/\r\n/g,'\n');
 function snapshot(dir,config){
   if(!fs.existsSync(dir))return {};
-  const result={};const walk=current=>{for(const e of fs.readdirSync(current,{withFileTypes:true})){
-    const p=path.join(current,e.name),rel=path.relative(dir,p).replaceAll('\\','/');
-    if(e.isSymbolicLink())result[rel]={link:normalize(fs.readlinkSync(p),dir,config)};
-    else if(e.isDirectory())walk(p);
-    else if(rel.endsWith('.json')){try{result[rel]=JSON.parse(normalize(fs.readFileSync(p,'utf8'),dir,config));}catch{result[rel]=createHash('sha256').update(fs.readFileSync(p)).digest('hex');}}
-    else result[rel]=createHash('sha256').update(fs.readFileSync(p)).digest('hex');
-  }};walk(dir);return result;
+  const result={};const walk=current=>{
+    let entries;
+    try{entries=fs.readdirSync(current,{withFileTypes:true});}catch(e){if(e.code==='ENOENT')return;throw e;}
+    for(const e of entries){
+      if(e.name.startsWith('.rnpm-trash')||e.name.startsWith('.rnpm-staging')||e.name==='.rnpm_checkout_done')continue;
+      const p=path.join(current,e.name),rel=path.relative(dir,p).replaceAll('\\','/');
+      try{
+        if(e.isSymbolicLink())result[rel]={link:normalize(fs.readlinkSync(p),dir,config)};
+        else if(e.isDirectory())walk(p);
+        else if(rel.endsWith('.json')){try{result[rel]=JSON.parse(normalize(fs.readFileSync(p,'utf8'),dir,config));}catch{result[rel]=createHash('sha256').update(fs.readFileSync(p)).digest('hex');}}
+        else result[rel]=createHash('sha256').update(fs.readFileSync(p)).digest('hex');
+      }catch(err){
+        if(err.code==='ENOENT')continue;
+        throw err;
+      }
+    }
+  };walk(dir);return result;
 }
 const stable=v=>JSON.stringify(v,(_,value)=>value&&typeof value==='object'&&!Array.isArray(value)?Object.fromEntries(Object.entries(value).sort(([a],[b])=>a.localeCompare(b))):value);
 const results=[];

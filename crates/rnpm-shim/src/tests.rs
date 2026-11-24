@@ -1384,3 +1384,234 @@ fn test_replace_existing_symlink_does_not_overwrite_target() {
         assert!(meta.is_file());
     }
 }
+
+#[test]
+fn test_shebang_parsing_env_dash_s_attached() {
+    let s1 = "#!/usr/bin/env -Snode --harmony";
+    let info1 = shebang::parse_shebang(s1).unwrap();
+    assert_eq!(info1.program, "node");
+    assert_eq!(info1.args, vec!["--harmony"]);
+
+    let s2 = "#!/usr/bin/env -SFOO=bar node -e 'console.log(1)'";
+    let info2 = shebang::parse_shebang(s2).unwrap();
+    assert_eq!(info2.program, "node");
+    assert_eq!(info2.args, vec!["-e", "console.log(1)"]);
+}
+
+#[test]
+fn test_cmd_shim_shebang_bom_handling() {
+    let dir = tempdir().unwrap();
+    let script = dir.path().join("bom_tool.js");
+    fs::write(
+        &script,
+        b"\xEF\xBB\xBF#!/usr/bin/env node --max-old-space-size=4096\nconsole.log(1);\n",
+    )
+    .unwrap();
+
+    let shebang = cmd_shim_shebang(&script);
+    assert!(shebang.is_some(), "Shebang with UTF-8 BOM must be recognized");
+    let (vars, prog, args) = shebang.unwrap();
+    assert_eq!(vars, "");
+    assert_eq!(prog, "node");
+    assert_eq!(args, "--max-old-space-size=4096");
+}
+
+#[test]
+fn test_read_shebang_from_binary_file_returns_none_cleanly() {
+    let dir = tempdir().unwrap();
+    let bin_file = dir.path().join("native_tool.exe");
+    // Non-UTF8 binary content
+    fs::write(&bin_file, b"\x7FELF\x02\x01\x01\x00\xFF\xFE\x00\x00\x01\x02").unwrap();
+
+    let result = shebang::read_shebang_from_file(&bin_file);
+    assert!(result.is_ok(), "Binary file should not error");
+    assert_eq!(result.unwrap(), None);
+}
+
+#[test]
+fn test_normalize_shebang_file_readonly_windows() {
+    let dir = tempdir().unwrap();
+    let script = dir.path().join("readonly_cli.js");
+    fs::write(&script, b"#!/usr/bin/env node\r\nconsole.log(1);\r\n").unwrap();
+
+    // Set read-only
+    let mut perms = fs::metadata(&script).unwrap().permissions();
+    perms.set_readonly(true);
+    fs::set_permissions(&script, perms).unwrap();
+
+    let changed = shebang::normalize_shebang_file(&script).unwrap();
+    assert!(changed);
+    let content = fs::read(&script).unwrap();
+    assert_eq!(&content[..20], b"#!/usr/bin/env node\n");
+}
+
+#[test]
+fn test_create_shim_trio_overwriting_readonly_shims() {
+    let dir = tempdir().unwrap();
+    let bin_dir = dir.path().join(".bin");
+    let target = dir.path().join("tool.js");
+    fs::write(&target, b"#!/usr/bin/env node\nconsole.log(1);\n").unwrap();
+
+    // First creation
+    let trio = generator::create_shim_trio(&target, &bin_dir, "mytool").unwrap();
+
+    // Mark all generated shims read-only
+    for p in [&trio.cmd_path, &trio.ps1_path, &trio.sh_path] {
+        let mut perms = fs::metadata(p).unwrap().permissions();
+        perms.set_readonly(true);
+        fs::set_permissions(p, perms).unwrap();
+    }
+
+    // Overwrite must succeed without permission errors
+    let trio2 = generator::create_shim_trio(&target, &bin_dir, "mytool");
+    assert!(trio2.is_ok(), "Overwriting read-only shims must succeed");
+}
+
+#[cfg(windows)]
+#[test]
+fn test_windows_junction_and_directory_bin_collision() {
+    let temp = tempdir().unwrap();
+    let root = temp.path();
+
+    // 1. A real directory is still refused with EEXIST even with force = true
+    let local_bin_dir = root.join("node_modules").join(".bin");
+    fs::create_dir_all(&local_bin_dir).unwrap();
+
+    let real_dir = local_bin_dir.join("real_dir_tool");
+    fs::create_dir_all(&real_dir).unwrap();
+
+    let target_js = root.join("node_modules").join("my-pkg").join("cli.js");
+    fs::create_dir_all(target_js.parent().unwrap()).unwrap();
+    fs::write(&target_js, b"#!/usr/bin/env node\nconsole.log(1);").unwrap();
+
+    let err = create_shims_with_force(&local_bin_dir, "real_dir_tool", "my-pkg/cli.js", true)
+        .expect_err("Real directory must be refused even with force = true");
+    let err_msg = err.to_string();
+    assert!(
+        err_msg.contains("EEXIST"),
+        "Error must contain EEXIST, got: {err_msg}"
+    );
+    assert!(real_dir.is_dir());
+
+    // 2. A foreign Windows directory junction in a global bin dir with force = false is refused with EEXIST
+    let global_bin_dir = root.join("global_bin");
+    fs::create_dir_all(&global_bin_dir).unwrap();
+
+    let target_dir = root.join("external_target_dir");
+    fs::create_dir_all(&target_dir).unwrap();
+    let canary_file = target_dir.join("canary.txt");
+    fs::write(&canary_file, b"important data that must not be deleted").unwrap();
+
+    let global_junction = global_bin_dir.join("mytool");
+    rnpm_fs::create_junction(&global_junction, &target_dir).unwrap();
+    assert!(global_junction.exists());
+
+    let err_global = create_shims_with_force(&global_bin_dir, "mytool", "my-pkg/cli.js", false)
+        .expect_err("Foreign directory junction in global bin with force = false must be refused");
+    assert!(
+        err_global.to_string().contains("EEXIST"),
+        "Must fail with EEXIST, got: {err_global}"
+    );
+    assert!(canary_file.exists(), "Canary file inside target must still exist");
+
+    // 3. A Windows directory junction in .bin (or global bin with force = true) is cleanly unlinked
+    // and replaced by create_shims_with_force WITHOUT deleting any files inside the junction's target directory.
+    // First, in local .bin:
+    let local_junction = local_bin_dir.join("junc_tool");
+    rnpm_fs::create_junction(&local_junction, &target_dir).unwrap();
+    assert!(local_junction.exists());
+
+    let res_local = create_shims_with_force(&local_bin_dir, "junc_tool", "my-pkg/cli.js", false);
+    assert!(res_local.is_ok(), "Junction in local .bin must be replaced: {:?}", res_local.err());
+    assert!(local_bin_dir.join("junc_tool.cmd").exists());
+    assert!(local_bin_dir.join("junc_tool.ps1").exists());
+    assert!(canary_file.exists(), "Target directory files must NEVER be deleted when junction is unlinked");
+
+    // Second, in global bin with force = true:
+    let res_global = create_shims_with_force(&global_bin_dir, "mytool", "my-pkg/cli.js", true);
+    assert!(res_global.is_ok(), "Junction in global bin with force = true must be replaced: {:?}", res_global.err());
+    assert!(global_bin_dir.join("mytool.cmd").exists());
+    assert!(global_bin_dir.join("mytool.ps1").exists());
+    assert!(canary_file.exists(), "Target directory files must NEVER be deleted when junction is unlinked");
+}
+
+#[test]
+fn test_readonly_file_replacement_and_mode_preservation() {
+    let dir = tempdir().unwrap();
+
+    // 1. normalize_shebang_file on a readonly file with CRLF
+    let script = dir.path().join("readonly_cli.js");
+    fs::write(&script, b"#!/usr/bin/env node\r\nconsole.log('readonly');\r\n").unwrap();
+
+    let mut perms = fs::metadata(&script).unwrap().permissions();
+    perms.set_readonly(true);
+    fs::set_permissions(&script, perms).unwrap();
+    assert!(fs::metadata(&script).unwrap().permissions().readonly());
+
+    let changed = crate::shebang::normalize_shebang_file(&script).unwrap();
+    assert!(changed, "CRLF shebang on readonly file should be normalized");
+
+    let content = fs::read(&script).unwrap();
+    assert!(
+        content.starts_with(b"#!/usr/bin/env node\n"),
+        "Shebang line must be converted to LF"
+    );
+
+    #[cfg(windows)]
+    assert!(
+        fs::metadata(&script).unwrap().permissions().readonly(),
+        "Windows readonly attribute must be preserved after shebang normalization"
+    );
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = fs::metadata(&script).unwrap().permissions().mode();
+        assert_eq!(
+            mode & 0o222,
+            0,
+            "Unix mode must restore readonly (never leave write bits 0o222 enabled)"
+        );
+    }
+
+    // 2. Overwrite existing readonly shim files via create_shim_trio
+    let bin_dir = dir.path().join("bin");
+    fs::create_dir_all(&bin_dir).unwrap();
+
+    let sh_path = bin_dir.join("mytool");
+    let cmd_path = bin_dir.join("mytool.cmd");
+    let ps1_path = bin_dir.join("mytool.ps1");
+
+    fs::write(&sh_path, b"stale_posix").unwrap();
+    fs::write(&cmd_path, b"stale_cmd").unwrap();
+    fs::write(&ps1_path, b"stale_ps1").unwrap();
+
+    for p in [&sh_path, &cmd_path, &ps1_path] {
+        let mut p_perms = fs::metadata(p).unwrap().permissions();
+        p_perms.set_readonly(true);
+        fs::set_permissions(p, p_perms).unwrap();
+        assert!(fs::metadata(p).unwrap().permissions().readonly());
+    }
+
+    let target_js = dir.path().join("pkg").join("cli.js");
+    fs::create_dir_all(target_js.parent().unwrap()).unwrap();
+    fs::write(&target_js, b"#!/usr/bin/env node\nconsole.log(1);\n").unwrap();
+
+    let trio_res = crate::generator::create_shim_trio(&target_js, &bin_dir, "mytool");
+    assert!(
+        trio_res.is_ok(),
+        "create_shim_trio must succeed even when existing destination files are readonly: {:?}",
+        trio_res.err()
+    );
+
+    let new_sh = fs::read_to_string(&sh_path).unwrap();
+    let new_cmd = fs::read_to_string(&cmd_path).unwrap();
+    let new_ps1 = fs::read_to_string(&ps1_path).unwrap();
+
+    assert_ne!(new_sh, "stale_posix");
+    assert_ne!(new_cmd, "stale_cmd");
+    assert_ne!(new_ps1, "stale_ps1");
+    assert!(new_sh.starts_with("#!/bin/sh"));
+    assert!(new_cmd.starts_with("@ECHO off"));
+    assert!(new_ps1.starts_with("#!/usr/bin/env pwsh"));
+}

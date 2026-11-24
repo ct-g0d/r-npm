@@ -197,9 +197,9 @@ fn parse_engine_entry_str(entry: &str) -> Option<(&str, &str)> {
     if trimmed.is_empty() {
         return None;
     }
-    if let Some(idx) = trimmed.find(|c: char| c.is_whitespace() || c == '@') {
+    if let Some((idx, ch)) = trimmed.char_indices().find(|(_, c)| c.is_whitespace() || *c == '@') {
         let name = trimmed[..idx].trim();
-        let range = trimmed[idx + 1..].trim();
+        let range = trimmed[idx + ch.len_utf8()..].trim();
         if !name.is_empty() && !range.is_empty() {
             return Some((name, range));
         }
@@ -268,6 +268,41 @@ pub enum PackageBin {
     Map(BTreeMap<String, String>),
 }
 
+/// Helper deserializer to tolerate object or array license forms and extract the license type/expression.
+pub(crate) fn deserialize_license<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let val = serde_json::Value::deserialize(deserializer)?;
+    match val {
+        serde_json::Value::String(s) => {
+            if s.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(s))
+            }
+        }
+        serde_json::Value::Object(map) => {
+            if let Some(t) = map.get("type").and_then(|v| v.as_str()) {
+                Ok(Some(t.to_string()))
+            } else if let Some(n) = map.get("name").and_then(|v| v.as_str()) {
+                Ok(Some(n.to_string()))
+            } else {
+                Ok(None)
+            }
+        }
+        serde_json::Value::Array(arr) => {
+            let joined: Vec<&str> = arr.iter().filter_map(|v| v.as_str()).collect();
+            if joined.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(joined.join(" OR ")))
+            }
+        }
+        _ => Ok(None),
+    }
+}
+
 /// Metadata for a package node in lockfile v3 `packages`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct LockfilePackage {
@@ -291,7 +326,7 @@ pub struct LockfilePackage {
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub resolved: Option<String>,
 
-    #[serde(skip_serializing_if = "Option::is_none", default)]
+    #[serde(skip_serializing_if = "Option::is_none", alias = "_integrity", default)]
     pub integrity: Option<String>,
 
     #[serde(skip_serializing_if = "is_false_or_none", default)]
@@ -337,6 +372,7 @@ pub struct LockfilePackage {
 
     #[serde(
         rename = "hasShrinkwrap",
+        alias = "_hasShrinkwrap",
         skip_serializing_if = "is_false_or_none",
         default
     )]
@@ -345,7 +381,11 @@ pub struct LockfilePackage {
     #[serde(skip_serializing_if = "is_false_or_none", default)]
     pub extraneous: Option<bool>,
 
-    #[serde(skip_serializing_if = "Option::is_none", default)]
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_license",
+        default
+    )]
     pub license: Option<String>,
 
     #[serde(skip_serializing_if = "is_none_or_empty_platform", default)]
@@ -476,6 +516,7 @@ impl LockfilePackage {
     /// Sets the `dev` flag (clearing `false` to `None`).
     pub fn set_dev(&mut self, val: bool) {
         self.dev = if val { Some(true) } else { None };
+        self.raw_value = None;
     }
 
     /// `$name` override references of this package, in arborist's edge.js
@@ -509,6 +550,7 @@ impl LockfilePackage {
     /// Sets the `optional` flag (clearing `false` to `None`).
     pub fn set_optional(&mut self, val: bool) {
         self.optional = if val { Some(true) } else { None };
+        self.raw_value = None;
     }
 
     pub fn with_optional(mut self, val: bool) -> Self {
@@ -519,6 +561,7 @@ impl LockfilePackage {
     /// Sets the `devOptional` flag (clearing `false` to `None`).
     pub fn set_dev_optional(&mut self, val: bool) {
         self.dev_optional = if val { Some(true) } else { None };
+        self.raw_value = None;
     }
 
     pub fn with_dev_optional(mut self, val: bool) -> Self {
@@ -529,6 +572,7 @@ impl LockfilePackage {
     /// Sets the `peer` flag (clearing `false` to `None`).
     pub fn set_peer(&mut self, val: bool) {
         self.peer = if val { Some(true) } else { None };
+        self.raw_value = None;
     }
 
     pub fn with_peer(mut self, val: bool) -> Self {
@@ -539,6 +583,7 @@ impl LockfilePackage {
     /// Sets the `peerOptional` flag (clearing `false` to `None`).
     pub fn set_peer_optional(&mut self, val: bool) {
         self.peer_optional = if val { Some(true) } else { None };
+        self.raw_value = None;
     }
 
     pub fn with_peer_optional(mut self, val: bool) -> Self {
@@ -549,6 +594,7 @@ impl LockfilePackage {
     /// Sets the `inBundle` flag (clearing `false` to `None`).
     pub fn set_in_bundle(&mut self, val: bool) {
         self.in_bundle = if val { Some(true) } else { None };
+        self.raw_value = None;
     }
 
     pub fn with_in_bundle(mut self, val: bool) -> Self {
@@ -559,6 +605,7 @@ impl LockfilePackage {
     /// Sets the `hasInstallScript` flag (clearing `false` to `None`).
     pub fn set_has_install_script(&mut self, val: bool) {
         self.has_install_script = if val { Some(true) } else { None };
+        self.raw_value = None;
     }
 
     pub fn with_has_install_script(mut self, val: bool) -> Self {
@@ -569,6 +616,7 @@ impl LockfilePackage {
     /// Sets the `hasShrinkwrap` flag (clearing `false` to `None`).
     pub fn set_has_shrinkwrap(&mut self, val: bool) {
         self.has_shrinkwrap = if val { Some(true) } else { None };
+        self.raw_value = None;
     }
 
     pub fn with_has_shrinkwrap(mut self, val: bool) -> Self {
@@ -579,6 +627,7 @@ impl LockfilePackage {
     /// Sets the `link` flag (clearing `false` to `None`).
     pub fn set_link(&mut self, val: bool) {
         self.link = if val { Some(true) } else { None };
+        self.raw_value = None;
     }
 
     pub fn with_link(mut self, val: bool) -> Self {
@@ -592,6 +641,7 @@ impl LockfilePackage {
     /// - If only `is_optional` is true, sets `optional: true`.
     /// - If neither, clears all three flags.
     pub fn set_dependency_types(&mut self, is_dev: bool, is_optional: bool) {
+        self.raw_value = None;
         if is_dev && is_optional {
             self.dev = Some(true);
             self.optional = Some(true);
@@ -621,6 +671,7 @@ impl LockfilePackage {
     /// - For npm 11 / lockfile v3, packages reachable via dev and optional branches retain `dev: true, optional: true`.
     /// - Any `false` boolean flags are normalized to `None`.
     pub fn normalize_flags(&mut self) {
+        self.raw_value = None;
         if self.dev == Some(false) {
             self.dev = None;
         }
@@ -734,6 +785,7 @@ impl LockfilePackage {
 
     /// Sets or unsets `optional: true` for a peer dependency in `peerDependenciesMeta`.
     pub fn set_peer_dep_optional(&mut self, dep_name: impl Into<String>, optional: bool) {
+        self.raw_value = None;
         let name = dep_name.into();
         if optional {
             let map = self
@@ -1248,7 +1300,7 @@ impl LockfileV3 {
         let root_has_ws = root_pkg.workspaces.as_ref().is_some_and(|w| !w.is_empty());
 
         if manifest_has_ws && root_has_ws {
-            let mut m = manifest_ws.unwrap();
+            let mut m = manifest_ws.clone().unwrap();
             let mut r = root_pkg.workspaces.clone().unwrap_or_default();
             m.sort();
             r.sort();
@@ -1257,9 +1309,10 @@ impl LockfileV3 {
             }
         } else if !manifest_has_ws && root_has_ws {
             return false;
-        } else if manifest_has_ws && !root_has_ws {
-            // Root workspace metadata is absent in lockfile (e.g. npm v1 workspace lock or npm v3 omission).
-            // Validate legacy / omitted lockfile via discovered members and available links while preserving genuine drift checks.
+        }
+
+        if manifest_has_ws {
+            // Validate workspace members and links against manifest patterns and discovered members on disk.
             let patterns = manifest.workspace_patterns();
 
             // Collect discovered workspace member paths from packages map
@@ -1309,16 +1362,19 @@ impl LockfileV3 {
                 }
             }
 
-            // All lockfile member paths outside node_modules must match workspace patterns
-            for member_path in &lockfile_member_paths {
-                if !Self::path_matches_workspace_patterns(member_path, &patterns) {
-                    return false;
+            if !root_has_ws {
+                // All lockfile member paths outside node_modules must match workspace patterns
+                for member_path in &lockfile_member_paths {
+                    if !Self::path_matches_workspace_patterns(member_path, &patterns) {
+                        return false;
+                    }
                 }
             }
 
             if let Some(members) = workspace_members {
                 // Workspace discovery is available (caller supplied workspace_members).
-                // 1. Every discovered member on disk must exist in the lockfile
+                // 1. Every discovered member on disk must exist in the lockfile (real npm `ci`
+                //    rejects new workspace members on disk that are missing from package-lock.json).
                 for member in members {
                     let has_entry = lockfile_member_paths.contains(&member.relative_path)
                         || available_link_targets.contains(&member.relative_path)
@@ -1328,22 +1384,28 @@ impl LockfileV3 {
                     }
                 }
 
-                // 2. Every member path in lockfile must exist on disk (detects stale / deleted members)
-                for member_path in &lockfile_member_paths {
-                    if !members.iter().any(|m| m.relative_path == *member_path) {
-                        return false;
+                // 2 & 3. Strict bidirectional checks (stale/deleted members or link targets).
+                // Real npm `ci` (`allow_extra_lock_deps == true`) allows absent lockfile workspace
+                // targets (e.g. `eslint` published tarball / `ci-missing-link-target`) and installs
+                // dangling links or omits dev links instead of throwing ELOCKFILE_DRIFT.
+                if !allow_extra_lock_deps {
+                    for member_path in &lockfile_member_paths {
+                        if Self::path_matches_workspace_patterns(member_path, &patterns)
+                            && !members.iter().any(|m| m.relative_path == *member_path)
+                        {
+                            return false;
+                        }
                     }
-                }
 
-                // 3. Every available link target that matches workspace patterns must exist on disk
-                for link_target in &available_link_targets {
-                    if Self::path_matches_workspace_patterns(link_target, &patterns)
-                        && !members.iter().any(|m| m.relative_path == *link_target)
-                    {
-                        return false;
+                    for link_target in &available_link_targets {
+                        if Self::path_matches_workspace_patterns(link_target, &patterns)
+                            && !members.iter().any(|m| m.relative_path == *link_target)
+                        {
+                            return false;
+                        }
                     }
                 }
-            } else {
+            } else if !root_has_ws {
                 // Workspace discovery is unavailable (None).
                 // Lockfile must have at least one workspace member or link matching patterns.
                 let has_matching_member = lockfile_member_paths
@@ -1358,10 +1420,56 @@ impl LockfileV3 {
                 }
             }
         } else if !manifest_has_ws && !root_has_ws && !allow_extra_lock_deps {
-            let has_lockfile_members = self
+            let link_targets: BTreeSet<String> = self
                 .packages
-                .keys()
-                .any(|k| !k.is_empty() && !k.split(['/', '\\']).any(|seg| seg == "node_modules"));
+                .iter()
+                .filter(|(pkg_key, p)| {
+                    if p.link != Some(true) {
+                        return false;
+                    }
+                    let norm_key = pkg_key.replace('\\', "/");
+                    // A direct `node_modules/<dep>` link is only a non-workspace `file:` target
+                    // when `<dep>` is declared in the root manifest; otherwise it is an orphaned
+                    // workspace link left over after removing `workspaces` from package.json.
+                    if let Some(dep_name) = norm_key.strip_prefix("node_modules/") {
+                        if !dep_name.contains("node_modules/") {
+                            return manifest.dependencies.contains_key(dep_name)
+                                || manifest.dev_dependencies.contains_key(dep_name)
+                                || manifest.optional_dependencies.contains_key(dep_name)
+                                || manifest.peer_dependencies.contains_key(dep_name);
+                        }
+                    }
+                    true
+                })
+                .filter_map(|(_, p)| p.resolved.as_deref().or(p.version.as_deref()))
+                .map(|r| {
+                    let s = r.replace('\\', "/");
+                    let s = s.strip_prefix("file:").unwrap_or(&s);
+                    let s = s.strip_prefix("./").unwrap_or(s).trim_end_matches('/');
+                    if cfg!(windows) {
+                        s.to_ascii_lowercase()
+                    } else {
+                        s.to_string()
+                    }
+                })
+                .collect();
+            let has_lockfile_members = self.packages.keys().any(|k| {
+                if k.is_empty() || k.split(['/', '\\']).any(|seg| seg == "node_modules") {
+                    return false;
+                }
+                let norm = k.replace('\\', "/");
+                let norm = norm.strip_prefix("file:").unwrap_or(&norm);
+                let norm = norm
+                    .strip_prefix("./")
+                    .unwrap_or(norm)
+                    .trim_end_matches('/');
+                let key_to_check = if cfg!(windows) {
+                    norm.to_ascii_lowercase()
+                } else {
+                    norm.to_string()
+                };
+                !link_targets.contains(&key_to_check)
+            });
             if has_lockfile_members {
                 return false;
             }
@@ -1419,6 +1527,17 @@ impl LockfileV3 {
             } else {
                 spec.clone()
             };
+            if let Some(ref lock_deps) = root_pkg.dependencies {
+                if let Some(lock_spec) = lock_deps.get(dep) {
+                    let eff_non_reg = Self::is_non_registry_spec(&eff_spec);
+                    let lock_non_reg = Self::is_non_registry_spec(lock_spec);
+                    if eff_non_reg != lock_non_reg
+                        || (eff_non_reg && !Self::non_registry_specs_match(&eff_spec, lock_spec))
+                    {
+                        return false;
+                    }
+                }
+            }
             if !Self::package_satisfies_spec(dep, pkg, &eff_spec) {
                 return false;
             }
@@ -1439,6 +1558,17 @@ impl LockfileV3 {
                 } else {
                     spec.clone()
                 };
+                if let Some(ref lock_dev) = root_pkg.dev_dependencies {
+                    if let Some(lock_spec) = lock_dev.get(dep) {
+                        let eff_non_reg = Self::is_non_registry_spec(&eff_spec);
+                        let lock_non_reg = Self::is_non_registry_spec(lock_spec);
+                        if eff_non_reg != lock_non_reg
+                            || (eff_non_reg && !Self::non_registry_specs_match(&eff_spec, lock_spec))
+                        {
+                            return false;
+                        }
+                    }
+                }
                 if !Self::package_satisfies_spec(dep, pkg, &eff_spec) {
                     return false;
                 }
@@ -1457,6 +1587,17 @@ impl LockfileV3 {
                 } else {
                     spec.clone()
                 };
+                if let Some(ref lock_opt) = root_pkg.optional_dependencies {
+                    if let Some(lock_spec) = lock_opt.get(dep) {
+                        let eff_non_reg = Self::is_non_registry_spec(&eff_spec);
+                        let lock_non_reg = Self::is_non_registry_spec(lock_spec);
+                        if eff_non_reg != lock_non_reg
+                            || (eff_non_reg && !Self::non_registry_specs_match(&eff_spec, lock_spec))
+                        {
+                            return false;
+                        }
+                    }
+                }
                 if !Self::package_satisfies_spec(dep, pkg, &eff_spec) {
                     return false;
                 }
@@ -1480,6 +1621,17 @@ impl LockfileV3 {
             } else {
                 spec.clone()
             };
+            if let Some(ref lock_peer) = root_pkg.peer_dependencies {
+                if let Some(lock_spec) = lock_peer.get(dep) {
+                    let eff_non_reg = Self::is_non_registry_spec(&eff_spec);
+                    let lock_non_reg = Self::is_non_registry_spec(lock_spec);
+                    if eff_non_reg != lock_non_reg
+                        || (eff_non_reg && !Self::non_registry_specs_match(&eff_spec, lock_spec))
+                    {
+                        return false;
+                    }
+                }
+            }
             if let Some(pkg) = self.packages.get(&key) {
                 if !Self::package_satisfies_spec(dep, pkg, &eff_spec) {
                     return false;
@@ -1498,17 +1650,81 @@ impl LockfileV3 {
 
     pub fn package_satisfies_spec(install_name: &str, pkg: &LockfilePackage, spec: &str) -> bool {
         let Ok(target) = PackageTarget::parse(spec) else {
+            // Handle SCP-like git specs (e.g. git@host:path#ref) or ssh:// that PackageTarget doesn't parse
+            if spec.starts_with("git@") || spec.starts_with("ssh://") {
+                if let Some(ref real_name) = pkg.name {
+                    if real_name != install_name {
+                        return false;
+                    }
+                }
+                if let Some(ref res) = pkg.resolved {
+                    let canon_target = Self::canonicalize_git_identity(spec);
+                    let canon_res = Self::canonicalize_git_identity(res);
+                    if canon_target != canon_res {
+                        return false;
+                    }
+                    let target_frag = spec.split('#').nth(1).unwrap_or("");
+                    if !target_frag.is_empty() {
+                        if let Some(semver_spec) = Self::extract_git_semver_range(target_frag) {
+                            let Some(ver_str) = pkg.version.as_deref() else {
+                                return false;
+                            };
+                            let (Ok(range), Ok(ver)) = (
+                                rnpm_core::semver::Range::parse(semver_spec.trim()),
+                                Version::parse(ver_str),
+                            ) else {
+                                return false;
+                            };
+                            if !range.satisfies(&ver) {
+                                return false;
+                            }
+                        }
+                        let res_frag = res.split('#').nth(1).unwrap_or("");
+                        if res_frag.is_empty() {
+                            return false;
+                        }
+                        if Self::git_refs_equal(res_frag, target_frag) {
+                            return true;
+                        }
+                        let res_is_sha = res_frag.len() >= 7
+                            && res_frag.chars().all(|ch| ch.is_ascii_hexdigit());
+                        let target_is_sha = target_frag.len() >= 7
+                            && target_frag.chars().all(|ch| ch.is_ascii_hexdigit());
+                        if target_is_sha {
+                            return Self::git_refs_equal(res_frag, target_frag);
+                        }
+                        return res_is_sha;
+                    }
+                    return true;
+                }
+            }
             return false;
         };
         if pkg.link == Some(true) {
-            if let PackageTarget::Alias { ref name, .. } = target {
-                if pkg.name.as_deref() != Some(name) {
-                    return false;
+            match &target {
+                PackageTarget::Alias { name, target } => {
+                    if pkg.name.as_deref() != Some(name) {
+                        return false;
+                    }
+                    if let PackageTarget::File(_) = &**target {
+                        if let Some(ref res) = pkg.resolved {
+                            return Self::target_matches_resolved(res, target);
+                        }
+                    }
                 }
+                PackageTarget::File(_) => {
+                    if let Some(ref res) = pkg.resolved {
+                        return Self::target_matches_resolved(res, &target);
+                    }
+                }
+                _ => {}
             }
             return true;
         }
         let Some(ref ver_str) = pkg.version else {
+            if let Some(ref res) = pkg.resolved {
+                return Self::target_matches_resolved(res, &target);
+            }
             return false;
         };
         match &target {
@@ -1516,7 +1732,7 @@ impl LockfileV3 {
                 if pkg.name.as_deref() != Some(name) {
                     return false;
                 }
-                Self::version_matches_target(ver_str, target)
+                Self::version_matches_target(ver_str, target, pkg.resolved.as_deref())
             }
             other => {
                 if let Some(ref real_name) = pkg.name {
@@ -1524,17 +1740,555 @@ impl LockfileV3 {
                         return false;
                     }
                 }
-                Self::version_matches_target(ver_str, other)
+                Self::version_matches_target(ver_str, other, pkg.resolved.as_deref())
             }
         }
     }
 
-    fn version_matches_target(ver_str: &str, target: &PackageTarget) -> bool {
+    fn is_posix_path_absolute(p: &str) -> bool {
+        p.starts_with('/')
+            || (p.len() >= 2
+                && p.as_bytes()[0].is_ascii_alphabetic()
+                && p.as_bytes()[1] == b':')
+    }
+
+    fn canonicalize_git_identity(raw: &str) -> String {
+        let s = raw.split('#').next().unwrap_or(raw).trim();
+        let s = s.split('?').next().unwrap_or(s).trim();
+        let s = s.strip_prefix("git+").unwrap_or(s);
+        let s = if s.starts_with("git:") && !s.starts_with("git://") {
+            s.strip_prefix("git:").unwrap_or(s)
+        } else {
+            s
+        };
+
+        let expanded = if let Some(rest) = s.strip_prefix("github:") {
+            format!("github.com/{rest}")
+        } else if let Some(rest) = s.strip_prefix("gitlab:") {
+            format!("gitlab.com/{rest}")
+        } else if let Some(rest) = s.strip_prefix("bitbucket:") {
+            format!("bitbucket.org/{rest}")
+        } else if let Some(rest) = s.strip_prefix("gist:") {
+            format!("gist.github.com/{rest}")
+        } else if !s.contains(':') && !s.contains('@') && s.split('/').count() == 2 {
+            format!("github.com/{s}")
+        } else {
+            s.to_string()
+        };
+
+        let (had_scheme, without_proto) = if let Some(idx) = expanded.find("://") {
+            (true, &expanded[idx + 3..])
+        } else {
+            (false, expanded.as_str())
+        };
+
+        let without_user = if let Some(at_idx) = without_proto.find('@') {
+            let slash_idx = without_proto.find('/').unwrap_or(usize::MAX);
+            let should_strip = if had_scheme {
+                at_idx < slash_idx
+            } else {
+                let colon_idx = without_proto.find(':').unwrap_or(usize::MAX);
+                at_idx < colon_idx && at_idx < slash_idx
+            };
+            if should_strip {
+                &without_proto[at_idx + 1..]
+            } else {
+                without_proto
+            }
+        } else {
+            without_proto
+        };
+
+        let normalized = if !had_scheme {
+            if let Some((host, path)) = without_user.split_once(':') {
+                let path = path.trim_start_matches('/');
+                if !host.contains('/') && !path.is_empty() {
+                    format!("{host}/{path}")
+                } else {
+                    without_user.to_string()
+                }
+            } else {
+                without_user.to_string()
+            }
+        } else {
+            without_user.to_string()
+        };
+
+        let trimmed = normalized.trim_matches('/');
+        let clean = trimmed.strip_suffix(".git").unwrap_or(trimmed);
+        clean.to_ascii_lowercase()
+    }
+
+    fn percent_decode(s: &str) -> String {
+        let mut bytes = Vec::with_capacity(s.len());
+        let mut chars = s.bytes();
+        while let Some(b) = chars.next() {
+            if b == b'%' {
+                let h1 = chars.next();
+                let h2 = chars.next();
+                if let (Some(h1), Some(h2)) = (h1, h2) {
+                    if let Ok(val) =
+                        u8::from_str_radix(std::str::from_utf8(&[h1, h2]).unwrap_or(""), 16)
+                    {
+                        bytes.push(val);
+                        continue;
+                    }
+                    bytes.push(b'%');
+                    bytes.push(h1);
+                    bytes.push(h2);
+                } else {
+                    bytes.push(b'%');
+                    if let Some(h1) = h1 {
+                        bytes.push(h1);
+                    }
+                }
+            } else {
+                bytes.push(b);
+            }
+        }
+        String::from_utf8(bytes).unwrap_or_else(|_| s.to_string())
+    }
+
+    pub fn extract_git_semver_range(ref_str: &str) -> Option<String> {
+        let s = ref_str.trim();
+        let raw = s
+            .strip_prefix("semver:")
+            .or_else(|| s.strip_prefix("semver%3A"))
+            .or_else(|| s.strip_prefix("semver%3a"))?;
+        let decoded = Self::percent_decode(raw);
+        Some(decoded.trim().to_string())
+    }
+
+    /// Compares two git ref fragments: hex commit SHAs match case-insensitively (full or prefix >= 7 chars),
+    /// semver ranges match semver equivalence (including #semver:^1.0.0 and #semver%3A^1.0.0),
+    /// while named branches/tags match case-sensitively (matching git & npm).
+    pub fn git_refs_equal(a: &str, b: &str) -> bool {
+        if a == b {
+            return true;
+        }
+
+        // SemVer git range comparisons: e.g. semver:^1.0.0 vs semver%3A^1.0.0 or semver: ^1.0.0
+        if let (Some(range_a), Some(range_b)) = (
+            Self::extract_git_semver_range(a),
+            Self::extract_git_semver_range(b),
+        ) {
+            if range_a == range_b {
+                return true;
+            }
+            if let (Ok(ra), Ok(rb)) = (
+                rnpm_core::semver::Range::parse(&range_a),
+                rnpm_core::semver::Range::parse(&range_b),
+            ) {
+                return ra == rb;
+            }
+            return false;
+        }
+
+        let a_is_hex = a.chars().all(|c| c.is_ascii_hexdigit());
+        let b_is_hex = b.chars().all(|c| c.is_ascii_hexdigit());
+        if a_is_hex && b_is_hex {
+            let a_is_full_sha = a.len() == 40 || a.len() == 64;
+            let b_is_full_sha = b.len() == 40 || b.len() == 64;
+
+            // Same-length hex commit refs (>= 7 chars) match case-insensitively
+            if a.len() == b.len() && a.len() >= 7 {
+                return a.eq_ignore_ascii_case(b);
+            }
+
+            // Prefix matching: ONLY allow when at least ONE operand is a full 40-char (SHA-1)
+            // or 64-char (SHA-256) hex commit SHA and the other is a >= 7-char hex prefix
+            if (a_is_full_sha && b.len() >= 7) || (b_is_full_sha && a.len() >= 7) {
+                let min_len = a.len().min(b.len());
+                return a[..min_len].eq_ignore_ascii_case(&b[..min_len]);
+            }
+        }
+
+        false
+    }
+
+    pub fn is_non_registry_spec(spec: &str) -> bool {
+        let s = spec.trim();
+        if s.is_empty() {
+            return false;
+        }
+
+        // npm: alias specifier wrapping an inner spec: e.g. npm:pkg@spec or npm:@scope/pkg@spec
+        if let Some(rest) = s.strip_prefix("npm:") {
+            let inner = if let Some(stripped_scope) = rest.strip_prefix('@') {
+                if let Some(slash_idx) = stripped_scope.find('/') {
+                    let after_slash = &stripped_scope[slash_idx + 1..];
+                    if let Some(at_idx) = after_slash.find('@') {
+                        &after_slash[at_idx + 1..]
+                    } else {
+                        ""
+                    }
+                } else {
+                    ""
+                }
+            } else if let Some(at_idx) = rest.find('@') {
+                &rest[at_idx + 1..]
+            } else {
+                ""
+            };
+            if !inner.is_empty() {
+                return Self::is_non_registry_spec(inner);
+            }
+            return false;
+        }
+
+        // Direct protocol and path prefixes
+        if s.starts_with("file:")
+            || s.starts_with("link:")
+            || s.starts_with("git:")
+            || s.starts_with("git+")
+            || s.starts_with("github:")
+            || s.starts_with("gitlab:")
+            || s.starts_with("bitbucket:")
+            || s.starts_with("gist:")
+            || s.starts_with("ssh://")
+            || rnpm_core::is_scp_git_url(s)
+            || s.starts_with("./")
+            || s.starts_with(".\\")
+            || s.starts_with("../")
+            || s.starts_with("..\\")
+            || s.starts_with('/')
+            || s.starts_with("~/")
+            || s.starts_with("http://")
+            || s.starts_with("https://")
+        {
+            return true;
+        }
+
+        // Windows drive path like C:\ or C:/
+        let b = s.as_bytes();
+        if b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':' {
+            return true;
+        }
+
+        // Tarball archive suffixes (.tgz, .tar.gz, .tar) before any query or fragment
+        let without_hash = s.split('#').next().unwrap_or(s);
+        let without_query = without_hash.split('?').next().unwrap_or(without_hash);
+        if without_query.ends_with(".tgz")
+            || without_query.ends_with(".tar.gz")
+            || without_query.ends_with(".tar")
+        {
+            return true;
+        }
+
+        // GitHub shorthand: user/repo or user/repo#committish
+        let (body, _) = s.split_once('#').unwrap_or((s, ""));
+        if let Some((user, repo)) = body.split_once('/') {
+            let user_ok = user
+                .chars()
+                .next()
+                .is_some_and(|c| !matches!(c, '@' | '%' | '/' | '.' | '-') && !c.is_whitespace())
+                && !user
+                    .chars()
+                    .any(|c| matches!(c, ':' | '@' | '%' | '/') || c.is_whitespace());
+            let repo_ok = !repo.is_empty()
+                && !repo
+                    .chars()
+                    .any(|c| matches!(c, '@' | '/' | '%') || c.is_whitespace());
+            if user_ok && repo_ok {
+                return true;
+            }
+        }
+
+        // Checked against PackageTarget::parse
+        if let Ok(target) = PackageTarget::parse(s) {
+            match target {
+                PackageTarget::Git { .. }
+                | PackageTarget::File(_)
+                | PackageTarget::Url(_) => return true,
+                PackageTarget::Alias { target, .. } => {
+                    match *target {
+                        PackageTarget::Git { .. }
+                        | PackageTarget::File(_)
+                        | PackageTarget::Url(_) => return true,
+                        _ => {}
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        false
+    }
+
+    pub fn non_registry_specs_match(spec_a: &str, spec_b: &str) -> bool {
+        let a = spec_a.trim();
+        let b = spec_b.trim();
+        if a == b {
+            return true;
+        }
+
+        // Handle npm: aliases
+        let a_alias = a.strip_prefix("npm:");
+        let b_alias = b.strip_prefix("npm:");
+        if a_alias.is_some() != b_alias.is_some() {
+            return false;
+        }
+        if let (Some(a_rest), Some(b_rest)) = (a_alias, b_alias) {
+            let parse_alias_parts = |rest: &str| -> (String, String) {
+                if let Some(stripped_scope) = rest.strip_prefix('@') {
+                    if let Some(slash_idx) = stripped_scope.find('/') {
+                        let after_slash = &stripped_scope[slash_idx + 1..];
+                        if let Some(at_idx) = after_slash.find('@') {
+                            let name = format!("@{}", &stripped_scope[..slash_idx + 1 + at_idx]);
+                            let sub_spec = &after_slash[at_idx + 1..];
+                            (name, sub_spec.to_string())
+                        } else {
+                            (format!("@{stripped_scope}"), String::new())
+                        }
+                    } else {
+                        (format!("@{stripped_scope}"), String::new())
+                    }
+                } else if let Some(at_idx) = rest.find('@') {
+                    (rest[..at_idx].to_string(), rest[at_idx + 1..].to_string())
+                } else {
+                    (rest.to_string(), String::new())
+                }
+            };
+            let (name_a, sub_a) = parse_alias_parts(a_rest);
+            let (name_b, sub_b) = parse_alias_parts(b_rest);
+            if name_a != name_b {
+                return false;
+            }
+            if sub_a.is_empty() && sub_b.is_empty() {
+                return true;
+            }
+            return Self::non_registry_specs_match(&sub_a, &sub_b);
+        }
+
+        // Check if both parse as PackageTarget::Git
+        let target_a = PackageTarget::parse(a);
+        let target_b = PackageTarget::parse(b);
+        if let (
+            Ok(PackageTarget::Git {
+                url: url_a,
+                committish: c_a,
+                subdir: s_a,
+            }),
+            Ok(PackageTarget::Git {
+                url: url_b,
+                committish: c_b,
+                subdir: s_b,
+            }),
+        ) = (&target_a, &target_b)
+        {
+            let canon_a = Self::canonicalize_git_identity(url_a.as_str());
+            let canon_b = Self::canonicalize_git_identity(url_b.as_str());
+            if canon_a != canon_b {
+                return false;
+            }
+            if s_a != s_b {
+                return false;
+            }
+            let c_a_str = c_a.as_deref().unwrap_or("");
+            let c_b_str = c_b.as_deref().unwrap_or("");
+            return Self::git_refs_equal(c_a_str, c_b_str);
+        }
+
+        // Also handle git specs that might not parse via PackageTarget::parse (e.g. git@ or ssh://)
+        // as well as GitHub shorthands paired against SCP/ssh specs.
+        let is_git_like = |s: &str, parsed: &Result<PackageTarget, _>| {
+            matches!(parsed, Ok(PackageTarget::Git { .. }))
+                || rnpm_core::is_scp_git_url(s)
+                || s.starts_with("ssh://")
+                || s.starts_with("git:")
+                || s.starts_with("git+")
+                || s.starts_with("github:")
+                || s.starts_with("gitlab:")
+                || s.starts_with("bitbucket:")
+                || s.starts_with("gist:")
+        };
+        if is_git_like(a, &target_a) || is_git_like(b, &target_b) {
+            if is_git_like(a, &target_a) && is_git_like(b, &target_b) {
+                let canon_a = Self::canonicalize_git_identity(a);
+                let canon_b = Self::canonicalize_git_identity(b);
+                if canon_a != canon_b {
+                    return false;
+                }
+                let frag_a = a.split('#').nth(1).unwrap_or("");
+                let frag_b = b.split('#').nth(1).unwrap_or("");
+                return Self::git_refs_equal(frag_a, frag_b);
+            }
+            return false;
+        }
+
+        // Check if both are File specs
+        if let (Ok(PackageTarget::File(p_a)), Ok(PackageTarget::File(p_b))) = (&target_a, &target_b) {
+            let norm = |p: &std::path::Path| -> String {
+                let s = p.to_string_lossy().replace('\\', "/");
+                let s = s.strip_prefix("file:").unwrap_or(&s);
+                let s = s.strip_prefix("./").unwrap_or(s).trim_end_matches('/').to_string();
+                if s == "." {
+                    String::new()
+                } else {
+                    s
+                }
+            };
+            let na = norm(p_a);
+            let nb = norm(p_b);
+            if cfg!(windows) {
+                return na.eq_ignore_ascii_case(&nb);
+            } else {
+                return na == nb;
+            }
+        }
+
+        // Also check raw file/link prefixes if PackageTarget::File wasn't returned
+        let is_file_prefix = |s: &str| {
+            s.starts_with("file:")
+                || s.starts_with("link:")
+                || s.starts_with("./")
+                || s.starts_with(".\\")
+                || s.starts_with("../")
+                || s.starts_with("..\\")
+        };
+        if is_file_prefix(a) && is_file_prefix(b) {
+            let clean = |s: &str| -> String {
+                let s = s.strip_prefix("file:").unwrap_or(s);
+                let s = s.strip_prefix("link:").unwrap_or(s);
+                let s = s.replace('\\', "/");
+                let s = s.strip_prefix("./").unwrap_or(&s).trim_end_matches('/').to_string();
+                if s == "." {
+                    String::new()
+                } else {
+                    s
+                }
+            };
+            let ca = clean(a);
+            let cb = clean(b);
+            if cfg!(windows) {
+                return ca.eq_ignore_ascii_case(&cb);
+            } else {
+                return ca == cb;
+            }
+        }
+
+        false
+    }
+
+    fn target_matches_resolved(resolved: &str, target: &PackageTarget) -> bool {
         match target {
-            PackageTarget::Tag(_)
-            | PackageTarget::File(_)
-            | PackageTarget::Git { .. }
-            | PackageTarget::Url(_) => true,
+            PackageTarget::Url(u) => resolved == u.as_str(),
+            PackageTarget::File(p) => {
+                let clean_res = resolved
+                    .strip_prefix("file:")
+                    .unwrap_or(resolved)
+                    .replace('\\', "/");
+                let clean_res = clean_res
+                    .strip_prefix("./")
+                    .unwrap_or(&clean_res)
+                    .trim_end_matches('/');
+                let clean_res = if clean_res == "." { "" } else { clean_res };
+                let clean_p = p.to_str().unwrap_or("").replace('\\', "/");
+                let clean_p = clean_p
+                    .strip_prefix("./")
+                    .unwrap_or(&clean_p)
+                    .trim_end_matches('/');
+                let clean_p = if clean_p == "." { "" } else { clean_p };
+
+                let res_abs = Self::is_posix_path_absolute(clean_res);
+                let p_abs = Self::is_posix_path_absolute(clean_p);
+
+                if res_abs == p_abs {
+                    if cfg!(windows) {
+                        clean_res.eq_ignore_ascii_case(clean_p)
+                    } else {
+                        clean_res == clean_p
+                    }
+                } else if res_abs {
+                    let suffix = clean_p.trim_start_matches("../").trim_matches('/');
+                    if suffix.is_empty() {
+                        false
+                    } else if cfg!(windows) {
+                        clean_res
+                            .to_ascii_lowercase()
+                            .ends_with(&format!("/{suffix}").to_ascii_lowercase())
+                    } else {
+                        clean_res.ends_with(&format!("/{suffix}"))
+                    }
+                } else {
+                    let suffix = clean_res.trim_start_matches("../").trim_matches('/');
+                    if suffix.is_empty() {
+                        false
+                    } else if cfg!(windows) {
+                        clean_p
+                            .to_ascii_lowercase()
+                            .ends_with(&format!("/{suffix}").to_ascii_lowercase())
+                    } else {
+                        clean_p.ends_with(&format!("/{suffix}"))
+                    }
+                }
+            }
+            PackageTarget::Git { url, committish, .. } => {
+                let canon_target = Self::canonicalize_git_identity(url.as_str());
+                let canon_res = Self::canonicalize_git_identity(resolved);
+                if canon_target != canon_res {
+                    return false;
+                }
+                if let Some(ref c) = committish {
+                    let res_frag = resolved.split('#').nth(1).unwrap_or("");
+                    let c_is_hex = c.len() >= 7 && c.chars().all(|ch| ch.is_ascii_hexdigit());
+                    if c_is_hex {
+                        if !Self::git_refs_equal(res_frag, c) {
+                            return false;
+                        }
+                    } else if !res_frag.is_empty() {
+                        if Self::git_refs_equal(res_frag, c) {
+                            return true;
+                        }
+                        let res_is_sha = res_frag.len() >= 7
+                            && res_frag.chars().all(|ch| ch.is_ascii_hexdigit());
+                        if !res_is_sha {
+                            return false;
+                        }
+                    } else {
+                        return false;
+                    }
+                }
+                true
+            }
+            _ => true,
+        }
+    }
+
+    fn version_matches_target(
+        ver_str: &str,
+        target: &PackageTarget,
+        resolved: Option<&str>,
+    ) -> bool {
+        match target {
+            PackageTarget::Tag(_) => true,
+            PackageTarget::Git { committish, .. } => {
+                if let Some(res) = resolved {
+                    if !Self::target_matches_resolved(res, target) {
+                        return false;
+                    }
+                }
+                if let Some(semver_spec) = committish
+                    .as_deref()
+                    .and_then(Self::extract_git_semver_range)
+                {
+                    let (Ok(range), Ok(v)) = (
+                        rnpm_core::semver::Range::parse(semver_spec.trim()),
+                        Version::parse(ver_str),
+                    ) else {
+                        return false;
+                    };
+                    return range.satisfies(&v);
+                }
+                true
+            }
+            PackageTarget::File(_) | PackageTarget::Url(_) => {
+                if let Some(res) = resolved {
+                    Self::target_matches_resolved(res, target)
+                } else {
+                    true
+                }
+            }
             PackageTarget::Version(expected) => {
                 let Ok(v) = Version::parse(ver_str) else {
                     return false;
@@ -1567,7 +2321,9 @@ impl LockfileV3 {
                     true
                 }
             }
-            PackageTarget::Alias { target, .. } => Self::version_matches_target(ver_str, target),
+            PackageTarget::Alias { target, .. } => {
+                Self::version_matches_target(ver_str, target, resolved)
+            }
         }
     }
 
@@ -1588,6 +2344,7 @@ impl LockfileV3 {
             let Some(lock_spec) = lock.get(k) else {
                 return false;
             };
+
             if lock_spec == manifest_spec {
                 continue;
             }
@@ -1607,19 +2364,18 @@ impl LockfileV3 {
                     }
                 }
             }
-            // For other spec differences, verify whether resolved package in packages satisfies manifest spec,
-            // but ONLY if the lock spec itself was not a non-registry/tarball/git spec that diverged.
-            let is_non_registry = |s: &str| {
-                s.starts_with("file:")
-                    || s.starts_with("git:")
-                    || s.starts_with("git+")
-                    || s.starts_with("github:")
-                    || s.starts_with("http:")
-                    || s.starts_with("https:")
-                    || s.ends_with(".tgz")
-                    || s.ends_with(".tar.gz")
-            };
-            if is_non_registry(lock_spec) || is_non_registry(manifest_spec) {
+
+            // For non-registry specs, check whether they canonically match (e.g. user/repo#v1 vs github:user/repo#v1);
+            // any drift in ref/path/identity must reject with false.
+            let m_non_reg = Self::is_non_registry_spec(manifest_spec);
+            let l_non_reg = Self::is_non_registry_spec(lock_spec);
+            if m_non_reg || l_non_reg {
+                if m_non_reg
+                    && l_non_reg
+                    && Self::non_registry_specs_match(manifest_spec, lock_spec)
+                {
+                    continue;
+                }
                 return false;
             }
 
@@ -1998,8 +2754,13 @@ impl LockfileV3 {
     }
 
     fn to_legacy_dependencies(&self) -> serde_json::Value {
-        fn package_value(dep_name: &str, package: &LockfilePackage) -> serde_json::Value {
+        fn package_value(
+            dep_name: &str,
+            package: &LockfilePackage,
+            all_packages: &std::collections::BTreeMap<String, LockfilePackage>,
+        ) -> serde_json::Value {
             let mut value = serde_json::Map::new();
+            let is_link = package.link == Some(true);
             if let Some(v) = &package.version {
                 let ver_str = if let Some(real_name) = &package.name {
                     if real_name != dep_name {
@@ -2011,7 +2772,7 @@ impl LockfileV3 {
                     v.clone()
                 };
                 value.insert("version".into(), serde_json::Value::String(ver_str));
-            } else if package.link == Some(true) {
+            } else if is_link {
                 let resolved = package.resolved.as_deref().unwrap_or("");
                 let ver_str = if resolved.starts_with("file:") {
                     resolved.to_string()
@@ -2020,26 +2781,31 @@ impl LockfileV3 {
                 };
                 value.insert("version".into(), serde_json::Value::String(ver_str));
             }
-            if let Some(v) = &package.resolved {
-                value.insert("resolved".into(), serde_json::Value::String(v.clone()));
-            }
-            if let Some(v) = &package.integrity {
-                value.insert("integrity".into(), serde_json::Value::String(v.clone()));
-            }
-            if package.dev == Some(true) {
-                value.insert("dev".into(), serde_json::Value::Bool(true));
-            }
-            if package.optional == Some(true) {
-                value.insert("optional".into(), serde_json::Value::Bool(true));
-            }
-            if package.dev_optional == Some(true) {
-                value.insert("devOptional".into(), serde_json::Value::Bool(true));
-            }
-            if package.peer == Some(true) {
-                value.insert("peer".into(), serde_json::Value::Bool(true));
-            }
-            if package.peer_optional == Some(true) {
-                value.insert("peerOptional".into(), serde_json::Value::Bool(true));
+            if !is_link {
+                if let Some(v) = &package.resolved {
+                    value.insert("resolved".into(), serde_json::Value::String(v.clone()));
+                }
+                if let Some(v) = &package.integrity {
+                    value.insert("integrity".into(), serde_json::Value::String(v.clone()));
+                }
+                if package.dev == Some(true) {
+                    value.insert("dev".into(), serde_json::Value::Bool(true));
+                }
+                if package.optional == Some(true) {
+                    value.insert("optional".into(), serde_json::Value::Bool(true));
+                }
+                if package.dev_optional == Some(true)
+                    && package.dev != Some(true)
+                    && package.optional != Some(true)
+                {
+                    value.insert("devOptional".into(), serde_json::Value::Bool(true));
+                }
+                if package.peer == Some(true) {
+                    value.insert("peer".into(), serde_json::Value::Bool(true));
+                }
+                if package.peer_optional == Some(true) {
+                    value.insert("peerOptional".into(), serde_json::Value::Bool(true));
+                }
             }
             if package.in_bundle == Some(true) {
                 value.insert("bundled".into(), serde_json::Value::Bool(true));
@@ -2050,13 +2816,44 @@ impl LockfileV3 {
             if package.has_shrinkwrap == Some(true) {
                 value.insert("hasShrinkwrap".into(), serde_json::Value::Bool(true));
             }
-            if let Some(deps) = &package.dependencies {
-                if !deps.is_empty() {
-                    value.insert(
-                        "requires".into(),
-                        serde_json::to_value(deps).unwrap_or_default(),
-                    );
+
+            // Build requires from dependencies + optional_dependencies
+            // If is_link and package has no dependencies, look up target package in all_packages
+            let target_pkg = if is_link {
+                let res = package.resolved.as_deref().unwrap_or("");
+                let clean_res = res.strip_prefix("file:").unwrap_or(res).replace('\\', "/");
+                let clean_res = clean_res
+                    .strip_prefix("./")
+                    .unwrap_or(&clean_res)
+                    .trim_matches('/')
+                    .to_string();
+                all_packages
+                    .get(&clean_res)
+                    .or_else(|| {
+                        let alt = format!("./{clean_res}");
+                        all_packages.get(&alt)
+                    })
+                    .unwrap_or(package)
+            } else {
+                package
+            };
+
+            let mut requires = BTreeMap::new();
+            if let Some(deps) = &target_pkg.dependencies {
+                for (k, v) in deps {
+                    requires.insert(k.clone(), v.clone());
                 }
+            }
+            if let Some(opt_deps) = &target_pkg.optional_dependencies {
+                for (k, v) in opt_deps {
+                    requires.insert(k.clone(), v.clone());
+                }
+            }
+            if !requires.is_empty() {
+                value.insert(
+                    "requires".into(),
+                    serde_json::to_value(requires).unwrap_or_default(),
+                );
             }
             serde_json::Value::Object(value)
         }
@@ -2065,13 +2862,14 @@ impl LockfileV3 {
             root: &mut serde_json::Map<String, serde_json::Value>,
             segments: &[&str],
             package: &LockfilePackage,
+            all_packages: &std::collections::BTreeMap<String, LockfilePackage>,
         ) {
             if segments.is_empty() {
                 return;
             }
             let name = segments[0];
             if segments.len() == 1 {
-                root.insert(name.to_string(), package_value(name, package));
+                root.insert(name.to_string(), package_value(name, package, all_packages));
                 return;
             }
             let entry = root
@@ -2086,7 +2884,7 @@ impl LockfileV3 {
             let Some(nested_obj) = nested.as_object_mut() else {
                 return;
             };
-            insert_node(nested_obj, &segments[1..], package);
+            insert_node(nested_obj, &segments[1..], package, all_packages);
         }
 
         let mut root = serde_json::Map::new();
@@ -2100,7 +2898,7 @@ impl LockfileV3 {
             let path = key.strip_prefix("node_modules/").unwrap_or(key);
             let segments: Vec<_> = path.split("/node_modules/").collect();
             if let Some(package) = self.packages.get(key) {
-                insert_node(&mut root, &segments, package);
+                insert_node(&mut root, &segments, package, &self.packages);
             }
         }
         serde_json::Value::Object(root)
@@ -2412,7 +3210,7 @@ pub fn npm_key_compare(a: &str, b: &str) -> std::cmp::Ordering {
             }
         }
         std::cmp::Ordering::Equal
-    })
+    }).then_with(|| a.cmp(b))
 }
 
 pub(crate) fn stringify_npm_nice(val: &serde_json::Value, indent_level: usize, out: &mut String) {
@@ -2685,5 +3483,355 @@ mod platform_field_tests {
         assert_eq!(json["libc"], "glibc");
         assert_eq!(json["os"], "linux");
         assert_eq!(json["cpu"], serde_json::json!(["arm"]));
+    }
+
+    #[test]
+    fn test_git_refs_equal_semantics() {
+        // Case-sensitive named branches and tags:
+        assert!(!super::LockfileV3::git_refs_equal("Main", "main"));
+        assert!(!super::LockfileV3::git_refs_equal("v1.0.0", "V1.0.0"));
+        assert!(super::LockfileV3::git_refs_equal("main", "main"));
+        assert!(super::LockfileV3::git_refs_equal("feature/foo", "feature/foo"));
+        assert!(!super::LockfileV3::git_refs_equal("feature/foo", "feature/Foo"));
+
+        // Case-insensitive full and prefix hex SHAs (len >= 7):
+        let full_lower = "abcdef0123456789abcdef0123456789abcdef01";
+        let full_upper = "ABCDEF0123456789ABCDEF0123456789ABCDEF01";
+        let prefix_lower = "abcdef0";
+        let prefix_upper = "ABCDEF0";
+        assert!(super::LockfileV3::git_refs_equal(full_lower, full_upper));
+        assert!(super::LockfileV3::git_refs_equal(prefix_lower, full_upper));
+        assert!(super::LockfileV3::git_refs_equal(full_lower, prefix_upper));
+        assert!(super::LockfileV3::git_refs_equal(prefix_lower, prefix_upper));
+
+        // Different hex SHAs:
+        assert!(!super::LockfileV3::git_refs_equal("1234567", "7654321"));
+
+        // #semver: git range matching and URL-encoded variants:
+        assert!(super::LockfileV3::git_refs_equal("semver:^1.0.0", "semver%3A^1.0.0"));
+        assert!(super::LockfileV3::git_refs_equal("semver:^1.0.0", "semver%3a^1.0.0"));
+        assert!(super::LockfileV3::git_refs_equal("semver:^1.0.0", "semver: ^1.0.0"));
+        assert!(!super::LockfileV3::git_refs_equal("semver:^1.0.0", "semver:^2.0.0"));
+    }
+
+    #[test]
+    fn test_canonicalize_git_identity_and_numeric_orgs() {
+        let scp_numeric = "git@github.com:12345/repo.git";
+        let ssh_numeric = "git+ssh://git@github.com/12345/repo.git";
+        let https_numeric = "git+https://github.com/12345/repo.git";
+        let shortcut_numeric = "github:12345/repo";
+        let bare_numeric = "12345/repo";
+
+        assert_eq!(
+            super::LockfileV3::canonicalize_git_identity(scp_numeric),
+            "github.com/12345/repo"
+        );
+        assert_eq!(
+            super::LockfileV3::canonicalize_git_identity(ssh_numeric),
+            "github.com/12345/repo"
+        );
+        assert_eq!(
+            super::LockfileV3::canonicalize_git_identity(https_numeric),
+            "github.com/12345/repo"
+        );
+        assert_eq!(
+            super::LockfileV3::canonicalize_git_identity(shortcut_numeric),
+            "github.com/12345/repo"
+        );
+        assert_eq!(
+            super::LockfileV3::canonicalize_git_identity(bare_numeric),
+            "github.com/12345/repo"
+        );
+
+        // Explicit URL ports preservation:
+        let port_8443 = "https://git.example.com:8443/org/repo.git";
+        let port_9443 = "https://git.example.com:9443/org/repo.git";
+        let port_default = "https://git.example.com/org/repo.git";
+        assert_eq!(
+            super::LockfileV3::canonicalize_git_identity(port_8443),
+            "git.example.com:8443/org/repo"
+        );
+        assert_eq!(
+            super::LockfileV3::canonicalize_git_identity(port_9443),
+            "git.example.com:9443/org/repo"
+        );
+        assert_ne!(
+            super::LockfileV3::canonicalize_git_identity(port_8443),
+            super::LockfileV3::canonicalize_git_identity(port_9443)
+        );
+        assert_ne!(
+            super::LockfileV3::canonicalize_git_identity(port_8443),
+            super::LockfileV3::canonicalize_git_identity(port_default)
+        );
+    }
+
+    #[test]
+    fn test_non_registry_specs_match_and_platform_cases() {
+        // user/repo vs github:user/repo vs git@github.com:user/repo.git
+        assert!(super::LockfileV3::non_registry_specs_match(
+            "user/repo",
+            "github:user/repo"
+        ));
+        assert!(super::LockfileV3::non_registry_specs_match(
+            "user/repo",
+            "git@github.com:user/repo.git"
+        ));
+        assert!(super::LockfileV3::non_registry_specs_match(
+            "github:user/repo",
+            "git+ssh://git@github.com/user/repo.git"
+        ));
+        assert!(super::LockfileV3::non_registry_specs_match(
+            "12345/repo",
+            "git@github.com:12345/repo.git"
+        ));
+
+        // Ports preservation in non_registry_specs_match:
+        assert!(!super::LockfileV3::non_registry_specs_match(
+            "https://git.example.com:8443/org/repo.git",
+            "https://git.example.com:9443/org/repo.git"
+        ));
+        assert!(super::LockfileV3::non_registry_specs_match(
+            "https://git.example.com:8443/org/repo.git",
+            "https://git.example.com:8443/org/repo.git"
+        ));
+
+        // File specs: relative ./ and ../
+        assert!(super::LockfileV3::non_registry_specs_match(
+            "file:../sibling",
+            "../sibling"
+        ));
+        assert!(super::LockfileV3::non_registry_specs_match(
+            "file:./local",
+            "./local"
+        ));
+        assert!(super::LockfileV3::non_registry_specs_match(
+            "file:./local",
+            "file:local"
+        ));
+        assert!(!super::LockfileV3::non_registry_specs_match(
+            "file:../sibling",
+            "file:./sibling"
+        ));
+
+        if cfg!(windows) {
+            assert!(super::LockfileV3::non_registry_specs_match(
+                "file:./local",
+                "file:./Local"
+            ));
+            assert!(super::LockfileV3::non_registry_specs_match(
+                "file:../sibling",
+                "file:../Sibling"
+            ));
+        }
+    }
+
+    #[test]
+    fn test_git_semver_range_validation_in_package_satisfies_spec() {
+        let pkg_locked_150 = super::LockfilePackage {
+            version: Some("1.5.0".to_string()),
+            resolved: Some("git+ssh://git@github.com/org/repo.git#abcdef0123456789abcdef0123456789abcdef01".to_string()),
+            ..Default::default()
+        };
+        let pkg_locked_200 = super::LockfilePackage {
+            version: Some("2.0.0".to_string()),
+            resolved: Some("git+ssh://git@github.com/org/repo.git#abcdef0123456789abcdef0123456789abcdef01".to_string()),
+            ..Default::default()
+        };
+
+        // Raw #semver:^1.0.0: accepts 1.5.0, rejects 2.0.0
+        assert!(super::LockfileV3::package_satisfies_spec(
+            "repo",
+            &pkg_locked_150,
+            "github:org/repo#semver:^1.0.0"
+        ));
+        assert!(!super::LockfileV3::package_satisfies_spec(
+            "repo",
+            &pkg_locked_200,
+            "github:org/repo#semver:^1.0.0"
+        ));
+
+        // URL-encoded #semver%3A^1.0.0: accepts 1.5.0, rejects 2.0.0
+        assert!(super::LockfileV3::package_satisfies_spec(
+            "repo",
+            &pkg_locked_150,
+            "github:org/repo#semver%3A^1.0.0"
+        ));
+        assert!(!super::LockfileV3::package_satisfies_spec(
+            "repo",
+            &pkg_locked_200,
+            "github:org/repo#semver%3A^1.0.0"
+        ));
+    }
+
+    #[test]
+    fn test_non_workspace_file_directory_link_and_deleted_workspaces_drift() {
+        use rnpm_core::manifest::Manifest;
+
+        // 1. Non-workspace file:./libs/local-a directory link passing strict matches_manifest
+        let mut manifest_non_ws = Manifest::default();
+        manifest_non_ws.name = Some("root-app".to_string());
+        manifest_non_ws.version = Some("1.0.0".to_string());
+        manifest_non_ws.dependencies.insert("local-a".to_string(), "file:./libs/local-a".to_string());
+
+        let mut lockfile = super::LockfileV3::new("root-app", Some("1.0.0".to_string()));
+
+        let mut root_pkg = super::LockfilePackage::default();
+        let mut root_deps = std::collections::BTreeMap::new();
+        root_deps.insert("local-a".to_string(), "file:./libs/local-a".to_string());
+        root_pkg.dependencies = Some(root_deps);
+        lockfile.packages.insert("".to_string(), root_pkg);
+
+        let mut local_a_target = super::LockfilePackage::default();
+        local_a_target.name = Some("local-a".to_string());
+        local_a_target.version = Some("1.0.0".to_string());
+        lockfile.packages.insert("libs/local-a".to_string(), local_a_target);
+
+        let mut local_a_link = super::LockfilePackage::default();
+        local_a_link.link = Some(true);
+        local_a_link.resolved = Some("libs/local-a".to_string());
+        lockfile.packages.insert("node_modules/local-a".to_string(), local_a_link);
+
+        // Strict matches_manifest (allow_extra_lock_deps = false): must PASS!
+        assert!(lockfile.matches_manifest(&manifest_non_ws, true));
+
+        // Even with resolved prefixed with file:
+        lockfile.packages.get_mut("node_modules/local-a").unwrap().resolved = Some("file:libs/local-a".to_string());
+        assert!(lockfile.matches_manifest(&manifest_non_ws, true));
+
+        // 2. Deleted workspaces: lockfile has packages/pkg-b leftover, not in manifest dependencies
+        let mut orphaned_pkg = super::LockfilePackage::default();
+        orphaned_pkg.name = Some("pkg-b".to_string());
+        orphaned_pkg.version = Some("1.0.0".to_string());
+        lockfile.packages.insert("packages/pkg-b".to_string(), orphaned_pkg);
+
+        let mut orphaned_link = super::LockfilePackage::default();
+        orphaned_link.link = Some(true);
+        orphaned_link.resolved = Some("packages/pkg-b".to_string());
+        lockfile.packages.insert("node_modules/pkg-b".to_string(), orphaned_link);
+
+        // Strict matches_manifest must detect drift because pkg-b is an orphaned workspace member!
+        assert!(!lockfile.matches_manifest(&manifest_non_ws, true));
+    }
+
+    #[test]
+    fn test_cross_review_findings_regression_suite() {
+        use std::path::PathBuf;
+
+        // Finding 3: canonicalize_git_identity strips user:password@ in URLs
+        let with_creds = "https://user:password@github.com/org/repo.git";
+        let clean = "https://github.com/org/repo.git";
+        assert_eq!(
+            super::LockfileV3::canonicalize_git_identity(with_creds),
+            super::LockfileV3::canonicalize_git_identity(clean)
+        );
+        assert_eq!(
+            super::LockfileV3::canonicalize_git_identity(with_creds),
+            "github.com/org/repo"
+        );
+
+        // Finding 4: git_refs_equal rejects unsound symmetrical prefix matching
+        assert!(!super::LockfileV3::git_refs_equal("20240101", "202401010"));
+        // Same length >= 7 hex strings match case-insensitively:
+        assert!(super::LockfileV3::git_refs_equal("20240101", "20240101"));
+        assert!(super::LockfileV3::git_refs_equal("abcdef0", "ABCDEF0"));
+        // Prefix matching allowed only when one is full 40/64 hex commit SHA:
+        assert!(super::LockfileV3::git_refs_equal(
+            "abcdef0123456789abcdef0123456789abcdef01",
+            "abcdef0"
+        ));
+        assert!(super::LockfileV3::git_refs_equal(
+            "ABCDEF0",
+            "abcdef0123456789abcdef0123456789abcdef01"
+        ));
+
+        // Git tags and branch names are independent of package.json version:
+        // a tag #v1.0.0 whose commit has package.json version 0.9.0 must pass,
+        // while changing package.json from #v1.0.0 to #v2.0.0 triggers drift via lock_spec.
+        let pkg_v09 = super::LockfilePackage {
+            version: Some("0.9.0".to_string()),
+            resolved: Some("git+https://github.com/org/repo.git#1a2b3c4d5e6f1a2b3c4d5e6f1a2b3c4d5e6f1a2b".to_string()),
+            ..Default::default()
+        };
+        assert!(super::LockfileV3::package_satisfies_spec(
+            "repo",
+            &pkg_v09,
+            "git+https://github.com/org/repo.git#v1.0.0"
+        ));
+        let mut git_lock = super::LockfileV3::new("git-tag-app", Some("1.0.0".to_string()));
+        if let Some(root) = git_lock.packages.get_mut("") {
+            root.dependencies = Some(std::collections::BTreeMap::from([(
+                "repo".to_string(),
+                "git+https://github.com/org/repo.git#v1.0.0".to_string(),
+            )]));
+        }
+        git_lock.insert_package("node_modules/repo", pkg_v09);
+        let mut git_manifest = rnpm_core::Manifest {
+            name: Some("git-tag-app".to_string()),
+            version: Some("1.0.0".to_string()),
+            ..Default::default()
+        };
+        git_manifest.dependencies.insert(
+            "repo".to_string(),
+            "git+https://github.com/org/repo.git#v1.0.0".to_string(),
+        );
+        assert!(
+            git_lock.matches_manifest(&git_manifest, true),
+            "git tag #v1.0.0 with package.json version 0.9.0 must match valid lockfile"
+        );
+        git_manifest.dependencies.insert(
+            "repo".to_string(),
+            "git+https://github.com/org/repo.git#v2.0.0".to_string(),
+        );
+        assert!(
+            !git_lock.matches_manifest(&git_manifest, true),
+            "changing package.json git tag from #v1.0.0 to #v2.0.0 must trigger lockfile drift"
+        );
+
+        // Finding 6: target_matches_resolved for file:../ rejects arbitrary absolute paths
+        let file_parent = rnpm_core::spec::PackageTarget::File(PathBuf::from("../"));
+        assert!(!super::LockfileV3::target_matches_resolved(
+            "/usr/local/random/path",
+            &file_parent
+        ));
+        assert!(!super::LockfileV3::target_matches_resolved(
+            "C:/some/random/dir",
+            &file_parent
+        ));
+
+        let file_sibling = rnpm_core::spec::PackageTarget::File(PathBuf::from("../sibling"));
+        assert!(super::LockfileV3::target_matches_resolved(
+            "/workspace/sibling",
+            &file_sibling
+        ));
+
+        // Switching a dependency between a file: link and a registry range must be detected as drift:
+        let mut lock_pkg_root = super::LockfilePackage::default();
+        lock_pkg_root.dependencies = Some(std::collections::BTreeMap::from([(
+            "sibling".to_string(),
+            "file:../sibling".to_string(),
+        )]));
+        let mut lock_pkg_link = super::LockfilePackage::default();
+        lock_pkg_link.resolved = Some("../sibling".to_string());
+        lock_pkg_link.link = Some(true);
+        let lockfile = super::LockfileV3 {
+            name: "root".to_string(),
+            version: Some("1.0.0".to_string()),
+            lockfile_version: 3,
+            requires: Some(true),
+            packages: std::collections::BTreeMap::from([
+                (String::new(), lock_pkg_root),
+                ("node_modules/sibling".to_string(), lock_pkg_link),
+            ]),
+        };
+        let manifest_registry = rnpm_core::manifest::Manifest {
+            name: Some("root".to_string()),
+            version: Some("1.0.0".to_string()),
+            dependencies: std::collections::BTreeMap::from([(
+                "sibling".to_string(),
+                "^1.0.0".to_string(),
+            )]),
+            ..Default::default()
+        };
+        assert!(!lockfile.matches_manifest(&manifest_registry, true));
     }
 }

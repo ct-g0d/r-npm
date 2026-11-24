@@ -521,6 +521,13 @@ pub fn plan(lock: &LockfileV3, omit: Omit, manifests: &HashMap<String, Value>) -
 
 /// Makes `link` a directory link to `target`, replacing whatever is there.
 pub fn ensure_link(link: &Path, target: &Path) -> Result<()> {
+    if !target.exists() {
+        anyhow::bail!(
+            "Cannot link '{}' to nonexistent target '{}'",
+            link.display(),
+            target.display()
+        );
+    }
     if rnpm_fs::junction::junction_points_to(link, target) {
         return Ok(());
     }
@@ -528,7 +535,70 @@ pub fn ensure_link(link: &Path, target: &Path) -> Result<()> {
         std::fs::create_dir_all(parent)?;
     }
     crate::linked::create_or_replace_junction(link, target)
-        .map_err(|e| anyhow!("Failed to link {} to {}: {e}", link.display(), target.display()))
+}
+
+/// Atomically unpacks a store package tarball into `dest`.
+///
+/// Extracts into a unique temporary sibling directory first, verifies that extraction
+/// succeeded (producing a valid `package.json`), and then atomically renames the staging
+/// directory into `dest`. On failure, the temporary directory is cleaned up immediately,
+/// leaving zero partial or stray files inside `node_modules/.store/...`.
+pub fn unpack_store_package(
+    dest: &Path,
+    tarball_bytes: &[u8],
+    writer_cfg: Option<&rnpm_fs::ParallelWriterConfig>,
+) -> Result<()> {
+    let parent = dest
+        .parent()
+        .ok_or_else(|| anyhow!("Invalid destination path '{}'", dest.display()))?;
+    std::fs::create_dir_all(parent)?;
+
+    let pkg_name = dest
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("pkg");
+    let staging_temp = tempfile::Builder::new()
+        .prefix(&format!(".{pkg_name}.tmp-"))
+        .tempdir_in(parent)?;
+    let staging_path = staging_temp.path();
+
+    if let Err(e) = rnpm_fs::extract_tarball_direct(
+        std::io::Cursor::new(tarball_bytes),
+        staging_path,
+        None,
+        writer_cfg,
+    ) {
+        let _ = staging_temp.close();
+        return Err(anyhow!("Failed to extract tarball: {e}"));
+    }
+
+    if !staging_path.join("package.json").is_file() {
+        let _ = staging_temp.close();
+        return Err(anyhow!(
+            "Extraction produced incomplete package (missing package.json)"
+        ));
+    }
+
+    if dest.join("package.json").is_file() {
+        // Concurrently completed by another worker
+        let _ = staging_temp.close();
+        return Ok(());
+    }
+
+    if let Err(e) = rnpm_fs::replace_dir_with_retries(staging_path, dest, 10) {
+        if dest.join("package.json").is_file() {
+            let _ = staging_temp.close();
+            return Ok(());
+        }
+        let _ = staging_temp.close();
+        return Err(anyhow!(
+            "Failed to atomically place store package into '{}': {e}",
+            dest.display()
+        ));
+    }
+
+    let _ = staging_temp.keep();
+    Ok(())
 }
 
 /// Tarball bytes for a store package: the cache first, then the registry.
@@ -722,18 +792,19 @@ impl crate::Installer {
                         Err(e) => return Err(e),
                     },
                 };
-                if dest.exists() {
-                    let _ = std::fs::remove_dir_all(&dest);
+                match unpack_store_package(&dest, &bytes, Some(&writer_cfg)) {
+                    Ok(()) => {
+                        added += 1;
+                    }
+                    Err(e) if entry.optional => {
+                        tracing::warn!(
+                            "Failed to extract optional store package {}: {e}; skipping",
+                            entry.hoisted
+                        );
+                        continue;
+                    }
+                    Err(e) => return Err(anyhow!("Failed to extract {}: {e}", entry.hoisted)),
                 }
-                std::fs::create_dir_all(&dest)?;
-                rnpm_fs::extract_tarball_direct(
-                    std::io::Cursor::new(&bytes),
-                    &dest,
-                    None,
-                    Some(&writer_cfg),
-                )
-                .map_err(|e| anyhow!("Failed to extract {}: {e}", entry.hoisted))?;
-                added += 1;
             }
             let pkg = &lock.packages[&entry.hoisted];
             if pkg.has_install_script == Some(true) {
@@ -865,6 +936,71 @@ mod tests {
         let skipped = plan_with_skipped(&lock, "node_modules/b");
         assert!(skipped.store.iter().all(|e| e.package_name != "b"));
         assert!(skipped.links.iter().all(|l| !l.location.ends_with("/b")));
+    }
+
+    #[test]
+    fn test_ensure_link_fails_hard_on_invalid_target() {
+        let temp = tempfile::tempdir().unwrap();
+        let link = temp.path().join("link_dir");
+        let non_existent_target = temp.path().join("non_existent_target_dir");
+
+        let res = ensure_link(&link, &non_existent_target);
+        assert!(res.is_err(), "ensure_link must return Err when link creation fails");
+        assert!(!link.exists(), "ensure_link must not silently copy or leave a directory");
+    }
+
+    #[test]
+    fn test_unpack_store_package_atomic_staging_cleanup_on_error() {
+        let temp = tempfile::tempdir().unwrap();
+        let dest = temp.path().join("node_modules/.store/test-pkg@1.0.0/node_modules/test-pkg");
+
+        // Corrupted / truncated tarball bytes
+        let corrupt_bytes = b"not a valid tarball";
+        let res = unpack_store_package(&dest, corrupt_bytes, None);
+        assert!(res.is_err(), "corrupt tarball unpack must fail");
+        assert!(!dest.exists(), "dest must not exist on failed extraction");
+
+        // Verify no stray temporary directories or files in parent
+        if let Some(parent) = dest.parent() {
+            if parent.exists() {
+                let entries: Vec<_> = std::fs::read_dir(parent).unwrap().flatten().collect();
+                assert!(entries.is_empty(), "parent must have zero stray files or tempdirs on error");
+            }
+        }
+    }
+
+    #[test]
+    fn test_unpack_store_package_success_leaves_no_stray_files() {
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+        use tar::Builder;
+
+        let temp = tempfile::tempdir().unwrap();
+        let dest = temp.path().join("node_modules/.store/my-pkg@1.0.0/node_modules/my-pkg");
+
+        // Create valid npm tarball with "package/package.json"
+        let enc = GzEncoder::new(Vec::new(), Compression::default());
+        let mut tar = Builder::new(enc);
+        let pkg_json = br#"{"name":"my-pkg","version":"1.0.0"}"#;
+        let mut header = tar::Header::new_gnu();
+        header.set_size(pkg_json.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        tar.append_data(&mut header, "package/package.json", &pkg_json[..]).unwrap();
+        let tar_bytes = tar.into_inner().unwrap().finish().unwrap();
+
+        let res = unpack_store_package(&dest, &tar_bytes, None);
+        assert!(res.is_ok(), "unpacking valid package must succeed: {:?}", res.err());
+        assert!(dest.join("package.json").is_file(), "package.json must exist in dest");
+
+        // Check parent directory contains ONLY dest and zero stray files or temp dirs
+        let parent = dest.parent().unwrap();
+        let entries: Vec<_> = std::fs::read_dir(parent)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(entries, vec!["my-pkg".to_string()], "parent must contain ONLY dest with zero stray temp files");
     }
 
     fn plan_with_skipped(lock: &LockfileV3, loc: &str) -> IsolatedPlan {

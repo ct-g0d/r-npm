@@ -36,7 +36,7 @@ impl AllowMode {
 }
 
 /// Which dependency sources may be fetched.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct SourcePolicy {
     pub git: AllowMode,
     pub remote: AllowMode,
@@ -134,7 +134,11 @@ pub fn is_registry_tarball(resolved: &str) -> bool {
     let first_char = ver.chars().next();
     first_char.is_some_and(|c| {
         c.is_ascii_digit()
-            || (c == 'v' && ver[1..].chars().next().is_some_and(|d| d.is_ascii_digit()))
+            || (c == 'v'
+                && ver
+                    .strip_prefix('v')
+                    .and_then(|v| v.chars().next())
+                    .is_some_and(|d| d.is_ascii_digit()))
     })
 }
 
@@ -159,38 +163,78 @@ pub(crate) fn is_git_spec(spec: &str) -> bool {
     if lower.ends_with(".git") || lower.contains(".git#") {
         return true;
     }
+    for host in [
+        "https://github.com/",
+        "http://github.com/",
+        "https://gitlab.com/",
+        "http://gitlab.com/",
+        "https://bitbucket.org/",
+        "http://bitbucket.org/",
+        "https://gist.github.com/",
+        "http://gist.github.com/",
+    ] {
+        if let Some(path) = lower.strip_prefix(host) {
+            let base = path.split_once('#').map(|(b, _)| b).unwrap_or(path);
+            let trimmed_base = base.trim_matches('/');
+            let segments: Vec<&str> = trimmed_base.split('/').collect();
+            let is_gist = host.contains("gist.github.com");
+            let has_required_segments = if is_gist {
+                !segments.is_empty() && !segments[0].is_empty()
+            } else {
+                segments.len() >= 2 && !segments[0].is_empty() && !segments[1].is_empty()
+            };
+            if has_required_segments
+                && !base.ends_with(".tgz")
+                && !base.ends_with(".tar.gz")
+                && !base.ends_with(".tar")
+                && !base.ends_with(".zip")
+                && !base.contains("/archive/")
+                && !base.contains("/releases/download/")
+                && !base.contains("/get/")
+            {
+                return true;
+            }
+        }
+    }
     // GitHub shortcut: "user/repo" or "user/repo#committish"
     if !spec.starts_with('@')
         && !spec.starts_with('.')
         && !spec.starts_with('/')
+        && !spec.starts_with('\\')
         && !spec.starts_with('~')
-        && !spec.contains('\\')
-        && !(spec.len() > 2 && spec.as_bytes()[1] == b':' && spec.as_bytes()[0].is_ascii_alphabetic())
+        && !(spec.len() >= 2 && spec.as_bytes()[1] == b':' && spec.as_bytes()[0].is_ascii_alphabetic())
     {
         let base = spec.split_once('#').map(|(b, _)| b).unwrap_or(spec);
-        if let Some((user, repo)) = base.split_once('/') {
-            if !user.is_empty()
-                && !repo.is_empty()
-                && !repo.contains('/')
-                && user.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-                && repo.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
-            {
-                return true;
+        if !base.contains(':') {
+            if let Some((user, repo)) = base.split_once('/') {
+                if !user.is_empty()
+                    && !repo.is_empty()
+                    && !repo.contains('/')
+                    && !user.chars().any(|c| c.is_whitespace() || c.is_control())
+                    && !repo.chars().any(|c| c.is_whitespace() || c.is_control())
+                {
+                    return true;
+                }
             }
         }
     }
     false
 }
 
-/// Classify a dependency spec string into its `SourceKind`.
-pub fn parse_source_kind(spec: &str) -> SourceKind {
-    let spec = spec.trim();
-    let spec = if spec
-        .get(..4)
-        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("npm:"))
-     {
-        let sub = spec[4..].trim();
-        if sub.starts_with('@') {
+/// Unpack potentially nested `npm:` aliases safely, returning the underlying spec
+/// or `""` if bare alias with no target spec.
+pub fn unpack_alias(mut spec: &str) -> &str {
+    loop {
+        let trimmed = spec.trim();
+        let Some(rest) = (if trimmed.get(..4).is_some_and(|p| p.eq_ignore_ascii_case("npm:")) {
+            Some(&trimmed[4..])
+        } else {
+            None
+        }) else {
+            return trimmed;
+        };
+        let sub = rest.trim();
+        let extracted = if sub.starts_with('@') {
             if let Some(slash_idx) = sub.find('/') {
                 if let Some(at_idx) = sub[slash_idx + 1..].find('@') {
                     sub[slash_idx + 1 + at_idx + 1..].trim()
@@ -204,10 +248,17 @@ pub fn parse_source_kind(spec: &str) -> SourceKind {
             sub[at_idx + 1..].trim()
         } else {
             ""
+        };
+        if extracted.is_empty() {
+            return "";
         }
-    } else {
-        spec
-    };
+        spec = extracted;
+    }
+}
+
+/// Classify a dependency spec string into its `SourceKind`.
+pub fn parse_source_kind(spec: &str) -> SourceKind {
+    let spec = unpack_alias(spec);
 
     if spec.is_empty() {
         return SourceKind::Registry;
@@ -240,9 +291,10 @@ pub fn parse_source_kind(spec: &str) -> SourceKind {
         || spec.starts_with("../")
         || spec.starts_with("..\\")
         || spec.starts_with('/')
+        || spec.starts_with('\\')
         || spec.starts_with("~/")
         || spec.starts_with("~\\")
-        || (spec.len() > 2 && spec.as_bytes()[1] == b':' && spec.as_bytes()[0].is_ascii_alphabetic())
+        || (spec.len() >= 2 && spec.as_bytes()[1] == b':' && spec.as_bytes()[0].is_ascii_alphabetic())
     {
         return SourceKind::Directory;
     }
@@ -280,7 +332,10 @@ fn classify(pkg: &LockfilePackage) -> SourceKind {
         || lower.starts_with(".\\")
         || lower.starts_with("../")
         || lower.starts_with("..\\")
-        || (resolved.len() > 2
+        || lower.starts_with('/')
+        || lower.starts_with('\\')
+        || lower.starts_with('~')
+        || (resolved.len() >= 2
             && resolved.as_bytes()[1] == b':'
             && resolved.as_bytes()[0].is_ascii_alphabetic())
     {
@@ -308,10 +363,136 @@ fn split_parent_and_name(location: &str) -> Option<(&str, &str)> {
     None
 }
 
+fn is_hex_str(s: &str) -> bool {
+    !s.is_empty() && s.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+fn is_full_commit_sha(s: &str) -> bool {
+    (s.len() == 40 || s.len() == 64) && is_hex_str(s)
+}
+
+fn is_git_ref_match(d_ref: &str, spec_ref: &str) -> bool {
+    // Exact ref equality (case-sensitive for branches/tags like #v1)
+    if d_ref == spec_ref {
+        return true;
+    }
+    // Case-insensitive for hex SHAs
+    if is_hex_str(d_ref) && is_hex_str(spec_ref) && d_ref.eq_ignore_ascii_case(spec_ref) {
+        return true;
+    }
+    // Short >=7-char hex prefix ONLY when one side is a full 40/64-char hex commit SHA
+    if (is_full_commit_sha(d_ref) && is_hex_str(spec_ref) && spec_ref.len() >= 7)
+        || (is_full_commit_sha(spec_ref) && is_hex_str(d_ref) && d_ref.len() >= 7)
+    {
+        let d_lower = d_ref.to_ascii_lowercase();
+        let spec_lower = spec_ref.to_ascii_lowercase();
+        if d_lower.starts_with(&spec_lower) || spec_lower.starts_with(&d_lower) {
+            return true;
+        }
+    }
+    // Allowing any lockfile commit SHA ONLY when the authored package.json spec itself has NO #ref
+    if d_ref.is_empty() {
+        if spec_ref.is_empty() {
+            return true;
+        }
+        if is_hex_str(spec_ref) && spec_ref.len() >= 7 {
+            return true;
+        }
+    }
+    // When the authored package.json spec pins a named tag/branch/semver ref (not a >=7-char hex commit SHA),
+    // npm lockfiles store the resolved 40/64-char commit SHA in `resolved`. Accept full commit SHAs
+    // while still rejecting any other named ref (e.g. `#evil` or `#v2`).
+    if !d_ref.is_empty() && (!is_hex_str(d_ref) || d_ref.len() < 7) && is_full_commit_sha(spec_ref) {
+        return true;
+    }
+    false
+}
+
+fn is_declared_root_spec(spec: &str, kind: SourceKind, root_declared: &HashSet<String>) -> bool {
+    let extracted = unpack_alias(spec);
+    let norm_spec = spec.replace('\\', "/");
+    let norm_extracted = extracted.replace('\\', "/");
+
+    if kind == SourceKind::Git {
+        let spec_ident = git_identity(extracted).or_else(|| git_identity(spec));
+        if let Some((spec_repo, spec_ref)) = spec_ident {
+            let matched = root_declared.iter().any(|d| {
+                let d_unpacked = unpack_alias(d);
+                let d_ident = git_identity(d_unpacked).or_else(|| git_identity(d));
+                if let Some((d_repo, d_ref)) = d_ident {
+                    if d_repo.eq_ignore_ascii_case(&spec_repo) {
+                        return is_git_ref_match(&d_ref, &spec_ref);
+                    }
+                }
+                false
+            });
+            if matched {
+                return true;
+            }
+        }
+        // Fallback for git specs that might not be parsed by git_identity:
+        // ONLY exact match without stripping `#`
+        return root_declared.contains(spec)
+            || root_declared.contains(extracted)
+            || root_declared.contains(&norm_spec)
+            || root_declared.contains(&norm_extracted)
+            || root_declared.iter().any(|d| {
+                let d_unpacked = unpack_alias(d);
+                let d_norm = d.replace('\\', "/");
+                let d_unpacked_norm = d_unpacked.replace('\\', "/");
+                d == spec
+                    || d == extracted
+                    || d_norm == norm_spec
+                    || d_unpacked_norm == norm_extracted
+                    || d_unpacked == extracted
+            });
+    }
+
+    let spec_base = spec.split_once('#').map(|(b, _)| b).unwrap_or(spec);
+    let extracted_base = extracted.split_once('#').map(|(b, _)| b).unwrap_or(extracted);
+    let norm_spec_base = norm_spec.split_once('#').map(|(b, _)| b).unwrap_or(&norm_spec);
+    let norm_extracted_base = norm_extracted.split_once('#').map(|(b, _)| b).unwrap_or(&norm_extracted);
+
+    if root_declared.contains(spec)
+        || root_declared.contains(extracted)
+        || root_declared.contains(&norm_spec)
+        || root_declared.contains(&norm_extracted)
+        || root_declared.contains(spec_base)
+        || root_declared.contains(extracted_base)
+        || root_declared.contains(norm_spec_base)
+        || root_declared.contains(norm_extracted_base)
+    {
+        return true;
+    }
+
+    root_declared.iter().any(|d| {
+        let d_unpacked = unpack_alias(d);
+        let d_norm = d.replace('\\', "/");
+        let d_unpacked_norm = d_unpacked.replace('\\', "/");
+        let d_base = d.split_once('#').map(|(b, _)| b).unwrap_or(d);
+        let d_unpacked_base = d_unpacked.split_once('#').map(|(b, _)| b).unwrap_or(d_unpacked);
+        let d_norm_base = d_norm.split_once('#').map(|(b, _)| b).unwrap_or(&d_norm);
+        let d_unpacked_norm_base = d_unpacked_norm.split_once('#').map(|(b, _)| b).unwrap_or(&d_unpacked_norm);
+
+        d == spec
+            || d == extracted
+            || d_norm == norm_spec
+            || d_unpacked_norm == norm_extracted
+            || d_unpacked == extracted
+            || (!is_git_spec(spec)
+                && !is_git_spec(d)
+                && (d_base == spec_base
+                    || d_unpacked_base == extracted_base
+                    || d_norm_base == norm_spec_base
+                    || d_unpacked_norm_base == norm_extracted_base))
+    })
+}
+
 fn is_direct_root_dep(
     location: &str,
-    packages: &std::collections::BTreeMap<String, LockfilePackage>,
+    normalized_packages: &std::collections::HashMap<String, &LockfilePackage>,
     workspace_paths: &HashSet<String>,
+    root_declared: &HashSet<String>,
     kind: SourceKind,
 ) -> bool {
     let location_norm = location.replace('\\', "/");
@@ -335,6 +516,13 @@ fn is_direct_root_dep(
             if let Some(spec) = map.get(name) {
                 let spec_kind = parse_source_kind(spec);
                 if spec_kind == kind {
+                    if kind != SourceKind::Registry {
+                        if !is_declared_root_spec(spec, kind, root_declared) {
+                            return false;
+                        }
+                    } else if !root_declared.contains(name) {
+                        return false;
+                    }
                     return true;
                 }
             }
@@ -342,20 +530,24 @@ fn is_direct_root_dep(
         false
     };
 
+    let get_pkg = |loc: &str| -> Option<&LockfilePackage> {
+        normalized_packages.get(loc).copied()
+    };
+
     if parent.is_empty() {
-        if let Some(root_pkg) = packages.get("") {
+        if let Some(root_pkg) = get_pkg("") {
             if check_pkg(root_pkg) {
                 return true;
             }
         }
         for ws in workspace_paths {
-            if let Some(ws_pkg) = packages.get(ws) {
+            if let Some(ws_pkg) = get_pkg(ws) {
                 if check_pkg(ws_pkg) {
                     return true;
                 }
             }
         }
-    } else if let Some(parent_pkg) = packages.get(parent) {
+    } else if let Some(parent_pkg) = get_pkg(parent) {
         if check_pkg(parent_pkg) {
             return true;
         }
@@ -427,34 +619,27 @@ pub fn check_sources_with_root_context(
         return Ok(());
     }
 
+    let norm_workspace_paths: HashSet<String> =
+        workspace_paths.iter().map(|p| p.replace('\\', "/")).collect();
+
+    let normalized_packages: std::collections::HashMap<String, &LockfilePackage> = lockfile
+        .packages
+        .iter()
+        .map(|(k, v)| (k.replace('\\', "/"), v))
+        .collect();
+
     // 1. Collect all explicit remote URLs from root_declared and lockfile specs.
     let mut explicit_remote_specs = HashSet::new();
     let mut add_remote_spec = |spec: &str| {
-        let trimmed = spec.trim();
-        let extracted = if trimmed.len() >= 4 && trimmed[..4].eq_ignore_ascii_case("npm:") {
-            let sub = trimmed[4..].trim();
-            if sub.starts_with('@') {
-                if let Some(slash_idx) = sub.find('/') {
-                    if let Some(at_idx) = sub[slash_idx + 1..].find('@') {
-                        sub[slash_idx + 1 + at_idx + 1..].trim()
-                    } else {
-                        ""
-                    }
-                } else {
-                    ""
-                }
-            } else if let Some(at_idx) = sub.find('@') {
-                sub[at_idx + 1..].trim()
-            } else {
-                ""
-            }
-        } else {
-            trimmed
-        };
+        let extracted = unpack_alias(spec);
         let lower = extracted.to_ascii_lowercase();
-        if lower.starts_with("http://") || lower.starts_with("https://") {
+        if (lower.starts_with("http://") || lower.starts_with("https://")) && !is_git_spec(extracted) {
             explicit_remote_specs.insert(extracted.to_string());
-            explicit_remote_specs.insert(extracted.to_ascii_lowercase());
+            explicit_remote_specs.insert(lower.clone());
+            if let Some((base, _)) = extracted.split_once('#') {
+                explicit_remote_specs.insert(base.to_string());
+                explicit_remote_specs.insert(base.to_ascii_lowercase());
+            }
         }
     };
 
@@ -485,7 +670,7 @@ pub fn check_sources_with_root_context(
         let is_root_edge = if force_non_root {
             false
         } else {
-            norm_req.is_empty() || workspace_paths.contains(&norm_req)
+            norm_req.is_empty() || norm_workspace_paths.contains(&norm_req)
         };
         for map in [
             &pkg.dependencies,
@@ -498,39 +683,80 @@ pub fn check_sources_with_root_context(
         {
             for spec in map.values() {
                 let kind = parse_source_kind(spec);
-                check_source_gate(policy, kind, is_root_edge)?;
+                let actual_root = is_root_edge
+                    && (kind == SourceKind::Registry
+                        || is_declared_root_spec(spec, kind, root_declared));
+                check_source_gate(policy, kind, actual_root)?;
             }
         }
 
         // Gate overrides in pkg.extra if present
         if let Some(overrides) = pkg.extra.get("overrides") {
+            let direct_dep_names: HashSet<&str> = pkg
+                .dependencies
+                .iter()
+                .flat_map(|m| m.keys().map(String::as_str))
+                .chain(pkg.dev_dependencies.iter().flat_map(|m| m.keys().map(String::as_str)))
+                .chain(pkg.optional_dependencies.iter().flat_map(|m| m.keys().map(String::as_str)))
+                .chain(pkg.peer_dependencies.iter().flat_map(|m| m.keys().map(String::as_str)))
+                .collect();
+
             fn check_overrides_recursive(
                 val: &serde_json::Value,
                 policy: &SourcePolicy,
                 is_root_edge: bool,
+                root_declared: &HashSet<String>,
+                direct_dep_names: Option<&HashSet<&str>>,
             ) -> Result<()> {
                 match val {
                     serde_json::Value::String(spec) => {
                         if !spec.starts_with('$') {
                             let kind = parse_source_kind(spec);
-                            check_source_gate(policy, kind, is_root_edge)?;
+                            let actual_root = is_root_edge
+                                && (kind == SourceKind::Registry
+                                    || is_declared_root_spec(spec, kind, root_declared));
+                            check_source_gate(policy, kind, actual_root)?;
                         }
                     }
                     serde_json::Value::Object(map) => {
-                        for v in map.values() {
-                            check_overrides_recursive(v, policy, false)?;
+                        for (k, v) in map {
+                            let child_is_root = if let Some(direct_names) = direct_dep_names {
+                                // Top-level override map: only entries targeting a direct root dep are root edges.
+                                let pkg_name = if let Some(stripped) = k.strip_prefix('@') {
+                                    match stripped.find('/') {
+                                        Some(slash) => match stripped[slash + 1..].find('@') {
+                                            Some(at) => &k[..1 + slash + 1 + at],
+                                            None => k.as_str(),
+                                        },
+                                        None => k.as_str(),
+                                    }
+                                } else {
+                                    k.split_once('@').map(|(n, _)| n).unwrap_or(k.as_str())
+                                };
+                                is_root_edge && direct_names.contains(pkg_name)
+                            } else {
+                                // Nested override object: "." applies to the parent package itself; any other key targets a child (non-root).
+                                is_root_edge && k == "."
+                            };
+                            check_overrides_recursive(v, policy, child_is_root, root_declared, None)?;
                         }
                     }
                     serde_json::Value::Array(arr) => {
                         for v in arr {
-                            check_overrides_recursive(v, policy, is_root_edge)?;
+                            check_overrides_recursive(v, policy, is_root_edge, root_declared, None)?;
                         }
                     }
                     _ => {}
                 }
                 Ok(())
             }
-            check_overrides_recursive(overrides, policy, is_root_edge)?;
+            check_overrides_recursive(
+                overrides,
+                policy,
+                is_root_edge,
+                root_declared,
+                is_root_edge.then_some(&direct_dep_names),
+            )?;
         }
     }
 
@@ -544,7 +770,7 @@ pub fn check_sources_with_root_context(
             && pkg
                 .resolved
                 .as_deref()
-                .is_some_and(|target| workspace_paths.contains(&target.replace('\\', "/")))
+                .is_some_and(|target| norm_workspace_paths.contains(&target.replace('\\', "/")))
         {
             continue;
         }
@@ -563,10 +789,19 @@ pub fn check_sources_with_root_context(
         };
         let is_root = if force_non_root {
             false
-        } else if workspace_paths.contains(&norm_loc) {
+        } else if norm_workspace_paths.contains(&norm_loc) {
             true
         } else {
-            is_direct_root_dep(&norm_loc, &lockfile.packages, workspace_paths, kind)
+            is_direct_root_dep(&norm_loc, &normalized_packages, &norm_workspace_paths, root_declared, kind)
+        };
+        let is_root = if is_root && (kind == SourceKind::Git || kind == SourceKind::Remote) {
+            if let Some(resolved) = pkg.resolved.as_deref() {
+                is_declared_root_spec(resolved, kind, root_declared)
+            } else {
+                true
+            }
+        } else {
+            is_root
         };
         check_source_gate(policy, kind, is_root)?;
     }
@@ -1097,6 +1332,7 @@ mod tests {
         root_declared.insert("workspace-a".to_string());
         root_declared.insert("packages/a".to_string());
         root_declared.insert("direct-remote".to_string());
+        root_declared.insert("http://example.com/direct-remote.tgz".to_string());
 
         let mut packages = BTreeMap::new();
 

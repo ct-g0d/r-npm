@@ -1021,6 +1021,7 @@ async fn test_rebuild_interaction_with_ignore_scripts() {
 
     let options = RebuildOptions {
         project_dir: temp.path().to_path_buf(),
+        init_cwd: None,
         packages: vec![],
         ignore_scripts: true, // Should skip all rebuild scripts immediately!
         foreground_scripts: false,
@@ -1207,23 +1208,23 @@ fn test_git_identity_non_ascii_prefix_boundary_safety() {
     let temp = tempdir().unwrap();
 
     // 1. Multi-byte UTF-8 character where byte 5, 7, or 10 lands mid-codepoint.
-    // "你好世界" is 12 bytes: [0..3, 3..6, 6..9, 9..12]. Byte 7 is inside '世' (6..9).
+    // "你好世界" is 12 bytes: [0..3, 3..6, 6..9, 9..12]. Canonicalized as GitHub shorthand to github.com/...
     let (repo_zh, committish_zh) = git_identity("你好世界/repo#main").unwrap();
-    assert_eq!(repo_zh, "你好世界/repo");
+    assert_eq!(repo_zh, "github.com/你好世界/repo");
     assert_eq!(committish_zh, "main");
 
-    // 2. 4-byte UTF-8 emoji "🦀" (bytes 0..4). Byte 5 or 7 lands on boundary or inside.
+    // 2. 4-byte UTF-8 emoji "🦀" (bytes 0..4).
     let (repo_crab, committish_crab) = git_identity("🦀/repo#feat").unwrap();
-    assert_eq!(repo_crab, "🦀/repo");
+    assert_eq!(repo_crab, "github.com/🦀/repo");
     assert_eq!(committish_crab, "feat");
 
     // 3. Accented character "é" (2 bytes).
     let (repo_accent, _) = git_identity("école/projet").unwrap();
-    assert_eq!(repo_accent, "école/projet");
+    assert_eq!(repo_accent, "github.com/école/projet");
 
     // 4. Multiple emojis with byte length > 10, crossing 5, 7, and 10 byte boundaries.
     let (repo_multi, _) = git_identity("🚀🎉🔥/tools").unwrap();
-    assert_eq!(repo_multi, "🚀🎉🔥/tools");
+    assert_eq!(repo_multi, "github.com/🚀🎉🔥/tools");
 
     // 5. Cyrillic text with 2-byte characters.
     let (repo_cyr, committish_cyr) = git_identity("git+https://example.com/пользователь/проект#v1.0").unwrap();
@@ -1233,7 +1234,7 @@ fn test_git_identity_non_ascii_prefix_boundary_safety() {
     let (repo_git_at, _) = git_identity("git@example.com:пользователь/проект").unwrap();
     assert_eq!(repo_git_at, "example.com/пользователь/проект");
 
-    // 6. ScriptNode matching with non-ASCII git spec
+    // 6. ScriptNode matching with non-ASCII git spec and shorthand
     let node = ScriptNode {
         location: "node_modules/unicode-dep",
         resolved: Some("git+https://github.com/用户/仓库.git#main"),
@@ -1242,6 +1243,880 @@ fn test_git_identity_non_ascii_prefix_boundary_safety() {
         link: false,
         project_dir: temp.path(),
     };
+    assert!(node.matches("用户/仓库#main", false));
+    assert!(node.matches("用户/仓库", false));
     assert!(node.matches("github:用户/仓库#main", false));
     assert!(node.matches("git+https://github.com/用户/仓库.git#main", false));
+}
+
+#[test]
+fn test_utf8_boundary_specs_no_panic() {
+    // 1. parse_source_kind on multi-byte UTF-8 specs
+    assert_eq!(parse_source_kind("./中文"), SourceKind::Directory);
+    assert_eq!(parse_source_kind(".\\中文"), SourceKind::Directory);
+    assert_eq!(parse_source_kind("/中文"), SourceKind::Directory);
+    assert_eq!(parse_source_kind("\\中文"), SourceKind::Directory);
+    assert_eq!(parse_source_kind("~/中文"), SourceKind::Directory);
+    assert_eq!(parse_source_kind("~\\中文"), SourceKind::Directory);
+    assert_eq!(parse_source_kind("./中文/pkg.tgz"), SourceKind::File);
+    assert_eq!(parse_source_kind(".\\中文\\pkg.tgz"), SourceKind::File);
+    assert_eq!(parse_source_kind("npm:中文@./中文"), SourceKind::Directory);
+    assert_eq!(parse_source_kind("npm:中文@.\\中文"), SourceKind::Directory);
+    assert_eq!(parse_source_kind("npm:中文@^1.0.0"), SourceKind::Registry);
+    assert_eq!(parse_source_kind("npm:中文"), SourceKind::Registry);
+
+    // 2. check_sources with multi-byte UTF-8 spec in root_declared and lockfile
+    let mut root_declared = HashSet::new();
+    root_declared.insert("./中文".to_string());
+    root_declared.insert(".\\中文".to_string());
+    root_declared.insert("npm:中文@./中文".to_string());
+    root_declared.insert("chinese-dep".to_string());
+
+    let mut packages = BTreeMap::new();
+    let mut root_deps = BTreeMap::new();
+    root_deps.insert("chinese-dep".to_string(), "./中文".to_string());
+    packages.insert(
+        String::new(),
+        LockfilePackage {
+            dependencies: Some(root_deps),
+            ..Default::default()
+        },
+    );
+    packages.insert(
+        "node_modules/chinese-dep".to_string(),
+        LockfilePackage {
+            resolved: Some("./中文".to_string()),
+            ..Default::default()
+        },
+    );
+
+    let lockfile = LockfileV3 {
+        name: "test-utf8".to_string(),
+        version: None,
+        lockfile_version: 3,
+        requires: None,
+        packages,
+    };
+    let workspace_paths = HashSet::new();
+    let policy = SourcePolicy {
+        directory: AllowMode::All,
+        remote: AllowMode::None,
+        ..Default::default()
+    };
+
+    // Must NOT panic and must succeed!
+    let res = check_sources(&lockfile, &root_declared, &workspace_paths, &policy);
+    assert!(res.is_ok(), "Expected check_sources with UTF-8 to succeed, got: {:?}", res.err());
+}
+
+#[test]
+fn test_nested_npm_aliases_unpacking_and_smuggling_blocking() {
+    // 1. Unpacking nested aliases
+    assert_eq!(
+        parse_source_kind("npm:foo@npm:bar@https://evil.com/payload.tgz"),
+        SourceKind::Remote
+    );
+    assert_eq!(
+        parse_source_kind("npm:foo@npm:bar@git+https://evil.com/repo.git"),
+        SourceKind::Git
+    );
+    assert_eq!(
+        parse_source_kind("npm:foo@npm:bar@file:./local.tgz"),
+        SourceKind::File
+    );
+    assert_eq!(
+        parse_source_kind("npm:foo@npm:bar@./local-dir"),
+        SourceKind::Directory
+    );
+    assert_eq!(
+        parse_source_kind("npm:foo@npm:bar@^1.0.0"),
+        SourceKind::Registry
+    );
+    assert_eq!(
+        parse_source_kind("npm:foo@npm:bar"),
+        SourceKind::Registry
+    );
+    assert_eq!(
+        parse_source_kind("npm:@scope/foo@npm:@scope/bar@git+https://evil.com/repo.git"),
+        SourceKind::Git
+    );
+
+    // 2. Gating nested alias smuggling attempt under allow-remote=none
+    let mut root_declared = HashSet::new();
+    root_declared.insert("smuggled".to_string());
+    root_declared.insert("npm:foo@npm:bar@https://evil.com/payload.tgz".to_string());
+
+    let mut packages = BTreeMap::new();
+    let mut root_deps = BTreeMap::new();
+    root_deps.insert("smuggled".to_string(), "npm:foo@npm:bar@https://evil.com/payload.tgz".to_string());
+    packages.insert(
+        String::new(),
+        LockfilePackage {
+            dependencies: Some(root_deps),
+            ..Default::default()
+        },
+    );
+    packages.insert(
+        "node_modules/smuggled".to_string(),
+        LockfilePackage {
+            resolved: Some("https://evil.com/payload.tgz".to_string()),
+            ..Default::default()
+        },
+    );
+
+    let lockfile = LockfileV3 {
+        name: "test-nested".to_string(),
+        version: None,
+        lockfile_version: 3,
+        requires: None,
+        packages,
+    };
+    let workspace_paths = HashSet::new();
+    let policy = SourcePolicy {
+        remote: AllowMode::None,
+        ..Default::default()
+    };
+
+    let res = check_sources(&lockfile, &root_declared, &workspace_paths, &policy);
+    assert!(res.is_err(), "Expected nested remote alias to be blocked under allow-remote=none");
+    let err = res.unwrap_err().to_string();
+    assert!(err.contains("EALLOWREMOTE"), "Expected EALLOWREMOTE, got: {err}");
+}
+
+#[test]
+fn test_windows_unc_and_backslash_and_drive_paths() {
+    // 1. parse_source_kind with UNC, backslash, and drive paths
+    assert_eq!(parse_source_kind(r"\\server\share\pkg"), SourceKind::Directory);
+    assert_eq!(parse_source_kind(r"\\server\share\pkg.tgz"), SourceKind::File);
+    assert_eq!(parse_source_kind(r"\local\folder"), SourceKind::Directory);
+    assert_eq!(parse_source_kind(r"C:\local\folder"), SourceKind::Directory);
+    assert_eq!(parse_source_kind(r"c:\local\folder"), SourceKind::Directory);
+    assert_eq!(parse_source_kind(r"D:\archive.tgz"), SourceKind::File);
+    assert_eq!(parse_source_kind(r"d:\archive.tar.gz"), SourceKind::File);
+    assert_eq!(parse_source_kind("C:"), SourceKind::Directory);
+
+    // 2. allow_scripts is_path_spec
+    assert!(is_path_spec(r"\\server\share\pkg"));
+    assert!(is_path_spec(r"\local\folder"));
+    assert!(is_path_spec(r"C:\local\folder"));
+    assert!(is_path_spec(r"c:\local\folder"));
+    assert!(is_path_spec("file:///C:/Users/foo"));
+
+    // 3. ScriptNode path matching across file:/// and drive letter
+    let temp = tempdir().unwrap();
+    let node = ScriptNode {
+        location: "node_modules/local-dep",
+        resolved: Some("file:./local-dep"),
+        lock_name: None,
+        in_bundle: false,
+        link: false,
+        project_dir: temp.path(),
+    };
+    assert!(node.matches("./local-dep", false));
+    assert!(node.matches("file:./local-dep", false));
+    assert!(node.matches(r".\local-dep", false));
+}
+
+#[test]
+fn test_hosted_git_without_dot_git_and_shorthand_allow_scripts_matching() {
+    // 1. Hosted git URLs without .git extension are parsed as Git
+    assert_eq!(parse_source_kind("https://github.com/foo/bar"), SourceKind::Git);
+    assert_eq!(parse_source_kind("http://github.com/foo/bar"), SourceKind::Git);
+    assert_eq!(parse_source_kind("https://gitlab.com/foo/bar"), SourceKind::Git);
+    assert_eq!(parse_source_kind("https://bitbucket.org/foo/bar"), SourceKind::Git);
+    assert_eq!(parse_source_kind("https://github.com/foo/bar#v1.0.0"), SourceKind::Git);
+
+    // Tarball archives on github are Remote, not Git
+    assert_eq!(parse_source_kind("https://github.com/foo/bar/archive/v1.0.0.tar.gz"), SourceKind::Remote);
+    assert_eq!(parse_source_kind("https://github.com/foo/bar/releases/download/v1.0.0/foo.tgz"), SourceKind::Remote);
+
+    // 2. ScriptNode::matches for GitHub shorthand and git+ssh normalized matching
+    let temp = tempdir().unwrap();
+    let full_sha = "0123456789abcdef0123456789abcdef01234567";
+    let node = ScriptNode {
+        location: "node_modules/git-dep",
+        resolved: Some(&format!("git+ssh://git@github.com/foo/bar.git#{full_sha}")),
+        lock_name: None,
+        in_bundle: false,
+        link: false,
+        project_dir: temp.path(),
+    };
+
+    assert!(node.matches("github:foo/bar", false));
+    assert!(node.matches("foo/bar", false));
+    assert!(node.matches("git+ssh://git@github.com/foo/bar.git", false));
+    assert!(node.matches("git+https://github.com/foo/bar.git", false));
+    assert!(node.matches("https://github.com/foo/bar", false));
+    assert!(node.matches("github:foo/bar#0123456", false));
+    assert!(node.matches("foo/bar#0123456", false));
+    assert!(!node.matches("github:foo/bar#wrong", false));
+    assert!(!node.matches("github:other/repo", false));
+}
+
+#[test]
+fn test_lockfile_smuggling_prevention_under_allow_remote_root() {
+    let mut root_declared = HashSet::new();
+    // package.json declared "innocent": "^1.0.0"
+    root_declared.insert("innocent".to_string());
+    root_declared.insert("^1.0.0".to_string());
+
+    // Attacker forged lockfile to resolve "innocent" to a remote malicious tarball,
+    // and forged root dependencies to declare "innocent": "https://evil.com/malicious.tgz"
+    let mut packages = BTreeMap::new();
+    let mut root_deps = BTreeMap::new();
+    root_deps.insert("innocent".to_string(), "https://evil.com/malicious.tgz".to_string());
+    packages.insert(
+        String::new(),
+        LockfilePackage {
+            dependencies: Some(root_deps),
+            ..Default::default()
+        },
+    );
+    packages.insert(
+        "node_modules/innocent".to_string(),
+        LockfilePackage {
+            resolved: Some("https://evil.com/malicious.tgz".to_string()),
+            ..Default::default()
+        },
+    );
+
+    let lockfile = LockfileV3 {
+        name: "test-smuggle".to_string(),
+        version: None,
+        lockfile_version: 3,
+        requires: None,
+        packages,
+    };
+    let workspace_paths = HashSet::new();
+    let policy = SourcePolicy {
+        remote: AllowMode::Root,
+        ..Default::default()
+    };
+
+    // Must FAIL because innocent was declared as registry ^1.0.0, but forged as remote in lockfile root and resolved!
+    let res = check_sources(&lockfile, &root_declared, &workspace_paths, &policy);
+    assert!(res.is_err(), "Expected lockfile smuggling of remote dep to fail under allow-remote=root");
+    let err = res.unwrap_err().to_string();
+    assert!(err.contains("EALLOWREMOTE"), "Expected EALLOWREMOTE, got: {err}");
+}
+
+#[test]
+fn test_lockfile_smuggling_prevention_in_workspace_member() {
+    let mut root_declared = HashSet::new();
+    // Workspace member package.json declared "ws-innocent": "^2.0.0"
+    root_declared.insert("ws-innocent".to_string());
+    root_declared.insert("^2.0.0".to_string());
+
+    let mut workspace_paths = HashSet::new();
+    workspace_paths.insert("packages/sub".to_string());
+
+    // Attacker forged lockfile: packages["packages/sub"].dependencies has "ws-innocent": "https://evil.com/malicious.tgz"
+    let mut packages = BTreeMap::new();
+    let mut ws_deps = BTreeMap::new();
+    ws_deps.insert("ws-innocent".to_string(), "https://evil.com/malicious.tgz".to_string());
+    packages.insert(
+        "packages/sub".to_string(),
+        LockfilePackage {
+            dependencies: Some(ws_deps),
+            ..Default::default()
+        },
+    );
+    packages.insert(
+        "packages/sub/node_modules/ws-innocent".to_string(),
+        LockfilePackage {
+            resolved: Some("https://evil.com/malicious.tgz".to_string()),
+            ..Default::default()
+        },
+    );
+
+    let lockfile = LockfileV3 {
+        name: "test-ws-smuggle".to_string(),
+        version: None,
+        lockfile_version: 3,
+        requires: None,
+        packages,
+    };
+    let policy = SourcePolicy {
+        remote: AllowMode::Root,
+        ..Default::default()
+    };
+
+    let res = check_sources(&lockfile, &root_declared, &workspace_paths, &policy);
+    assert!(res.is_err(), "Expected workspace lockfile smuggling to fail under allow-remote=root");
+    let err = res.unwrap_err().to_string();
+    assert!(err.contains("EALLOWREMOTE"), "Expected EALLOWREMOTE, got: {err}");
+}
+
+#[test]
+fn test_authored_file_spec_with_windows_slash_matches() {
+    let mut root_declared = HashSet::new();
+    // package.json authored with forward slashes "./local/tool"
+    root_declared.insert("local-tool".to_string());
+    root_declared.insert("./local/tool".to_string());
+
+    // Lockfile recorded with Windows backslashes ".\\local\\tool"
+    let mut packages = BTreeMap::new();
+    let mut root_deps = BTreeMap::new();
+    root_deps.insert("local-tool".to_string(), ".\\local\\tool".to_string());
+    packages.insert(
+        String::new(),
+        LockfilePackage {
+            dependencies: Some(root_deps),
+            ..Default::default()
+        },
+    );
+    packages.insert(
+        "node_modules/local-tool".to_string(),
+        LockfilePackage {
+            resolved: Some(".\\local\\tool".to_string()),
+            ..Default::default()
+        },
+    );
+
+    let lockfile = LockfileV3 {
+        name: "test-slash".to_string(),
+        version: None,
+        lockfile_version: 3,
+        requires: None,
+        packages,
+    };
+    let workspace_paths = HashSet::new();
+    let policy = SourcePolicy {
+        file: AllowMode::Root,
+        directory: AllowMode::Root,
+        ..Default::default()
+    };
+
+    let res = check_sources(&lockfile, &root_declared, &workspace_paths, &policy);
+    assert!(res.is_ok(), "Expected Windows backslash spec in lockfile to match authored forward slash spec, got: {:?}", res.err());
+}
+
+#[test]
+fn test_hosted_git_without_dot_git_under_allow_git_all_allow_remote_none() {
+    let mut root_declared = HashSet::new();
+    root_declared.insert("git-pkg".to_string());
+    root_declared.insert("https://github.com/user/repo".to_string());
+
+    let mut packages = BTreeMap::new();
+    let mut root_deps = BTreeMap::new();
+    root_deps.insert("git-pkg".to_string(), "https://github.com/user/repo".to_string());
+    packages.insert(
+        String::new(),
+        LockfilePackage {
+            dependencies: Some(root_deps),
+            ..Default::default()
+        },
+    );
+    packages.insert(
+        "node_modules/git-pkg".to_string(),
+        LockfilePackage {
+            resolved: Some("https://github.com/user/repo".to_string()),
+            ..Default::default()
+        },
+    );
+
+    let lockfile = LockfileV3 {
+        name: "test-git".to_string(),
+        version: None,
+        lockfile_version: 3,
+        requires: None,
+        packages,
+    };
+    let workspace_paths = HashSet::new();
+    let policy = SourcePolicy {
+        git: AllowMode::All,
+        remote: AllowMode::None,
+        ..Default::default()
+    };
+
+    // Must PASS because https://github.com/user/repo is Git, not Remote!
+    let res = check_sources(&lockfile, &root_declared, &workspace_paths, &policy);
+    assert!(res.is_ok(), "Expected https://github.com/user/repo to pass under allow-git=all allow-remote=none, got: {:?}", res.err());
+}
+
+#[test]
+fn test_single_segment_github_url_classified_as_remote() {
+    assert_eq!(parse_source_kind("https://github.com/foo"), SourceKind::Remote);
+    assert_eq!(parse_source_kind("https://github.com/foo/bar"), SourceKind::Git);
+    assert_eq!(parse_source_kind("https://gist.github.com/12345"), SourceKind::Git);
+}
+
+#[test]
+fn test_git_identity_mixed_case_git_plus_prefix() {
+    let (repo1, ref1) = git_identity("Git+https://github.com/user/repo").unwrap();
+    assert_eq!(repo1, "github.com/user/repo");
+    assert_eq!(ref1, "");
+
+    let (repo2, ref2) = git_identity("GIT+ssh://git@github.com/user/repo.git#v1.0").unwrap();
+    assert_eq!(repo2, "github.com/user/repo");
+    assert_eq!(ref2, "v1.0");
+
+    let (repo3, ref3) = git_identity("gIt+https://gitlab.com/group/project#main").unwrap();
+    assert_eq!(repo3, "gitlab.com/group/project");
+    assert_eq!(ref3, "main");
+}
+
+#[test]
+fn test_aliased_git_root_spec_matching() {
+    let mut root_declared = HashSet::new();
+    // package.json declared "my-alias": "npm:foo@github:user/repo#main"
+    root_declared.insert("my-alias".to_string());
+    root_declared.insert("npm:foo@github:user/repo#main".to_string());
+
+    let mut packages = BTreeMap::new();
+    let mut root_deps = BTreeMap::new();
+    // lockfile declared full git+https URL for the dependency
+    root_deps.insert("my-alias".to_string(), "git+https://github.com/user/repo.git#main".to_string());
+    packages.insert(
+        String::new(),
+        LockfilePackage {
+            dependencies: Some(root_deps),
+            ..Default::default()
+        },
+    );
+    packages.insert(
+        "node_modules/my-alias".to_string(),
+        LockfilePackage {
+            resolved: Some("git+https://github.com/user/repo.git#main".to_string()),
+            ..Default::default()
+        },
+    );
+
+    let lockfile = LockfileV3 {
+        name: "test-aliased-git".to_string(),
+        version: None,
+        lockfile_version: 3,
+        requires: None,
+        packages,
+    };
+    let workspace_paths = HashSet::new();
+    let policy = SourcePolicy {
+        git: AllowMode::Root,
+        remote: AllowMode::None,
+        ..Default::default()
+    };
+
+    let res = check_sources(&lockfile, &root_declared, &workspace_paths, &policy);
+    assert!(res.is_ok(), "Expected aliased git spec to match git identity under allow-git=root, got: {:?}", res.err());
+}
+
+#[test]
+fn test_hosted_git_zip_archive_and_sha_prefix_matching() {
+    // 1. Hosted .zip archive URLs are classified as Remote, not Git
+    assert_eq!(parse_source_kind("https://github.com/user/repo/archive/master.zip"), SourceKind::Remote);
+    assert_eq!(parse_source_kind("https://bitbucket.org/user/repo/get/master.zip"), SourceKind::Remote);
+    assert_eq!(parse_source_kind("https://gitlab.com/user/repo/-/archive/main/repo-main.zip"), SourceKind::Remote);
+
+    // 2. Commit SHA prefix matching in check_sources
+    let mut root_declared = HashSet::new();
+    root_declared.insert("git-sha-pkg".to_string());
+    // Author declared short SHA
+    root_declared.insert("github:user/repo#0123456".to_string());
+
+    let mut packages = BTreeMap::new();
+    let mut root_deps = BTreeMap::new();
+    // Lockfile recorded full 40-character SHA
+    root_deps.insert("git-sha-pkg".to_string(), "git+https://github.com/user/repo.git#0123456789abcdef0123456789abcdef01234567".to_string());
+    packages.insert(
+        String::new(),
+        LockfilePackage {
+            dependencies: Some(root_deps),
+            ..Default::default()
+        },
+    );
+    packages.insert(
+        "node_modules/git-sha-pkg".to_string(),
+        LockfilePackage {
+            resolved: Some("git+https://github.com/user/repo.git#0123456789abcdef0123456789abcdef01234567".to_string()),
+            ..Default::default()
+        },
+    );
+
+    let lockfile = LockfileV3 {
+        name: "test-git-sha".to_string(),
+        version: None,
+        lockfile_version: 3,
+        requires: None,
+        packages,
+    };
+    let workspace_paths = HashSet::new();
+    let policy = SourcePolicy {
+        git: AllowMode::Root,
+        remote: AllowMode::None,
+        ..Default::default()
+    };
+
+    let res = check_sources(&lockfile, &root_declared, &workspace_paths, &policy);
+    assert!(res.is_ok(), "Expected SHA prefix matching to succeed under allow-git=root, got: {:?}", res.err());
+}
+
+#[test]
+fn test_case_insensitive_git_sha_and_windows_backslash_clean_file_path() {
+    let temp = tempdir().unwrap();
+
+    // 1. clean_file_path with leading backslash on Windows drive path
+    assert_eq!(clean_file_path(r"\C:\projects\pkg"), r"C:\projects\pkg");
+    assert_eq!(clean_file_path(r"/C:\projects\pkg"), r"C:\projects\pkg");
+
+    // 2. ScriptNode::matches with uppercase hex commit hash against lowercase in lockfile
+    let node = ScriptNode {
+        location: "node_modules/my-sha-pkg",
+        resolved: Some("git+https://github.com/user/repo.git#1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b"),
+        lock_name: None,
+        in_bundle: false,
+        link: false,
+        project_dir: temp.path(),
+    };
+    assert!(node.matches("github:user/repo#1A2B3C4", false));
+    assert!(node.matches("user/repo#1A2B3C4D5E6F7A8B9C0D1E2F3A4B5C6D7E8F9A0B", false));
+
+    // 3. check_sources with uppercase SHA in package.json and lowercase in lockfile
+    let mut root_declared = HashSet::new();
+    root_declared.insert("case-pkg".to_string());
+    root_declared.insert("github:user/repo#1A2B3C4".to_string());
+
+    let mut packages = BTreeMap::new();
+    let mut root_deps = BTreeMap::new();
+    root_deps.insert("case-pkg".to_string(), "git+https://github.com/user/repo.git#1a2b3c4".to_string());
+    packages.insert(
+        String::new(),
+        LockfilePackage {
+            dependencies: Some(root_deps),
+            ..Default::default()
+        },
+    );
+    packages.insert(
+        "node_modules/case-pkg".to_string(),
+        LockfilePackage {
+            resolved: Some("git+https://github.com/user/repo.git#1a2b3c4".to_string()),
+            ..Default::default()
+        },
+    );
+
+    let lockfile = LockfileV3 {
+        name: "test-case-sha".to_string(),
+        version: None,
+        lockfile_version: 3,
+        requires: None,
+        packages,
+    };
+    let workspace_paths = HashSet::new();
+    let policy = SourcePolicy {
+        git: AllowMode::Root,
+        remote: AllowMode::None,
+        ..Default::default()
+    };
+
+    let res = check_sources(&lockfile, &root_declared, &workspace_paths, &policy);
+    assert!(res.is_ok(), "Expected case-insensitive git SHA comparison to pass under allow-git=root, got: {:?}", res.err());
+}
+
+#[test]
+fn test_numeric_org_git_scp_parsing_and_remote_fragment_and_registry_root_smuggling() {
+    // 1. Git SCP parsing for numeric orgs like 0xPolygon or 42school
+    let (repo_poly, ref_poly) = git_identity("git@github.com:0xPolygon/contracts.git#v1.0").unwrap();
+    assert_eq!(repo_poly, "github.com/0xpolygon/contracts");
+    assert_eq!(ref_poly, "v1.0");
+
+    let (repo_42, _) = git_identity("git@gitlab.com:42school/lib.git").unwrap();
+    assert_eq!(repo_42, "gitlab.com/42school/lib");
+
+    // Real port is preserved/not treated as org
+    let (repo_port, _) = git_identity("ssh://git@example.com:2222/group/repo.git").unwrap();
+    assert_eq!(repo_port, "example.com:2222/group/repo");
+
+    // 2. Remote URL with fragment declared in package.json matching clean lockfile spec
+    let mut root_declared = HashSet::new();
+    root_declared.insert("remote-frag-pkg".to_string());
+    root_declared.insert("https://example.com/tarball.tgz#sha512-abc123".to_string());
+
+    let mut packages = BTreeMap::new();
+    let mut root_deps = BTreeMap::new();
+    root_deps.insert("remote-frag-pkg".to_string(), "https://example.com/tarball.tgz".to_string());
+    packages.insert(
+        String::new(),
+        LockfilePackage {
+            dependencies: Some(root_deps),
+            ..Default::default()
+        },
+    );
+    packages.insert(
+        "node_modules/remote-frag-pkg".to_string(),
+        LockfilePackage {
+            resolved: Some("https://example.com/tarball.tgz".to_string()),
+            ..Default::default()
+        },
+    );
+
+    let lockfile = LockfileV3 {
+        name: "test-frag".to_string(),
+        version: None,
+        lockfile_version: 3,
+        requires: None,
+        packages,
+    };
+    let workspace_paths = HashSet::new();
+    let policy = SourcePolicy {
+        remote: AllowMode::Root,
+        ..Default::default()
+    };
+    let res = check_sources(&lockfile, &root_declared, &workspace_paths, &policy);
+    assert!(res.is_ok(), "Expected remote URL with fragment in package.json to match clean lockfile URL, got: {:?}", res.err());
+
+    // 3. Forged registry root dep injection blocked under allow-registry=root
+    let root_declared_empty = HashSet::new(); // package.json declares nothing
+    let mut packages_forged = BTreeMap::new();
+    let mut root_deps_forged = BTreeMap::new();
+    root_deps_forged.insert("injected-registry-pkg".to_string(), "^1.0.0".to_string());
+    packages_forged.insert(
+        String::new(),
+        LockfilePackage {
+            dependencies: Some(root_deps_forged),
+            ..Default::default()
+        },
+    );
+    packages_forged.insert(
+        "node_modules/injected-registry-pkg".to_string(),
+        LockfilePackage {
+            resolved: Some("https://registry.npmjs.org/injected-registry-pkg/-/injected-registry-pkg-1.0.0.tgz".to_string()),
+            ..Default::default()
+        },
+    );
+    let lockfile_forged = LockfileV3 {
+        name: "test-forged-reg".to_string(),
+        version: None,
+        lockfile_version: 3,
+        requires: None,
+        packages: packages_forged,
+    };
+    let policy_reg_root = SourcePolicy {
+        registry: AllowMode::Root,
+        ..Default::default()
+    };
+    let res_forged = check_sources(&lockfile_forged, &root_declared_empty, &workspace_paths, &policy_reg_root);
+    assert!(res_forged.is_err(), "Expected undeclared registry package injected into lockfile root to fail under allow-registry=root");
+    let err = res_forged.unwrap_err().to_string();
+    assert!(err.contains("EALLOWREGISTRY"), "Expected EALLOWREGISTRY, got: {err}");
+}
+
+#[test]
+fn test_git_tampered_ref_rejected_under_allow_git_root() {
+    let workspace_paths = HashSet::new();
+    let policy_git_root = SourcePolicy {
+        git: AllowMode::Root,
+        ..Default::default()
+    };
+
+    // 1. package.json declares "github:a/b#v1", lockfile tampered with "github:a/b#evil"
+    let mut root_declared_v1 = HashSet::new();
+    root_declared_v1.insert("foo".to_string());
+    root_declared_v1.insert("github:a/b#v1".to_string());
+
+    let mut packages_tampered = BTreeMap::new();
+    let mut root_deps_tampered = BTreeMap::new();
+    root_deps_tampered.insert("foo".to_string(), "github:a/b#evil".to_string());
+    packages_tampered.insert(
+        String::new(),
+        LockfilePackage {
+            dependencies: Some(root_deps_tampered),
+            ..Default::default()
+        },
+    );
+    packages_tampered.insert(
+        "node_modules/foo".to_string(),
+        LockfilePackage {
+            resolved: Some("git+https://github.com/a/b.git#evil".to_string()),
+            ..Default::default()
+        },
+    );
+    let lockfile_tampered = LockfileV3 {
+        name: "test-tampered-git".to_string(),
+        version: None,
+        lockfile_version: 3,
+        requires: None,
+        packages: packages_tampered,
+    };
+
+    let res_tampered = check_sources(&lockfile_tampered, &root_declared_v1, &workspace_paths, &policy_git_root);
+    assert!(res_tampered.is_err(), "Expected tampered git ref '#evil' to be rejected when package.json declared '#v1'");
+    let err = res_tampered.unwrap_err().to_string();
+    assert!(err.contains("EALLOWGIT"), "Expected EALLOWGIT error, got: {err}");
+
+    // 2. package.json declares "github:a/b#v1", lockfile has exact matching "#v1"
+    let mut packages_exact = BTreeMap::new();
+    let mut root_deps_exact = BTreeMap::new();
+    root_deps_exact.insert("foo".to_string(), "github:a/b#v1".to_string());
+    packages_exact.insert(
+        String::new(),
+        LockfilePackage {
+            dependencies: Some(root_deps_exact),
+            ..Default::default()
+        },
+    );
+    packages_exact.insert(
+        "node_modules/foo".to_string(),
+        LockfilePackage {
+            resolved: Some("git+https://github.com/a/b.git#v1".to_string()),
+            ..Default::default()
+        },
+    );
+    let lockfile_exact = LockfileV3 {
+        name: "test-exact-git".to_string(),
+        version: None,
+        lockfile_version: 3,
+        requires: None,
+        packages: packages_exact,
+    };
+    let res_exact = check_sources(&lockfile_exact, &root_declared_v1, &workspace_paths, &policy_git_root);
+    assert!(res_exact.is_ok(), "Expected exact git ref '#v1' to succeed under allow-git=root, got: {:?}", res_exact.err());
+
+    // 3. package.json declares unpinned "github:a/b", lockfile resolves to full 40-char commit SHA
+    let mut root_declared_unpinned = HashSet::new();
+    root_declared_unpinned.insert("bar".to_string());
+    root_declared_unpinned.insert("github:a/b".to_string());
+
+    let mut packages_unpinned = BTreeMap::new();
+    let mut root_deps_unpinned = BTreeMap::new();
+    root_deps_unpinned.insert("bar".to_string(), "git+https://github.com/a/b.git#1234567890abcdef1234567890abcdef12345678".to_string());
+    packages_unpinned.insert(
+        String::new(),
+        LockfilePackage {
+            dependencies: Some(root_deps_unpinned),
+            ..Default::default()
+        },
+    );
+    packages_unpinned.insert(
+        "node_modules/bar".to_string(),
+        LockfilePackage {
+            resolved: Some("git+https://github.com/a/b.git#1234567890abcdef1234567890abcdef12345678".to_string()),
+            ..Default::default()
+        },
+    );
+    let lockfile_unpinned = LockfileV3 {
+        name: "test-unpinned-git".to_string(),
+        version: None,
+        lockfile_version: 3,
+        requires: None,
+        packages: packages_unpinned,
+    };
+    let res_unpinned = check_sources(&lockfile_unpinned, &root_declared_unpinned, &workspace_paths, &policy_git_root);
+    assert!(res_unpinned.is_ok(), "Expected unpinned github:a/b resolving to 40-char SHA to succeed under allow-git=root, got: {:?}", res_unpinned.err());
+
+    // 4. package.json declares unpinned "github:a/b", but lockfile tampered with non-SHA branch/ref "#evil"
+    let mut packages_unpinned_tampered = BTreeMap::new();
+    let mut root_deps_unpinned_tampered = BTreeMap::new();
+    root_deps_unpinned_tampered.insert("bar".to_string(), "github:a/b#evil".to_string());
+    packages_unpinned_tampered.insert(
+        String::new(),
+        LockfilePackage {
+            dependencies: Some(root_deps_unpinned_tampered),
+            ..Default::default()
+        },
+    );
+    packages_unpinned_tampered.insert(
+        "node_modules/bar".to_string(),
+        LockfilePackage {
+            resolved: Some("git+https://github.com/a/b.git#evil".to_string()),
+            ..Default::default()
+        },
+    );
+    let lockfile_unpinned_tampered = LockfileV3 {
+        name: "test-unpinned-tampered".to_string(),
+        version: None,
+        lockfile_version: 3,
+        requires: None,
+        packages: packages_unpinned_tampered,
+    };
+    let res_unpinned_tampered = check_sources(&lockfile_unpinned_tampered, &root_declared_unpinned, &workspace_paths, &policy_git_root);
+    assert!(res_unpinned_tampered.is_err(), "Expected unpinned github:a/b with tampered non-SHA ref '#evil' to be rejected under allow-git=root");
+    let err_unpinned = res_unpinned_tampered.unwrap_err().to_string();
+    assert!(err_unpinned.contains("EALLOWGIT"), "Expected EALLOWGIT, got: {err_unpinned}");
+
+    // 5. Root dependencies map has untampered "github:a/b#v1", but node_modules/foo.resolved has attacker repo
+    let mut packages_resolved_tampered_repo = BTreeMap::new();
+    let mut root_deps_ok = BTreeMap::new();
+    root_deps_ok.insert("foo".to_string(), "github:a/b#v1".to_string());
+    packages_resolved_tampered_repo.insert(
+        String::new(),
+        LockfilePackage {
+            dependencies: Some(root_deps_ok.clone()),
+            ..Default::default()
+        },
+    );
+    packages_resolved_tampered_repo.insert(
+        "node_modules/foo".to_string(),
+        LockfilePackage {
+            resolved: Some("git+https://github.com/evil/backdoor.git#evil".to_string()),
+            ..Default::default()
+        },
+    );
+    let lockfile_resolved_tampered_repo = LockfileV3 {
+        name: "test-resolved-tampered-repo".to_string(),
+        version: None,
+        lockfile_version: 3,
+        requires: None,
+        packages: packages_resolved_tampered_repo,
+    };
+    let res_tampered_repo = check_sources(&lockfile_resolved_tampered_repo, &root_declared_v1, &workspace_paths, &policy_git_root);
+    assert!(res_tampered_repo.is_err(), "Expected tampered resolved repo 'evil/backdoor' to be rejected under allow-git=root even if root deps map had '#v1'");
+    let err_repo = res_tampered_repo.unwrap_err().to_string();
+    assert!(err_repo.contains("EALLOWGIT"), "Expected EALLOWGIT, got: {err_repo}");
+
+    // 6. Root dependencies map has untampered "github:a/b#v1", but node_modules/foo.resolved has tampered ref #evil
+    let mut packages_resolved_tampered_ref = BTreeMap::new();
+    packages_resolved_tampered_ref.insert(
+        String::new(),
+        LockfilePackage {
+            dependencies: Some(root_deps_ok),
+            ..Default::default()
+        },
+    );
+    packages_resolved_tampered_ref.insert(
+        "node_modules/foo".to_string(),
+        LockfilePackage {
+            resolved: Some("git+https://github.com/a/b.git#evil".to_string()),
+            ..Default::default()
+        },
+    );
+    let lockfile_resolved_tampered_ref = LockfileV3 {
+        name: "test-resolved-tampered-ref".to_string(),
+        version: None,
+        lockfile_version: 3,
+        requires: None,
+        packages: packages_resolved_tampered_ref,
+    };
+    let res_tampered_ref = check_sources(&lockfile_resolved_tampered_ref, &root_declared_v1, &workspace_paths, &policy_git_root);
+    assert!(res_tampered_ref.is_err(), "Expected tampered resolved ref '#evil' on node_modules/foo to be rejected under allow-git=root even if root deps map had '#v1'");
+    let err_ref = res_tampered_ref.unwrap_err().to_string();
+    assert!(err_ref.contains("EALLOWGIT"), "Expected EALLOWGIT, got: {err_ref}");
+
+    // 7. Root declares named tag "github:a/b#v1" and lockfile stores normal resolved 40-char commit SHA
+    let mut packages_resolved_sha = BTreeMap::new();
+    let mut root_deps_v1 = BTreeMap::new();
+    root_deps_v1.insert("foo".to_string(), "github:a/b#v1".to_string());
+    packages_resolved_sha.insert(
+        String::new(),
+        LockfilePackage {
+            dependencies: Some(root_deps_v1),
+            ..Default::default()
+        },
+    );
+    packages_resolved_sha.insert(
+        "node_modules/foo".to_string(),
+        LockfilePackage {
+            resolved: Some("git+ssh://git@github.com/a/b.git#0123456789abcdef0123456789abcdef01234567".to_string()),
+            ..Default::default()
+        },
+    );
+    let lockfile_resolved_sha = LockfileV3 {
+        name: "test-resolved-sha".to_string(),
+        version: None,
+        lockfile_version: 3,
+        requires: None,
+        packages: packages_resolved_sha,
+    };
+    assert!(
+        check_sources(&lockfile_resolved_sha, &root_declared_v1, &workspace_paths, &policy_git_root).is_ok(),
+        "Expected named tag github:a/b#v1 with normal resolved 40-char commit SHA to be accepted under allow-git=root"
+    );
 }

@@ -52,10 +52,18 @@ pub fn create_or_replace_junction(link: &Path, target: &Path) -> Result<()> {
     if let Some(parent) = link.parent() {
         fs::create_dir_all(parent)?;
     }
-    if is_junction(link).unwrap_or(false) {
-        let _ = remove_junction(link);
-    } else if link.exists() {
-        let _ = remove_dir_all_safe(link);
+    if let Ok(meta) = fs::symlink_metadata(link) {
+        if meta.file_type().is_symlink() || is_junction(link).unwrap_or(false) {
+            let _ = remove_junction(link);
+            #[cfg(unix)]
+            let _ = fs::remove_file(link);
+            #[cfg(windows)]
+            let _ = fs::remove_dir(link).or_else(|_| fs::remove_file(link));
+        } else if meta.is_dir() {
+            let _ = remove_dir_all_safe(link);
+        } else {
+            let _ = fs::remove_file(link);
+        }
     }
     create_junction(link, target).map_err(|e| {
         anyhow!(

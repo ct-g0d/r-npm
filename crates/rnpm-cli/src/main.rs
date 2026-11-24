@@ -400,6 +400,34 @@ pub(crate) enum Commands {
         /// Additional arguments passed to the script
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
+
+        /// Run script across all workspace packages in topological order
+        #[arg(long = "workspaces", alias = "ws")]
+        workspaces: bool,
+
+        /// Run script in specific workspace package(s)
+        #[arg(short = 'w', long = "workspace")]
+        workspace: Vec<String>,
+
+        /// If true, do not fail if a package does not declare the script
+        #[arg(long)]
+        if_present: bool,
+
+        /// Skip lifecycle scripts
+        #[arg(long)]
+        ignore_scripts: bool,
+
+        /// Run scripts with direct stdio inheritance
+        #[arg(long = "foreground-scripts")]
+        foreground_scripts: bool,
+
+        /// Enforce strict sandbox policy
+        #[arg(long = "strict-sandbox")]
+        strict_sandbox: bool,
+
+        /// Include workspace root when workspaces are enabled
+        #[arg(long = "workspace-root", alias = "include-workspace-root")]
+        workspace_root: bool,
     },
 
     /// Run package start script
@@ -407,6 +435,34 @@ pub(crate) enum Commands {
         /// Additional arguments passed to the script
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
+
+        /// Run script across all workspace packages in topological order
+        #[arg(long = "workspaces", alias = "ws")]
+        workspaces: bool,
+
+        /// Run script in specific workspace package(s)
+        #[arg(short = 'w', long = "workspace")]
+        workspace: Vec<String>,
+
+        /// If true, do not fail if a package does not declare the script
+        #[arg(long)]
+        if_present: bool,
+
+        /// Skip lifecycle scripts
+        #[arg(long)]
+        ignore_scripts: bool,
+
+        /// Run scripts with direct stdio inheritance
+        #[arg(long = "foreground-scripts")]
+        foreground_scripts: bool,
+
+        /// Enforce strict sandbox policy
+        #[arg(long = "strict-sandbox")]
+        strict_sandbox: bool,
+
+        /// Include workspace root when workspaces are enabled
+        #[arg(long = "workspace-root", alias = "include-workspace-root")]
+        workspace_root: bool,
     },
 
     /// Run package restart script
@@ -414,6 +470,34 @@ pub(crate) enum Commands {
         /// Additional arguments passed to the script
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
+
+        /// Run script across all workspace packages in topological order
+        #[arg(long = "workspaces", alias = "ws")]
+        workspaces: bool,
+
+        /// Run script in specific workspace package(s)
+        #[arg(short = 'w', long = "workspace")]
+        workspace: Vec<String>,
+
+        /// If true, do not fail if a package does not declare the script
+        #[arg(long)]
+        if_present: bool,
+
+        /// Skip lifecycle scripts
+        #[arg(long)]
+        ignore_scripts: bool,
+
+        /// Run scripts with direct stdio inheritance
+        #[arg(long = "foreground-scripts")]
+        foreground_scripts: bool,
+
+        /// Enforce strict sandbox policy
+        #[arg(long = "strict-sandbox")]
+        strict_sandbox: bool,
+
+        /// Include workspace root when workspaces are enabled
+        #[arg(long = "workspace-root", alias = "include-workspace-root")]
+        workspace_root: bool,
     },
 
     /// Run package stop script
@@ -421,6 +505,34 @@ pub(crate) enum Commands {
         /// Additional arguments passed to the script
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
+
+        /// Run script across all workspace packages in topological order
+        #[arg(long = "workspaces", alias = "ws")]
+        workspaces: bool,
+
+        /// Run script in specific workspace package(s)
+        #[arg(short = 'w', long = "workspace")]
+        workspace: Vec<String>,
+
+        /// If true, do not fail if a package does not declare the script
+        #[arg(long)]
+        if_present: bool,
+
+        /// Skip lifecycle scripts
+        #[arg(long)]
+        ignore_scripts: bool,
+
+        /// Run scripts with direct stdio inheritance
+        #[arg(long = "foreground-scripts")]
+        foreground_scripts: bool,
+
+        /// Enforce strict sandbox policy
+        #[arg(long = "strict-sandbox")]
+        strict_sandbox: bool,
+
+        /// Include workspace root when workspaces are enabled
+        #[arg(long = "workspace-root", alias = "include-workspace-root")]
+        workspace_root: bool,
     },
 
     /// Run arbitrary package scripts
@@ -434,11 +546,11 @@ pub(crate) enum Commands {
         args: Vec<String>,
 
         /// Run script across all workspace packages in topological order
-        #[arg(long = "workspaces", short = 'w', alias = "ws")]
+        #[arg(long = "workspaces", alias = "ws")]
         workspaces: bool,
 
         /// Run script in specific workspace package(s)
-        #[arg(long = "workspace")]
+        #[arg(short = 'w', long = "workspace")]
         workspace: Vec<String>,
 
         /// Filter workspace packages by name, scope (@scope, @scope/*), glob (ui-*), or path
@@ -566,6 +678,10 @@ pub(crate) enum Commands {
         /// Remove only from regular dependencies
         #[arg(short = 'P', long = "save-prod", alias = "save")]
         save_prod: bool,
+
+        /// Remove only from peerDependencies
+        #[arg(long = "save-peer")]
+        save_peer: bool,
 
         /// Specific workspace(s) to target
         #[arg(long = "workspace", short = 'w')]
@@ -817,6 +933,9 @@ pub(crate) enum Commands {
         /// Target all workspace packages
         #[arg(long = "workspaces", alias = "ws", global = true)]
         workspaces: bool,
+        /// Include workspace root when workspaces are enabled
+        #[arg(long = "workspace-root", alias = "include-workspace-root", global = true)]
+        include_workspace_root: bool,
     },
 
     /// Create a package.json file or run an initializer
@@ -1095,6 +1214,19 @@ pub(crate) enum Commands {
         /// Custom npm registry URL
         #[arg(long)]
         registry: Option<String>,
+
+        /// Tells npm whether or not to expect results from the command
+        #[arg(
+            long = "expect-results",
+            num_args = 0..=1,
+            default_missing_value = "true",
+            conflicts_with = "expect_result_count"
+        )]
+        expect_results: Option<bool>,
+
+        /// Tells npm how many results to expect from the command
+        #[arg(long = "expect-result-count")]
+        expect_result_count: Option<usize>,
     },
 
     /// Publish a package to the registry
@@ -1575,10 +1707,9 @@ pub(crate) enum Commands {
 
     /// Set a configuration value (npm set alias)
     Set {
-        /// Configuration key to set
-        key: String,
-        /// Value to assign
-        value: String,
+        /// Configuration key=value pairs or keys and values
+        #[arg(required = true)]
+        args: Vec<String>,
         /// Set in global configuration
         #[arg(short = 'g', long = "global")]
         global: bool,
@@ -1708,10 +1839,9 @@ pub(crate) enum OwnerAction {
 pub(crate) enum ConfigAction {
     /// Set a configuration key to a value
     Set {
-        /// Configuration key to set (or key=value)
-        key: String,
-        /// Value to assign
-        value: Option<String>,
+        /// Configuration key=value pairs or keys and values
+        #[arg(required = true)]
+        args: Vec<String>,
         /// Set in global configuration
         #[arg(short = 'g', long = "global")]
         global: bool,
@@ -1731,6 +1861,8 @@ pub(crate) enum ConfigAction {
     Delete {
         /// Configuration key to delete
         key: String,
+        /// Further keys to delete
+        extra_keys: Vec<String>,
         /// Delete from global configuration
         #[arg(short = 'g', long = "global")]
         global: bool,
@@ -2213,6 +2345,16 @@ pub(crate) async fn execute_run(
     strict_sandbox: bool,
     workspace_root: bool,
 ) -> anyhow::Result<()> {
+    let current_dir = if workspace_root
+        && !workspaces
+        && workspace.is_empty()
+        && filter.is_empty()
+        && scope.is_empty()
+    {
+        rnpm_config::find_workspace_root(&current_dir).unwrap_or(current_dir)
+    } else {
+        current_dir
+    };
     let manifest_path = current_dir.join("package.json");
     if !manifest_path.exists() {
         return Err(anyhow::anyhow!(
@@ -2275,7 +2417,7 @@ pub(crate) async fn execute_run(
     let has_filter = !workspace.is_empty() || !filter.is_empty() || !scope.is_empty();
     if workspaces || has_filter {
         // Fail before any member runs, not as one member's script failure.
-        enforce_run_dev_engines_once()?;
+        enforce_run_dev_engines_once(&current_dir)?;
         let mut filters = workspace;
         filters.extend(filter);
         filters.extend(scope);
@@ -2308,11 +2450,17 @@ pub(crate) async fn execute_run(
                     .unwrap_or_else(|| member.name.clone());
                 eprintln!("npm error workspace {id}");
                 eprintln!("npm error location {}", member.path.display());
-                if !member.manifest.scripts.contains_key(&script) {
+                let is_missing = !member.manifest.scripts.contains_key(&script)
+                    && !(script == "start" && member.path.join("server.js").exists())
+                    && script != "restart"
+                    && script != "env";
+                if is_missing {
                     eprintln!("npm error Missing script: \"{script}\"\nnpm error\nnpm error To see a list of scripts, run:\nnpm error   npm run --workspace={id}");
                 } else {
                     eprintln!("npm error command failed");
-                    eprintln!("npm error command {}", member.manifest.scripts[&script]);
+                    if let Some(cmd) = member.manifest.scripts.get(&script) {
+                        eprintln!("npm error command {cmd}");
+                    }
                 }
             }
         }
@@ -3014,6 +3162,12 @@ fn preprocess_run_args(
     }
 
     let is_run = subcmd == "run" || subcmd == "run-script" || subcmd == "rum" || subcmd == "urn";
+    let is_lifecycle = subcmd == "test"
+        || subcmd == "t"
+        || subcmd == "tst"
+        || subcmd == "start"
+        || subcmd == "restart"
+        || subcmd == "stop";
 
     let mut clap_flags = Vec::new();
     let mut script_name: Option<String> = if !is_run {
@@ -3034,7 +3188,7 @@ fn preprocess_run_args(
             continue;
         }
 
-        if is_run {
+        if is_run || is_lifecycle {
             if token == "--if-present" {
                 clap_flags.push("--if-present".to_string());
                 i += 1;
@@ -3094,22 +3248,42 @@ fn preprocess_run_args(
                 i += 1;
                 continue;
             }
-            if token == "--filter" || token == "--scope" {
-                clap_flags.push(token.clone());
-                if let Some(next) = next_token {
-                    if !next.starts_with('-') {
-                        clap_flags.push(next.to_string());
-                        i += 2;
-                        continue;
+            if is_run {
+                if token == "--filter" || token == "--scope" {
+                    clap_flags.push(token.clone());
+                    if let Some(next) = next_token {
+                        if !next.starts_with('-') {
+                            clap_flags.push(next.to_string());
+                            i += 2;
+                            continue;
+                        }
                     }
+                    i += 1;
+                    continue;
                 }
-                i += 1;
-                continue;
-            }
-            if token.starts_with("--filter=") || token.starts_with("--scope=") {
-                clap_flags.push(token.clone());
-                i += 1;
-                continue;
+                if token.starts_with("--filter=") || token.starts_with("--scope=") {
+                    clap_flags.push(token.clone());
+                    i += 1;
+                    continue;
+                }
+            } else if is_lifecycle {
+                if token == "--filter" || token == "--scope" {
+                    script_positional_args.push(token.clone());
+                    if let Some(next) = next_token {
+                        if !next.starts_with('-') {
+                            script_positional_args.push(next.to_string());
+                            i += 2;
+                            continue;
+                        }
+                    }
+                    i += 1;
+                    continue;
+                }
+                if token.starts_with("--filter=") || token.starts_with("--scope=") {
+                    script_positional_args.push(token.clone());
+                    i += 1;
+                    continue;
+                }
             }
         }
 
@@ -3624,6 +3798,7 @@ pub(crate) async fn ensure_npx_environment(
         std::fs::write(env_dir.join("package.json"), &manifest_text)?;
         let mut installer = Installer::new(InstallOptions {
             project_dir: env_dir.clone(),
+            init_cwd: std::env::current_dir().ok(),
             registry_url: registry,
             cache_dir: Some(cache_path),
             silent: true,
@@ -3778,6 +3953,7 @@ pub(crate) async fn execute_exec(
 
                 let install_options = InstallOptions {
                     project_dir: npx_env_dir.clone(),
+                    init_cwd: std::env::current_dir().ok(),
                     registry_url: registry,
                     cache_dir: Some(cache_path.clone()),
                     offline: false,
@@ -3864,6 +4040,7 @@ pub(crate) async fn execute_exec(
 
             let install_options = InstallOptions {
                 project_dir: npx_env_dir.clone(),
+                init_cwd: std::env::current_dir().ok(),
                 registry_url: registry,
                 cache_dir: Some(cache_path.clone()),
                 offline: false,
@@ -5150,6 +5327,7 @@ async fn run_audit_fix(
 
     let options = InstallOptions {
         project_dir: project_dir.to_path_buf(),
+        init_cwd: std::env::current_dir().ok(),
         registry_url: registry.clone(),
         ignore_scripts: config.get_bool("ignore-scripts").unwrap_or(false),
         foreground_scripts: config.get_bool("foreground-scripts").unwrap_or(false),
@@ -5281,12 +5459,12 @@ fn should_cleanup_trash(cmd: &Commands) -> bool {
 }
 
 /// The devEngines gate for `run`, applied once per process.
-fn enforce_run_dev_engines_once() -> anyhow::Result<()> {
+fn enforce_run_dev_engines_once(project_dir: &std::path::Path) -> anyhow::Result<()> {
     static CHECKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     if CHECKED.swap(true, std::sync::atomic::Ordering::SeqCst) {
         return Ok(());
     }
-    enforce_dev_engines(&std::env::current_dir()?)
+    enforce_dev_engines(project_dir)
 }
 
 /// npm's devEngines gate for the current (non-global) project.
@@ -5358,18 +5536,70 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
         Some(d) => d,
         None => std::env::current_dir()?,
     };
+    let cli_overrides = rnpm_config::get_process_cli_overrides();
+    let current_dir = match &cli.command {
+        Commands::Install { prefix: Some(_), .. }
+        | Commands::Uninstall { prefix: Some(_), .. }
+        | Commands::List { prefix: Some(_), .. } => current_dir,
+        Commands::Pkg { prefix, .. } => {
+            if prefix == Path::new(".") {
+                apply_cli_prefix(current_dir, cli_overrides.as_ref())
+            } else {
+                current_dir
+            }
+        }
+        _ => apply_cli_prefix(current_dir, cli_overrides.as_ref()),
+    };
 
     let silent = rnpm_config::Config::load(Some(&current_dir))?.get("loglevel") == Some("silent");
 
     // Clean up any leftover .rnpm-trash-* directories only for commands that mutate node_modules or clean cache
     if should_cleanup_trash(&cli.command) {
-        rnpm_install::trash::cleanup_leftover_trash(&current_dir);
+        let trash_dir = match &cli.command {
+            Commands::Install { prefix: Some(p), .. }
+            | Commands::Uninstall { prefix: Some(p), .. }
+            | Commands::List { prefix: Some(p), .. } => {
+                if p.is_absolute() {
+                    p.clone()
+                } else {
+                    current_dir.join(p)
+                }
+            }
+            Commands::Pkg { prefix, .. } => {
+                if prefix.is_absolute() {
+                    prefix.clone()
+                } else {
+                    current_dir.join(prefix)
+                }
+            }
+            _ => current_dir.clone(),
+        };
+        rnpm_install::trash::cleanup_leftover_trash(&trash_dir);
     }
 
     // npm checks devEngines before arborist commands and `run`, never for
     // global operations.
     if checks_dev_engines(&cli.command) {
-        enforce_dev_engines(&current_dir)?;
+        let dev_engines_dir = match &cli.command {
+            Commands::Install { prefix: Some(p), .. }
+            | Commands::Uninstall { prefix: Some(p), .. }
+            | Commands::List { prefix: Some(p), .. } => {
+                if p.is_absolute() {
+                    p.clone()
+                } else {
+                    current_dir.join(p)
+                }
+            }
+            Commands::Pkg { prefix, .. } => {
+                if prefix.is_absolute() {
+                    prefix.clone()
+                } else {
+                    current_dir.join(prefix)
+                }
+            }
+            _ => current_dir.clone(),
+        };
+        enforce_dev_engines(&dev_engines_dir)?;
     }
 
     match cli.command {
@@ -5551,6 +5781,7 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
 
             let options = InstallOptions {
                 project_dir: target_dir,
+                init_cwd: std::env::current_dir().ok(),
                 is_global: global,
                 registry_url: registry.clone(),
                 cache_dir: cache,
@@ -5793,6 +6024,7 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             };
             let options = InstallOptions {
                 project_dir: current_dir.clone(),
+                init_cwd: std::env::current_dir().ok(),
                 registry_url: registry.clone(),
                 cache_dir: cache,
                 offline,
@@ -5922,71 +6154,107 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
                 }
             }
         }
-        Commands::Test { args } => {
+        Commands::Test {
+            args,
+            workspaces,
+            workspace,
+            if_present,
+            ignore_scripts,
+            foreground_scripts,
+            strict_sandbox,
+            workspace_root,
+        } => {
             execute_run(
                 current_dir,
                 Some("test".to_string()),
                 args,
-                false,
+                workspaces,
+                workspace,
                 Vec::new(),
                 Vec::new(),
-                Vec::new(),
-                false,
-                false,
-                false,
-                false,
-                false,
+                if_present,
+                ignore_scripts,
+                foreground_scripts,
+                strict_sandbox,
+                workspace_root,
             )
             .await?;
         }
-        Commands::Start { args } => {
+        Commands::Start {
+            args,
+            workspaces,
+            workspace,
+            if_present,
+            ignore_scripts,
+            foreground_scripts,
+            strict_sandbox,
+            workspace_root,
+        } => {
             execute_run(
                 current_dir,
                 Some("start".to_string()),
                 args,
-                false,
+                workspaces,
+                workspace,
                 Vec::new(),
                 Vec::new(),
-                Vec::new(),
-                false,
-                false,
-                false,
-                false,
-                false,
+                if_present,
+                ignore_scripts,
+                foreground_scripts,
+                strict_sandbox,
+                workspace_root,
             )
             .await?;
         }
-        Commands::Restart { args } => {
+        Commands::Restart {
+            args,
+            workspaces,
+            workspace,
+            if_present,
+            ignore_scripts,
+            foreground_scripts,
+            strict_sandbox,
+            workspace_root,
+        } => {
             execute_run(
                 current_dir,
                 Some("restart".to_string()),
                 args,
-                false,
+                workspaces,
+                workspace,
                 Vec::new(),
                 Vec::new(),
-                Vec::new(),
-                false,
-                false,
-                false,
-                false,
-                false,
+                if_present,
+                ignore_scripts,
+                foreground_scripts,
+                strict_sandbox,
+                workspace_root,
             )
             .await?;
         }
-        Commands::Stop { args } => {
+        Commands::Stop {
+            args,
+            workspaces,
+            workspace,
+            if_present,
+            ignore_scripts,
+            foreground_scripts,
+            strict_sandbox,
+            workspace_root,
+        } => {
             execute_run(
                 current_dir,
                 Some("stop".to_string()),
                 args,
-                false,
+                workspaces,
+                workspace,
                 Vec::new(),
                 Vec::new(),
-                Vec::new(),
-                false,
-                false,
-                false,
-                false,
-                false,
+                if_present,
+                ignore_scripts,
+                foreground_scripts,
+                strict_sandbox,
+                workspace_root,
             )
             .await?;
         }
@@ -6216,6 +6484,7 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             save_dev,
             save_optional,
             save_prod,
+            save_peer,
             global,
             prefix,
             workspace,
@@ -6245,6 +6514,7 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             let report_dir = target_dir.clone();
             let options = InstallOptions {
                 project_dir: target_dir,
+                init_cwd: std::env::current_dir().ok(),
                 is_global,
                 ..Default::default()
             };
@@ -6255,6 +6525,7 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
                 save_dev,
                 save_optional,
                 save_prod,
+                save_peer,
                 is_global,
                 workspace,
                 workspaces,
@@ -6398,8 +6669,17 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             json,
             workspace,
             workspaces,
+            include_workspace_root,
         } => {
-            commands::pkg::run(action, prefix, json, workspace, workspaces, current_dir)?;
+            commands::pkg::run(
+                action,
+                prefix,
+                json,
+                workspace,
+                workspaces,
+                include_workspace_root,
+                current_dir,
+            )?;
         }
         Commands::Audit {
             action,
@@ -6647,8 +6927,18 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             selector,
             package_lock_only,
             registry,
+            expect_results,
+            expect_result_count,
         } => {
-            commands::query::run(selector, package_lock_only, registry, current_dir).await?;
+            commands::query::run(
+                selector,
+                package_lock_only,
+                registry,
+                expect_results,
+                expect_result_count,
+                current_dir,
+            )
+            .await?;
         }
         Commands::Publish {
             target,
@@ -7270,14 +7560,12 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             commands::config::run_get_keys(key.as_deref(), &extra_keys, &current_dir)?;
         }
         Commands::Set {
-            key,
-            value,
+            args,
             global,
             location,
         } => {
-            commands::config::run_set(
-                &key,
-                Some(&value),
+            commands::config::run_set_args(
+                &args,
                 global,
                 location.as_deref(),
                 &current_dir,
@@ -7684,6 +7972,26 @@ fn format_bytes(bytes: u64, space: bool) -> String {
     }
 }
 
+fn apply_cli_prefix(
+    base: PathBuf,
+    cli_overrides: Option<&std::collections::BTreeMap<String, String>>,
+) -> PathBuf {
+    if let Some(prefix) = cli_overrides
+        .and_then(|o| o.get("prefix"))
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+    {
+        let p = PathBuf::from(prefix);
+        if p.is_absolute() {
+            p
+        } else {
+            base.join(p)
+        }
+    } else {
+        base
+    }
+}
+
 fn execute_run_sync(
     current_dir: PathBuf,
     script: String,
@@ -7695,7 +8003,7 @@ fn execute_run_sync(
 ) -> anyhow::Result<()> {
     // `npm run` (and test/start/stop/restart, which run through it) checks
     // devEngines once, at the project prefix, before any script.
-    enforce_run_dev_engines_once()?;
+    enforce_run_dev_engines_once(&current_dir)?;
     let manifest_path = current_dir.join("package.json");
     if !manifest_path.exists() {
         return Err(anyhow::anyhow!(
@@ -7704,18 +8012,6 @@ fn execute_run_sync(
         ));
     }
     let mut manifest = Manifest::from_file(&manifest_path)?;
-    if !manifest.scripts.contains_key(&script) {
-        if script == "start" && current_dir.join("server.js").exists() {
-            manifest
-                .scripts
-                .insert("start".to_string(), "node server.js".to_string());
-        } else {
-            if if_present {
-                return Ok(());
-            }
-            anyhow::bail!("npm error Missing script: \"{script}\"\nnpm error\nnpm error To see a list of scripts, run:\nnpm error   npm run");
-        }
-    }
     let config = rnpm_config::Config::load(Some(&current_dir))?;
     if config.get("script-shell") == Some("true") {
         eprintln!("npm error code ENOENT\nnpm error syscall spawn true");
@@ -7724,6 +8020,69 @@ fn execute_run_sync(
     let ignore_scripts = ignore_scripts || config.get_bool("ignore-scripts").unwrap_or(false);
     let foreground_scripts =
         foreground_scripts || config.get_bool("foreground-scripts").unwrap_or(false);
+
+    if !manifest.scripts.contains_key(&script) {
+        if script == "start" && current_dir.join("server.js").exists() {
+            manifest
+                .scripts
+                .insert("start".to_string(), "node server.js".to_string());
+        } else if script == "restart" {
+            // Execute npm's default implicit restart sequence in-process:
+            // prerestart -> stop (--if-present) -> start -> postrestart,
+            // without shelling out to an external `npm` on PATH.
+            if !ignore_scripts && manifest.scripts.contains_key("prerestart") {
+                execute_run_sync(
+                    current_dir.clone(),
+                    "prerestart".to_string(),
+                    Vec::new(),
+                    true,
+                    true,
+                    foreground_scripts,
+                    strict_sandbox,
+                )?;
+            }
+            execute_run_sync(
+                current_dir.clone(),
+                "stop".to_string(),
+                args.clone(),
+                true,
+                ignore_scripts,
+                foreground_scripts,
+                strict_sandbox,
+            )?;
+            execute_run_sync(
+                current_dir.clone(),
+                "start".to_string(),
+                args,
+                if_present,
+                ignore_scripts,
+                foreground_scripts,
+                strict_sandbox,
+            )?;
+            if !ignore_scripts && manifest.scripts.contains_key("postrestart") {
+                execute_run_sync(
+                    current_dir,
+                    "postrestart".to_string(),
+                    Vec::new(),
+                    true,
+                    true,
+                    foreground_scripts,
+                    strict_sandbox,
+                )?;
+            }
+            return Ok(());
+        } else if script == "env" {
+            let env_cmd = if cfg!(windows) { "SET" } else { "env" };
+            manifest
+                .scripts
+                .insert("env".to_string(), env_cmd.to_string());
+        } else {
+            if if_present {
+                return Ok(());
+            }
+            anyhow::bail!("npm error Missing script: \"{script}\"\nnpm error\nnpm error To see a list of scripts, run:\nnpm error   npm run");
+        }
+    }
     let is_silent = config.get("loglevel") == Some("silent");
     let pre = format!("pre{script}");
     let post = format!("post{script}");
@@ -7770,6 +8129,10 @@ fn execute_run_sync(
         ctx.package_version = manifest.version.clone();
         ctx.foreground_scripts = foreground_scripts;
         ctx.extra_env = lifecycle_config_env(&current_dir);
+        if let Ok(inv_cwd) = std::env::current_dir() {
+            ctx.extra_env
+                .insert("INIT_CWD".into(), inv_cwd.to_string_lossy().to_string());
+        }
         ctx.extra_env
             .insert("npm_lifecycle_script".into(), cmd.clone());
         if let Some(shell) = config.get("script-shell") {
@@ -8164,15 +8527,28 @@ fn main() {
 
     // Ultra-fast path for standard `rnpm run <script>` without clap AST building
     if filtered_args.get(1).map(|s| s.as_str()) == Some("run")
-        && !filtered_args.iter().any(|a| {
-            a == "--help"
-                || a == "-h"
-                || a == "--workspaces"
-                || a == "-ws"
-                || a == "-w"
-                || a == "--workspace"
-                || a.starts_with("--workspace=")
-        })
+        && !filtered_args
+            .iter()
+            .take_while(|a| a.as_str() != "--")
+            .any(|a| {
+                a == "--help"
+                    || a == "-h"
+                    || a == "--workspaces"
+                    || a == "-ws"
+                    || a.starts_with("--workspaces=")
+                    || a == "-w"
+                    || a.starts_with("-w=")
+                    || a == "--workspace"
+                    || a.starts_with("--workspace=")
+                    || a == "--filter"
+                    || a.starts_with("--filter=")
+                    || a == "--scope"
+                    || a.starts_with("--scope=")
+                    || a == "--workspace-root"
+                    || a.starts_with("--workspace-root=")
+                    || a == "--include-workspace-root"
+                    || a.starts_with("--include-workspace-root=")
+            })
     {
         let mut script_name = None;
         let mut script_args = Vec::new();
@@ -8211,8 +8587,11 @@ fn main() {
         }
 
         if let Some(script) = script_name {
-            let current_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
             let cli_overrides = rnpm_config::get_process_cli_overrides();
+            let current_dir = apply_cli_prefix(
+                std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+                cli_overrides.as_ref(),
+            );
             if let Some(ref o) = cli_overrides {
                 if let Some(shell) = o.get("script-shell") {
                     if shell == "true" {
@@ -8369,13 +8748,16 @@ fn main() {
         ignore_scripts,
         foreground_scripts,
         strict_sandbox,
-        workspace_root: _,
+        workspace_root,
     } = cli.command
     {
         let has_filter = !workspace.is_empty() || !filter.is_empty() || !scope.is_empty();
-        if !workspaces && !has_filter && script.is_some() {
-            let current_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        if !workspaces && !has_filter && !workspace_root && script.is_some() {
             let cli_overrides = rnpm_config::get_process_cli_overrides();
+            let current_dir = apply_cli_prefix(
+                std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+                cli_overrides.as_ref(),
+            );
             if let Some(ref o) = cli_overrides {
                 if let Some(shell) = o.get("script-shell") {
                     if shell == "true" {

@@ -19,6 +19,21 @@ pub struct Npmrc {
     pub auth_tokens: BTreeMap<String, String>,
 }
 
+/// A URI-scoped TLS configuration entry (certificates and private keys).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScopedTlsEntry {
+    /// Normalized URI prefix, e.g. `//registry.company.com/` or `//internal.repo/npm/`
+    pub prefix: String,
+    /// Inline certificate content (`:cert`) if configured.
+    pub cert: Option<String>,
+    /// Path to certificate file (`:certfile`) if configured.
+    pub certfile: Option<String>,
+    /// Inline private key content (`:key`) if configured.
+    pub key: Option<String>,
+    /// Path to private key file (`:keyfile`) if configured.
+    pub keyfile: Option<String>,
+}
+
 impl std::fmt::Debug for Npmrc {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let scrubbed_tokens: BTreeMap<_, _> = self
@@ -114,17 +129,34 @@ impl Npmrc {
                 continue;
             }
 
-            // Interpolate environment variables
-            let interpolated = interpolate_env(trimmed, &env_lookup);
+            // Skip section headers: e.g. [section]
+            if trimmed.starts_with('[') && trimmed.ends_with(']') {
+                continue;
+            }
 
-            // Parse key-value: key = value or key=value or bare key
-            let (key, value) = if let Some(idx) = interpolated.find('=') {
-                let k = interpolated[..idx].trim().to_string();
-                let v = interpolated[idx + 1..].trim().to_string();
-                (k, v)
+            // Split key and value on '='
+            let (raw_key, raw_val) = if let Some(idx) = trimmed.find('=') {
+                (&trimmed[..idx], Some(&trimmed[idx + 1..]))
             } else {
-                (interpolated.to_string(), "true".to_string())
+                (trimmed, None)
             };
+
+            let decoded_key = decode_ini_field(raw_key);
+            if decoded_key.is_empty() {
+                if raw_val.is_some() {
+                    return Err(ConfigError::InvalidLine(format!("Empty key in: '{trimmed}'")));
+                }
+                continue;
+            }
+
+            let decoded_val = match raw_val {
+                Some(v) => decode_ini_field(v),
+                None => "true".to_string(),
+            };
+
+            // Interpolate environment variables
+            let key = interpolate_env(&decoded_key, &env_lookup);
+            let value = interpolate_env(&decoded_val, &env_lookup);
 
             npmrc.set(&key, &value)?;
         }
@@ -183,7 +215,7 @@ impl Npmrc {
         }
 
         // 2. Check if key is a scoped registry: e.g. "@myorg:registry", "@myorg/registry", or "myorg:registry"
-        if let Some(scope) = parse_scoped_registry_key(key_trimmed) {
+        if let Some(scope) = crate::parse_scoped_registry_key(key_trimmed) {
             if let Ok(mut reg_url) = Url::parse(value_trimmed) {
                 ensure_trailing_slash(&mut reg_url);
                 self.scoped_registries
@@ -260,7 +292,7 @@ impl Npmrc {
 
         // Fallback: general setting
         self.settings
-            .insert(key_trimmed.to_string(), value_trimmed.to_string());
+            .insert(key_trimmed.to_string(), value.to_string());
         Ok(())
     }
 
@@ -433,6 +465,169 @@ impl Npmrc {
         None
     }
 
+    /// Enumerate all scoped TLS entries (`//host/path/:cert`, `:certfile`, `:key`, `:keyfile`)
+    /// grouped by normalized URI prefix.
+    pub fn scoped_tls_entries(&self) -> Vec<ScopedTlsEntry> {
+        let mut by_prefix: BTreeMap<String, ScopedTlsEntry> = BTreeMap::new();
+
+        for (k, v) in &self.settings {
+            let v_clean = v.trim();
+            if v_clean.is_empty() || v_clean == "null" {
+                continue;
+            }
+
+            let (raw_prefix, kind) = if let Some(p) = k.strip_suffix(":certfile") {
+                (p, 1)
+            } else if let Some(p) = k.strip_suffix(":cert") {
+                (p, 0)
+            } else if let Some(p) = k.strip_suffix(":keyfile") {
+                (p, 3)
+            } else if let Some(p) = k.strip_suffix(":key") {
+                (p, 2)
+            } else {
+                continue;
+            };
+
+            if raw_prefix.starts_with("//") || raw_prefix.contains("://") {
+                let norm = normalize_uri_prefix(raw_prefix);
+                let entry = by_prefix.entry(norm.clone()).or_insert_with(|| ScopedTlsEntry {
+                    prefix: norm,
+                    cert: None,
+                    certfile: None,
+                    key: None,
+                    keyfile: None,
+                });
+                match kind {
+                    0 => entry.cert = Some(v_clean.to_string()),
+                    1 => entry.certfile = Some(v_clean.to_string()),
+                    2 => entry.key = Some(v_clean.to_string()),
+                    3 => entry.keyfile = Some(v_clean.to_string()),
+                    _ => {}
+                }
+            }
+        }
+
+        by_prefix.into_values().collect()
+    }
+
+    /// Clean public helper returning all scoped TLS configurations as tuples of:
+    /// `(prefix, cert, certfile, key, keyfile)`
+    #[allow(clippy::type_complexity)]
+    pub fn scoped_tls_configs(
+        &self,
+    ) -> Vec<(String, Option<String>, Option<String>, Option<String>, Option<String>)> {
+        self.scoped_tls_entries()
+            .into_iter()
+            .map(|entry| (entry.prefix, entry.cert, entry.certfile, entry.key, entry.keyfile))
+            .collect()
+    }
+
+    /// Retrieve any of the given suffix keys performing longest-prefix matching
+    /// on registry URL paths down to host root. For each prefix in descending order
+    /// of specificity, all given suffix keys are tested in order.
+    pub fn get_scoped_setting_any<'a>(
+        &'a self,
+        registry_url: &Url,
+        suffix_keys: &[&str],
+    ) -> Option<&'a str> {
+        let host = registry_url.host_str()?;
+        let port_part = if let Some(port) = registry_url.port() {
+            format!(":{port}")
+        } else {
+            String::new()
+        };
+
+        let path = registry_url.path();
+        let host_lower = host.to_ascii_lowercase();
+        let prefixes = generate_path_prefixes(path);
+
+        for prefix in &prefixes {
+            for suffix_key in suffix_keys {
+                if !port_part.is_empty() {
+                    let cand1 = format!("//{host_lower}{port_part}{prefix}:{suffix_key}");
+                    if let Some(val) = self.settings.get(&cand1) {
+                        return Some(val.as_str());
+                    }
+                }
+                let cand2 = format!("//{host_lower}{prefix}:{suffix_key}");
+                if let Some(val) = self.settings.get(&cand2) {
+                    return Some(val.as_str());
+                }
+                if prefix.ends_with('/') {
+                    let no_slash = &prefix[..prefix.len() - 1];
+                    let cand3 = format!("//{host_lower}{no_slash}:{suffix_key}");
+                    if let Some(val) = self.settings.get(&cand3) {
+                        return Some(val.as_str());
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Retrieve a URI-scoped configuration value (e.g. `:certfile`, `:keyfile`, `:ca`, `:cafile`, `:proxy`)
+    /// performing longest-prefix matching on registry URL paths down to host root.
+    pub fn get_scoped_setting(&self, registry_url: &Url, suffix_key: &str) -> Option<&str> {
+        self.get_scoped_setting_any(registry_url, &[suffix_key])
+    }
+
+    /// Retrieve the SSL certificate file configured for a registry URL,
+    /// falling back to global `certfile` or `cert` setting.
+    pub fn get_cert(&self, registry_url: &Url) -> Option<&str> {
+        self.get_scoped_setting_any(registry_url, &["certfile", "cert"])
+            .or_else(|| self.settings.get("certfile").map(|s| s.as_str()))
+            .or_else(|| self.settings.get("cert").map(|s| s.as_str()))
+            .filter(|s| !s.is_empty() && *s != "null")
+    }
+
+    /// Retrieve the SSL private key file configured for a registry URL,
+    /// falling back to global `keyfile` or `key` setting.
+    pub fn get_key(&self, registry_url: &Url) -> Option<&str> {
+        self.get_scoped_setting_any(registry_url, &["keyfile", "key"])
+            .or_else(|| self.settings.get("keyfile").map(|s| s.as_str()))
+            .or_else(|| self.settings.get("key").map(|s| s.as_str()))
+            .filter(|s| !s.is_empty() && *s != "null")
+    }
+
+    /// Retrieve the CA certificate or CA file configured for a registry URL,
+    /// falling back to global `cafile` or `ca` setting.
+    pub fn get_ca(&self, registry_url: &Url) -> Option<&str> {
+        self.get_scoped_setting_any(registry_url, &["ca", "cafile"])
+            .or_else(|| self.settings.get("ca").map(|s| s.as_str()))
+            .or_else(|| self.settings.get("cafile").map(|s| s.as_str()))
+            .filter(|s| !s.is_empty() && *s != "null")
+    }
+
+    /// Retrieve a proxy configured for a registry URL via URI-scoped setting (`:proxy` or `:https-proxy`),
+    /// falling back to global settings.
+    pub fn get_proxy_for_registry(&self, registry_url: &Url) -> Option<&str> {
+        let is_https = registry_url.scheme() == "https";
+        if is_https {
+            self.get_scoped_setting_any(registry_url, &["https-proxy", "https_proxy", "proxy"])
+                .or_else(|| self.settings.get("https-proxy").map(|s| s.as_str()))
+                .or_else(|| self.settings.get("https_proxy").map(|s| s.as_str()))
+                .or_else(|| self.settings.get("proxy").map(|s| s.as_str()))
+                .filter(|s| !s.is_empty() && *s != "null")
+        } else {
+            self.get_scoped_setting_any(
+                registry_url,
+                &[
+                    "proxy",
+                    "http-proxy",
+                    "http_proxy",
+                    "https-proxy",
+                    "https_proxy",
+                ],
+            )
+            .or_else(|| self.settings.get("proxy").map(|s| s.as_str()))
+            .or_else(|| self.settings.get("http-proxy").map(|s| s.as_str()))
+            .or_else(|| self.settings.get("http_proxy").map(|s| s.as_str()))
+            .or_else(|| self.settings.get("https-proxy").map(|s| s.as_str()))
+            .or_else(|| self.settings.get("https_proxy").map(|s| s.as_str()))
+            .filter(|s| !s.is_empty() && *s != "null")
+        }
+    }
+
     /// Returns a copy of the settings map with all sensitive tokens safely redacted.
     pub fn scrubbed_settings(&self) -> BTreeMap<String, String> {
         self.settings
@@ -475,30 +670,54 @@ impl Npmrc {
     }
 }
 
-fn parse_scoped_registry_key(key: &str) -> Option<String> {
-    if let Some(raw_scope) = key.strip_suffix(":registry") {
-        let s = raw_scope.trim();
-        if !s.is_empty() {
-            let scope = if !s.starts_with('@') {
-                format!("@{s}")
+/// Decodes an ini key or value string according to npm / ini rules:
+/// - Strips quotes (double quotes with JSON unescaping, single quotes stripped).
+/// - If unquoted, strips inline comments starting with unescaped ';' or '#'.
+/// - Unescapes '\;', '\#', and '\\'.
+pub fn decode_ini_field(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+
+    // Double-quoted string: try JSON unescaping; fallback to stripping quotes
+    if let Some(inner) = trimmed.strip_prefix('"').and_then(|s| s.strip_suffix('"')) {
+        if let Ok(unquoted) = serde_json::from_str::<String>(trimmed) {
+            return unquoted;
+        }
+        return inner.to_string();
+    }
+
+    // Single-quoted string: strip quotes
+    if let Some(inner) = trimmed.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')) {
+        return inner.to_string();
+    }
+
+    // Unquoted: walk the string to find the first unescaped ';' or '#' (inline comment)
+    let mut unesc = String::with_capacity(trimmed.len());
+    let mut esc = false;
+
+    for c in trimmed.chars() {
+        if esc {
+            if c == ';' || c == '#' || c == '\\' {
+                unesc.push(c);
             } else {
-                s.to_string()
-            };
-            return Some(scope);
+                unesc.push('\\');
+                unesc.push(c);
+            }
+            esc = false;
+        } else if c == ';' || c == '#' {
+            break;
+        } else if c == '\\' {
+            esc = true;
+        } else {
+            unesc.push(c);
         }
     }
-    if let Some(raw_scope) = key.strip_suffix("/registry") {
-        let s = raw_scope.trim();
-        if !s.is_empty() {
-            let scope = if !s.starts_with('@') {
-                format!("@{s}")
-            } else {
-                s.to_string()
-            };
-            return Some(scope);
-        }
+    if esc {
+        unesc.push('\\');
     }
-    None
+    unesc.trim().to_string()
 }
 
 fn generate_path_prefixes(path: &str) -> Vec<String> {
@@ -506,6 +725,7 @@ fn generate_path_prefixes(path: &str) -> Vec<String> {
     let trimmed = path.trim();
     if trimmed.is_empty() || trimmed == "/" {
         prefixes.push("/".to_string());
+        prefixes.push(String::new());
         return prefixes;
     }
 
@@ -522,6 +742,7 @@ fn generate_path_prefixes(path: &str) -> Vec<String> {
         prefixes.push(format!("/{sub}"));
     }
     prefixes.push("/".to_string());
+    prefixes.push(String::new());
     prefixes
 }
 
@@ -774,13 +995,19 @@ where
                         };
 
                         let var_name = var_name.trim();
-                        let is_valid_name = !var_name.is_empty()
-                            && var_name
+                        let is_optional = var_name.ends_with('?');
+                        let clean_var_name = if is_optional {
+                            &var_name[..var_name.len() - 1]
+                        } else {
+                            var_name
+                        };
+                        let is_valid_name = !clean_var_name.is_empty()
+                            && clean_var_name
                                 .chars()
                                 .all(|c| c.is_ascii_alphanumeric() || c == '_');
 
                         if is_valid_name {
-                            let looked_up = lookup(var_name);
+                            let looked_up = lookup(clean_var_name);
                             let val = match looked_up {
                                 Some(v) => {
                                     if use_default_if_empty && v.is_empty() {
@@ -892,7 +1119,11 @@ pub fn is_sensitive_credential_key(key: &str) -> bool {
     {
         return true;
     }
-    if lower.contains("auth") && !lower.contains("author") {
+    if lower.contains("auth")
+        && !lower.contains("author")
+        && !lower.contains("auth-type")
+        && !lower.contains("auth_type")
+    {
         return true;
     }
     false

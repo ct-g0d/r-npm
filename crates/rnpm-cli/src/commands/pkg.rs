@@ -8,6 +8,7 @@ pub(crate) fn run(
     json: bool,
     workspace: Vec<String>,
     workspaces: bool,
+    include_workspace_root: bool,
     current_dir: PathBuf,
 ) -> Result<()> {
     let base_path = if prefix.is_absolute() {
@@ -45,7 +46,7 @@ pub(crate) fn run(
             ));
         }
 
-        let matched_members: Vec<rnpm_core::workspace::WorkspaceMember> = if workspaces
+        let mut matched_members: Vec<rnpm_core::workspace::WorkspaceMember> = if workspaces
             && workspace.is_empty()
         {
             discovered
@@ -77,6 +78,22 @@ pub(crate) fn run(
             }
             matched
         };
+
+        if include_workspace_root && !matched_members.iter().any(|m| m.path == project_root) {
+            let root_manifest = rnpm_core::Manifest::from_file(&root_manifest_path)?;
+            let root_name = root_manifest
+                .name
+                .clone()
+                .unwrap_or_else(|| "root".to_string());
+            let root_member = rnpm_core::workspace::WorkspaceMember {
+                name: root_name,
+                version: root_manifest.version.clone(),
+                path: project_root.clone(),
+                relative_path: ".".to_string(),
+                manifest: root_manifest,
+            };
+            matched_members.insert(0, root_member);
+        }
 
         match action {
             PkgAction::Get { fields } => {
