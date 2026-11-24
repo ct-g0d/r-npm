@@ -181,7 +181,17 @@ fn flatten_legacy_dependencies(
 
         let resolved = if is_dir_link {
             let raw_target = dep.version.strip_prefix("file:").unwrap().trim_matches('/');
-            Some(to_posix_path(raw_target))
+            let raw_target = raw_target
+                .strip_prefix("./")
+                .unwrap_or(raw_target)
+                .trim_matches('/');
+            let posix = to_posix_path(raw_target);
+            let canonical = if posix == "." || posix.is_empty() {
+                "".to_string()
+            } else {
+                posix
+            };
+            Some(canonical)
         } else {
             dep.resolved.clone()
         };
@@ -232,7 +242,11 @@ fn flatten_legacy_dependencies(
             } else {
                 None
             },
-            dependencies: dep.requires.clone(),
+            dependencies: if is_dir_link {
+                None
+            } else {
+                dep.requires.clone()
+            },
             ..Default::default()
         };
         pkg.normalize_flags();
@@ -314,8 +328,19 @@ fn enrich_packages_from_legacy(
                 }
                 if pkg.resolved.is_none() {
                     let raw_target = dep.version.strip_prefix("file:").unwrap().trim_matches('/');
-                    pkg.resolved = Some(to_posix_path(raw_target));
+                    let raw_target = raw_target
+                        .strip_prefix("./")
+                        .unwrap_or(raw_target)
+                        .trim_matches('/');
+                    let posix = to_posix_path(raw_target);
+                    let canonical = if posix == "." || posix.is_empty() {
+                        "".to_string()
+                    } else {
+                        posix
+                    };
+                    pkg.resolved = Some(canonical);
                 }
+                pkg.dependencies = None;
             }
             pkg.normalize_flags();
         } else {

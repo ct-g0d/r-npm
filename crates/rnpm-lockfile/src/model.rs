@@ -1597,12 +1597,36 @@ impl LockfileV3 {
                     .strip_prefix("file:")
                     .unwrap_or(resolved)
                     .replace('\\', "/");
+                let clean_res = clean_res
+                    .strip_prefix("./")
+                    .unwrap_or(&clean_res)
+                    .trim_end_matches('/');
                 let clean_p = p.to_str().unwrap_or("").replace('\\', "/");
+                let clean_p = clean_p
+                    .strip_prefix("./")
+                    .unwrap_or(&clean_p)
+                    .trim_end_matches('/');
                 clean_res == clean_p
-                    || clean_res.ends_with(&clean_p)
-                    || clean_p.ends_with(&clean_res)
+                    || clean_res.ends_with(&format!("/{clean_p}"))
+                    || clean_p.ends_with(&format!("/{clean_res}"))
             }
-            PackageTarget::Git { url, .. } => resolved.contains(url.as_str()),
+            PackageTarget::Git { url, committish, .. } => {
+                let url_matches = resolved.contains(url.as_str());
+                if !url_matches {
+                    return false;
+                }
+                // If the spec requested an exact 40-char commit SHA, resolved must contain it
+                if let Some(ref c) = committish {
+                    if c.len() == 40
+                        && c.chars().all(|ch| ch.is_ascii_hexdigit())
+                        && !resolved.ends_with(&format!("#{c}"))
+                        && !resolved.contains(c.as_str())
+                    {
+                        return false;
+                    }
+                }
+                true
+            }
             _ => true,
         }
     }
@@ -2153,9 +2177,14 @@ impl LockfileV3 {
             // If is_link and package has no dependencies, look up target package in all_packages
             let target_pkg = if is_link {
                 let res = package.resolved.as_deref().unwrap_or("");
-                let clean_res = res.strip_prefix("file:").unwrap_or(res).trim_matches('/');
+                let clean_res = res.strip_prefix("file:").unwrap_or(res).replace('\\', "/");
+                let clean_res = clean_res
+                    .strip_prefix("./")
+                    .unwrap_or(&clean_res)
+                    .trim_matches('/')
+                    .to_string();
                 all_packages
-                    .get(clean_res)
+                    .get(&clean_res)
                     .or_else(|| {
                         let alt = format!("./{clean_res}");
                         all_packages.get(&alt)

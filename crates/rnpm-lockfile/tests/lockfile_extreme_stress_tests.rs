@@ -1762,8 +1762,115 @@ fn test_integrity_audit_aliased_direct_dependency() {
     };
 
     let res = verify_lockfile_integrity(&lock, &policy);
-    if let Err(e) = &res {
-        eprintln!("Integrity error: {:?}", e);
-    }
     assert!(res.is_ok(), "Aliased direct dependency must be recognized as direct");
+}
+
+#[test]
+fn test_target_matches_resolved_path_boundary_no_false_positive() {
+    let pkg = LockfilePackage {
+        version: Some("1.0.0".to_string()),
+        resolved: Some("file:packages/client-app".to_string()),
+        ..Default::default()
+    };
+    // Spec asks for file:packages/app - should NOT match packages/client-app despite sharing suffix
+    assert!(
+        !LockfileV3::package_satisfies_spec("app", &pkg, "file:packages/app"),
+        "client-app should not match app via bare substring suffix"
+    );
+    // Spec asks for file:packages/client-app - SHOULD match
+    assert!(
+        LockfileV3::package_satisfies_spec("client-app", &pkg, "file:packages/client-app"),
+        "exact path match must succeed"
+    );
+}
+
+#[test]
+fn test_git_committish_drift_detected() {
+    let pkg = LockfilePackage {
+        version: Some("1.0.0".to_string()),
+        resolved: Some("git+https://github.com/org/repo.git#1111111111111111111111111111111111111111".to_string()),
+        ..Default::default()
+    };
+    // Spec with different committish
+    assert!(
+        !LockfileV3::package_satisfies_spec("repo", &pkg, "git+https://github.com/org/repo.git#2222222222222222222222222222222222222222"),
+        "Mismatched committish must be detected as drift"
+    );
+    // Spec with matching committish
+    assert!(
+        LockfileV3::package_satisfies_spec("repo", &pkg, "git+https://github.com/org/repo.git#1111111111111111111111111111111111111111"),
+        "Matching committish must satisfy spec"
+    );
+}
+
+#[test]
+fn test_migration_symlink_omits_duplicated_dependencies() {
+    let v1_json = r#"{
+        "name": "v1-symlink-clean",
+        "version": "1.0.0",
+        "lockfileVersion": 1,
+        "dependencies": {
+            "my-link": {
+                "version": "file:packages/my-link",
+                "requires": {
+                    "nested": "1.0.0"
+                }
+            }
+        }
+    }"#;
+
+    let v3 = parse_and_migrate(v1_json).expect("Must migrate v1 file: links");
+    let link = v3.packages.get("node_modules/my-link").expect("Link node must exist");
+    assert_eq!(link.link, Some(true));
+    assert_eq!(link.resolved.as_deref(), Some("packages/my-link"));
+    // Arborist parity: symlink node does not duplicate dependencies
+    assert!(link.dependencies.is_none(), "Symlink node must not duplicate dependencies");
+
+    let target = v3.packages.get("packages/my-link").expect("Target node must exist");
+    assert_eq!(target.dependencies.as_ref().unwrap().get("nested").map(|s| s.as_str()), Some("1.0.0"));
+}
+
+#[test]
+fn test_migration_file_dot_maps_to_root() {
+    let v1_json = r#"{
+        "name": "v1-self-link",
+        "version": "1.0.0",
+        "lockfileVersion": 1,
+        "dependencies": {
+            "self": {
+                "version": "file:."
+            }
+        }
+    }"#;
+
+    let v3 = parse_and_migrate(v1_json).expect("Must migrate v1 file:. link");
+    let link = v3.packages.get("node_modules/self").expect("Link node must exist");
+    assert_eq!(link.link, Some(true));
+    assert_eq!(link.resolved.as_deref(), Some(""));
+}
+
+#[test]
+fn test_legacy_dependencies_windows_backslashes_in_link() {
+    let mut lock = LockfileV3::new("win-link-test", Some("1.0.0".to_string()));
+    lock.lockfile_version = 2;
+
+    let mut target = LockfilePackage {
+        version: Some("1.0.0".to_string()),
+        ..Default::default()
+    };
+    let mut deps = BTreeMap::new();
+    deps.insert("chalk".to_string(), "5.0.0".to_string());
+    target.dependencies = Some(deps);
+    lock.packages.insert("packages/my-ws".to_string(), target);
+
+    let link_pkg = LockfilePackage {
+        resolved: Some("packages\\my-ws".to_string()),
+        link: Some(true),
+        ..Default::default()
+    };
+    lock.packages.insert("node_modules/my-ws".to_string(), link_pkg);
+
+    let json = lock.to_json_string_version(2).unwrap();
+    let val: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(val["dependencies"]["my-ws"]["requires"]["chalk"], "5.0.0");
 }
