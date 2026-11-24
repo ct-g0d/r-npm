@@ -1073,6 +1073,11 @@ pub fn decode_tar_entries<R: Read>(
         }
 
         let path_bytes = entry.path_bytes();
+        if path_bytes.contains(&0) {
+            return Err(FsError::PathTraversal {
+                path: PathBuf::from(String::from_utf8_lossy(&path_bytes).into_owned()),
+            });
+        }
         if std::str::from_utf8(&path_bytes).is_err() {
             return Err(FsError::InvalidUtf8Path {
                 path: PathBuf::from(String::from_utf8_lossy(&path_bytes).into_owned()),
@@ -1274,6 +1279,11 @@ pub fn decode_tar_entries<R: Read>(
             }
 
             if let Some(link_bytes) = entry.link_name_bytes() {
+                if link_bytes.contains(&0) {
+                    return Err(FsError::PathTraversal {
+                        path: PathBuf::from(String::from_utf8_lossy(&link_bytes).into_owned()),
+                    });
+                }
                 if std::str::from_utf8(&link_bytes).is_err() {
                     return Err(FsError::InvalidUtf8Path {
                         path: PathBuf::from(String::from_utf8_lossy(&link_bytes).into_owned()),

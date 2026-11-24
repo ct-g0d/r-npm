@@ -1287,10 +1287,12 @@ pub fn build_lifecycle_env(ctx: &LifecycleContext) -> HashMap<String, String> {
     env.insert("Path".to_string(), final_path);
 
     // 4. Standard npm environment contract
-    env.insert(
-        "INIT_CWD".to_string(),
-        ctx.project_root.to_string_lossy().to_string(),
-    );
+    if !env.contains_key("INIT_CWD") {
+        env.insert(
+            "INIT_CWD".to_string(),
+            ctx.project_root.to_string_lossy().to_string(),
+        );
+    }
     if !env.contains_key("npm_command") {
         let cmd = match ctx.event.as_str() {
             "preinstall" | "install" | "postinstall" => "install",
@@ -2916,6 +2918,12 @@ async fn execute_dependency_hooks_with_abort(
                     hook,
                     script_cmd,
                 );
+                if !opts.init_cwd.as_os_str().is_empty() {
+                    ctx.extra_env.insert(
+                        "INIT_CWD".to_string(),
+                        opts.init_cwd.to_string_lossy().to_string(),
+                    );
+                }
                 ctx.package_version = node.manifest.version.clone();
                 ctx.timeout = opts.timeout;
                 ctx.sandbox_policy = opts.sandbox_policy.clone();
@@ -3044,6 +3052,12 @@ async fn execute_root_hooks_with_abort(
                 hook,
                 script_cmd,
             );
+            if !opts.init_cwd.as_os_str().is_empty() {
+                ctx.extra_env.insert(
+                    "INIT_CWD".to_string(),
+                    opts.init_cwd.to_string_lossy().to_string(),
+                );
+            }
             ctx.package_version = root_manifest.version.clone();
             let is_silent = if let Some(trusted) = get_trusted_config() {
                 trusted.get("loglevel") == Some("silent")

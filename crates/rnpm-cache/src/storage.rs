@@ -297,15 +297,19 @@ impl Cache {
             .join(p1)
             .join(p2)
             .join(if hex.len() >= 4 { &hex[4..] } else { &hex });
+        let legacy_style = self
+            .root
+            .join("content-v2")
+            .join(algo.as_str())
+            .join(p1)
+            .join(p2)
+            .join(&hex);
         if npm_style.exists() {
             npm_style
+        } else if legacy_style.exists() {
+            legacy_style
         } else {
-            self.root
-                .join("content-v2")
-                .join(algo.as_str())
-                .join(p1)
-                .join(p2)
-                .join(&hex)
+            npm_style
         }
     }
 
@@ -1042,7 +1046,7 @@ impl Cache {
         for entry in sorted_entries {
             let hex = HEXLOWER.encode(&entry.digest);
             let blob_path = self.blob_path_for_algo(entry.algorithm, &hex);
-            match fs::read(&blob_path) {
+            match read_file_with_retries(&blob_path) {
                 Ok(bytes) => {
                     if let Err(err) = integrity.verify(&bytes) {
                         warn!("SSRI verification failed for blob {hex}: {err}. Auto-purging.");
@@ -1052,7 +1056,13 @@ impl Cache {
                     }
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(e) => return Err(CacheError::Io(e)),
+                Err(e) => {
+                    warn!(
+                        "Unreadable or corrupt blob at {} ({e}). Purging corrupted entry.",
+                        blob_path.display()
+                    );
+                    let _ = remove_file_with_retries(&blob_path);
+                }
             }
         }
         Ok(None)
@@ -1307,10 +1317,31 @@ impl Cache {
 
             for path in blob_paths {
                 let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                let is_hex =
+                let is_hex_128 =
                     file_name.len() == 128 && file_name.chars().all(|c| c.is_ascii_hexdigit());
+                let p2 = path
+                    .parent()
+                    .and_then(|p| p.file_name())
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("");
+                let p1 = path
+                    .parent()
+                    .and_then(|p| p.parent())
+                    .and_then(|p| p.file_name())
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("");
+                let is_hex_124 = file_name.len() == 124
+                    && file_name.chars().all(|c| c.is_ascii_hexdigit())
+                    && p1.len() == 2
+                    && p1.chars().all(|c| c.is_ascii_hexdigit())
+                    && p2.len() == 2
+                    && p2.chars().all(|c| c.is_ascii_hexdigit());
 
-                if !is_hex {
+                let expected_hex = if is_hex_128 {
+                    file_name.to_string()
+                } else if is_hex_124 {
+                    format!("{p1}{p2}{file_name}")
+                } else {
                     warn!(
                         "Invalid blob file name '{}' in content-v2. Purging.",
                         path.display()
@@ -1318,14 +1349,14 @@ impl Cache {
                     let _ = remove_file_with_retries(&path);
                     report.corrupted_blobs += 1;
                     continue;
-                }
+                };
 
                 match read_file_with_retries(&path) {
                     Ok(bytes) => {
                         let mut hasher = Sha512::new();
                         hasher.update(&bytes);
                         let actual = HEXLOWER.encode(&hasher.finalize());
-                        if actual.eq_ignore_ascii_case(file_name) {
+                        if actual.eq_ignore_ascii_case(&expected_hex) {
                             report.verified_blobs += 1;
                             report.total_blob_bytes += bytes.len() as u64;
                             valid_blobs.insert(actual.to_ascii_lowercase());
@@ -1333,7 +1364,7 @@ impl Cache {
                             warn!(
                                 "Corrupted blob detected at {} (expected {}, got {}). Purging.",
                                 path.display(),
-                                file_name,
+                                expected_hex,
                                 actual
                             );
                             let _ = remove_file_with_retries(&path);
