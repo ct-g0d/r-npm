@@ -37,6 +37,36 @@ fn set_executable_mode(_path: &Path) -> Result<(), std::io::Error> {
     Ok(())
 }
 
+fn prepare_shim_destination(path: &Path) {
+    if let Ok(meta) = std::fs::symlink_metadata(path) {
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::MetadataExt;
+            let attrs = meta.file_attributes();
+            if attrs & 0x400 != 0 {
+                if attrs & 0x10 != 0 {
+                    let _ = std::fs::remove_dir(path);
+                } else {
+                    let _ = std::fs::remove_file(path);
+                }
+                return;
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            if meta.file_type().is_symlink() {
+                let _ = std::fs::remove_file(path);
+                return;
+            }
+        }
+        if meta.permissions().readonly() {
+            let mut perms = meta.permissions();
+            perms.set_readonly(false);
+            let _ = std::fs::set_permissions(path, perms);
+        }
+    }
+}
+
 /// Generates the content of the executable shim trio for a target script.
 ///
 /// - `rel_path`: Relative path from `node_modules/.bin/` to the target script with forward slashes (e.g. `../my-pkg/bin/cli.js`).
@@ -247,18 +277,21 @@ pub fn create_shim_trio(
     let cmd_path = bin_dir.join(format!("{bin_name}.cmd"));
     let ps1_path = bin_dir.join(format!("{bin_name}.ps1"));
 
+    prepare_shim_destination(&sh_path);
     std::fs::write(&sh_path, content.sh.as_bytes()).map_err(|e| ShimError::Io {
         path: sh_path.clone(),
         source: e,
     })?;
     let _ = set_executable_mode(&sh_path);
 
+    prepare_shim_destination(&cmd_path);
     std::fs::write(&cmd_path, content.cmd.as_bytes()).map_err(|e| ShimError::Io {
         path: cmd_path.clone(),
         source: e,
     })?;
     let _ = set_executable_mode(&cmd_path);
 
+    prepare_shim_destination(&ps1_path);
     std::fs::write(&ps1_path, content.ps1.as_bytes()).map_err(|e| ShimError::Io {
         path: ps1_path.clone(),
         source: e,

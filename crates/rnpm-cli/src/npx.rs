@@ -99,7 +99,7 @@ pub fn translate_npx_args(tokens: &[String]) -> Vec<String> {
                     i += 1;
                     continue;
                 }
-                "no" | "no-yes" => {
+                "n" | "no" | "no-yes" => {
                     if let Some(val) = inline_val {
                         if val == "false" || val == "0" || val == "no" || val == "off" {
                             result.push("--yes".to_string());
@@ -113,7 +113,15 @@ pub fn translate_npx_args(tokens: &[String]) -> Vec<String> {
                     continue;
                 }
                 "no-install" => {
-                    result.push("--no-yes".to_string());
+                    if let Some(val) = inline_val {
+                        if val == "false" || val == "0" || val == "no" || val == "off" {
+                            result.push("--yes".to_string());
+                        } else {
+                            result.push("--no-yes".to_string());
+                        }
+                    } else {
+                        result.push("--no-yes".to_string());
+                    }
                     i += 1;
                     continue;
                 }
@@ -296,16 +304,26 @@ pub fn find_rnpm_executable() -> Option<PathBuf> {
         }
     }
 
+    let candidates = if cfg!(windows) {
+        &["rnpm.exe", "npm.exe"][..]
+    } else {
+        &["rnpm", "npm"][..]
+    };
+
     if let Ok(current_exe) = std::env::current_exe() {
         if let Some(dir) = current_exe.parent() {
-            let candidate = dir.join(if cfg!(windows) { "rnpm.exe" } else { "rnpm" });
-            if candidate.is_file() {
-                return Some(candidate);
-            }
-            if let Some(parent) = dir.parent() {
-                let candidate = parent.join(if cfg!(windows) { "rnpm.exe" } else { "rnpm" });
+            for name in candidates {
+                let candidate = dir.join(name);
                 if candidate.is_file() {
                     return Some(candidate);
+                }
+            }
+            if let Some(parent) = dir.parent() {
+                for name in candidates {
+                    let candidate = parent.join(name);
+                    if candidate.is_file() {
+                        return Some(candidate);
+                    }
                 }
             }
         }
@@ -313,9 +331,11 @@ pub fn find_rnpm_executable() -> Option<PathBuf> {
 
     if let Some(path_var) = std::env::var_os("PATH") {
         for dir in std::env::split_paths(&path_var) {
-            let candidate = dir.join(if cfg!(windows) { "rnpm.exe" } else { "rnpm" });
-            if candidate.is_file() {
-                return Some(candidate);
+            for name in candidates {
+                let candidate = dir.join(name);
+                if candidate.is_file() {
+                    return Some(candidate);
+                }
             }
         }
     }
@@ -431,7 +451,11 @@ mod tests {
             vec!["exec", "--no-yes", "--", "cowsay"]
         );
 
-        // --no and --no-yes
+        // -n, --no and --no-yes
+        assert_eq!(
+            translate_npx_args(&["-n".into(), "cowsay".into()]),
+            vec!["exec", "--no-yes", "--", "cowsay"]
+        );
         assert_eq!(
             translate_npx_args(&["--no".into(), "cowsay".into()]),
             vec!["exec", "--no-yes", "--", "cowsay"]
@@ -439,6 +463,22 @@ mod tests {
         assert_eq!(
             translate_npx_args(&["--no-yes".into(), "cowsay".into()]),
             vec!["exec", "--no-yes", "--", "cowsay"]
+        );
+        assert_eq!(
+            translate_npx_args(&["-n=false".into(), "cowsay".into()]),
+            vec!["exec", "--yes", "--", "cowsay"]
+        );
+        assert_eq!(
+            translate_npx_args(&["-n=0".into(), "cowsay".into()]),
+            vec!["exec", "--yes", "--", "cowsay"]
+        );
+        assert_eq!(
+            translate_npx_args(&["--no=false".into(), "cowsay".into()]),
+            vec!["exec", "--yes", "--", "cowsay"]
+        );
+        assert_eq!(
+            translate_npx_args(&["--no-install=false".into(), "cowsay".into()]),
+            vec!["exec", "--yes", "--", "cowsay"]
         );
 
         // --yes=false / --yes=0 / -y=false / -y=0 / --yes=true / --yes=1 / -y=true / -y=1

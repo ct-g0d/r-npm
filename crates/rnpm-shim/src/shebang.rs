@@ -85,6 +85,13 @@ pub fn normalize_shebang_file(file_path: &Path) -> Result<bool, ShimError> {
 
     let (normalized, changed) = normalize_shebang_bytes(&bytes);
     if changed {
+        if let Ok(metadata) = std::fs::metadata(file_path) {
+            let mut perms = metadata.permissions();
+            if perms.readonly() {
+                perms.set_readonly(false);
+                let _ = std::fs::set_permissions(file_path, perms);
+            }
+        }
         std::fs::write(file_path, &normalized).map_err(|e| ShimError::Io {
             path: file_path.to_path_buf(),
             source: e,
@@ -147,7 +154,7 @@ pub fn parse_shebang(content: &str) -> Option<ShebangInfo> {
         return None;
     }
 
-    let tokens = split_shebang_tokens(line);
+    let mut tokens = split_shebang_tokens(line);
     if tokens.is_empty() {
         return None;
     }
@@ -156,9 +163,13 @@ pub fn parse_shebang(content: &str) -> Option<ShebangInfo> {
     // Check if invoked via /usr/bin/env or env
     if tokens[idx].ends_with("/env") || tokens[idx] == "env" {
         idx += 1;
-        // Check for -S option in env (e.g., /usr/bin/env -S node --harmony)
-        if idx < tokens.len() && tokens[idx] == "-S" {
-            idx += 1;
+        // Check for -S option in env (e.g., /usr/bin/env -S node --harmony or /usr/bin/env -Snode)
+        if idx < tokens.len() {
+            if tokens[idx] == "-S" {
+                idx += 1;
+            } else if let Some(rest) = tokens[idx].strip_prefix("-S") {
+                tokens[idx] = rest.to_string();
+            }
         }
         // Skip environment variable declarations (e.g. FOO=BAR)
         while idx < tokens.len() && tokens[idx].contains('=') && !tokens[idx].starts_with('-') {
@@ -191,10 +202,11 @@ pub fn read_shebang_from_file(file_path: &Path) -> Result<Option<ShebangInfo>, S
         return Ok(None);
     }
 
-    let content = std::fs::read_to_string(file_path).map_err(|e| ShimError::Io {
+    let bytes = std::fs::read(file_path).map_err(|e| ShimError::Io {
         path: file_path.to_path_buf(),
         source: e,
     })?;
+    let content = String::from_utf8_lossy(&bytes);
 
     Ok(parse_shebang(&content))
 }

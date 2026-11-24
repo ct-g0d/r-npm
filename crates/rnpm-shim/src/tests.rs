@@ -1384,3 +1384,85 @@ fn test_replace_existing_symlink_does_not_overwrite_target() {
         assert!(meta.is_file());
     }
 }
+
+#[test]
+fn test_shebang_parsing_env_dash_s_attached() {
+    let s1 = "#!/usr/bin/env -Snode --harmony";
+    let info1 = shebang::parse_shebang(s1).unwrap();
+    assert_eq!(info1.program, "node");
+    assert_eq!(info1.args, vec!["--harmony"]);
+
+    let s2 = "#!/usr/bin/env -SFOO=bar node -e 'console.log(1)'";
+    let info2 = shebang::parse_shebang(s2).unwrap();
+    assert_eq!(info2.program, "node");
+    assert_eq!(info2.args, vec!["-e", "console.log(1)"]);
+}
+
+#[test]
+fn test_cmd_shim_shebang_bom_handling() {
+    let dir = tempdir().unwrap();
+    let script = dir.path().join("bom_tool.js");
+    fs::write(
+        &script,
+        b"\xEF\xBB\xBF#!/usr/bin/env node --max-old-space-size=4096\nconsole.log(1);\n",
+    )
+    .unwrap();
+
+    let shebang = cmd_shim_shebang(&script);
+    assert!(shebang.is_some(), "Shebang with UTF-8 BOM must be recognized");
+    let (vars, prog, args) = shebang.unwrap();
+    assert_eq!(vars, "");
+    assert_eq!(prog, "node");
+    assert_eq!(args, "--max-old-space-size=4096");
+}
+
+#[test]
+fn test_read_shebang_from_binary_file_returns_none_cleanly() {
+    let dir = tempdir().unwrap();
+    let bin_file = dir.path().join("native_tool.exe");
+    // Non-UTF8 binary content
+    fs::write(&bin_file, b"\x7FELF\x02\x01\x01\x00\xFF\xFE\x00\x00\x01\x02").unwrap();
+
+    let result = shebang::read_shebang_from_file(&bin_file);
+    assert!(result.is_ok(), "Binary file should not error");
+    assert_eq!(result.unwrap(), None);
+}
+
+#[test]
+fn test_normalize_shebang_file_readonly_windows() {
+    let dir = tempdir().unwrap();
+    let script = dir.path().join("readonly_cli.js");
+    fs::write(&script, b"#!/usr/bin/env node\r\nconsole.log(1);\r\n").unwrap();
+
+    // Set read-only
+    let mut perms = fs::metadata(&script).unwrap().permissions();
+    perms.set_readonly(true);
+    fs::set_permissions(&script, perms).unwrap();
+
+    let changed = shebang::normalize_shebang_file(&script).unwrap();
+    assert!(changed);
+    let content = fs::read(&script).unwrap();
+    assert_eq!(&content[..20], b"#!/usr/bin/env node\n");
+}
+
+#[test]
+fn test_create_shim_trio_overwriting_readonly_shims() {
+    let dir = tempdir().unwrap();
+    let bin_dir = dir.path().join(".bin");
+    let target = dir.path().join("tool.js");
+    fs::write(&target, b"#!/usr/bin/env node\nconsole.log(1);\n").unwrap();
+
+    // First creation
+    let trio = generator::create_shim_trio(&target, &bin_dir, "mytool").unwrap();
+
+    // Mark all generated shims read-only
+    for p in [&trio.cmd_path, &trio.ps1_path, &trio.sh_path] {
+        let mut perms = fs::metadata(p).unwrap().permissions();
+        perms.set_readonly(true);
+        fs::set_permissions(p, perms).unwrap();
+    }
+
+    // Overwrite must succeed without permission errors
+    let trio2 = generator::create_shim_trio(&target, &bin_dir, "mytool");
+    assert!(trio2.is_ok(), "Overwriting read-only shims must succeed");
+}
