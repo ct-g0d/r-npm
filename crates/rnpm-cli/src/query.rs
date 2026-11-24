@@ -14,6 +14,8 @@ pub struct QueryOptions {
     pub selector: Option<String>,
     pub package_lock_only: bool,
     pub registry: Option<String>,
+    pub expect_results: Option<bool>,
+    pub expect_result_count: Option<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -600,6 +602,44 @@ pub async fn run_query(project_dir: &Path, options: &QueryOptions) -> anyhow::Re
 
     let json_output = serde_json::to_string_pretty(&matched_json_nodes)?;
     println!("{json_output}");
+
+    let config = rnpm_config::Config::load(Some(project_dir)).unwrap_or_default();
+    let entries = matched_json_nodes.len();
+
+    let expect_results = options.expect_results.or_else(|| {
+        config
+            .get("expect-results")
+            .filter(|v| *v != "null")
+            .map(|v| v == "true" || v == "1")
+    });
+
+    if let Some(expected) = expect_results {
+        let actual = entries > 0;
+        if actual != expected {
+            eprintln!(
+                "npm warn query Expected {}results, got {entries}",
+                if expected { "" } else { "no " }
+            );
+            return Ok(1);
+        }
+    } else {
+        let expect_result_count = options.expect_result_count.or_else(|| {
+            config
+                .get("expect-result-count")
+                .filter(|v| *v != "null")
+                .and_then(|v| v.parse::<usize>().ok())
+        });
+
+        if let Some(expected_count) = expect_result_count {
+            if expected_count != entries {
+                eprintln!(
+                    "npm warn query Expected {expected_count} result{}, got {entries}",
+                    if expected_count == 1 { "" } else { "s" }
+                );
+                return Ok(1);
+            }
+        }
+    }
 
     Ok(0)
 }

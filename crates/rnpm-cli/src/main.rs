@@ -400,6 +400,34 @@ pub(crate) enum Commands {
         /// Additional arguments passed to the script
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
+
+        /// Run script across all workspace packages in topological order
+        #[arg(long = "workspaces", short = 'w', alias = "ws")]
+        workspaces: bool,
+
+        /// Run script in specific workspace package(s)
+        #[arg(long = "workspace")]
+        workspace: Vec<String>,
+
+        /// If true, do not fail if a package does not declare the script
+        #[arg(long)]
+        if_present: bool,
+
+        /// Skip lifecycle scripts
+        #[arg(long)]
+        ignore_scripts: bool,
+
+        /// Run scripts with direct stdio inheritance
+        #[arg(long = "foreground-scripts")]
+        foreground_scripts: bool,
+
+        /// Enforce strict sandbox policy
+        #[arg(long = "strict-sandbox")]
+        strict_sandbox: bool,
+
+        /// Include workspace root when workspaces are enabled
+        #[arg(long = "workspace-root", alias = "include-workspace-root")]
+        workspace_root: bool,
     },
 
     /// Run package start script
@@ -407,6 +435,34 @@ pub(crate) enum Commands {
         /// Additional arguments passed to the script
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
+
+        /// Run script across all workspace packages in topological order
+        #[arg(long = "workspaces", short = 'w', alias = "ws")]
+        workspaces: bool,
+
+        /// Run script in specific workspace package(s)
+        #[arg(long = "workspace")]
+        workspace: Vec<String>,
+
+        /// If true, do not fail if a package does not declare the script
+        #[arg(long)]
+        if_present: bool,
+
+        /// Skip lifecycle scripts
+        #[arg(long)]
+        ignore_scripts: bool,
+
+        /// Run scripts with direct stdio inheritance
+        #[arg(long = "foreground-scripts")]
+        foreground_scripts: bool,
+
+        /// Enforce strict sandbox policy
+        #[arg(long = "strict-sandbox")]
+        strict_sandbox: bool,
+
+        /// Include workspace root when workspaces are enabled
+        #[arg(long = "workspace-root", alias = "include-workspace-root")]
+        workspace_root: bool,
     },
 
     /// Run package restart script
@@ -414,6 +470,34 @@ pub(crate) enum Commands {
         /// Additional arguments passed to the script
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
+
+        /// Run script across all workspace packages in topological order
+        #[arg(long = "workspaces", short = 'w', alias = "ws")]
+        workspaces: bool,
+
+        /// Run script in specific workspace package(s)
+        #[arg(long = "workspace")]
+        workspace: Vec<String>,
+
+        /// If true, do not fail if a package does not declare the script
+        #[arg(long)]
+        if_present: bool,
+
+        /// Skip lifecycle scripts
+        #[arg(long)]
+        ignore_scripts: bool,
+
+        /// Run scripts with direct stdio inheritance
+        #[arg(long = "foreground-scripts")]
+        foreground_scripts: bool,
+
+        /// Enforce strict sandbox policy
+        #[arg(long = "strict-sandbox")]
+        strict_sandbox: bool,
+
+        /// Include workspace root when workspaces are enabled
+        #[arg(long = "workspace-root", alias = "include-workspace-root")]
+        workspace_root: bool,
     },
 
     /// Run package stop script
@@ -421,6 +505,34 @@ pub(crate) enum Commands {
         /// Additional arguments passed to the script
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
+
+        /// Run script across all workspace packages in topological order
+        #[arg(long = "workspaces", short = 'w', alias = "ws")]
+        workspaces: bool,
+
+        /// Run script in specific workspace package(s)
+        #[arg(long = "workspace")]
+        workspace: Vec<String>,
+
+        /// If true, do not fail if a package does not declare the script
+        #[arg(long)]
+        if_present: bool,
+
+        /// Skip lifecycle scripts
+        #[arg(long)]
+        ignore_scripts: bool,
+
+        /// Run scripts with direct stdio inheritance
+        #[arg(long = "foreground-scripts")]
+        foreground_scripts: bool,
+
+        /// Enforce strict sandbox policy
+        #[arg(long = "strict-sandbox")]
+        strict_sandbox: bool,
+
+        /// Include workspace root when workspaces are enabled
+        #[arg(long = "workspace-root", alias = "include-workspace-root")]
+        workspace_root: bool,
     },
 
     /// Run arbitrary package scripts
@@ -817,6 +929,9 @@ pub(crate) enum Commands {
         /// Target all workspace packages
         #[arg(long = "workspaces", alias = "ws", global = true)]
         workspaces: bool,
+        /// Include workspace root when workspaces are enabled
+        #[arg(long = "workspace-root", alias = "include-workspace-root", global = true)]
+        include_workspace_root: bool,
     },
 
     /// Create a package.json file or run an initializer
@@ -1095,6 +1210,14 @@ pub(crate) enum Commands {
         /// Custom npm registry URL
         #[arg(long)]
         registry: Option<String>,
+
+        /// Tells npm whether or not to expect results from the command
+        #[arg(long = "expect-results", num_args = 0..=1, default_missing_value = "true")]
+        expect_results: Option<bool>,
+
+        /// Tells npm how many results to expect from the command
+        #[arg(long = "expect-result-count")]
+        expect_result_count: Option<usize>,
     },
 
     /// Publish a package to the registry
@@ -1575,10 +1698,9 @@ pub(crate) enum Commands {
 
     /// Set a configuration value (npm set alias)
     Set {
-        /// Configuration key to set
-        key: String,
-        /// Value to assign
-        value: String,
+        /// Configuration key=value pairs or keys and values
+        #[arg(required = true)]
+        args: Vec<String>,
         /// Set in global configuration
         #[arg(short = 'g', long = "global")]
         global: bool,
@@ -1708,10 +1830,9 @@ pub(crate) enum OwnerAction {
 pub(crate) enum ConfigAction {
     /// Set a configuration key to a value
     Set {
-        /// Configuration key to set (or key=value)
-        key: String,
-        /// Value to assign
-        value: Option<String>,
+        /// Configuration key=value pairs or keys and values
+        #[arg(required = true)]
+        args: Vec<String>,
         /// Set in global configuration
         #[arg(short = 'g', long = "global")]
         global: bool,
@@ -1731,6 +1852,8 @@ pub(crate) enum ConfigAction {
     Delete {
         /// Configuration key to delete
         key: String,
+        /// Further keys to delete
+        extra_keys: Vec<String>,
         /// Delete from global configuration
         #[arg(short = 'g', long = "global")]
         global: bool,
@@ -2308,11 +2431,17 @@ pub(crate) async fn execute_run(
                     .unwrap_or_else(|| member.name.clone());
                 eprintln!("npm error workspace {id}");
                 eprintln!("npm error location {}", member.path.display());
-                if !member.manifest.scripts.contains_key(&script) {
+                let is_missing = !member.manifest.scripts.contains_key(&script)
+                    && !(script == "start" && member.path.join("server.js").exists())
+                    && script != "restart"
+                    && script != "env";
+                if is_missing {
                     eprintln!("npm error Missing script: \"{script}\"\nnpm error\nnpm error To see a list of scripts, run:\nnpm error   npm run --workspace={id}");
                 } else {
                     eprintln!("npm error command failed");
-                    eprintln!("npm error command {}", member.manifest.scripts[&script]);
+                    if let Some(cmd) = member.manifest.scripts.get(&script) {
+                        eprintln!("npm error command {cmd}");
+                    }
                 }
             }
         }
@@ -3014,6 +3143,12 @@ fn preprocess_run_args(
     }
 
     let is_run = subcmd == "run" || subcmd == "run-script" || subcmd == "rum" || subcmd == "urn";
+    let is_lifecycle = subcmd == "test"
+        || subcmd == "t"
+        || subcmd == "tst"
+        || subcmd == "start"
+        || subcmd == "restart"
+        || subcmd == "stop";
 
     let mut clap_flags = Vec::new();
     let mut script_name: Option<String> = if !is_run {
@@ -3034,7 +3169,7 @@ fn preprocess_run_args(
             continue;
         }
 
-        if is_run {
+        if is_run || is_lifecycle {
             if token == "--if-present" {
                 clap_flags.push("--if-present".to_string());
                 i += 1;
@@ -5922,71 +6057,107 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
                 }
             }
         }
-        Commands::Test { args } => {
+        Commands::Test {
+            args,
+            workspaces,
+            workspace,
+            if_present,
+            ignore_scripts,
+            foreground_scripts,
+            strict_sandbox,
+            workspace_root,
+        } => {
             execute_run(
                 current_dir,
                 Some("test".to_string()),
                 args,
-                false,
+                workspaces,
+                workspace,
                 Vec::new(),
                 Vec::new(),
-                Vec::new(),
-                false,
-                false,
-                false,
-                false,
-                false,
+                if_present,
+                ignore_scripts,
+                foreground_scripts,
+                strict_sandbox,
+                workspace_root,
             )
             .await?;
         }
-        Commands::Start { args } => {
+        Commands::Start {
+            args,
+            workspaces,
+            workspace,
+            if_present,
+            ignore_scripts,
+            foreground_scripts,
+            strict_sandbox,
+            workspace_root,
+        } => {
             execute_run(
                 current_dir,
                 Some("start".to_string()),
                 args,
-                false,
+                workspaces,
+                workspace,
                 Vec::new(),
                 Vec::new(),
-                Vec::new(),
-                false,
-                false,
-                false,
-                false,
-                false,
+                if_present,
+                ignore_scripts,
+                foreground_scripts,
+                strict_sandbox,
+                workspace_root,
             )
             .await?;
         }
-        Commands::Restart { args } => {
+        Commands::Restart {
+            args,
+            workspaces,
+            workspace,
+            if_present,
+            ignore_scripts,
+            foreground_scripts,
+            strict_sandbox,
+            workspace_root,
+        } => {
             execute_run(
                 current_dir,
                 Some("restart".to_string()),
                 args,
-                false,
+                workspaces,
+                workspace,
                 Vec::new(),
                 Vec::new(),
-                Vec::new(),
-                false,
-                false,
-                false,
-                false,
-                false,
+                if_present,
+                ignore_scripts,
+                foreground_scripts,
+                strict_sandbox,
+                workspace_root,
             )
             .await?;
         }
-        Commands::Stop { args } => {
+        Commands::Stop {
+            args,
+            workspaces,
+            workspace,
+            if_present,
+            ignore_scripts,
+            foreground_scripts,
+            strict_sandbox,
+            workspace_root,
+        } => {
             execute_run(
                 current_dir,
                 Some("stop".to_string()),
                 args,
-                false,
+                workspaces,
+                workspace,
                 Vec::new(),
                 Vec::new(),
-                Vec::new(),
-                false,
-                false,
-                false,
-                false,
-                false,
+                if_present,
+                ignore_scripts,
+                foreground_scripts,
+                strict_sandbox,
+                workspace_root,
             )
             .await?;
         }
@@ -6398,8 +6569,17 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             json,
             workspace,
             workspaces,
+            include_workspace_root,
         } => {
-            commands::pkg::run(action, prefix, json, workspace, workspaces, current_dir)?;
+            commands::pkg::run(
+                action,
+                prefix,
+                json,
+                workspace,
+                workspaces,
+                include_workspace_root,
+                current_dir,
+            )?;
         }
         Commands::Audit {
             action,
@@ -6647,8 +6827,18 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             selector,
             package_lock_only,
             registry,
+            expect_results,
+            expect_result_count,
         } => {
-            commands::query::run(selector, package_lock_only, registry, current_dir).await?;
+            commands::query::run(
+                selector,
+                package_lock_only,
+                registry,
+                expect_results,
+                expect_result_count,
+                current_dir,
+            )
+            .await?;
         }
         Commands::Publish {
             target,
@@ -7270,14 +7460,12 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             commands::config::run_get_keys(key.as_deref(), &extra_keys, &current_dir)?;
         }
         Commands::Set {
-            key,
-            value,
+            args,
             global,
             location,
         } => {
-            commands::config::run_set(
-                &key,
-                Some(&value),
+            commands::config::run_set_args(
+                &args,
                 global,
                 location.as_deref(),
                 &current_dir,
@@ -7709,6 +7897,16 @@ fn execute_run_sync(
             manifest
                 .scripts
                 .insert("start".to_string(), "node server.js".to_string());
+        } else if script == "restart" {
+            manifest.scripts.insert(
+                "restart".to_string(),
+                "npm stop --if-present && npm start".to_string(),
+            );
+        } else if script == "env" {
+            let env_cmd = if cfg!(windows) { "SET" } else { "env" };
+            manifest
+                .scripts
+                .insert("env".to_string(), env_cmd.to_string());
         } else {
             if if_present {
                 return Ok(());
