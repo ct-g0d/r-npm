@@ -6597,6 +6597,11 @@ fn test_workspace_member_reference_overrides() {
 
     let mut root_manifest = Manifest::default();
     root_manifest.name = Some("monorepo-root".to_string());
+    // Root requests external-dep at ^1.0.0 (which would normally pick 1.0.0 or lowest compatible)
+    root_manifest
+        .dependencies
+        .insert("external-dep".to_string(), "^1.0.0".to_string());
+    // But override points external-dep to $ws-member (which is 2.0.0)
     root_manifest.extra.insert(
         "overrides".to_string(),
         serde_json::json!({
@@ -6619,6 +6624,11 @@ fn test_workspace_member_reference_overrides() {
     let graph = resolve_workspace_graph(&root_manifest, &[member], &provider, &options)
         .expect("Reference override $ws-member should resolve to workspace member spec");
     assert!(graph.nodes.contains_key("node_modules/ws-member"));
+    // Verify that the override actually applied to external-dep, resolving it to 2.0.0 instead of 1.0.0!
+    assert_eq!(
+        graph.nodes.get("node_modules/external-dep").unwrap().version,
+        "2.0.0"
+    );
 }
 
 #[test]

@@ -482,9 +482,27 @@ fn parse_key_and_spec(key: &str) -> Option<(&str, &str)> {
 fn comparator_intersects(c1: &Comparator, c2: &Comparator) -> bool {
     // If either comparator is equality:
     if c1.op == Op::Eq {
+        if c1.version.is_prerelease() {
+            let has_matching_prerelease = c2.version.is_prerelease()
+                && c2.version.major == c1.version.major
+                && c2.version.minor == c1.version.minor
+                && c2.version.patch == c1.version.patch;
+            if !has_matching_prerelease {
+                return false;
+            }
+        }
         return c2.matches(&c1.version);
     }
     if c2.op == Op::Eq {
+        if c2.version.is_prerelease() {
+            let has_matching_prerelease = c1.version.is_prerelease()
+                && c1.version.major == c2.version.major
+                && c1.version.minor == c2.version.minor
+                && c1.version.patch == c2.version.patch;
+            if !has_matching_prerelease {
+                return false;
+            }
+        }
         return c1.matches(&c2.version);
     }
 
@@ -511,13 +529,33 @@ fn comparator_intersects(c1: &Comparator, c2: &Comparator) -> bool {
     }
 
     // Opposite directions: c1 increasing, c2 decreasing
-    if c1_inc && c2_dec && c1.version < c2.version {
-        return true;
+    if c1_inc && c2_dec {
+        if c2.version.is_prerelease()
+            && !c1.version.is_prerelease()
+            && c1.version.major == c2.version.major
+            && c1.version.minor == c2.version.minor
+            && c1.version.patch == c2.version.patch
+        {
+            return false;
+        }
+        if c1.version < c2.version {
+            return true;
+        }
     }
 
     // Opposite directions: c1 decreasing, c2 increasing
-    if c1_dec && c2_inc && c1.version > c2.version {
-        return true;
+    if c1_dec && c2_inc {
+        if c1.version.is_prerelease()
+            && !c2.version.is_prerelease()
+            && c1.version.major == c2.version.major
+            && c1.version.minor == c2.version.minor
+            && c1.version.patch == c2.version.patch
+        {
+            return false;
+        }
+        if c1.version > c2.version {
+            return true;
+        }
     }
 
     false
@@ -588,6 +626,9 @@ fn spec_matches(pattern_spec: &str, requested_spec: &str) -> bool {
             r = sub_spec;
         } else if let Some(at_idx) = rest.rfind('@') {
             r = &rest[at_idx + 1..];
+        } else {
+            // Bare alias like "npm:react" defaults to "*"
+            r = "*";
         }
     }
 
@@ -984,5 +1025,31 @@ mod tests {
             .resolve_override("target", "1.0.0", &["parent", "intermediate"])
             .unwrap();
         assert_eq!(res, Some("9.9.9".to_string()));
+    }
+
+    #[test]
+    fn test_ranges_intersect_prerelease_exclusion() {
+        let r1 = Range::parse("^1.0.0").unwrap();
+        let r_pre = Range::parse("2.0.0-alpha.1").unwrap();
+        // ^1.0.0 must NOT intersect with 2.0.0-alpha.1 per node-semver prerelease rule
+        assert!(!ranges_intersect(&r1, &r_pre));
+
+        let r2 = Range::parse("<2.0.0-beta.1").unwrap();
+        // <2.0.0-beta.1 explicitly targets 2.0.0 prereleases, so it DOES intersect
+        assert!(ranges_intersect(&r2, &r_pre));
+    }
+
+    #[test]
+    fn test_bare_alias_spec_override() {
+        let json = serde_json::json!({
+            "my-react@*": "18.3.1"
+        });
+        let overrides = Overrides::from_json_value(Some(&json), BTreeMap::new());
+
+        // Bare alias "npm:react" defaults to "*"
+        let res = overrides
+            .resolve_override("my-react", "npm:react", &[])
+            .unwrap();
+        assert_eq!(res, Some("18.3.1".to_string()));
     }
 }
