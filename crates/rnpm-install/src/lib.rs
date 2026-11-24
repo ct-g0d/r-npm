@@ -1033,7 +1033,7 @@ impl RegistryPackageProvider {
             let if_none_match = stored_etag.clone();
             let res = self.handle.block_on(async move {
                 client
-                    .get_package_metadata_install_conditional(&pkg_name, if_none_match.as_deref())
+                    .get_package_metadata_full_conditional(&pkg_name, if_none_match.as_deref())
                     .await
             });
 
@@ -1116,7 +1116,7 @@ impl RegistryPackageProvider {
         let pkg_name = name.to_string();
         let res = self.handle.block_on(async move {
             client
-                .get_package_metadata_install_conditional(&pkg_name, None)
+                .get_package_metadata_full_conditional(&pkg_name, None)
                 .await
         });
         match res {
@@ -1494,7 +1494,7 @@ impl PackageMetadataProvider for RegistryPackageProvider {
                     .map(|(n, etag, _)| (n.clone(), etag.clone()))
                     .collect();
                 let results = client_c
-                    .get_package_metadata_install_conditional_concurrent(&req_pkgs)
+                    .get_package_metadata_full_conditional_concurrent(&req_pkgs)
                     .await;
                 for ((name, stored_etag, cached_info), res) in
                     to_revalidate.into_iter().zip(results)
@@ -3323,6 +3323,11 @@ impl Installer {
                     .flatten();
                 let metadata = if cached.is_some() || self.options.offline {
                     cached
+                } else if before_cutoff().is_some() {
+                    self.registry_client
+                        .get_package_metadata_full(&spec.package_name)
+                        .await
+                        .ok()
                 } else {
                     self.registry_client
                         .get_package_metadata_install(&spec.package_name)
@@ -9115,11 +9120,16 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
         let metadata = if let Some(cached) = self.metadata_cache.get(lookup_name) {
             cached.clone()
         } else {
-            let meta = self
-                .registry_client
-                .get_package_metadata_install(lookup_name)
-                .await
-                .map_err(|e| anyhow!("Failed to fetch metadata for {lookup_name}: {e}"))?;
+            let meta = if before_cutoff().is_some() {
+                self.registry_client
+                    .get_package_metadata_full(lookup_name)
+                    .await
+            } else {
+                self.registry_client
+                    .get_package_metadata_install(lookup_name)
+                    .await
+            }
+            .map_err(|e| anyhow!("Failed to fetch metadata for {lookup_name}: {e}"))?;
             self.metadata_cache
                 .insert(lookup_name.to_string(), meta.clone());
             meta
@@ -9256,10 +9266,30 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
             return Ok(());
         }
 
-        let results = self
-            .registry_client
-            .get_package_metadata_install_concurrent(&missing)
-            .await;
+        let results = if before_cutoff().is_some() {
+            let reqs: Vec<(String, Option<String>)> =
+                missing.iter().map(|s| (s.clone(), None)).collect();
+            self.registry_client
+                .get_package_metadata_full_conditional_concurrent(&reqs)
+                .await
+                .into_iter()
+                .map(|r| match r {
+                    Ok(rnpm_registry::client::MetadataFetchResult::Fresh { metadata, .. }) => {
+                        Ok(metadata)
+                    }
+                    Ok(rnpm_registry::client::MetadataFetchResult::NotModified { .. }) => {
+                        Err(rnpm_registry::RegistryError::Other(
+                            "Unexpected 304 Not Modified response for unconditional request".into(),
+                        ))
+                    }
+                    Err(e) => Err(e),
+                })
+                .collect()
+        } else {
+            self.registry_client
+                .get_package_metadata_install_concurrent(&missing)
+                .await
+        };
 
         for (name, res) in missing.into_iter().zip(results) {
             if let Ok(meta) = res {

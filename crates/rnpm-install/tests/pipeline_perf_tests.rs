@@ -147,22 +147,26 @@ fn test_lockfile_from_json_str_readonly_in_pipeline() {
 }
 
 #[tokio::test]
-async fn test_install_v1_accept_header_sent_on_packument_fetch() {
-    let saw_install_accept = Arc::new(AtomicBool::new(false));
-    let saw_flag = Arc::clone(&saw_install_accept);
+async fn test_full_metadata_accept_header_sent_on_ideal_tree_packument_fetch() {
+    let saw_full_accept = Arc::new(AtomicBool::new(false));
+    let saw_flag = Arc::clone(&saw_full_accept);
 
     let server = MockInstallServer::start(move |_method, path, accept| {
         if path.contains("test-pkg") {
-            if accept.contains("application/vnd.npm.install-v1+json") {
+            if accept.contains("application/json")
+                && !accept.contains("application/vnd.npm.install-v1+json")
+            {
                 saw_flag.store(true, Ordering::SeqCst);
             }
             let packument = r#"{
                 "name": "test-pkg",
                 "dist-tags": { "latest": "1.0.0" },
+                "time": { "1.0.0": "2024-01-01T00:00:00.000Z" },
                 "versions": {
                     "1.0.0": {
                         "name": "test-pkg",
                         "version": "1.0.0",
+                        "license": "MIT",
                         "dist": {
                             "tarball": "http://127.0.0.1/test-pkg-1.0.0.tgz",
                             "shasum": "0000000000000000000000000000000000000000"
@@ -200,7 +204,7 @@ async fn test_install_v1_accept_header_sent_on_packument_fetch() {
     let _ = installer.run().await;
 
     assert!(
-        saw_install_accept.load(Ordering::SeqCst),
-        "Expected NPM_INSTALL_ACCEPT header (application/vnd.npm.install-v1+json) to be sent by Installer"
+        saw_full_accept.load(Ordering::SeqCst),
+        "Expected full application/json Accept header (matching npm 11.20.0 buildIdealTree fullMetadata: true) so license/libc/workspaces/time metadata is preserved"
     );
 }
