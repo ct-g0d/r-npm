@@ -24,8 +24,8 @@
 - `run` (alias: `run-script`): Execute scripts defined in `package.json` with appropriate `PATH`, environment variables, credential scrubbing, and process tree lifecycle controls.
   - When invoked without arguments (`rnpm run`), lists all available lifecycle scripts and custom user scripts alongside package ID.
   - Flags: `--workspaces` (`-w`, `ws`), `--workspace`, `--filter`, `--scope`, `--if-present`, `--ignore-scripts`.
-- `exec` / `npx` (alias: `x`): Dynamic ephemeral package downloads and binary execution with isolated temporary workspaces and ancestor binary PATH inheritance.
-  - Flags: `--registry`, `--cache`, `--offline`.
+- `exec` / `npx` (alias: `x`): Dynamic ephemeral package downloads and binary execution with isolated temporary workspaces and ancestor binary PATH inheritance. Also available as standalone `npx` binary with full argument compatibility (including `-c` / `--call`, `--package`, positional runner forwarding, and legacy flag deprecation notices).
+  - Flags: `--registry`, `--cache`, `--offline`, `-c`, `-p`/`--package`, `-y`/`--yes`.
 - `pack`: Package project files into a canonical npm-compatible `.tgz` archive with npm ignore/files filtering.
   - Flags: `--dry-run`, `--json`, `--pack-destination`.
 - `uninstall` (aliases: `remove`, `rm`, `r`, `un`): Remove dependencies from `package.json`, mutate tree, re-hoist if necessary, update lockfile, and clean empty scope directories.
@@ -45,7 +45,7 @@
 - `bin`: Print local executable bin folder (`node_modules/.bin`) or global bin directory (`--global`, `-g`).
 - `audit`: Security vulnerability auditing parsing lockfile trees, querying bulk advisory endpoints using shared `rnpm-config` and `rnpm-registry` stacks, generating structured JSON / human-readable reports, classifying dependencies (`prod`, `dev`, `optional`, `peer`, `peerOptional`), and enforcing `--audit-level` exit thresholds (`info`, `low`, `moderate`, `high`, `critical`, `none`).
   - Flags: `--registry`, `--json`, `--audit-level`, `--dry-run`.
-  - `audit signatures` verifies each installed registry package's ECDSA registry signature against the registry's `/-/npm/v1/keys`, with npm's text and `--json` reports and exit codes. Provenance attestations (`dist.attestations`) are not verified yet.
+  - `audit signatures` verifies each installed registry package's ECDSA registry signature against the registry's `/-/npm/v1/keys`, as well as cryptographically verifying in-toto SLSA provenance attestations (`dist.attestations`) via Sigstore bundles against Sigstore roots (detecting tampered bundles with `EINTEGRITYATTESTATION`), with npm's text and `--json` reports and exit codes.
 - `cache`: Content-addressable cache management (`clean [--force]` and `verify`).
   - Flags: `--cache`.
 - `get` / `set`: Top-level npm-compatible aliases for configuration reads and writes.
@@ -85,7 +85,7 @@ npm error Unsupported URL Type "<protocol>": <spec>
 Regression fixture: `benchmarks/fixtures/gate-e-unsupported-protocol/`.
 
 ### Flags Handling
-Like npm, rnpm rejects no flag as unsupported: flags a command does not declare are read as config. `--save-bundle` works on install, `--production` is treated as `--omit=dev` (with npm's deprecation warning), and `--legacy-peer-deps` / `--strict-peer-deps` are accepted on every command and alias and honored, from the command line or `.npmrc`, by the commands that build a tree (install, ci, update, uninstall, dedupe, audit fix, exec, and their aliases). `--before=<date>` (or `before=` in `.npmrc`) limits install/update resolution and `outdated` to versions published on or before the date, as npm does; `min-release-age` is not implemented yet.
+Like npm, rnpm rejects no flag as unsupported: flags a command does not declare are read as config. `--save-bundle` works on install, `--production` is treated as `--omit=dev` (with npm's deprecation warning), and `--legacy-peer-deps` / `--strict-peer-deps` are accepted on every command and alias and honored, from the command line or `.npmrc`, by the commands that build a tree (install, ci, update, uninstall, dedupe, audit fix, exec, and their aliases). `--before=<date>` (or `before=` in `.npmrc`) limits install/update resolution and `outdated` to versions published on or before the date, as npm does. `--min-release-age=<duration>` (or `min-release-age=` in `.npmrc`, e.g. `24h`, `7d`) and `--min-release-age-exclude` filter out package versions published more recently than the threshold to guard against fresh-release supply-chain attacks, matching npm behavior.
 
 ### Remaining Gaps
 - Registry-specific organization, team, profile, and star APIs vary across compatible registries; rnpm exposes the command surface and reports when the target registry does not implement an endpoint.
