@@ -960,6 +960,8 @@ mod tests {
         let mut root_deps = BTreeMap::new();
         root_deps.insert("pkg-b".to_string(), "$pkg-final".to_string());
         root_deps.insert("pkg-final".to_string(), "1.2.3".to_string());
+        root_deps.insert("pkg-c".to_string(), "$pkg-d".to_string());
+        root_deps.insert("pkg-d".to_string(), "$pkg-c".to_string());
 
         let overrides = Overrides::from_json_value(Some(&json), root_deps);
 
@@ -970,6 +972,7 @@ mod tests {
         // Cyclic reference $pkg-c -> $pkg-d -> $pkg-c must return error, not hang or panic
         let err = overrides.resolve_override("pkg-c", "^1.0.0", &[]);
         assert!(err.is_err());
+        assert!(err.unwrap_err().to_string().contains("cyclic"));
     }
 
     #[test]
