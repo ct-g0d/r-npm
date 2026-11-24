@@ -350,6 +350,44 @@ fn split_parent_and_name(location: &str) -> Option<(&str, &str)> {
     None
 }
 
+fn is_declared_root_spec(spec: &str, kind: SourceKind, root_declared: &HashSet<String>) -> bool {
+    let extracted = unpack_alias(spec);
+    let norm_spec = spec.replace('\\', "/");
+    let norm_extracted = extracted.replace('\\', "/");
+    if root_declared.contains(spec)
+        || root_declared.contains(extracted)
+        || root_declared.contains(&norm_spec)
+        || root_declared.contains(&norm_extracted)
+    {
+        return true;
+    }
+    if kind == SourceKind::Git {
+        if let Some((spec_repo, spec_ref)) = git_identity(spec) {
+            let matched = root_declared.iter().any(|d| {
+                if let Some((d_repo, d_ref)) = git_identity(d) {
+                    if d_repo.eq_ignore_ascii_case(&spec_repo) {
+                        return d_ref.is_empty() || d_ref == spec_ref;
+                    }
+                }
+                false
+            });
+            if matched {
+                return true;
+            }
+        }
+    }
+    root_declared.iter().any(|d| {
+        let d_unpacked = unpack_alias(d);
+        let d_norm = d.replace('\\', "/");
+        let d_unpacked_norm = d_unpacked.replace('\\', "/");
+        d == spec
+            || d == extracted
+            || d_norm == norm_spec
+            || d_unpacked_norm == norm_extracted
+            || d_unpacked == extracted
+    })
+}
+
 fn is_direct_root_dep(
     location: &str,
     packages: &std::collections::BTreeMap<String, LockfilePackage>,
@@ -378,14 +416,8 @@ fn is_direct_root_dep(
             if let Some(spec) = map.get(name) {
                 let spec_kind = parse_source_kind(spec);
                 if spec_kind == kind {
-                    if parent.is_empty() && kind != SourceKind::Registry {
-                        let extracted = unpack_alias(spec);
-                        if !root_declared.contains(name)
-                            && !root_declared.contains(spec)
-                            && !root_declared.contains(extracted)
-                        {
-                            return false;
-                        }
+                    if kind != SourceKind::Registry && !is_declared_root_spec(spec, kind, root_declared) {
+                        return false;
                     }
                     return true;
                 }
@@ -549,7 +581,10 @@ pub fn check_sources_with_root_context(
         {
             for spec in map.values() {
                 let kind = parse_source_kind(spec);
-                check_source_gate(policy, kind, is_root_edge)?;
+                let actual_root = is_root_edge
+                    && (kind == SourceKind::Registry
+                        || is_declared_root_spec(spec, kind, root_declared));
+                check_source_gate(policy, kind, actual_root)?;
             }
         }
 
@@ -1148,6 +1183,7 @@ mod tests {
         root_declared.insert("workspace-a".to_string());
         root_declared.insert("packages/a".to_string());
         root_declared.insert("direct-remote".to_string());
+        root_declared.insert("http://example.com/direct-remote.tgz".to_string());
 
         let mut packages = BTreeMap::new();
 

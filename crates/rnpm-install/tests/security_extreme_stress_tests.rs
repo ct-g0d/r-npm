@@ -1457,10 +1457,11 @@ fn test_lockfile_smuggling_prevention_under_allow_remote_root() {
     root_declared.insert("innocent".to_string());
     root_declared.insert("^1.0.0".to_string());
 
-    // Attacker forged lockfile to resolve "innocent" to a remote malicious tarball
+    // Attacker forged lockfile to resolve "innocent" to a remote malicious tarball,
+    // and forged root dependencies to declare "innocent": "https://evil.com/malicious.tgz"
     let mut packages = BTreeMap::new();
     let mut root_deps = BTreeMap::new();
-    root_deps.insert("innocent".to_string(), "^1.0.0".to_string());
+    root_deps.insert("innocent".to_string(), "https://evil.com/malicious.tgz".to_string());
     packages.insert(
         String::new(),
         LockfilePackage {
@@ -1489,9 +1490,100 @@ fn test_lockfile_smuggling_prevention_under_allow_remote_root() {
         ..Default::default()
     };
 
-    // Must FAIL because innocent was declared as registry ^1.0.0, but resolved as remote!
+    // Must FAIL because innocent was declared as registry ^1.0.0, but forged as remote in lockfile root and resolved!
     let res = check_sources(&lockfile, &root_declared, &workspace_paths, &policy);
     assert!(res.is_err(), "Expected lockfile smuggling of remote dep to fail under allow-remote=root");
     let err = res.unwrap_err().to_string();
     assert!(err.contains("EALLOWREMOTE"), "Expected EALLOWREMOTE, got: {err}");
+}
+
+#[test]
+fn test_lockfile_smuggling_prevention_in_workspace_member() {
+    let mut root_declared = HashSet::new();
+    // Workspace member package.json declared "ws-innocent": "^2.0.0"
+    root_declared.insert("ws-innocent".to_string());
+    root_declared.insert("^2.0.0".to_string());
+
+    let mut workspace_paths = HashSet::new();
+    workspace_paths.insert("packages/sub".to_string());
+
+    // Attacker forged lockfile: packages["packages/sub"].dependencies has "ws-innocent": "https://evil.com/malicious.tgz"
+    let mut packages = BTreeMap::new();
+    let mut ws_deps = BTreeMap::new();
+    ws_deps.insert("ws-innocent".to_string(), "https://evil.com/malicious.tgz".to_string());
+    packages.insert(
+        "packages/sub".to_string(),
+        LockfilePackage {
+            dependencies: Some(ws_deps),
+            ..Default::default()
+        },
+    );
+    packages.insert(
+        "packages/sub/node_modules/ws-innocent".to_string(),
+        LockfilePackage {
+            resolved: Some("https://evil.com/malicious.tgz".to_string()),
+            ..Default::default()
+        },
+    );
+
+    let lockfile = LockfileV3 {
+        name: "test-ws-smuggle".to_string(),
+        version: None,
+        lockfile_version: 3,
+        requires: None,
+        packages,
+    };
+    let policy = SourcePolicy {
+        remote: AllowMode::Root,
+        ..Default::default()
+    };
+
+    let res = check_sources(&lockfile, &root_declared, &workspace_paths, &policy);
+    assert!(res.is_err(), "Expected workspace lockfile smuggling to fail under allow-remote=root");
+    let err = res.unwrap_err().to_string();
+    assert!(err.contains("EALLOWREMOTE"), "Expected EALLOWREMOTE, got: {err}");
+}
+
+#[test]
+fn test_authored_file_spec_with_windows_slash_matches() {
+    let mut root_declared = HashSet::new();
+    // package.json authored with forward slashes "./local/tool"
+    root_declared.insert("local-tool".to_string());
+    root_declared.insert("./local/tool".to_string());
+
+    // Lockfile recorded with Windows backslashes ".\\local\\tool"
+    let mut packages = BTreeMap::new();
+    let mut root_deps = BTreeMap::new();
+    root_deps.insert("local-tool".to_string(), ".\\local\\tool".to_string());
+    packages.insert(
+        String::new(),
+        LockfilePackage {
+            dependencies: Some(root_deps),
+            ..Default::default()
+        },
+    );
+    packages.insert(
+        "node_modules/local-tool".to_string(),
+        LockfilePackage {
+            resolved: Some(".\\local\\tool".to_string()),
+            ..Default::default()
+        },
+    );
+
+    let lockfile = LockfileV3 {
+        name: "test-slash".to_string(),
+        version: None,
+        lockfile_version: 3,
+        requires: None,
+        packages,
+    };
+    let workspace_paths = HashSet::new();
+    let policy = SourcePolicy {
+        file: AllowMode::Root,
+        directory: AllowMode::Root,
+        ..Default::default()
+    };
+
+    let res = check_sources(&lockfile, &root_declared, &workspace_paths, &policy);
+    assert!(res.is_ok(), "Expected Windows backslash spec in lockfile to match authored forward slash spec, got: {:?}", res.err());
 }
