@@ -513,14 +513,26 @@ fn candidate_shadows_ancestor_dep(
     let Some(ancestor_node) = graph.nodes.get(ancestor) else {
         return false;
     };
+    let is_top = ancestor.is_empty()
+        || !ancestor
+            .split(['/', '\\'])
+            .any(|segment| segment == "node_modules");
     let dep_spec = ancestor_node
         .dependencies
         .get(install_name)
         .or_else(|| ancestor_node.dependencies.get(package_name))
         .or_else(|| ancestor_node.optional_dependencies.get(install_name))
         .or_else(|| ancestor_node.optional_dependencies.get(package_name))
-        .or_else(|| ancestor_node.dev_dependencies.get(install_name))
-        .or_else(|| ancestor_node.dev_dependencies.get(package_name))
+        .or_else(|| {
+            if is_top {
+                ancestor_node
+                    .dev_dependencies
+                    .get(install_name)
+                    .or_else(|| ancestor_node.dev_dependencies.get(package_name))
+            } else {
+                None
+            }
+        })
         .or_else(|| ancestor_node.peer_dependencies.get(install_name))
         .or_else(|| ancestor_node.peer_dependencies.get(package_name));
 
@@ -1139,24 +1151,34 @@ mod tests {
     #[test]
     fn test_candidate_shadows_ancestor_dev_and_peer_dependencies() {
         let mut graph = DependencyGraph::new();
-        let mut ancestor_node = make_test_node("node_modules/parent", "parent", "1.0.0");
-        ancestor_node
+        // Workspace member or root package honors devDependencies
+        let mut ws_ancestor = make_test_node("packages/parent", "parent", "1.0.0");
+        ws_ancestor
             .dev_dependencies
             .insert("dev-dep".to_string(), "^1.0.0".to_string());
-        ancestor_node
+        graph
+            .nodes
+            .insert("packages/parent".to_string(), ws_ancestor);
+
+        // Installed package in node_modules honors peerDependencies, but never devDependencies
+        let mut installed_ancestor = make_test_node("node_modules/parent", "parent", "1.0.0");
+        installed_ancestor
+            .dev_dependencies
+            .insert("dev-dep".to_string(), "^1.0.0".to_string());
+        installed_ancestor
             .peer_dependencies
             .insert("peer-dep".to_string(), "^1.0.0".to_string());
         graph
             .nodes
-            .insert("node_modules/parent".to_string(), ancestor_node);
+            .insert("node_modules/parent".to_string(), installed_ancestor);
 
         let target_v2 = PackageTarget::Range(Range::parse("^2.0.0").unwrap());
         let target_v1 = PackageTarget::Range(Range::parse("^1.0.0").unwrap());
 
-        // devDependencies shadowing guard
+        // devDependencies shadowing guard for workspace package
         assert!(candidate_shadows_ancestor_dep(
             &graph,
-            "node_modules/parent",
+            "packages/parent",
             "dev-dep",
             "dev-dep",
             &target_v2,
@@ -1164,14 +1186,24 @@ mod tests {
         ));
         assert!(!candidate_shadows_ancestor_dep(
             &graph,
-            "node_modules/parent",
+            "packages/parent",
             "dev-dep",
             "dev-dep",
             &target_v1,
             Some("1.1.0"),
         ));
 
-        // peerDependencies shadowing guard
+        // devDependencies on installed packages in node_modules are ignored and never shadow
+        assert!(!candidate_shadows_ancestor_dep(
+            &graph,
+            "node_modules/parent",
+            "dev-dep",
+            "dev-dep",
+            &target_v2,
+            Some("2.0.0"),
+        ));
+
+        // peerDependencies shadowing guard on installed packages
         assert!(candidate_shadows_ancestor_dep(
             &graph,
             "node_modules/parent",
