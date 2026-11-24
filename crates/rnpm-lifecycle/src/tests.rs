@@ -4522,3 +4522,38 @@ fn test_github_actions_sub_ci_tokens() {
     );
     assert_eq!(github_actions_sub_ci("", "github-hosted"), None);
 }
+
+#[tokio::test]
+async fn test_init_cwd_preservation() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("root");
+    let caller_dir = temp.path().join("caller");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::create_dir_all(&caller_dir).unwrap();
+
+    let mut ctx = LifecycleContext::new(
+        &root,
+        &root,
+        "test-init-cwd",
+        "custom-hook",
+        "echo test",
+    );
+
+    // 1. When not in extra_env, falls back to project_root
+    let env_default = build_lifecycle_env(&ctx);
+    assert_eq!(
+        env_default.get("INIT_CWD").unwrap(),
+        &root.to_string_lossy().to_string()
+    );
+
+    // 2. When provided in extra_env (e.g. from opts.init_cwd), it is preserved!
+    ctx.extra_env.insert(
+        "INIT_CWD".to_string(),
+        caller_dir.to_string_lossy().to_string(),
+    );
+    let env_custom = build_lifecycle_env(&ctx);
+    assert_eq!(
+        env_custom.get("INIT_CWD").unwrap(),
+        &caller_dir.to_string_lossy().to_string()
+    );
+}
