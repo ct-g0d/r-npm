@@ -582,7 +582,9 @@ impl GitFetcher {
 
             let (subm_ok, _, subm_err) = run_git_cmd(&subm_args, Some(&checkout_dir)).await?;
             if !subm_ok {
-                if subm_err.contains("protocol") || subm_err.contains("transport 'file'") {
+                if is_file_proto
+                    && (subm_err.contains("protocol") || subm_err.contains("transport 'file'"))
+                {
                     let (retry_ok, _, retry_err) = run_git_cmd(
                         &[
                             "-c",
