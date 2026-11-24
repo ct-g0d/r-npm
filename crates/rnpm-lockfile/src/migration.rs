@@ -168,35 +168,61 @@ fn flatten_legacy_dependencies(
             format!("{parent_path}/node_modules/{dep_name}")
         };
 
-        let (alias_or_name, clean_version) =
-            parse_legacy_version_and_name(dep_name, &dep.version, dep.name.as_deref());
+        let is_dir_link = dep.version.starts_with("file:")
+            && !dep.version.ends_with(".tgz")
+            && !dep.version.ends_with(".tar.gz")
+            && !dep.version.ends_with(".tar");
+
+        let (alias_or_name, clean_version) = if is_dir_link {
+            (None, None)
+        } else {
+            parse_legacy_version_and_name(dep_name, &dep.version, dep.name.as_deref())
+        };
+
+        let resolved = if is_dir_link {
+            let raw_target = dep.version.strip_prefix("file:").unwrap().trim_matches('/');
+            let raw_target = raw_target
+                .strip_prefix("./")
+                .unwrap_or(raw_target)
+                .trim_matches('/');
+            let posix = to_posix_path(raw_target);
+            let canonical = if posix == "." || posix.is_empty() {
+                "".to_string()
+            } else {
+                posix
+            };
+            Some(canonical)
+        } else {
+            dep.resolved.clone()
+        };
 
         let mut pkg = LockfilePackage {
             name: alias_or_name,
             version: clean_version,
-            resolved: dep.resolved.clone(),
-            integrity: dep.integrity.clone(),
-            dev: if dep.dev == Some(true) {
+            resolved: resolved.clone(),
+            integrity: if is_dir_link { None } else { dep.integrity.clone() },
+            link: if is_dir_link { Some(true) } else { None },
+            dev: if !is_dir_link && dep.dev == Some(true) {
                 Some(true)
             } else {
                 None
             },
-            optional: if dep.optional == Some(true) {
+            optional: if !is_dir_link && dep.optional == Some(true) {
                 Some(true)
             } else {
                 None
             },
-            dev_optional: if dep.dev_optional == Some(true) {
+            dev_optional: if !is_dir_link && dep.dev_optional == Some(true) {
                 Some(true)
             } else {
                 None
             },
-            peer: if dep.peer == Some(true) {
+            peer: if !is_dir_link && dep.peer == Some(true) {
                 Some(true)
             } else {
                 None
             },
-            peer_optional: if dep.peer_optional == Some(true) {
+            peer_optional: if !is_dir_link && dep.peer_optional == Some(true) {
                 Some(true)
             } else {
                 None
@@ -216,12 +242,30 @@ fn flatten_legacy_dependencies(
             } else {
                 None
             },
-            dependencies: dep.requires.clone(),
+            dependencies: if is_dir_link {
+                None
+            } else {
+                dep.requires.clone()
+            },
             ..Default::default()
         };
         pkg.normalize_flags();
 
         out_packages.insert(node_path.clone(), pkg);
+
+        if is_dir_link {
+            if let Some(target) = resolved {
+                out_packages.entry(target).or_insert_with(|| {
+                    let mut target_pkg = LockfilePackage {
+                        name: dep.name.clone().or_else(|| Some(dep_name.clone())),
+                        dependencies: dep.requires.clone(),
+                        ..Default::default()
+                    };
+                    target_pkg.normalize_flags();
+                    target_pkg
+                });
+            }
+        }
 
         if let Some(child_deps) = &dep.dependencies {
             flatten_legacy_dependencies(&node_path, child_deps, out_packages);
@@ -273,6 +317,35 @@ fn enrich_packages_from_legacy(
             }
             if pkg.has_shrinkwrap.is_none() && dep.has_shrinkwrap == Some(true) {
                 pkg.has_shrinkwrap = Some(true);
+            }
+            let is_dir_link = dep.version.starts_with("file:")
+                && !dep.version.ends_with(".tgz")
+                && !dep.version.ends_with(".tar.gz")
+                && !dep.version.ends_with(".tar");
+            if is_dir_link {
+                if pkg.link.is_none() {
+                    pkg.link = Some(true);
+                }
+                pkg.dev = None;
+                pkg.optional = None;
+                pkg.dev_optional = None;
+                pkg.peer = None;
+                pkg.peer_optional = None;
+                if pkg.resolved.is_none() {
+                    let raw_target = dep.version.strip_prefix("file:").unwrap().trim_matches('/');
+                    let raw_target = raw_target
+                        .strip_prefix("./")
+                        .unwrap_or(raw_target)
+                        .trim_matches('/');
+                    let posix = to_posix_path(raw_target);
+                    let canonical = if posix == "." || posix.is_empty() {
+                        "".to_string()
+                    } else {
+                        posix
+                    };
+                    pkg.resolved = Some(canonical);
+                }
+                pkg.dependencies = None;
             }
             pkg.normalize_flags();
         } else {

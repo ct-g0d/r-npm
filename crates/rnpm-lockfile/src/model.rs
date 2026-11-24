@@ -197,9 +197,9 @@ fn parse_engine_entry_str(entry: &str) -> Option<(&str, &str)> {
     if trimmed.is_empty() {
         return None;
     }
-    if let Some(idx) = trimmed.find(|c: char| c.is_whitespace() || c == '@') {
+    if let Some((idx, ch)) = trimmed.char_indices().find(|(_, c)| c.is_whitespace() || *c == '@') {
         let name = trimmed[..idx].trim();
-        let range = trimmed[idx + 1..].trim();
+        let range = trimmed[idx + ch.len_utf8()..].trim();
         if !name.is_empty() && !range.is_empty() {
             return Some((name, range));
         }
@@ -268,6 +268,41 @@ pub enum PackageBin {
     Map(BTreeMap<String, String>),
 }
 
+/// Helper deserializer to tolerate object or array license forms and extract the license type/expression.
+pub(crate) fn deserialize_license<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let val = serde_json::Value::deserialize(deserializer)?;
+    match val {
+        serde_json::Value::String(s) => {
+            if s.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(s))
+            }
+        }
+        serde_json::Value::Object(map) => {
+            if let Some(t) = map.get("type").and_then(|v| v.as_str()) {
+                Ok(Some(t.to_string()))
+            } else if let Some(n) = map.get("name").and_then(|v| v.as_str()) {
+                Ok(Some(n.to_string()))
+            } else {
+                Ok(None)
+            }
+        }
+        serde_json::Value::Array(arr) => {
+            let joined: Vec<&str> = arr.iter().filter_map(|v| v.as_str()).collect();
+            if joined.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(joined.join(" OR ")))
+            }
+        }
+        _ => Ok(None),
+    }
+}
+
 /// Metadata for a package node in lockfile v3 `packages`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct LockfilePackage {
@@ -291,7 +326,7 @@ pub struct LockfilePackage {
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub resolved: Option<String>,
 
-    #[serde(skip_serializing_if = "Option::is_none", default)]
+    #[serde(skip_serializing_if = "Option::is_none", alias = "_integrity", default)]
     pub integrity: Option<String>,
 
     #[serde(skip_serializing_if = "is_false_or_none", default)]
@@ -337,6 +372,7 @@ pub struct LockfilePackage {
 
     #[serde(
         rename = "hasShrinkwrap",
+        alias = "_hasShrinkwrap",
         skip_serializing_if = "is_false_or_none",
         default
     )]
@@ -345,7 +381,11 @@ pub struct LockfilePackage {
     #[serde(skip_serializing_if = "is_false_or_none", default)]
     pub extraneous: Option<bool>,
 
-    #[serde(skip_serializing_if = "Option::is_none", default)]
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_license",
+        default
+    )]
     pub license: Option<String>,
 
     #[serde(skip_serializing_if = "is_none_or_empty_platform", default)]
@@ -476,6 +516,7 @@ impl LockfilePackage {
     /// Sets the `dev` flag (clearing `false` to `None`).
     pub fn set_dev(&mut self, val: bool) {
         self.dev = if val { Some(true) } else { None };
+        self.raw_value = None;
     }
 
     /// `$name` override references of this package, in arborist's edge.js
@@ -509,6 +550,7 @@ impl LockfilePackage {
     /// Sets the `optional` flag (clearing `false` to `None`).
     pub fn set_optional(&mut self, val: bool) {
         self.optional = if val { Some(true) } else { None };
+        self.raw_value = None;
     }
 
     pub fn with_optional(mut self, val: bool) -> Self {
@@ -519,6 +561,7 @@ impl LockfilePackage {
     /// Sets the `devOptional` flag (clearing `false` to `None`).
     pub fn set_dev_optional(&mut self, val: bool) {
         self.dev_optional = if val { Some(true) } else { None };
+        self.raw_value = None;
     }
 
     pub fn with_dev_optional(mut self, val: bool) -> Self {
@@ -529,6 +572,7 @@ impl LockfilePackage {
     /// Sets the `peer` flag (clearing `false` to `None`).
     pub fn set_peer(&mut self, val: bool) {
         self.peer = if val { Some(true) } else { None };
+        self.raw_value = None;
     }
 
     pub fn with_peer(mut self, val: bool) -> Self {
@@ -539,6 +583,7 @@ impl LockfilePackage {
     /// Sets the `peerOptional` flag (clearing `false` to `None`).
     pub fn set_peer_optional(&mut self, val: bool) {
         self.peer_optional = if val { Some(true) } else { None };
+        self.raw_value = None;
     }
 
     pub fn with_peer_optional(mut self, val: bool) -> Self {
@@ -549,6 +594,7 @@ impl LockfilePackage {
     /// Sets the `inBundle` flag (clearing `false` to `None`).
     pub fn set_in_bundle(&mut self, val: bool) {
         self.in_bundle = if val { Some(true) } else { None };
+        self.raw_value = None;
     }
 
     pub fn with_in_bundle(mut self, val: bool) -> Self {
@@ -559,6 +605,7 @@ impl LockfilePackage {
     /// Sets the `hasInstallScript` flag (clearing `false` to `None`).
     pub fn set_has_install_script(&mut self, val: bool) {
         self.has_install_script = if val { Some(true) } else { None };
+        self.raw_value = None;
     }
 
     pub fn with_has_install_script(mut self, val: bool) -> Self {
@@ -569,6 +616,7 @@ impl LockfilePackage {
     /// Sets the `hasShrinkwrap` flag (clearing `false` to `None`).
     pub fn set_has_shrinkwrap(&mut self, val: bool) {
         self.has_shrinkwrap = if val { Some(true) } else { None };
+        self.raw_value = None;
     }
 
     pub fn with_has_shrinkwrap(mut self, val: bool) -> Self {
@@ -579,6 +627,7 @@ impl LockfilePackage {
     /// Sets the `link` flag (clearing `false` to `None`).
     pub fn set_link(&mut self, val: bool) {
         self.link = if val { Some(true) } else { None };
+        self.raw_value = None;
     }
 
     pub fn with_link(mut self, val: bool) -> Self {
@@ -592,6 +641,7 @@ impl LockfilePackage {
     /// - If only `is_optional` is true, sets `optional: true`.
     /// - If neither, clears all three flags.
     pub fn set_dependency_types(&mut self, is_dev: bool, is_optional: bool) {
+        self.raw_value = None;
         if is_dev && is_optional {
             self.dev = Some(true);
             self.optional = Some(true);
@@ -621,6 +671,7 @@ impl LockfilePackage {
     /// - For npm 11 / lockfile v3, packages reachable via dev and optional branches retain `dev: true, optional: true`.
     /// - Any `false` boolean flags are normalized to `None`.
     pub fn normalize_flags(&mut self) {
+        self.raw_value = None;
         if self.dev == Some(false) {
             self.dev = None;
         }
@@ -734,6 +785,7 @@ impl LockfilePackage {
 
     /// Sets or unsets `optional: true` for a peer dependency in `peerDependenciesMeta`.
     pub fn set_peer_dep_optional(&mut self, dep_name: impl Into<String>, optional: bool) {
+        self.raw_value = None;
         let name = dep_name.into();
         if optional {
             let map = self
@@ -1248,7 +1300,7 @@ impl LockfileV3 {
         let root_has_ws = root_pkg.workspaces.as_ref().is_some_and(|w| !w.is_empty());
 
         if manifest_has_ws && root_has_ws {
-            let mut m = manifest_ws.unwrap();
+            let mut m = manifest_ws.clone().unwrap();
             let mut r = root_pkg.workspaces.clone().unwrap_or_default();
             m.sort();
             r.sort();
@@ -1257,9 +1309,10 @@ impl LockfileV3 {
             }
         } else if !manifest_has_ws && root_has_ws {
             return false;
-        } else if manifest_has_ws && !root_has_ws {
-            // Root workspace metadata is absent in lockfile (e.g. npm v1 workspace lock or npm v3 omission).
-            // Validate legacy / omitted lockfile via discovered members and available links while preserving genuine drift checks.
+        }
+
+        if manifest_has_ws {
+            // Validate workspace members and links against manifest patterns and discovered members on disk.
             let patterns = manifest.workspace_patterns();
 
             // Collect discovered workspace member paths from packages map
@@ -1309,10 +1362,12 @@ impl LockfileV3 {
                 }
             }
 
-            // All lockfile member paths outside node_modules must match workspace patterns
-            for member_path in &lockfile_member_paths {
-                if !Self::path_matches_workspace_patterns(member_path, &patterns) {
-                    return false;
+            if !root_has_ws {
+                // All lockfile member paths outside node_modules must match workspace patterns
+                for member_path in &lockfile_member_paths {
+                    if !Self::path_matches_workspace_patterns(member_path, &patterns) {
+                        return false;
+                    }
                 }
             }
 
@@ -1328,9 +1383,11 @@ impl LockfileV3 {
                     }
                 }
 
-                // 2. Every member path in lockfile must exist on disk (detects stale / deleted members)
+                // 2. Every member path in lockfile matching workspace patterns must exist on disk (detects stale / deleted members)
                 for member_path in &lockfile_member_paths {
-                    if !members.iter().any(|m| m.relative_path == *member_path) {
+                    if Self::path_matches_workspace_patterns(member_path, &patterns)
+                        && !members.iter().any(|m| m.relative_path == *member_path)
+                    {
                         return false;
                     }
                 }
@@ -1343,7 +1400,7 @@ impl LockfileV3 {
                         return false;
                     }
                 }
-            } else {
+            } else if !root_has_ws {
                 // Workspace discovery is unavailable (None).
                 // Lockfile must have at least one workspace member or link matching patterns.
                 let has_matching_member = lockfile_member_paths
@@ -1501,14 +1558,30 @@ impl LockfileV3 {
             return false;
         };
         if pkg.link == Some(true) {
-            if let PackageTarget::Alias { ref name, .. } = target {
-                if pkg.name.as_deref() != Some(name) {
-                    return false;
+            match &target {
+                PackageTarget::Alias { name, target } => {
+                    if pkg.name.as_deref() != Some(name) {
+                        return false;
+                    }
+                    if let PackageTarget::File(_) = &**target {
+                        if let Some(ref res) = pkg.resolved {
+                            return Self::target_matches_resolved(res, target);
+                        }
+                    }
                 }
+                PackageTarget::File(_) => {
+                    if let Some(ref res) = pkg.resolved {
+                        return Self::target_matches_resolved(res, &target);
+                    }
+                }
+                _ => {}
             }
             return true;
         }
         let Some(ref ver_str) = pkg.version else {
+            if let Some(ref res) = pkg.resolved {
+                return Self::target_matches_resolved(res, &target);
+            }
             return false;
         };
         match &target {
@@ -1516,7 +1589,7 @@ impl LockfileV3 {
                 if pkg.name.as_deref() != Some(name) {
                     return false;
                 }
-                Self::version_matches_target(ver_str, target)
+                Self::version_matches_target(ver_str, target, pkg.resolved.as_deref())
             }
             other => {
                 if let Some(ref real_name) = pkg.name {
@@ -1524,17 +1597,149 @@ impl LockfileV3 {
                         return false;
                     }
                 }
-                Self::version_matches_target(ver_str, other)
+                Self::version_matches_target(ver_str, other, pkg.resolved.as_deref())
             }
         }
     }
 
-    fn version_matches_target(ver_str: &str, target: &PackageTarget) -> bool {
+    fn is_posix_path_absolute(p: &str) -> bool {
+        p.starts_with('/')
+            || (p.len() >= 2
+                && p.as_bytes()[0].is_ascii_alphabetic()
+                && p.as_bytes()[1] == b':')
+    }
+
+    fn canonicalize_git_identity(raw: &str) -> String {
+        let s = raw.split('#').next().unwrap_or(raw).trim();
+        let s = s.split('?').next().unwrap_or(s).trim();
+        let s = s.strip_prefix("git+").unwrap_or(s);
+
+        let expanded = if let Some(rest) = s.strip_prefix("github:") {
+            format!("github.com/{rest}")
+        } else if let Some(rest) = s.strip_prefix("gitlab:") {
+            format!("gitlab.com/{rest}")
+        } else if let Some(rest) = s.strip_prefix("bitbucket:") {
+            format!("bitbucket.org/{rest}")
+        } else if let Some(rest) = s.strip_prefix("gist:") {
+            format!("gist.github.com/{rest}")
+        } else if !s.contains(':') && !s.contains('@') && s.split('/').count() == 2 {
+            format!("github.com/{s}")
+        } else {
+            s.to_string()
+        };
+
+        let without_proto = if let Some(idx) = expanded.find("://") {
+            &expanded[idx + 3..]
+        } else {
+            &expanded
+        };
+
+        let without_user = if let Some(at_idx) = without_proto.find('@') {
+            let slash_idx = without_proto.find('/').unwrap_or(usize::MAX);
+            let colon_idx = without_proto.find(':').unwrap_or(usize::MAX);
+            if at_idx < slash_idx && at_idx < colon_idx {
+                &without_proto[at_idx + 1..]
+            } else {
+                without_proto
+            }
+        } else {
+            without_proto
+        };
+
+        let normalized = if let Some((host, path)) = without_user.split_once(':') {
+            if !host.contains('/') {
+                if let Some((port_or_user, rest_path)) = path.split_once('/') {
+                    if port_or_user.chars().all(|c| c.is_ascii_digit()) {
+                        format!("{host}/{rest_path}")
+                    } else {
+                        format!("{host}/{path}")
+                    }
+                } else {
+                    format!("{host}/{path}")
+                }
+            } else {
+                without_user.to_string()
+            }
+        } else {
+            without_user.to_string()
+        };
+
+        let trimmed = normalized.trim_matches('/');
+        let clean = trimmed.strip_suffix(".git").unwrap_or(trimmed);
+        clean.to_ascii_lowercase()
+    }
+
+    fn target_matches_resolved(resolved: &str, target: &PackageTarget) -> bool {
         match target {
-            PackageTarget::Tag(_)
-            | PackageTarget::File(_)
-            | PackageTarget::Git { .. }
-            | PackageTarget::Url(_) => true,
+            PackageTarget::Url(u) => resolved == u.as_str(),
+            PackageTarget::File(p) => {
+                let clean_res = resolved
+                    .strip_prefix("file:")
+                    .unwrap_or(resolved)
+                    .replace('\\', "/");
+                let clean_res = clean_res
+                    .strip_prefix("./")
+                    .unwrap_or(&clean_res)
+                    .trim_end_matches('/');
+                let clean_res = if clean_res == "." { "" } else { clean_res };
+                let clean_p = p.to_str().unwrap_or("").replace('\\', "/");
+                let clean_p = clean_p
+                    .strip_prefix("./")
+                    .unwrap_or(&clean_p)
+                    .trim_end_matches('/');
+                let clean_p = if clean_p == "." { "" } else { clean_p };
+
+                let res_abs = Self::is_posix_path_absolute(clean_res);
+                let p_abs = Self::is_posix_path_absolute(clean_p);
+
+                if res_abs == p_abs {
+                    if res_abs {
+                        clean_res.eq_ignore_ascii_case(clean_p)
+                    } else {
+                        clean_res == clean_p
+                    }
+                } else if res_abs {
+                    clean_res.ends_with(&format!("/{clean_p}"))
+                } else {
+                    clean_p.ends_with(&format!("/{clean_res}"))
+                }
+            }
+            PackageTarget::Git { url, committish, .. } => {
+                let canon_target = Self::canonicalize_git_identity(url.as_str());
+                let canon_res = Self::canonicalize_git_identity(resolved);
+                if canon_target != canon_res {
+                    return false;
+                }
+                if let Some(ref c) = committish {
+                    let res_frag = resolved.split('#').nth(1).unwrap_or("");
+                    if (c.len() == 40 || c.len() == 64) && c.chars().all(|ch| ch.is_ascii_hexdigit()) {
+                        if !res_frag.eq_ignore_ascii_case(c) {
+                            return false;
+                        }
+                    } else if !res_frag.is_empty() && res_frag.eq_ignore_ascii_case(c) {
+                        return true;
+                    }
+                }
+                true
+            }
+            _ => true,
+        }
+    }
+
+    fn version_matches_target(
+        ver_str: &str,
+        target: &PackageTarget,
+        resolved: Option<&str>,
+    ) -> bool {
+        match target {
+            PackageTarget::Tag(_) => true,
+            PackageTarget::File(_) | PackageTarget::Git { .. } | PackageTarget::Url(_) => {
+                if let Some(res) = resolved {
+                    Self::target_matches_resolved(res, target)
+                } else {
+                    true
+                }
+            }
             PackageTarget::Version(expected) => {
                 let Ok(v) = Version::parse(ver_str) else {
                     return false;
@@ -1567,7 +1772,9 @@ impl LockfileV3 {
                     true
                 }
             }
-            PackageTarget::Alias { target, .. } => Self::version_matches_target(ver_str, target),
+            PackageTarget::Alias { target, .. } => {
+                Self::version_matches_target(ver_str, target, resolved)
+            }
         }
     }
 
@@ -1998,8 +2205,13 @@ impl LockfileV3 {
     }
 
     fn to_legacy_dependencies(&self) -> serde_json::Value {
-        fn package_value(dep_name: &str, package: &LockfilePackage) -> serde_json::Value {
+        fn package_value(
+            dep_name: &str,
+            package: &LockfilePackage,
+            all_packages: &std::collections::BTreeMap<String, LockfilePackage>,
+        ) -> serde_json::Value {
             let mut value = serde_json::Map::new();
+            let is_link = package.link == Some(true);
             if let Some(v) = &package.version {
                 let ver_str = if let Some(real_name) = &package.name {
                     if real_name != dep_name {
@@ -2011,7 +2223,7 @@ impl LockfileV3 {
                     v.clone()
                 };
                 value.insert("version".into(), serde_json::Value::String(ver_str));
-            } else if package.link == Some(true) {
+            } else if is_link {
                 let resolved = package.resolved.as_deref().unwrap_or("");
                 let ver_str = if resolved.starts_with("file:") {
                     resolved.to_string()
@@ -2020,26 +2232,31 @@ impl LockfileV3 {
                 };
                 value.insert("version".into(), serde_json::Value::String(ver_str));
             }
-            if let Some(v) = &package.resolved {
-                value.insert("resolved".into(), serde_json::Value::String(v.clone()));
-            }
-            if let Some(v) = &package.integrity {
-                value.insert("integrity".into(), serde_json::Value::String(v.clone()));
-            }
-            if package.dev == Some(true) {
-                value.insert("dev".into(), serde_json::Value::Bool(true));
-            }
-            if package.optional == Some(true) {
-                value.insert("optional".into(), serde_json::Value::Bool(true));
-            }
-            if package.dev_optional == Some(true) {
-                value.insert("devOptional".into(), serde_json::Value::Bool(true));
-            }
-            if package.peer == Some(true) {
-                value.insert("peer".into(), serde_json::Value::Bool(true));
-            }
-            if package.peer_optional == Some(true) {
-                value.insert("peerOptional".into(), serde_json::Value::Bool(true));
+            if !is_link {
+                if let Some(v) = &package.resolved {
+                    value.insert("resolved".into(), serde_json::Value::String(v.clone()));
+                }
+                if let Some(v) = &package.integrity {
+                    value.insert("integrity".into(), serde_json::Value::String(v.clone()));
+                }
+                if package.dev == Some(true) {
+                    value.insert("dev".into(), serde_json::Value::Bool(true));
+                }
+                if package.optional == Some(true) {
+                    value.insert("optional".into(), serde_json::Value::Bool(true));
+                }
+                if package.dev_optional == Some(true)
+                    && package.dev != Some(true)
+                    && package.optional != Some(true)
+                {
+                    value.insert("devOptional".into(), serde_json::Value::Bool(true));
+                }
+                if package.peer == Some(true) {
+                    value.insert("peer".into(), serde_json::Value::Bool(true));
+                }
+                if package.peer_optional == Some(true) {
+                    value.insert("peerOptional".into(), serde_json::Value::Bool(true));
+                }
             }
             if package.in_bundle == Some(true) {
                 value.insert("bundled".into(), serde_json::Value::Bool(true));
@@ -2050,13 +2267,44 @@ impl LockfileV3 {
             if package.has_shrinkwrap == Some(true) {
                 value.insert("hasShrinkwrap".into(), serde_json::Value::Bool(true));
             }
-            if let Some(deps) = &package.dependencies {
-                if !deps.is_empty() {
-                    value.insert(
-                        "requires".into(),
-                        serde_json::to_value(deps).unwrap_or_default(),
-                    );
+
+            // Build requires from dependencies + optional_dependencies
+            // If is_link and package has no dependencies, look up target package in all_packages
+            let target_pkg = if is_link {
+                let res = package.resolved.as_deref().unwrap_or("");
+                let clean_res = res.strip_prefix("file:").unwrap_or(res).replace('\\', "/");
+                let clean_res = clean_res
+                    .strip_prefix("./")
+                    .unwrap_or(&clean_res)
+                    .trim_matches('/')
+                    .to_string();
+                all_packages
+                    .get(&clean_res)
+                    .or_else(|| {
+                        let alt = format!("./{clean_res}");
+                        all_packages.get(&alt)
+                    })
+                    .unwrap_or(package)
+            } else {
+                package
+            };
+
+            let mut requires = BTreeMap::new();
+            if let Some(deps) = &target_pkg.dependencies {
+                for (k, v) in deps {
+                    requires.insert(k.clone(), v.clone());
                 }
+            }
+            if let Some(opt_deps) = &target_pkg.optional_dependencies {
+                for (k, v) in opt_deps {
+                    requires.insert(k.clone(), v.clone());
+                }
+            }
+            if !requires.is_empty() {
+                value.insert(
+                    "requires".into(),
+                    serde_json::to_value(requires).unwrap_or_default(),
+                );
             }
             serde_json::Value::Object(value)
         }
@@ -2065,13 +2313,14 @@ impl LockfileV3 {
             root: &mut serde_json::Map<String, serde_json::Value>,
             segments: &[&str],
             package: &LockfilePackage,
+            all_packages: &std::collections::BTreeMap<String, LockfilePackage>,
         ) {
             if segments.is_empty() {
                 return;
             }
             let name = segments[0];
             if segments.len() == 1 {
-                root.insert(name.to_string(), package_value(name, package));
+                root.insert(name.to_string(), package_value(name, package, all_packages));
                 return;
             }
             let entry = root
@@ -2086,7 +2335,7 @@ impl LockfileV3 {
             let Some(nested_obj) = nested.as_object_mut() else {
                 return;
             };
-            insert_node(nested_obj, &segments[1..], package);
+            insert_node(nested_obj, &segments[1..], package, all_packages);
         }
 
         let mut root = serde_json::Map::new();
@@ -2100,7 +2349,7 @@ impl LockfileV3 {
             let path = key.strip_prefix("node_modules/").unwrap_or(key);
             let segments: Vec<_> = path.split("/node_modules/").collect();
             if let Some(package) = self.packages.get(key) {
-                insert_node(&mut root, &segments, package);
+                insert_node(&mut root, &segments, package, &self.packages);
             }
         }
         serde_json::Value::Object(root)
@@ -2412,7 +2661,7 @@ pub fn npm_key_compare(a: &str, b: &str) -> std::cmp::Ordering {
             }
         }
         std::cmp::Ordering::Equal
-    })
+    }).then_with(|| a.cmp(b))
 }
 
 pub(crate) fn stringify_npm_nice(val: &serde_json::Value, indent_level: usize, out: &mut String) {

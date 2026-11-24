@@ -443,10 +443,10 @@ fn is_direct_dependency(
         return false;
     }
 
-    // Direct dependencies are located at `node_modules/<name>` and listed in direct_deps
-    let direct_path = format!("node_modules/{inferred_name}");
-    if clean == direct_path && direct_deps.contains(inferred_name) {
-        return true;
+    if let Some(folder_name) = clean.strip_prefix("node_modules/") {
+        if direct_deps.contains(folder_name) || direct_deps.contains(inferred_name) {
+            return true;
+        }
     }
 
     false
