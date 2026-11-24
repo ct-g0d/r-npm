@@ -187,8 +187,10 @@ pub(crate) fn is_git_spec(spec: &str) -> bool {
                 && !base.ends_with(".tgz")
                 && !base.ends_with(".tar.gz")
                 && !base.ends_with(".tar")
+                && !base.ends_with(".zip")
                 && !base.contains("/archive/")
                 && !base.contains("/releases/download/")
+                && !base.contains("/get/")
             {
                 return true;
             }
@@ -380,7 +382,11 @@ fn is_declared_root_spec(spec: &str, kind: SourceKind, root_declared: &HashSet<S
                 let d_ident = git_identity(d_unpacked).or_else(|| git_identity(d));
                 if let Some((d_repo, d_ref)) = d_ident {
                     if d_repo.eq_ignore_ascii_case(&spec_repo) {
-                        return d_ref.is_empty() || d_ref == spec_ref;
+                        return d_ref.is_empty()
+                            || d_ref == spec_ref
+                            || (d_ref.len() >= 7
+                                && spec_ref.len() >= 7
+                                && (d_ref.starts_with(&spec_ref) || spec_ref.starts_with(&d_ref)));
                     }
                 }
                 false

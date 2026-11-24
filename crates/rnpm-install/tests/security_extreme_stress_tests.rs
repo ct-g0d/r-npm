@@ -1698,3 +1698,53 @@ fn test_aliased_git_root_spec_matching() {
     let res = check_sources(&lockfile, &root_declared, &workspace_paths, &policy);
     assert!(res.is_ok(), "Expected aliased git spec to match git identity under allow-git=root, got: {:?}", res.err());
 }
+
+#[test]
+fn test_hosted_git_zip_archive_and_sha_prefix_matching() {
+    // 1. Hosted .zip archive URLs are classified as Remote, not Git
+    assert_eq!(parse_source_kind("https://github.com/user/repo/archive/master.zip"), SourceKind::Remote);
+    assert_eq!(parse_source_kind("https://bitbucket.org/user/repo/get/master.zip"), SourceKind::Remote);
+    assert_eq!(parse_source_kind("https://gitlab.com/user/repo/-/archive/main/repo-main.zip"), SourceKind::Remote);
+
+    // 2. Commit SHA prefix matching in check_sources
+    let mut root_declared = HashSet::new();
+    root_declared.insert("git-sha-pkg".to_string());
+    // Author declared short SHA
+    root_declared.insert("github:user/repo#0123456".to_string());
+
+    let mut packages = BTreeMap::new();
+    let mut root_deps = BTreeMap::new();
+    // Lockfile recorded full 40-character SHA
+    root_deps.insert("git-sha-pkg".to_string(), "git+https://github.com/user/repo.git#0123456789abcdef0123456789abcdef01234567".to_string());
+    packages.insert(
+        String::new(),
+        LockfilePackage {
+            dependencies: Some(root_deps),
+            ..Default::default()
+        },
+    );
+    packages.insert(
+        "node_modules/git-sha-pkg".to_string(),
+        LockfilePackage {
+            resolved: Some("git+https://github.com/user/repo.git#0123456789abcdef0123456789abcdef01234567".to_string()),
+            ..Default::default()
+        },
+    );
+
+    let lockfile = LockfileV3 {
+        name: "test-git-sha".to_string(),
+        version: None,
+        lockfile_version: 3,
+        requires: None,
+        packages,
+    };
+    let workspace_paths = HashSet::new();
+    let policy = SourcePolicy {
+        git: AllowMode::Root,
+        remote: AllowMode::None,
+        ..Default::default()
+    };
+
+    let res = check_sources(&lockfile, &root_declared, &workspace_paths, &policy);
+    assert!(res.is_ok(), "Expected SHA prefix matching to succeed under allow-git=root, got: {:?}", res.err());
+}
