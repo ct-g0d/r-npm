@@ -1663,8 +1663,36 @@ pub fn apply_npmrc_to_client_config(
         client_config.cert = Some(cert_val.clone());
     }
 
+    if let Some(certfile_val) = npmrc
+        .settings
+        .get("certfile")
+        .or_else(|| npmrc.settings.get("cert_file"))
+    {
+        client_config.certfile = Some(PathBuf::from(certfile_val));
+    }
+
     if let Some(key_val) = npmrc.settings.get("key") {
         client_config.key = Some(key_val.clone());
+    }
+
+    if let Some(keyfile_val) = npmrc
+        .settings
+        .get("keyfile")
+        .or_else(|| npmrc.settings.get("key_file"))
+    {
+        client_config.keyfile = Some(PathBuf::from(keyfile_val));
+    }
+
+    for entry in npmrc.scoped_tls_entries() {
+        client_config.add_scoped_tls(
+            entry.prefix,
+            rnpm_registry::ScopedTlsConfig {
+                cert: entry.cert,
+                key: entry.key,
+                certfile: entry.certfile.map(PathBuf::from),
+                keyfile: entry.keyfile.map(PathBuf::from),
+            },
+        );
     }
 
     let timeout_ms = npmrc

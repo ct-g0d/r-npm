@@ -807,3 +807,46 @@ async fn test_git_credential_scrubbing_on_errors() {
         "resolve_git_dependency invalid package.json error should be scrubbed: {resolve_dep_err}"
     );
 }
+
+#[test]
+fn test_apply_npmrc_wires_global_and_scoped_tls_identities() {
+    let npmrc_text = "\
+certfile=/global/cert.pem
+keyfile=/global/key.pem
+//registry.internal.test/:certfile=/scoped/root-cert.pem
+//registry.internal.test/:keyfile=/scoped/root-key.pem
+//registry.internal.test/npm/:cert=INLINE_SUB_CERT
+//registry.internal.test/npm/:key=INLINE_SUB_KEY
+";
+    let npmrc = rnpm_config::Npmrc::parse(npmrc_text).expect("parse npmrc");
+    let mut client_config = rnpm_registry::RegistryClientConfig::default();
+    rnpm_install::apply_npmrc_to_client_config(&mut client_config, &npmrc);
+
+    assert_eq!(
+        client_config.certfile,
+        Some(std::path::PathBuf::from("/global/cert.pem"))
+    );
+    assert_eq!(
+        client_config.keyfile,
+        Some(std::path::PathBuf::from("/global/key.pem"))
+    );
+    let root_scoped = client_config
+        .scoped_tls
+        .get("//registry.internal.test/")
+        .expect("root scoped TLS entry wired");
+    assert_eq!(
+        root_scoped.certfile,
+        Some(std::path::PathBuf::from("/scoped/root-cert.pem"))
+    );
+    assert_eq!(
+        root_scoped.keyfile,
+        Some(std::path::PathBuf::from("/scoped/root-key.pem"))
+    );
+
+    let sub_scoped = client_config
+        .scoped_tls
+        .get("//registry.internal.test/npm/")
+        .expect("subpath scoped TLS entry wired");
+    assert_eq!(sub_scoped.cert.as_deref(), Some("INLINE_SUB_CERT"));
+    assert_eq!(sub_scoped.key.as_deref(), Some("INLINE_SUB_KEY"));
+}
