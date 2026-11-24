@@ -201,20 +201,45 @@ impl GitFetcher {
         // pacote resolves the remote refs before attempting a clone. Preserve
         // that command's stderr and status rather than reporting clone errors.
         let args = ["--no-replace-objects", "ls-remote", clone_url];
-        let output = tokio::process::Command::new("git")
+        let output = match tokio::process::Command::new("git")
             .args(args)
             .env("GIT_TERMINAL_PROMPT", "0")
             .env("GIT_ASKPASS", "")
             .env("SSH_ASKPASS", "")
             .output()
-            .await?;
+            .await
+        {
+            Ok(out) => out,
+            Err(e) => {
+                if e.kind() == std::io::ErrorKind::NotFound {
+                    return Err(anyhow!(
+                        "npm error code ENOENT\nnpm error syscall spawn git\nnpm error path git\nnpm error spawn git ENOENT"
+                    ));
+                }
+                return Err(e.into());
+            }
+        };
+
         if !output.status.success() {
+            let scrubbed_url = rnpm_config::scrub_credentials(&normalized_url);
+            let display_args: Vec<_> = args
+                .iter()
+                .map(|a| {
+                    if *a == normalized_url.as_str() || *a == clone_url {
+                        scrubbed_url.as_str()
+                    } else {
+                        *a
+                    }
+                })
+                .collect();
             let mut block = format!(
                 "npm error code {}\nnpm error An unknown git error occurred\nnpm error command git {}",
-                output.status.code().unwrap_or(128), args.join(" ")
+                output.status.code().unwrap_or(128),
+                display_args.join(" ")
             );
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            for line in stderr.trim().lines() {
+            let raw_stderr = String::from_utf8_lossy(&output.stderr);
+            let scrubbed_stderr = rnpm_config::scrub_credentials(&raw_stderr);
+            for line in scrubbed_stderr.trim().lines() {
                 block.push_str("\nnpm error");
                 if !line.is_empty() {
                     block.push(' ');
@@ -228,12 +253,14 @@ impl GitFetcher {
             std::fs::create_dir_all(parent)?;
         }
 
-        info!("Cloning git repository '{}'", clone_url);
+        info!("Cloning git repository '{}'", rnpm_config::scrub_credentials(clone_url));
         let remote_dir_str = remote_dir.to_string_lossy();
 
         // 1. Try mirror clone
         let (mirror_ok, _, mirror_err) = run_git_cmd(
             &[
+                "-c",
+                "protocol.file.allow=always",
                 "clone",
                 "--config",
                 "core.longpaths=true",
@@ -253,6 +280,8 @@ impl GitFetcher {
         let _ = safe_remove_dir_all(&remote_dir);
         let (bare_ok, _, bare_err) = run_git_cmd(
             &[
+                "-c",
+                "protocol.file.allow=always",
                 "clone",
                 "--config",
                 "core.longpaths=true",
@@ -274,10 +303,12 @@ impl GitFetcher {
         } else {
             bare_err
         };
+        let scrubbed_err = rnpm_config::scrub_credentials(&err_msg);
+        let scrubbed_clone = rnpm_config::scrub_credentials(clone_url);
         Err(anyhow!(
             "Failed to clone git repository '{}': {}",
-            clone_url,
-            err_msg
+            scrubbed_clone,
+            scrubbed_err
         ))
     }
 
@@ -715,21 +746,22 @@ pub fn format_git_resolved_url(target: &PackageTarget, commit_sha: &str) -> Stri
 
 /// Normalizes clone URL for git command execution on current platform.
 pub fn normalize_clone_url_for_git(url: &str) -> String {
-    if url.starts_with("file://") {
-        if let Ok(path) = url::Url::parse(url).and_then(|url| {
-            url.to_file_path()
+    let clean = url.strip_prefix("git+").unwrap_or(url);
+    if clean.starts_with("file://") {
+        if let Ok(path) = url::Url::parse(clean).and_then(|u| {
+            u.to_file_path()
                 .map_err(|_| url::ParseError::RelativeUrlWithoutBase)
         }) {
             return path.to_string_lossy().replace('\\', "/");
         }
     }
-    if let Some(rest) = url.strip_prefix("ssh://git@github.com/") {
+    if let Some(rest) = clean.strip_prefix("ssh://git@github.com/") {
         return format!("https://github.com/{rest}");
     }
-    if let Some(rest) = url.strip_prefix("git@github.com:") {
+    if let Some(rest) = clean.strip_prefix("git@github.com:") {
         return format!("https://github.com/{rest}");
     }
-    if let Some(rest) = url.strip_prefix("file://") {
+    if let Some(rest) = clean.strip_prefix("file://") {
         let rest_trimmed = rest.trim_start_matches('/');
         // If it starts with Windows drive letter (e.g. C: or D:)
         if rest_trimmed.len() >= 2 && rest_trimmed.chars().nth(1) == Some(':') {
@@ -746,7 +778,7 @@ pub fn normalize_clone_url_for_git(url: &str) -> String {
             return format!("/{rest_trimmed}");
         }
     }
-    url.to_string()
+    clean.to_string()
 }
 
 /// Path to the checkout marker file, placed as a sibling to the checkout directory

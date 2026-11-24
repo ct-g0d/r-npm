@@ -64,24 +64,43 @@ pub fn compute_project_fingerprint(project_dir: &Path, options: &InstallOptions)
         if let Ok(bytes) = std::fs::read(&shrinkwrap_path) {
             hasher.update(b"\nlockfile:npm-shrinkwrap.json:\n");
             hasher.update(&bytes);
+        } else {
+            hasher.update(b"\nlockfile:npm-shrinkwrap.json:unreadable\n");
         }
     } else if lockfile_path.exists() {
         if let Ok(bytes) = std::fs::read(&lockfile_path) {
             hasher.update(b"\nlockfile:package-lock.json:\n");
             hasher.update(&bytes);
+        } else {
+            hasher.update(b"\nlockfile:package-lock.json:unreadable\n");
         }
     } else {
         hasher.update(b"\nlockfile:none\n");
     }
 
     // 4. .npmrc configuration & registry settings
-    let config = Config::load(Some(project_dir)).unwrap_or_default();
+    let config = if let Some(ref c) = options.config_override {
+        c.clone()
+    } else {
+        Config::load(Some(project_dir)).unwrap_or_default()
+    };
     hasher.update(format!("\nnpmrc:registry:{}\n", config.npmrc.registry).as_bytes());
-    for (scope, url) in &config.npmrc.scoped_registries {
+    let mut sorted_scoped: Vec<_> = config.npmrc.scoped_registries.iter().collect();
+    sorted_scoped.sort_by_key(|(k, _)| *k);
+    for (scope, url) in sorted_scoped {
         hasher.update(format!("npmrc:scoped:{scope}={url}\n").as_bytes());
     }
-    for (k, v) in &config.npmrc.settings {
+    let mut sorted_settings: Vec<_> = config.npmrc.settings.iter().collect();
+    sorted_settings.sort_by_key(|(k, _)| *k);
+    for (k, v) in sorted_settings {
         hasher.update(format!("npmrc:setting:{k}={v}\n").as_bytes());
+    }
+    let project_npmrc = project_dir.join(".npmrc");
+    if project_npmrc.is_file() {
+        if let Ok(bytes) = std::fs::read(&project_npmrc) {
+            hasher.update(b"\nproject_npmrc_bytes:\n");
+            hasher.update(&bytes);
+        }
     }
 
     // 5. Options impacting resolution and tree structure
@@ -90,10 +109,12 @@ pub fn compute_project_fingerprint(project_dir: &Path, options: &InstallOptions)
     sorted_include.sort();
     let mut sorted_workspace = options.workspace.clone();
     sorted_workspace.sort();
+    let mut sorted_min_release_age_exclude = options.min_release_age_exclude.clone();
+    sorted_min_release_age_exclude.sort();
 
     hasher.update(
         format!(
-            "\noptions:install_strategy={:?}:omit_dev={}:omit_opt={}:omit_peer={}:legacy_peer={}:strict_peer={}:global={}:os={:?}:cpu={:?}:libc={:?}:target_os={}:target_cpu={}:target_libc={:?}:lock_ver={}:include={:?}:workspaces={}:workspace_root={}:workspace={:?}:bin_links={}\n",
+            "\noptions:install_strategy={:?}:omit_dev={}:omit_opt={}:omit_peer={}:legacy_peer={}:strict_peer={}:global={}:os={:?}:cpu={:?}:libc={:?}:target_os={}:target_cpu={}:target_libc={:?}:lock_ver={}:include={:?}:workspaces={}:workspace_root={}:workspace={:?}:bin_links={}:force={}:ignore_scripts={}:offline={}:prefer_offline={}:prefer_online={}:prefer_dedupe={}:install_links={}:package_lock_only={}:pkg_lock={}:no_pkg_lock={}:registry_url={:?}:before={:?}:release_age_ex={:?}:store_dir={:?}\n",
             options.install_strategy,
             options.omit_dev,
             options.omit_optional,
@@ -113,6 +134,20 @@ pub fn compute_project_fingerprint(project_dir: &Path, options: &InstallOptions)
             options.workspace_root,
             sorted_workspace,
             options.bin_links,
+            options.force,
+            options.ignore_scripts,
+            options.offline,
+            options.prefer_offline,
+            options.prefer_online,
+            options.prefer_dedupe,
+            options.install_links,
+            options.package_lock_only,
+            options.package_lock,
+            options.no_package_lock,
+            options.registry_url,
+            options.before_cutoff,
+            sorted_min_release_age_exclude,
+            options.store_dir,
         )
         .as_bytes(),
     );
@@ -305,11 +340,19 @@ pub fn validate_hidden_lockfile(project_dir: &Path, options: Option<&InstallOpti
         if pkg_key.is_empty() {
             continue;
         }
+        let normalized_key = pkg_key.replace('\\', "/");
         if !pkg_key.starts_with("node_modules/") && !pkg_key.contains("/node_modules/") {
+            // Workspace member directory (e.g. "packages/a")
+            let ws_folder = project_dir.join(&normalized_key);
+            if !ws_folder.join("package.json").is_file() {
+                debug!(
+                    "Hidden lockfile invalid: workspace member package.json missing in '{}'",
+                    normalized_key
+                );
+                return false;
+            }
             continue;
         }
-
-        let normalized_key = pkg_key.replace('\\', "/");
 
         let is_platform_skipped = platform_skipped.contains(pkg_key)
             || pkg_info
@@ -338,6 +381,16 @@ pub fn validate_hidden_lockfile(project_dir: &Path, options: Option<&InstallOpti
             folder_path.exists() || rnpm_fs::is_junction(&folder_path).unwrap_or(false);
 
         if exists_on_disk {
+            // If the package is omitted by current options (e.g. devDependency under --omit=dev),
+            // it must NOT remain on disk. If it's on disk, hidden lockfile is invalid so prune runs.
+            if is_omitted {
+                debug!(
+                    "Hidden lockfile invalid: package folder '{}' exists on disk but is omitted by options",
+                    normalized_key
+                );
+                return false;
+            }
+
             // Top-level junction check in linked mode: if junction exists, ensure target is not broken
             if is_linked
                 && is_top_level
@@ -346,6 +399,16 @@ pub fn validate_hidden_lockfile(project_dir: &Path, options: Option<&InstallOpti
             {
                 debug!(
                     "Hidden lockfile invalid: linked junction target for '{}' missing from store",
+                    normalized_key
+                );
+                return false;
+            }
+
+            // A valid package directory on disk must contain package.json
+            // (Unless it's a link whose link target holds it)
+            if pkg_info.link != Some(true) && !folder_path.join("package.json").is_file() {
+                debug!(
+                    "Hidden lockfile invalid: package.json missing from package folder '{}'",
                     normalized_key
                 );
                 return false;
@@ -377,6 +440,17 @@ pub fn validate_hidden_lockfile(project_dir: &Path, options: Option<&InstallOpti
             debug!(
                 "Hidden lockfile invalid: package folder '{}' missing from disk",
                 normalized_key
+            );
+            return false;
+        }
+    }
+
+    // Verify there are no extraneous package directories in node_modules
+    for key in dir_mtimes.keys() {
+        if !lockfile.packages.contains_key(key) && !direct_top_level_deps.contains(key) {
+            debug!(
+                "Hidden lockfile invalid: extraneous directory '{}' found on disk",
+                key
             );
             return false;
         }

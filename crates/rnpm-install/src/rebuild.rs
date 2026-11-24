@@ -236,11 +236,13 @@ pub async fn execute_rebuild(options: &RebuildOptions) -> Result<RebuildSummary>
     }
 
     // 3. Sort candidates bottom-up (deeper nesting first, dependencies before dependents)
-    // Deeper paths have more `/node_modules/` segments
+    // Deeper paths have more `/node_modules/` segments. Normalize backslashes for Windows path safety.
     candidate_nodes.sort_by(|a, b| {
-        let count_a = a.package_path.matches("/node_modules/").count();
-        let count_b = b.package_path.matches("/node_modules/").count();
-        count_b.cmp(&count_a)
+        let norm_a = a.package_path.replace('\\', "/");
+        let norm_b = b.package_path.replace('\\', "/");
+        let count_a = norm_a.matches("/node_modules/").count();
+        let count_b = norm_b.matches("/node_modules/").count();
+        count_b.cmp(&count_a).then_with(|| norm_b.cmp(&norm_a))
     });
 
     // 4. Configure lifecycle execution options
