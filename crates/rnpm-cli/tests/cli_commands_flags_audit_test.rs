@@ -77,7 +77,22 @@ fn test_config_set_multiple_key_value_pairs() {
     );
 
     let content = fs::read_to_string(&npmrc_path).unwrap();
-    assert!(content.contains("mykey=val=123"), "Expected mykey=val=123 in {content}");
+    assert!(
+        content.contains("mykey=\"val=123\""),
+        "Expected mykey=\"val=123\" in {content}"
+    );
+
+    let out = rnpm(
+        tmp.path(),
+        &["config", "get", "mykey", "--location=project"],
+    );
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(stdout.trim(), "val=123");
 }
 
 #[test]
