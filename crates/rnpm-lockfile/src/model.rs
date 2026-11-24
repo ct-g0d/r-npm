@@ -1589,6 +1589,72 @@ impl LockfileV3 {
         }
     }
 
+    fn is_posix_path_absolute(p: &str) -> bool {
+        p.starts_with('/')
+            || (p.len() >= 2
+                && p.as_bytes()[0].is_ascii_alphabetic()
+                && p.as_bytes()[1] == b':')
+    }
+
+    fn canonicalize_git_identity(raw: &str) -> String {
+        let s = raw.split('#').next().unwrap_or(raw).trim();
+        let s = s.strip_prefix("git+").unwrap_or(s);
+
+        let expanded = if let Some(rest) = s.strip_prefix("github:") {
+            format!("github.com/{rest}")
+        } else if let Some(rest) = s.strip_prefix("gitlab:") {
+            format!("gitlab.com/{rest}")
+        } else if let Some(rest) = s.strip_prefix("bitbucket:") {
+            format!("bitbucket.org/{rest}")
+        } else if let Some(rest) = s.strip_prefix("gist:") {
+            format!("gist.github.com/{rest}")
+        } else if !s.contains(':') && !s.contains('@') && s.split('/').count() == 2 {
+            format!("github.com/{s}")
+        } else {
+            s.to_string()
+        };
+
+        let without_proto = if let Some(idx) = expanded.find("://") {
+            &expanded[idx + 3..]
+        } else {
+            &expanded
+        };
+
+        let without_user = if let Some(at_idx) = without_proto.find('@') {
+            let slash_idx = without_proto.find('/').unwrap_or(usize::MAX);
+            let colon_idx = without_proto.find(':').unwrap_or(usize::MAX);
+            if at_idx < slash_idx && at_idx < colon_idx {
+                &without_proto[at_idx + 1..]
+            } else {
+                without_proto
+            }
+        } else {
+            without_proto
+        };
+
+        let normalized = if let Some((host, path)) = without_user.split_once(':') {
+            if !host.contains('/') {
+                if let Some((port_or_user, rest_path)) = path.split_once('/') {
+                    if port_or_user.chars().all(|c| c.is_ascii_digit()) {
+                        format!("{host}/{rest_path}")
+                    } else {
+                        format!("{host}/{path}")
+                    }
+                } else {
+                    format!("{host}/{path}")
+                }
+            } else {
+                without_user.to_string()
+            }
+        } else {
+            without_user.to_string()
+        };
+
+        let trimmed = normalized.trim_matches('/');
+        let clean = trimmed.strip_suffix(".git").unwrap_or(trimmed);
+        clean.to_ascii_lowercase()
+    }
+
     fn target_matches_resolved(resolved: &str, target: &PackageTarget) -> bool {
         match target {
             PackageTarget::Url(u) => resolved == u.as_str(),
@@ -1606,23 +1672,36 @@ impl LockfileV3 {
                     .strip_prefix("./")
                     .unwrap_or(&clean_p)
                     .trim_end_matches('/');
-                clean_res == clean_p
-                    || clean_res.ends_with(&format!("/{clean_p}"))
-                    || clean_p.ends_with(&format!("/{clean_res}"))
+
+                let res_abs = Self::is_posix_path_absolute(clean_res);
+                let p_abs = Self::is_posix_path_absolute(clean_p);
+
+                if res_abs == p_abs {
+                    if res_abs {
+                        clean_res.eq_ignore_ascii_case(clean_p)
+                    } else {
+                        clean_res == clean_p
+                    }
+                } else if res_abs {
+                    clean_res.ends_with(&format!("/{clean_p}"))
+                } else {
+                    clean_p.ends_with(&format!("/{clean_res}"))
+                }
             }
             PackageTarget::Git { url, committish, .. } => {
-                let url_matches = resolved.contains(url.as_str());
-                if !url_matches {
+                let canon_target = Self::canonicalize_git_identity(url.as_str());
+                let canon_res = Self::canonicalize_git_identity(resolved);
+                if canon_target != canon_res {
                     return false;
                 }
-                // If the spec requested an exact 40-char commit SHA, resolved must contain it
                 if let Some(ref c) = committish {
-                    if c.len() == 40
-                        && c.chars().all(|ch| ch.is_ascii_hexdigit())
-                        && !resolved.ends_with(&format!("#{c}"))
-                        && !resolved.contains(c.as_str())
-                    {
-                        return false;
+                    let res_frag = resolved.split('#').nth(1).unwrap_or("");
+                    if c.len() == 40 && c.chars().all(|ch| ch.is_ascii_hexdigit()) {
+                        if !res_frag.eq_ignore_ascii_case(c) {
+                            return false;
+                        }
+                    } else if !res_frag.is_empty() && res_frag.eq_ignore_ascii_case(c) {
+                        return true;
                     }
                 }
                 true

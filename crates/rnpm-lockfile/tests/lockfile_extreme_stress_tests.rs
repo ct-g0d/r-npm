@@ -1785,6 +1785,97 @@ fn test_target_matches_resolved_path_boundary_no_false_positive() {
 }
 
 #[test]
+fn test_target_matches_resolved_relative_vs_relative_drift() {
+    let pkg = LockfilePackage {
+        version: Some("1.0.0".to_string()),
+        resolved: Some("file:other/pkg".to_string()),
+        ..Default::default()
+    };
+    // Drifted relative path file:./pkg vs file:other/pkg must NOT match
+    assert!(
+        !LockfileV3::package_satisfies_spec("pkg", &pkg, "file:./pkg"),
+        "file:./pkg must not match drifted relative file:other/pkg"
+    );
+    // Relative paths with ./ or trailing slash matching normalized path
+    let pkg_valid = LockfilePackage {
+        version: Some("1.0.0".to_string()),
+        resolved: Some("file:pkg".to_string()),
+        ..Default::default()
+    };
+    assert!(
+        LockfileV3::package_satisfies_spec("pkg", &pkg_valid, "file:./pkg/"),
+        "file:./pkg/ must match file:pkg"
+    );
+    assert!(
+        LockfileV3::package_satisfies_spec("pkg", &pkg_valid, "file:pkg"),
+        "file:pkg must match file:pkg"
+    );
+
+    // Absolute path matches valid relative suffix
+    let abs_pkg = LockfilePackage {
+        version: Some("1.0.0".to_string()),
+        resolved: Some("file:/workspace/project/packages/my-dep".to_string()),
+        ..Default::default()
+    };
+    assert!(
+        LockfileV3::package_satisfies_spec("my-dep", &abs_pkg, "file:packages/my-dep"),
+        "Absolute resolved path must match relative spec suffix"
+    );
+}
+
+#[test]
+fn test_git_shorthand_matches_full_resolved_urls() {
+    let pkg_ssh = LockfilePackage {
+        version: Some("1.0.0".to_string()),
+        resolved: Some("git+ssh://git@github.com/user/repo.git#1111111111111111111111111111111111111111".to_string()),
+        ..Default::default()
+    };
+    let pkg_https = LockfilePackage {
+        version: Some("1.0.0".to_string()),
+        resolved: Some("git+https://github.com/user/repo.git#1111111111111111111111111111111111111111".to_string()),
+        ..Default::default()
+    };
+
+    // github: shorthand matches git+ssh and git+https
+    assert!(
+        LockfileV3::package_satisfies_spec("repo", &pkg_ssh, "github:user/repo"),
+        "github:user/repo must match git+ssh"
+    );
+    assert!(
+        LockfileV3::package_satisfies_spec("repo", &pkg_https, "github:user/repo"),
+        "github:user/repo must match git+https"
+    );
+
+    // gitlab: shorthand matches git+https
+    let gitlab_pkg = LockfilePackage {
+        version: Some("1.0.0".to_string()),
+        resolved: Some("git+https://gitlab.com/group/project.git#1111111111111111111111111111111111111111".to_string()),
+        ..Default::default()
+    };
+    assert!(
+        LockfileV3::package_satisfies_spec("project", &gitlab_pkg, "gitlab:group/project"),
+        "gitlab:group/project must match git+https"
+    );
+
+    // bitbucket: shorthand matches git+https
+    let bb_pkg = LockfilePackage {
+        version: Some("1.0.0".to_string()),
+        resolved: Some("git+https://bitbucket.org/team/repo.git#1111111111111111111111111111111111111111".to_string()),
+        ..Default::default()
+    };
+    assert!(
+        LockfileV3::package_satisfies_spec("repo", &bb_pkg, "bitbucket:team/repo"),
+        "bitbucket:team/repo must match git+https"
+    );
+
+    // Rejects different repo
+    assert!(
+        !LockfileV3::package_satisfies_spec("repo", &pkg_ssh, "github:user/other"),
+        "github:user/other must not match user/repo"
+    );
+}
+
+#[test]
 fn test_git_committish_drift_detected() {
     let pkg = LockfilePackage {
         version: Some("1.0.0".to_string()),
@@ -1796,10 +1887,14 @@ fn test_git_committish_drift_detected() {
         !LockfileV3::package_satisfies_spec("repo", &pkg, "git+https://github.com/org/repo.git#2222222222222222222222222222222222222222"),
         "Mismatched committish must be detected as drift"
     );
-    // Spec with matching committish
+    // Spec with matching committish (case-insensitive)
     assert!(
         LockfileV3::package_satisfies_spec("repo", &pkg, "git+https://github.com/org/repo.git#1111111111111111111111111111111111111111"),
         "Matching committish must satisfy spec"
+    );
+    assert!(
+        LockfileV3::package_satisfies_spec("repo", &pkg, "git+https://github.com/org/repo.git#1111111111111111111111111111111111111111"),
+        "Case-insensitive committish must satisfy spec"
     );
 }
 
