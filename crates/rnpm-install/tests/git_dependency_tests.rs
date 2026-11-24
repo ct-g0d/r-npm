@@ -118,6 +118,39 @@ fn test_git_spec_target_parsing() {
     assert_eq!(t6.git_committish(), Some("feature-branch"));
 }
 
+#[test]
+fn test_git_ssh_urls_preserved_not_rewritten_to_https() {
+    use rnpm_install::git::normalize_clone_url_for_git;
+
+    // Explicit SSH URLs must NOT be rewritten to https:// (Opus Finding #3)
+    assert_eq!(
+        normalize_clone_url_for_git("ssh://git@github.com/org/private.git"),
+        "ssh://git@github.com/org/private.git"
+    );
+    assert_eq!(
+        normalize_clone_url_for_git("git+ssh://git@github.com/org/private.git"),
+        "ssh://git@github.com/org/private.git"
+    );
+    assert_eq!(
+        normalize_clone_url_for_git("git@github.com:org/private.git"),
+        "git@github.com:org/private.git"
+    );
+    assert_eq!(
+        normalize_clone_url_for_git("git+git@github.com:org/private.git"),
+        "git@github.com:org/private.git"
+    );
+
+    // GitHub shorthand resolves to https
+    assert_eq!(
+        normalize_clone_url_for_git("github:org/repo"),
+        "https://github.com/org/repo.git"
+    );
+    assert_eq!(
+        normalize_clone_url_for_git("git+https://github.com/org/repo.git"),
+        "https://github.com/org/repo.git"
+    );
+}
+
 #[tokio::test]
 async fn test_git_install_commit_and_tag_ref() {
     let repo_dir = tempdir().unwrap();
