@@ -679,6 +679,10 @@ pub(crate) enum Commands {
         #[arg(short = 'P', long = "save-prod", alias = "save")]
         save_prod: bool,
 
+        /// Remove only from peerDependencies
+        #[arg(long = "save-peer")]
+        save_peer: bool,
+
         /// Specific workspace(s) to target
         #[arg(long = "workspace", short = 'w')]
         workspace: Vec<String>,
@@ -6412,6 +6416,7 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
             save_dev,
             save_optional,
             save_prod,
+            save_peer,
             global,
             prefix,
             workspace,
@@ -6451,6 +6456,7 @@ pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()
                 save_dev,
                 save_optional,
                 save_prod,
+                save_peer,
                 is_global,
                 workspace,
                 workspaces,
