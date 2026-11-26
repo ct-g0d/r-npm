@@ -1779,6 +1779,23 @@ pub fn decode_tar_entries<R: Read>(
             });
         }
 
+        let path_ascii_result: Result<Option<(String, usize)>, ()> = {
+            let path_bytes = entry.path_bytes();
+            if path_bytes.contains(&0) {
+                return Err(FsError::PathTraversal {
+                    path: PathBuf::from(String::from_utf8_lossy(&path_bytes).into_owned()),
+                });
+            }
+            let s = std::str::from_utf8(&path_bytes).map_err(|_| FsError::InvalidUtf8Path {
+                path: PathBuf::from(String::from_utf8_lossy(&path_bytes).into_owned()),
+            })?;
+            match fast_validate_and_strip_ascii(s) {
+                Ok(None) => Ok(None),
+                Ok(Some((rel, depth))) => Ok(Some((rel.to_string(), depth))),
+                Err(()) => Err(()),
+            }
+        };
+
         let is_sparse = entry_type.as_byte() == b'S' || entry_type.is_gnu_sparse();
         let has_pax_sparse = if let Ok(Some(extensions)) = entry.pax_extensions() {
             extensions.filter_map(|e| e.ok()).any(|ext| {
@@ -1791,46 +1808,38 @@ pub fn decode_tar_entries<R: Read>(
             false
         };
         if is_sparse || has_pax_sparse {
-            let err_path = entry.path().unwrap_or_default().to_path_buf();
+            let err_path = match path_ascii_result {
+                Ok(Some((s, _))) => PathBuf::from(s),
+                _ => entry.path().unwrap_or_default().to_path_buf(),
+            };
             return Err(FsError::ForbiddenSparseFile { path: err_path });
         }
 
-        let fast_ascii: Option<(String, usize)> = {
-            let path_bytes = entry.path_bytes();
-            if path_bytes.contains(&0) {
-                return Err(FsError::PathTraversal {
-                    path: PathBuf::from(String::from_utf8_lossy(&path_bytes).into_owned()),
-                });
-            }
-            let s = std::str::from_utf8(&path_bytes).map_err(|_| FsError::InvalidUtf8Path {
-                path: PathBuf::from(String::from_utf8_lossy(&path_bytes).into_owned()),
-            })?;
-            match fast_validate_and_strip_ascii(s) {
-                Ok(None) => continue,
-                Ok(Some((rel, depth))) => {
-                    if entry_type.is_file() {
-                        if rel == ".npmignore" || rel.ends_with("/.npmignore") {
-                            saw_npmignores.insert(PathBuf::from(rel));
-                            Some((rel.to_string(), depth))
-                        } else if rel == ".gitignore" || rel.ends_with("/.gitignore") {
-                            let rewritten = if rel.len() == ".gitignore".len() {
-                                ".npmignore".to_string()
-                            } else {
-                                format!("{}/.npmignore", &rel[..rel.len() - "/.gitignore".len()])
-                            };
-                            if saw_npmignores.contains(Path::new(&rewritten)) {
-                                continue;
-                            }
-                            Some((rewritten, depth))
+        let fast_ascii: Option<(String, usize)> = match path_ascii_result {
+            Ok(None) => continue,
+            Ok(Some((rel, depth))) => {
+                if entry_type.is_file() {
+                    if rel == ".npmignore" || rel.ends_with("/.npmignore") {
+                        saw_npmignores.insert(PathBuf::from(&rel));
+                        Some((rel, depth))
+                    } else if rel == ".gitignore" || rel.ends_with("/.gitignore") {
+                        let rewritten = if rel.len() == ".gitignore".len() {
+                            ".npmignore".to_string()
                         } else {
-                            Some((rel.to_string(), depth))
+                            format!("{}/.npmignore", &rel[..rel.len() - "/.gitignore".len()])
+                        };
+                        if saw_npmignores.contains(Path::new(&rewritten)) {
+                            continue;
                         }
+                        Some((rewritten, depth))
                     } else {
-                        Some((rel.to_string(), depth))
+                        Some((rel, depth))
                     }
+                } else {
+                    Some((rel, depth))
                 }
-                Err(()) => None,
             }
+            Err(()) => None,
         };
 
         let (relative_path, target_path, norm_exact, path_depth, _is_ascii_clean) =

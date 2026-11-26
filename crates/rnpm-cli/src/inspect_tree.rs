@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 
 use rnpm_core::manifest::Manifest;
 use rnpm_core::semver::{Range, Version};
-use rnpm_fs::junction::{is_dir_entry_reparse_or_symlink, is_junction};
+use rnpm_fs::junction::{is_dir_entry_reparse_or_symlink, is_junction, read_junction_target};
 use rnpm_lockfile::LockfileV3;
 
 /// A node in the dependency tree, representing either the root project or a package in node_modules.
@@ -366,7 +366,7 @@ pub(crate) fn scan_disk_packages_with_raw(
             };
             let entry_path = entry.path();
             let is_link = if is_dir_entry_reparse_or_symlink(&entry, &file_type) {
-                file_type.is_symlink() || is_junction(&entry_path).unwrap_or(false)
+                file_type.is_symlink() || read_junction_target(&entry_path).is_ok()
             } else {
                 false
             };
@@ -389,7 +389,7 @@ pub(crate) fn scan_disk_packages_with_raw(
                         let sub_path = scoped_entry.path();
                         let sub_is_link = if is_dir_entry_reparse_or_symlink(&scoped_entry, &sub_ft)
                         {
-                            sub_ft.is_symlink() || is_junction(&sub_path).unwrap_or(false)
+                            sub_ft.is_symlink() || read_junction_target(&sub_path).is_ok()
                         } else {
                             false
                         };

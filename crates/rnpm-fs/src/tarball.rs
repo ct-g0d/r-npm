@@ -485,6 +485,24 @@ pub fn extract_tar_gz<R: Read>(
             });
         }
 
+        // Check non-UTF-8 path bytes or embedded null bytes before sparse/root checks.
+        let path_ascii_result: Result<Option<(String, usize)>, ()> = {
+            let path_bytes = entry.path_bytes();
+            if path_bytes.contains(&0) {
+                return Err(FsError::PathTraversal {
+                    path: PathBuf::from(String::from_utf8_lossy(&path_bytes).into_owned()),
+                });
+            }
+            let s = std::str::from_utf8(&path_bytes).map_err(|_| FsError::InvalidUtf8Path {
+                path: PathBuf::from(String::from_utf8_lossy(&path_bytes).into_owned()),
+            })?;
+            match fast_validate_and_strip_ascii(s) {
+                Ok(None) => Ok(None),
+                Ok(Some((rel, depth))) => Ok(Some((rel.to_string(), depth))),
+                Err(()) => Err(()),
+            }
+        };
+
         // Reject sparse entries before skipping archive roots.
         let is_sparse = entry_type.as_byte() == b'S' || entry_type.is_gnu_sparse();
         let has_pax_sparse = if let Ok(Some(extensions)) = entry.pax_extensions() {
@@ -498,26 +516,17 @@ pub fn extract_tar_gz<R: Read>(
             false
         };
         if is_sparse || has_pax_sparse {
-            let err_path = entry.path().unwrap_or_default().to_path_buf();
+            let err_path = match path_ascii_result {
+                Ok(Some((s, _))) => PathBuf::from(s),
+                _ => entry.path().unwrap_or_default().to_path_buf(),
+            };
             return Err(FsError::ForbiddenSparseFile { path: err_path });
         }
 
-        // Check non-UTF-8 path bytes or embedded null bytes before entry.path()
-        let fast_ascii: Option<(String, usize)> = {
-            let path_bytes = entry.path_bytes();
-            if path_bytes.contains(&0) {
-                return Err(FsError::PathTraversal {
-                    path: PathBuf::from(String::from_utf8_lossy(&path_bytes).into_owned()),
-                });
-            }
-            let s = std::str::from_utf8(&path_bytes).map_err(|_| FsError::InvalidUtf8Path {
-                path: PathBuf::from(String::from_utf8_lossy(&path_bytes).into_owned()),
-            })?;
-            match fast_validate_and_strip_ascii(s) {
-                Ok(None) => continue,
-                Ok(Some((rel, depth))) => Some((rel.to_string(), depth)),
-                Err(()) => None,
-            }
+        let fast_ascii: Option<(String, usize)> = match path_ascii_result {
+            Ok(None) => continue,
+            Ok(Some(v)) => Some(v),
+            Err(()) => None,
         };
 
         let (relative_path, target_path, norm_exact, path_depth, _is_ascii_clean) =
