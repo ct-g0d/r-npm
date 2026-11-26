@@ -877,9 +877,6 @@ impl PackagePack {
             f.as_raw_handle() as usize
         });
 
-        #[cfg(not(windows))]
-        let raw_pack_handle: Option<usize> = None;
-
         // 2. Direct materialization straight from memory mapping (or ReFS block cloning).
         let files = &self.index.files;
         if !can_block_clone && files.len() >= 8 {
@@ -5192,15 +5189,37 @@ mod tests {
         let dir = tempdir().unwrap();
         let store = PackStore::new(dir.path().join("store")).unwrap();
         let integrity = "sha512-norm-dedup-mixed-prefixes==";
+        #[cfg(windows)]
         let files = [
             PackInputFile::new("foo/bar.js", 0o644, b"first"),
             PackInputFile::new("./foo/bar.js", 0o644, b"second"),
             PackInputFile::new("././foo/bar.js", 0o644, b"third"),
-            PackInputFile::new("foo\\bar.js", 0o644, b"fourth-winner"),
+            PackInputFile::new("foo\\bar.js", 0o644, b"winner"),
+        ];
+        #[cfg(not(windows))]
+        let files = [
+            PackInputFile::new("foo/bar.js", 0o644, b"first"),
+            PackInputFile::new("./foo/bar.js", 0o644, b"second"),
+            PackInputFile::new("././foo/bar.js", 0o644, b"winner"),
         ];
         let idx = store.put_package_pack_deferred(integrity, &files).unwrap();
         assert_eq!(idx.files.len(), 1);
         assert_eq!(idx.files[0].path, "foo/bar.js");
+
+        // On POSIX, backslashes are rejected as potential cross-platform path traversal.
+        #[cfg(not(windows))]
+        {
+            let bs_err = store
+                .put_package_pack_deferred(
+                    integrity,
+                    &[PackInputFile::new("foo\\bar.js", 0o644, b"bad")],
+                )
+                .unwrap_err();
+            assert!(matches!(
+                bs_err,
+                CacheError::Fs(rnpm_fs::FsError::PathTraversal { .. })
+            ));
+        }
 
         // Leading '/' must still be rejected as an absolute path.
         let abs_err = store
@@ -5210,7 +5229,7 @@ mod tests {
 
         store.clear_mmap_cache();
         let pack = store.get_package_pack(integrity).unwrap().unwrap();
-        assert_eq!(pack.get_file_slice("foo/bar.js").unwrap(), b"fourth-winner");
+        assert_eq!(pack.get_file_slice("foo/bar.js").unwrap(), b"winner");
     }
 
     #[test]
