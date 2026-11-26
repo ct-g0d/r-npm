@@ -4687,3 +4687,88 @@ fn test_precomputed_env_preserves_original_npm_lifecycle_script_when_forwarding_
         "Unset precomputed npm_lifecycle_script must fall back to ctx.script_cmd"
     );
 }
+
+#[test]
+fn test_script_base_env_with_manifest_matches_direct_hook_env_for_raw_fields() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let pkg_dir = root.join("node_modules").join("dep-raw");
+    std::fs::create_dir_all(&pkg_dir).unwrap();
+    std::fs::write(
+        pkg_dir.join("package.json"),
+        r#"{
+  "name": "dep-raw",
+  "version": "1.2.3",
+  "engines": ["node >= 18", "npm >= 9"],
+  "bin": ["./bin/cli.js", "./bin/helper.js"],
+  "config": {
+    "port": 8080,
+    "disabled": false,
+    "empty": null,
+    "flags": ["alpha", "beta"]
+  },
+  "scripts": {
+    "postinstall": "node -e 1"
+  }
+}"#,
+    )
+    .unwrap();
+
+    let mut config = rnpm_config::Config::default();
+    config.npmrc.settings.insert("ignore-scripts".into(), "false".into());
+    let base_extra = HashMap::from([("INIT_CWD".to_string(), root.to_string_lossy().into_owned())]);
+
+    let mut direct_ctx = LifecycleContext::new_with_config(
+        root,
+        &pkg_dir,
+        "dep-raw",
+        "postinstall",
+        "node -e 1",
+        config.clone(),
+    );
+    direct_ctx.package_version = Some("1.2.3".to_string());
+    direct_ctx.extra_env = base_extra.clone();
+    let direct_env = build_script_env_with_config(&direct_ctx, &config);
+
+    assert_eq!(direct_env.get("npm_package_engines_0").map(String::as_str), Some("node >= 18"));
+    assert_eq!(direct_env.get("npm_package_engines_1").map(String::as_str), Some("npm >= 9"));
+    assert_eq!(direct_env.get("npm_package_bin_0").map(String::as_str), Some("./bin/cli.js"));
+    assert_eq!(direct_env.get("npm_package_bin_1").map(String::as_str), Some("./bin/helper.js"));
+    assert_eq!(direct_env.get("npm_package_config_port").map(String::as_str), Some("8080"));
+    assert_eq!(direct_env.get("npm_package_config_disabled").map(String::as_str), Some(""));
+    assert_eq!(direct_env.get("npm_package_config_empty").map(String::as_str), Some(""));
+    assert_eq!(direct_env.get("npm_package_config_flags_0").map(String::as_str), Some("alpha"));
+    assert_eq!(direct_env.get("npm_package_config_flags_1").map(String::as_str), Some("beta"));
+
+    let base_env = ScriptBaseEnv::build(root, &config, None, None, None);
+    for manifest in [
+        rnpm_core::Manifest::from_file(pkg_dir.join("package.json")).unwrap(),
+        rnpm_core::Manifest::from_file_readonly(pkg_dir.join("package.json")).unwrap(),
+    ] {
+        let mut precomputed = base_env.build_package_env_with_manifest(
+            &pkg_dir,
+            "dep-raw",
+            Some("1.2.3"),
+            "run",
+            "",
+            Some(&base_extra),
+            None,
+            Some(&manifest),
+        );
+        let mut batched_ctx = LifecycleContext::new_with_config(
+            root,
+            &pkg_dir,
+            "dep-raw",
+            "postinstall",
+            "node -e 1",
+            config.clone(),
+        );
+        batched_ctx.package_version = Some("1.2.3".to_string());
+        batched_ctx.extra_env = base_extra.clone();
+        apply_context_overrides_to_precomputed_env(&mut precomputed, &batched_ctx);
+        batched_ctx.precomputed_env = Some(precomputed);
+        let batched_env = build_script_env_with_config(&batched_ctx, &config);
+
+        assert_eq!(batched_env, direct_env);
+    }
+}

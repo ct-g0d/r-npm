@@ -2,8 +2,8 @@ use anyhow::{anyhow, Context, Result};
 use rnpm_config::{find_global_bin_dir, find_global_node_modules};
 use rnpm_core::manifest::Manifest;
 use rnpm_fs::junction::{create_junction, is_junction, remove_dir_all_safe, remove_junction};
+use rnpm_shim::create_shims_with_options;
 use rnpm_shim::generator::create_shim_trio;
-use rnpm_shim::{create_shims_with_force, normalize_shebang};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use tracing::debug;
@@ -64,9 +64,6 @@ pub fn link_package(current_dir: &Path, global_prefix: &Path) -> Result<PathBuf>
 
     for (bin_name, script_rel) in manifest.bin_entries() {
         let target_script = current_dir.join(&script_rel);
-        if target_script.exists() {
-            let _ = normalize_shebang(&target_script);
-        }
         let _ = create_shim_trio(&target_script, &global_bin, &bin_name)?;
     }
 
@@ -133,9 +130,6 @@ pub fn link_package_from_global(
             std::fs::create_dir_all(&local_bin)?;
             for (bin_name, script_rel) in m.bin_entries() {
                 let target_script = target_link.join(&script_rel);
-                if target_script.exists() {
-                    let _ = normalize_shebang(&target_script);
-                }
                 let _ = create_shim_trio(&target_script, &local_bin, &bin_name)?;
             }
         }
@@ -466,17 +460,54 @@ pub(crate) fn remove_all_bin_dirs(root_nm: &Path) {
     visit(root_nm);
 }
 
-pub(crate) fn link_single_pkg_bin(
-    target_path: &Path,
-    pkg_bin_dir: &Path,
-    bin_name: &str,
-    script_rel: &str,
-    source_script_path: &Path,
-    force: bool,
-) -> Result<()> {
-    let target_rel = compute_bin_target_rel(target_path, pkg_bin_dir, script_rel);
-    let _ = normalize_shebang(source_script_path);
-    create_shims_with_force(pkg_bin_dir, bin_name, &target_rel, force)
+#[inline]
+fn is_path_symlink_or_reparse(path: &Path) -> bool {
+    let Ok(meta) = std::fs::symlink_metadata(path) else {
+        return false;
+    };
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        if meta.file_attributes() & 0x400 != 0 {
+            return true;
+        }
+    }
+    meta.file_type().is_symlink()
+}
+
+#[inline]
+fn fast_top_level_target_rel(pkg_loc: &str, script_rel: &str) -> Option<String> {
+    let pkg_sub = pkg_loc.strip_prefix("node_modules/")?;
+    if pkg_sub.is_empty() || pkg_sub.contains("node_modules/") || pkg_sub.contains('\\') {
+        return None;
+    }
+    let clean_script = script_rel.strip_prefix("./").unwrap_or(script_rel);
+    if clean_script.is_empty()
+        || clean_script.starts_with('.')
+        || clean_script.starts_with('/')
+        || clean_script.starts_with('\\')
+        || clean_script.contains("..")
+        || clean_script.contains("//")
+        || clean_script.contains("/.")
+        || clean_script.contains("\\.")
+    {
+        return None;
+    }
+    if clean_script.contains('\\') {
+        let mut out = String::with_capacity(pkg_sub.len() + 1 + clean_script.len());
+        out.push_str(pkg_sub);
+        out.push('/');
+        for ch in clean_script.chars() {
+            out.push(if ch == '\\' { '/' } else { ch });
+        }
+        Some(out)
+    } else {
+        let mut out = String::with_capacity(pkg_sub.len() + 1 + clean_script.len());
+        out.push_str(pkg_sub);
+        out.push('/');
+        out.push_str(clean_script);
+        Some(out)
+    }
 }
 
 pub(crate) fn package_name_from_loc(loc: &str) -> &str {
@@ -589,8 +620,12 @@ pub(crate) fn link_tree_bins(
     // 3. Track claimed bin names per .bin directory in memory for the current run.
     let mut claimed_bins: HashMap<PathBuf, HashSet<String>> = HashMap::new();
     let mut wanted_shims: HashMap<PathBuf, HashSet<String>> = HashMap::new();
-    let mut shims_to_link = Vec::new();
-    let nm_real = node_modules_dir.canonicalize().ok();
+    let mut shims_to_link: Vec<(PathBuf, PathBuf, String, String, PathBuf, Option<String>)> =
+        Vec::new();
+    let nm_is_direct_child = loc_base_dir.join("node_modules") == node_modules_dir
+        || is_same_or_matching_root_nm(&loc_base_dir.join("node_modules"), node_modules_dir);
+    let clean_root_bin = path_clean::clean(root_bin_dir);
+    let mut nm_real_cache: Option<Option<PathBuf>> = None;
 
     for loc in &package_locs {
         let target_path = loc_base_dir.join(loc);
@@ -603,11 +638,7 @@ pub(crate) fn link_tree_bins(
             }
         } else {
             let pkg_manifest_path = target_path.join("package.json");
-            if !pkg_manifest_path.exists() {
-                continue;
-            }
-
-            let pkg_manifest = match Manifest::from_file(&pkg_manifest_path) {
+            let pkg_manifest = match Manifest::from_file_readonly(&pkg_manifest_path) {
                 Ok(m) => m,
                 Err(_) => continue,
             };
@@ -619,16 +650,29 @@ pub(crate) fn link_tree_bins(
             continue;
         }
 
-        let pkg_bin_dir = find_enclosing_bin_dir(&target_path, root_bin_dir, node_modules_dir);
-        let clean_bin_dir = path_clean::clean(&pkg_bin_dir);
+        let is_top_level_nm = loc.starts_with("node_modules/")
+            && !loc["node_modules/".len()..].contains("node_modules/");
+
+        let (pkg_bin_dir, clean_bin_dir) = if is_top_level_nm && nm_is_direct_child {
+            (root_bin_dir.to_path_buf(), clean_root_bin.clone())
+        } else {
+            let dir = find_enclosing_bin_dir(&target_path, root_bin_dir, node_modules_dir);
+            let clean = path_clean::clean(&dir);
+            (dir, clean)
+        };
 
         let claimed_set = claimed_bins.entry(clean_bin_dir.clone()).or_default();
-        let wanted_set = wanted_shims.entry(clean_bin_dir.clone()).or_default();
 
-        let outside_node_modules = match (target_path.canonicalize(), &nm_real) {
-            (Ok(real), Some(nm)) => !real.starts_with(nm),
-            _ => false,
+        let outside_node_modules = if is_top_level_nm && nm_is_direct_child && !is_path_symlink_or_reparse(&target_path) {
+            false
+        } else {
+            let nm_real = nm_real_cache.get_or_insert_with(|| node_modules_dir.canonicalize().ok());
+            match (target_path.canonicalize(), nm_real.as_ref()) {
+                (Ok(real), Some(nm)) => !real.starts_with(nm),
+                _ => false,
+            }
         };
+        let can_fast_rel = is_top_level_nm && nm_is_direct_child && !outside_node_modules;
         for (bin_name, script_rel) in bin_entries {
             let script_path = target_path.join(&script_rel);
             // cmd-shim's cmdShimIfExists: a bin whose target is missing (e.g. an
@@ -640,17 +684,25 @@ pub(crate) fn link_tree_bins(
             }
             // First-writer-wins within the current installation run
             if claimed_set.insert(bin_name.clone()) {
+                let fast_rel = if can_fast_rel {
+                    fast_top_level_target_rel(loc, &script_rel)
+                } else {
+                    None
+                };
+                if !is_clean_install {
+                    let wset = wanted_shims.entry(clean_bin_dir.clone()).or_default();
+                    wset.insert(bin_name.clone());
+                    wset.insert(format!("{bin_name}.cmd"));
+                    wset.insert(format!("{bin_name}.ps1"));
+                }
                 shims_to_link.push((
                     target_path.clone(),
                     pkg_bin_dir.clone(),
-                    bin_name.clone(),
+                    bin_name,
                     script_rel,
                     script_path,
+                    fast_rel,
                 ));
-
-                wanted_set.insert(bin_name.clone());
-                wanted_set.insert(format!("{bin_name}.cmd"));
-                wanted_set.insert(format!("{bin_name}.ps1"));
             } else {
                 debug!(
                     "Bin '{bin_name}' in '{}' already claimed in this run; skipping",
@@ -660,9 +712,39 @@ pub(crate) fn link_tree_bins(
         }
     }
 
+    // Precreate every unique .bin directory once before spawning bin-linking workers.
+    for dir in claimed_bins.keys() {
+        std::fs::create_dir_all(dir)
+            .with_context(|| format!("Failed to create bin dir {}", dir.display()))?;
+    }
+
+    let link_entry = |(target_path, pkg_bin_dir, bin_name, script_rel, script_path, fast_rel): &(
+        PathBuf,
+        PathBuf,
+        String,
+        String,
+        PathBuf,
+        Option<String>,
+    )|
+     -> Result<()> {
+        if let Some(ref rel) = fast_rel {
+            create_shims_with_options(pkg_bin_dir, bin_name, rel, force, Some(script_path), true)
+        } else {
+            let target_rel = compute_bin_target_rel(target_path, pkg_bin_dir, script_rel);
+            create_shims_with_options(
+                pkg_bin_dir,
+                bin_name,
+                &target_rel,
+                force,
+                Some(script_path),
+                true,
+            )
+        }
+    };
+
     if shims_to_link.len() <= 2 {
-        for (target_path, pkg_bin_dir, bin_name, script_rel, script_path) in &shims_to_link {
-            link_single_pkg_bin(target_path, pkg_bin_dir, bin_name, script_rel, script_path, force)?;
+        for item in &shims_to_link {
+            link_entry(item)?;
         }
     } else {
         let num_threads = 16.min(shims_to_link.len());
@@ -671,15 +753,8 @@ pub(crate) fn link_tree_bins(
             let mut handles = Vec::new();
             for chunk in shims_to_link.chunks(chunk_size) {
                 handles.push(scope.spawn(move || {
-                    for (target_path, pkg_bin_dir, bin_name, script_rel, script_path) in chunk {
-                        link_single_pkg_bin(
-                            target_path,
-                            pkg_bin_dir,
-                            bin_name,
-                            script_rel,
-                            script_path,
-                            force,
-                        )?;
+                    for item in chunk {
+                        link_entry(item)?;
                     }
                     Ok::<(), anyhow::Error>(())
                 }));

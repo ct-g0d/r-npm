@@ -130,60 +130,7 @@ pub fn normalize_shebang_file(file_path: &Path) -> Result<bool, ShimError> {
         return Ok(false);
     }
 
-    drop(file);
-
-    let bytes = std::fs::read(file_path).map_err(|e| ShimError::Io {
-        path: file_path.to_path_buf(),
-        source: e,
-    })?;
-
-    let (normalized, changed) = normalize_shebang_bytes(&bytes);
-    if changed {
-        #[cfg(unix)]
-        let mut orig_unix_mode: Option<u32> = None;
-        #[cfg(windows)]
-        let mut orig_readonly = false;
-
-        if let Ok(metadata) = std::fs::metadata(file_path) {
-            let mut perms = metadata.permissions();
-            if perms.readonly() {
-                #[cfg(windows)]
-                {
-                    orig_readonly = true;
-                    perms.set_readonly(false);
-                    let _ = std::fs::set_permissions(file_path, perms);
-                }
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    let mode = perms.mode();
-                    orig_unix_mode = Some(mode);
-                    perms.set_mode(mode | 0o200);
-                    let _ = std::fs::set_permissions(file_path, perms);
-                }
-            }
-        }
-        let write_res = std::fs::write(file_path, &normalized).map_err(|e| ShimError::Io {
-            path: file_path.to_path_buf(),
-            source: e,
-        });
-        #[cfg(unix)]
-        if let Some(mode) = orig_unix_mode {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(file_path, std::fs::Permissions::from_mode(mode));
-        }
-        #[cfg(windows)]
-        if orig_readonly {
-            if let Ok(meta) = std::fs::metadata(file_path) {
-                let mut perms = meta.permissions();
-                perms.set_readonly(true);
-                let _ = std::fs::set_permissions(file_path, perms);
-            }
-        }
-        write_res?;
-    }
-
-    Ok(changed)
+    normalize_crlf_from_open_file(file_path, file, header_slice, n < 512)
 }
 
 /// Splits a shebang line into tokens respecting quotes and backslash escaping.
@@ -335,4 +282,175 @@ pub fn read_shebang_from_file(file_path: &Path) -> Result<Option<ShebangInfo>, S
     }
     let content = String::from_utf8_lossy(&line_bytes);
     Ok(parse_shebang(&content))
+}
+
+/// Result of a single-open inspect+normalize read of a target script.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ShebangRead {
+    /// Path did not exist or was not a regular file.
+    NotFile,
+    /// Regular file existed, did not start with `#!` (or BOM + `#!`).
+    NoShebang,
+    /// Regular file started with `#!`; contains the normalized first line.
+    Line(String),
+}
+
+/// Normalizes a CRLF shebang line to LF if needed AND inspects line 1 in a single
+/// file open, distinguishing missing/non-files from direct (non-shebang) scripts.
+pub fn normalize_and_read_shebang_line(file_path: &Path) -> Result<ShebangRead, ShimError> {
+    use std::io::Read;
+
+    let mut file = match std::fs::File::open(file_path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(ShebangRead::NotFile),
+        Err(_) if file_path.is_dir() => return Ok(ShebangRead::NotFile),
+        Err(e) => {
+            return Err(ShimError::Io {
+                path: file_path.to_path_buf(),
+                source: e,
+            });
+        }
+    };
+
+    #[cfg(not(windows))]
+    if file.metadata().map(|m| !m.is_file()).unwrap_or(true) {
+        return Ok(ShebangRead::NotFile);
+    }
+
+    let mut header = [0u8; 512];
+    let n = match file.read(&mut header) {
+        Ok(n) => n,
+        Err(_) => return Ok(ShebangRead::NotFile),
+    };
+    let header_slice = &header[..n];
+
+    let clean = if header_slice.starts_with(b"\xEF\xBB\xBF#!") {
+        &header_slice[3..]
+    } else if header_slice.starts_with(b"#!") {
+        header_slice
+    } else {
+        return Ok(ShebangRead::NoShebang);
+    };
+
+    let (first_line_bytes, has_crlf, eof_in_header) =
+        if let Some(nl_pos) = clean.iter().position(|&b| b == b'\n') {
+            let crlf = nl_pos > 0 && clean[nl_pos - 1] == b'\r';
+            (&clean[..nl_pos], crlf, n < 512)
+        } else if n < 512 {
+            return Ok(ShebangRead::Line(
+                String::from_utf8_lossy(clean).into_owned(),
+            ));
+        } else {
+            let mut line_bytes = clean.to_vec();
+            let mut prev_byte = header_slice[511];
+            let mut crlf = false;
+            let mut byte = [0u8; 1];
+            while let Ok(1) = file.read(&mut byte) {
+                if byte[0] == b'\n' {
+                    crlf = prev_byte == b'\r';
+                    break;
+                }
+                prev_byte = byte[0];
+                line_bytes.push(byte[0]);
+            }
+            let line_str = String::from_utf8_lossy(&line_bytes).into_owned();
+            if crlf {
+                // `file` was already read past header; append line_bytes tail + rest
+                let mut full = Vec::with_capacity(header.len() + line_bytes.len());
+                if header_slice.starts_with(b"\xEF\xBB\xBF#!") {
+                    full.extend_from_slice(&header_slice[..3]);
+                }
+                full.extend_from_slice(&line_bytes);
+                full.push(b'\n');
+                normalize_crlf_from_open_file(file_path, file, &full, false)?;
+            }
+            return Ok(ShebangRead::Line(line_str));
+        };
+
+    let line_str = String::from_utf8_lossy(first_line_bytes).into_owned();
+    if has_crlf {
+        normalize_crlf_from_open_file(file_path, file, header_slice, eof_in_header)?;
+    }
+    Ok(ShebangRead::Line(line_str))
+}
+
+/// Normalizes CRLF shebang line on disk (if any) and returns `(is_file, Option<ShebangInfo>)` in one pass.
+pub fn normalize_and_read_shebang_info(
+    file_path: &Path,
+) -> Result<(bool, Option<ShebangInfo>), ShimError> {
+    match normalize_and_read_shebang_line(file_path)? {
+        ShebangRead::NotFile => Ok((false, None)),
+        ShebangRead::NoShebang => Ok((true, None)),
+        ShebangRead::Line(line) => Ok((true, parse_shebang(&line))),
+    }
+}
+
+fn normalize_crlf_from_open_file(
+    file_path: &Path,
+    mut file: std::fs::File,
+    prefix: &[u8],
+    eof_reached: bool,
+) -> Result<bool, ShimError> {
+    use std::io::Read;
+
+    let bytes = if eof_reached {
+        prefix.to_vec()
+    } else {
+        let mut buf = Vec::with_capacity(prefix.len() + 4096);
+        buf.extend_from_slice(prefix);
+        file.read_to_end(&mut buf).map_err(|e| ShimError::Io {
+            path: file_path.to_path_buf(),
+            source: e,
+        })?;
+        buf
+    };
+    let meta_opt = file.metadata().ok();
+    drop(file);
+
+    let (normalized, changed) = normalize_shebang_bytes(&bytes);
+    if changed {
+        #[cfg(unix)]
+        let mut orig_unix_mode: Option<u32> = None;
+        #[cfg(windows)]
+        let mut orig_readonly = false;
+
+        if let Some(metadata) = meta_opt {
+            let mut perms = metadata.permissions();
+            if perms.readonly() {
+                #[cfg(windows)]
+                {
+                    orig_readonly = true;
+                    perms.set_readonly(false);
+                    let _ = std::fs::set_permissions(file_path, perms);
+                }
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let mode = perms.mode();
+                    orig_unix_mode = Some(mode);
+                    perms.set_mode(mode | 0o200);
+                    let _ = std::fs::set_permissions(file_path, perms);
+                }
+            }
+        }
+        let write_res = std::fs::write(file_path, &normalized).map_err(|e| ShimError::Io {
+            path: file_path.to_path_buf(),
+            source: e,
+        });
+        #[cfg(unix)]
+        if let Some(mode) = orig_unix_mode {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(file_path, std::fs::Permissions::from_mode(mode));
+        }
+        #[cfg(windows)]
+        if orig_readonly {
+            if let Ok(meta) = std::fs::metadata(file_path) {
+                let mut perms = meta.permissions();
+                perms.set_readonly(true);
+                let _ = std::fs::set_permissions(file_path, perms);
+            }
+        }
+        write_res?;
+    }
+    Ok(changed)
 }

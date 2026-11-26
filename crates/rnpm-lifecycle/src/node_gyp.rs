@@ -192,15 +192,48 @@ pub fn find_node_gyp(
         }
     }
 
-    // c. Standalone node-gyp on PATH
-    let path_var = std::env::var_os("PATH").or_else(|| std::env::var_os("Path")).unwrap_or_default();
+#[inline]
+fn contains_ascii_ci(hay: &[u8], needle: &[u8]) -> bool {
+    hay.len() >= needle.len()
+        && hay
+            .windows(needle.len())
+            .any(|w| w.eq_ignore_ascii_case(needle))
+}
+
+fn find_standalone_node_gyp_on_path() -> Option<PathBuf> {
+    use std::sync::{Mutex, OnceLock};
+    use std::time::{Duration, Instant};
+
+    #[allow(clippy::type_complexity)]
+    static CACHE: OnceLock<Mutex<Option<(std::ffi::OsString, Option<PathBuf>, Instant)>>> =
+        OnceLock::new();
+
+    let path_var = std::env::var_os("PATH")
+        .or_else(|| std::env::var_os("Path"))
+        .unwrap_or_default();
+
+    let cache = CACHE.get_or_init(|| Mutex::new(None));
+    if let Ok(guard) = cache.lock() {
+        if let Some((ref cached_path, ref result, ts)) = *guard {
+            if cached_path == &path_var {
+                match result {
+                    Some(p) if p.is_file() => return Some(p.clone()),
+                    None if ts.elapsed() < Duration::from_secs(2) => return None,
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    let mut found = None;
     for p in std::env::split_paths(&path_var) {
-        let s = p.to_string_lossy().to_ascii_lowercase();
+        let s_lossy = p.to_string_lossy();
+        let bytes = s_lossy.as_bytes();
         // Skip npm's bundled node-gyp-bin or npm node_modules so we don't confuse bundled with standalone
-        if s.contains("node_modules\\npm")
-            || s.contains("node_modules/npm")
-            || s.contains("npm\\bin\\node-gyp-bin")
-            || s.contains("npm/bin/node-gyp-bin")
+        if contains_ascii_ci(bytes, b"node_modules\\npm")
+            || contains_ascii_ci(bytes, b"node_modules/npm")
+            || contains_ascii_ci(bytes, b"npm\\bin\\node-gyp-bin")
+            || contains_ascii_ci(bytes, b"npm/bin/node-gyp-bin")
         {
             continue;
         }
@@ -208,16 +241,38 @@ pub fn find_node_gyp(
             for ext in ["cmd", "exe", "bat"] {
                 let candidate = p.join(format!("node-gyp.{ext}"));
                 if candidate.is_file() {
-                    debug!("Resolved standalone node-gyp on PATH: {}", candidate.display());
-                    return Some(candidate);
+                    debug!(
+                        "Resolved standalone node-gyp on PATH: {}",
+                        candidate.display()
+                    );
+                    found = Some(candidate);
+                    break;
                 }
+            }
+            if found.is_some() {
+                break;
             }
         }
         let candidate = p.join("node-gyp");
         if candidate.is_file() {
-            debug!("Resolved standalone node-gyp on PATH: {}", candidate.display());
-            return Some(candidate);
+            debug!(
+                "Resolved standalone node-gyp on PATH: {}",
+                candidate.display()
+            );
+            found = Some(candidate);
+            break;
         }
+    }
+
+    if let Ok(mut guard) = cache.lock() {
+        *guard = Some((path_var, found.clone(), Instant::now()));
+    }
+    found
+}
+
+    // c. Standalone node-gyp on PATH
+    if let Some(candidate) = find_standalone_node_gyp_on_path() {
+        return Some(candidate);
     }
 
     // d. rnpm's own cached standalone node-gyp directory (<cache>/node-gyp/current/bin/node-gyp.js)

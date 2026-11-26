@@ -90,18 +90,19 @@ impl ScriptPolicy {
         };
         let mut pkg_entries = None;
         if !is_global {
-            let text =
-                std::fs::read_to_string(project_dir.join("package.json")).unwrap_or_default();
-            if let Ok(value) =
-                serde_json::from_str::<serde_json::Value>(text.trim_start_matches('\u{feff}'))
-            {
-                if let Some(obj) = value.get("allowScripts").and_then(|v| v.as_object()) {
-                    let entries: Vec<(String, bool)> = obj
-                        .iter()
-                        .filter_map(|(k, v)| v.as_bool().map(|b| (k.trim().to_string(), b)))
-                        .collect();
-                    if !entries.is_empty() {
-                        pkg_entries = Some(entries);
+            if let Ok(bytes) = std::fs::read(project_dir.join("package.json")) {
+                if bytes_contain(&bytes, b"\"allowScripts\"") || bytes_contain(&bytes, b"\\u") {
+                    let clean = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(&bytes);
+                    if let Ok(value) = serde_json::from_slice::<serde_json::Value>(clean) {
+                        if let Some(obj) = value.get("allowScripts").and_then(|v| v.as_object()) {
+                            let entries: Vec<(String, bool)> = obj
+                                .iter()
+                                .filter_map(|(k, v)| v.as_bool().map(|b| (k.trim().to_string(), b)))
+                                .collect();
+                            if !entries.is_empty() {
+                                pkg_entries = Some(entries);
+                            }
+                        }
                     }
                 }
             }
@@ -618,6 +619,27 @@ pub fn apply_script_policy(
     Ok(kept)
 }
 
+#[inline]
+fn bytes_contain(hay: &[u8], needle: &[u8]) -> bool {
+    hay.len() >= needle.len() && hay.windows(needle.len()).any(|w| w == needle)
+}
+
+#[inline]
+fn may_have_install_scripts(bytes: &[u8], is_registry: bool) -> bool {
+    bytes_contain(bytes, b"preinstall")
+        || bytes_contain(bytes, b"\"install\"")
+        || bytes_contain(bytes, b"postinstall")
+        || (!is_registry && bytes_contain(bytes, b"\"prepare\""))
+        || bytes_contain(bytes, b"\\u")
+}
+
+struct UnreviewedCandidate<'a> {
+    location: &'a str,
+    dir: PathBuf,
+    is_reg: bool,
+    reg_id: Option<(String, Option<String>)>,
+}
+
 /// The advisory npm prints after reify: installed dependencies with install
 /// scripts that the policy neither allows nor denies.
 pub fn unreviewed_scripts_warning(
@@ -631,8 +653,7 @@ pub fn unreviewed_scripts_warning(
         return None;
     }
     let norm_ws: HashSet<String> = workspace_paths.iter().map(|p| p.replace('\\', "/")).collect();
-    let mut found: Vec<(String, String)> = Vec::new();
-    let mut names = Vec::new();
+    let mut candidates: Vec<UnreviewedCandidate<'_>> = Vec::new();
     for (location, pkg) in &lockfile.packages {
         if location.is_empty() || !location.contains("node_modules/") {
             continue;
@@ -665,35 +686,91 @@ pub fn unreviewed_scripts_warning(
         if ident.in_bundle || policy.verdict(&ident).is_some() {
             continue;
         }
-        let Ok(manifest) = Manifest::from_file(dir.join("package.json")) else {
-            continue;
-        };
-        let scripts = install_scripts(&manifest, &dir, ident.is_registry());
-        if scripts.is_empty() {
-            continue;
+        let is_reg = ident.is_registry();
+        let reg_id = is_reg.then(|| ident.registry_identity()).flatten();
+        candidates.push(UnreviewedCandidate {
+            location: location.as_str(),
+            dir,
+            is_reg,
+            reg_id,
+        });
+    }
+
+    if candidates.is_empty() {
+        return None;
+    }
+
+    let inspect_candidate = |c: &UnreviewedCandidate<'_>| -> Option<(String, String, String)> {
+        let bytes = std::fs::read(c.dir.join("package.json")).ok()?;
+        let has_script_keys = may_have_install_scripts(&bytes, c.is_reg);
+        if !has_script_keys && !c.dir.join("binding.gyp").is_file() {
+            return None;
         }
-        let (name, version) = ident
-            .registry_identity()
-            .filter(|_| ident.is_registry())
+        let manifest = Manifest::from_slice_readonly(&bytes).ok()?;
+        let scripts = install_scripts(&manifest, &c.dir, c.is_reg);
+        if scripts.is_empty() {
+            return None;
+        }
+        let (name, version) = c
+            .reg_id
+            .clone()
+            .filter(|_| c.is_reg)
             .map(|(n, v)| (n, v.or_else(|| manifest.version.clone())))
             .unwrap_or_else(|| {
                 (
                     manifest
                         .name
                         .clone()
-                        .unwrap_or_else(|| location.to_string()),
+                        .unwrap_or_else(|| c.location.to_string()),
                     manifest.version.clone(),
                 )
             });
-        names.push(name.clone());
         let ver = version.map(|v| format!("@{v}")).unwrap_or_default();
-        found.push((
-            location.clone(),
+        Some((
+            c.location.to_string(),
+            name.clone(),
             format!("  {name}{ver} ({})", describe(&scripts)),
-        ));
-    }
-    if found.is_empty() {
+        ))
+    };
+
+    let mut matches: Vec<(String, String, String)> = if candidates.len() <= 16 {
+        candidates.iter().filter_map(inspect_candidate).collect()
+    } else {
+        let num_threads = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4)
+            .min(16)
+            .min(candidates.len());
+        let chunk_size = candidates.len().div_ceil(num_threads);
+        std::thread::scope(|scope| {
+            let mut handles = Vec::with_capacity(num_threads);
+            for chunk in candidates.chunks(chunk_size) {
+                handles.push(scope.spawn(move || {
+                    chunk
+                        .iter()
+                        .filter_map(inspect_candidate)
+                        .collect::<Vec<_>>()
+                }));
+            }
+            let mut out = Vec::new();
+            for handle in handles {
+                if let Ok(part) = handle.join() {
+                    out.extend(part);
+                }
+            }
+            out
+        })
+    };
+
+    if matches.is_empty() {
         return None;
+    }
+    matches.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut found: Vec<(String, String)> = Vec::with_capacity(matches.len());
+    let mut names = Vec::with_capacity(matches.len());
+    for (loc, name, line) in matches {
+        names.push(name);
+        found.push((loc, line));
     }
     let count = found.len();
     let noun = if count == 1 {
