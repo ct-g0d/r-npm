@@ -2414,7 +2414,6 @@ fn is_lifecycle_script(name: &str) -> bool {
 }
 
 #[allow(clippy::too_many_arguments)]
-#[allow(clippy::too_many_arguments)]
 #[allow(dead_code)]
 pub(crate) async fn execute_run(
     current_dir: PathBuf,
@@ -2544,7 +2543,7 @@ pub(crate) fn execute_run_with_config(
     let has_filter = !workspace.is_empty() || !filter.is_empty() || !scope.is_empty();
     if workspaces || has_filter {
         // Fail before any member runs, not as one member's script failure.
-        enforce_run_dev_engines_once_with_config(&current_dir, &config)?;
+        enforce_run_dev_engines_once_with_config(&current_dir, config)?;
         let mut filters = workspace;
         filters.extend(filter);
         filters.extend(scope);
@@ -2609,7 +2608,7 @@ pub(crate) fn execute_run_with_config(
             ignore_scripts,
             foreground_scripts,
             strict_sandbox,
-            &config,
+            config,
         )
     }
 }
@@ -8672,7 +8671,7 @@ fn execute_sync_command_inner(
             }
             Ok(())
         })()),
-        Commands::Repo { packages, .. } if packages.is_empty() => Some((|| -> anyhow::Result<()> {
+        Commands::Repo { packages, .. } if packages.is_empty() => {
             let pkg_json = current_dir.join("package.json");
             let value = std::fs::read_to_string(&pkg_json)
                 .ok()
@@ -8682,7 +8681,7 @@ fn execute_sync_command_inner(
                 .and_then(|v| v.get("repository"))
                 .and_then(|v| v.get("url").or(Some(v)))
                 .and_then(|v| v.as_str());
-            if let Some(r) = repo {
+            Some(if let Some(r) = repo {
                 let name = value
                     .as_ref()
                     .and_then(|v| v.get("name"))
@@ -8698,8 +8697,8 @@ fn execute_sync_command_inner(
                 Ok(())
             } else {
                 Err(anyhow::anyhow!("npm error no repository"))
-            }
-        })()),
+            })
+        }
         Commands::Explore {
             package,
             args,
@@ -8738,26 +8737,21 @@ fn execute_sync_command_inner(
             foreground_scripts,
             strict_sandbox,
             workspace_root,
-        } => Some((|| -> anyhow::Result<()> {
-            if run_prechecks {
-                enforce_run_dev_engines_once_with_config(current_dir, config)?;
-            }
-            execute_run_with_config(
-                current_dir.to_path_buf(),
-                Some("test".to_string()),
-                std::mem::take(args),
-                *workspaces,
-                std::mem::take(workspace),
-                Vec::new(),
-                Vec::new(),
-                *if_present,
-                *ignore_scripts,
-                *foreground_scripts,
-                *strict_sandbox,
-                *workspace_root,
-                Some(config),
-            )
-        })()),
+        } => Some(execute_run_with_config(
+            current_dir.to_path_buf(),
+            Some("test".to_string()),
+            std::mem::take(args),
+            *workspaces,
+            std::mem::take(workspace),
+            Vec::new(),
+            Vec::new(),
+            *if_present,
+            *ignore_scripts,
+            *foreground_scripts,
+            *strict_sandbox,
+            *workspace_root,
+            Some(config),
+        )),
         Commands::Start {
             args,
             workspaces,
@@ -8767,26 +8761,21 @@ fn execute_sync_command_inner(
             foreground_scripts,
             strict_sandbox,
             workspace_root,
-        } => Some((|| -> anyhow::Result<()> {
-            if run_prechecks {
-                enforce_run_dev_engines_once_with_config(current_dir, config)?;
-            }
-            execute_run_with_config(
-                current_dir.to_path_buf(),
-                Some("start".to_string()),
-                std::mem::take(args),
-                *workspaces,
-                std::mem::take(workspace),
-                Vec::new(),
-                Vec::new(),
-                *if_present,
-                *ignore_scripts,
-                *foreground_scripts,
-                *strict_sandbox,
-                *workspace_root,
-                Some(config),
-            )
-        })()),
+        } => Some(execute_run_with_config(
+            current_dir.to_path_buf(),
+            Some("start".to_string()),
+            std::mem::take(args),
+            *workspaces,
+            std::mem::take(workspace),
+            Vec::new(),
+            Vec::new(),
+            *if_present,
+            *ignore_scripts,
+            *foreground_scripts,
+            *strict_sandbox,
+            *workspace_root,
+            Some(config),
+        )),
         Commands::Restart {
             args,
             workspaces,
@@ -8796,26 +8785,21 @@ fn execute_sync_command_inner(
             foreground_scripts,
             strict_sandbox,
             workspace_root,
-        } => Some((|| -> anyhow::Result<()> {
-            if run_prechecks {
-                enforce_run_dev_engines_once_with_config(current_dir, config)?;
-            }
-            execute_run_with_config(
-                current_dir.to_path_buf(),
-                Some("restart".to_string()),
-                std::mem::take(args),
-                *workspaces,
-                std::mem::take(workspace),
-                Vec::new(),
-                Vec::new(),
-                *if_present,
-                *ignore_scripts,
-                *foreground_scripts,
-                *strict_sandbox,
-                *workspace_root,
-                Some(config),
-            )
-        })()),
+        } => Some(execute_run_with_config(
+            current_dir.to_path_buf(),
+            Some("restart".to_string()),
+            std::mem::take(args),
+            *workspaces,
+            std::mem::take(workspace),
+            Vec::new(),
+            Vec::new(),
+            *if_present,
+            *ignore_scripts,
+            *foreground_scripts,
+            *strict_sandbox,
+            *workspace_root,
+            Some(config),
+        )),
         Commands::Stop {
             args,
             workspaces,
@@ -8825,26 +8809,21 @@ fn execute_sync_command_inner(
             foreground_scripts,
             strict_sandbox,
             workspace_root,
-        } => Some((|| -> anyhow::Result<()> {
-            if run_prechecks {
-                enforce_run_dev_engines_once_with_config(current_dir, config)?;
-            }
-            execute_run_with_config(
-                current_dir.to_path_buf(),
-                Some("stop".to_string()),
-                std::mem::take(args),
-                *workspaces,
-                std::mem::take(workspace),
-                Vec::new(),
-                Vec::new(),
-                *if_present,
-                *ignore_scripts,
-                *foreground_scripts,
-                *strict_sandbox,
-                *workspace_root,
-                Some(config),
-            )
-        })()),
+        } => Some(execute_run_with_config(
+            current_dir.to_path_buf(),
+            Some("stop".to_string()),
+            std::mem::take(args),
+            *workspaces,
+            std::mem::take(workspace),
+            Vec::new(),
+            Vec::new(),
+            *if_present,
+            *ignore_scripts,
+            *foreground_scripts,
+            *strict_sandbox,
+            *workspace_root,
+            Some(config),
+        )),
         Commands::Run {
             script,
             args,

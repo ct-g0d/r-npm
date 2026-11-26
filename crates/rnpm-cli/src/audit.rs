@@ -534,7 +534,7 @@ pub(crate) async fn build_audit_report_with_advisories_and_config(
     let mut bulk_request: BTreeMap<String, Vec<String>> = BTreeMap::new();
     let mut installed_packages: Vec<(String, String, String, bool)> = Vec::new(); // (key, name, version, is_direct)
 
-    let dep_counts = dependency_counts(&lockfile);
+    let dep_counts = dependency_counts(lockfile);
 
     for (key, pkg) in &lockfile.packages {
         if key.is_empty() {
@@ -572,7 +572,7 @@ pub(crate) async fn build_audit_report_with_advisories_and_config(
         .unwrap_or_else(|| config.npmrc.registry.to_string());
 
     let advisories_by_pkg =
-        fetch_advisories(&registry, &bulk_request, project_dir, &config).await?;
+        fetch_advisories(&registry, &bulk_request, project_dir, config).await?;
 
     // Scan for vulnerabilities
     let mut vulnerabilities: BTreeMap<String, PackageVulnerability> = BTreeMap::new();
@@ -664,7 +664,7 @@ pub(crate) async fn build_audit_report_with_advisories_and_config(
         }
     }
 
-    graph::complete_graph(&mut vulnerabilities, &lockfile, &registry, &config).await?;
+    graph::complete_graph(&mut vulnerabilities, lockfile, &registry, config).await?;
 
     // npm 11 counts vulnerable packages using each package's highest severity
     let mut pkg_vuln_counts = VulnerabilitiesCount::default();

@@ -286,7 +286,7 @@ mod pe_version {
         let data_entry = read_at(file, rsrc_base.checked_add(u64::from(leaf_off))?, 16)?;
         let data_rva = read_u32(&data_entry, 0)?;
         let data_size = read_u32(&data_entry, 4)? as usize;
-        if data_size < 64 || data_size > 65536 {
+        if !(64..=65536).contains(&data_size) {
             return None;
         }
         let data_offset = rva_to_file_offset(sections, data_rva)?;
@@ -425,9 +425,10 @@ mod pe_version {
     }
 
     fn decode_utf16le_trimmed(bytes: &[u8]) -> Option<String> {
-        let mut units: Vec<u16> = bytes
-            .chunks_exact(2)
-            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+        let (chunks, _) = bytes.as_chunks::<2>();
+        let mut units: Vec<u16> = chunks
+            .iter()
+            .map(|&c| u16::from_le_bytes(c))
             .collect();
         while units.last() == Some(&0) {
             units.pop();
