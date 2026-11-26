@@ -1,10 +1,11 @@
-use std::collections::{HashMap, HashSet, VecDeque};
+use crate::fast_util::{fast_map_with_capacity, fast_set_with_capacity, FastMap};
+use std::collections::VecDeque;
 
 /// Context tracker for detecting and breaking cyclic peer dependency relationships of any depth.
 #[derive(Debug, Clone, Default)]
 pub struct PeerContext {
     /// Active peer edges: dependent_package -> set of peer_packages being resolved
-    active_graph: HashMap<String, Vec<String>>,
+    active_graph: FastMap<String, Vec<String>>,
 }
 
 impl PeerContext {
@@ -34,8 +35,8 @@ impl PeerContext {
         }
 
         // Cycle exists if `dependent` (or alias) is reachable from `peer` (or alias) in active graph
-        let mut visited = HashSet::new();
-        let mut queue = VecDeque::new();
+        let mut visited = fast_set_with_capacity(8);
+        let mut queue = VecDeque::with_capacity(8);
         queue.push_back(peer);
         visited.insert(peer);
         if let Some(pa) = peer_alias {
@@ -87,9 +88,9 @@ impl PeerContext {
         }
 
         // BFS with predecessor map to reconstruct shortest path from `peer` (or alias) to `dependent`
-        let mut visited = HashSet::new();
-        let mut queue = VecDeque::new();
-        let mut parent_map: HashMap<&str, &str> = HashMap::new();
+        let mut visited = fast_set_with_capacity(8);
+        let mut queue = VecDeque::with_capacity(8);
+        let mut parent_map: FastMap<&str, &str> = fast_map_with_capacity(8);
 
         queue.push_back(peer);
         visited.insert(peer);

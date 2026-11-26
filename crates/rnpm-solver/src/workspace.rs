@@ -8,7 +8,9 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use tracing::debug;
 
 use crate::error::SolverError;
+use crate::fast_util::{fast_map_with_capacity, FastMap};
 use crate::graph::{DependencyEdge, DependencyGraph, DependencyType, Node, NodeFlags};
+use crate::hoisting::{cached_target_rc, cached_version_rc};
 use crate::overrides::Overrides;
 use crate::solver::{ResolverOptions, Solver};
 use crate::types::PackageMetadataProvider;
@@ -47,26 +49,17 @@ impl WorkspaceDependencyGraph {
         let mut dev_deps: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
         let mut peer_deps: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
 
-        // 1. Resolve workspace dependencies for each member
+        // 1. Resolve workspace dependencies for each member (avoid cloning non-workspace specs)
         for member in members {
             let mut member_prod: BTreeMap<String, String> = BTreeMap::new();
             let mut member_dev: BTreeMap<String, String> = BTreeMap::new();
             let mut member_peer: BTreeMap<String, String> = BTreeMap::new();
 
-            // Collect production dependencies (dependencies + optional_dependencies)
-            let mut raw_prod = BTreeMap::new();
-            for (k, v) in &member.manifest.dependencies {
-                raw_prod.insert(k.clone(), v.clone());
-            }
-            for (k, v) in &member.manifest.optional_dependencies {
-                raw_prod.entry(k.clone()).or_insert_with(|| v.clone());
-            }
-
-            for (dep_name, dep_spec) in raw_prod {
+            // Production dependencies: dependencies take priority over optional_dependencies.
+            for (dep_name, dep_spec) in &member.manifest.dependencies {
                 let trimmed_spec = dep_spec.trim();
-
                 if let Some(ws_spec) = trimmed_spec.strip_prefix("workspace:") {
-                    let sibling = member_map.get(&dep_name).ok_or_else(|| {
+                    let sibling = member_map.get(dep_name).ok_or_else(|| {
                         SolverError::UnresolvedDependency {
                             name: dep_name.clone(),
                             spec: dep_spec.clone(),
@@ -76,15 +69,35 @@ impl WorkspaceDependencyGraph {
                             ),
                         }
                     })?;
-
-                    // Validate version constraint
-                    validate_workspace_protocol_constraint(member, sibling, ws_spec, &dep_spec)?;
-
-                    member_prod.insert(dep_name, dep_spec);
-                } else if let Some(sibling) = member_map.get(&dep_name) {
-                    // Check if a normal semver spec satisfies the local sibling version
+                    validate_workspace_protocol_constraint(member, sibling, ws_spec, dep_spec)?;
+                    member_prod.insert(dep_name.clone(), dep_spec.clone());
+                } else if let Some(sibling) = member_map.get(dep_name) {
                     if is_sibling_compatible(sibling, trimmed_spec) {
-                        member_prod.insert(dep_name, dep_spec);
+                        member_prod.insert(dep_name.clone(), dep_spec.clone());
+                    }
+                }
+            }
+            for (dep_name, dep_spec) in &member.manifest.optional_dependencies {
+                if member.manifest.dependencies.contains_key(dep_name) {
+                    continue;
+                }
+                let trimmed_spec = dep_spec.trim();
+                if let Some(ws_spec) = trimmed_spec.strip_prefix("workspace:") {
+                    let sibling = member_map.get(dep_name).ok_or_else(|| {
+                        SolverError::UnresolvedDependency {
+                            name: dep_name.clone(),
+                            spec: dep_spec.clone(),
+                            message: format!(
+                                "Workspace package '{}' not found in monorepo, requested by '{}' via '{}'",
+                                dep_name, member.name, dep_spec
+                            ),
+                        }
+                    })?;
+                    validate_workspace_protocol_constraint(member, sibling, ws_spec, dep_spec)?;
+                    member_prod.insert(dep_name.clone(), dep_spec.clone());
+                } else if let Some(sibling) = member_map.get(dep_name) {
+                    if is_sibling_compatible(sibling, trimmed_spec) {
+                        member_prod.insert(dep_name.clone(), dep_spec.clone());
                     }
                 }
             }
@@ -393,12 +406,21 @@ fn is_sibling_compatible(sibling: &WorkspaceMember, spec: &str) -> bool {
         return true;
     }
     if let Some(ref ver_str) = sibling.version {
-        if let Ok(ver) = Version::parse(ver_str) {
+        if let Some(ver) = cached_version_rc(ver_str) {
+            if let Some(target) = cached_target_rc(spec) {
+                match target.as_ref() {
+                    rnpm_core::spec::PackageTarget::Range(range) => return range.satisfies(&ver),
+                    rnpm_core::spec::PackageTarget::Version(expected) => {
+                        return ver.as_ref() == expected;
+                    }
+                    _ => {}
+                }
+            }
             if let Ok(range) = Range::parse(spec) {
                 return range.satisfies(&ver);
             }
             if let Ok(expected) = Version::parse(spec) {
-                return ver == expected;
+                return ver.as_ref() == &expected;
             }
         }
     }
@@ -437,143 +459,188 @@ pub fn topological_sort_with_dev_deps(
         }
     }
 
-    // 2. Cycle detection strictly on production dependencies
-    let mut state: BTreeMap<String, u8> = BTreeMap::new();
-    let mut stack: Vec<String> = Vec::new();
-    let mut dummy_order: Vec<String> = Vec::new();
-
-    for name in members.keys() {
-        state.insert(name.clone(), 0);
+    // Collect deterministic lexicographically sorted node table (`BTreeSet` preserves exact DFS order).
+    let mut name_set: BTreeSet<&str> = BTreeSet::new();
+    for k in members.keys() {
+        name_set.insert(k.as_str());
     }
-
-    for name in members.keys() {
-        if state.get(name) == Some(&0) {
-            dfs_visit(name, prod_deps, &mut state, &mut stack, &mut dummy_order)?;
+    for (u, deps) in prod_deps.iter().chain(dev_deps.iter()) {
+        name_set.insert(u.as_str());
+        for v in deps.keys() {
+            name_set.insert(v.as_str());
         }
     }
-
-    // 3. Construct combined graph for execution ordering by adding dev dependencies that do not create cycles
-    let mut adj: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
-    for name in members.keys() {
-        let mut targets = BTreeSet::new();
-        if let Some(p_deps) = prod_deps.get(name) {
-            for dep in p_deps.keys() {
-                targets.insert(dep.clone());
-            }
-        }
-        adj.insert(name.clone(), targets);
+    let id_to_name: Vec<&str> = name_set.into_iter().collect();
+    let total = id_to_name.len();
+    let member_limit = members.len();
+    let mut name_to_id: FastMap<&str, usize> = fast_map_with_capacity(total);
+    for (i, &n) in id_to_name.iter().enumerate() {
+        name_to_id.insert(n, i);
     }
 
-    fn has_path(from: &str, to: &str, adj: &BTreeMap<String, BTreeSet<String>>) -> bool {
-        if from == to {
-            return true;
-        }
-        let mut visited = BTreeSet::new();
-        let mut queue = VecDeque::new();
-        visited.insert(from.to_string());
-        queue.push_back(from.to_string());
-
-        while let Some(curr) = queue.pop_front() {
-            if let Some(neighbors) = adj.get(&curr) {
-                for next in neighbors {
-                    if next == to {
-                        return true;
-                    }
-                    if visited.insert(next.clone()) {
-                        queue.push_back(next.clone());
-                    }
+    let mut prod_adj: Vec<Vec<usize>> = vec![Vec::new(); total];
+    for (u, dep_map) in prod_deps {
+        if let Some(&u_id) = name_to_id.get(u.as_str()) {
+            let list = &mut prod_adj[u_id];
+            list.reserve(dep_map.len());
+            for v in dep_map.keys() {
+                if let Some(&v_id) = name_to_id.get(v.as_str()) {
+                    list.push(v_id);
                 }
             }
         }
-        false
     }
 
-    // For each dev dependency edge (u -> v, meaning u depends on v):
-    // If v can reach u, then adding u -> v creates a cycle. So we gracefully skip (break) it!
-    for (u, v_map) in dev_deps {
-        for v in v_map.keys() {
-            if u == v {
-                continue;
-            }
-            if has_path(v, u, &adj) {
-                debug!(
-                    "Gracefully broke circular workspace devDependency back-edge: {} -> {}",
-                    u, v
-                );
-            } else {
-                adj.entry(u.clone()).or_default().insert(v.clone());
-            }
-        }
-    }
+    // 2. Cycle detection strictly on production dependencies
+    let mut state: Vec<u8> = vec![0; total];
+    let mut stack: Vec<usize> = Vec::with_capacity(total.min(64));
+    let mut dummy_order: Vec<usize> = Vec::with_capacity(total);
 
-    // 4. Run topological sort on the combined acyclic graph
-    let mut combined_deps: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
-    for (name, targets) in &adj {
-        let mut m = BTreeMap::new();
-        for target in targets {
-            m.insert(target.clone(), String::new());
-        }
-        combined_deps.insert(name.clone(), m);
-    }
+    fn dfs_visit_id(
+        node: usize,
+        adj: &[Vec<usize>],
+        id_to_name: &[&str],
+        state: &mut [u8],
+        stack: &mut Vec<usize>,
+        order: &mut Vec<usize>,
+    ) -> Result<(), SolverError> {
+        state[node] = 1;
+        stack.push(node);
 
-    let mut final_state: BTreeMap<String, u8> = BTreeMap::new();
-    let mut final_stack: Vec<String> = Vec::new();
-    let mut final_order: Vec<String> = Vec::new();
-
-    for name in members.keys() {
-        final_state.insert(name.clone(), 0);
-    }
-
-    for name in members.keys() {
-        if final_state.get(name) == Some(&0) {
-            dfs_visit(
-                name,
-                &combined_deps,
-                &mut final_state,
-                &mut final_stack,
-                &mut final_order,
-            )?;
-        }
-    }
-
-    Ok(final_order)
-}
-
-fn dfs_visit(
-    node: &str,
-    deps: &BTreeMap<String, BTreeMap<String, String>>,
-    state: &mut BTreeMap<String, u8>,
-    stack: &mut Vec<String>,
-    order: &mut Vec<String>,
-) -> Result<(), SolverError> {
-    state.insert(node.to_string(), 1);
-    stack.push(node.to_string());
-
-    if let Some(node_deps) = deps.get(node) {
-        for dep_name in node_deps.keys() {
-            match state.get(dep_name).copied().unwrap_or(0) {
+        for &dep in &adj[node] {
+            match state[dep] {
                 1 => {
-                    // Cycle detected!
-                    let start_idx = stack.iter().position(|s| s == dep_name).unwrap_or(0);
-                    let mut cycle: Vec<String> = stack[start_idx..].to_vec();
-                    cycle.push(dep_name.clone());
+                    let start_idx = stack.iter().position(|&s| s == dep).unwrap_or(0);
+                    let mut cycle: Vec<&str> =
+                        stack[start_idx..].iter().map(|&id| id_to_name[id]).collect();
+                    cycle.push(id_to_name[dep]);
                     return Err(SolverError::CycleDetected(format!(
                         "Circular workspace dependency detected: {}",
                         cycle.join(" -> ")
                     )));
                 }
                 0 => {
-                    dfs_visit(dep_name, deps, state, stack, order)?;
+                    dfs_visit_id(dep, adj, id_to_name, state, stack, order)?;
                 }
                 _ => {}
             }
         }
+
+        state[node] = 2;
+        stack.pop();
+        order.push(node);
+        Ok(())
     }
 
-    state.insert(node.to_string(), 2);
-    stack.pop();
-    order.push(node.to_string());
-    Ok(())
+    for name in members.keys() {
+        let id = name_to_id[name.as_str()];
+        if state[id] == 0 {
+            dfs_visit_id(id, &prod_adj, &id_to_name, &mut state, &mut stack, &mut dummy_order)?;
+        }
+    }
+
+    // 3. Construct combined graph adding dev dependencies that do not create cycles
+    let mut combined_adj = prod_adj;
+    let mut visited_gen: Vec<u32> = vec![0; total];
+    let mut gen_counter: u32 = 0;
+    let mut bfs_queue: VecDeque<usize> = VecDeque::with_capacity(32.min(total));
+
+    fn has_path_id(
+        from: usize,
+        to: usize,
+        adj: &[Vec<usize>],
+        visited_gen: &mut [u32],
+        gen_counter: &mut u32,
+        queue: &mut VecDeque<usize>,
+    ) -> bool {
+        if from == to {
+            return true;
+        }
+        *gen_counter = gen_counter.wrapping_add(1);
+        if *gen_counter == 0 {
+            visited_gen.fill(0);
+            *gen_counter = 1;
+        }
+        let stamp = *gen_counter;
+        queue.clear();
+        visited_gen[from] = stamp;
+        queue.push_back(from);
+
+        while let Some(curr) = queue.pop_front() {
+            for &next in &adj[curr] {
+                if next == to {
+                    return true;
+                }
+                if visited_gen[next] != stamp {
+                    visited_gen[next] = stamp;
+                    queue.push_back(next);
+                }
+            }
+        }
+        false
+    }
+
+    for (u, v_map) in dev_deps {
+        let Some(&u_id) = name_to_id.get(u.as_str()) else {
+            continue;
+        };
+        for v in v_map.keys() {
+            let Some(&v_id) = name_to_id.get(v.as_str()) else {
+                continue;
+            };
+            if u_id == v_id {
+                continue;
+            }
+            if has_path_id(
+                v_id,
+                u_id,
+                &combined_adj,
+                &mut visited_gen,
+                &mut gen_counter,
+                &mut bfs_queue,
+            ) {
+                debug!(
+                    "Gracefully broke circular workspace devDependency back-edge: {} -> {}",
+                    u, v
+                );
+            } else if !combined_adj[u_id].contains(&v_id) {
+                combined_adj[u_id].push(v_id);
+            }
+        }
+    }
+
+    // Preserve deterministic lexicographical neighbor traversal matching BTreeSet.
+    if !dev_deps.is_empty() {
+        for list in &mut combined_adj {
+            if list.len() > 1 {
+                list.sort_unstable();
+            }
+        }
+    }
+
+    // 4. Run topological sort on the combined acyclic graph
+    state.fill(0);
+    stack.clear();
+    let mut final_order_ids: Vec<usize> = Vec::with_capacity(member_limit);
+
+    for name in members.keys() {
+        let id = name_to_id[name.as_str()];
+        if state[id] == 0 {
+            dfs_visit_id(
+                id,
+                &combined_adj,
+                &id_to_name,
+                &mut state,
+                &mut stack,
+                &mut final_order_ids,
+            )?;
+        }
+    }
+
+    Ok(final_order_ids
+        .into_iter()
+        .map(|id| id_to_name[id].to_string())
+        .collect())
 }
 
 /// Resolves a full workspace dependency graph including sibling linking and cross-workspace external package hoisting.
@@ -597,6 +664,7 @@ pub fn resolve_workspace_graph<P: PackageMetadataProvider>(
         .clone()
         .unwrap_or_else(|| "1.0.0".to_string());
 
+    let root_parsed_ver = cached_version_rc(&root_version).map(|rc| (*rc).clone());
     // 2. Insert root package node at ""
     let root_node = Node {
         location: String::new(),
@@ -629,7 +697,7 @@ pub fn resolve_workspace_graph<P: PackageMetadataProvider>(
             .and_then(|v| v.as_str())
             .map(str::to_owned),
         engines: root_manifest.engines.clone(),
-        parsed_version: None,
+        parsed_version: root_parsed_ver,
         extra: {
             let mut extra = root_manifest.extra.clone();
             if let Some(ref bd) = root_manifest.bundled_dependencies {
@@ -650,13 +718,14 @@ pub fn resolve_workspace_graph<P: PackageMetadataProvider>(
             .version
             .clone()
             .unwrap_or_else(|| "0.0.0".to_string());
+        let mem_parsed_ver = cached_version_rc(&mem_ver).map(|rc| (*rc).clone());
 
         let member_node = Node {
             location: member_loc.clone(),
             install_name: member.name.clone(),
             name: member.name.clone(),
             version: mem_ver.clone(),
-            parsed_version: None,
+            parsed_version: mem_parsed_ver.clone(),
             resolved: None,
             integrity: None,
             flags: NodeFlags {
@@ -702,6 +771,7 @@ pub fn resolve_workspace_graph<P: PackageMetadataProvider>(
             install_name: member.name.clone(),
             name: member.name.clone(),
             version: mem_ver,
+            parsed_version: mem_parsed_ver,
             resolved: Some(member_loc.clone()),
             integrity: None,
             flags: NodeFlags {
@@ -724,7 +794,8 @@ pub fn resolve_workspace_graph<P: PackageMetadataProvider>(
         });
 
         // Add production edges between workspace members
-        if let Some(sibling_deps) = ws_graph.dependencies.get(&member.name) {
+        let sibling_deps = ws_graph.dependencies.get(&member.name);
+        if let Some(sibling_deps) = sibling_deps {
             for (sibling_name, spec) in sibling_deps {
                 let sibling_link_loc = format!("node_modules/{sibling_name}");
                 graph.edges.push(DependencyEdge {
@@ -738,30 +809,33 @@ pub fn resolve_workspace_graph<P: PackageMetadataProvider>(
             }
         }
 
-        // Add development edges between workspace members
-        if let Some(sibling_dev_deps) = ws_graph.dev_dependencies.get(&member.name) {
+        // Add development edges between workspace members (deduped in O(log deg) via ws_graph.dependencies)
+        let sibling_dev_deps = ws_graph.dev_dependencies.get(&member.name);
+        if let Some(sibling_dev_deps) = sibling_dev_deps {
             for (sibling_name, spec) in sibling_dev_deps {
-                let sibling_link_loc = format!("node_modules/{sibling_name}");
-                if !graph.edges.iter().any(|e| {
-                    e.from_location == member_loc
-                        && e.to_location == sibling_link_loc
-                        && e.install_name == *sibling_name
-                }) {
-                    graph.edges.push(DependencyEdge {
-                        from_location: member_loc.clone(),
-                        to_location: sibling_link_loc,
-                        install_name: sibling_name.clone(),
-                        package_name: sibling_name.clone(),
-                        spec: spec.clone(),
-                        dep_type: DependencyType::Dev,
-                    });
+                if sibling_deps.is_some_and(|p| p.contains_key(sibling_name)) {
+                    continue;
                 }
+                let sibling_link_loc = format!("node_modules/{sibling_name}");
+                graph.edges.push(DependencyEdge {
+                    from_location: member_loc.clone(),
+                    to_location: sibling_link_loc,
+                    install_name: sibling_name.clone(),
+                    package_name: sibling_name.clone(),
+                    spec: spec.clone(),
+                    dep_type: DependencyType::Dev,
+                });
             }
         }
 
-        // Add peer edges between workspace members
+        // Add peer edges between workspace members (deduped in O(log deg) via prod & dev maps)
         if let Some(sibling_peer_deps) = ws_graph.peer_dependencies.get(&member.name) {
             for (sibling_name, spec) in sibling_peer_deps {
+                if sibling_deps.is_some_and(|p| p.contains_key(sibling_name))
+                    || sibling_dev_deps.is_some_and(|d| d.contains_key(sibling_name))
+                {
+                    continue;
+                }
                 let sibling_link_loc = format!("node_modules/{sibling_name}");
                 let is_opt = member
                     .manifest
@@ -774,20 +848,14 @@ pub fn resolve_workspace_graph<P: PackageMetadataProvider>(
                 } else {
                     DependencyType::Peer
                 };
-                if !graph.edges.iter().any(|e| {
-                    e.from_location == member_loc
-                        && e.to_location == sibling_link_loc
-                        && e.install_name == *sibling_name
-                }) {
-                    graph.edges.push(DependencyEdge {
-                        from_location: member_loc.clone(),
-                        to_location: sibling_link_loc,
-                        install_name: sibling_name.clone(),
-                        package_name: sibling_name.clone(),
-                        spec: spec.clone(),
-                        dep_type,
-                    });
-                }
+                graph.edges.push(DependencyEdge {
+                    from_location: member_loc.clone(),
+                    to_location: sibling_link_loc,
+                    install_name: sibling_name.clone(),
+                    package_name: sibling_name.clone(),
+                    spec: spec.clone(),
+                    dep_type,
+                });
             }
         }
     }
@@ -805,32 +873,37 @@ pub fn resolve_workspace_graph<P: PackageMetadataProvider>(
 
     let root_ancestors = std::sync::Arc::new(vec![root_name.clone()]);
 
-    // Enqueue root external dependencies
-    let mut root_deps: BTreeMap<String, (String, DependencyType)> = BTreeMap::new();
+    // Enqueue root external dependencies borrowing manifest strings until enqueued
+    let mut root_deps: FastMap<&str, (&str, DependencyType)> = fast_map_with_capacity(
+        root_manifest.dependencies.len()
+            + root_manifest.optional_dependencies.len()
+            + root_manifest.peer_dependencies.len()
+            + if options.dev {
+                root_manifest.dev_dependencies.len()
+            } else {
+                0
+            },
+    );
     if options.dev {
         for (k, v) in &root_manifest.dev_dependencies {
-            let is_ws = ws_graph.is_member(k) || v.trim().starts_with("workspace:");
-            if !is_ws {
-                root_deps.insert(k.clone(), (v.clone(), DependencyType::Dev));
+            if !(ws_graph.is_member(k) || v.trim().starts_with("workspace:")) {
+                root_deps.insert(k.as_str(), (v.as_str(), DependencyType::Dev));
             }
         }
     }
     for (k, v) in &root_manifest.dependencies {
-        let is_ws = ws_graph.is_member(k) || v.trim().starts_with("workspace:");
-        if !is_ws {
-            root_deps.insert(k.clone(), (v.clone(), DependencyType::Prod));
+        if !(ws_graph.is_member(k) || v.trim().starts_with("workspace:")) {
+            root_deps.insert(k.as_str(), (v.as_str(), DependencyType::Prod));
         }
     }
     for (k, v) in &root_manifest.optional_dependencies {
-        let is_ws = ws_graph.is_member(k) || v.trim().starts_with("workspace:");
-        if !is_ws {
-            root_deps.insert(k.clone(), (v.clone(), DependencyType::Optional));
+        if !(ws_graph.is_member(k) || v.trim().starts_with("workspace:")) {
+            root_deps.insert(k.as_str(), (v.as_str(), DependencyType::Optional));
         }
     }
     if !options.legacy_peer_deps {
         for (k, v) in &root_manifest.peer_dependencies {
-            let is_ws = ws_graph.is_member(k) || v.trim().starts_with("workspace:");
-            if !is_ws {
+            if !(ws_graph.is_member(k) || v.trim().starts_with("workspace:")) {
                 let is_opt_peer = root_manifest
                     .peer_dependencies_meta
                     .get(k)
@@ -841,9 +914,7 @@ pub fn resolve_workspace_graph<P: PackageMetadataProvider>(
                 } else {
                     DependencyType::Peer
                 };
-                root_deps
-                    .entry(k.clone())
-                    .or_insert_with(|| (v.clone(), p_type));
+                root_deps.entry(k.as_str()).or_insert((v.as_str(), p_type));
             }
         }
     }
@@ -852,33 +923,34 @@ pub fn resolve_workspace_graph<P: PackageMetadataProvider>(
         solver.enqueue_task(
             String::new(),
             root_name.clone(),
-            install_name,
-            raw_spec,
+            install_name.to_string(),
+            raw_spec.to_string(),
             dep_type,
             root_ancestors.clone(),
         );
     }
 
     // Enqueue member external dependencies
+    let mut member_deps: FastMap<&str, (&str, DependencyType)> = fast_map_with_capacity(32);
     for member in members {
         let member_ancestors = std::sync::Arc::new(vec![root_name.clone(), member.name.clone()]);
-        let mut member_deps: BTreeMap<String, (String, DependencyType)> = BTreeMap::new();
+        member_deps.clear();
 
         if options.dev {
             for (k, v) in &member.manifest.dev_dependencies {
                 if !ws_graph.has_compatible_sibling(k, v) {
-                    member_deps.insert(k.clone(), (v.clone(), DependencyType::Dev));
+                    member_deps.insert(k.as_str(), (v.as_str(), DependencyType::Dev));
                 }
             }
         }
         for (k, v) in &member.manifest.dependencies {
             if !ws_graph.has_compatible_sibling(k, v) {
-                member_deps.insert(k.clone(), (v.clone(), DependencyType::Prod));
+                member_deps.insert(k.as_str(), (v.as_str(), DependencyType::Prod));
             }
         }
         for (k, v) in &member.manifest.optional_dependencies {
             if !ws_graph.has_compatible_sibling(k, v) {
-                member_deps.insert(k.clone(), (v.clone(), DependencyType::Optional));
+                member_deps.insert(k.as_str(), (v.as_str(), DependencyType::Optional));
             }
         }
         if !options.legacy_peer_deps {
@@ -895,20 +967,18 @@ pub fn resolve_workspace_graph<P: PackageMetadataProvider>(
                     } else {
                         DependencyType::Peer
                     };
-                    member_deps
-                        .entry(k.clone())
-                        .or_insert_with(|| (v.clone(), p_type));
+                    member_deps.entry(k.as_str()).or_insert((v.as_str(), p_type));
                 }
             }
         }
 
-        for (install_name, (raw_spec, dep_type)) in member_deps {
+        for (install_name, (raw_spec, dep_type)) in &member_deps {
             solver.enqueue_task(
                 member.relative_path.clone(),
                 member.name.clone(),
-                install_name,
-                raw_spec,
-                dep_type,
+                (*install_name).to_string(),
+                (*raw_spec).to_string(),
+                *dep_type,
                 member_ancestors.clone(),
             );
         }
