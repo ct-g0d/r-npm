@@ -290,25 +290,38 @@ impl DependencyGraph {
 
     /// Adds or replaces a node in the graph, updating all secondary indices.
     pub fn add_node(&mut self, location: String, node: Node) {
-        if let Some(old) = self.nodes.remove(&location) {
-            Self::remove_node_from_indices(
-                &mut self.nodes_by_dep_name,
-                &mut self.nodes_by_name,
-                &mut self.nodes_by_install_name,
-                &mut self.children_by_parent,
-                &location,
-                &old,
-            );
+        match self.nodes.entry(location) {
+            std::collections::btree_map::Entry::Vacant(e) => {
+                Self::add_node_to_indices(
+                    &mut self.nodes_by_dep_name,
+                    &mut self.nodes_by_name,
+                    &mut self.nodes_by_install_name,
+                    &mut self.children_by_parent,
+                    e.key(),
+                    &node,
+                );
+                e.insert(node);
+            }
+            std::collections::btree_map::Entry::Occupied(mut e) => {
+                let old = std::mem::replace(e.get_mut(), node);
+                Self::remove_node_from_indices(
+                    &mut self.nodes_by_dep_name,
+                    &mut self.nodes_by_name,
+                    &mut self.nodes_by_install_name,
+                    &mut self.children_by_parent,
+                    e.key(),
+                    &old,
+                );
+                Self::add_node_to_indices(
+                    &mut self.nodes_by_dep_name,
+                    &mut self.nodes_by_name,
+                    &mut self.nodes_by_install_name,
+                    &mut self.children_by_parent,
+                    e.key(),
+                    e.get(),
+                );
+            }
         }
-        Self::add_node_to_indices(
-            &mut self.nodes_by_dep_name,
-            &mut self.nodes_by_name,
-            &mut self.nodes_by_install_name,
-            &mut self.children_by_parent,
-            &location,
-            &node,
-        );
-        self.nodes.insert(location, node);
     }
 
     /// Removes a node from the graph and updates all secondary indices.
@@ -502,6 +515,10 @@ impl DependencyGraph {
         self.edges_by_install_name.clear();
         self.incoming_edges_by_location.clear();
         self.outgoing_edges_by_location.clear();
+        let edge_count = self.edges.len();
+        self.edges_by_install_name.reserve(edge_count / 4 + 16);
+        self.incoming_edges_by_location.reserve(edge_count / 4 + 16);
+        self.outgoing_edges_by_location.reserve(edge_count / 8 + 16);
         for (idx, edge) in self.edges.iter().enumerate() {
             Self::add_edge_to_indices(
                 &mut self.edges_by_install_name,
@@ -519,6 +536,11 @@ impl DependencyGraph {
         self.nodes_by_name.clear();
         self.nodes_by_install_name.clear();
         self.children_by_parent.clear();
+        let node_count = self.nodes.len();
+        self.nodes_by_dep_name.reserve(node_count / 2 + 16);
+        self.nodes_by_name.reserve(node_count / 2 + 16);
+        self.nodes_by_install_name.reserve(node_count / 2 + 16);
+        self.children_by_parent.reserve(node_count / 8 + 16);
         for (loc, node) in &self.nodes {
             Self::add_node_to_indices(
                 &mut self.nodes_by_dep_name,
@@ -720,7 +742,8 @@ impl DependencyGraph {
             }
         };
 
-        let mut outgoing: Vec<Vec<(u32, DependencyType)>> = vec![Vec::new(); locs.len()];
+        let mut raw_edges: Vec<(u32, u32, DependencyType)> =
+            Vec::with_capacity(self.edges.len() + link_targets.len());
 
         for edge in &self.edges {
             let from_id = if let Some(&id) = loc_to_id.get(edge.from_location.as_str()) {
@@ -735,7 +758,6 @@ impl DependencyGraph {
                 loc_to_id.insert(s, id);
                 locs.push(s);
                 initially_skipped.push(false);
-                outgoing.push(Vec::new());
                 id
             };
             let to_id = if let Some(&id) = loc_to_id.get(edge.to_location.as_str()) {
@@ -746,10 +768,9 @@ impl DependencyGraph {
                 loc_to_id.insert(s, id);
                 locs.push(s);
                 initially_skipped.push(false);
-                outgoing.push(Vec::new());
                 id
             };
-            outgoing[from_id as usize].push((to_id, edge.dep_type));
+            raw_edges.push((from_id, to_id, edge.dep_type));
         }
 
         // A link and its target are one node to calc-dep-flags: whatever
@@ -759,13 +780,29 @@ impl DependencyGraph {
             if target != from_loc {
                 if let Some(&target_id) = loc_to_id.get(target) {
                     if (target_id as usize) < node_count {
-                        outgoing[from_id as usize].push((target_id, DependencyType::Prod));
+                        raw_edges.push((from_id, target_id, DependencyType::Prod));
                     }
                 }
             }
         }
 
         let total_nodes = locs.len();
+        // Flat CSR adjacency lists replace per-node `Vec` heap allocations.
+        let mut offsets: Vec<u32> = vec![0; total_nodes + 1];
+        for &(from_id, _, _) in &raw_edges {
+            offsets[from_id as usize + 1] += 1;
+        }
+        for i in 1..=total_nodes {
+            offsets[i] += offsets[i - 1];
+        }
+        let mut cursor = offsets[..total_nodes].to_vec();
+        let mut adj: Vec<(u32, DependencyType)> = vec![(0, DependencyType::Prod); raw_edges.len()];
+        for (from_id, to_id, dep_type) in raw_edges {
+            let slot = &mut cursor[from_id as usize];
+            adj[*slot as usize] = (to_id, dep_type);
+            *slot += 1;
+        }
+
         // Pack 4x2-bit states per node:
         // bits 0..1: dev, bits 2..3: optional, bits 4..5: peer, bits 6..7: skipped
         let mut states: Vec<u8> = vec![0; total_nodes];
@@ -784,7 +821,9 @@ impl DependencyGraph {
             let peer_state = (s >> 4) & 0b11;
             let skipped_state = (s >> 6) & 0b11;
 
-            for &(to_id, dep_type) in &outgoing[id as usize] {
+            let start = offsets[id as usize] as usize;
+            let end = offsets[id as usize + 1] as usize;
+            for &(to_id, dep_type) in &adj[start..end] {
                 let to_idx = to_id as usize;
 
                 let mut next_dev = dev_state & DEV_ONLY;
@@ -850,7 +889,9 @@ impl DependencyGraph {
         pure_prod_reachable[root_id as usize] = true;
         queue.push_back(root_id);
         while let Some(id) = queue.pop_front() {
-            for &(to_id, dep_type) in &outgoing[id as usize] {
+            let start = offsets[id as usize] as usize;
+            let end = offsets[id as usize + 1] as usize;
+            for &(to_id, dep_type) in &adj[start..end] {
                 if dep_type != DependencyType::Dev
                     && dep_type != DependencyType::Optional
                     && dep_type != DependencyType::PeerOptional
@@ -868,7 +909,9 @@ impl DependencyGraph {
         non_extraneous[root_id as usize] = true;
         queue.push_back(root_id);
         while let Some(id) = queue.pop_front() {
-            for &(to_id, dep_type) in &outgoing[id as usize] {
+            let start = offsets[id as usize] as usize;
+            let end = offsets[id as usize + 1] as usize;
+            for &(to_id, dep_type) in &adj[start..end] {
                 if dep_type != DependencyType::PeerOptional && !non_extraneous[to_id as usize] {
                     non_extraneous[to_id as usize] = true;
                     queue.push_back(to_id);
@@ -1284,7 +1327,14 @@ impl DependencyGraph {
                     extra,
                     ..Default::default()
                 };
-                lockfile.insert_package(loc, pkg);
+                let mut pkg = pkg;
+                pkg.normalize_flags();
+                let posix_loc = if loc.contains('\\') {
+                    rnpm_core::to_posix_path(loc)
+                } else {
+                    loc.clone()
+                };
+                lockfile.packages.insert(posix_loc, pkg);
             }
         }
 
@@ -1293,10 +1343,24 @@ impl DependencyGraph {
 
     /// Constructs an in-memory DependencyGraph from an npm lockfile version 3 document.
     pub fn from_lockfile_v3(lockfile: &LockfileV3) -> Self {
+        let mut graph = Self::from_lockfile_v3_unindexed(lockfile);
+        graph.rebuild_indices();
+        graph
+    }
+
+    /// Same as `from_lockfile_v3`, skipping secondary index map construction when
+    /// callers only traverse `nodes` directly.
+    pub(crate) fn from_lockfile_v3_unindexed(lockfile: &LockfileV3) -> Self {
         let mut graph = Self::new();
         graph.root_location = String::new();
+        let mut estimated_edges = 0usize;
 
         for (loc, pkg) in &lockfile.packages {
+            estimated_edges += pkg.dependencies.as_ref().map_or(0, BTreeMap::len)
+                + pkg.dev_dependencies.as_ref().map_or(0, BTreeMap::len)
+                + pkg.optional_dependencies.as_ref().map_or(0, BTreeMap::len)
+                + pkg.peer_dependencies.as_ref().map_or(0, BTreeMap::len);
+
             let install_name = if loc.is_empty() {
                 pkg.name.clone().unwrap_or_else(|| lockfile.name.clone())
             } else if let Some(idx) = loc.rfind("/node_modules/") {
@@ -1337,11 +1401,11 @@ impl DependencyGraph {
             let parsed_version = if version.is_empty() {
                 None
             } else {
-                crate::hoisting::cached_version_rc(&version).map(|rc| (*rc).clone())
+                rnpm_core::semver::Version::parse(&version).ok()
             };
             let node = Node {
                 location: loc.clone(),
-                install_name: install_name.clone(),
+                install_name,
                 name,
                 parsed_version,
                 version,
@@ -1384,12 +1448,18 @@ impl DependencyGraph {
 
         // Fast O(1)-per-scope lookup table for resolving lockfile dependency targets into edges.
         let mut node_by_loc: FastMap<&str, &Node> = fast_map_with_capacity(graph.nodes.len());
+        let mut parent_scopes: FastSet<&str> = fast_set_with_capacity(graph.nodes.len() / 8 + 8);
+        parent_scopes.insert("");
         for (loc, node) in &graph.nodes {
             node_by_loc.insert(loc.as_str(), node);
+            if let Some(parent) = crate::hoisting::parent_scope(loc) {
+                parent_scopes.insert(parent);
+            }
         }
 
         // Helper buffer to locate package in scope hierarchy without allocations
         let mut candidate_buf = String::with_capacity(128);
+        graph.edges.reserve(estimated_edges);
 
         // Build edges based on dependencies
         for (loc, node) in &graph.nodes {
@@ -1435,6 +1505,9 @@ impl DependencyGraph {
             for (dep_name, dep_spec, dep_type) in all_deps {
                 let mut found_node: Option<&Node> = None;
                 for scope in crate::hoisting::iter_ancestor_scopes(loc) {
+                    if !parent_scopes.contains(scope) {
+                        continue;
+                    }
                     candidate_buf.clear();
                     if scope.is_empty() {
                         candidate_buf.push_str("node_modules/");

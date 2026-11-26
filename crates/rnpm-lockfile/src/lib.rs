@@ -11,6 +11,7 @@
 )]
 
 pub mod error;
+mod fast_parse;
 pub mod integrity;
 pub mod migration;
 pub mod model;

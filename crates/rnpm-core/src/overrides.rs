@@ -1,4 +1,5 @@
 use crate::error::OverrideError;
+use crate::fast_hash::{fx_map_with_capacity, fx_set_with_capacity, FxHashMap, FxHashSet};
 use crate::manifest::Manifest;
 use crate::semver::{
     comparator::{Comparator, Op},
@@ -290,6 +291,165 @@ impl PrecompiledOverrides {
     }
 }
 
+#[derive(Debug, Clone)]
+struct FastRule {
+    pattern: PrecompiledPattern,
+    has_spec: bool,
+    exact_override: Option<String>,
+    nested: Option<FastNode>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct FastNode {
+    rules_by_pkg: FxHashMap<String, Vec<FastRule>>,
+}
+
+impl FastNode {
+    fn compile(
+        rules: &BTreeMap<String, OverrideValue>,
+        all_targets: &mut FxHashSet<String>,
+        nested_targets: &mut FxHashSet<String>,
+        in_nested: bool,
+    ) -> Self {
+        let mut rules_by_pkg: FxHashMap<String, Vec<FastRule>> =
+            fx_map_with_capacity(rules.len());
+
+        for (k, v) in rules {
+            let (k_name, k_spec, has_spec) = if let Some((name, spec)) = parse_key_and_spec(k) {
+                (name, spec, true)
+            } else {
+                (k.as_str(), "", false)
+            };
+
+            all_targets.insert(k_name.to_string());
+            if in_nested {
+                nested_targets.insert(k_name.to_string());
+            }
+
+            let pattern = if has_spec {
+                PrecompiledPattern::compile(k_spec)
+            } else {
+                PrecompiledPattern::Any
+            };
+
+            let (exact_override, nested) = match v {
+                OverrideValue::Exact(s) => (Some(s.clone()), None),
+                OverrideValue::Nested(sub_map) => {
+                    let dot = match sub_map.get(".") {
+                        Some(OverrideValue::Exact(s)) => Some(s.clone()),
+                        _ => None,
+                    };
+                    (
+                        dot,
+                        Some(FastNode::compile(sub_map, all_targets, nested_targets, true)),
+                    )
+                }
+            };
+
+            let rule = FastRule {
+                pattern,
+                has_spec,
+                exact_override,
+                nested,
+            };
+
+            rules_by_pkg
+                .entry(k_name.to_string())
+                .or_default()
+                .push(rule);
+        }
+
+        Self { rules_by_pkg }
+    }
+
+    #[inline]
+    fn find_direct(&self, dep_name: &str, requested_spec: &str) -> Option<&str> {
+        let rule_list = self.rules_by_pkg.get(dep_name)?;
+
+        for rule in rule_list {
+            if rule.has_spec && rule.pattern.matches(requested_spec) {
+                return rule.exact_override.as_deref();
+            }
+        }
+
+        for rule in rule_list {
+            if !rule.has_spec {
+                return rule.exact_override.as_deref();
+            }
+        }
+
+        None
+    }
+
+    fn find_in_nested<T: AsRef<str>>(
+        &self,
+        ancestors: &[T],
+        dep_name: &str,
+        requested_spec: &str,
+    ) -> Option<&str> {
+        if ancestors.is_empty() {
+            return self.find_direct(dep_name, requested_spec);
+        }
+
+        let parent_str = ancestors[0].as_ref();
+        let (parent_name, parent_ver) = parse_key_and_spec(parent_str).unwrap_or((parent_str, ""));
+
+        let rule_list = self.rules_by_pkg.get(parent_name)?;
+
+        for rule in rule_list {
+            let Some(ref nested_node) = rule.nested else {
+                continue;
+            };
+
+            let matches_parent = if rule.has_spec && !parent_ver.is_empty() {
+                rule.pattern.matches(parent_ver)
+            } else {
+                true
+            };
+
+            if matches_parent {
+                if ancestors.len() > 1 {
+                    for next_idx in 1..ancestors.len() {
+                        if let Some(res) = nested_node.find_in_nested(
+                            &ancestors[next_idx..],
+                            dep_name,
+                            requested_spec,
+                        ) {
+                            return Some(res);
+                        }
+                    }
+                }
+                if let Some(res) = nested_node.find_direct(dep_name, requested_spec) {
+                    return Some(res);
+                }
+            }
+        }
+
+        None
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct FastOverridesIndex {
+    all_target_names: FxHashSet<String>,
+    nested_target_names: FxHashSet<String>,
+    root_node: FastNode,
+}
+
+impl FastOverridesIndex {
+    fn compile(rules: &BTreeMap<String, OverrideValue>) -> Self {
+        let mut all_targets = fx_set_with_capacity(rules.len());
+        let mut nested_targets = fx_set_with_capacity(rules.len());
+        let root_node =
+            FastNode::compile(rules, &mut all_targets, &mut nested_targets, false);
+        Self {
+            all_target_names: all_targets,
+            nested_target_names: nested_targets,
+            root_node,
+        }
+    }
+}
+
 /// Overrides engine implementing npm RFC 36 package overrides.
 #[derive(Debug, Clone, Default)]
 pub struct Overrides {
@@ -297,6 +457,7 @@ pub struct Overrides {
     /// Root dependencies map (for reference overrides like `"$foo"`).
     pub root_dependencies: BTreeMap<String, String>,
     indexed: PrecompiledOverrides,
+    fast_idx: FastOverridesIndex,
 }
 
 impl PartialEq for Overrides {
@@ -312,11 +473,21 @@ impl Overrides {
         rules: BTreeMap<String, OverrideValue>,
         root_dependencies: BTreeMap<String, String>,
     ) -> Self {
+        if rules.is_empty() {
+            return Self {
+                rules,
+                root_dependencies,
+                indexed: PrecompiledOverrides::default(),
+                fast_idx: FastOverridesIndex::default(),
+            };
+        }
         let indexed = PrecompiledOverrides::compile(&rules);
+        let fast_idx = FastOverridesIndex::compile(&rules);
         Self {
             rules,
             root_dependencies,
             indexed,
+            fast_idx,
         }
     }
 
@@ -429,52 +600,110 @@ impl Overrides {
             return Ok(None);
         }
 
-        let fallback_indexed;
-        let indexed = if self.indexed.matches_rules(&self.rules) {
-            &self.indexed
+        let fallback_fast;
+        let fast = if self.indexed.matches_rules(&self.rules) {
+            &self.fast_idx
         } else {
-            fallback_indexed = PrecompiledOverrides::compile(&self.rules);
-            &fallback_indexed
+            fallback_fast = FastOverridesIndex::compile(&self.rules);
+            &fallback_fast
         };
 
+        Self::resolve_with_fast_index(
+            fast,
+            dep_name,
+            requested_spec,
+            ancestors,
+            reference_root,
+            caller_specs,
+        )
+    }
+
+    /// Fast precompiled lookup bypassing `rules` mutation checks.
+    /// Safe when `Overrides` has not been mutated directly via `pub rules`.
+    #[inline]
+    pub fn resolve_override_precompiled_with_caller<T: AsRef<str>>(
+        &self,
+        dep_name: &str,
+        requested_spec: &str,
+        ancestors: &[T],
+        caller_specs: Option<&BTreeMap<String, String>>,
+    ) -> Result<Option<String>, OverrideError> {
+        self.resolve_override_precompiled_in_context(
+            dep_name,
+            requested_spec,
+            ancestors,
+            &self.root_dependencies,
+            caller_specs,
+        )
+    }
+
+    /// Fast precompiled lookup in a caller context, bypassing `rules` mutation checks.
+    #[inline]
+    pub fn resolve_override_precompiled_in_context<T: AsRef<str>>(
+        &self,
+        dep_name: &str,
+        requested_spec: &str,
+        ancestors: &[T],
+        reference_root: &BTreeMap<String, String>,
+        caller_specs: Option<&BTreeMap<String, String>>,
+    ) -> Result<Option<String>, OverrideError> {
+        if self.rules.is_empty() {
+            return Ok(None);
+        }
+        Self::resolve_with_fast_index(
+            &self.fast_idx,
+            dep_name,
+            requested_spec,
+            ancestors,
+            reference_root,
+            caller_specs,
+        )
+    }
+
+    #[inline]
+    fn resolve_with_fast_index<T: AsRef<str>>(
+        fast: &FastOverridesIndex,
+        dep_name: &str,
+        requested_spec: &str,
+        ancestors: &[T],
+        reference_root: &BTreeMap<String, String>,
+        caller_specs: Option<&BTreeMap<String, String>>,
+    ) -> Result<Option<String>, OverrideError> {
         // O(1) fast check: If dep_name is not targeted anywhere in overrides, exit immediately
-        if !indexed.all_target_names.contains(dep_name) {
+        if !fast.all_target_names.contains(dep_name) {
             return Ok(None);
         }
 
-        let mut matched_val = None;
+        let mut matched_val: Option<&str> = None;
 
-        // 1. Check nested scoped overrides along ancestor chain
-        for i in 0..ancestors.len() {
-            let slice = &ancestors[i..];
-            if let Some(val) = indexed.root_node.find_in_nested(&self.rules, slice, dep_name, requested_spec) {
-                matched_val = Some(val);
-                break;
+        // 1. Check nested scoped overrides along ancestor chain (skip entirely if dep_name has no nested rules)
+        if !ancestors.is_empty() && fast.nested_target_names.contains(dep_name) {
+            for i in 0..ancestors.len() {
+                let slice = &ancestors[i..];
+                if let Some(val) = fast.root_node.find_in_nested(slice, dep_name, requested_spec) {
+                    matched_val = Some(val);
+                    break;
+                }
             }
         }
 
         // 2. If no nested override matched, check top-level global overrides
         if matched_val.is_none() {
-            matched_val = indexed.root_node.find_direct(&self.rules, dep_name, requested_spec);
+            matched_val = fast.root_node.find_direct(dep_name, requested_spec);
         }
 
         // 3. Extract the target spec string
-        let Some(val) = matched_val else {
+        let Some(raw_override) = matched_val else {
             return Ok(None);
         };
-        let raw_override = match val {
-            OverrideValue::Exact(s) => s.clone(),
-            OverrideValue::Nested(map) => {
-                if let Some(OverrideValue::Exact(s)) = map.get(".") {
-                    s.clone()
-                } else {
-                    return Ok(None);
-                }
-            }
-        };
 
-        // 4. Resolve reference override ($pkg) if present, following chained references with cycle detection
-        let mut current_spec = raw_override;
+        // 4. Fast path when not a $ reference override
+        if !raw_override.starts_with('$') {
+            return Ok(Some(raw_override.to_string()));
+        }
+
+        // 5. Resolve reference override ($pkg) if present, following chained references with cycle detection
+        let mut current_spec = raw_override.to_string();
         let mut visited_refs = BTreeSet::new();
 
         while let Some(ref_name) = current_spec.strip_prefix('$') {
@@ -680,8 +909,11 @@ fn insert_override_rule(
 impl Overrides {
     /// Whether any rule, at any depth, names `name`.
     pub fn mentions(&self, name: &str) -> bool {
+        if self.rules.is_empty() {
+            return false;
+        }
         if self.indexed.matches_rules(&self.rules) {
-            return self.indexed.all_target_names.contains(name);
+            return self.fast_idx.all_target_names.contains(name);
         }
         fn walk(rules: &BTreeMap<String, OverrideValue>, name: &str) -> bool {
             rules.iter().any(|(key, value)| {
@@ -690,6 +922,12 @@ impl Overrides {
             })
         }
         walk(&self.rules, name)
+    }
+
+    /// Fast `mentions` bypassing `rules` mutation check.
+    #[inline]
+    pub fn mentions_precompiled(&self, name: &str) -> bool {
+        !self.rules.is_empty() && self.fast_idx.all_target_names.contains(name)
     }
 }
 

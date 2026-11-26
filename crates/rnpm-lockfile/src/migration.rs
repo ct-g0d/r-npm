@@ -301,14 +301,26 @@ fn enrich_packages_from_legacy(
     deps: &BTreeMap<String, LegacyDependency>,
     packages: &mut BTreeMap<String, LockfilePackage>,
 ) {
-    for (dep_name, dep) in deps {
-        let node_path = if parent_path.is_empty() {
-            format!("node_modules/{dep_name}")
-        } else {
-            format!("{parent_path}/node_modules/{dep_name}")
-        };
+    let mut path_buf = String::with_capacity(parent_path.len() + 64);
+    path_buf.push_str(parent_path);
+    enrich_packages_from_legacy_buf(&mut path_buf, deps, packages);
+}
 
-        if let Some(pkg) = packages.get_mut(&node_path) {
+fn enrich_packages_from_legacy_buf(
+    path_buf: &mut String,
+    deps: &BTreeMap<String, LegacyDependency>,
+    packages: &mut BTreeMap<String, LockfilePackage>,
+) {
+    for (dep_name, dep) in deps {
+        let prev_len = path_buf.len();
+        if prev_len == 0 {
+            path_buf.push_str("node_modules/");
+        } else {
+            path_buf.push_str("/node_modules/");
+        }
+        path_buf.push_str(dep_name);
+
+        if let Some(pkg) = packages.get_mut(path_buf.as_str()) {
             if pkg.name.is_none() {
                 let (alias_or_name, _) =
                     parse_legacy_version_and_name(dep_name, &dep.version, dep.name.as_deref());
@@ -377,15 +389,17 @@ fn enrich_packages_from_legacy(
             let mut sub_map = BTreeMap::new();
             let mut single_dep = BTreeMap::new();
             single_dep.insert(dep_name.clone(), dep.clone());
-            flatten_legacy_dependencies(parent_path, &single_dep, &mut sub_map);
+            let parent_slice_end = prev_len;
+            flatten_legacy_dependencies(&path_buf[..parent_slice_end], &single_dep, &mut sub_map);
             for (path, pkg) in sub_map {
                 packages.entry(path).or_insert(pkg);
             }
         }
 
         if let Some(child_deps) = &dep.dependencies {
-            enrich_packages_from_legacy(&node_path, child_deps, packages);
+            enrich_packages_from_legacy_buf(path_buf, child_deps, packages);
         }
+        path_buf.truncate(prev_len);
     }
 }
 
@@ -481,16 +495,24 @@ pub fn migrate_to_v3(raw: AnyLockfile) -> Result<LockfileV3, LockfileError> {
             // v2 has both `packages` (like v3) and `dependencies` (like v1).
             // v3 normally has only `packages`, but if packages is empty, fall back to dependencies.
             let mut packages = match raw.packages {
-                Some(pkgs) if !pkgs.is_empty() => {
-                    let mut normalized = BTreeMap::new();
-                    for (k, mut v) in pkgs {
-                        v.normalize_flags();
-                        let norm_k = match to_posix_path_cow(&k) {
-                            Cow::Borrowed(_) => k,
-                            Cow::Owned(s) => s,
-                        };
-                        normalized.insert(norm_k, v);
-                    }
+                Some(mut pkgs) if !pkgs.is_empty() => {
+                    let mut normalized = if pkgs.keys().all(|k| !k.contains('\\')) {
+                        for v in pkgs.values_mut() {
+                            v.normalize_flags();
+                        }
+                        pkgs
+                    } else {
+                        let mut out = BTreeMap::new();
+                        for (k, mut v) in pkgs {
+                            v.normalize_flags();
+                            let norm_k = match to_posix_path_cow(&k) {
+                                Cow::Borrowed(_) => k,
+                                Cow::Owned(s) => s,
+                            };
+                            out.insert(norm_k, v);
+                        }
+                        out
+                    };
                     if let Some(deps) = &raw.dependencies {
                         enrich_packages_from_legacy("", deps, &mut normalized);
                     }

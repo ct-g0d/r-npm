@@ -13,29 +13,33 @@ pub struct ComparatorSet {
 impl ComparatorSet {
     #[inline]
     pub fn matches(&self, version: &Version) -> bool {
-        let all_match = match self.comparators.as_slice() {
-            [c] => c.matches(version),
-            [c1, c2] => c1.matches(version) && c2.matches(version),
-            comps => comps.iter().all(|c| c.matches(version)),
-        };
-        if !all_match {
-            return false;
+        if version.prerelease.is_empty() {
+            return match self.comparators.as_slice() {
+                [c] => c.matches_release(version),
+                [c1, c2] => c1.matches_release(version) && c2.matches_release(version),
+                comps => comps.iter().all(|c| c.matches_release(version)),
+            };
         }
 
         // node-semver prerelease rule:
         // If a version has a prerelease tag, it will only satisfy a comparator set
         // if at least one comparator in the set has the same (major, minor, patch)
         // AND that comparator also has a prerelease tag.
-        if version.is_prerelease() {
-            return self.comparators.iter().any(|comp| {
-                comp.version.is_prerelease()
-                    && comp.version.major == version.major
-                    && comp.version.minor == version.minor
-                    && comp.version.patch == version.patch
-            });
+        let has_matching_pre = self.comparators.iter().any(|comp| {
+            !comp.version.prerelease.is_empty()
+                && comp.version.major == version.major
+                && comp.version.minor == version.minor
+                && comp.version.patch == version.patch
+        });
+        if !has_matching_pre {
+            return false;
         }
 
-        true
+        match self.comparators.as_slice() {
+            [c] => c.matches(version),
+            [c1, c2] => c1.matches(version) && c2.matches(version),
+            comps => comps.iter().all(|c| c.matches(version)),
+        }
     }
 }
 
@@ -483,20 +487,96 @@ fn eval_fast_partial_on_release(
     v: (u64, u64, u64),
     input_for_err: &str,
 ) -> Result<bool, SemverError> {
-    let (bounds, count) = expand_fast_partial_bounds(op, p).ok_or_else(|| {
-        SemverError::InvalidRange(format!("Version number overflow: {input_for_err}"))
-    })?;
-    Ok(bounds[..count].iter().all(|c| {
-        let bv = (c.major, c.minor, c.patch);
-        match c.op {
-            Op::Eq => v == bv,
-            Op::Gt => v > bv,
-            Op::Gte => v >= bv,
-            // Release versions have no prerelease, so `< X.Y.Z-0` and `< X.Y.Z` are both `v < (X, Y, Z)`.
-            Op::Lt => v < bv,
-            Op::Lte => v <= bv,
+    let major = p.major.unwrap_or(0);
+    let minor = p.minor.unwrap_or(0);
+    let patch = p.patch.unwrap_or(0);
+
+    let overflow = || SemverError::InvalidRange(format!("Version number overflow: {input_for_err}"));
+
+    match op {
+        FastOp::Caret => {
+            if p.major.is_none() {
+                return Ok(true);
+            }
+            if major > 0 {
+                let next = major.checked_add(1).ok_or_else(overflow)?;
+                Ok(v >= (major, minor, patch) && v.0 < next)
+            } else if p.minor.is_none() {
+                Ok(v.0 == 0)
+            } else if minor > 0 {
+                let next = minor.checked_add(1).ok_or_else(overflow)?;
+                Ok(v >= (0, minor, patch) && v.0 == 0 && v.1 < next)
+            } else if p.patch.is_none() {
+                Ok(v.0 == 0 && v.1 == 0)
+            } else {
+                let _ = patch.checked_add(1).ok_or_else(overflow)?;
+                Ok(v == (0, 0, patch))
+            }
         }
-    }))
+        FastOp::Tilde => {
+            if p.major.is_none() {
+                return Ok(true);
+            }
+            if p.minor.is_none() {
+                let _ = major.checked_add(1).ok_or_else(overflow)?;
+                Ok(v.0 == major)
+            } else {
+                let next = minor.checked_add(1).ok_or_else(overflow)?;
+                Ok(v >= (major, minor, patch) && v.0 == major && v.1 < next)
+            }
+        }
+        FastOp::Exact => {
+            if p.major.is_none() {
+                Ok(true)
+            } else if p.minor.is_none() {
+                let _ = major.checked_add(1).ok_or_else(overflow)?;
+                Ok(v.0 == major)
+            } else if p.patch.is_none() {
+                let _ = minor.checked_add(1).ok_or_else(overflow)?;
+                Ok(v.0 == major && v.1 == minor)
+            } else {
+                Ok(v == (major, minor, patch))
+            }
+        }
+        FastOp::Gte => Ok(v >= (major, minor, patch)),
+        FastOp::Gt => {
+            if p.major.is_none() {
+                Ok(false)
+            } else if p.minor.is_none() {
+                let next = major.checked_add(1).ok_or_else(overflow)?;
+                Ok(v.0 >= next)
+            } else if p.patch.is_none() {
+                let next = minor.checked_add(1).ok_or_else(overflow)?;
+                Ok(v >= (major, next, 0))
+            } else {
+                Ok(v > (major, minor, patch))
+            }
+        }
+        FastOp::Lt => {
+            if p.major.is_none() {
+                Ok(false)
+            } else if p.minor.is_none() {
+                Ok(v.0 < major)
+            } else if p.patch.is_none() {
+                Ok(v < (major, minor, 0))
+            } else {
+                Ok(v < (major, minor, patch))
+            }
+        }
+        FastOp::Lte => {
+            if p.major.is_none() {
+                Ok(true)
+            } else if p.minor.is_none() {
+                let next = major.checked_add(1).ok_or_else(overflow)?;
+                Ok(v.0 < next)
+            } else if p.patch.is_none() {
+                let next = minor.checked_add(1).ok_or_else(overflow)?;
+                Ok(v < (major, next, 0))
+            } else {
+                Ok(v <= (major, minor, patch))
+            }
+        }
+    }
 }
 
 /// Fast path for a single comparator token without whitespace or prerelease/build tags.
@@ -601,7 +681,7 @@ impl Range {
     }
 
     /// Zero-allocation fast evaluation of `range_str` against `version`.
-    /// Falls back to full `Range::parse` only for prerelease versions or non-simple syntax.
+    /// Falls back to full `Range::parse` only for non-simple syntax or range-side prereleases.
     #[inline]
     pub fn satisfies_str(range_str: &str, version: &Version) -> Result<bool, SemverError> {
         let trimmed = range_str.trim();
@@ -612,6 +692,35 @@ impl Range {
         }
 
         if !version.prerelease.is_empty() {
+            // Fast-path: ranges accepted by try_eval_fast_set contain no prerelease comparators,
+            // so once syntax/overflow is validated they never match any prerelease version.
+            let dummy = (0, 0, 0);
+            if trimmed.is_empty() || trimmed == "*" || trimmed == "x" || trimmed == "X" {
+                return Ok(false);
+            }
+            let (op, rest) = split_fast_op_prefix(trimmed);
+            if let Some(p) = parse_fast_partial_token(rest) {
+                eval_fast_partial_on_release(op, p, dummy, range_str)?;
+                return Ok(false);
+            }
+            if let Some((first_or, rest_or)) = trimmed.split_once("||") {
+                for or_part in std::iter::once(first_or).chain(rest_or.split("||")) {
+                    let set_str = or_part.trim();
+                    if set_str.is_empty() {
+                        continue;
+                    }
+                    match try_eval_fast_set(set_str, dummy, range_str) {
+                        Some(Ok(_)) => {}
+                        Some(Err(e)) => return Err(e),
+                        None => return Self::parse(range_str).map(|r| r.satisfies(version)),
+                    }
+                }
+                return Ok(false);
+            }
+            if let Some(res) = try_eval_fast_set_multi(trimmed, dummy, range_str) {
+                res?;
+                return Ok(false);
+            }
             return Self::parse(range_str).map(|r| r.satisfies(version));
         }
 
@@ -620,8 +729,9 @@ impl Range {
             return Ok(true);
         }
 
-        if let Some(matched) = try_eval_fast_set(trimmed, v, range_str) {
-            return matched;
+        let (op, rest) = split_fast_op_prefix(trimmed);
+        if let Some(p) = parse_fast_partial_token(rest) {
+            return eval_fast_partial_on_release(op, p, v, range_str);
         }
 
         if let Some((first_or, rest_or)) = trimmed.split_once("||") {
@@ -645,7 +755,55 @@ impl Range {
             return Ok(matched);
         }
 
+        if let Some(matched) = try_eval_fast_set_multi(trimmed, v, range_str) {
+            return matched;
+        }
+
         Self::parse(range_str).map(|r| r.satisfies(version))
+    }
+
+    /// Returns `(min_major, max_major_exclusive)` bounds when the range is a single comparator set
+    /// with a simple major-version window, enabling binary search on descending version lists.
+    #[doc(hidden)]
+    #[inline]
+    pub fn major_bounds_hint(&self) -> (Option<u64>, Option<u64>) {
+        if self.sets.len() != 1 {
+            return (None, None);
+        }
+        let mut min_major: Option<u64> = None;
+        let mut max_major_incl: Option<u64> = None;
+        for c in &self.sets[0].comparators {
+            match c.op {
+                Op::Eq => {
+                    let m = c.version.major;
+                    min_major = Some(min_major.map_or(m, |cur| cur.max(m)));
+                    max_major_incl = Some(max_major_incl.map_or(m, |cur| cur.min(m)));
+                }
+                Op::Gte | Op::Gt => {
+                    let m = c.version.major;
+                    min_major = Some(min_major.map_or(m, |cur| cur.max(m)));
+                }
+                Op::Lt => {
+                    let is_zero_prerelease = matches!(
+                        c.version.prerelease.as_slice(),
+                        [PrereleaseId::Numeric(0)]
+                    );
+                    let m = if c.version.minor == 0 && c.version.patch == 0 && is_zero_prerelease {
+                        c.version.major.saturating_sub(1)
+                    } else {
+                        c.version.major
+                    };
+                    if c.version.major > 0 || c.version.minor > 0 || c.version.patch > 0 {
+                        max_major_incl = Some(max_major_incl.map_or(m, |cur| cur.min(m)));
+                    }
+                }
+                Op::Lte => {
+                    let m = c.version.major;
+                    max_major_incl = Some(max_major_incl.map_or(m, |cur| cur.min(m)));
+                }
+            }
+        }
+        (min_major, max_major_incl)
     }
 
     /// Checks if this range normalizes to node-semver's ANY wildcard (`*`, `""`, `x`, `*.*`, `>=0.0.0`, etc.).
@@ -682,6 +840,15 @@ fn try_eval_fast_set(
         return Some(eval_fast_partial_on_release(op, p, v, input_for_err));
     }
 
+    try_eval_fast_set_multi(set_str, v, input_for_err)
+}
+
+#[inline]
+fn try_eval_fast_set_multi(
+    set_str: &str,
+    v: (u64, u64, u64),
+    input_for_err: &str,
+) -> Option<Result<bool, SemverError>> {
     // Space-separated simple comparators or simple hyphen range: iterate without Vec
     let mut parts = set_str.split_whitespace();
     let first = parts.next()?;

@@ -48,6 +48,42 @@ pub struct Version {
     pub build: Vec<String>,
 }
 
+#[inline(always)]
+fn parse_strict_u64_segment(bytes: &[u8], i: &mut usize) -> Option<u64> {
+    let len = bytes.len();
+    if *i >= len {
+        return None;
+    }
+    let b0 = bytes[*i];
+    let d0 = b0.wrapping_sub(b'0');
+    if d0 > 9 {
+        return None;
+    }
+    *i += 1;
+    if d0 == 0 {
+        if *i < len && bytes[*i].wrapping_sub(b'0') <= 9 {
+            return None;
+        }
+        return Some(0);
+    }
+    let mut val = d0 as u64;
+    let start = *i;
+    while *i < len {
+        let d = bytes[*i].wrapping_sub(b'0');
+        if d > 9 {
+            break;
+        }
+        // Up to 18 additional digits (19 total) cannot overflow u64.
+        if *i - start < 18 {
+            val = val * 10 + d as u64;
+        } else {
+            val = val.checked_mul(10)?.checked_add(d as u64)?;
+        }
+        *i += 1;
+    }
+    Some(val)
+}
+
 /// Single-pass prefix parser for strict `MAJOR.MINOR.PATCH` segments.
 /// Returns `(major, minor, patch, bytes_consumed)`.
 #[inline]
@@ -58,48 +94,20 @@ pub(crate) fn parse_strict_triplet_prefix(bytes: &[u8]) -> Option<(u64, u64, u64
     }
 
     let mut i = 0usize;
-    let mut vals = [0u64; 3];
-
-    let mut seg = 0usize;
-    while seg < 3 {
-        if i >= len {
-            return None;
-        }
-        let b0 = bytes[i];
-        if !b0.is_ascii_digit() {
-            return None;
-        }
-        i += 1;
-
-        if b0 == b'0' {
-            // SemVer 2.0.0 §2: numeric identifiers MUST NOT contain leading zeroes
-            if i < len && bytes[i].is_ascii_digit() {
-                return None;
-            }
-            vals[seg] = 0;
-        } else {
-            let mut val = (b0 - b'0') as u64;
-            while i < len {
-                let b = bytes[i];
-                if !b.is_ascii_digit() {
-                    break;
-                }
-                val = val.checked_mul(10)?.checked_add((b - b'0') as u64)?;
-                i += 1;
-            }
-            vals[seg] = val;
-        }
-
-        if seg < 2 {
-            if i >= len || bytes[i] != b'.' {
-                return None;
-            }
-            i += 1;
-        }
-        seg += 1;
+    let major = parse_strict_u64_segment(bytes, &mut i)?;
+    if i >= len || bytes[i] != b'.' {
+        return None;
     }
+    i += 1;
 
-    Some((vals[0], vals[1], vals[2], i))
+    let minor = parse_strict_u64_segment(bytes, &mut i)?;
+    if i >= len || bytes[i] != b'.' {
+        return None;
+    }
+    i += 1;
+
+    let patch = parse_strict_u64_segment(bytes, &mut i)?;
+    Some((major, minor, patch, i))
 }
 
 /// Single-pass prefix parser for loose `MAJOR[.MINOR[.PATCH]]` (allows leading zeroes).

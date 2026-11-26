@@ -386,27 +386,38 @@ impl ManifestFormat {
     pub fn detect(raw: &str) -> Self {
         let clean = raw.strip_prefix('\u{feff}').unwrap_or(raw);
         let has_bom = clean.len() != raw.len();
-        let trailing_newline = clean.ends_with('\n') || clean.ends_with('\r');
-        let trimmed_content = clean.trim();
+        let bytes = clean.as_bytes();
+        let trailing_newline = bytes.last().is_some_and(|&b| b == b'\n' || b == b'\r');
 
-        let (indent, newline) = if let Some(nl_rel) = trimmed_content.find('\n') {
-            let nl = if trimmed_content.contains("\r\n") {
+        // Trim leading and trailing ASCII whitespace cheaply (fall back to .trim() only on non-ASCII)
+        let mut start = 0usize;
+        while start < bytes.len() && bytes[start].is_ascii_whitespace() {
+            start += 1;
+        }
+        let mut end = bytes.len();
+        while end > start && bytes[end - 1].is_ascii_whitespace() {
+            end -= 1;
+        }
+        let trimmed_bytes = &bytes[start..end];
+
+        let (indent, newline) = if let Some(nl_rel) = trimmed_bytes.iter().position(|&b| b == b'\n')
+        {
+            let nl = if nl_rel > 0 && trimmed_bytes[nl_rel - 1] == b'\r' {
                 "\r\n".to_string()
             } else {
                 "\n".to_string()
             };
 
-            let ind = if trimmed_content.starts_with('{') || trimmed_content.starts_with('[') {
-                let rest = &trimmed_content[nl_rel + 1..];
-                let ws_len = rest
-                    .as_bytes()
-                    .iter()
-                    .take_while(|&&b| b == b' ' || b == b'\t')
-                    .count();
+            let ind = if matches!(trimmed_bytes.first(), Some(b'{' | b'[')) {
+                let rest = &trimmed_bytes[nl_rel + 1..];
+                let mut ws_len = 0usize;
+                while ws_len < rest.len() && (rest[ws_len] == b' ' || rest[ws_len] == b'\t') {
+                    ws_len += 1;
+                }
                 if ws_len == 0 {
                     "  ".to_string()
                 } else {
-                    rest[..ws_len].to_string()
+                    clean[start + nl_rel + 1..start + nl_rel + 1 + ws_len].to_string()
                 }
             } else {
                 "  ".to_string()
@@ -512,7 +523,7 @@ where
             M: MapAccess<'de>,
         {
             let mut map = BTreeMap::new();
-            let mut order = access.size_hint().map_or_else(Vec::new, Vec::with_capacity);
+            let mut order = Vec::with_capacity(access.size_hint().unwrap_or(8));
             while let Some((k, v)) = access.next_entry::<String, String>()? {
                 match map.entry(k) {
                     std::collections::btree_map::Entry::Vacant(e) => {
@@ -719,7 +730,7 @@ impl<'de> de::DeserializeSeed<'de> for OrderedDepsWithRawSeed {
                 f.write_str("a map of dependencies or null")
             }
             fn visit_map<M: MapAccess<'de>>(self, mut access: M) -> Result<Self::Value, M::Error> {
-                let cap = access.size_hint().unwrap_or(0);
+                let cap = access.size_hint().unwrap_or(8);
                 let mut map = BTreeMap::new();
                 let mut order = Vec::with_capacity(cap);
                 let mut raw_map = OrderedJsonMap::with_capacity(cap);
@@ -761,7 +772,7 @@ impl<'de> de::DeserializeSeed<'de> for StringMapWithRawSeed {
             }
             fn visit_map<M: MapAccess<'de>>(self, mut access: M) -> Result<Self::Value, M::Error> {
                 let mut map = BTreeMap::new();
-                let mut raw_map = OrderedJsonMap::with_capacity(access.size_hint().unwrap_or(0));
+                let mut raw_map = OrderedJsonMap::with_capacity(access.size_hint().unwrap_or(4));
                 while let Some((k, v)) = access.next_entry::<String, String>()? {
                     map.insert(k.clone(), v.clone());
                     raw_map.insert(k, OrderedJsonValue::String(v));
@@ -979,7 +990,7 @@ impl<'de> Visitor<'de> for ManifestVisitor {
         use crate::ordered_json::{OrderedJsonMap, OrderedJsonValue};
         let mut m = Manifest::default();
         let mut raw_map = if self.capture_raw {
-            Some(OrderedJsonMap::with_capacity(access.size_hint().unwrap_or(0)))
+            Some(OrderedJsonMap::with_capacity(access.size_hint().unwrap_or(16)))
         } else {
             None
         };
@@ -1096,8 +1107,10 @@ impl<'de> Visitor<'de> for ManifestVisitor {
                     }
                     _ => {
                         let rv: OrderedJsonValue = access.next_value()?;
-                        m.extra.insert(key.to_string(), rv.to_serde_value());
-                        rv
+                        let key_owned = key_wrap.0.into_owned();
+                        m.extra.insert(key_owned.clone(), rv.to_serde_value());
+                        rmap.insert(key_owned, rv);
+                        continue;
                     }
                 };
                 rmap.insert(key_wrap.0.into_owned(), raw_val);
@@ -1152,6 +1165,492 @@ impl<'de> Visitor<'de> for ManifestVisitor {
         }
 
         Ok(m)
+    }
+}
+
+struct FastManifestScanner<'a> {
+    bytes: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> FastManifestScanner<'a> {
+    #[inline]
+    fn skip_ws(&mut self) {
+        while let Some(&b) = self.bytes.get(self.pos) {
+            if matches!(b, b' ' | b'\n' | b'\r' | b'\t') {
+                self.pos += 1;
+            } else {
+                break;
+            }
+        }
+    }
+
+    #[inline]
+    fn expect_byte(&mut self, expected: u8) -> Option<()> {
+        self.skip_ws();
+        if *self.bytes.get(self.pos)? == expected {
+            self.pos += 1;
+            Some(())
+        } else {
+            None
+        }
+    }
+
+    #[inline]
+    fn peek(&mut self) -> Option<u8> {
+        self.skip_ws();
+        self.bytes.get(self.pos).copied()
+    }
+
+    #[inline]
+    fn read_plain_str(&mut self) -> Option<&'a str> {
+        self.skip_ws();
+        if *self.bytes.get(self.pos)? != b'"' {
+            return None;
+        }
+        self.pos += 1;
+        let start = self.pos;
+        let rest = &self.bytes[start..];
+        for (i, &b) in rest.iter().enumerate() {
+            if b == b'"' {
+                self.pos = start + i + 1;
+                // SAFETY: `self.bytes` came from `&str` and `start..start+i` is bounded by ASCII `"` bytes.
+                return Some(unsafe {
+                    std::str::from_utf8_unchecked(&self.bytes[start..start + i])
+                });
+            }
+            if b == b'\\' || b < 0x20 {
+                return None;
+            }
+        }
+        None
+    }
+
+    #[inline]
+    fn read_bool(&mut self) -> Option<bool> {
+        self.skip_ws();
+        let rest = &self.bytes[self.pos..];
+        if rest.starts_with(b"true") {
+            self.pos += 4;
+            Some(true)
+        } else if rest.starts_with(b"false") {
+            self.pos += 5;
+            Some(false)
+        } else {
+            None
+        }
+    }
+
+    #[inline]
+    fn read_null(&mut self) -> Option<()> {
+        self.skip_ws();
+        if self.bytes[self.pos..].starts_with(b"null") {
+            self.pos += 4;
+            Some(())
+        } else {
+            None
+        }
+    }
+
+    #[inline]
+    fn read_string_vec(&mut self) -> Option<Vec<String>> {
+        self.expect_byte(b'[')?;
+        let mut out = Vec::new();
+        if self.peek()? == b']' {
+            self.pos += 1;
+            return Some(out);
+        }
+        loop {
+            let s = self.read_plain_str()?;
+            out.push(s.to_owned());
+            match self.peek()? {
+                b',' => {
+                    self.pos += 1;
+                }
+                b']' => {
+                    self.pos += 1;
+                    return Some(out);
+                }
+                _ => return None,
+            }
+        }
+    }
+
+    #[inline]
+    fn read_string_btree(&mut self) -> Option<BTreeMap<String, String>> {
+        self.expect_byte(b'{')?;
+        let mut map = BTreeMap::new();
+        if self.peek()? == b'}' {
+            self.pos += 1;
+            return Some(map);
+        }
+        loop {
+            let k = self.read_plain_str()?;
+            self.expect_byte(b':')?;
+            let v = self.read_plain_str()?;
+            map.insert(k.to_owned(), v.to_owned());
+            match self.peek()? {
+                b',' => {
+                    self.pos += 1;
+                }
+                b'}' => {
+                    self.pos += 1;
+                    return Some(map);
+                }
+                _ => return None,
+            }
+        }
+    }
+
+    #[inline]
+    fn read_ordered_deps(&mut self) -> Option<(BTreeMap<String, String>, Vec<String>)> {
+        self.skip_ws();
+        match self.bytes.get(self.pos)? {
+            b'n' => {
+                self.read_null()?;
+                Some((BTreeMap::new(), Vec::new()))
+            }
+            b'{' => {
+                self.pos += 1;
+                let mut map = BTreeMap::new();
+                let mut order = Vec::new();
+                if self.peek()? == b'}' {
+                    self.pos += 1;
+                    return Some((map, order));
+                }
+                loop {
+                    let k = self.read_plain_str()?;
+                    self.expect_byte(b':')?;
+                    let v = self.read_plain_str()?;
+                    match map.entry(k.to_owned()) {
+                        std::collections::btree_map::Entry::Vacant(e) => {
+                            order.push(e.key().clone());
+                            e.insert(v.to_owned());
+                        }
+                        std::collections::btree_map::Entry::Occupied(mut e) => {
+                            e.insert(v.to_owned());
+                        }
+                    }
+                    match self.peek()? {
+                        b',' => {
+                            self.pos += 1;
+                        }
+                        b'}' => {
+                            self.pos += 1;
+                            return Some((map, order));
+                        }
+                        _ => return None,
+                    }
+                }
+            }
+            _ => None,
+        }
+    }
+
+    fn read_serde_value(&mut self, depth: u8) -> Option<serde_json::Value> {
+        if depth > 24 {
+            return None;
+        }
+        let b = self.peek()?;
+        match b {
+            b'"' => self.read_plain_str().map(|s| serde_json::Value::String(s.to_owned())),
+            b't' | b'f' => self.read_bool().map(serde_json::Value::Bool),
+            b'n' => {
+                self.read_null()?;
+                Some(serde_json::Value::Null)
+            }
+            b'[' => {
+                self.pos += 1;
+                let mut arr = Vec::new();
+                if self.peek()? == b']' {
+                    self.pos += 1;
+                    return Some(serde_json::Value::Array(arr));
+                }
+                loop {
+                    arr.push(self.read_serde_value(depth + 1)?);
+                    match self.peek()? {
+                        b',' => self.pos += 1,
+                        b']' => {
+                            self.pos += 1;
+                            return Some(serde_json::Value::Array(arr));
+                        }
+                        _ => return None,
+                    }
+                }
+            }
+            b'{' => {
+                self.pos += 1;
+                let mut map = serde_json::Map::new();
+                if self.peek()? == b'}' {
+                    self.pos += 1;
+                    return Some(serde_json::Value::Object(map));
+                }
+                loop {
+                    let k = self.read_plain_str()?;
+                    self.expect_byte(b':')?;
+                    let v = self.read_serde_value(depth + 1)?;
+                    map.insert(k.to_owned(), v);
+                    match self.peek()? {
+                        b',' => self.pos += 1,
+                        b'}' => {
+                            self.pos += 1;
+                            return Some(serde_json::Value::Object(map));
+                        }
+                        _ => return None,
+                    }
+                }
+            }
+            b'-' | b'0'..=b'9' => {
+                let start = self.pos;
+                if b == b'-' {
+                    self.pos += 1;
+                }
+                let first = *self.bytes.get(self.pos)?;
+                if !first.is_ascii_digit() {
+                    return None;
+                }
+                if first == b'0' {
+                    self.pos += 1;
+                    if self.bytes.get(self.pos).is_some_and(|c| c.is_ascii_digit()) {
+                        return None;
+                    }
+                } else {
+                    while self.bytes.get(self.pos).is_some_and(|c| c.is_ascii_digit()) {
+                        self.pos += 1;
+                    }
+                }
+                // Defer floats/exponents to serde_json for exact parsing
+                if self
+                    .bytes
+                    .get(self.pos)
+                    .is_some_and(|&c| matches!(c, b'.' | b'e' | b'E'))
+                {
+                    return None;
+                }
+                let s = std::str::from_utf8(&self.bytes[start..self.pos]).ok()?;
+                if b == b'-' {
+                    let v: i64 = s.parse().ok()?;
+                    Some(serde_json::Value::Number(serde_json::Number::from(v)))
+                } else {
+                    let v: u64 = s.parse().ok()?;
+                    Some(serde_json::Value::Number(serde_json::Number::from(v)))
+                }
+            }
+            _ => None,
+        }
+    }
+}
+
+fn try_parse_manifest_readonly_fast(clean_str: &str) -> Option<Manifest> {
+    let mut r = FastManifestScanner {
+        bytes: clean_str.as_bytes(),
+        pos: 0,
+    };
+    r.expect_byte(b'{')?;
+    let mut m = Manifest::default();
+    if r.peek()? == b'}' {
+        r.pos += 1;
+        r.skip_ws();
+        return if r.pos == r.bytes.len() {
+            Some(m)
+        } else {
+            None
+        };
+    }
+
+    loop {
+        let key = r.read_plain_str()?;
+        r.expect_byte(b':')?;
+        match key {
+            "name" => match r.peek()? {
+                b'n' => {
+                    r.read_null()?;
+                    m.name = None;
+                }
+                _ => m.name = Some(r.read_plain_str()?.to_owned()),
+            },
+            "version" => match r.peek()? {
+                b'n' => {
+                    r.read_null()?;
+                    m.version = None;
+                }
+                _ => m.version = Some(r.read_plain_str()?.to_owned()),
+            },
+            "description" => match r.peek()? {
+                b'n' => {
+                    r.read_null()?;
+                    m.description = None;
+                }
+                _ => m.description = Some(r.read_plain_str()?.to_owned()),
+            },
+            "main" => match r.peek()? {
+                b'"' => m.main = Some(r.read_plain_str()?.to_owned()),
+                b't' | b'f' => {
+                    r.read_bool()?;
+                    m.main = None;
+                }
+                b'n' => {
+                    r.read_null()?;
+                    m.main = None;
+                }
+                _ => return None,
+            },
+            "bin" => match r.peek()? {
+                b'n' => {
+                    r.read_null()?;
+                    m.bin = None;
+                }
+                b'"' => m.bin = Some(PackageBin::Single(r.read_plain_str()?.to_owned())),
+                b'{' => m.bin = Some(PackageBin::Map(r.read_string_btree()?)),
+                _ => return None,
+            },
+            "files" => match r.peek()? {
+                b'n' => {
+                    r.read_null()?;
+                    m.files = None;
+                }
+                b'"' => m.files = Some(vec![r.read_plain_str()?.to_owned()]),
+                b'[' => m.files = Some(r.read_string_vec()?),
+                _ => return None,
+            },
+            "scripts" => {
+                m.scripts = r.read_string_btree()?;
+            }
+            "dependencies" => {
+                let (map, order) = r.read_ordered_deps()?;
+                m.dependencies = map;
+                m.dependency_order = order;
+            }
+            "devDependencies" => {
+                let (map, order) = r.read_ordered_deps()?;
+                m.dev_dependencies = map;
+                m.dev_dependency_order = order;
+            }
+            "peerDependencies" => {
+                let (map, order) = r.read_ordered_deps()?;
+                m.peer_dependencies = map;
+                m.peer_dependency_order = order;
+            }
+            "peerDependenciesMeta" => {
+                r.expect_byte(b'{')?;
+                let mut pmeta = BTreeMap::new();
+                if r.peek()? != b'}' {
+                    loop {
+                        let dep_k = r.read_plain_str()?;
+                        r.expect_byte(b':')?;
+                        r.expect_byte(b'{')?;
+                        let mut optional = false;
+                        if r.peek()? != b'}' {
+                            loop {
+                                let mk = r.read_plain_str()?;
+                                r.expect_byte(b':')?;
+                                if mk != "optional" {
+                                    return None;
+                                }
+                                optional = r.read_bool()?;
+                                match r.peek()? {
+                                    b',' => r.pos += 1,
+                                    b'}' => break,
+                                    _ => return None,
+                                }
+                            }
+                        }
+                        r.pos += 1;
+                        pmeta.insert(dep_k.to_owned(), PeerDependencyMeta { optional });
+                        match r.peek()? {
+                            b',' => r.pos += 1,
+                            b'}' => break,
+                            _ => return None,
+                        }
+                    }
+                }
+                r.pos += 1;
+                m.peer_dependencies_meta = pmeta;
+            }
+            "optionalDependencies" => {
+                let (map, order) = r.read_ordered_deps()?;
+                m.optional_dependencies = map;
+                m.optional_dependency_order = order;
+            }
+            "bundledDependencies" | "bundleDependencies" => match r.peek()? {
+                b'n' => {
+                    r.read_null()?;
+                    m.bundled_dependencies = None;
+                }
+                b't' | b'f' => {
+                    m.bundled_dependencies = Some(BundledDependencies::Boolean(r.read_bool()?));
+                }
+                b'[' => {
+                    m.bundled_dependencies = Some(BundledDependencies::List(r.read_string_vec()?));
+                }
+                _ => return None,
+            },
+            "workspaces" => match r.peek()? {
+                b'n' => {
+                    r.read_null()?;
+                    m.workspaces = None;
+                }
+                b'[' => {
+                    m.workspaces = Some(PackageWorkspaces::List(r.read_string_vec()?));
+                }
+                _ => return None,
+            },
+            "os" => match r.peek()? {
+                b'n' => {
+                    r.read_null()?;
+                    m.os = None;
+                }
+                b'"' => m.os = Some(PlatformList::from(r.read_plain_str()?.to_owned())),
+                b'[' => m.os = Some(PlatformList::from(r.read_string_vec()?)),
+                _ => return None,
+            },
+            "cpu" => match r.peek()? {
+                b'n' => {
+                    r.read_null()?;
+                    m.cpu = None;
+                }
+                b'"' => m.cpu = Some(PlatformList::from(r.read_plain_str()?.to_owned())),
+                b'[' => m.cpu = Some(PlatformList::from(r.read_string_vec()?)),
+                _ => return None,
+            },
+            "libc" => match r.peek()? {
+                b'n' => {
+                    r.read_null()?;
+                    m.libc = None;
+                }
+                b'"' => m.libc = Some(PlatformList::from(r.read_plain_str()?.to_owned())),
+                b'[' => m.libc = Some(PlatformList::from(r.read_string_vec()?)),
+                _ => return None,
+            },
+            "engines" => match r.peek()? {
+                b'n' => {
+                    r.read_null()?;
+                    m.engines = BTreeMap::new();
+                }
+                b'{' => m.engines = r.read_string_btree()?,
+                _ => return None,
+            },
+            _ => {
+                let val = r.read_serde_value(0)?;
+                m.extra.insert(key.to_owned(), val);
+            }
+        }
+
+        match r.peek()? {
+            b',' => {
+                r.pos += 1;
+            }
+            b'}' => {
+                r.pos += 1;
+                r.skip_ws();
+                return if r.pos == r.bytes.len() {
+                    Some(m)
+                } else {
+                    None
+                };
+            }
+            _ => return None,
+        }
     }
 }
 
@@ -1218,6 +1717,10 @@ impl Manifest {
     pub fn from_str_readonly(s: &str) -> Result<Self, ManifestError> {
         let format = ManifestFormat::detect(s);
         let clean_str = s.strip_prefix('\u{feff}').unwrap_or(s);
+        if let Some(mut manifest) = try_parse_manifest_readonly_fast(clean_str) {
+            manifest.format = format;
+            return Ok(manifest);
+        }
         let mut manifest: Self =
             serde_json::from_str(clean_str).map_err(|err| ManifestError::MalformedJson {
                 message: err.to_string(),
@@ -1519,7 +2022,7 @@ impl Manifest {
             let mut idx = 0usize;
             let mut emitted_unique = 0usize;
             let mut seen_large = if order.len() > 16 {
-                Some(std::collections::HashSet::with_capacity(order.len()))
+                Some(crate::fast_hash::fx_set_with_capacity(order.len()))
             } else {
                 None
             };
