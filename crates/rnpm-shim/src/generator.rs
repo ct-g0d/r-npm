@@ -1,7 +1,12 @@
 use crate::error::ShimError;
 use crate::path::compute_relative_path;
-use crate::shebang::{normalize_shebang_file, read_shebang_from_file, ShebangInfo};
+use crate::shebang::{normalize_and_read_shebang_info, ShebangInfo};
+use crate::{
+    escape_cmd_path_cow, escape_posix_path_cow, escape_ps1_path_cow, push_escaped_cmd_arg,
+    push_escaped_posix_arg, push_escaped_ps1_arg,
+};
 use rnpm_core::manifest::{Manifest, PackageBin};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 /// The string contents of the executable shim trio (sh, cmd, ps1).
@@ -85,175 +90,186 @@ pub fn generate_shim_content(rel_path: &str, shebang: Option<&ShebangInfo>) -> S
     let prog = &info.program;
 
     // 1. Unix POSIX Shell Script (<name>)
-    let sh_args_str = if info.args.is_empty() {
-        "  ".to_string()
-    } else {
-        let escaped: Vec<String> = info
-            .args
-            .iter()
-            .map(|arg| crate::escape_posix_arg(arg))
-            .collect();
-        format!("{} ", escaped.join(" "))
-    };
-    let sh_rel_path = crate::escape_posix_path(rel_path);
-    let mut sh = format!(
-        "#!/bin/sh\n\
-         basedir=$(dirname \"$(echo \"$0\" | sed -e 's,\\,/,g')\")\n\
-         \n\
-         case `uname` in\n\
-             *CYGWIN*|*MINGW*|*MSYS*)\n\
-                 if command -v cygpath > /dev/null 2>&1; then\n\
-                     basedir=`cygpath -w \"$basedir\"`\n\
-                 fi\n\
-             ;;\n\
-         esac\n\
-         \n\
-         if [ -x \"$basedir/{prog}\" ]; then\n\
-           exec \"$basedir/{prog}\" {sh_args_str}\"$basedir/{sh_rel_path}\" \"$@\"\n\
-         else \n\
-           exec {prog} {sh_args_str}\"$basedir/{sh_rel_path}\" \"$@\"\n\
-         fi\n"
+    // Match npm's cmd-shim output exactly, including blank lines, indentation,
+    // and the double-space argument separator when no shebang args exist.
+    let sh_rel_path = escape_posix_path_cow(rel_path);
+    let mut sh = String::with_capacity(
+        310 + prog.len() * 2 + sh_rel_path.len() * 2 + info.args.len() * 8,
     );
-    // Match npm's cmd-shim output exactly: its sed expression contains two
-    // literal backslashes in the generated script, and its node invocation
-    // keeps the double-space argument separator.
-    sh = sh.replace("s,\\\\\\\\,/,g", "s,\\\\,/,g");
+    sh.push_str(
+        "#!/bin/sh\n\
+basedir=$(dirname \"$(echo \"$0\" | sed -e 's,\\,/,g')\")\n\
+\n\
+case `uname` in\n\
+    *CYGWIN*|*MINGW*|*MSYS*)\n\
+        if command -v cygpath > /dev/null 2>&1; then\n\
+            basedir=`cygpath -w \"$basedir\"`\n\
+        fi\n\
+    ;;\n\
+esac\n\
+\n\
+if [ -x \"$basedir/",
+    );
+    sh.push_str(prog);
+    sh.push_str("\" ]; then\n  exec \"$basedir/");
+    sh.push_str(prog);
+    sh.push_str("\" ");
+    if info.args.is_empty() {
+        sh.push_str("  ");
+    } else {
+        for arg in &info.args {
+            push_escaped_posix_arg(&mut sh, arg);
+            sh.push(' ');
+        }
+    }
+    sh.push_str("\"$basedir/");
+    sh.push_str(&sh_rel_path);
+    sh.push_str("\" \"$@\"\nelse \n  exec ");
+    sh.push_str(prog);
+    sh.push(' ');
+    if info.args.is_empty() {
+        sh.push_str("  ");
+    } else {
+        for arg in &info.args {
+            push_escaped_posix_arg(&mut sh, arg);
+            sh.push(' ');
+        }
+    }
+    sh.push_str("\"$basedir/");
+    sh.push_str(&sh_rel_path);
+    sh.push_str("\" \"$@\"\nfi\n");
 
     // 2. Windows Batch Wrapper (<name>.cmd)
-    let cmd_args_str = if info.args.is_empty() {
-        " ".to_string()
-    } else {
-        let escaped: Vec<String> = info
-            .args
-            .iter()
-            .map(|arg| crate::escape_cmd_arg(arg))
-            .collect();
-        format!("{} ", escaped.join(" "))
-    };
-    let win_rel_path = crate::escape_cmd_path(&rel_path.replace('/', "\\"));
-    let cmd = format!(
-        "@ECHO off\r\n\
-         GOTO start\r\n\
-         :find_dp0\r\n\
-         SET dp0=%~dp0\r\n\
-         EXIT /b\r\n\
-         :start\r\n\
-         SETLOCAL\r\n\
-         CALL :find_dp0\r\n\
-         \r\n\
-         IF EXIST \"%dp0%\\{prog}.exe\" (\r\n\
-           SET \"_prog=%dp0%\\{prog}.exe\"\r\n\
-         ) ELSE (\r\n\
-           SET \"_prog={prog}\"\r\n\
-           SET PATHEXT=%PATHEXT:;.JS;=;%\r\n\
-         )\r\n\
-         \r\n\
-         endLocal & goto #_undefined_# 2>NUL || title %COMSPEC% & \"%_prog%\" {cmd_args_str}\"%dp0%\\{win_rel_path}\" %*\r\n"
+    let win_rel_path = escape_cmd_path_cow(rel_path);
+    let mut cmd = String::with_capacity(
+        320 + prog.len() * 3 + win_rel_path.len() + info.args.len() * 8,
     );
+    cmd.push_str(
+        "@ECHO off\r\n\
+GOTO start\r\n\
+:find_dp0\r\n\
+SET dp0=%~dp0\r\n\
+EXIT /b\r\n\
+:start\r\n\
+SETLOCAL\r\n\
+CALL :find_dp0\r\n\
+\r\n\
+IF EXIST \"%dp0%\\",
+    );
+    cmd.push_str(prog);
+    cmd.push_str(".exe\" (\r\n  SET \"_prog=%dp0%\\");
+    cmd.push_str(prog);
+    cmd.push_str(".exe\"\r\n) ELSE (\r\n  SET \"_prog=");
+    cmd.push_str(prog);
+    cmd.push_str(
+        "\"\r\n  SET PATHEXT=%PATHEXT:;.JS;=;%\r\n)\r\n\r\nendLocal & goto #_undefined_# 2>NUL || title %COMSPEC% & \"%_prog%\" ",
+    );
+    if info.args.is_empty() {
+        cmd.push(' ');
+    } else {
+        for arg in &info.args {
+            push_escaped_cmd_arg(&mut cmd, arg);
+            cmd.push(' ');
+        }
+    }
+    cmd.push_str("\"%dp0%\\");
+    cmd.push_str(&win_rel_path);
+    cmd.push_str("\" %*\r\n");
 
     // 3. Windows PowerShell Wrapper (<name>.ps1)
-    let ps1_args_str = if info.args.is_empty() {
-        "  ".to_string()
-    } else {
-        let escaped: Vec<String> = info
-            .args
-            .iter()
-            .map(|arg| crate::escape_ps1_arg(arg))
-            .collect();
-        format!("{} ", escaped.join(" "))
-    };
-    let ps1_rel_path = crate::escape_ps1_path(rel_path);
-    let ps1 = format!(
+    let ps1_rel_path = escape_ps1_path_cow(rel_path);
+    let mut ps1 = String::with_capacity(
+        620 + prog.len() * 3 + ps1_rel_path.len() * 4 + info.args.len() * 16,
+    );
+    ps1.push_str(
         "#!/usr/bin/env pwsh\r\n\
-         $basedir=Split-Path $MyInvocation.MyCommand.Definition -Parent\r\n\
-         \r\n\
-         $exe=\"\"\r\n\
-         if ($PSVersionTable.PSVersion -lt \"6.0\" -or $IsWindows) {{\r\n\
-         # Fix case when both the Windows and Linux builds of Node\r\n\
-         # are installed in the same directory\r\n\
-           $exe=\".exe\"\r\n\
-         }}\r\n\
-         $ret=0\r\n\
-         if (Test-Path \"$basedir/{prog}$exe\") {{\r\n\
-           # Support pipeline input\r\n\
-           if ($MyInvocation.ExpectingInput) {{\r\n\
-             $input | & \"$basedir/{prog}$exe\" {ps1_args_str}\"$basedir/{ps1_rel_path}\" $args\r\n\
-           }} else {{\r\n\
-             & \"$basedir/{prog}$exe\" {ps1_args_str}\"$basedir/{ps1_rel_path}\" $args\r\n\
-           }}\r\n\
-           $ret=$LASTEXITCODE\r\n\
-         }} else {{\r\n\
-           # Support pipeline input\r\n\
-           if ($MyInvocation.ExpectingInput) {{\r\n\
-             $input | & \"{prog}$exe\" {ps1_args_str}\"$basedir/{ps1_rel_path}\" $args\r\n\
-           }} else {{\r\n\
-             & \"{prog}$exe\" {ps1_args_str}\"$basedir/{ps1_rel_path}\" $args\r\n\
-           }}\r\n\
-           $ret=$LASTEXITCODE\r\n\
-         }}\r\n\
-         exit $ret\r\n"
-    )
-    .replace("\r\n# Fix", "\r\n  # Fix")
-    .replace("\r\n$exe=\".exe\"", "\r\n  $exe=\".exe\"")
-    .replace("\r\n# Support", "\r\n  # Support")
-    .replace("\r\nif ($MyInvocation", "\r\n  if ($MyInvocation")
-    .replace("\r\n$input |", "\r\n    $input |")
-    .replace("\r\n& \"", "\r\n    & \"")
-    .replace("\n}\n$ret=$LASTEXITCODE", "\n  }\n  $ret=$LASTEXITCODE")
-    .replacen("\n} else {\n  # Support", "\n  } else {\n  # Support", 1)
-    .replace("\n# are installed", "\n  # are installed")
-    .replacen("\n} else {", "\n  } else {", 1)
-    .replacen("\n} else {", "\n  } else {", 1)
-    .replace("\"   \"$basedir", "\"  \"$basedir")
-    .replace("\"   \"$basedir", "\"  \"$basedir")
-    .replace("$basedir =", "$basedir=")
-    .replace("$exe =", "$exe=")
-    .replace("$ret =", "$ret=");
-
-    let ps1 = {
-        let mut close_count = 0usize;
-        let mut else_count = 0usize;
-        let mut ret_count = 0usize;
-        ps1.split("\r\n")
-            .map(|line| {
-                let bare = line.trim_start();
-                if bare == "}" {
-                    close_count += 1;
-                    if close_count == 2 || close_count == 3 {
-                        return "  }".to_string();
-                    }
-                    return "}".to_string();
-                }
-                if bare == "} else {" {
-                    else_count += 1;
-                    if else_count == 1 || else_count == 3 {
-                        return "  } else {".to_string();
-                    }
-                    return "} else {".to_string();
-                }
-                if bare == "$ret=$LASTEXITCODE" {
-                    ret_count += 1;
-                    if ret_count <= 2 {
-                        return "  $ret=$LASTEXITCODE".to_string();
-                    }
-                    return "$ret=$LASTEXITCODE".to_string();
-                }
-                line.to_string()
-            })
-            .collect::<Vec<_>>()
-            .join("\r\n")
-    };
+$basedir=Split-Path $MyInvocation.MyCommand.Definition -Parent\r\n\
+\r\n\
+$exe=\"\"\r\n\
+if ($PSVersionTable.PSVersion -lt \"6.0\" -or $IsWindows) {\r\n\
+# Fix case when both the Windows and Linux builds of Node\r\n\
+# are installed in the same directory\r\n\
+  $exe=\".exe\"\r\n\
+}\r\n\
+$ret=0\r\n\
+if (Test-Path \"$basedir/",
+    );
+    ps1.push_str(prog);
+    ps1.push_str(
+        "$exe\") {\r\n\
+  # Support pipeline input\r\n\
+  if ($MyInvocation.ExpectingInput) {\r\n\
+    $input | & \"$basedir/",
+    );
+    ps1.push_str(prog);
+    ps1.push_str("$exe\" ");
+    let mut ps1_args_buf = String::new();
+    if info.args.is_empty() {
+        ps1_args_buf.push_str("  ");
+    } else {
+        for arg in &info.args {
+            push_escaped_ps1_arg(&mut ps1_args_buf, arg);
+            ps1_args_buf.push(' ');
+        }
+    }
+    ps1.push_str(&ps1_args_buf);
+    ps1.push_str("\"$basedir/");
+    ps1.push_str(&ps1_rel_path);
+    ps1.push_str("\" $args\r\n  } else {\r\n    & \"$basedir/");
+    ps1.push_str(prog);
+    ps1.push_str("$exe\" ");
+    ps1.push_str(&ps1_args_buf);
+    ps1.push_str("\"$basedir/");
+    ps1.push_str(&ps1_rel_path);
+    ps1.push_str(
+        "\" $args\r\n  }\r\n\
+  $ret=$LASTEXITCODE\r\n\
+} else {\r\n\
+  # Support pipeline input\r\n\
+  if ($MyInvocation.ExpectingInput) {\r\n\
+    $input | & \"",
+    );
+    ps1.push_str(prog);
+    ps1.push_str("$exe\" ");
+    ps1.push_str(&ps1_args_buf);
+    ps1.push_str("\"$basedir/");
+    ps1.push_str(&ps1_rel_path);
+    ps1.push_str("\" $args\r\n  } else {\r\n    & \"");
+    ps1.push_str(prog);
+    ps1.push_str("$exe\" ");
+    ps1.push_str(&ps1_args_buf);
+    ps1.push_str("\"$basedir/");
+    ps1.push_str(&ps1_rel_path);
+    ps1.push_str(
+        "\" $args\r\n  }\r\n\
+  $ret=$LASTEXITCODE\r\n\
+}\r\n\
+exit $ret\r\n",
+    );
 
     ShimContent { sh, cmd, ps1 }
 }
 
+fn write_trio_shim_file(path: &Path, data: &[u8]) -> Result<(), ShimError> {
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+    {
+        f.write_all(data).map_err(|e| ShimError::Io {
+            path: path.to_path_buf(),
+            source: e,
+        })?;
+        return Ok(());
+    }
+    prepare_shim_destination(path);
+    std::fs::write(path, data).map_err(|e| ShimError::Io {
+        path: path.to_path_buf(),
+        source: e,
+    })
+}
+
 /// Generates the standard executable shim trio into `bin_dir` for a target script file.
-///
-/// 1. Computes the relative path from `bin_dir` to `target_script` (with forward slashes).
-/// 2. Normalizes any CRLF shebang in `target_script` if it exists on disk.
-/// 3. Reads any shebang options.
-/// 4. Generates `<bin_name>`, `<bin_name>.cmd`, and `<bin_name>.ps1` in `bin_dir`.
-/// 5. Sets file mode `0755` on Unix.
 pub fn create_shim_trio(
     target_script: &Path,
     bin_dir: &Path,
@@ -262,48 +278,33 @@ pub fn create_shim_trio(
     // 1. Compute relative path with forward slashes (e.g. "../my-pkg/bin/cli.js")
     let target_rel_path = compute_relative_path(bin_dir, target_script)?;
 
-    // 2. Normalize CRLF shebang in the target script if it exists
-    if target_script.exists() {
-        let _ = normalize_shebang_file(target_script)?;
+    // 2. Single-open normalize CRLF shebang + read shebang info
+    let (is_file, shebang) = normalize_and_read_shebang_info(target_script)?;
+    if is_file {
         let _ = set_executable_mode(target_script);
     }
 
-    // 3. Read shebang info if present
-    let shebang = read_shebang_from_file(target_script).ok().flatten();
-
-    // 4. Generate content
+    // 3. Generate content
     let content = generate_shim_content(&target_rel_path, shebang.as_ref());
 
-    // 5. Ensure bin_dir exists
+    // 4. Ensure bin_dir exists
     std::fs::create_dir_all(bin_dir).map_err(|e| ShimError::Io {
         path: bin_dir.to_path_buf(),
         source: e,
     })?;
 
-    // 6. Write shims to disk
+    // 5. Write shims to disk
     let sh_path = bin_dir.join(bin_name);
     let cmd_path = bin_dir.join(format!("{bin_name}.cmd"));
     let ps1_path = bin_dir.join(format!("{bin_name}.ps1"));
 
-    prepare_shim_destination(&sh_path);
-    std::fs::write(&sh_path, content.sh.as_bytes()).map_err(|e| ShimError::Io {
-        path: sh_path.clone(),
-        source: e,
-    })?;
+    write_trio_shim_file(&sh_path, content.sh.as_bytes())?;
     let _ = set_executable_mode(&sh_path);
 
-    prepare_shim_destination(&cmd_path);
-    std::fs::write(&cmd_path, content.cmd.as_bytes()).map_err(|e| ShimError::Io {
-        path: cmd_path.clone(),
-        source: e,
-    })?;
+    write_trio_shim_file(&cmd_path, content.cmd.as_bytes())?;
     let _ = set_executable_mode(&cmd_path);
 
-    prepare_shim_destination(&ps1_path);
-    std::fs::write(&ps1_path, content.ps1.as_bytes()).map_err(|e| ShimError::Io {
-        path: ps1_path.clone(),
-        source: e,
-    })?;
+    write_trio_shim_file(&ps1_path, content.ps1.as_bytes())?;
     let _ = set_executable_mode(&ps1_path);
 
     Ok(ShimTrio {

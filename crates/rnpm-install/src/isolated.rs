@@ -813,11 +813,11 @@ async fn fetch_tarball(
         return Ok(std::fs::read(project_dir.join(rel))?);
     }
     if let Some(exp) = &expected {
-        if let Ok(Some(data)) = installer.cache.get_by_integrity(exp) {
+        if let Ok(Some(data)) = installer.cache().get_by_integrity(exp) {
             return Ok(data);
         }
     }
-    if let Ok(Some((_, data))) = installer.cache.get(resolved) {
+    if let Ok(Some((_, data))) = installer.cache().get(resolved) {
         if expected.as_ref().is_none_or(|e| e.verify(&data).is_ok()) {
             return Ok(data);
         }
@@ -828,7 +828,7 @@ async fn fetch_tarball(
         ));
     }
     let data = installer
-        .registry_client
+        .registry_client()
         .download_tarball_bytes(resolved)
         .await
         .map_err(|e| anyhow!("Failed to download tarball from {resolved}: {e}"))?;
@@ -837,7 +837,7 @@ async fn fetch_tarball(
             .map_err(|e| anyhow!("Integrity verification failed for {location}: {e}"))?;
     }
     let _ = installer
-        .cache
+        .cache()
         .put_with_integrity(resolved, &data, expected.as_ref(), None);
     Ok(data)
 }

@@ -6,6 +6,7 @@ use std::collections::BinaryHeap;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus};
+use std::sync::Arc;
 use tracing::{debug, info, warn};
 
 pub mod error;
@@ -491,12 +492,28 @@ impl LifecycleContext {
             );
         }
 
-        let script_shell = rnpm_config::Config::load(Some(&package_dir))
-            .ok()
+        let pkg_cfg = if package_dir != project_root && package_dir.join(".npmrc").exists() {
+            rnpm_config::Config::load(Some(&package_dir)).ok()
+        } else {
+            None
+        };
+        let root_cfg = if pkg_cfg.is_none()
+            || pkg_cfg
+                .as_ref()
+                .is_some_and(|c| c.get("script-shell").is_none() || c.get("node-gyp").is_none())
+        {
+            rnpm_config::Config::load(Some(&project_root)).ok()
+        } else {
+            None
+        };
+        let effective_cfg = pkg_cfg.as_ref().or(root_cfg.as_ref());
+
+        let script_shell = pkg_cfg
+            .as_ref()
             .and_then(|c| c.get("script-shell").map(str::to_string))
             .or_else(|| {
-                rnpm_config::Config::load(Some(&project_root))
-                    .ok()
+                root_cfg
+                    .as_ref()
                     .and_then(|c| c.get("script-shell").map(str::to_string))
             })
             .filter(|s| {
@@ -509,10 +526,14 @@ impl LifecycleContext {
             .ok()
             .map(PathBuf::from)
             .or_else(|| {
-                rnpm_config::Config::load(Some(&package_dir))
-                    .or_else(|_| rnpm_config::Config::load(Some(&project_root)))
-                    .ok()
+                pkg_cfg
+                    .as_ref()
                     .and_then(|c| c.get("node-gyp").map(PathBuf::from))
+                    .or_else(|| {
+                        root_cfg
+                            .as_ref()
+                            .and_then(|c| c.get("node-gyp").map(PathBuf::from))
+                    })
             });
 
         Self {
@@ -533,7 +554,7 @@ impl LifecycleContext {
             script_shell,
             node_gyp,
             offline: false,
-            config: None,
+            config: effective_cfg.cloned(),
             precomputed_env: None,
         }
     }
@@ -665,72 +686,76 @@ impl LifecycleContext {
     }
 }
 
+#[inline]
+fn contains_ascii_ci(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack.len() >= needle.len()
+        && haystack
+            .windows(needle.len())
+            .any(|w| w.eq_ignore_ascii_case(needle))
+}
+
 /// Scrub sensitive authentication tokens and credentials from environment map.
 pub fn is_sensitive_credential_key(key: &str) -> bool {
-    let lower = key.to_ascii_lowercase();
+    let b = key.as_bytes();
 
     // Specific credential keys requested for hardening
-    if lower.contains("aws_access_key_id")
-        || lower.contains("aws_secret_access_key")
-        || lower.contains("aws_session_token")
-        || lower.contains("ssh_auth_sock")
-        || lower.contains("jwt")
-        || lower.contains("deploy_key")
-        || lower.contains("deploykey")
-        || lower.contains("signing_key")
-        || lower.contains("signingkey")
-        || lower.contains("encryption_key")
-        || lower.contains("encryptionkey")
-        || lower.contains("secret_key")
-        || lower.contains("secretkey")
+    if contains_ascii_ci(b, b"aws_access_key_id")
+        || contains_ascii_ci(b, b"aws_secret_access_key")
+        || contains_ascii_ci(b, b"aws_session_token")
+        || contains_ascii_ci(b, b"ssh_auth_sock")
+        || contains_ascii_ci(b, b"jwt")
+        || contains_ascii_ci(b, b"deploy_key")
+        || contains_ascii_ci(b, b"deploykey")
+        || contains_ascii_ci(b, b"signing_key")
+        || contains_ascii_ci(b, b"signingkey")
+        || contains_ascii_ci(b, b"encryption_key")
+        || contains_ascii_ci(b, b"encryptionkey")
+        || contains_ascii_ci(b, b"secret_key")
+        || contains_ascii_ci(b, b"secretkey")
     {
         return true;
     }
 
-    // Token prefixes
-    if lower.starts_with("ghp_")
-        || lower.contains("ghp_")
-        || lower.starts_with("github_pat_")
-        || lower.contains("github_pat_")
+    // Token prefixes / substrings
+    if contains_ascii_ci(b, b"ghp_") || contains_ascii_ci(b, b"github_pat_") {
+        return true;
+    }
+
+    if contains_ascii_ci(b, b"authtoken")
+        || contains_ascii_ci(b, b"password")
+        || contains_ascii_ci(b, b"passwd")
+        || contains_ascii_ci(b, b"secret")
+        || contains_ascii_ci(b, b"credential")
+        || contains_ascii_ci(b, b"private_key")
+        || contains_ascii_ci(b, b"privatekey")
+        || contains_ascii_ci(b, b"apikey")
+        || contains_ascii_ci(b, b"api_key")
+        || contains_ascii_ci(b, b"bearer")
     {
         return true;
     }
 
-    if lower.contains("authtoken")
-        || lower.contains("password")
-        || lower.contains("passwd")
-        || lower.contains("secret")
-        || lower.contains("credential")
-        || lower.contains("private_key")
-        || lower.contains("privatekey")
-        || lower.contains("apikey")
-        || lower.contains("api_key")
-        || lower.contains("bearer")
+    if b.starts_with(b"//")
+        || contains_ascii_ci(b, b"/:_")
+        || contains_ascii_ci(b, b":_authtoken")
+        || contains_ascii_ci(b, b":_auth")
+        || contains_ascii_ci(b, b":_password")
+        || (b.len() >= 13 && b[..13].eq_ignore_ascii_case(b"npm_config_//"))
     {
         return true;
     }
 
-    if lower.starts_with("//")
-        || lower.contains("/:_")
-        || lower.contains(":_authtoken")
-        || lower.contains(":_auth")
-        || lower.contains(":_password")
-        || lower.starts_with("npm_config_//")
+    if (contains_ascii_ci(b, b"_auth")
+        || contains_ascii_ci(b, b"auth_")
+        || (b.len() >= 4 && b[..4].eq_ignore_ascii_case(b"auth"))
+        || (b.len() >= 4 && b[b.len() - 4..].eq_ignore_ascii_case(b"auth"))
+        || b.eq_ignore_ascii_case(b"auth"))
+        && !contains_ascii_ci(b, b"author")
     {
         return true;
     }
 
-    if (lower.contains("_auth")
-        || lower.contains("auth_")
-        || lower.starts_with("auth")
-        || lower.ends_with("auth")
-        || lower == "auth")
-        && !lower.contains("author")
-    {
-        return true;
-    }
-
-    if lower.contains("token") {
+    if contains_ascii_ci(b, b"token") {
         return true;
     }
 
@@ -1213,7 +1238,7 @@ pub fn build_lifecycle_env_with_config(
 
     // 2. Extra env passed in (also scrubbed)
     for (k, v) in &ctx.extra_env {
-        if !is_sensitive_credential_key(k) {
+        if !k.eq_ignore_ascii_case("path") && !is_sensitive_credential_key(k) {
             env.insert(k.clone(), v.clone());
         }
     }
@@ -1375,23 +1400,15 @@ pub fn build_lifecycle_env_with_config(
     );
 
     // Honor config node-options: inject or append into NODE_OPTIONS
-    let node_opts = if let Some(ref config) = ctx.config {
-        config.get("node-options").map(str::to_string)
-    } else {
-        rnpm_config::Config::load(Some(&ctx.package_dir))
-            .ok()
-            .and_then(|c| c.get("node-options").map(str::to_string))
-            .or_else(|| {
-                rnpm_config::Config::load(Some(&ctx.project_root))
-                    .ok()
-                    .and_then(|c| c.get("node-options").map(str::to_string))
-            })
-    }
-    .or_else(|| env.get("npm_config_node_options").cloned())
-    .filter(|s| {
-        let trimmed = s.trim().trim_matches('"');
-        !trimmed.is_empty() && trimmed != "null" && s != "null"
-    });
+    let active_config = ctx.config.as_ref().unwrap_or(config);
+    let node_opts = active_config
+        .get("node-options")
+        .map(str::to_string)
+        .or_else(|| env.get("npm_config_node_options").cloned())
+        .filter(|s| {
+            let trimmed = s.trim().trim_matches('"');
+            !trimmed.is_empty() && trimmed != "null" && s != "null"
+        });
 
     if let Some(opts) = node_opts {
         if let Some(existing) = env.get_mut("NODE_OPTIONS") {
@@ -1442,22 +1459,14 @@ pub fn build_lifecycle_env_with_config(
         }
 
         if !omit_dev_active {
-            let config_res = if let Some(ref config) = ctx.config {
-                Ok(config.clone())
-            } else {
-                rnpm_config::Config::load(Some(&ctx.package_dir))
-                    .or_else(|_| rnpm_config::Config::load(Some(&ctx.project_root)))
-            };
-            if let Ok(config) = config_res {
-                if let Some(val) = config.get("omit") {
-                    if is_omit_dev(val) {
-                        omit_dev_active = true;
-                    }
+            if let Some(val) = active_config.get("omit") {
+                if is_omit_dev(val) {
+                    omit_dev_active = true;
                 }
-                if let Some(val) = config.get("production") {
-                    if is_truthy(val) {
-                        omit_dev_active = true;
-                    }
+            }
+            if let Some(val) = active_config.get("production") {
+                if is_truthy(val) {
+                    omit_dev_active = true;
                 }
             }
         }
@@ -1496,17 +1505,9 @@ pub fn build_lifecycle_env_with_config(
             }
         }
         if !include_dev {
-            let config_res = if let Some(ref config) = ctx.config {
-                Ok(config.clone())
-            } else {
-                rnpm_config::Config::load(Some(&ctx.package_dir))
-                    .or_else(|_| rnpm_config::Config::load(Some(&ctx.project_root)))
-            };
-            if let Ok(config) = config_res {
-                if let Some(val) = config.get("include") {
-                    if has_include_dev(val) {
-                        include_dev = true;
-                    }
+            if let Some(val) = active_config.get("include") {
+                if has_include_dev(val) {
+                    include_dev = true;
                 }
             }
         }
@@ -1540,14 +1541,307 @@ pub fn build_lifecycle_env(ctx: &LifecycleContext) -> HashMap<String, String> {
     build_lifecycle_env_with_config(ctx, config)
 }
 
-/// The process environment follows npm's current package-field contract.
-pub fn build_script_env_with_config(
-    ctx: &LifecycleContext,
-    config: &rnpm_config::Config,
-) -> HashMap<String, String> {
-    if let Some(ref precomputed) = ctx.precomputed_env {
-        let mut env = precomputed.clone();
-        let cmd = match ctx.event.as_str() {
+fn flatten_pkg_script_env(prefix: &str, value: &serde_json::Value, env: &mut HashMap<String, String>) {
+    match value {
+        serde_json::Value::Object(map) => {
+            for (key, value) in map {
+                flatten_pkg_script_env(&format!("{prefix}_{key}"), value, env);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for (index, value) in items.iter().enumerate() {
+                flatten_pkg_script_env(&format!("{prefix}_{index}"), value, env);
+            }
+        }
+        serde_json::Value::Null | serde_json::Value::Bool(false) => {
+            env.insert(prefix.into(), String::new());
+        }
+        serde_json::Value::String(value) => {
+            env.insert(prefix.into(), value.clone());
+        }
+        value => {
+            env.insert(prefix.into(), value.to_string());
+        }
+    }
+}
+
+#[inline]
+fn bytes_contain_subslice(hay: &[u8], needle: &[u8]) -> bool {
+    hay.len() >= needle.len() && hay.windows(needle.len()).any(|w| w == needle)
+}
+
+fn flatten_pkg_script_fields_from_bytes(bytes: &[u8], env: &mut HashMap<String, String>) {
+    let bytes = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(bytes);
+    let maybe_has_fields = bytes_contain_subslice(bytes, b"\"config\"")
+        || bytes_contain_subslice(bytes, b"\"engines\"")
+        || bytes_contain_subslice(bytes, b"\"bin\"")
+        || bytes_contain_subslice(bytes, b"\\u");
+    if !maybe_has_fields {
+        return;
+    }
+    if let Ok(package) = serde_json::from_slice::<serde_json::Value>(bytes) {
+        for key in ["config", "engines", "bin"] {
+            if let Some(value) = package.get(key) {
+                flatten_pkg_script_env(&format!("npm_package_{key}"), value, env);
+            }
+        }
+    }
+}
+
+/// Shared immutable environment snapshot computed once per dependency/workspace batch
+/// (inherited env scrubbed once, config layers resolved once, node/node-gyp/PATH resolved once).
+struct ScriptBaseEnv {
+    env: HashMap<String, String>,
+    gyp_bin: Option<PathBuf>,
+    inherited_tail_no_gyp: std::ffi::OsString,
+    inherited_tail_with_gyp: Option<std::ffi::OsString>,
+    init_cwd_fallback: PathBuf,
+}
+
+impl ScriptBaseEnv {
+    fn build(
+        project_root: &Path,
+        config: &rnpm_config::Config,
+        node_execpath: Option<&Path>,
+        npm_execpath: Option<&Path>,
+        extra_env: Option<&HashMap<String, String>>,
+    ) -> Self {
+        let mut env: HashMap<String, String> = HashMap::with_capacity(96);
+
+        for (k, v) in std::env::vars() {
+            if !k.eq_ignore_ascii_case("path") && !is_sensitive_credential_key(&k) {
+                env.insert(k, v);
+            }
+        }
+
+        if let Some(extra) = extra_env {
+            for (k, v) in extra {
+                if !k.eq_ignore_ascii_case("path") && !is_sensitive_credential_key(k) {
+                    env.insert(k.clone(), v.clone());
+                }
+            }
+        }
+
+        if let Some(ua) = env.get_mut("npm_config_user_agent") {
+            *ua = scrub_text(ua);
+        } else {
+            env.insert("npm_config_user_agent".to_string(), npm_user_agent());
+        }
+
+        // Single pass over config layers instead of walking config twice.
+        if !config.layers.is_empty() {
+            let mut winning: HashMap<&str, (&str, &String)> =
+                HashMap::with_capacity(config.layers.iter().map(|l| l.settings.len()).sum::<usize>().min(64));
+            for layer in &config.layers {
+                let source = if layer.name == "env" { "env" } else { "other" };
+                for (key, value) in &layer.settings {
+                    winning.insert(key.as_str(), (source, value));
+                }
+            }
+            for (key, (source, value)) in winning {
+                if source == "env" {
+                    continue;
+                }
+                if !(key.starts_with(['/', '@', '_'])
+                    || key.contains(":_")
+                    || key.contains("//"))
+                {
+                    let lower_k = format!("npm_config_{}", key.replace('-', "_").to_ascii_lowercase());
+                    env.entry(lower_k).or_insert_with(|| value.clone());
+                }
+                if !is_sensitive_credential_key(key) {
+                    env.insert(format!("npm_config_{}", key.replace('-', "_")), value.clone());
+                }
+            }
+        } else {
+            for (key, value) in &config.npmrc.settings {
+                if !(key.starts_with(['/', '@', '_'])
+                    || key.contains(":_")
+                    || key.contains("//"))
+                {
+                    let lower_k = format!("npm_config_{}", key.replace('-', "_").to_ascii_lowercase());
+                    env.entry(lower_k).or_insert_with(|| value.clone());
+                }
+                if !is_sensitive_credential_key(key) {
+                    env.insert(format!("npm_config_{}", key.replace('-', "_")), value.clone());
+                }
+            }
+        }
+
+        let global_prefix = config
+            .get("prefix")
+            .map(PathBuf::from)
+            .unwrap_or_else(rnpm_config::find_global_prefix);
+        env.entry("npm_config_global_prefix".into())
+            .or_insert_with(|| global_prefix.to_string_lossy().into_owned());
+        env.entry("npm_config_local_prefix".into())
+            .or_insert_with(|| project_root.to_string_lossy().into_owned());
+        if let Some(gyp) = find_node_gyp(project_root, project_root, config, None) {
+            env.entry("npm_config_node_gyp".into())
+                .or_insert_with(|| gyp.to_string_lossy().into_owned());
+        }
+        env.entry("npm_config_npm_version".into())
+            .or_insert_with(|| NPM_VERSION.into());
+
+        let node_bin = node_execpath.map(Path::to_path_buf).unwrap_or_else(|| {
+            if let Ok(cur_node) = std::env::var("NODE") {
+                PathBuf::from(cur_node)
+            } else {
+                node_executable().unwrap_or_else(|| PathBuf::from("node"))
+            }
+        });
+        let node_str = node_bin.to_string_lossy().into_owned();
+        env.insert("npm_node_execpath".to_string(), node_str.clone());
+        env.insert("NODE".to_string(), node_str);
+
+        let rnpm_exec = npm_execpath
+            .map(Path::to_path_buf)
+            .or_else(node_entrypoint)
+            .unwrap_or_else(|| std::env::current_exe().unwrap_or_else(|_| PathBuf::from("rnpm")));
+        env.insert(
+            "npm_execpath".to_string(),
+            rnpm_exec.to_string_lossy().into_owned(),
+        );
+
+        let node_opts = config
+            .get("node-options")
+            .map(str::to_string)
+            .or_else(|| env.get("npm_config_node_options").cloned())
+            .filter(|s| {
+                let trimmed = s.trim().trim_matches('"');
+                !trimmed.is_empty() && trimmed != "null" && s != "null"
+            });
+
+        if let Some(opts) = node_opts {
+            if let Some(existing) = env.get_mut("NODE_OPTIONS") {
+                let trimmed = existing.trim();
+                if trimmed.is_empty() {
+                    *existing = opts;
+                } else if trimmed != opts {
+                    *existing = format!("{trimmed} {opts}");
+                }
+            } else {
+                env.insert("NODE_OPTIONS".to_string(), opts);
+            }
+        }
+
+        if !env.contains_key("NODE_ENV") {
+            let is_omit_dev = |val: &str| {
+                val.split(',').any(|p| {
+                    matches!(
+                        p.trim().to_ascii_lowercase().as_str(),
+                        "dev" | "development" | "prod" | "production"
+                    )
+                })
+            };
+            let is_truthy = |val: &str| {
+                matches!(
+                    val.trim().to_ascii_lowercase().as_str(),
+                    "true" | "1" | "yes" | "on"
+                )
+            };
+
+            let mut omit_dev_active = env
+                .get("npm_config_omit")
+                .or_else(|| env.get("omit"))
+                .is_some_and(|v| is_omit_dev(v))
+                || env
+                    .get("npm_config_production")
+                    .or_else(|| env.get("production"))
+                    .is_some_and(|v| is_truthy(v));
+
+            if !omit_dev_active {
+                if config.get("omit").is_some_and(is_omit_dev)
+                    || config.get("production").is_some_and(is_truthy)
+                {
+                    omit_dev_active = true;
+                } else if let Some(overrides) = rnpm_config::get_process_cli_overrides() {
+                    if overrides.get("omit").is_some_and(|v| is_omit_dev(v))
+                        || overrides.get("production").is_some_and(|v| is_truthy(v))
+                    {
+                        omit_dev_active = true;
+                    }
+                }
+            }
+
+            let has_include_dev = |val: &str| {
+                val.split(',').any(|p| {
+                    matches!(
+                        p.trim().to_ascii_lowercase().as_str(),
+                        "dev" | "development" | "prod" | "production"
+                    )
+                })
+            };
+
+            let mut include_dev = env
+                .get("npm_config_include")
+                .or_else(|| env.get("include"))
+                .is_some_and(|v| has_include_dev(v));
+            if !include_dev {
+                if config.get("include").is_some_and(has_include_dev) {
+                    include_dev = true;
+                } else if let Some(overrides) = rnpm_config::get_process_cli_overrides() {
+                    if overrides.get("include").is_some_and(|v| has_include_dev(v)) {
+                        include_dev = true;
+                    }
+                }
+            }
+
+            if omit_dev_active && !include_dev {
+                env.insert("NODE_ENV".to_string(), "production".to_string());
+            }
+        }
+
+        let gyp_bin = node_gyp_bin_dir();
+        let inherited = std::env::var_os("PATH")
+            .or_else(|| std::env::var_os("Path"))
+            .unwrap_or_default();
+        let inherited_paths: Vec<PathBuf> = std::env::split_paths(&inherited).collect();
+        let inherited_tail_no_gyp =
+            std::env::join_paths(inherited_paths.iter()).unwrap_or_default();
+        let inherited_tail_with_gyp = gyp_bin.as_ref().and_then(|g| {
+            std::env::join_paths(std::iter::once(g).chain(inherited_paths.iter())).ok()
+        });
+
+        Self {
+            env,
+            gyp_bin,
+            inherited_tail_no_gyp,
+            inherited_tail_with_gyp,
+            init_cwd_fallback: project_root.to_path_buf(),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn build_package_env_with_manifest(
+        &self,
+        package_dir: &Path,
+        package_name: &str,
+        package_version: Option<&str>,
+        event: &str,
+        script_cmd: &str,
+        extra_env: Option<&HashMap<String, String>>,
+        node_gyp: Option<&Path>,
+        manifest: Option<&rnpm_core::Manifest>,
+    ) -> HashMap<String, String> {
+        let mut env = self.env.clone();
+
+        if let Some(extra) = extra_env {
+            for (k, v) in extra {
+                if !k.eq_ignore_ascii_case("path") && !is_sensitive_credential_key(k) {
+                    env.insert(k.clone(), v.clone());
+                }
+            }
+        }
+
+        if let Some(val) = extra_env.and_then(|e| e.get("INIT_CWD")) {
+            env.insert("INIT_CWD".to_string(), val.clone());
+        } else {
+            env.entry("INIT_CWD".to_string())
+                .or_insert_with(|| self.init_cwd_fallback.to_string_lossy().into_owned());
+        }
+
+        let cmd = match event {
             "preinstall" | "install" | "postinstall" => "install",
             "prepack" | "postpack" => "pack",
             "prepublish" | "publish" | "postpublish" | "prepublishOnly" => "publish",
@@ -1557,116 +1851,163 @@ pub fn build_script_env_with_config(
             "stop" | "prestop" | "poststop" => "stop",
             _ => "run",
         };
-        env.insert("npm_command".to_string(), cmd.to_string());
-        env.insert("npm_lifecycle_event".to_string(), ctx.event.clone());
-        let has_precomputed_script = env
-            .get("npm_lifecycle_script")
-            .is_some_and(|s| !s.is_empty());
-        if !has_precomputed_script {
-            env.insert("npm_lifecycle_script".to_string(), ctx.script_cmd.clone());
+        env.entry("npm_command".to_string())
+            .or_insert_with(|| cmd.to_string());
+        env.insert("npm_lifecycle_event".to_string(), event.to_string());
+        env.insert("npm_lifecycle_script".to_string(), script_cmd.to_string());
+        env.insert("npm_package_name".to_string(), package_name.to_string());
+        if let Some(ver) = package_version {
+            env.insert("npm_package_version".to_string(), ver.to_string());
         }
-        for (k, v) in &ctx.extra_env {
-            if !is_sensitive_credential_key(k) {
-                env.insert(k.clone(), v.clone());
+        let pkg_json = package_dir.join("package.json");
+        env.insert(
+            "npm_package_json".to_string(),
+            pkg_json.to_string_lossy().into_owned(),
+        );
+
+        // Reuse raw-field JSON flattening whenever raw package.json text or the
+        // file on disk is available so arrays/booleans/nulls in `engines`, `bin`,
+        // and `config` flatten identically to single-package script execution.
+        if let Some(raw_bytes) = manifest.and_then(|m| m.raw_text.as_deref().map(str::as_bytes)) {
+            flatten_pkg_script_fields_from_bytes(raw_bytes, &mut env);
+        } else if let Ok(bytes) = std::fs::read(&pkg_json) {
+            flatten_pkg_script_fields_from_bytes(&bytes, &mut env);
+        } else if let Some(m) = manifest {
+            if let Some(config_val) = m.extra.get("config") {
+                flatten_pkg_script_env("npm_package_config", config_val, &mut env);
+            }
+            for (k, v) in &m.engines {
+                env.insert(format!("npm_package_engines_{k}"), v.clone());
+            }
+            match &m.bin {
+                Some(rnpm_core::manifest::PackageBin::Single(s)) => {
+                    env.insert("npm_package_bin".to_string(), s.clone());
+                }
+                Some(rnpm_core::manifest::PackageBin::Map(map)) => {
+                    for (k, v) in map {
+                        env.insert(format!("npm_package_bin_{k}"), v.clone());
+                    }
+                }
+                None => {}
             }
         }
-        if let Some(ref gyp) = ctx.node_gyp {
+
+        // npm inserts every ancestor's .bin directory, even before it exists.
+        let mut bins: Vec<PathBuf> = Vec::with_capacity(8);
+        for dir in package_dir.ancestors() {
+            bins.push(dir.join("node_modules").join(".bin"));
+        }
+        let gyp_in_bins = self.gyp_bin.as_ref().is_some_and(|g| bins.contains(g));
+        let tail = if gyp_in_bins {
+            &self.inherited_tail_no_gyp
+        } else {
+            self.inherited_tail_with_gyp
+                .as_ref()
+                .unwrap_or(&self.inherited_tail_no_gyp)
+        };
+        if let Ok(bins_joined) = std::env::join_paths(&bins) {
+            let mut full = bins_joined.to_string_lossy().into_owned();
+            if !tail.is_empty() {
+                let sep = if cfg!(windows) { ';' } else { ':' };
+                if !full.is_empty() {
+                    full.push(sep);
+                }
+                full.push_str(&tail.to_string_lossy());
+            }
+            env.insert("PATH".into(), full);
+        }
+
+        if let Some(gyp) = node_gyp {
             env.insert(
                 "npm_config_node_gyp".to_string(),
-                gyp.to_string_lossy().to_string(),
+                gyp.to_string_lossy().into_owned(),
             );
         }
-        if let Some(script) = ctx.extra_env.get("npm_lifecycle_script") {
+        if let Some(script) = extra_env.and_then(|e| e.get("npm_lifecycle_script")) {
             env.insert("npm_lifecycle_script".into(), script.clone());
         }
+        env
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn build_package_env(
+        &self,
+        package_dir: &Path,
+        package_name: &str,
+        package_version: Option<&str>,
+        event: &str,
+        script_cmd: &str,
+        extra_env: Option<&HashMap<String, String>>,
+        node_gyp: Option<&Path>,
+    ) -> HashMap<String, String> {
+        self.build_package_env_with_manifest(
+            package_dir,
+            package_name,
+            package_version,
+            event,
+            script_cmd,
+            extra_env,
+            node_gyp,
+            None,
+        )
+    }
+}
+
+/// The process environment follows npm's current package-field contract.
+pub fn build_script_env_with_config(
+    ctx: &LifecycleContext,
+    config: &rnpm_config::Config,
+) -> HashMap<String, String> {
+    if let Some(ref precomputed) = ctx.precomputed_env {
+        let mut env = precomputed.clone();
+        apply_context_overrides_to_precomputed_env(&mut env, ctx);
         return env;
     }
 
-    let mut env = build_lifecycle_env_with_config(ctx, config);
-    env.retain(|key, _| {
-        !key.starts_with("npm_package_")
-            || matches!(
-                key.as_str(),
-                "npm_package_name" | "npm_package_version" | "npm_package_json"
-            )
-    });
-    fn package_env(prefix: &str, value: &serde_json::Value, env: &mut HashMap<String, String>) {
-        match value {
-            serde_json::Value::Object(map) => {
-                for (key, value) in map {
-                    package_env(&format!("{prefix}_{key}"), value, env);
-                }
-            }
-            serde_json::Value::Array(items) => {
-                for (index, value) in items.iter().enumerate() {
-                    package_env(&format!("{prefix}_{index}"), value, env);
-                }
-            }
-            serde_json::Value::Null | serde_json::Value::Bool(false) => {
-                env.insert(prefix.into(), String::new());
-            }
-            serde_json::Value::String(value) => {
-                env.insert(prefix.into(), value.clone());
-            }
-            value => {
-                env.insert(prefix.into(), value.to_string());
-            }
-        }
+    let base = ScriptBaseEnv::build(
+        &ctx.project_root,
+        config,
+        ctx.node_execpath.as_deref(),
+        ctx.npm_execpath.as_deref(),
+        Some(&ctx.extra_env),
+    );
+    base.build_package_env(
+        &ctx.package_dir,
+        &ctx.package_name,
+        ctx.package_version.as_deref(),
+        &ctx.event,
+        &ctx.script_cmd,
+        None,
+        ctx.node_gyp.as_deref(),
+    )
+}
+
+fn apply_context_overrides_to_precomputed_env(
+    env: &mut HashMap<String, String>,
+    ctx: &LifecycleContext,
+) {
+    let cmd = match ctx.event.as_str() {
+        "preinstall" | "install" | "postinstall" => "install",
+        "prepack" | "postpack" => "pack",
+        "prepublish" | "publish" | "postpublish" | "prepublishOnly" => "publish",
+        "test" | "pretest" | "posttest" => "test",
+        "start" | "prestart" | "poststart" => "start",
+        "restart" | "prerestart" | "postrestart" => "restart",
+        "stop" | "prestop" | "poststop" => "stop",
+        _ => "run",
+    };
+    env.insert("npm_command".to_string(), cmd.to_string());
+    env.insert("npm_lifecycle_event".to_string(), ctx.event.clone());
+    let has_precomputed_script = env
+        .get("npm_lifecycle_script")
+        .is_some_and(|s| !s.is_empty());
+    if !has_precomputed_script {
+        env.insert("npm_lifecycle_script".to_string(), ctx.script_cmd.clone());
     }
-    if let Ok(bytes) = std::fs::read(ctx.package_dir.join("package.json")) {
-        if let Ok(package) = serde_json::from_slice::<serde_json::Value>(&bytes) {
-            for key in ["config", "engines", "bin"] {
-                if let Some(value) = package.get(key) {
-                    package_env(&format!("npm_package_{key}"), value, &mut env);
-                }
-            }
+    for (k, v) in &ctx.extra_env {
+        if !k.eq_ignore_ascii_case("path") && !is_sensitive_credential_key(k) {
+            env.insert(k.clone(), v.clone());
         }
-    }
-    if !config.layers.is_empty() {
-        let mut winning: std::collections::BTreeMap<String, (&str, &String)> =
-            std::collections::BTreeMap::new();
-        for layer in &config.layers {
-            let source = if layer.name == "env" { "env" } else { "other" };
-            for (key, value) in &layer.settings {
-                winning.insert(key.clone(), (source, value));
-            }
-        }
-        for (key, (source, value)) in winning {
-            if source != "env" && !is_sensitive_credential_key(&key) {
-                env.insert(format!("npm_config_{}", key.replace('-', "_")), value.clone());
-            }
-        }
-    } else {
-        for (key, value) in &config.npmrc.settings {
-            if !is_sensitive_credential_key(key) {
-                env.insert(format!("npm_config_{}", key.replace('-', "_")), value.clone());
-            }
-        }
-    }
-    // CLI callers explicitly preserve their invocation directory. Library
-    // callers retain the project_root contract of LifecycleContext.
-    if let Some(cwd) = ctx.extra_env.get("INIT_CWD") {
-        env.insert("INIT_CWD".into(), cwd.clone());
-    }
-    // npm inserts every ancestor's .bin directory, even before it exists.
-    let mut bins: Vec<PathBuf> = ctx
-        .package_dir
-        .ancestors()
-        .map(|dir| dir.join("node_modules").join(".bin"))
-        .collect();
-    if let Some(gyp_bin) = node_gyp_bin_dir() {
-        if !bins.contains(&gyp_bin) {
-            bins.push(gyp_bin);
-        }
-    }
-    let inherited = std::env::var_os("PATH")
-        .or_else(|| std::env::var_os("Path"))
-        .unwrap_or_default();
-    bins.extend(std::env::split_paths(&inherited));
-    if let Ok(path) = std::env::join_paths(bins) {
-        env.remove("Path");
-        env.remove("path");
-        env.insert("PATH".into(), path.to_string_lossy().into_owned());
     }
     if let Some(ref gyp) = ctx.node_gyp {
         env.insert(
@@ -1677,7 +2018,6 @@ pub fn build_script_env_with_config(
     if let Some(script) = ctx.extra_env.get("npm_lifecycle_script") {
         env.insert("npm_lifecycle_script".into(), script.clone());
     }
-    env
 }
 
 /// Precompute the shared environment for a package's lifecycle scripts (PATH,
@@ -1691,28 +2031,16 @@ pub fn precompute_lifecycle_env(
     config: &rnpm_config::Config,
     base_extra_env: Option<&HashMap<String, String>>,
 ) -> HashMap<String, String> {
-    let dummy_ctx = LifecycleContext {
-        project_root: project_root.to_path_buf(),
-        package_dir: package_dir.to_path_buf(),
-        package_name: package_name.to_string(),
-        package_version: package_version.map(|v| v.to_string()),
-        event: "run".to_string(),
-        script_cmd: String::new(),
-        node_execpath: None,
-        npm_execpath: None,
-        extra_env: base_extra_env.cloned().unwrap_or_default(),
-        timeout: None,
-        capture_output: false,
-        foreground_scripts: false,
-        captured_output: std::sync::Arc::new(std::sync::Mutex::new(None)),
-        sandbox_policy: ScriptSandboxPolicy::default(),
-        script_shell: None,
-        node_gyp: None,
-        offline: false,
-        config: Some(config.clone()),
-        precomputed_env: None,
-    };
-    build_script_env_with_config(&dummy_ctx, config)
+    let base = ScriptBaseEnv::build(project_root, config, None, None, None);
+    base.build_package_env(
+        package_dir,
+        package_name,
+        package_version,
+        "run",
+        "",
+        base_extra_env,
+        None,
+    )
 }
 
 /// Spawns and executes a lifecycle script synchronously within the specified context,
@@ -2957,72 +3285,155 @@ async fn execute_dependency_hooks_with_abort(
         }
     }
 
-    // Topological sorting: leaf nodes first (bottom-up)
-    let mut name_to_node: HashMap<String, &LifecyclePackageNode> = HashMap::new();
-    for node in nodes {
+    if nodes.is_empty() {
+        return Ok(());
+    }
+
+    // Build dependency index matching node name / package_path lookup.
+    let mut name_to_idx: HashMap<String, usize> = HashMap::with_capacity(nodes.len() * 2);
+    for (idx, node) in nodes.iter().enumerate() {
         let name = node
             .manifest
             .name
             .clone()
             .unwrap_or_else(|| node.package_path.clone());
-        name_to_node.insert(name, node);
+        name_to_idx.insert(name, idx);
         if let Some(stripped) = node.package_path.strip_prefix("node_modules/") {
-            name_to_node.insert(stripped.to_string(), node);
+            name_to_idx.insert(stripped.to_string(), idx);
         }
     }
 
-    let mut ordered: Vec<&LifecyclePackageNode> = Vec::new();
-    let mut visited: HashSet<String> = HashSet::new();
-    let mut in_stack: HashSet<String> = HashSet::new();
+    // Construct an acyclic dependency DAG using DFS cycle back-edge breaking.
+    let n = nodes.len();
+    let mut dependents: Vec<Vec<usize>> = vec![Vec::new(); n];
+    let mut indegree: Vec<usize> = vec![0; n];
+    let mut visited = vec![false; n];
+    let mut in_stack = vec![false; n];
 
-    fn visit<'a>(
-        node: &'a LifecyclePackageNode,
-        name_to_node: &HashMap<String, &'a LifecyclePackageNode>,
-        visited: &mut HashSet<String>,
-        in_stack: &mut HashSet<String>,
-        ordered: &mut Vec<&'a LifecyclePackageNode>,
+    fn dfs_dag(
+        u: usize,
+        nodes: &[LifecyclePackageNode],
+        name_to_idx: &HashMap<String, usize>,
+        visited: &mut [bool],
+        in_stack: &mut [bool],
+        dependents: &mut [Vec<usize>],
+        indegree: &mut [usize],
     ) {
-        let name = node.manifest.name.as_deref().unwrap_or(&node.package_path);
-        if in_stack.contains(name) {
-            // Cycle detected: safely skip back-edge to prevent infinite recursion
+        if visited[u] || in_stack[u] {
             return;
         }
-        if visited.contains(name) {
-            return;
-        }
-
-        in_stack.insert(name.to_string());
-        for dep in &node.dependencies {
-            if let Some(dep_node) = name_to_node.get(dep) {
-                visit(dep_node, name_to_node, visited, in_stack, ordered);
+        in_stack[u] = true;
+        let mut added_deps: Vec<usize> = Vec::with_capacity(nodes[u].dependencies.len());
+        for dep in &nodes[u].dependencies {
+            if let Some(&v) = name_to_idx.get(dep) {
+                if v != u && !in_stack[v] {
+                    if !added_deps.contains(&v) {
+                        added_deps.push(v);
+                        dependents[v].push(u);
+                        indegree[u] += 1;
+                    }
+                    dfs_dag(v, nodes, name_to_idx, visited, in_stack, dependents, indegree);
+                }
             }
         }
-        in_stack.remove(name);
-        visited.insert(name.to_string());
-        ordered.push(node);
+        in_stack[u] = false;
+        visited[u] = true;
     }
 
-    for node in nodes {
-        visit(
-            node,
-            &name_to_node,
-            &mut visited,
-            &mut in_stack,
-            &mut ordered,
-        );
+    for i in 0..n {
+        if !visited[i] {
+            dfs_dag(
+                i,
+                nodes,
+                &name_to_idx,
+                &mut visited,
+                &mut in_stack,
+                &mut dependents,
+                &mut indegree,
+            );
+        }
     }
 
-    let root_config = get_trusted_config().unwrap_or_else(|| {
+    let has_matching_hooks: Vec<bool> = nodes
+        .iter()
+        .map(|node| {
+            let hooks = node.source.lifecycle_hooks();
+            hooks
+                .iter()
+                .any(|h| node.manifest.scripts.contains_key(*h))
+        })
+        .collect();
+
+    if !has_matching_hooks.iter().any(|&has| has) {
+        return Ok(());
+    }
+
+    let root_config = Arc::new(get_trusted_config().unwrap_or_else(|| {
         rnpm_config::Config::load(Some(&opts.root_dir)).unwrap_or_default()
-    });
+    }));
+    let base_env = Arc::new(ScriptBaseEnv::build(
+        &opts.root_dir,
+        &root_config,
+        None,
+        None,
+        None,
+    ));
 
-    // Execute dependency hooks in bottom-up order:
-    // Hooks: preinstall -> install -> postinstall -> prepare (for local / git / tarball dependencies)
-    // Note: Registry dependencies NEVER run `prepare` per docs/lifecycle-contract.md!
-    for node in ordered {
-        let hooks = node.source.lifecycle_hooks();
-        let has_matching_hooks = hooks.iter().any(|h| node.manifest.scripts.contains_key(*h));
-        let precomputed = if has_matching_hooks {
+    let mut ready_hooks = std::collections::VecDeque::new();
+    let mut zero_queue = std::collections::VecDeque::new();
+    for (i, &deg) in indegree.iter().enumerate() {
+        if deg == 0 {
+            zero_queue.push_back(i);
+        }
+    }
+    let drain_ready = |zero_q: &mut std::collections::VecDeque<usize>,
+                       ready_h: &mut std::collections::VecDeque<usize>,
+                       indeg: &mut [usize]| {
+        while let Some(u) = zero_q.pop_front() {
+            if has_matching_hooks[u] {
+                ready_h.push_back(u);
+            } else {
+                for &child in &dependents[u] {
+                    indeg[child] -= 1;
+                    if indeg[child] == 0 {
+                        zero_q.push_back(child);
+                    }
+                }
+            }
+        }
+    };
+    drain_ready(&mut zero_queue, &mut ready_hooks, &mut indegree);
+
+    let max_workers = std::thread::available_parallelism()
+        .map(|p| p.get())
+        .unwrap_or(4)
+        .clamp(4, 16);
+
+    let (fail_abort_tx, fail_abort_rx) = tokio::sync::watch::channel(false);
+    let mut join_set: tokio::task::JoinSet<Result<usize>> = tokio::task::JoinSet::new();
+    let opts_arc = Arc::new(opts.clone());
+
+    let spawn_node = |idx: usize,
+                      join_set: &mut tokio::task::JoinSet<Result<usize>>,
+                      base_env: &Arc<ScriptBaseEnv>,
+                      root_config: &Arc<rnpm_config::Config>,
+                      opts_arc: &Arc<LifecycleOptions>,
+                      abort_rx: &Option<tokio::sync::watch::Receiver<bool>>,
+                      fail_abort_rx: &tokio::sync::watch::Receiver<bool>| {
+        let node = nodes[idx].clone();
+        let base_env = Arc::clone(base_env);
+        let root_config = Arc::clone(root_config);
+        let opts = Arc::clone(opts_arc);
+        let caller_rx = abort_rx.clone();
+        let local_fail_rx = fail_abort_rx.clone();
+
+        join_set.spawn(async move {
+            let hooks = node.source.lifecycle_hooks();
+            let matching_hooks: Vec<(&str, &str)> = hooks
+                .iter()
+                .filter_map(|&h| node.manifest.scripts.get(h).map(|cmd| (h, cmd.as_str())))
+                .collect();
+
             let mut base_extra = HashMap::new();
             if !opts.init_cwd.as_os_str().is_empty() {
                 base_extra.insert(
@@ -3030,37 +3441,41 @@ async fn execute_dependency_hooks_with_abort(
                     opts.init_cwd.to_string_lossy().to_string(),
                 );
             }
-            Some(precompute_lifecycle_env(
+            let pkg_name = node.manifest.name.as_deref().unwrap_or("unknown");
+            let mut precomputed = base_env.build_package_env_with_manifest(
                 &node.disk_path,
-                &opts.root_dir,
-                node.manifest.name.as_deref().unwrap_or("unknown"),
+                pkg_name,
                 node.manifest.version.as_deref(),
-                &root_config,
+                "run",
+                "",
                 Some(&base_extra),
-            ))
-        } else {
-            None
-        };
+                None,
+                Some(&node.manifest),
+            );
 
-        for &hook in hooks {
-            if let Some(script_cmd) = node.manifest.scripts.get(hook) {
-                if let Some(ref rx) = abort_rx {
-                    if *rx.borrow() {
-                        return Err(anyhow::anyhow!(
-                            "Topological lifecycle execution aborted by signal"
-                        ));
-                    }
+            let last_i = matching_hooks.len().saturating_sub(1);
+            for (i, (hook, script_cmd)) in matching_hooks.into_iter().enumerate() {
+                if *local_fail_rx.borrow()
+                    || caller_rx.as_ref().is_some_and(|rx| *rx.borrow())
+                {
+                    return Err(anyhow::anyhow!(
+                        "Topological lifecycle execution aborted by signal"
+                    ));
                 }
 
                 let mut ctx = LifecycleContext::new_with_config(
                     &opts.root_dir,
                     &node.disk_path,
-                    node.manifest.name.as_deref().unwrap_or("unknown"),
+                    pkg_name,
                     hook,
                     script_cmd,
-                    root_config.clone(),
+                    (*root_config).clone(),
                 );
-                ctx.precomputed_env = precomputed.clone();
+                let mut hook_env = if i == last_i {
+                    std::mem::take(&mut precomputed)
+                } else {
+                    precomputed.clone()
+                };
                 if !opts.init_cwd.as_os_str().is_empty() {
                     ctx.extra_env.insert(
                         "INIT_CWD".to_string(),
@@ -3075,15 +3490,23 @@ async fn execute_dependency_hooks_with_abort(
                 ctx.capture_output = opts.capture_output && !opts.foreground_scripts;
                 ctx.node_gyp = opts.node_gyp.clone();
                 ctx.offline = opts.offline;
+                apply_context_overrides_to_precomputed_env(&mut hook_env, &ctx);
+                ctx.precomputed_env = Some(hook_env);
 
-                let abort_fut = {
-                    let mut rx_opt = abort_rx.clone();
-                    async move {
-                        if let Some(ref mut rx) = rx_opt {
-                            let _ = rx.wait_for(|&val| val).await;
-                        } else {
-                            std::future::pending::<()>().await;
-                        }
+                let mut rx_caller_wait = caller_rx.clone();
+                let mut rx_fail_wait = local_fail_rx.clone();
+                let abort_fut = async move {
+                    tokio::select! {
+                        _ = async {
+                            if let Some(ref mut rx) = rx_caller_wait {
+                                let _ = rx.wait_for(|&val| val).await;
+                            } else {
+                                std::future::pending::<()>().await;
+                            }
+                        } => {}
+                        _ = async {
+                            let _ = rx_fail_wait.wait_for(|&val| val).await;
+                        } => {}
                     }
                 };
 
@@ -3091,7 +3514,6 @@ async fn execute_dependency_hooks_with_abort(
                     Ok(status) if status.success() => {}
                     Ok(status) => {
                         if node.optional {
-                            let pkg_name = node.manifest.name.as_deref().unwrap_or("unknown");
                             let pkg_ver = node.manifest.version.as_deref().unwrap_or("unknown");
                             warn!(
                                 "npm warn optional SKIPPING OPTIONAL DEPENDENCY: {}@{} ({}):",
@@ -3101,24 +3523,21 @@ async fn execute_dependency_hooks_with_abort(
                             );
                             warn!(
                                 "npm warn optional {} failed at the {} script with exit code: {:?}.",
-                                pkg_name, hook, status.code()
+                                pkg_name,
+                                hook,
+                                status.code()
                             );
                             if node.disk_path.exists() {
                                 let _ = std::fs::remove_dir_all(&node.disk_path);
                             }
-                            // Break hook loop for this optional dependency; isolate failure
                             break;
                         } else {
-                            // npm: exit with the script's code and replay its output.
                             let mut failure = ScriptExitError::lifecycle_failure(&ctx, &status);
                             if let Some(out) =
                                 ctx.captured_output.lock().ok().and_then(|o| o.clone())
                             {
                                 for line in out.stdout.lines().chain(out.stderr.lines()) {
-                                    failure.message.push_str(
-                                        "
-npm error ",
-                                    );
+                                    failure.message.push_str("\nnpm error ");
                                     failure.message.push_str(line);
                                 }
                             }
@@ -3127,7 +3546,6 @@ npm error ",
                     }
                     Err(e) => {
                         if node.optional {
-                            let pkg_name = node.manifest.name.as_deref().unwrap_or("unknown");
                             let pkg_ver = node.manifest.version.as_deref().unwrap_or("unknown");
                             warn!(
                                 "npm warn optional SKIPPING OPTIONAL DEPENDENCY: {}@{} ({}):",
@@ -3142,7 +3560,6 @@ npm error ",
                             if node.disk_path.exists() {
                                 let _ = std::fs::remove_dir_all(&node.disk_path);
                             }
-                            // Break hook loop for this optional dependency; isolate failure
                             break;
                         } else {
                             return Err(e);
@@ -3150,7 +3567,72 @@ npm error ",
                     }
                 }
             }
+            Ok(idx)
+        });
+    };
+
+    while join_set.len() < max_workers {
+        if let Some(idx) = ready_hooks.pop_front() {
+            spawn_node(
+                idx,
+                &mut join_set,
+                &base_env,
+                &root_config,
+                &opts_arc,
+                &abort_rx,
+                &fail_abort_rx,
+            );
+        } else {
+            break;
         }
+    }
+
+    let mut first_err: Option<anyhow::Error> = None;
+    while let Some(res) = join_set.join_next().await {
+        match res {
+            Ok(Ok(done_idx)) => {
+                if first_err.is_none() {
+                    for &child in &dependents[done_idx] {
+                        indegree[child] -= 1;
+                        if indegree[child] == 0 {
+                            zero_queue.push_back(child);
+                        }
+                    }
+                    drain_ready(&mut zero_queue, &mut ready_hooks, &mut indegree);
+                    while join_set.len() < max_workers {
+                        if let Some(idx) = ready_hooks.pop_front() {
+                            spawn_node(
+                                idx,
+                                &mut join_set,
+                                &base_env,
+                                &root_config,
+                                &opts_arc,
+                                &abort_rx,
+                                &fail_abort_rx,
+                            );
+                        } else {
+                            break;
+                        }
+                    }
+                }
+            }
+            Ok(Err(e)) => {
+                if first_err.is_none() {
+                    first_err = Some(e);
+                    let _ = fail_abort_tx.send(true);
+                }
+            }
+            Err(join_err) => {
+                if first_err.is_none() {
+                    first_err = Some(anyhow::anyhow!("Lifecycle worker panicked: {join_err}"));
+                    let _ = fail_abort_tx.send(true);
+                }
+            }
+        }
+    }
+
+    if let Some(err) = first_err {
+        return Err(err);
     }
 
     Ok(())
@@ -3499,6 +3981,11 @@ pub async fn execute_workspace_scripts_topological_with_abort(
     let ordered_members = sort_workspace_members_topologically(members, topological_order);
     let mut summary = WorkspaceRunSummary::default();
 
+    let root_config = get_trusted_config().unwrap_or_else(|| {
+        rnpm_config::Config::load(Some(root_dir)).unwrap_or_default()
+    });
+    let root_base_env = ScriptBaseEnv::build(root_dir, &root_config, None, None, None);
+
     let pre_hook_name = format!("pre{}", opts.script);
     let post_hook_name = format!("post{}", opts.script);
 
@@ -3550,7 +4037,33 @@ pub async fn execute_workspace_scripts_topological_with_abort(
             hooks_to_run.push((post_hook_name.as_str(), cmd, false));
         }
 
-        for (hook_name, cmd, pass_args) in hooks_to_run {
+        let member_config;
+        let member_base_storage;
+        let (cfg_ref, base_ref) = if member.path.join(".npmrc").exists() {
+            member_config = rnpm_config::Config::load(Some(&member.path))
+                .unwrap_or_else(|_| root_config.clone());
+            member_base_storage = ScriptBaseEnv::build(root_dir, &member_config, None, None, None);
+            (&member_config, &member_base_storage)
+        } else {
+            (&root_config, &root_base_env)
+        };
+        let mut precomputed = if hooks_to_run.len() > 1 {
+            Some(base_ref.build_package_env_with_manifest(
+                &member.path,
+                &member.name,
+                member.manifest.version.as_deref(),
+                "run",
+                "",
+                None,
+                None,
+                Some(&member.manifest),
+            ))
+        } else {
+            None
+        };
+
+        let last_hook_idx = hooks_to_run.len().saturating_sub(1);
+        for (hook_i, (hook_name, cmd, pass_args)) in hooks_to_run.into_iter().enumerate() {
             if let Some(ref rx) = abort_rx {
                 if *rx.borrow() {
                     return Err(anyhow::anyhow!("Workspace execution aborted by signal"));
@@ -3572,9 +4085,29 @@ pub async fn execute_workspace_scripts_topological_with_abort(
             );
             println!("> {full_cmd}\n");
 
-            let mut ctx =
-                LifecycleContext::new(root_dir, &member.path, &member.name, hook_name, &full_cmd);
+            let mut ctx = LifecycleContext::new_with_config(
+                root_dir,
+                &member.path,
+                &member.name,
+                hook_name,
+                &full_cmd,
+                cfg_ref.clone(),
+            );
             ctx.package_version = member.manifest.version.clone();
+            ctx.precomputed_env = match precomputed.as_mut() {
+                Some(p) if hook_i == last_hook_idx => Some(std::mem::take(p)),
+                Some(p) => Some(p.clone()),
+                None => Some(base_ref.build_package_env_with_manifest(
+                    &member.path,
+                    &member.name,
+                    member.manifest.version.as_deref(),
+                    hook_name,
+                    &full_cmd,
+                    None,
+                    None,
+                    Some(&member.manifest),
+                )),
+            };
             ctx.foreground_scripts = opts.foreground_scripts;
             if opts.foreground_scripts {
                 ctx.capture_output = false;

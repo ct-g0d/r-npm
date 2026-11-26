@@ -4644,12 +4644,12 @@ async fn test_enrich_lockfile_never_makes_network_requests() {
     };
     let mut installer = Installer::new(options).unwrap();
 
-    let before_requests = installer.registry_client.http_requests();
+    let before_requests = installer.registry_client().http_requests();
     installer
         .enrich_lockfile_from_registry(&mut lockfile)
         .await
         .unwrap();
-    let after_requests = installer.registry_client.http_requests();
+    let after_requests = installer.registry_client().http_requests();
 
     assert_eq!(
         before_requests, after_requests,
@@ -6232,5 +6232,32 @@ fn test_fast_path_validate_hidden_lockfile_ignores_non_directory_files() {
     assert!(
         crate::fast_path::validate_hidden_lockfile(root, Some(&opts)),
         "hidden lockfile must ignore non-directory files like README.txt and @scope/.DS_Store"
+    );
+}
+
+#[test]
+fn test_read_cached_project_fingerprint_matches_cache_and_stays_lazy() {
+    let tmp = tempdir().unwrap();
+    let proj = tmp.path().join("proj");
+    let cache_dir = tmp.path().join("cache");
+    fs::create_dir_all(&proj).unwrap();
+
+    let installer = Installer::new(InstallOptions {
+        project_dir: proj.clone(),
+        cache_dir: Some(cache_dir.clone()),
+        ..Default::default()
+    })
+    .unwrap();
+    assert!(installer.read_cached_project_fingerprint().is_none());
+    assert!(
+        !cache_dir.exists(),
+        "reading missing fingerprint must not initialize Cache directories"
+    );
+
+    let cache = rnpm_cache::Cache::new(&cache_dir).unwrap();
+    cache.set_project_fingerprint(&proj, "abc123").unwrap();
+    assert_eq!(
+        installer.read_cached_project_fingerprint().as_deref(),
+        Some("abc123")
     );
 }
