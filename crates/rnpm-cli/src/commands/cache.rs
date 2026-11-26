@@ -2,26 +2,27 @@ use crate::CacheAction;
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 
-pub(crate) async fn run(
-    action: CacheAction,
-    cache_arg: Option<PathBuf>,
-    current_dir: PathBuf,
-) -> Result<()> {
-    let config = rnpm_config::Config::load(Some(&current_dir)).unwrap_or_default();
-    let cache_path = cache_arg
-        .clone()
-        .or_else(|| match &action {
+fn resolve_cache_path(
+    action: &CacheAction,
+    cache_arg: Option<&Path>,
+    config: &rnpm_config::Config,
+) -> PathBuf {
+    cache_arg
+        .map(Path::to_path_buf)
+        .or_else(|| match action {
             CacheAction::Clean { cache: c, .. } => c.clone(),
             CacheAction::Verify { cache: c } => c.clone(),
             CacheAction::Add { cache: c, .. } => c.clone(),
             CacheAction::Ls { cache: c, .. } => c.clone(),
-            CacheAction::Npx { cache: c, action: npx_action, .. } => {
-                c.clone().or_else(|| match npx_action {
-                    crate::CacheNpxAction::Rm { cache: c, .. } => c.clone(),
-                    crate::CacheNpxAction::Info { cache: c, .. } => c.clone(),
-                    crate::CacheNpxAction::Ls { cache: c, .. } => c.clone(),
-                })
-            }
+            CacheAction::Npx {
+                cache: c,
+                action: npx_action,
+                ..
+            } => c.clone().or_else(|| match npx_action {
+                crate::CacheNpxAction::Rm { cache: c, .. } => c.clone(),
+                crate::CacheNpxAction::Info { cache: c, .. } => c.clone(),
+                crate::CacheNpxAction::Ls { cache: c, .. } => c.clone(),
+            }),
         })
         .unwrap_or_else(|| {
             if let Some(user_cache) = config.npmrc.settings.get("cache") {
@@ -31,10 +32,22 @@ pub(crate) async fn run(
             } else {
                 std::env::temp_dir().join(".rnpm-cache")
             }
-        });
+        })
+}
 
-    let cache = rnpm_cache::Cache::new(&cache_path)
-        .with_context(|| format!("Failed to initialize cache at {}", cache_path.display()))?;
+pub(crate) fn run_sync_with_config(
+    action: &CacheAction,
+    cache_arg: Option<&Path>,
+    current_dir: &Path,
+    config: &rnpm_config::Config,
+) -> Option<Result<()>> {
+    let cache_path = resolve_cache_path(action, cache_arg, config);
+    let cache = match rnpm_cache::Cache::new(&cache_path)
+        .with_context(|| format!("Failed to initialize cache at {}", cache_path.display()))
+    {
+        Ok(c) => c,
+        Err(e) => return Some(Err(e)),
+    };
 
     match action {
         CacheAction::Clean { force, .. } => {
@@ -49,18 +62,26 @@ pub(crate) async fn run(
                 eprintln!("npm error If you're sure you want to delete the entire cache, rerun this command with --force.");
                 std::process::exit(1);
             }
-            cache.clean()?;
+            if let Err(e) = cache.clean() {
+                return Some(Err(e.into()));
+            }
             let stores = std::collections::BTreeSet::from([
                 rnpm_cache::PackStore::default_location(Some(&cache_path)),
                 rnpm_cache::PackStore::default_location(None),
             ]);
             for store in stores {
-                rnpm_cache::PackStore::clean_at(&store)?;
+                if let Err(e) = rnpm_cache::PackStore::clean_at(&store) {
+                    return Some(Err(e.into()));
+                }
             }
+            Some(Ok(()))
         }
         CacheAction::Verify { .. } => {
             let start = std::time::Instant::now();
-            let report = cache.verify()?;
+            let report = match cache.verify() {
+                Ok(r) => r,
+                Err(e) => return Some(Err(e.into())),
+            };
             let elapsed = start.elapsed().as_secs_f64();
             println!("Cache verified and compacted ({}):", cache_path.display());
             println!(
@@ -82,6 +103,7 @@ pub(crate) async fn run(
                 );
             }
             println!("Finished in {:.3}s", elapsed);
+            Some(Ok(()))
         }
         CacheAction::Ls { path: filter, .. } => {
             if cache_path.exists() {
@@ -100,25 +122,32 @@ pub(crate) async fn run(
                     }
                 }
             }
+            Some(Ok(()))
         }
         CacheAction::Add { package, .. } => {
-            let target_file = current_dir.join(package.strip_prefix("file:").unwrap_or(&package));
+            let target_file = current_dir.join(package.strip_prefix("file:").unwrap_or(package));
             if target_file.exists() && target_file.is_file() {
-                let data = std::fs::read(&target_file)?;
+                let data = match std::fs::read(&target_file) {
+                    Ok(d) => d,
+                    Err(e) => return Some(Err(e.into())),
+                };
                 let key = format!(
                     "pacote:tarball:file:{}",
                     target_file.to_string_lossy().replace('\\', "/")
                 );
-                cache.put(&key, &data, None)?;
+                Some(cache.put(&key, &data, None).map(|_| ()).map_err(Into::into))
             } else if target_file.is_dir() {
-                let (_, data) = rnpm_fs::pack_directory(&target_file, None)?;
+                let (_, data) = match rnpm_fs::pack_directory(&target_file, None) {
+                    Ok(packed) => packed,
+                    Err(e) => return Some(Err(e.into())),
+                };
                 let key = format!(
                     "pacote:tarball:file:{}",
                     target_file.to_string_lossy().replace('\\', "/")
                 );
-                cache.put(&key, &data, None)?;
+                Some(cache.put(&key, &data, None).map(|_| ()).map_err(Into::into))
             } else {
-                cache_registry_package(&cache, &current_dir, &package).await?;
+                None
             }
         }
         CacheAction::Npx {
@@ -127,22 +156,37 @@ pub(crate) async fn run(
             force,
             dry_run,
         } => {
-            let npx_cache_override = c.or(cache_arg);
-            let final_cache = npx_cache_override.unwrap_or(cache_path);
-            run_npx(npx_action, &final_cache, force, dry_run).await?;
+            let final_cache = c.as_deref().or(cache_arg).unwrap_or(&cache_path);
+            Some(run_npx_sync(npx_action, final_cache, *force, *dry_run))
         }
     }
+}
 
+pub(crate) async fn run(
+    action: CacheAction,
+    cache_arg: Option<PathBuf>,
+    current_dir: PathBuf,
+) -> Result<()> {
+    let config = rnpm_config::Config::load(Some(&current_dir)).unwrap_or_default();
+    if let Some(res) = run_sync_with_config(&action, cache_arg.as_deref(), &current_dir, &config) {
+        return res;
+    }
+    let cache_path = resolve_cache_path(&action, cache_arg.as_deref(), &config);
+    let cache = rnpm_cache::Cache::new(&cache_path)
+        .with_context(|| format!("Failed to initialize cache at {}", cache_path.display()))?;
+    if let CacheAction::Add { package, .. } = action {
+        cache_registry_package(&cache, &current_dir, &package).await?;
+    }
     Ok(())
 }
 
-async fn run_npx(
-    action: crate::CacheNpxAction,
+fn run_npx_sync(
+    action: &crate::CacheNpxAction,
     cache_path: &Path,
     parent_force: bool,
     parent_dry_run: bool,
 ) -> Result<()> {
-    let npx_cache = match &action {
+    let npx_cache = match action {
         crate::CacheNpxAction::Ls { cache: Some(c) }
         | crate::CacheNpxAction::Rm { cache: Some(c), .. }
         | crate::CacheNpxAction::Info { cache: Some(c), .. } => c.join("_npx"),
@@ -193,8 +237,8 @@ async fn run_npx(
             dry_run,
             ..
         } => {
-            let effective_force = force || parent_force;
-            let effective_dry_run = dry_run || parent_dry_run;
+            let effective_force = *force || parent_force;
+            let effective_dry_run = *dry_run || parent_dry_run;
             if keys.is_empty() {
                 if !effective_force {
                     anyhow::bail!("npm error code EUSAGE\nnpm error Please use --force to remove entire npx cache");
@@ -215,7 +259,7 @@ async fn run_npx(
                     }
                 }
             }
-            for key in &keys {
+            for key in keys {
                 let resolved = resolve_abbrev(&existing_keys, key)
                     .ok_or_else(|| anyhow::anyhow!("npm error code EUSAGE\nnpm error Invalid npx key {key}"))?;
                 let target = npx_cache.join(resolved);
@@ -240,7 +284,7 @@ async fn run_npx(
                     }
                 }
             }
-            for key in &keys {
+            for key in keys {
                 let resolved = resolve_abbrev(&existing_keys, key)
                     .ok_or_else(|| anyhow::anyhow!("npm error code EUSAGE\nnpm error Invalid npx key {key}"))?;
                 let hash = resolved;

@@ -22,8 +22,24 @@ pub(crate) struct UpdateOptions {
     pub workspaces: bool,
 }
 
+#[allow(dead_code)]
 pub(crate) async fn run(opts: UpdateOptions, current_dir: PathBuf) -> Result<()> {
-    let config = rnpm_config::Config::load(Some(&current_dir)).unwrap_or_default();
+    run_with_config(opts, current_dir, None).await
+}
+
+pub(crate) async fn run_with_config(
+    opts: UpdateOptions,
+    current_dir: PathBuf,
+    preloaded_config: Option<&rnpm_config::Config>,
+) -> Result<()> {
+    let owned_config;
+    let config = match preloaded_config {
+        Some(cfg) => cfg,
+        None => {
+            owned_config = rnpm_config::Config::load(Some(&current_dir)).unwrap_or_default();
+            &owned_config
+        }
+    };
     let effective_ignore =
         opts.ignore_scripts || config.get_bool("ignore-scripts").unwrap_or(false);
     let effective_foreground =
@@ -55,7 +71,7 @@ pub(crate) async fn run(opts: UpdateOptions, current_dir: PathBuf) -> Result<()>
 
     let options = InstallOptions {
         project_dir: current_dir.clone(),
-        registry_url: opts.registry,
+        registry_url: opts.registry.clone(),
         cache_dir: opts.cache,
         offline: opts.offline,
         ignore_scripts: effective_ignore,
@@ -70,6 +86,11 @@ pub(crate) async fn run(opts: UpdateOptions, current_dir: PathBuf) -> Result<()>
         workspace_root: opts.workspace_root,
         workspace: opts.workspace,
         workspaces: opts.workspaces,
+        config_override: if opts.registry.is_none() {
+            Some(config.clone())
+        } else {
+            None
+        },
         ..Default::default()
     };
 
@@ -78,13 +99,14 @@ pub(crate) async fn run(opts: UpdateOptions, current_dir: PathBuf) -> Result<()>
     if dry_run {
         let summary = installer.run().await?;
         let report = summary.reify.unwrap_or_default();
-        return crate::reify_output::finish(
+        return crate::reify_output::finish_with_config(
             &current_dir,
             &report,
             opts.json,
             true,
             opts.silent,
             start_time.elapsed(),
+            Some(config),
         )
         .await;
     }
@@ -92,13 +114,14 @@ pub(crate) async fn run(opts: UpdateOptions, current_dir: PathBuf) -> Result<()>
     installer.update(&opts.packages).await?;
     let report =
         crate::reify_output::report_between(&before, &crate::reify_output::snapshot(&current_dir));
-    crate::reify_output::finish(
+    crate::reify_output::finish_with_config(
         &current_dir,
         &report,
         opts.json,
         false,
         opts.silent,
         start_time.elapsed(),
+        Some(config),
     )
     .await
 }

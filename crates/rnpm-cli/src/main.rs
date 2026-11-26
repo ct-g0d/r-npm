@@ -16,6 +16,7 @@ pub mod init;
 pub mod inspect_tree;
 pub mod json_errors;
 pub mod list;
+mod node_info;
 pub(crate) mod npx;
 pub mod outdated;
 pub mod query;
@@ -2413,6 +2414,8 @@ fn is_lifecycle_script(name: &str) -> bool {
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
+#[allow(dead_code)]
 pub(crate) async fn execute_run(
     current_dir: PathBuf,
     script: Option<String>,
@@ -2427,19 +2430,58 @@ pub(crate) async fn execute_run(
     strict_sandbox: bool,
     workspace_root: bool,
 ) -> anyhow::Result<()> {
-    let (current_dir, config) = if workspace_root
+    execute_run_with_config(
+        current_dir,
+        script,
+        args,
+        workspaces,
+        workspace,
+        filter,
+        scope,
+        if_present,
+        ignore_scripts,
+        foreground_scripts,
+        strict_sandbox,
+        workspace_root,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn execute_run_with_config(
+    current_dir: PathBuf,
+    script: Option<String>,
+    args: Vec<String>,
+    workspaces: bool,
+    workspace: Vec<String>,
+    filter: Vec<String>,
+    scope: Vec<String>,
+    if_present: bool,
+    ignore_scripts: bool,
+    foreground_scripts: bool,
+    strict_sandbox: bool,
+    workspace_root: bool,
+    preloaded_config: Option<&rnpm_config::Config>,
+) -> anyhow::Result<()> {
+    let loaded_config: Option<rnpm_config::Config>;
+    let target_dir = if workspace_root
         && !workspaces
         && workspace.is_empty()
         && filter.is_empty()
         && scope.is_empty()
     {
-        let root = rnpm_config::find_workspace_root(&current_dir).unwrap_or(current_dir);
-        let cfg = rnpm_config::Config::load(Some(&root)).unwrap_or_default();
-        (root, cfg)
+        rnpm_config::find_workspace_root(&current_dir).unwrap_or(current_dir.clone())
     } else {
-        let cfg = rnpm_config::Config::load(Some(&current_dir)).unwrap_or_default();
-        (current_dir, cfg)
+        current_dir.clone()
     };
+    let config: &rnpm_config::Config = match preloaded_config {
+        Some(cfg) if target_dir == current_dir => cfg,
+        _ => {
+            loaded_config = Some(rnpm_config::Config::load(Some(&target_dir)).unwrap_or_default());
+            loaded_config.as_ref().expect("just assigned")
+        }
+    };
+    let current_dir = target_dir;
     let manifest_path = current_dir.join("package.json");
     if !manifest_path.exists() {
         return Err(anyhow::anyhow!(
@@ -3406,7 +3448,18 @@ fn preprocess_run_args(
     result
 }
 
+#[cfg(test)]
 pub(crate) fn preprocess_cli_args<I, T>(raw_args: I) -> Vec<String>
+where
+    I: IntoIterator<Item = T>,
+    T: Into<std::ffi::OsString>,
+{
+    preprocess_cli_args_with_cmd(raw_args).0
+}
+
+pub(crate) fn preprocess_cli_args_with_cmd<I, T>(
+    raw_args: I,
+) -> (Vec<String>, Option<clap::Command>)
 where
     I: IntoIterator<Item = T>,
     T: Into<std::ffi::OsString>,
@@ -3417,7 +3470,7 @@ where
         .collect();
 
     if args.is_empty() {
-        return args;
+        return (args, None);
     }
 
     let program = args[0].clone();
@@ -3438,12 +3491,14 @@ where
         }
     }
 
+    let mut cached_cmd: Option<clap::Command> = None;
+
     // Find subcommand index
     let mut subcmd_idx = None;
     if !rest.is_empty() && !rest[0].starts_with('-') {
         subcmd_idx = Some(0);
-    } else {
-        let root_cmd = Cli::command();
+    } else if rest.iter().take_while(|t| *t != "--").any(|t| !t.starts_with('-')) {
+        let root_cmd = cached_cmd.get_or_insert_with(Cli::command);
         let mut i = 0;
         while i < rest.len() {
             let token = &rest[i];
@@ -3461,7 +3516,7 @@ where
                             i += 1;
                         }
                     }
-                } else if let Some(takes_val) = is_clap_declared_arg(&root_cmd, token) {
+                } else if let Some(takes_val) = is_clap_declared_arg(root_cmd, token) {
                     if takes_val && !token.contains('=') {
                         if let Some(next) = next_token {
                             if !next.starts_with('-') {
@@ -3573,9 +3628,18 @@ where
                 is_silent,
                 &mut overrides,
             )
+        } else if !rest[idx + 1..]
+            .iter()
+            .take_while(|t| t.as_str() != "--")
+            .any(|t| t.starts_with('-'))
+        {
+            let mut new_tokens = Vec::with_capacity(rest.len() - idx + 1);
+            new_tokens.push(program.clone());
+            new_tokens.extend(rest[idx..].iter().cloned());
+            new_tokens
         } else {
             // General subcommand
-            let root_cmd = Cli::command();
+            let root_cmd = cached_cmd.get_or_insert_with(Cli::command);
             let mut cmd_stack = vec![root_cmd.clone()];
             if let Some(sub) = root_cmd.find_subcommand(subcmd) {
                 cmd_stack.push(sub.clone());
@@ -3647,9 +3711,11 @@ where
             }
             new_tokens
         }
+    } else if rest.is_empty() {
+        vec![program.clone()]
     } else {
         // No subcommand (e.g. `rnpm --version`, `rnpm --help`, or `rnpm`)
-        let root_cmd = Cli::command();
+        let root_cmd = cached_cmd.get_or_insert_with(Cli::command);
         let mut new_tokens = vec![program.clone()];
         let mut j = 0;
         while j < rest.len() {
@@ -3662,7 +3728,7 @@ where
                 break;
             }
 
-            if let Some(takes_val) = is_clap_declared_arg(&root_cmd, token) {
+            if let Some(takes_val) = is_clap_declared_arg(root_cmd, token) {
                 if takes_val && !token.contains('=') {
                     if let Some(next) = next_token {
                         if !next.starts_with('-') {
@@ -3702,7 +3768,7 @@ where
         rnpm_config::set_process_cli_overrides(overrides);
     }
 
-    result
+    (result, cached_cmd)
 }
 
 pub(crate) fn parse_package_spec(spec: &str) -> (String, String) {
@@ -4384,14 +4450,12 @@ pub(crate) fn prepare_publish_manifest(
             ),
         );
     }
-    if let Ok(out) = std::process::Command::new("node").arg("--version").output() {
-        if out.status.success() {
-            let v = String::from_utf8_lossy(&out.stdout)
-                .trim()
-                .trim_start_matches('v')
-                .to_string();
-            obj.insert("_nodeVersion".into(), serde_json::Value::String(v));
-        }
+    let node_ver = crate::node_info::node_version();
+    if node_ver != "unknown" {
+        obj.insert(
+            "_nodeVersion".into(),
+            serde_json::Value::String(node_ver.trim_start_matches('v').to_string()),
+        );
     }
     obj.insert(
         "_npmVersion".into(),
@@ -5171,8 +5235,15 @@ async fn run_audit_fix(
     let started = std::time::Instant::now();
     let config = rnpm_config::Config::load(Some(project_dir)).unwrap_or_default();
     if initial_vulns == 0 {
-        let (post_report, _) = audit::build_audit_report(project_dir, registry.clone()).await?;
-        let inventory = if let Ok(lockfile) = rnpm_lockfile::load_and_migrate(&lock_path) {
+        let parsed_lock = rnpm_lockfile::load_and_migrate(&lock_path).ok();
+        let (post_report, _) = audit::build_audit_report_with_config_and_lockfile(
+            project_dir,
+            registry.clone(),
+            Some(&config),
+            parsed_lock.as_ref(),
+        )
+        .await?;
+        let inventory = if let Some(ref lockfile) = parsed_lock {
             lockfile.packages.keys().filter(|k| !k.is_empty()).count() + 1
         } else {
             let tree = reify_output::snapshot(project_dir);
@@ -5185,10 +5256,10 @@ async fn run_audit_fix(
         };
         let fund = config.get_bool("fund").unwrap_or(true);
         let mut opts =
-            reify_output::ReifyOutputOptions::from_config(project_dir, json, dry_run, fund);
+            reify_output::ReifyOutputOptions::from_config_loaded(&config, json, dry_run, fund);
         opts.audit_command = true;
         let funding = if fund && !dry_run {
-            audit::count_funding_packages(project_dir)
+            audit::count_funding_packages_with_lockfile(project_dir, parsed_lock.as_ref())
         } else {
             0
         };
@@ -5476,8 +5547,14 @@ async fn run_audit_fix(
 
     // npm reifies, then prints the detailed audit report of the new tree.
     let mut report = summary.reify.unwrap_or_default();
+    let parsed_lock = if !dry_run && (report.inventory == 0 || config.get_bool("fund").unwrap_or(true))
+    {
+        rnpm_lockfile::load_and_migrate(&lock_path).ok()
+    } else {
+        None
+    };
     if report.inventory == 0 {
-        if let Ok(lockfile) = rnpm_lockfile::load_and_migrate(&lock_path) {
+        if let Some(ref lockfile) = parsed_lock {
             report.inventory = lockfile.packages.keys().filter(|k| !k.is_empty()).count() + 1;
         }
     }
@@ -5490,16 +5567,21 @@ async fn run_audit_fix(
         }
         post
     } else {
-        audit::build_audit_report(project_dir, registry)
-            .await
-            .map(|(r, _)| r)
-            .unwrap_or(initial_report)
+        audit::build_audit_report_with_config_and_lockfile(
+            project_dir,
+            registry,
+            Some(&config),
+            parsed_lock.as_ref(),
+        )
+        .await
+        .map(|(r, _)| r)
+        .unwrap_or(initial_report)
     };
     let fund = config.get_bool("fund").unwrap_or(true);
-    let mut opts = reify_output::ReifyOutputOptions::from_config(project_dir, json, dry_run, fund);
+    let mut opts = reify_output::ReifyOutputOptions::from_config_loaded(&config, json, dry_run, fund);
     opts.audit_command = true;
     let funding = if fund && !dry_run {
-        audit::count_funding_packages(project_dir)
+        audit::count_funding_packages_with_lockfile(project_dir, parsed_lock.as_ref())
     } else {
         0
     };
@@ -5636,13 +5718,202 @@ pub(crate) fn format_duration(d: std::time::Duration) -> String {
     format!("{ms}ms")
 }
 
+fn resolve_command_dir(
+    cmd: &Commands,
+    inv_cwd: &Path,
+    cli_overrides: Option<&std::collections::BTreeMap<String, String>>,
+) -> PathBuf {
+    match cmd {
+        Commands::Install { prefix: Some(_), .. }
+        | Commands::Uninstall { prefix: Some(_), .. }
+        | Commands::List { prefix: Some(_), .. } => inv_cwd.to_path_buf(),
+        Commands::Pkg { prefix, .. } => {
+            if prefix == Path::new(".") {
+                apply_cli_prefix(inv_cwd.to_path_buf(), cli_overrides)
+            } else {
+                inv_cwd.to_path_buf()
+            }
+        }
+        _ => apply_cli_prefix(inv_cwd.to_path_buf(), cli_overrides),
+    }
+}
+
+fn command_prefix_dir(cmd: &Commands, current_dir: &Path) -> PathBuf {
+    match cmd {
+        Commands::Install { prefix: Some(p), .. }
+        | Commands::Uninstall { prefix: Some(p), .. }
+        | Commands::List { prefix: Some(p), .. } => {
+            if p.is_absolute() {
+                p.clone()
+            } else {
+                current_dir.join(p)
+            }
+        }
+        Commands::Pkg { prefix, .. } => {
+            if prefix.is_absolute() {
+                prefix.clone()
+            } else {
+                current_dir.join(prefix)
+            }
+        }
+        _ => current_dir.to_path_buf(),
+    }
+}
+
+fn prepare_command_execution(
+    cmd: &Commands,
+    current_dir: &Path,
+    config: &rnpm_config::Config,
+) -> anyhow::Result<()> {
+    if should_cleanup_trash(cmd) {
+        let trash_dir = command_prefix_dir(cmd, current_dir);
+        rnpm_install::trash::cleanup_leftover_trash(&trash_dir);
+    }
+    if checks_dev_engines(cmd) {
+        let dev_engines_dir = command_prefix_dir(cmd, current_dir);
+        enforce_dev_engines_with_config(&dev_engines_dir, config)?;
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn finish_install_or_ci_output(
+    report_dir: &Path,
+    summary: &rnpm_install::InstallSummary,
+    config: &rnpm_config::Config,
+    registry: Option<String>,
+    audit_val: bool,
+    fund_val: bool,
+    dry_run: bool,
+    silent: bool,
+    json: bool,
+    timing_val: bool,
+    elapsed: std::time::Duration,
+) -> anyhow::Result<()> {
+    let elapsed_str = format_duration(elapsed);
+
+    if let Some(report) = summary.reify.as_ref() {
+        let parsed_lock = if !dry_run && audit_val && fund_val {
+            let (lock_path, _) = rnpm_install::resolve_lockfile_path(report_dir);
+            if lock_path.exists() {
+                rnpm_lockfile::load_and_migrate(&lock_path).ok()
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let audit_report = if audit_val && !dry_run {
+            audit::build_audit_report_with_config_and_lockfile(
+                report_dir,
+                registry,
+                Some(config),
+                parsed_lock.as_ref(),
+            )
+            .await
+            .ok()
+            .map(|(r, _)| r)
+        } else {
+            None
+        };
+        let funding = if fund_val && !dry_run {
+            audit::count_funding_packages_with_lockfile(report_dir, parsed_lock.as_ref())
+        } else {
+            0
+        };
+        let mut out =
+            reify_output::ReifyOutputOptions::from_config_loaded(config, json, dry_run, fund_val);
+        out.silent |= silent;
+        reify_output::print(
+            report_dir,
+            report,
+            audit_report.as_ref(),
+            funding,
+            &out,
+            elapsed,
+        )?;
+    } else if json {
+        let json_output = serde_json::json!({
+            "add": [],
+            "added": summary.packages_installed,
+            "audited": 0,
+            "change": [],
+            "changed": 0,
+            "funding": 0,
+            "remove": [],
+            "removed": 0
+        });
+        println!("{}", serde_json::to_string_pretty(&json_output)?);
+    } else if !silent && dry_run {
+        println!(
+            "rnpm: dry-run: would install {} package(s)",
+            summary.packages_installed
+        );
+    } else if !dry_run {
+        let parsed_lock = if !silent && fund_val && audit_val {
+            let (lock_path, _) = rnpm_install::resolve_lockfile_path(report_dir);
+            if lock_path.exists() {
+                rnpm_lockfile::load_and_migrate(&lock_path).ok()
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        if !silent {
+            if summary.packages_installed > 0 {
+                let pkg_str = if summary.packages_installed == 1 {
+                    "package"
+                } else {
+                    "packages"
+                };
+                println!(
+                    "\nadded {} {} in {}",
+                    summary.packages_installed, pkg_str, elapsed_str
+                );
+            } else {
+                println!("\nup to date in {}", elapsed_str);
+            }
+
+            if fund_val {
+                let count =
+                    audit::count_funding_packages_with_lockfile(report_dir, parsed_lock.as_ref());
+                if count > 0 {
+                    println!(
+                        "\n{} packages are looking for funding\n  run `npm fund` for details",
+                        count
+                    );
+                }
+            }
+        }
+
+        if audit_val {
+            let _ = audit::run_post_install_audit_with_config(
+                report_dir,
+                registry,
+                Some(config),
+                parsed_lock.as_ref(),
+            )
+            .await;
+        }
+    }
+
+    if let Some(ref timing_metrics) = summary.timing {
+        if timing_val {
+            print!("{}", timing_metrics.format_table());
+            print!("{}", timing_metrics.format_counters());
+        }
+    }
+    Ok(())
+}
+
 #[allow(dead_code)]
 pub(crate) async fn run_cli(cli: Cli, dir: Option<PathBuf>) -> anyhow::Result<()> {
     run_cli_with_config(cli, dir, None).await
 }
 
 pub(crate) async fn run_cli_with_config(
-    cli: Cli,
+    mut cli: Cli,
     dir: Option<PathBuf>,
     loaded_config: Option<rnpm_config::Config>,
 ) -> anyhow::Result<()> {
@@ -5651,19 +5922,7 @@ pub(crate) async fn run_cli_with_config(
         None => std::env::current_dir()?,
     };
     let cli_overrides = rnpm_config::get_process_cli_overrides();
-    let current_dir = match &cli.command {
-        Commands::Install { prefix: Some(_), .. }
-        | Commands::Uninstall { prefix: Some(_), .. }
-        | Commands::List { prefix: Some(_), .. } => inv_cwd.clone(),
-        Commands::Pkg { prefix, .. } => {
-            if prefix == Path::new(".") {
-                apply_cli_prefix(inv_cwd.clone(), cli_overrides.as_ref())
-            } else {
-                inv_cwd.clone()
-            }
-        }
-        _ => apply_cli_prefix(inv_cwd.clone(), cli_overrides.as_ref()),
-    };
+    let current_dir = resolve_command_dir(&cli.command, &inv_cwd, cli_overrides.as_ref());
 
     let config = match loaded_config {
         Some(c) if should_reuse_ambient_config(&current_dir, &inv_cwd, cli_overrides.as_ref()) => c,
@@ -5671,53 +5930,9 @@ pub(crate) async fn run_cli_with_config(
     };
     let silent = config.get("loglevel") == Some("silent");
 
-    // Clean up any leftover .rnpm-trash-* directories only for commands that mutate node_modules or clean cache
-    if should_cleanup_trash(&cli.command) {
-        let trash_dir = match &cli.command {
-            Commands::Install { prefix: Some(p), .. }
-            | Commands::Uninstall { prefix: Some(p), .. }
-            | Commands::List { prefix: Some(p), .. } => {
-                if p.is_absolute() {
-                    p.clone()
-                } else {
-                    current_dir.join(p)
-                }
-            }
-            Commands::Pkg { prefix, .. } => {
-                if prefix.is_absolute() {
-                    prefix.clone()
-                } else {
-                    current_dir.join(prefix)
-                }
-            }
-            _ => current_dir.clone(),
-        };
-        rnpm_install::trash::cleanup_leftover_trash(&trash_dir);
-    }
-
-    // npm checks devEngines before arborist commands and `run`, never for
-    // global operations.
-    if checks_dev_engines(&cli.command) {
-        let dev_engines_dir = match &cli.command {
-            Commands::Install { prefix: Some(p), .. }
-            | Commands::Uninstall { prefix: Some(p), .. }
-            | Commands::List { prefix: Some(p), .. } => {
-                if p.is_absolute() {
-                    p.clone()
-                } else {
-                    current_dir.join(p)
-                }
-            }
-            Commands::Pkg { prefix, .. } => {
-                if prefix.is_absolute() {
-                    prefix.clone()
-                } else {
-                    current_dir.join(prefix)
-                }
-            }
-            _ => current_dir.clone(),
-        };
-        enforce_dev_engines_with_config(&dev_engines_dir, &config)?;
+    prepare_command_execution(&cli.command, &current_dir, &config)?;
+    if let Some(res) = execute_sync_command_inner(&mut cli, &current_dir, &config, false) {
+        return res;
     }
 
     match cli.command {
@@ -5771,23 +5986,56 @@ pub(crate) async fn run_cli_with_config(
             if json {
                 mark_json_mode();
             }
-            let config = rnpm_config::Config::load(Some(&current_dir)).unwrap_or_default();
+            let mut workspace = workspace;
+            let target_dir = if let Some(p) = prefix {
+                if p.is_absolute() {
+                    p
+                } else {
+                    current_dir.join(p)
+                }
+            } else if global {
+                rnpm_config::find_global_prefix()
+            } else {
+                if let Some(root) = rnpm_config::find_workspace_root(&current_dir) {
+                    if workspace.is_empty() && !workspaces {
+                        if let Some(member) = rnpm_core::workspace::discover_workspaces(&root)?
+                            .into_iter()
+                            .find(|m| m.path == current_dir)
+                        {
+                            workspace.push(member.name);
+                        }
+                    }
+                    root
+                } else {
+                    current_dir.clone()
+                }
+            };
+            let target_config = if !global && target_dir != current_dir {
+                Some(rnpm_config::Config::load(Some(&target_dir)).unwrap_or_default())
+            } else {
+                None
+            };
+            let effective_config = target_config.as_ref().unwrap_or(&config);
+            let effective_silent = silent || effective_config.get("loglevel") == Some("silent");
+
             let timing_val = timing
-                || config.get_bool("timing").unwrap_or(false)
+                || effective_config.get_bool("timing").unwrap_or(false)
                 || std::env::var("RNPM_TIMING")
                     .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
                     .unwrap_or(false);
             let effective_ignore =
-                ignore_scripts || config.get_bool("ignore-scripts").unwrap_or(false);
-            let effective_foreground =
-                foreground_scripts || config.get_bool("foreground-scripts").unwrap_or(false);
+                ignore_scripts || effective_config.get_bool("ignore-scripts").unwrap_or(false);
+            let effective_foreground = foreground_scripts
+                || effective_config
+                    .get_bool("foreground-scripts")
+                    .unwrap_or(false);
             let effective_strict =
-                strict_sandbox || config.get_bool("strict-sandbox").unwrap_or(false);
+                strict_sandbox || effective_config.get_bool("strict-sandbox").unwrap_or(false);
 
             let strategy_str = install_strategy
                 .as_deref()
-                .or_else(|| config.get("install-strategy"))
-                .or_else(|| config.get("install_strategy"))
+                .or_else(|| effective_config.get("install-strategy"))
+                .or_else(|| effective_config.get("install_strategy"))
                 .unwrap_or("hoisted");
             let effective_strategy = strategy_str
                 .parse::<rnpm_install::InstallStrategy>()
@@ -5815,46 +6063,22 @@ pub(crate) async fn run_cli_with_config(
                 } else if format_package_lock == Some(true) {
                     Some(true)
                 } else {
-                    config.get_bool("format-package-lock")
+                    effective_config.get_bool("format-package-lock")
                 };
             let audit_val = if no_audit || audit == Some(false) {
                 false
             } else {
-                audit.unwrap_or_else(|| config.get_bool("audit").unwrap_or(true))
+                audit.unwrap_or_else(|| effective_config.get_bool("audit").unwrap_or(true))
             };
             let fund_val = if no_fund || fund == Some(false) {
                 false
             } else {
-                fund.unwrap_or_else(|| config.get_bool("fund").unwrap_or(true))
+                fund.unwrap_or_else(|| effective_config.get_bool("fund").unwrap_or(true))
             };
             let bin_links_val = if no_bin_links || bin_links == Some(false) {
                 false
             } else {
-                bin_links.unwrap_or_else(|| config.get_bool("bin-links").unwrap_or(true))
-            };
-            let mut workspace = workspace;
-            let target_dir = if let Some(p) = prefix {
-                if p.is_absolute() {
-                    p
-                } else {
-                    current_dir.join(p)
-                }
-            } else if global {
-                rnpm_config::find_global_prefix()
-            } else {
-                if let Some(root) = rnpm_config::find_workspace_root(&current_dir) {
-                    if workspace.is_empty() && !workspaces {
-                        if let Some(member) = rnpm_core::workspace::discover_workspaces(&root)?
-                            .into_iter()
-                            .find(|m| m.path == current_dir)
-                        {
-                            workspace.push(member.name);
-                        }
-                    }
-                    root
-                } else {
-                    current_dir.clone()
-                }
+                bin_links.unwrap_or_else(|| effective_config.get_bool("bin-links").unwrap_or(true))
             };
             // Relative local specs were typed relative to the invocation directory;
             // keep them pointing there after switching to the workspace root.
@@ -5868,8 +6092,8 @@ pub(crate) async fn run_cli_with_config(
             };
 
             let effective_save_prefix = save_prefix
-                .or_else(|| config.get("save-prefix").map(ToString::to_string))
-                .or_else(|| config.get("save_prefix").map(ToString::to_string));
+                .or_else(|| effective_config.get("save-prefix").map(ToString::to_string))
+                .or_else(|| effective_config.get("save_prefix").map(ToString::to_string));
 
             let cli_overrides = rnpm_config::get_process_cli_overrides();
             let ws_in_overrides = cli_overrides
@@ -5885,6 +6109,10 @@ pub(crate) async fn run_cli_with_config(
                 let has_ws =
                     if let Ok(content) = std::fs::read_to_string(target_dir.join("package.json")) {
                         content.contains("\"workspaces\"")
+                            || (content.contains("\\u")
+                                && serde_json::from_str::<serde_json::Value>(&content)
+                                    .ok()
+                                    .is_some_and(|v| v.get("workspaces").is_some()))
                     } else {
                         false
                     };
@@ -5896,6 +6124,13 @@ pub(crate) async fn run_cli_with_config(
                     std::process::exit(1);
                 }
             }
+
+            let report_dir = if global {
+                current_dir.clone()
+            } else {
+                target_dir.clone()
+            };
+            let install_config_override = (!global).then(|| effective_config.clone());
 
             let options = InstallOptions {
                 project_dir: target_dir,
@@ -5914,7 +6149,7 @@ pub(crate) async fn run_cli_with_config(
                 legacy_peer_deps,
                 strict_peer_deps,
                 save_dev,
-                save_exact: save_exact || config.get_bool("save-exact").unwrap_or(false),
+                save_exact: save_exact || effective_config.get_bool("save-exact").unwrap_or(false),
                 save_prefix: effective_save_prefix,
                 save_prod,
                 save_optional,
@@ -5936,7 +6171,7 @@ pub(crate) async fn run_cli_with_config(
                 workspace,
                 workspaces,
                 lockfile_version: lockfile_version.or_else(|| {
-                    config
+                    effective_config
                         .get("lockfile-version")
                         .and_then(|v| v.parse().ok())
                 }),
@@ -5944,100 +6179,29 @@ pub(crate) async fn run_cli_with_config(
                 install_strategy: effective_strategy,
                 wait_for_trash,
                 detached_trash,
-                silent,
+                silent: effective_silent,
                 bin_links: bin_links_val,
+                config_override: install_config_override,
                 ..Default::default()
             };
 
             let start_time = std::time::Instant::now();
             let mut installer = Installer::new(options)?;
             let summary = installer.run().await?;
-            let elapsed_str = format_duration(start_time.elapsed());
-
-            if let Some(report) = summary.reify.as_ref() {
-                let audit_report = if audit_val && !dry_run {
-                    audit::build_audit_report(&current_dir, registry.clone())
-                        .await
-                        .ok()
-                        .map(|(r, _)| r)
-                } else {
-                    None
-                };
-                let funding = if fund_val && !dry_run {
-                    audit::count_funding_packages(&current_dir)
-                } else {
-                    0
-                };
-                let mut out = reify_output::ReifyOutputOptions::from_config(
-                    &current_dir,
-                    json,
-                    dry_run,
-                    fund_val,
-                );
-                out.silent |= silent;
-                reify_output::print(
-                    &current_dir,
-                    report,
-                    audit_report.as_ref(),
-                    funding,
-                    &out,
-                    start_time.elapsed(),
-                )?;
-            } else if json {
-                let json_output = serde_json::json!({
-                    "add": [],
-                    "added": summary.packages_installed,
-                    "audited": 0,
-                    "change": [],
-                    "changed": 0,
-                    "funding": 0,
-                    "remove": [],
-                    "removed": 0
-                });
-                println!("{}", serde_json::to_string_pretty(&json_output)?);
-            } else if !silent && dry_run {
-                println!(
-                    "rnpm: dry-run: would install {} package(s)",
-                    summary.packages_installed
-                );
-            } else if !dry_run {
-                if !silent {
-                    if summary.packages_installed > 0 {
-                        let pkg_str = if summary.packages_installed == 1 {
-                            "package"
-                        } else {
-                            "packages"
-                        };
-                        println!(
-                            "\nadded {} {} in {}",
-                            summary.packages_installed, pkg_str, elapsed_str
-                        );
-                    } else {
-                        println!("\nup to date in {}", elapsed_str);
-                    }
-
-                    if fund_val {
-                        let count = audit::count_funding_packages(&current_dir);
-                        if count > 0 {
-                            println!(
-                                "\n{} packages are looking for funding\n  run `npm fund` for details",
-                                count
-                            );
-                        }
-                    }
-                }
-
-                if audit_val {
-                    let _ = audit::run_post_install_audit(&current_dir, registry).await;
-                }
-            }
-
-            if let Some(ref timing_metrics) = summary.timing {
-                if timing_val {
-                    print!("{}", timing_metrics.format_table());
-                    print!("{}", timing_metrics.format_counters());
-                }
-            }
+            finish_install_or_ci_output(
+                &report_dir,
+                &summary,
+                effective_config,
+                registry,
+                audit_val,
+                fund_val,
+                dry_run,
+                effective_silent,
+                json,
+                timing_val,
+                start_time.elapsed(),
+            )
+            .await?;
         }
         Commands::Ci {
             registry,
@@ -6079,7 +6243,6 @@ pub(crate) async fn run_cli_with_config(
             if json {
                 mark_json_mode();
             }
-            let config = rnpm_config::Config::load(Some(&current_dir)).unwrap_or_default();
             let timing_val = timing
                 || config.get_bool("timing").unwrap_or(false)
                 || std::env::var("RNPM_TIMING")
@@ -6140,6 +6303,7 @@ pub(crate) async fn run_cli_with_config(
             } else {
                 bin_links.unwrap_or_else(|| config.get_bool("bin-links").unwrap_or(true))
             };
+            let ci_config_override = Some(config.clone());
             let options = InstallOptions {
                 project_dir: current_dir.clone(),
                 init_cwd: std::env::current_dir().ok(),
@@ -6179,272 +6343,33 @@ pub(crate) async fn run_cli_with_config(
                 wait_for_trash,
                 detached_trash,
                 bin_links: bin_links_val,
+                config_override: ci_config_override,
                 ..Default::default()
             };
 
             let start_time = std::time::Instant::now();
             let mut installer = Installer::new(options)?;
             let summary = installer.run_ci().await?;
-            let elapsed_str = format_duration(start_time.elapsed());
-
-            if let Some(report) = summary.reify.as_ref() {
-                let audit_report = if audit_val && !dry_run {
-                    audit::build_audit_report(&current_dir, registry.clone())
-                        .await
-                        .ok()
-                        .map(|(r, _)| r)
-                } else {
-                    None
-                };
-                let funding = if fund_val && !dry_run {
-                    audit::count_funding_packages(&current_dir)
-                } else {
-                    0
-                };
-                let mut out = reify_output::ReifyOutputOptions::from_config(
-                    &current_dir,
-                    json,
-                    dry_run,
-                    fund_val,
-                );
-                out.silent |= silent;
-                reify_output::print(
-                    &current_dir,
-                    report,
-                    audit_report.as_ref(),
-                    funding,
-                    &out,
-                    start_time.elapsed(),
-                )?;
-            } else if json {
-                let json_output = serde_json::json!({
-                    "add": [],
-                    "added": summary.packages_installed,
-                    "audited": 0,
-                    "change": [],
-                    "changed": 0,
-                    "funding": 0,
-                    "remove": [],
-                    "removed": 0
-                });
-                println!("{}", serde_json::to_string_pretty(&json_output)?);
-            } else if !silent && dry_run {
-                println!(
-                    "rnpm: dry-run: would install {} package(s)",
-                    summary.packages_installed
-                );
-            } else if !dry_run {
-                if !silent {
-                    if summary.packages_installed > 0 {
-                        let pkg_str = if summary.packages_installed == 1 {
-                            "package"
-                        } else {
-                            "packages"
-                        };
-                        println!(
-                            "\nadded {} {} in {}",
-                            summary.packages_installed, pkg_str, elapsed_str
-                        );
-                    } else {
-                        println!("\nup to date in {}", elapsed_str);
-                    }
-
-                    if fund_val {
-                        let count = audit::count_funding_packages(&current_dir);
-                        if count > 0 {
-                            println!(
-                                "\n{} packages are looking for funding\n  run `npm fund` for details",
-                                count
-                            );
-                        }
-                    }
-                }
-
-                if audit_val {
-                    let _ = audit::run_post_install_audit(&current_dir, registry).await;
-                }
-            }
-
-            if let Some(ref timing_metrics) = summary.timing {
-                if timing_val {
-                    print!("{}", timing_metrics.format_table());
-                    print!("{}", timing_metrics.format_counters());
-                }
-            }
-        }
-        Commands::Test {
-            args,
-            workspaces,
-            workspace,
-            if_present,
-            ignore_scripts,
-            foreground_scripts,
-            strict_sandbox,
-            workspace_root,
-        } => {
-            execute_run(
-                current_dir,
-                Some("test".to_string()),
-                args,
-                workspaces,
-                workspace,
-                Vec::new(),
-                Vec::new(),
-                if_present,
-                ignore_scripts,
-                foreground_scripts,
-                strict_sandbox,
-                workspace_root,
+            finish_install_or_ci_output(
+                &current_dir,
+                &summary,
+                &config,
+                registry,
+                audit_val,
+                fund_val,
+                dry_run,
+                silent,
+                json,
+                timing_val,
+                start_time.elapsed(),
             )
             .await?;
         }
-        Commands::Start {
-            args,
-            workspaces,
-            workspace,
-            if_present,
-            ignore_scripts,
-            foreground_scripts,
-            strict_sandbox,
-            workspace_root,
-        } => {
-            execute_run(
-                current_dir,
-                Some("start".to_string()),
-                args,
-                workspaces,
-                workspace,
-                Vec::new(),
-                Vec::new(),
-                if_present,
-                ignore_scripts,
-                foreground_scripts,
-                strict_sandbox,
-                workspace_root,
-            )
-            .await?;
-        }
-        Commands::Restart {
-            args,
-            workspaces,
-            workspace,
-            if_present,
-            ignore_scripts,
-            foreground_scripts,
-            strict_sandbox,
-            workspace_root,
-        } => {
-            execute_run(
-                current_dir,
-                Some("restart".to_string()),
-                args,
-                workspaces,
-                workspace,
-                Vec::new(),
-                Vec::new(),
-                if_present,
-                ignore_scripts,
-                foreground_scripts,
-                strict_sandbox,
-                workspace_root,
-            )
-            .await?;
-        }
-        Commands::Stop {
-            args,
-            workspaces,
-            workspace,
-            if_present,
-            ignore_scripts,
-            foreground_scripts,
-            strict_sandbox,
-            workspace_root,
-        } => {
-            execute_run(
-                current_dir,
-                Some("stop".to_string()),
-                args,
-                workspaces,
-                workspace,
-                Vec::new(),
-                Vec::new(),
-                if_present,
-                ignore_scripts,
-                foreground_scripts,
-                strict_sandbox,
-                workspace_root,
-            )
-            .await?;
-        }
-        Commands::Run {
-            script,
-            args,
-            workspaces,
-            workspace,
-            filter,
-            scope,
-            if_present,
-            ignore_scripts,
-            foreground_scripts,
-            strict_sandbox,
-            workspace_root,
-        } => {
-            let cli_overrides = rnpm_config::get_process_cli_overrides();
-            let has_script_overrides = cli_overrides
-                .as_ref()
-                .map(|o| {
-                    o.contains_key("ignore-scripts")
-                        || o.contains_key("foreground-scripts")
-                        || o.contains_key("strict-sandbox")
-                })
-                .unwrap_or(false);
-
-            let (effective_ignore, effective_foreground, effective_strict) = if has_script_overrides
-            {
-                let overrides = cli_overrides.as_ref().unwrap();
-                let ig = ignore_scripts
-                    || overrides
-                        .get("ignore-scripts")
-                        .map(|v| v == "true" || v == "1")
-                        .unwrap_or(false);
-                let fg = foreground_scripts
-                    || overrides
-                        .get("foreground-scripts")
-                        .map(|v| v == "true" || v == "1")
-                        .unwrap_or(false);
-                let ss = strict_sandbox
-                    || overrides
-                        .get("strict-sandbox")
-                        .map(|v| v == "true" || v == "1")
-                        .unwrap_or(false);
-                (ig, fg, ss)
-            } else if current_dir.join(".npmrc").is_file() {
-                let config = rnpm_config::Config::load(Some(&current_dir)).unwrap_or_default();
-                let ig = ignore_scripts || config.get_bool("ignore-scripts").unwrap_or(false);
-                let fg =
-                    foreground_scripts || config.get_bool("foreground-scripts").unwrap_or(false);
-                let ss = strict_sandbox || config.get_bool("strict-sandbox").unwrap_or(false);
-                (ig, fg, ss)
-            } else {
-                (ignore_scripts, foreground_scripts, strict_sandbox)
-            };
-
-            execute_run(
-                current_dir,
-                script,
-                args,
-                workspaces,
-                workspace,
-                filter,
-                scope,
-                if_present,
-                effective_ignore,
-                effective_foreground,
-                effective_strict,
-                workspace_root,
-            )
-            .await?;
-        }
+        Commands::Test { .. }
+        | Commands::Start { .. }
+        | Commands::Restart { .. }
+        | Commands::Stop { .. }
+        | Commands::Run { .. } => unreachable!("handled by execute_sync_command_inner"),
         Commands::Exec {
             call,
             package,
@@ -6626,7 +6551,7 @@ pub(crate) async fn run_cli_with_config(
             } else if global {
                 rnpm_config::find_global_prefix()
             } else {
-                current_dir
+                current_dir.clone()
             };
             let before = (!is_global).then(|| reify_output::snapshot(&target_dir));
             let report_dir = target_dir.clone();
@@ -6634,6 +6559,8 @@ pub(crate) async fn run_cli_with_config(
                 project_dir: target_dir,
                 init_cwd: std::env::current_dir().ok(),
                 is_global,
+                config_override: (!is_global && report_dir == current_dir)
+                    .then(|| config.clone()),
                 ..Default::default()
             };
             let start_time = std::time::Instant::now();
@@ -6664,13 +6591,18 @@ pub(crate) async fn run_cli_with_config(
             if let Some(before) = before {
                 let report =
                     reify_output::report_between(&before, &reify_output::snapshot(&report_dir));
-                reify_output::finish(
+                reify_output::finish_with_config(
                     &report_dir,
                     &report,
                     json,
                     false,
                     silent,
                     start_time.elapsed(),
+                    if report_dir == current_dir {
+                        Some(&config)
+                    } else {
+                        None
+                    },
                 )
                 .await?;
             } else if json {
@@ -6734,7 +6666,7 @@ pub(crate) async fn run_cli_with_config(
                 workspace,
                 workspaces,
             };
-            commands::update::run(opts, current_dir).await?;
+            commands::update::run_with_config(opts, current_dir, Some(&config)).await?;
         }
         Commands::Prune {
             omit,
@@ -6757,7 +6689,7 @@ pub(crate) async fn run_cli_with_config(
                 workspace,
                 workspaces,
             };
-            commands::prune::run(args, current_dir).await?;
+            commands::prune::run_with_config(args, current_dir, Some(&config)).await?;
         }
         Commands::Dedupe {
             packages, dry_run, ..
@@ -6781,24 +6713,7 @@ pub(crate) async fn run_cli_with_config(
             };
             commands::rebuild::run(opts, current_dir).await?;
         }
-        Commands::Pkg {
-            action,
-            prefix,
-            json,
-            workspace,
-            workspaces,
-            include_workspace_root,
-        } => {
-            commands::pkg::run(
-                action,
-                prefix,
-                json,
-                workspace,
-                workspaces,
-                include_workspace_root,
-                current_dir,
-            )?;
-        }
+        Commands::Pkg { .. } => unreachable!("handled by execute_sync_command_inner"),
         Commands::Audit {
             action,
             registry,
@@ -6832,7 +6747,14 @@ pub(crate) async fn run_cli_with_config(
             } else if action.as_deref() == Some("signatures") {
                 audit_signatures::run(&current_dir, json).await?;
             } else {
-                audit::run_audit(&current_dir, registry, json, &audit_level).await?;
+                audit::run_audit_with_config(
+                    &current_dir,
+                    registry,
+                    json,
+                    &audit_level,
+                    Some(&config),
+                )
+                .await?;
             }
         }
         Commands::Cache { action, cache } => {
@@ -6909,95 +6831,7 @@ pub(crate) async fn run_cli_with_config(
             };
             commands::version::run(args, current_dir).await?;
         }
-        Commands::List {
-            mut packages,
-            depth,
-            all,
-            json,
-            long,
-            parseable,
-            package_lock_only,
-            omit,
-            global,
-            prefix,
-            workspace,
-            workspaces,
-            workspace_root,
-        } => {
-            let is_global = global || prefix.is_some();
-            let target_dir = if let Some(p) = prefix {
-                if p.is_absolute() {
-                    p
-                } else {
-                    current_dir.join(p)
-                }
-            } else if global {
-                let prefix = rnpm_config::find_global_prefix();
-                if cfg!(windows) {
-                    prefix
-                } else {
-                    prefix.join("lib")
-                }
-            } else {
-                current_dir
-            };
-
-            if package_lock_only && !target_dir.join("package-lock.json").is_file() {
-                eprintln!("npm error code ENOLOCK\nnpm error ls This command requires an existing lockfile.\nnpm error ls Try creating one first with: npm i --package-lock-only");
-                std::process::exit(1);
-            }
-
-            let cli_overrides = rnpm_config::get_process_cli_overrides();
-            let ws_in_overrides = workspaces
-                || !workspace.is_empty()
-                || cli_overrides
-                    .as_ref()
-                    .map(|o| {
-                        o.get("workspaces")
-                            .map(|v| v != "false" && v != "0")
-                            .unwrap_or(false)
-                            || o.contains_key("workspace")
-                    })
-                    .unwrap_or(false);
-            if ws_in_overrides {
-                let ws_filters = if !workspace.is_empty() {
-                    workspace.clone()
-                } else if let Some(ref o) = cli_overrides {
-                    o.get("workspace")
-                        .map(|w| vec![w.clone()])
-                        .unwrap_or_default()
-                } else {
-                    Vec::new()
-                };
-                let members = select_workspace_members(&target_dir, &ws_filters, workspace_root)?;
-                if packages.is_empty() {
-                    packages.extend(members.into_iter().map(|m| m.name));
-                }
-            }
-
-            let opts = list::ListOptions {
-                packages,
-                depth,
-                all,
-                json,
-                long,
-                parseable,
-                package_lock_only,
-                omit,
-                is_global,
-            };
-            let code = if ws_in_overrides {
-                list::run_workspace_list(&target_dir, &opts)?
-            } else {
-                list::run_list(&target_dir, &opts)?
-            };
-            if code != 0 {
-                return Err(anyhow::Error::from(rnpm_lifecycle::ScriptExitError {
-                    exit_code: code,
-                    message: "list finished with problems".to_string(),
-                }));
-            }
-        }
+        Commands::List { .. } => unreachable!("handled by execute_sync_command_inner"),
         Commands::Outdated {
             packages,
             all,
@@ -7117,37 +6951,9 @@ pub(crate) async fn run_cli_with_config(
         } => {
             commands::token::run(action, registry, json, current_dir).await?;
         }
-        Commands::ApproveScripts {
-            packages,
-            all,
-            allow_scripts_pending,
-            json,
-        } => {
-            commands::allow_scripts::run_approve(
-                &current_dir,
-                &packages,
-                all,
-                allow_scripts_pending,
-                json,
-            )?;
-        }
-        Commands::DenyScripts {
-            packages,
-            all,
-            allow_scripts_pending,
-            json,
-        } => {
-            commands::allow_scripts::run_deny(
-                &current_dir,
-                &packages,
-                all,
-                allow_scripts_pending,
-                json,
-            )?;
-        }
-        Commands::Completion { args } => {
-            commands::completion::run(args, &current_dir)?;
-        }
+        Commands::ApproveScripts { .. }
+        | Commands::DenyScripts { .. }
+        | Commands::Completion { .. } => unreachable!("handled by execute_sync_command_inner"),
         Commands::DistTag {
             args,
             registry,
@@ -7352,102 +7158,12 @@ pub(crate) async fn run_cli_with_config(
         Commands::Fund { package, json } => {
             commands::fund::run(&current_dir, package, json).await?;
         }
-        Commands::Explain { package, json } => {
-            explain::run_explain(&current_dir, &package, json)?;
-        }
-        Commands::Bugs { packages, .. } => {
-            let packages = if packages.is_empty() {
-                vec![".".into()]
-            } else {
-                packages
-            };
-            for package in packages {
-                let dir = resolve_local_package_dir(&current_dir, &package)?;
-                let value = package_manifest_value(&dir)?;
-                let url = value
-                    .get("bugs")
-                    .and_then(|v| v.get("url"))
-                    .and_then(|v| v.as_str())
-                    .or_else(|| value.get("bugs").and_then(|v| v.as_str()))
-                    .unwrap_or("");
-                if url.is_empty() {
-                    print_package_url(
-                        &current_dir,
-                        value
-                            .get("name")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or(&package),
-                        "bugs",
-                        &format!("https://www.npmjs.com/package/{package}?activeTab=issues"),
-                    );
-                } else {
-                    print_package_url(
-                        &current_dir,
-                        value
-                            .get("name")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or(&package),
-                        "bugs",
-                        url,
-                    );
-                }
-            }
-        }
-        Commands::Docs { packages, .. } => {
-            let packages = if packages.is_empty() {
-                vec![".".into()]
-            } else {
-                packages
-            };
-            for package in packages {
-                let dir = resolve_local_package_dir(&current_dir, &package)?;
-                let value = package_manifest_value(&dir)?;
-                let url = value.get("homepage").and_then(|v| v.as_str()).unwrap_or("");
-                if url.is_empty() {
-                    print_package_url(
-                        &current_dir,
-                        value
-                            .get("name")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or(&package),
-                        "docs",
-                        &format!("https://www.npmjs.com/package/{package}?activeTab=readme"),
-                    );
-                } else {
-                    print_package_url(
-                        &current_dir,
-                        value
-                            .get("name")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or(&package),
-                        "docs",
-                        url,
-                    );
-                }
-            }
-        }
+        Commands::Explain { .. }
+        | Commands::Bugs { .. }
+        | Commands::Docs { .. } => unreachable!("handled by execute_sync_command_inner"),
         Commands::Repo { packages, registry } => {
             if packages.is_empty() {
-                let pkg_json = current_dir.join("package.json");
-                let value = std::fs::read_to_string(&pkg_json)
-                    .ok()
-                    .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok());
-                let repo = value
-                    .as_ref()
-                    .and_then(|v| v.get("repository"))
-                    .and_then(|v| v.get("url").or(Some(v)))
-                    .and_then(|v| v.as_str());
-                if let Some(r) = repo {
-                    let name = value
-                        .as_ref()
-                        .and_then(|v| v.get("name"))
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("");
-                    print_package_url(&current_dir, name, "repo", r.trim_end_matches(".git"));
-                    return Ok(());
-                } else {
-                    return Err(anyhow::anyhow!("npm error no repository"));
-                }
+                unreachable!("handled by execute_sync_command_inner");
             }
             let (registry_url, client) = make_registry_client(&current_dir, registry)?;
             for package in packages {
@@ -7466,11 +7182,12 @@ pub(crate) async fn run_cli_with_config(
                         .and_then(|v| v.as_str())
                         .or_else(|| value.get("repository").and_then(|v| v.as_str()))
                     {
-                        print_package_url(
+                        print_package_url_with_config(
                             &current_dir,
                             &package,
                             "repo",
                             repo.trim_end_matches(".git"),
+                            Some(&config),
                         );
                         continue;
                     }
@@ -7489,12 +7206,13 @@ pub(crate) async fn run_cli_with_config(
                             .and_then(|v| v.extra.get("repository"))
                             .and_then(|v| v.as_str())
                     });
-                print_package_url(
+                print_package_url_with_config(
                     &current_dir,
                     &package,
                     "repo",
                     repo.unwrap_or("https://www.npmjs.com/package/")
                         .trim_end_matches(".git"),
+                    Some(&config),
                 );
                 let _ = registry_url;
             }
@@ -7502,20 +7220,8 @@ pub(crate) async fn run_cli_with_config(
         Commands::Edit { package, editor } => {
             commands::edit::run(package, editor, current_dir).await?;
         }
-        Commands::Explore {
-            package,
-            args,
-            shell,
-        } => {
-            commands::explore::run(package, args, shell, current_dir).await?;
-        }
-        Commands::HelpSearch {
-            terms,
-            long,
-            registry: _,
-            json: _,
-        } => {
-            commands::help_search::run(terms, long, None).await?;
+        Commands::Explore { .. } | Commands::HelpSearch { .. } => {
+            unreachable!("handled by execute_sync_command_inner")
         }
         Commands::Stage {
             action,
@@ -7537,28 +7243,11 @@ pub(crate) async fn run_cli_with_config(
         Commands::InstallCiTest { args } => {
             commands::install_test::run_install_ci_test(args, current_dir).await?;
         }
-        Commands::InstallScripts {
-            action,
-            packages,
-            all,
-            json,
-            dry_run,
-        } => {
-            commands::allow_scripts::run_install_scripts(
-                &current_dir,
-                action.as_deref(),
-                &packages,
-                all,
-                json,
-                dry_run,
-            )?;
-        }
+        Commands::InstallScripts { .. } => unreachable!("handled by execute_sync_command_inner"),
         Commands::InstallTest { args } => {
             commands::install_test::run_install_test(args, current_dir).await?;
         }
-        Commands::Shrinkwrap => {
-            commands::shrinkwrap::run(current_dir)?;
-        }
+        Commands::Shrinkwrap => unreachable!("handled by execute_sync_command_inner"),
         Commands::Fix {
             force,
             registry,
@@ -7654,7 +7343,6 @@ pub(crate) async fn run_cli_with_config(
             .await?;
         }
         Commands::Hook { registry, .. } => {
-            let config = rnpm_config::Config::load(Some(&current_dir)).unwrap_or_default();
             let registry_url = if let Some(ref reg_str) = registry {
                 Url::parse(reg_str).map_err(|e| {
                     anyhow::anyhow!(
@@ -7674,101 +7362,29 @@ pub(crate) async fn run_cli_with_config(
                 "npm error code ENOTSUP\nnpm error hook is not supported by the active registry"
             ));
         }
-        Commands::Get { key, extra_keys } => {
-            commands::config::run_get_keys(key.as_deref(), &extra_keys, &current_dir)?;
-        }
-        Commands::Set {
-            args,
-            global,
-            location,
-        } => {
-            commands::config::run_set_args(
-                &args,
-                global,
-                location.as_deref(),
-                &current_dir,
-            )?;
-        }
-        Commands::Config { action } => {
-            commands::config::run(action, current_dir)?;
-        }
-        Commands::Link {
-            package,
-            workspace,
-            workspaces,
-            save,
-            save_dev,
-            save_optional,
-            save_peer,
-            save_prod,
-            no_save,
-        } => {
-            let link_args = commands::link::LinkCommandArgs {
-                package,
-                workspace,
-                workspaces,
-                save,
-                save_dev,
-                save_optional,
-                save_peer,
-                save_prod,
-                no_save,
-            };
-            commands::link::run_link(link_args, current_dir)?;
-        }
-        Commands::Unlink {
-            package,
-            workspace,
-            workspaces,
-        } => {
-            let unlink_args = commands::link::UnlinkCommandArgs {
-                package,
-                workspace,
-                workspaces,
-            };
-            commands::link::run_unlink(unlink_args, current_dir)?;
-        }
-        Commands::Prefix { global } => {
-            if global {
-                let p = rnpm_config::find_global_prefix();
-                println!("{}", p.display());
-            } else {
-                let p = rnpm_config::find_local_prefix(&current_dir);
-                println!("{}", p.display());
-            }
-        }
-        Commands::Root { global } => {
-            if global {
-                let p = rnpm_config::find_global_node_modules(&rnpm_config::find_global_prefix());
-                println!("{}", p.display());
-            } else {
-                let p = rnpm_config::find_local_node_modules(&current_dir);
-                println!("{}", p.display());
-            }
-        }
-        Commands::Bin { global } => {
-            if global {
-                let p = rnpm_config::find_global_bin_dir(&rnpm_config::find_global_prefix());
-                println!("{}", p.display());
-            } else {
-                let p = rnpm_config::find_local_bin_dir(&current_dir);
-                println!("{}", p.display());
-            }
-        }
-        Commands::Help { topic } => {
-            execute_sync_help(&topic)?;
-        }
+        Commands::Get { .. }
+        | Commands::Set { .. }
+        | Commands::Config { .. }
+        | Commands::Link { .. }
+        | Commands::Unlink { .. }
+        | Commands::Prefix { .. }
+        | Commands::Root { .. }
+        | Commands::Bin { .. }
+        | Commands::Help { .. } => unreachable!("handled by execute_sync_command_inner"),
     }
 
     Ok(())
 }
 
-fn execute_sync_help(topic: &[String]) -> anyhow::Result<()> {
+fn execute_sync_help_with_config(
+    topic: &[String],
+    config: Option<&rnpm_config::Config>,
+) -> anyhow::Result<()> {
     let topic_str = topic.join("-").to_ascii_lowercase();
     if topic_str == "install-strategy" || topic_str == "install_strategy" {
         print_help_install_strategy();
     } else if topic.is_empty() {
-        print!("{}", npm_usage());
+        print!("{}", npm_usage_with_config(config));
     } else {
         let cmd = Cli::command();
         if let Some(sub) = cmd.find_subcommand(&topic[0]) {
@@ -7878,7 +7494,12 @@ fn npm_command_names() -> String {
     format!("\n    {}", &joined[2..])
 }
 
+#[allow(dead_code)]
 fn npm_usage() -> String {
+    npm_usage_with_config(None)
+}
+
+fn npm_usage_with_config(config: Option<&rnpm_config::Config>) -> String {
     let userconfig = rnpm_config::find_user_npmrc()
         .map(|p| p.display().to_string())
         .unwrap_or_default();
@@ -7886,11 +7507,14 @@ fn npm_usage() -> String {
         .ok()
         .and_then(|p| p.parent().map(|d| d.display().to_string()))
         .unwrap_or_default();
-    let viewer = std::env::current_dir()
-        .ok()
-        .and_then(|d| rnpm_config::Config::load(Some(&d)).ok())
-        .and_then(|c| c.get("viewer").map(str::to_owned))
-        .unwrap_or_else(|| if cfg!(windows) { "browser" } else { "man" }.to_string());
+    let viewer = match config {
+        Some(cfg) => cfg.get("viewer").map(str::to_owned),
+        None => std::env::current_dir()
+            .ok()
+            .and_then(|d| rnpm_config::Config::load(Some(&d)).ok())
+            .and_then(|c| c.get("viewer").map(str::to_owned)),
+    }
+    .unwrap_or_else(|| if cfg!(windows) { "browser" } else { "man" }.to_string());
     let browser = if viewer == "browser" {
         " (in a browser)"
     } else {
@@ -7983,29 +7607,48 @@ CONFIGURATION
     );
 }
 
-fn print_package_url(dir: &Path, name: &str, command: &str, url: &str) {
-    if rnpm_config::Config::load(Some(dir))
-        .ok()
-        .is_some_and(|config| config.get("browser") == Some("false"))
-    {
+fn print_package_url_with_config(
+    dir: &Path,
+    name: &str,
+    command: &str,
+    url: &str,
+    config: Option<&rnpm_config::Config>,
+) {
+    let browser_disabled = match config {
+        Some(cfg) => cfg.get("browser") == Some("false"),
+        None => rnpm_config::Config::load(Some(dir))
+            .ok()
+            .is_some_and(|cfg| cfg.get("browser") == Some("false")),
+    };
+    if browser_disabled {
         println!("{name} {command} available at the following URL:\n{url}");
     } else {
         println!("{url}");
     }
 }
 
+pub(crate) fn use_unicode_with_config(
+    dir: &Path,
+    config: Option<&rnpm_config::Config>,
+) -> bool {
+    let configured = match config {
+        Some(cfg) => cfg.get_bool("unicode"),
+        None => rnpm_config::Config::load(Some(dir))
+            .ok()
+            .and_then(|cfg| cfg.get_bool("unicode")),
+    };
+    configured.unwrap_or_else(|| {
+        let locale = ["LC_ALL", "LC_CTYPE", "LANG"]
+            .iter()
+            .find_map(|key| std::env::var(key).ok().filter(|value| !value.is_empty()))
+            .unwrap_or_default()
+            .to_ascii_uppercase();
+        locale.ends_with("UTF8") || locale.ends_with("UTF-8")
+    })
+}
+
 pub(crate) fn use_unicode(dir: &Path) -> bool {
-    rnpm_config::Config::load(Some(dir))
-        .ok()
-        .and_then(|config| config.get_bool("unicode"))
-        .unwrap_or_else(|| {
-            let locale = ["LC_ALL", "LC_CTYPE", "LANG"]
-                .iter()
-                .find_map(|key| std::env::var(key).ok().filter(|value| !value.is_empty()))
-                .unwrap_or_default()
-                .to_ascii_uppercase();
-            locale.ends_with("UTF8") || locale.ends_with("UTF-8")
-        })
+    use_unicode_with_config(dir, None)
 }
 
 /// True when npm's loglevel resolves to `silent` for this directory.
@@ -8172,6 +7815,7 @@ fn execute_run_sync_with_config(
     let ignore_scripts = ignore_scripts || config.get_bool("ignore-scripts").unwrap_or(false);
     let foreground_scripts =
         foreground_scripts || config.get_bool("foreground-scripts").unwrap_or(false);
+    let strict_sandbox = strict_sandbox || config.get_bool("strict-sandbox").unwrap_or(false);
 
     if !manifest.scripts.contains_key(&script) {
         if script == "start" && current_dir.join("server.js").exists() {
@@ -8394,6 +8038,19 @@ fn lifecycle_config_env_from_config(_dir: &Path, config: &rnpm_config::Config) -
         if source != "env" {
             env.insert(format!("npm_config_{}", key.replace('-', "_")), value);
         }
+    }
+    if !env.contains_key("npm_config_user_agent")
+        && std::env::var_os("npm_config_user_agent").is_none()
+    {
+        env.insert(
+            "npm_config_user_agent".into(),
+            config
+                .npmrc
+                .settings
+                .get("user-agent")
+                .cloned()
+                .unwrap_or_else(crate::node_info::npm_user_agent),
+        );
     }
     env
 }
@@ -8666,6 +8323,15 @@ fn execute_sync_command(
     current_dir: &Path,
     config: &rnpm_config::Config,
 ) -> Option<anyhow::Result<()>> {
+    execute_sync_command_inner(cli, current_dir, config, true)
+}
+
+fn execute_sync_command_inner(
+    cli: &mut Cli,
+    current_dir: &Path,
+    config: &rnpm_config::Config,
+    run_prechecks: bool,
+) -> Option<anyhow::Result<()>> {
     match &mut cli.command {
         Commands::Prefix { global } => {
             if *global {
@@ -8697,11 +8363,9 @@ fn execute_sync_command(
             }
             Some(Ok(()))
         }
-        Commands::Help { topic } => {
-            Some(execute_sync_help(topic))
-        }
+        Commands::Help { topic } => Some(execute_sync_help_with_config(topic, Some(config))),
         Commands::Completion { args } => {
-            Some(commands::completion::run(args.clone(), current_dir))
+            Some(commands::completion::run(std::mem::take(args), current_dir))
         }
         Commands::Version {
             newversion,
@@ -8709,9 +8373,10 @@ fn execute_sync_command(
             workspace,
             workspaces,
             ..
-        } if newversion.is_none() && !*workspaces && workspace.is_empty() => {
-            Some(crate::version::execute_bare_version(current_dir, *json).map_err(commands::version::wrap_version_error))
-        }
+        } if newversion.is_none() && !*workspaces && workspace.is_empty() => Some(
+            crate::version::execute_bare_version(current_dir, *json)
+                .map_err(commands::version::wrap_version_error),
+        ),
         Commands::List {
             packages,
             depth,
@@ -8750,8 +8415,10 @@ fn execute_sync_command(
                 std::process::exit(1);
             }
 
-            if let Err(e) = enforce_dev_engines_with_config(&target_dir, config) {
-                return Some(Err(e));
+            if run_prechecks {
+                if let Err(e) = enforce_dev_engines_with_config(&target_dir, config) {
+                    return Some(Err(e));
+                }
             }
 
             let cli_overrides = rnpm_config::get_process_cli_overrides();
@@ -8776,7 +8443,8 @@ fn execute_sync_command(
                 } else {
                     Vec::new()
                 };
-                let members = match select_workspace_members(&target_dir, &ws_filters, *workspace_root) {
+                let members = match select_workspace_members(&target_dir, &ws_filters, *workspace_root)
+                {
                     Ok(m) => m,
                     Err(e) => return Some(Err(e)),
                 };
@@ -8786,20 +8454,20 @@ fn execute_sync_command(
             }
 
             let opts = list::ListOptions {
-                packages: packages.clone(),
+                packages: std::mem::take(packages),
                 depth: *depth,
                 all: *all,
                 json: *json,
                 long: *long,
                 parseable: *parseable,
                 package_lock_only: *package_lock_only,
-                omit: omit.clone(),
+                omit: std::mem::take(omit),
                 is_global,
             };
             let code = if ws_in_overrides {
-                list::run_workspace_list(&target_dir, &opts)
+                list::run_workspace_list_with_config(&target_dir, &opts, config)
             } else {
-                list::run_list(&target_dir, &opts)
+                list::run_list_with_config(&target_dir, &opts, config)
             };
             match code {
                 Ok(0) => Some(Ok(())),
@@ -8810,16 +8478,410 @@ fn execute_sync_command(
                 Err(e) => Some(Err(e)),
             }
         }
+        Commands::Config { action } => Some(commands::config::run_with_config(
+            action.clone(),
+            current_dir.to_path_buf(),
+            Some(config),
+        )),
+        Commands::Get { key, extra_keys } => Some(commands::config::run_get_keys_with_config(
+            key.as_deref(),
+            extra_keys,
+            current_dir,
+            Some(config),
+        )),
+        Commands::Set {
+            args,
+            global,
+            location,
+        } => Some(commands::config::run_set_args(
+            args,
+            *global,
+            location.as_deref(),
+            current_dir,
+        )),
+        Commands::Pkg {
+            action,
+            prefix,
+            json,
+            workspace,
+            workspaces,
+            include_workspace_root,
+        } => Some(commands::pkg::run(
+            action.clone(),
+            prefix.clone(),
+            *json,
+            std::mem::take(workspace),
+            *workspaces,
+            *include_workspace_root,
+            current_dir.to_path_buf(),
+        )),
+        Commands::Link {
+            package,
+            workspace,
+            workspaces,
+            save,
+            save_dev,
+            save_optional,
+            save_peer,
+            save_prod,
+            no_save,
+        } => {
+            if run_prechecks {
+                if let Err(e) = enforce_dev_engines_with_config(current_dir, config) {
+                    return Some(Err(e));
+                }
+            }
+            let link_args = commands::link::LinkCommandArgs {
+                package: std::mem::take(package),
+                workspace: std::mem::take(workspace),
+                workspaces: *workspaces,
+                save: *save,
+                save_dev: *save_dev,
+                save_optional: *save_optional,
+                save_peer: *save_peer,
+                save_prod: *save_prod,
+                no_save: *no_save,
+            };
+            Some(commands::link::run_link(link_args, current_dir.to_path_buf()))
+        }
+        Commands::Unlink {
+            package,
+            workspace,
+            workspaces,
+        } => {
+            let unlink_args = commands::link::UnlinkCommandArgs {
+                package: std::mem::take(package),
+                workspace: std::mem::take(workspace),
+                workspaces: *workspaces,
+            };
+            Some(commands::link::run_unlink(unlink_args, current_dir.to_path_buf()))
+        }
+        Commands::Shrinkwrap => Some(commands::shrinkwrap::run(current_dir.to_path_buf())),
+        Commands::Explain { package, json } => {
+            if run_prechecks {
+                if let Err(e) = enforce_dev_engines_with_config(current_dir, config) {
+                    return Some(Err(e));
+                }
+            }
+            Some(explain::run_explain(current_dir, package, *json))
+        }
+        Commands::ApproveScripts {
+            packages,
+            all,
+            allow_scripts_pending,
+            json,
+        } => Some(commands::allow_scripts::run_approve_with_config(
+            current_dir,
+            packages,
+            *all,
+            *allow_scripts_pending,
+            *json,
+            Some(config),
+        )),
+        Commands::DenyScripts {
+            packages,
+            all,
+            allow_scripts_pending,
+            json,
+        } => Some(commands::allow_scripts::run_deny_with_config(
+            current_dir,
+            packages,
+            *all,
+            *allow_scripts_pending,
+            *json,
+            Some(config),
+        )),
+        Commands::InstallScripts {
+            action,
+            packages,
+            all,
+            json,
+            dry_run,
+        } => {
+            if run_prechecks {
+                rnpm_install::trash::cleanup_leftover_trash(current_dir);
+            }
+            Some(commands::allow_scripts::run_install_scripts_with_config(
+                current_dir,
+                action.as_deref(),
+                packages,
+                *all,
+                *json,
+                *dry_run,
+                Some(config),
+            ))
+        }
+        Commands::Bugs { packages, .. } => Some((|| -> anyhow::Result<()> {
+            let pkgs = if packages.is_empty() {
+                vec![".".to_string()]
+            } else {
+                packages.clone()
+            };
+            for package in pkgs {
+                let dir = resolve_local_package_dir(current_dir, &package)?;
+                let value = package_manifest_value(&dir)?;
+                let url = value
+                    .get("bugs")
+                    .and_then(|v| v.get("url"))
+                    .and_then(|v| v.as_str())
+                    .or_else(|| value.get("bugs").and_then(|v| v.as_str()))
+                    .unwrap_or("");
+                let name = value
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(&package);
+                if url.is_empty() {
+                    print_package_url_with_config(
+                        current_dir,
+                        name,
+                        "bugs",
+                        &format!("https://www.npmjs.com/package/{package}?activeTab=issues"),
+                        Some(config),
+                    );
+                } else {
+                    print_package_url_with_config(current_dir, name, "bugs", url, Some(config));
+                }
+            }
+            Ok(())
+        })()),
+        Commands::Docs { packages, .. } => Some((|| -> anyhow::Result<()> {
+            let pkgs = if packages.is_empty() {
+                vec![".".to_string()]
+            } else {
+                packages.clone()
+            };
+            for package in pkgs {
+                let dir = resolve_local_package_dir(current_dir, &package)?;
+                let value = package_manifest_value(&dir)?;
+                let url = value.get("homepage").and_then(|v| v.as_str()).unwrap_or("");
+                let name = value
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(&package);
+                if url.is_empty() {
+                    print_package_url_with_config(
+                        current_dir,
+                        name,
+                        "docs",
+                        &format!("https://www.npmjs.com/package/{package}?activeTab=readme"),
+                        Some(config),
+                    );
+                } else {
+                    print_package_url_with_config(current_dir, name, "docs", url, Some(config));
+                }
+            }
+            Ok(())
+        })()),
+        Commands::Repo { packages, .. } if packages.is_empty() => Some((|| -> anyhow::Result<()> {
+            let pkg_json = current_dir.join("package.json");
+            let value = std::fs::read_to_string(&pkg_json)
+                .ok()
+                .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok());
+            let repo = value
+                .as_ref()
+                .and_then(|v| v.get("repository"))
+                .and_then(|v| v.get("url").or(Some(v)))
+                .and_then(|v| v.as_str());
+            if let Some(r) = repo {
+                let name = value
+                    .as_ref()
+                    .and_then(|v| v.get("name"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                print_package_url_with_config(
+                    current_dir,
+                    name,
+                    "repo",
+                    r.trim_end_matches(".git"),
+                    Some(config),
+                );
+                Ok(())
+            } else {
+                Err(anyhow::anyhow!("npm error no repository"))
+            }
+        })()),
+        Commands::Explore {
+            package,
+            args,
+            shell,
+        } => Some(commands::explore::run_sync(
+            package.take(),
+            std::mem::take(args),
+            shell.take(),
+            current_dir.to_path_buf(),
+            Some(config),
+        )),
+        Commands::HelpSearch { terms, long, .. } => {
+            Some(commands::help_search::run_sync(terms, *long, None))
+        }
+        Commands::Cache { action, cache } => {
+            let needs_trash_cleanup = run_prechecks
+                && matches!(
+                    action,
+                    CacheAction::Clean { .. }
+                        | CacheAction::Npx {
+                            action: CacheNpxAction::Rm { .. },
+                            ..
+                        }
+                );
+            if needs_trash_cleanup {
+                rnpm_install::trash::cleanup_leftover_trash(current_dir);
+            }
+            commands::cache::run_sync_with_config(action, cache.as_deref(), current_dir, config)
+        }
+        Commands::Test {
+            args,
+            workspaces,
+            workspace,
+            if_present,
+            ignore_scripts,
+            foreground_scripts,
+            strict_sandbox,
+            workspace_root,
+        } => Some((|| -> anyhow::Result<()> {
+            if run_prechecks {
+                enforce_run_dev_engines_once_with_config(current_dir, config)?;
+            }
+            execute_run_with_config(
+                current_dir.to_path_buf(),
+                Some("test".to_string()),
+                std::mem::take(args),
+                *workspaces,
+                std::mem::take(workspace),
+                Vec::new(),
+                Vec::new(),
+                *if_present,
+                *ignore_scripts,
+                *foreground_scripts,
+                *strict_sandbox,
+                *workspace_root,
+                Some(config),
+            )
+        })()),
+        Commands::Start {
+            args,
+            workspaces,
+            workspace,
+            if_present,
+            ignore_scripts,
+            foreground_scripts,
+            strict_sandbox,
+            workspace_root,
+        } => Some((|| -> anyhow::Result<()> {
+            if run_prechecks {
+                enforce_run_dev_engines_once_with_config(current_dir, config)?;
+            }
+            execute_run_with_config(
+                current_dir.to_path_buf(),
+                Some("start".to_string()),
+                std::mem::take(args),
+                *workspaces,
+                std::mem::take(workspace),
+                Vec::new(),
+                Vec::new(),
+                *if_present,
+                *ignore_scripts,
+                *foreground_scripts,
+                *strict_sandbox,
+                *workspace_root,
+                Some(config),
+            )
+        })()),
+        Commands::Restart {
+            args,
+            workspaces,
+            workspace,
+            if_present,
+            ignore_scripts,
+            foreground_scripts,
+            strict_sandbox,
+            workspace_root,
+        } => Some((|| -> anyhow::Result<()> {
+            if run_prechecks {
+                enforce_run_dev_engines_once_with_config(current_dir, config)?;
+            }
+            execute_run_with_config(
+                current_dir.to_path_buf(),
+                Some("restart".to_string()),
+                std::mem::take(args),
+                *workspaces,
+                std::mem::take(workspace),
+                Vec::new(),
+                Vec::new(),
+                *if_present,
+                *ignore_scripts,
+                *foreground_scripts,
+                *strict_sandbox,
+                *workspace_root,
+                Some(config),
+            )
+        })()),
+        Commands::Stop {
+            args,
+            workspaces,
+            workspace,
+            if_present,
+            ignore_scripts,
+            foreground_scripts,
+            strict_sandbox,
+            workspace_root,
+        } => Some((|| -> anyhow::Result<()> {
+            if run_prechecks {
+                enforce_run_dev_engines_once_with_config(current_dir, config)?;
+            }
+            execute_run_with_config(
+                current_dir.to_path_buf(),
+                Some("stop".to_string()),
+                std::mem::take(args),
+                *workspaces,
+                std::mem::take(workspace),
+                Vec::new(),
+                Vec::new(),
+                *if_present,
+                *ignore_scripts,
+                *foreground_scripts,
+                *strict_sandbox,
+                *workspace_root,
+                Some(config),
+            )
+        })()),
+        Commands::Run {
+            script,
+            args,
+            workspaces,
+            workspace,
+            filter,
+            scope,
+            if_present,
+            ignore_scripts,
+            foreground_scripts,
+            strict_sandbox,
+            workspace_root,
+        } => Some(execute_run_with_config(
+            current_dir.to_path_buf(),
+            script.take(),
+            std::mem::take(args),
+            *workspaces,
+            std::mem::take(workspace),
+            std::mem::take(filter),
+            std::mem::take(scope),
+            *if_present,
+            *ignore_scripts,
+            *foreground_scripts,
+            *strict_sandbox,
+            *workspace_root,
+            Some(config),
+        )),
         _ => None,
     }
 }
 
 fn main() {
     // Suppress mimalloc warning output on stderr under high memory pressure
-    if std::env::var("MIMALLOC_SHOW_ERRORS").is_err() {
+    if std::env::var_os("MIMALLOC_SHOW_ERRORS").is_none() {
         std::env::set_var("MIMALLOC_SHOW_ERRORS", "0");
     }
-    if std::env::var("MIMALLOC_VERBOSE").is_err() {
+    if std::env::var_os("MIMALLOC_VERBOSE").is_none() {
         std::env::set_var("MIMALLOC_VERBOSE", "0");
     }
 
@@ -8848,12 +8910,20 @@ fn main() {
         .map(|a| npx::is_npx_argv0(a))
         .unwrap_or(false);
 
+    if !is_npx
+        && raw_args_vec.len() == 2
+        && matches!(raw_args_vec[1].as_str(), "--version" | "-v" | "-V")
+    {
+        println!("{}", crate::version::NPM_VERSION);
+        std::process::exit(0);
+    }
+
     let effective_args: Vec<String> = if is_npx {
         let mut new_args = vec![raw_args_vec[0].clone()];
         new_args.extend(npx::translate_npx_args(&raw_args_vec[1..]));
         new_args
     } else {
-        raw_args_vec
+        raw_args_vec.clone()
     };
 
     let (filtered_args, _scoped_registries) = extract_scoped_registries(effective_args);
@@ -8868,11 +8938,15 @@ fn main() {
         std::process::exit(1);
     }
 
-    let filtered_args = preprocess_cli_args(filtered_args);
+    let (filtered_args, cached_cmd) = preprocess_cli_args_with_cmd(filtered_args);
     let inv_cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let ambient_config = rnpm_config::Config::load(Some(&inv_cwd)).unwrap_or_default();
-    if warn_workspaces && !matches!(ambient_config.get("loglevel"), Some("silent" | "error")) {
-        eprintln!("npm warn -ws is not a valid single-hyphen cli flag and will be removed in the future");
+    let mut ambient_config: Option<rnpm_config::Config> = None;
+    if warn_workspaces {
+        let cfg = rnpm_config::Config::load(Some(&inv_cwd)).unwrap_or_default();
+        if !matches!(cfg.get("loglevel"), Some("silent" | "error")) {
+            eprintln!("npm warn -ws is not a valid single-hyphen cli flag and will be removed in the future");
+        }
+        ambient_config = Some(cfg);
     }
 
     // Ultra-fast path for standard `rnpm run <script>` without clap AST building
@@ -8938,68 +9012,14 @@ fn main() {
 
         if let Some(script) = script_name {
             let cli_overrides = rnpm_config::get_process_cli_overrides();
-            let current_dir = apply_cli_prefix(
-                inv_cwd.clone(),
-                cli_overrides.as_ref(),
-            );
-            if let Some(ref o) = cli_overrides {
-                if let Some(shell) = o.get("script-shell") {
-                    if shell == "true" {
-                        eprintln!("npm error code ENOENT\nnpm error syscall spawn true");
-                        std::process::exit(1);
-                    }
+            let current_dir = apply_cli_prefix(inv_cwd.clone(), cli_overrides.as_ref());
+            let run_config = match ambient_config {
+                Some(cfg)
+                    if should_reuse_ambient_config(&current_dir, &inv_cwd, cli_overrides.as_ref()) =>
+                {
+                    cfg
                 }
-            }
-            let has_script_overrides = cli_overrides
-                .as_ref()
-                .map(|o| {
-                    o.contains_key("ignore-scripts")
-                        || o.contains_key("foreground-scripts")
-                        || o.contains_key("strict-sandbox")
-                })
-                .unwrap_or(false);
-
-            let (effective_ignore, effective_foreground, effective_strict) = if has_script_overrides
-            {
-                let overrides = cli_overrides.as_ref().unwrap();
-                let ig = ignore_scripts
-                    || overrides
-                        .get("ignore-scripts")
-                        .map(|v| v == "true" || v == "1")
-                        .unwrap_or(false);
-                let fg = foreground_scripts
-                    || overrides
-                        .get("foreground-scripts")
-                        .map(|v| v == "true" || v == "1")
-                        .unwrap_or(false);
-                let ss = strict_sandbox
-                    || overrides
-                        .get("strict-sandbox")
-                        .map(|v| v == "true" || v == "1")
-                        .unwrap_or(false);
-                (ig, fg, ss)
-            } else if let Ok(npmrc_text) = std::fs::read_to_string(current_dir.join(".npmrc")) {
-                let ig = ignore_scripts
-                    || npmrc_text
-                        .lines()
-                        .any(|l| l.trim().starts_with("ignore-scripts=true"));
-                let fg = foreground_scripts
-                    || npmrc_text
-                        .lines()
-                        .any(|l| l.trim().starts_with("foreground-scripts=true"));
-                let ss = strict_sandbox
-                    || npmrc_text
-                        .lines()
-                        .any(|l| l.trim().starts_with("strict-sandbox=true"));
-                (ig, fg, ss)
-            } else {
-                (ignore_scripts, foreground_scripts, strict_sandbox)
-            };
-
-            let run_config = if should_reuse_ambient_config(&current_dir, &inv_cwd, cli_overrides.as_ref()) {
-                ambient_config.clone()
-            } else {
-                rnpm_config::Config::load(Some(&current_dir)).unwrap_or_default()
+                _ => rnpm_config::Config::load(Some(&current_dir)).unwrap_or_default(),
             };
 
             if let Err(err) = execute_run_sync_with_config(
@@ -9007,9 +9027,9 @@ fn main() {
                 script,
                 script_args,
                 if_present,
-                effective_ignore,
-                effective_foreground,
-                effective_strict,
+                ignore_scripts,
+                foreground_scripts,
+                strict_sandbox,
                 &run_config,
             ) {
                 finish_cli_error(&err);
@@ -9018,7 +9038,15 @@ fn main() {
         }
     }
 
-    let mut cli = match Cli::try_parse_from(&filtered_args) {
+    let parse_res = match cached_cmd {
+        Some(mut cmd) => cmd
+            .try_get_matches_from_mut(&filtered_args)
+            .and_then(|mut matches| {
+                <Cli as clap::FromArgMatches>::from_arg_matches_mut(&mut matches)
+            }),
+        None => Cli::try_parse_from(&filtered_args),
+    };
+    let mut cli = match parse_res {
         Ok(c) => c,
         Err(e) => {
             if !e.use_stderr() {
@@ -9046,38 +9074,26 @@ fn main() {
     };
 
     let cli_overrides = rnpm_config::get_process_cli_overrides();
-    let current_dir = apply_cli_prefix(inv_cwd.clone(), cli_overrides.as_ref());
-    let effective_config = if should_reuse_ambient_config(&current_dir, &inv_cwd, cli_overrides.as_ref()) {
-        ambient_config
-    } else {
-        rnpm_config::Config::load(Some(&current_dir)).unwrap_or_default()
+    let current_dir = resolve_command_dir(&cli.command, &inv_cwd, cli_overrides.as_ref());
+    let effective_config = match ambient_config {
+        Some(cfg) if should_reuse_ambient_config(&current_dir, &inv_cwd, cli_overrides.as_ref()) => {
+            cfg
+        }
+        _ => rnpm_config::Config::load(Some(&current_dir)).unwrap_or_default(),
     };
-
-    let command_name = cli.command.command_name();
-    let mut agent = effective_config
-        .npmrc
-        .settings
-        .get("user-agent")
-        .cloned()
-        .unwrap_or_else(rnpm_lifecycle::npm_user_agent);
-    if effective_config.get_bool("workspaces") == Some(true)
-        || effective_config.get("workspace").is_some_and(|v| !v.is_empty())
-    {
-        agent = agent.replace("workspaces/false", "workspaces/true");
-    }
-    rnpm_registry::client::set_cli_request_context(command_name.to_string(), agent);
 
     // npm warns whenever force is in effect, whatever the command.
     {
-        let raw: Vec<String> = std::env::args().skip(1).take_while(|a| a != "--").collect();
-        let silent = raw
-            .iter()
-            .any(|a| a == "-s" || a == "--silent" || a == "--loglevel=silent");
-        let forced = raw
-            .iter()
-            .any(|a| a == "--force" || a == "-f" || a == "--force=true")
-            || effective_config.get_bool("force").unwrap_or(false);
-        if forced && !silent {
+        let mut silent = false;
+        let mut forced = false;
+        for a in raw_args_vec.iter().skip(1).take_while(|a| a.as_str() != "--") {
+            if a == "-s" || a == "--silent" || a == "--loglevel=silent" {
+                silent = true;
+            } else if a == "--force" || a == "-f" || a == "--force=true" {
+                forced = true;
+            }
+        }
+        if !silent && (forced || effective_config.get_bool("force").unwrap_or(false)) {
             eprintln!("npm warn using --force Recommended protections disabled.");
         }
     }
@@ -9088,93 +9104,6 @@ fn main() {
         }
     }
 
-    // Fast synchronous path for standard `rnpm run <script>` without tokio runtime overhead
-    if let Commands::Run {
-        ref script,
-        ref args,
-        workspaces,
-        ref workspace,
-        ref filter,
-        ref scope,
-        if_present,
-        ignore_scripts,
-        foreground_scripts,
-        strict_sandbox,
-        workspace_root,
-    } = cli.command
-    {
-        let has_filter = !workspace.is_empty() || !filter.is_empty() || !scope.is_empty();
-        if !workspaces && !has_filter && !workspace_root && script.is_some() {
-            if let Some(ref o) = cli_overrides {
-                if let Some(shell) = o.get("script-shell") {
-                    if shell == "true" {
-                        eprintln!("npm error code ENOENT\nnpm error syscall spawn true");
-                        std::process::exit(1);
-                    }
-                }
-            }
-            let has_script_overrides = cli_overrides
-                .as_ref()
-                .map(|o| {
-                    o.contains_key("ignore-scripts")
-                        || o.contains_key("foreground-scripts")
-                        || o.contains_key("strict-sandbox")
-                })
-                .unwrap_or(false);
-
-            let (effective_ignore, effective_foreground, effective_strict) = if has_script_overrides
-            {
-                let overrides = cli_overrides.as_ref().unwrap();
-                let ig = ignore_scripts
-                    || overrides
-                        .get("ignore-scripts")
-                        .map(|v| v == "true" || v == "1")
-                        .unwrap_or(false);
-                let fg = foreground_scripts
-                    || overrides
-                        .get("foreground-scripts")
-                        .map(|v| v == "true" || v == "1")
-                        .unwrap_or(false);
-                let ss = strict_sandbox
-                    || overrides
-                        .get("strict-sandbox")
-                        .map(|v| v == "true" || v == "1")
-                        .unwrap_or(false);
-                (ig, fg, ss)
-            } else if let Ok(npmrc_text) = std::fs::read_to_string(current_dir.join(".npmrc")) {
-                let ig = ignore_scripts
-                    || npmrc_text
-                        .lines()
-                        .any(|l| l.trim().starts_with("ignore-scripts=true"));
-                let fg = foreground_scripts
-                    || npmrc_text
-                        .lines()
-                        .any(|l| l.trim().starts_with("foreground-scripts=true"));
-                let ss = strict_sandbox
-                    || npmrc_text
-                        .lines()
-                        .any(|l| l.trim().starts_with("strict-sandbox=true"));
-                (ig, fg, ss)
-            } else {
-                (ignore_scripts, foreground_scripts, strict_sandbox)
-            };
-
-            if let Err(err) = execute_run_sync_with_config(
-                current_dir,
-                script.as_ref().unwrap().clone(),
-                args.clone(),
-                if_present,
-                effective_ignore,
-                effective_foreground,
-                effective_strict,
-                &effective_config,
-            ) {
-                finish_cli_error(&err);
-            }
-            std::process::exit(0);
-        }
-    }
-
     // Fast path: synchronous commands executing directly on the main thread without spinning up Tokio
     if let Some(res) = execute_sync_command(&mut cli, &current_dir, &effective_config) {
         if let Err(err) = res {
@@ -9182,6 +9111,20 @@ fn main() {
         }
         std::process::exit(0);
     }
+
+    let command_name = cli.command.command_name();
+    let mut agent = effective_config
+        .npmrc
+        .settings
+        .get("user-agent")
+        .cloned()
+        .unwrap_or_else(crate::node_info::npm_user_agent);
+    if effective_config.get_bool("workspaces") == Some(true)
+        || effective_config.get("workspace").is_some_and(|v| !v.is_empty())
+    {
+        agent = agent.replace("workspaces/false", "workspaces/true");
+    }
+    rnpm_registry::client::set_cli_request_context(command_name.to_string(), agent);
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()

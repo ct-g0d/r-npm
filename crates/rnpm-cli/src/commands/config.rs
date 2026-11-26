@@ -5,7 +5,16 @@ use crate::ConfigAction;
 use anyhow::Result;
 use std::path::{Path, PathBuf};
 
+#[allow(dead_code)]
 pub(crate) fn run(action: ConfigAction, current_dir: PathBuf) -> Result<()> {
+    run_with_config(action, current_dir, None)
+}
+
+pub(crate) fn run_with_config(
+    action: ConfigAction,
+    current_dir: PathBuf,
+    config: Option<&rnpm_config::Config>,
+) -> Result<()> {
     match action {
         ConfigAction::Set {
             args,
@@ -13,7 +22,7 @@ pub(crate) fn run(action: ConfigAction, current_dir: PathBuf) -> Result<()> {
             location,
         } => run_set_args(&args, global, location.as_deref(), &current_dir)?,
         ConfigAction::Get { key, extra_keys } => {
-            run_get_keys(key.as_deref(), &extra_keys, &current_dir)?
+            run_get_keys_with_config(key.as_deref(), &extra_keys, &current_dir, config)?
         }
         ConfigAction::Delete {
             key,
@@ -21,7 +30,7 @@ pub(crate) fn run(action: ConfigAction, current_dir: PathBuf) -> Result<()> {
             global,
             location,
         } => run_delete_keys(&key, &extra_keys, global, location.as_deref(), &current_dir)?,
-        ConfigAction::List { json, long } => report::run(json, long, &current_dir)?,
+        ConfigAction::List { json, long } => report::run(json, long, &current_dir, config)?,
         ConfigAction::Edit {
             editor,
             global,
@@ -98,13 +107,30 @@ pub(crate) fn run_set(
 }
 
 /// `npm config get a b c` prints `key=value` lines; one key prints the value.
+#[allow(dead_code)]
 pub(crate) fn run_get_keys(key: Option<&str>, extra: &[String], current_dir: &Path) -> Result<()> {
+    run_get_keys_with_config(key, extra, current_dir, None)
+}
+
+pub(crate) fn run_get_keys_with_config(
+    key: Option<&str>,
+    extra: &[String],
+    current_dir: &Path,
+    config: Option<&rnpm_config::Config>,
+) -> Result<()> {
     if extra.is_empty() {
-        return run_get(key, current_dir);
+        return run_get_with_config(key, current_dir, config);
     }
-    let config = rnpm_config::Config::load(Some(current_dir))?;
+    let loaded_config;
+    let config_ref = match config {
+        Some(cfg) => cfg,
+        None => {
+            loaded_config = rnpm_config::Config::load(Some(current_dir))?;
+            &loaded_config
+        }
+    };
     for k in key.into_iter().chain(extra.iter().map(String::as_str)) {
-        let value = config
+        let value = config_ref
             .get(k)
             .map(str::to_string)
             .or_else(|| rnpm_config::npm_default(k))
@@ -114,10 +140,26 @@ pub(crate) fn run_get_keys(key: Option<&str>, extra: &[String], current_dir: &Pa
     Ok(())
 }
 
+#[allow(dead_code)]
 pub(crate) fn run_get(key: Option<&str>, current_dir: &Path) -> Result<()> {
+    run_get_with_config(key, current_dir, None)
+}
+
+fn run_get_with_config(
+    key: Option<&str>,
+    current_dir: &Path,
+    config: Option<&rnpm_config::Config>,
+) -> Result<()> {
     if let Some(key_str) = key {
-        let config = rnpm_config::Config::load(Some(current_dir))?;
-        match config
+        let loaded_config;
+        let config_ref = match config {
+            Some(cfg) => cfg,
+            None => {
+                loaded_config = rnpm_config::Config::load(Some(current_dir))?;
+                &loaded_config
+            }
+        };
+        match config_ref
             .get(key_str)
             .map(str::to_string)
             .or_else(|| rnpm_config::npm_default(key_str))
@@ -126,7 +168,7 @@ pub(crate) fn run_get(key: Option<&str>, current_dir: &Path) -> Result<()> {
             None => println!("undefined"),
         }
     } else {
-        report::run(false, false, current_dir)?;
+        report::run(false, false, current_dir, config)?;
     }
     Ok(())
 }

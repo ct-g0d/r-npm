@@ -120,13 +120,71 @@ impl Config {
     }
 
     pub fn get(&self, key: &str) -> Option<&str> {
+        if let Some(val) = self.npmrc.settings.get(key) {
+            return Some(val.as_str());
+        }
+        if key == "registry" {
+            return Some(self.npmrc.registry.as_str());
+        }
+        self.get_normalized_fallback(key)
+    }
+
+    fn get_normalized_fallback(&self, key: &str) -> Option<&str> {
+        let bytes = key.as_bytes();
+        if bytes.len() <= 128 {
+            let mut lower_buf = [0u8; 128];
+            let mut dashed_buf = [0u8; 128];
+            let mut under_buf = [0u8; 128];
+            let mut has_upper = false;
+            let mut has_under = false;
+            let mut has_dash = false;
+            for (i, &b) in bytes.iter().enumerate() {
+                let lb = b.to_ascii_lowercase();
+                if lb != b {
+                    has_upper = true;
+                }
+                lower_buf[i] = lb;
+                if lb == b'_' {
+                    has_under = true;
+                    dashed_buf[i] = b'-';
+                    under_buf[i] = b'_';
+                } else if lb == b'-' {
+                    has_dash = true;
+                    dashed_buf[i] = b'-';
+                    under_buf[i] = b'_';
+                } else {
+                    dashed_buf[i] = lb;
+                    under_buf[i] = lb;
+                }
+            }
+            let len = bytes.len();
+            if has_upper {
+                let lower = std::str::from_utf8(&lower_buf[..len]).expect("valid utf8");
+                if let Some(val) = self.npmrc.settings.get(lower) {
+                    return Some(val.as_str());
+                }
+            }
+            let dashed = std::str::from_utf8(&dashed_buf[..len]).expect("valid utf8");
+            if has_under {
+                if let Some(val) = self.npmrc.settings.get(dashed) {
+                    return Some(val.as_str());
+                }
+            }
+            if has_dash {
+                let underscored = std::str::from_utf8(&under_buf[..len]).expect("valid utf8");
+                if let Some(val) = self.npmrc.settings.get(underscored) {
+                    return Some(val.as_str());
+                }
+            }
+            return (dashed == "registry").then(|| self.npmrc.registry.as_str());
+        }
+
         let key_lower = key.to_ascii_lowercase();
         let dashed = key_lower.replace('_', "-");
         let underscored = key_lower.replace('-', "_");
         self.npmrc
             .settings
-            .get(key)
-            .or_else(|| self.npmrc.settings.get(&key_lower))
+            .get(&key_lower)
             .or_else(|| self.npmrc.settings.get(&dashed))
             .or_else(|| self.npmrc.settings.get(&underscored))
             .map(|val| val.as_str())
@@ -134,12 +192,24 @@ impl Config {
     }
 
     pub fn get_bool(&self, key: &str) -> Option<bool> {
-        self.get(key)
-            .and_then(|val| match val.trim().to_ascii_lowercase().as_str() {
-                "true" | "1" | "yes" | "on" => Some(true),
-                "false" | "0" | "no" | "off" => Some(false),
-                _ => None,
-            })
+        self.get(key).and_then(|val| {
+            let trimmed = val.trim();
+            if trimmed.eq_ignore_ascii_case("true")
+                || trimmed == "1"
+                || trimmed.eq_ignore_ascii_case("yes")
+                || trimmed.eq_ignore_ascii_case("on")
+            {
+                Some(true)
+            } else if trimmed.eq_ignore_ascii_case("false")
+                || trimmed == "0"
+                || trimmed.eq_ignore_ascii_case("no")
+                || trimmed.eq_ignore_ascii_case("off")
+            {
+                Some(false)
+            } else {
+                None
+            }
+        })
     }
 
     pub fn proxy(&self) -> Option<&str> {
@@ -263,17 +333,16 @@ impl Config {
             Some(now_ms.saturating_sub(delta_ms))
         };
 
-        let layer_lookup = |settings: &BTreeMap<String, String>, key: &str| -> Option<String> {
-            let key_lower = key.to_ascii_lowercase();
-            let dashed = key_lower.replace('_', "-");
-            let underscored = key_lower.replace('-', "_");
-            settings
-                .get(key)
-                .or_else(|| settings.get(&key_lower))
-                .or_else(|| settings.get(&dashed))
-                .or_else(|| settings.get(&underscored))
-                .cloned()
-        };
+        fn layer_lookup<'a>(settings: &'a BTreeMap<String, String>, key: &str) -> Option<&'a str> {
+            match key {
+                "before" => settings.get("before").map(String::as_str),
+                "min-release-age" => settings
+                    .get("min-release-age")
+                    .or_else(|| settings.get("min_release_age"))
+                    .map(String::as_str),
+                _ => settings.get(key).map(String::as_str),
+            }
+        }
 
         if !self.layers.is_empty() {
             let layer_priority = |name: &str| -> u8 {
@@ -298,9 +367,9 @@ impl Config {
 
                 if before_opt.is_some() || age_opt.is_some() {
                     if let Some(b_val) = before_opt {
-                        return parse_before_val(&b_val);
+                        return parse_before_val(b_val);
                     } else if let Some(a_val) = age_opt {
-                        return parse_age_val(&a_val);
+                        return parse_age_val(a_val);
                     }
                 }
             }
@@ -362,9 +431,17 @@ impl Config {
     }
 
     pub fn load_with_options(options: ConfigOptions<'_>) -> Result<Self, ConfigError> {
+        let (process_env, process_npm_vars) = if options.env_vars.is_none() {
+            let (snap, vars) = ProcessEnvSnapshot::capture();
+            (Some(snap), Some(vars))
+        } else {
+            (None, None)
+        };
         let env_lookup = |var_name: &str| -> Option<String> {
             if let Some(ref map) = options.env_vars {
                 map.get(var_name).cloned()
+            } else if let Some(ref snap) = process_env {
+                snap.get(var_name)
             } else {
                 env::var(var_name).ok()
             }
@@ -378,13 +455,11 @@ impl Config {
             .builtin_config
             .clone()
             .or_else(|| {
-                cli_map_opt
-                    .as_ref()
-                    .and_then(|cli| {
-                        cli.get("builtinconfig")
-                            .or_else(|| cli.get("--builtinconfig"))
-                            .map(PathBuf::from)
-                    })
+                cli_map_opt.as_ref().and_then(|cli| {
+                    cli.get("builtinconfig")
+                        .or_else(|| cli.get("--builtinconfig"))
+                        .map(PathBuf::from)
+                })
             })
             .or_else(|| {
                 env_lookup("npm_config_builtinconfig")
@@ -393,14 +468,15 @@ impl Config {
             });
 
         if let Some(path) = builtin_config_path {
-            if path.as_os_str() != "false" && !path.as_os_str().is_empty() && path.exists() {
-                let builtin_config = Npmrc::from_file(&path)?;
-                layers.push(ConfigLayer {
-                    name: "builtin".to_string(),
-                    source: Some(path),
-                    settings: builtin_config.scrubbed_settings(),
-                });
-                base_npmrc.merge(builtin_config);
+            if path.as_os_str() != "false" && !path.as_os_str().is_empty() {
+                if let Some(builtin_config) = Npmrc::from_file_if_exists(&path)? {
+                    layers.push(ConfigLayer {
+                        name: "builtin".to_string(),
+                        source: Some(path),
+                        settings: builtin_config.scrubbed_settings(),
+                    });
+                    base_npmrc.merge(builtin_config);
+                }
             }
         }
 
@@ -418,39 +494,57 @@ impl Config {
                 })
                 .unwrap_or(false);
 
-        let global_config_path = if disable_global {
-            None
-        } else {
-            options
+        if !disable_global {
+            let explicit_global = options
                 .globalconfig
                 .clone()
                 .or_else(get_process_globalconfig)
                 .or_else(|| {
-                    cli_map_opt
-                        .as_ref()
-                        .and_then(|cli| {
-                            cli.get("globalconfig")
-                                .or_else(|| cli.get("--globalconfig"))
-                                .map(PathBuf::from)
-                        })
+                    cli_map_opt.as_ref().and_then(|cli| {
+                        cli.get("globalconfig")
+                            .or_else(|| cli.get("--globalconfig"))
+                            .map(PathBuf::from)
+                    })
                 })
                 .or_else(|| {
                     env_lookup("npm_config_globalconfig")
                         .or_else(|| env_lookup("NPM_CONFIG_GLOBALCONFIG"))
                         .map(PathBuf::from)
-                })
-                .or_else(|| find_global_npmrc_with_env(env_lookup))
-        };
-
-        if let Some(path) = global_config_path {
-            if path.as_os_str() != "false" && !path.as_os_str().is_empty() && path.exists() {
-                let global_config = Npmrc::from_file(&path)?;
-                layers.push(ConfigLayer {
-                    name: "global".to_string(),
-                    source: Some(path),
-                    settings: global_config.scrubbed_settings(),
                 });
-                base_npmrc.merge(global_config);
+
+            if let Some(path) = explicit_global {
+                if path.as_os_str() != "false" && !path.as_os_str().is_empty() {
+                    if let Some(global_config) = Npmrc::from_file_if_exists(&path)? {
+                        layers.push(ConfigLayer {
+                            name: "global".to_string(),
+                            source: Some(path),
+                            settings: global_config.scrubbed_settings(),
+                        });
+                        base_npmrc.merge(global_config);
+                    }
+                }
+            } else {
+                let primary_global = find_global_prefix_with_env(env_lookup)
+                    .join("etc")
+                    .join("npmrc");
+                if let Some(global_config) = Npmrc::from_file_if_exists(&primary_global)? {
+                    layers.push(ConfigLayer {
+                        name: "global".to_string(),
+                        source: Some(primary_global),
+                        settings: global_config.scrubbed_settings(),
+                    });
+                    base_npmrc.merge(global_config);
+                } else {
+                    let etc_path = PathBuf::from("/etc/npmrc");
+                    if let Some(global_config) = Npmrc::from_file_if_exists(&etc_path)? {
+                        layers.push(ConfigLayer {
+                            name: "global".to_string(),
+                            source: Some(etc_path),
+                            settings: global_config.scrubbed_settings(),
+                        });
+                        base_npmrc.merge(global_config);
+                    }
+                }
             }
         }
 
@@ -476,13 +570,11 @@ impl Config {
                 .clone()
                 .or_else(get_process_userconfig)
                 .or_else(|| {
-                    cli_map_opt
-                        .as_ref()
-                        .and_then(|cli| {
-                            cli.get("userconfig")
-                                .or_else(|| cli.get("--userconfig"))
-                                .map(PathBuf::from)
-                        })
+                    cli_map_opt.as_ref().and_then(|cli| {
+                        cli.get("userconfig")
+                            .or_else(|| cli.get("--userconfig"))
+                            .map(PathBuf::from)
+                    })
                 })
                 .or_else(|| {
                     env_lookup("npm_config_userconfig")
@@ -494,26 +586,29 @@ impl Config {
         };
 
         if let Some(path) = user_config_path {
-            if path.as_os_str() != "false" && !path.as_os_str().is_empty() && path.exists() {
-                let user_config = Npmrc::from_file(&path)?;
-                layers.push(ConfigLayer {
-                    name: "user".to_string(),
-                    source: Some(path),
-                    settings: user_config.scrubbed_settings(),
-                });
-                base_npmrc.merge(user_config);
+            if path.as_os_str() != "false" && !path.as_os_str().is_empty() {
+                if let Some(user_config) = Npmrc::from_file_if_exists(&path)? {
+                    layers.push(ConfigLayer {
+                        name: "user".to_string(),
+                        source: Some(path),
+                        settings: user_config.scrubbed_settings(),
+                    });
+                    base_npmrc.merge(user_config);
+                }
             }
         }
 
-        let ws_root = options
-            .workspace_root
-            .map(|path| path.to_path_buf())
-            .or_else(|| options.project_dir.and_then(find_workspace_root));
+        let ws_root = if let Some(path) = options.workspace_root {
+            Some(path.to_path_buf())
+        } else if let Some(dir) = options.project_dir {
+            find_workspace_root_with_npmrc(dir)
+        } else {
+            None
+        };
 
         if let Some(ws_path) = ws_root {
             let ws_npmrc_path = ws_path.join(".npmrc");
-            if ws_npmrc_path.exists() {
-                let ws_config = Npmrc::from_file(&ws_npmrc_path)?;
+            if let Some(ws_config) = Npmrc::from_file_if_exists(&ws_npmrc_path)? {
                 layers.push(ConfigLayer {
                     name: "workspace".to_string(),
                     source: Some(ws_npmrc_path),
@@ -525,8 +620,7 @@ impl Config {
 
         if let Some(dir) = options.project_dir {
             let project_npmrc_path = dir.join(".npmrc");
-            if project_npmrc_path.exists() {
-                let project_config = Npmrc::from_file(&project_npmrc_path)?;
+            if let Some(project_config) = Npmrc::from_file_if_exists(&project_npmrc_path)? {
                 layers.push(ConfigLayer {
                     name: "project".to_string(),
                     source: Some(project_npmrc_path),
@@ -536,69 +630,14 @@ impl Config {
             }
         }
 
-        let all_env: BTreeMap<String, String> = if let Some(ref map) = options.env_vars {
-            map.clone()
-        } else {
-            let mut filtered = BTreeMap::new();
-            for (k, v) in env::vars() {
-                if let Some(prefix) = k.get(..11) {
-                    if prefix.eq_ignore_ascii_case("npm_config_") {
-                        filtered.insert(k, v);
-                    }
-                }
-            }
-            filtered
-        };
-
         let mut env_layer_settings = BTreeMap::new();
-        for (raw_key, value) in all_env {
-            let rest_opt = if let Some(prefix) = raw_key.get(..11) {
-                if prefix.eq_ignore_ascii_case("npm_config_") {
-                    raw_key.get(11..)
-                } else {
-                    None
-                }
-            } else {
-                None
-            };
-            if let Some(rest) = rest_opt {
-                if rest.is_empty() {
-                    continue;
-                }
-                // In npm, nerf-darted keys (e.g. //registry.npmjs.org/:_authToken)
-                // preserve case and underscores without normalizing.
-                if rest.starts_with("//") {
-                    let val_display = if crate::npmrc::is_sensitive_credential_key(rest) {
-                        crate::npmrc::mask_credential(&value)
-                    } else {
-                        value.clone()
-                    };
-                    env_layer_settings.insert(rest.to_string(), val_display);
-                    base_npmrc.set(rest, &value)?;
-                } else {
-                    let lower = rest.to_ascii_lowercase();
-                    let (prefix, body) = if let Some(stripped) = lower.strip_prefix('_') {
-                        ("_", stripped)
-                    } else {
-                        ("", lower.as_str())
-                    };
-                    let dashed = format!("{prefix}{}", body.replace('_', "-"));
-                    let val_display = if crate::npmrc::is_sensitive_credential_key(&dashed) {
-                        crate::npmrc::mask_credential(&value)
-                    } else {
-                        value.clone()
-                    };
-                    env_layer_settings.insert(dashed.clone(), val_display);
-                    base_npmrc.set(&dashed, &value)?;
-                    if dashed != rest {
-                        let _ = base_npmrc.set(rest, &value);
-                    }
-                    if dashed == "no-proxy" || dashed == "no_proxy" {
-                        let _ = base_npmrc.set("noproxy", &value);
-                    } else if dashed == "noproxy" {
-                        let _ = base_npmrc.set("no-proxy", &value);
-                    }
-                }
+        if let Some(ref map) = options.env_vars {
+            for (raw_key, value) in map {
+                apply_env_entry(raw_key, value, &mut env_layer_settings, &mut base_npmrc)?;
+            }
+        } else if let Some(vars) = process_npm_vars {
+            for (raw_key, value) in &vars {
+                apply_env_entry(raw_key, value, &mut env_layer_settings, &mut base_npmrc)?;
             }
         }
 
@@ -717,38 +756,402 @@ impl Config {
     }
 }
 
-pub fn find_workspace_root(project_dir: &Path) -> Option<PathBuf> {
-    let project_dir_canon = project_dir
-        .canonicalize()
-        .unwrap_or_else(|_| project_dir.to_path_buf());
+#[derive(Default)]
+struct ProcessEnvSnapshot {
+    npm_config_builtinconfig: Option<String>,
+    npm_config_globalconfig: Option<String>,
+    npm_config_userconfig: Option<String>,
+    npm_config_prefix: Option<String>,
+    npm_config_builtinconfig_upper: Option<String>,
+    npm_config_globalconfig_upper: Option<String>,
+    npm_config_userconfig_upper: Option<String>,
+    npm_config_prefix_upper: Option<String>,
+    prefix: Option<String>,
+    appdata: Option<String>,
+    userprofile: Option<String>,
+    home: Option<String>,
+    userconfig: Option<String>,
+    https_proxy: Option<String>,
+    https_proxy_lower: Option<String>,
+    http_proxy: Option<String>,
+    http_proxy_lower: Option<String>,
+    no_proxy: Option<String>,
+    no_proxy_lower: Option<String>,
+}
+
+impl ProcessEnvSnapshot {
+    fn capture() -> (Self, Vec<(String, String)>) {
+        let mut snap = Self::default();
+        let mut npm_config_vars = Vec::new();
+        for (k_os, v_os) in env::vars_os() {
+            let kb = k_os.as_encoded_bytes();
+            if kb.len() >= 11 && kb[..11].eq_ignore_ascii_case(b"npm_config_") {
+                let k = k_os.to_string_lossy().into_owned();
+                let v = v_os.to_string_lossy().into_owned();
+                let rest = &k.as_bytes()[11..];
+                if cfg!(windows) {
+                    if rest.eq_ignore_ascii_case(b"builtinconfig") {
+                        snap.npm_config_builtinconfig = Some(v.clone());
+                    } else if rest.eq_ignore_ascii_case(b"globalconfig") {
+                        snap.npm_config_globalconfig = Some(v.clone());
+                    } else if rest.eq_ignore_ascii_case(b"userconfig") {
+                        snap.npm_config_userconfig = Some(v.clone());
+                    } else if rest.eq_ignore_ascii_case(b"prefix") {
+                        snap.npm_config_prefix = Some(v.clone());
+                    }
+                } else {
+                    match k.as_str() {
+                        "npm_config_builtinconfig" => snap.npm_config_builtinconfig = Some(v.clone()),
+                        "NPM_CONFIG_BUILTINCONFIG" => {
+                            snap.npm_config_builtinconfig_upper = Some(v.clone());
+                        }
+                        "npm_config_globalconfig" => snap.npm_config_globalconfig = Some(v.clone()),
+                        "NPM_CONFIG_GLOBALCONFIG" => {
+                            snap.npm_config_globalconfig_upper = Some(v.clone());
+                        }
+                        "npm_config_userconfig" => snap.npm_config_userconfig = Some(v.clone()),
+                        "NPM_CONFIG_USERCONFIG" => snap.npm_config_userconfig_upper = Some(v.clone()),
+                        "npm_config_prefix" => snap.npm_config_prefix = Some(v.clone()),
+                        "NPM_CONFIG_PREFIX" => snap.npm_config_prefix_upper = Some(v.clone()),
+                        _ => {}
+                    }
+                }
+                npm_config_vars.push((k, v));
+                continue;
+            }
+
+            if kb.len() > 11 {
+                continue;
+            }
+            if cfg!(windows) {
+                if kb.eq_ignore_ascii_case(b"PREFIX") {
+                    snap.prefix = Some(v_os.to_string_lossy().into_owned());
+                } else if kb.eq_ignore_ascii_case(b"APPDATA") {
+                    snap.appdata = Some(v_os.to_string_lossy().into_owned());
+                } else if kb.eq_ignore_ascii_case(b"USERPROFILE") {
+                    snap.userprofile = Some(v_os.to_string_lossy().into_owned());
+                } else if kb.eq_ignore_ascii_case(b"HOME") {
+                    snap.home = Some(v_os.to_string_lossy().into_owned());
+                } else if kb.eq_ignore_ascii_case(b"USERCONFIG") {
+                    snap.userconfig = Some(v_os.to_string_lossy().into_owned());
+                } else if kb.eq_ignore_ascii_case(b"HTTPS_PROXY") {
+                    snap.https_proxy = Some(v_os.to_string_lossy().into_owned());
+                } else if kb.eq_ignore_ascii_case(b"HTTP_PROXY") {
+                    snap.http_proxy = Some(v_os.to_string_lossy().into_owned());
+                } else if kb.eq_ignore_ascii_case(b"NO_PROXY") {
+                    snap.no_proxy = Some(v_os.to_string_lossy().into_owned());
+                }
+            } else {
+                match kb {
+                    b"PREFIX" => snap.prefix = Some(v_os.to_string_lossy().into_owned()),
+                    b"APPDATA" => snap.appdata = Some(v_os.to_string_lossy().into_owned()),
+                    b"USERPROFILE" => snap.userprofile = Some(v_os.to_string_lossy().into_owned()),
+                    b"HOME" => snap.home = Some(v_os.to_string_lossy().into_owned()),
+                    b"USERCONFIG" => snap.userconfig = Some(v_os.to_string_lossy().into_owned()),
+                    b"HTTPS_PROXY" => snap.https_proxy = Some(v_os.to_string_lossy().into_owned()),
+                    b"https_proxy" => {
+                        snap.https_proxy_lower = Some(v_os.to_string_lossy().into_owned());
+                    }
+                    b"HTTP_PROXY" => snap.http_proxy = Some(v_os.to_string_lossy().into_owned()),
+                    b"http_proxy" => {
+                        snap.http_proxy_lower = Some(v_os.to_string_lossy().into_owned());
+                    }
+                    b"NO_PROXY" => snap.no_proxy = Some(v_os.to_string_lossy().into_owned()),
+                    b"no_proxy" => snap.no_proxy_lower = Some(v_os.to_string_lossy().into_owned()),
+                    _ => {}
+                }
+            }
+        }
+        npm_config_vars.sort_by(|a, b| a.0.cmp(&b.0));
+        (snap, npm_config_vars)
+    }
+
+    fn get(&self, name: &str) -> Option<String> {
+        if cfg!(windows) {
+            if name.eq_ignore_ascii_case("npm_config_builtinconfig") {
+                return self.npm_config_builtinconfig.clone();
+            } else if name.eq_ignore_ascii_case("npm_config_globalconfig") {
+                return self.npm_config_globalconfig.clone();
+            } else if name.eq_ignore_ascii_case("npm_config_userconfig") {
+                return self.npm_config_userconfig.clone();
+            } else if name.eq_ignore_ascii_case("npm_config_prefix") {
+                return self.npm_config_prefix.clone();
+            } else if name.eq_ignore_ascii_case("PREFIX") {
+                return self.prefix.clone();
+            } else if name.eq_ignore_ascii_case("APPDATA") {
+                return self.appdata.clone();
+            } else if name.eq_ignore_ascii_case("USERPROFILE") {
+                return self.userprofile.clone();
+            } else if name.eq_ignore_ascii_case("HOME") {
+                return self.home.clone();
+            } else if name.eq_ignore_ascii_case("USERCONFIG") {
+                return self.userconfig.clone();
+            } else if name.eq_ignore_ascii_case("HTTPS_PROXY") {
+                return self.https_proxy.clone();
+            } else if name.eq_ignore_ascii_case("HTTP_PROXY") {
+                return self.http_proxy.clone();
+            } else if name.eq_ignore_ascii_case("NO_PROXY") {
+                return self.no_proxy.clone();
+            }
+            return env::var(name).ok();
+        }
+
+        match name {
+            "npm_config_builtinconfig" => self.npm_config_builtinconfig.clone(),
+            "NPM_CONFIG_BUILTINCONFIG" => self.npm_config_builtinconfig_upper.clone(),
+            "npm_config_globalconfig" => self.npm_config_globalconfig.clone(),
+            "NPM_CONFIG_GLOBALCONFIG" => self.npm_config_globalconfig_upper.clone(),
+            "npm_config_userconfig" => self.npm_config_userconfig.clone(),
+            "NPM_CONFIG_USERCONFIG" => self.npm_config_userconfig_upper.clone(),
+            "npm_config_prefix" => self.npm_config_prefix.clone(),
+            "NPM_CONFIG_PREFIX" => self.npm_config_prefix_upper.clone(),
+            "PREFIX" => self.prefix.clone(),
+            "APPDATA" => self.appdata.clone(),
+            "USERPROFILE" => self.userprofile.clone(),
+            "HOME" => self.home.clone(),
+            "USERCONFIG" => self.userconfig.clone(),
+            "HTTPS_PROXY" => self.https_proxy.clone(),
+            "https_proxy" => self.https_proxy_lower.clone(),
+            "HTTP_PROXY" => self.http_proxy.clone(),
+            "http_proxy" => self.http_proxy_lower.clone(),
+            "NO_PROXY" => self.no_proxy.clone(),
+            "no_proxy" => self.no_proxy_lower.clone(),
+            _ => env::var(name).ok(),
+        }
+    }
+}
+
+fn apply_env_entry(
+    raw_key: &str,
+    value: &str,
+    env_layer_settings: &mut BTreeMap<String, String>,
+    base_npmrc: &mut Npmrc,
+) -> Result<(), ConfigError> {
+    let Some(prefix) = raw_key.get(..11) else {
+        return Ok(());
+    };
+    if !prefix.eq_ignore_ascii_case("npm_config_") {
+        return Ok(());
+    }
+    let Some(rest) = raw_key.get(11..) else {
+        return Ok(());
+    };
+    if rest.is_empty() {
+        return Ok(());
+    }
+    // In npm, nerf-darted keys (e.g. //registry.npmjs.org/:_authToken)
+    // preserve case and underscores without normalizing.
+    if rest.starts_with("//") {
+        let val_display = if crate::npmrc::is_sensitive_credential_key(rest) {
+            crate::npmrc::mask_credential(value)
+        } else {
+            value.to_string()
+        };
+        env_layer_settings.insert(rest.to_string(), val_display);
+        base_npmrc.set(rest, value)?;
+    } else {
+        let dashed = normalize_env_or_cli_key(rest);
+        let val_display = if crate::npmrc::is_sensitive_credential_key(&dashed) {
+            crate::npmrc::mask_credential(value)
+        } else {
+            value.to_string()
+        };
+        if dashed != rest {
+            let _ = base_npmrc.set(rest, value);
+        }
+        if dashed == "no-proxy" || dashed == "no_proxy" {
+            let _ = base_npmrc.set("noproxy", value);
+        } else if dashed == "noproxy" {
+            let _ = base_npmrc.set("no-proxy", value);
+        }
+        base_npmrc.set(&dashed, value)?;
+        env_layer_settings.insert(dashed, val_display);
+    }
+    Ok(())
+}
+
+fn normalize_env_or_cli_key(key: &str) -> String {
+    let mut out = String::with_capacity(key.len());
+    let mut chars = key.chars();
+    if let Some(first) = chars.next() {
+        out.push(first.to_ascii_lowercase());
+        for ch in chars {
+            let lc = ch.to_ascii_lowercase();
+            out.push(if lc == '_' { '-' } else { lc });
+        }
+    }
+    out
+}
+
+#[derive(serde::Deserialize)]
+struct WorkspacesOnly {
+    workspaces: Option<rnpm_core::manifest::PackageWorkspaces>,
+}
+
+fn read_workspace_patterns(pkg_json: &Path) -> Option<Vec<String>> {
+    let bytes = std::fs::read(pkg_json).ok()?;
+    let bytes = bytes.strip_prefix(b"\xef\xbb\xbf").unwrap_or(&bytes);
+    if !bytes.windows(10).any(|w| w == b"workspaces")
+        && !bytes.windows(2).any(|w| w == b"\\u")
+    {
+        return None;
+    }
+    let parsed: WorkspacesOnly = serde_json::from_slice(bytes).ok()?;
+    let patterns = match parsed.workspaces? {
+        rnpm_core::manifest::PackageWorkspaces::List(patterns) => patterns,
+        rnpm_core::manifest::PackageWorkspaces::Config { packages } => packages,
+    };
+    if patterns.is_empty() {
+        None
+    } else {
+        Some(patterns)
+    }
+}
+
+fn should_skip_ws_dir(name: &str) -> bool {
+    name.starts_with('.')
+        || name == "node_modules"
+        || name == "target"
+        || name == "dist"
+        || name == "build"
+}
+
+fn match_ws_segments(pat_segs: &[&str], path_segs: &[&str]) -> bool {
+    if pat_segs.is_empty() {
+        return path_segs.is_empty();
+    }
+    let segment = pat_segs[0];
+    let remaining = &pat_segs[1..];
+    if segment == "**" {
+        if match_ws_segments(remaining, path_segs) {
+            return true;
+        }
+        if !path_segs.is_empty() {
+            if should_skip_ws_dir(path_segs[0]) {
+                return false;
+            }
+            return match_ws_segments(pat_segs, &path_segs[1..]);
+        }
+        return false;
+    }
+    let Some((&head, tail)) = path_segs.split_first() else {
+        return false;
+    };
+    if segment == "*" {
+        !should_skip_ws_dir(head) && match_ws_segments(remaining, tail)
+    } else if segment.contains('*') || segment.contains('?') {
+        !should_skip_ws_dir(head)
+            && rnpm_core::workspace::wildcard_match(segment, head)
+            && match_ws_segments(remaining, tail)
+    } else {
+        segment == head && match_ws_segments(remaining, tail)
+    }
+}
+
+fn matches_workspace_patterns_lexical(rel: &Path, patterns: &[String]) -> Option<bool> {
+    if patterns.iter().any(|p| p.starts_with('!')) {
+        return None;
+    }
+    let mut rel_segs = Vec::new();
+    for comp in rel.components() {
+        match comp {
+            std::path::Component::Normal(os) => rel_segs.push(os.to_str()?),
+            _ => return None,
+        }
+    }
+    if rel_segs.is_empty() {
+        return Some(false);
+    }
+    for pattern in patterns {
+        let clean = pattern.trim();
+        let clean = clean.strip_prefix("./").unwrap_or(clean);
+        let clean = clean.strip_prefix(".\\").unwrap_or(clean);
+        let posix = clean.replace('\\', "/");
+        let mut pat_segs: Vec<&str> = Vec::new();
+        for s in posix.split('/').filter(|s| !s.is_empty()) {
+            if s == "**" && pat_segs.last() == Some(&"**") {
+                continue;
+            }
+            pat_segs.push(s);
+        }
+        if !pat_segs.is_empty() && match_ws_segments(&pat_segs, &rel_segs) {
+            return Some(true);
+        }
+    }
+    Some(false)
+}
+
+fn find_workspace_root_up_to(project_dir: &Path, stop_at: Option<&Path>) -> Option<PathBuf> {
+    if !project_dir.join("package.json").is_file() {
+        return None;
+    }
+    let mut project_dir_canon: Option<PathBuf> = None;
     let mut current = project_dir.parent();
     while let Some(dir) = current {
         let pkg_json = dir.join("package.json");
-        if pkg_json.is_file() {
-            if let Ok(manifest) = rnpm_core::manifest::Manifest::from_file(&pkg_json) {
-                if !manifest.workspace_patterns().is_empty() {
-                    if let Ok(members) =
-                        rnpm_core::workspace::discover_workspaces_from_manifest(dir, &manifest)
+        if let Some(patterns) = read_workspace_patterns(&pkg_json) {
+            if let Ok(rel) = project_dir.strip_prefix(dir) {
+                if matches_workspace_patterns_lexical(rel, &patterns) == Some(true) {
+                    return Some(dir.to_path_buf());
+                }
+            }
+            if let Ok(member_dirs) = rnpm_core::workspace::match_glob_patterns(dir, &patterns) {
+                for member_dir in &member_dirs {
+                    let rel_matches = member_dir
+                        .strip_prefix(dir)
+                        .ok()
+                        .is_some_and(|rel| !rel.as_os_str().is_empty() && project_dir.ends_with(rel));
+                    if (*member_dir == project_dir || rel_matches)
+                        && member_dir.join("package.json").is_file()
                     {
-                        for member in members {
-                            let member_canon = member
-                                .path
-                                .canonicalize()
-                                .unwrap_or_else(|_| member.path.clone());
-                            if member_canon == project_dir_canon
-                                || member.path == project_dir
-                                || project_dir.ends_with(&member.relative_path)
-                            {
-                                return Some(dir.to_path_buf());
-                            }
+                        return Some(dir.to_path_buf());
+                    }
+                }
+                let target_canon = project_dir_canon.get_or_insert_with(|| {
+                    project_dir
+                        .canonicalize()
+                        .unwrap_or_else(|_| project_dir.to_path_buf())
+                });
+                for member_dir in &member_dirs {
+                    if member_dir.join("package.json").is_file() {
+                        let member_canon = member_dir
+                            .canonicalize()
+                            .unwrap_or_else(|_| member_dir.clone());
+                        if &member_canon == target_canon {
+                            return Some(dir.to_path_buf());
                         }
                     }
                 }
             }
         }
+        if stop_at == Some(dir) {
+            break;
+        }
         current = dir.parent();
     }
     None
+}
+
+fn find_workspace_root_with_npmrc(project_dir: &Path) -> Option<PathBuf> {
+    let mut highest_npmrc_dir = None;
+    let mut current = project_dir.parent();
+    while let Some(dir) = current {
+        if dir.join(".npmrc").is_file() {
+            highest_npmrc_dir = Some(dir);
+        }
+        current = dir.parent();
+    }
+    let stop_at = highest_npmrc_dir?;
+    let ws_root = find_workspace_root_up_to(project_dir, Some(stop_at))?;
+    if ws_root.join(".npmrc").is_file() {
+        Some(ws_root)
+    } else {
+        None
+    }
+}
+
+pub fn find_workspace_root(project_dir: &Path) -> Option<PathBuf> {
+    find_workspace_root_up_to(project_dir, None)
 }
 
 pub fn find_global_npmrc() -> Option<PathBuf> {

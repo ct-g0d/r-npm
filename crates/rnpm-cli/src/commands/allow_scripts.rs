@@ -198,6 +198,7 @@ fn apply_policy_changes(
     all: bool,
     json: bool,
     _cmd_name: &str,
+    config: Option<&rnpm_config::Config>,
 ) -> Result<()> {
     if !all && packages.is_empty() {
         let usage = if approved {
@@ -219,9 +220,12 @@ fn apply_policy_changes(
         .ok()
         .and_then(|text| serde_json::from_str(&text).ok())
         .unwrap_or_default();
-    let pin = rnpm_config::Config::load(Some(current_dir))?
-        .get_bool("allow-scripts-pin")
-        .unwrap_or(true);
+    let pin = match config {
+        Some(cfg) => cfg.get_bool("allow-scripts-pin").unwrap_or(true),
+        None => rnpm_config::Config::load(Some(current_dir))?
+            .get_bool("allow-scripts-pin")
+            .unwrap_or(true),
+    };
     let mut unmatched = Vec::new();
     let mut targets: Vec<(String, String)> = Vec::new(); // (group_name, pinned_key)
 
@@ -375,6 +379,7 @@ fn apply_policy_changes(
     Ok(())
 }
 
+#[allow(dead_code)]
 pub(crate) fn run_approve(
     current_dir: &Path,
     packages: &[String],
@@ -382,13 +387,33 @@ pub(crate) fn run_approve(
     pending: bool,
     json: bool,
 ) -> Result<()> {
+    run_approve_with_config(current_dir, packages, all, pending, json, None)
+}
+
+pub(crate) fn run_approve_with_config(
+    current_dir: &Path,
+    packages: &[String],
+    all: bool,
+    pending: bool,
+    json: bool,
+    config: Option<&rnpm_config::Config>,
+) -> Result<()> {
     if pending {
         list_pending_install_scripts(current_dir, json)
     } else {
-        apply_policy_changes(current_dir, packages, true, all, json, "approve-scripts")
+        apply_policy_changes(
+            current_dir,
+            packages,
+            true,
+            all,
+            json,
+            "approve-scripts",
+            config,
+        )
     }
 }
 
+#[allow(dead_code)]
 pub(crate) fn run_deny(
     current_dir: &Path,
     packages: &[String],
@@ -396,14 +421,34 @@ pub(crate) fn run_deny(
     pending: bool,
     json: bool,
 ) -> Result<()> {
+    run_deny_with_config(current_dir, packages, all, pending, json, None)
+}
+
+pub(crate) fn run_deny_with_config(
+    current_dir: &Path,
+    packages: &[String],
+    all: bool,
+    pending: bool,
+    json: bool,
+    config: Option<&rnpm_config::Config>,
+) -> Result<()> {
     if pending {
         return Err(anyhow::anyhow!(
             "npm error code EUSAGE\nnpm error `npm deny-scripts --allow-scripts-pending` is not supported; run `npm install-scripts ls` to list unreviewed packages."
         ));
     }
-    apply_policy_changes(current_dir, packages, false, all, json, "deny-scripts")
+    apply_policy_changes(
+        current_dir,
+        packages,
+        false,
+        all,
+        json,
+        "deny-scripts",
+        config,
+    )
 }
 
+#[allow(dead_code)]
 pub(crate) fn run_install_scripts(
     current_dir: &Path,
     action: Option<&str>,
@@ -412,11 +457,37 @@ pub(crate) fn run_install_scripts(
     json: bool,
     dry_run: bool,
 ) -> Result<()> {
+    run_install_scripts_with_config(current_dir, action, packages, all, json, dry_run, None)
+}
+
+pub(crate) fn run_install_scripts_with_config(
+    current_dir: &Path,
+    action: Option<&str>,
+    packages: &[String],
+    all: bool,
+    json: bool,
+    dry_run: bool,
+    config: Option<&rnpm_config::Config>,
+) -> Result<()> {
     match action.unwrap_or("") {
-        "approve" => {
-            apply_policy_changes(current_dir, packages, true, all, json, "install-scripts")
-        }
-        "deny" => apply_policy_changes(current_dir, packages, false, all, json, "install-scripts"),
+        "approve" => apply_policy_changes(
+            current_dir,
+            packages,
+            true,
+            all,
+            json,
+            "install-scripts",
+            config,
+        ),
+        "deny" => apply_policy_changes(
+            current_dir,
+            packages,
+            false,
+            all,
+            json,
+            "install-scripts",
+            config,
+        ),
         "ls" | "list" => list_pending_install_scripts(current_dir, json),
         "prune" => prune_install_scripts_policy(current_dir, json, dry_run),
         _ => {

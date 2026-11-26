@@ -31,17 +31,34 @@ pub struct ListOptions {
 ///
 /// Returns exit code: `0` if no dependency problems exist, `1` if problems (`extraneous`, `invalid`, `missing`) exist.
 pub fn run_list(project_dir: &Path, options: &ListOptions) -> anyhow::Result<i32> {
-    run_list_inner(project_dir, options, false)
+    run_list_inner(project_dir, options, false, None)
 }
 
 pub fn run_workspace_list(project_dir: &Path, options: &ListOptions) -> anyhow::Result<i32> {
-    run_list_inner(project_dir, options, true)
+    run_list_inner(project_dir, options, true, None)
+}
+
+pub(crate) fn run_list_with_config(
+    project_dir: &Path,
+    options: &ListOptions,
+    config: &rnpm_config::Config,
+) -> anyhow::Result<i32> {
+    run_list_inner(project_dir, options, false, Some(config))
+}
+
+pub(crate) fn run_workspace_list_with_config(
+    project_dir: &Path,
+    options: &ListOptions,
+    config: &rnpm_config::Config,
+) -> anyhow::Result<i32> {
+    run_list_inner(project_dir, options, true, Some(config))
 }
 
 fn run_list_inner(
     project_dir: &Path,
     options: &ListOptions,
     workspace: bool,
+    config: Option<&rnpm_config::Config>,
 ) -> anyhow::Result<i32> {
     let (omit_dev, omit_optional, omit_peer) = crate::parse_omit_options(&options.omit);
     let tree_opts = TreeOptions {
@@ -106,7 +123,7 @@ fn run_list_inner(
             &root_node,
             effective_depth,
             options.long,
-            crate::use_unicode(project_dir),
+            crate::use_unicode_with_config(project_dir, config),
         );
         if options.is_global {
             if let Some((_, rest)) = output.split_once('\n') {

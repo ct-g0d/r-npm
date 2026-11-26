@@ -141,7 +141,7 @@ impl Npmrc {
                 (trimmed, None)
             };
 
-            let decoded_key = decode_ini_field(raw_key);
+            let decoded_key = decode_ini_field_cow(raw_key);
             if decoded_key.is_empty() {
                 if raw_val.is_some() {
                     return Err(ConfigError::InvalidLine(format!("Empty key in: '{trimmed}'")));
@@ -150,13 +150,13 @@ impl Npmrc {
             }
 
             let decoded_val = match raw_val {
-                Some(v) => decode_ini_field(v),
-                None => "true".to_string(),
+                Some(v) => decode_ini_field_cow(v),
+                None => std::borrow::Cow::Borrowed("true"),
             };
 
             // Interpolate environment variables
-            let key = interpolate_env(&decoded_key, &env_lookup);
-            let value = interpolate_env(&decoded_val, &env_lookup);
+            let key = interpolate_env_cow(&decoded_key, &env_lookup);
+            let value = interpolate_env_cow(&decoded_val, &env_lookup);
 
             npmrc.set(&key, &value)?;
         }
@@ -166,17 +166,22 @@ impl Npmrc {
 
     /// Read and parse an .npmrc file from disk.
     pub fn from_file(path: impl AsRef<Path>) -> Result<Self, ConfigError> {
-        let path = path.as_ref();
-        if !path.exists() {
-            return Ok(Self::new());
-        }
+        Ok(Self::from_file_if_exists(path.as_ref())?.unwrap_or_default())
+    }
 
-        let content = fs::read_to_string(path).map_err(|err| ConfigError::Io {
-            path: path.to_path_buf(),
-            source: err,
-        })?;
+    pub(crate) fn from_file_if_exists(path: &Path) -> Result<Option<Self>, ConfigError> {
+        let content = match fs::read_to_string(path) {
+            Ok(c) => c,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(err) => {
+                return Err(ConfigError::Io {
+                    path: path.to_path_buf(),
+                    source: err,
+                });
+            }
+        };
 
-        Self::parse(&content)
+        Self::parse(&content).map(Some)
     }
 
     /// Set a key-value setting and update parsed registry/auth structures.
@@ -191,12 +196,14 @@ impl Npmrc {
         }
 
         // Prevent newline and null injection in configuration keys and values
-        if key_trimmed.contains('\n')
-            || key_trimmed.contains('\r')
-            || key_trimmed.contains('\0')
-            || value_trimmed.contains('\n')
-            || value_trimmed.contains('\r')
-            || value_trimmed.contains('\0')
+        if key_trimmed
+            .as_bytes()
+            .iter()
+            .any(|&b| b == b'\n' || b == b'\r' || b == 0)
+            || value_trimmed
+                .as_bytes()
+                .iter()
+                .any(|&b| b == b'\n' || b == b'\r' || b == 0)
         {
             return Err(ConfigError::InvalidLine(format!(
                 "Configuration line contains forbidden control character (newline or null): '{key_trimmed}'"
@@ -220,15 +227,17 @@ impl Npmrc {
         }
 
         // 2. Check if key is a scoped registry: e.g. "@myorg:registry", "@myorg/registry", or "myorg:registry"
-        if let Some(scope) = crate::parse_scoped_registry_key(key_trimmed) {
-            if let Ok(mut reg_url) = Url::parse(value_trimmed) {
-                ensure_trailing_slash(&mut reg_url);
-                self.scoped_registries
-                    .insert(scope.to_ascii_lowercase(), reg_url);
+        if key_trimmed.ends_with("registry") {
+            if let Some(scope) = crate::parse_scoped_registry_key(key_trimmed) {
+                if let Ok(mut reg_url) = Url::parse(value_trimmed) {
+                    ensure_trailing_slash(&mut reg_url);
+                    self.scoped_registries
+                        .insert(scope.to_ascii_lowercase(), reg_url);
+                }
+                self.settings
+                    .insert(key_trimmed.to_string(), value_trimmed.to_string());
+                return Ok(());
             }
-            self.settings
-                .insert(key_trimmed.to_string(), value_trimmed.to_string());
-            return Ok(());
         }
 
         // 3. Check if key is URI-scoped auth: e.g. "//registry.npmjs.org/:_authToken" or "https://registry.npmjs.org/:_authToken"
@@ -303,6 +312,14 @@ impl Npmrc {
 
     /// Merge another Npmrc configuration into this one. The other config's settings take precedence.
     pub fn merge(&mut self, other: Npmrc) {
+        if self.settings.is_empty()
+            && self.scoped_registries.is_empty()
+            && self.auth_tokens.is_empty()
+            && (other.settings.contains_key("registry") || self.registry == other.registry)
+        {
+            *self = other;
+            return;
+        }
         if other.settings.contains_key("registry") {
             self.registry = other.registry;
         }
@@ -680,22 +697,35 @@ impl Npmrc {
 /// - If unquoted, strips inline comments starting with unescaped ';' or '#'.
 /// - Unescapes '\;', '\#', and '\\'.
 pub fn decode_ini_field(raw: &str) -> String {
+    decode_ini_field_cow(raw).into_owned()
+}
+
+fn decode_ini_field_cow(raw: &str) -> std::borrow::Cow<'_, str> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
-        return String::new();
+        return std::borrow::Cow::Borrowed("");
     }
 
     // Double-quoted string: try JSON unescaping; fallback to stripping quotes
     if let Some(inner) = trimmed.strip_prefix('"').and_then(|s| s.strip_suffix('"')) {
         if let Ok(unquoted) = serde_json::from_str::<String>(trimmed) {
-            return unquoted;
+            return std::borrow::Cow::Owned(unquoted);
         }
-        return inner.to_string();
+        return std::borrow::Cow::Borrowed(inner);
     }
 
     // Single-quoted string: strip quotes
     if let Some(inner) = trimmed.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')) {
-        return inner.to_string();
+        return std::borrow::Cow::Borrowed(inner);
+    }
+
+    // Fast path for unquoted fields without escapes or inline comments
+    if !trimmed
+        .as_bytes()
+        .iter()
+        .any(|&b| b == b';' || b == b'#' || b == b'\\')
+    {
+        return std::borrow::Cow::Borrowed(trimmed);
     }
 
     // Unquoted: walk the string to find the first unescaped ';' or '#' (inline comment)
@@ -722,7 +752,7 @@ pub fn decode_ini_field(raw: &str) -> String {
     if esc {
         unesc.push('\\');
     }
-    unesc.trim().to_string()
+    std::borrow::Cow::Owned(unesc.trim().to_string())
 }
 
 fn generate_path_prefixes(path: &str) -> Vec<String> {
@@ -912,6 +942,17 @@ pub fn interpolate_env<F>(input: &str, lookup: &F) -> String
 where
     F: Fn(&str) -> Option<String>,
 {
+    interpolate_env_cow(input, lookup).into_owned()
+}
+
+fn interpolate_env_cow<'a, F>(input: &'a str, lookup: &F) -> std::borrow::Cow<'a, str>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    if !input.as_bytes().contains(&b'$') {
+        return std::borrow::Cow::Borrowed(input);
+    }
+
     let mut result = String::with_capacity(input.len());
     let mut chars = input.char_indices().peekable();
 
@@ -1070,7 +1111,7 @@ where
         result.push(ch);
     }
 
-    result
+    std::borrow::Cow::Owned(result)
 }
 
 /// Redact sensitive tokens and passwords from configuration strings, logs, or error traces.
@@ -1109,27 +1150,36 @@ pub fn scrub_credentials(text: &str) -> String {
     result
 }
 
+fn contains_ascii_ci(haystack: &str, needle_lower: &str) -> bool {
+    let hb = haystack.as_bytes();
+    let nb = needle_lower.as_bytes();
+    if nb.is_empty() {
+        return true;
+    }
+    hb.len() >= nb.len() && hb.windows(nb.len()).any(|w| w.eq_ignore_ascii_case(nb))
+}
+
 /// Checks if a key name corresponds to a sensitive credential.
 pub fn is_sensitive_credential_key(key: &str) -> bool {
-    let lower = key.to_ascii_lowercase();
-    if lower.contains("password")
-        || lower.contains("secret")
-        || lower.contains("token")
-        || lower.contains("auth_key")
-        || lower.contains("auth_token")
-        || lower.contains("_authtoken")
-        || lower.contains("_auth")
-        || lower.contains("apikey")
-        || lower.contains("api_key")
+    if contains_ascii_ci(key, "password")
+        || contains_ascii_ci(key, "secret")
+        || contains_ascii_ci(key, "token")
+        || contains_ascii_ci(key, "apikey")
+        || contains_ascii_ci(key, "api_key")
     {
         return true;
     }
-    if lower.contains("auth")
-        && !lower.contains("author")
-        && !lower.contains("auth-type")
-        && !lower.contains("auth_type")
-    {
-        return true;
+    if contains_ascii_ci(key, "auth") {
+        if contains_ascii_ci(key, "auth_key")
+            || contains_ascii_ci(key, "auth_token")
+            || contains_ascii_ci(key, "_authtoken")
+            || contains_ascii_ci(key, "_auth")
+        {
+            return true;
+        }
+        return !contains_ascii_ci(key, "author")
+            && !contains_ascii_ci(key, "auth-type")
+            && !contains_ascii_ci(key, "auth_type");
     }
     false
 }
