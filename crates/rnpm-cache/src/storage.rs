@@ -9,15 +9,73 @@ use rnpm_core::{Algorithm, Integrity, IntegrityError};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha512};
 use std::collections::HashSet;
+use std::fmt::Write as _;
 use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::{sleep, yield_now};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::{debug, warn};
 
 static TMP_COUNTER: AtomicU64 = AtomicU64::new(1);
+static PROCESS_START_NANOS: OnceLock<u128> = OnceLock::new();
+const LOCK_SHARD_COUNT: usize = 64;
+
+#[inline]
+fn process_start_nanos() -> u128 {
+    *PROCESS_START_NANOS.get_or_init(|| {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    })
+}
+
+#[inline]
+fn prefix_index_and_mask(hex: &str) -> Option<(usize, u64)> {
+    let b = hex.as_bytes();
+    if b.len() < 4 {
+        return None;
+    }
+    let idx16 = ((hex_nibble(b[0])? as usize) << 12)
+        | ((hex_nibble(b[1])? as usize) << 8)
+        | ((hex_nibble(b[2])? as usize) << 4)
+        | (hex_nibble(b[3])? as usize);
+    Some((idx16 >> 6, 1u64 << (idx16 & 63)))
+}
+
+#[inline]
+fn prefix_bitset_has(bits: &[AtomicU64; 1024], hex: &str) -> bool {
+    let Some((word, mask)) = prefix_index_and_mask(hex) else {
+        return false;
+    };
+    (bits[word].load(Ordering::Relaxed) & mask) != 0
+}
+
+#[inline]
+fn prefix_bitset_set(bits: &[AtomicU64; 1024], hex: &str) {
+    if let Some((word, mask)) = prefix_index_and_mask(hex) {
+        bits[word].fetch_or(mask, Ordering::Relaxed);
+    }
+}
+
+fn clear_prefix_bitset(bits: &[AtomicU64; 1024]) {
+    for slot in bits {
+        slot.store(0, Ordering::Relaxed);
+    }
+}
+
+#[inline]
+fn shard_index_for_str(s: &str) -> usize {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for &byte in s.as_bytes() {
+        hash ^= byte as u64;
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    (hash as usize) & (LOCK_SHARD_COUNT - 1)
+}
 
 #[inline]
 fn is_path_not_found(err: &std::io::Error) -> bool {
@@ -476,6 +534,9 @@ pub struct Cache {
     root: PathBuf,
     lock_timeout: Duration,
     stale_threshold: Duration,
+    blob_prefix_dirs: Arc<[AtomicU64; 1024]>,
+    index_prefix_dirs: Arc<[AtomicU64; 1024]>,
+    lock_shards: Arc<[Mutex<()>; LOCK_SHARD_COUNT]>,
 }
 
 impl Cache {
@@ -490,6 +551,9 @@ impl Cache {
             root,
             lock_timeout: CacheLock::DEFAULT_TIMEOUT,
             stale_threshold: CacheLock::DEFAULT_STALE_THRESHOLD,
+            blob_prefix_dirs: Arc::new([const { AtomicU64::new(0) }; 1024]),
+            index_prefix_dirs: Arc::new([const { AtomicU64::new(0) }; 1024]),
+            lock_shards: Arc::new(std::array::from_fn(|_| Mutex::new(()))),
         })
     }
 
@@ -673,12 +737,13 @@ impl Cache {
     fn create_temp_path(&self, prefix: &str) -> PathBuf {
         let count = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
         let pid = std::process::id();
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        let mut path = self.tmp_dir();
-        path.push(format!("{prefix}_{pid}_{now}_{count}.tmp"));
+        let now = process_start_nanos();
+        let mut name = String::with_capacity(prefix.len() + 48);
+        let _ = write!(&mut name, "{prefix}_{pid}_{now}_{count}.tmp");
+        let mut path = PathBuf::with_capacity(self.root.as_os_str().len() + 8 + name.len());
+        path.push(&self.root);
+        path.push("tmp");
+        path.push(&name);
         path
     }
 
@@ -727,23 +792,26 @@ impl Cache {
     /// Store a pre-verified blob atomically by its known SHA-512 hex digest.
     pub fn put_blob_direct(&self, data: &[u8], sha512_hex: &str) -> Result<(), CacheError> {
         let npm_path = self.npm_blob_path_for_algo(Algorithm::Sha512, sha512_hex);
-        match fs::metadata(&npm_path) {
-            Ok(meta) => {
-                if meta.is_dir() {
-                    return Err(CacheError::Io(std::io::Error::new(
-                        std::io::ErrorKind::AlreadyExists,
-                        format!("Blob path is a directory: {}", npm_path.display()),
-                    )));
-                }
-                if meta.len() == data.len() as u64 {
-                    if let Ok(existing) = read_file_with_retries(&npm_path) {
-                        if existing.as_slice() == data {
+        let mut npm_definitely_missing = false;
+        match fs::File::open(&npm_path) {
+            Ok(mut f) => {
+                if let Ok(meta) = f.metadata() {
+                    if meta.is_dir() {
+                        return Err(CacheError::Io(std::io::Error::new(
+                            std::io::ErrorKind::AlreadyExists,
+                            format!("Blob path is a directory: {}", npm_path.display()),
+                        )));
+                    }
+                    if meta.len() == data.len() as u64 {
+                        let mut existing = Vec::with_capacity(data.len());
+                        if f.read_to_end(&mut existing).is_ok() && existing.as_slice() == data {
                             return Ok(());
                         }
                     }
                 }
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                npm_definitely_missing = true;
                 if !is_path_not_found(&e) {
                     let legacy_path = Self::legacy_blob_path_from_npm(&npm_path, sha512_hex);
                     if let Ok(meta) = fs::metadata(&legacy_path) {
@@ -763,16 +831,39 @@ impl Cache {
                     }
                 }
             }
-            Err(_) => {}
+            Err(_) => {
+                if let Ok(meta) = fs::metadata(&npm_path) {
+                    if meta.is_dir() {
+                        return Err(CacheError::Io(std::io::Error::new(
+                            std::io::ErrorKind::AlreadyExists,
+                            format!("Blob path is a directory: {}", npm_path.display()),
+                        )));
+                    }
+                    if meta.len() == data.len() as u64 {
+                        if let Ok(existing) = read_file_with_retries(&npm_path) {
+                            if existing.as_slice() == data {
+                                return Ok(());
+                            }
+                        }
+                    }
+                }
+            }
         }
 
         // Staging step: Write to temporary file on the SAME filesystem/volume
         let temp_path = self.write_temp_file("blob", data)?;
 
         // Fast lock-free atomic rename only when target does not yet exist
-        if fs::symlink_metadata(&npm_path).is_err() {
+        if npm_definitely_missing || fs::symlink_metadata(&npm_path).is_err() {
+            if !prefix_bitset_has(&self.blob_prefix_dirs, sha512_hex) {
+                if let Some(parent) = npm_path.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                prefix_bitset_set(&self.blob_prefix_dirs, sha512_hex);
+            }
             match fs::rename(&temp_path, &npm_path) {
                 Ok(()) => {
+                    prefix_bitset_set(&self.blob_prefix_dirs, sha512_hex);
                     debug!("Atomically stored blob {}", npm_path.display());
                     return Ok(());
                 }
@@ -781,6 +872,7 @@ impl Cache {
                         fs::create_dir_all(parent)?;
                     }
                     if fs::rename(&temp_path, &npm_path).is_ok() {
+                        prefix_bitset_set(&self.blob_prefix_dirs, sha512_hex);
                         debug!("Atomically stored blob {}", npm_path.display());
                         return Ok(());
                     }
@@ -794,7 +886,10 @@ impl Cache {
             }
         }
 
-        // Fallback to cross-process lock whenever overwriting/repairing an existing or contended blob
+        // Serialize in-process writers on the same shard before touching the lockfile.
+        let _shard_guard = self.lock_shards[shard_index_for_str(sha512_hex)]
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let _blob_lock = self.lock_blob(sha512_hex)?;
         if let Ok(meta) = fs::metadata(&npm_path) {
             if meta.is_dir() {
@@ -824,6 +919,7 @@ impl Cache {
             let _ = remove_file_with_retries(&temp_path);
             return Err(CacheError::Io(err));
         }
+        prefix_bitset_set(&self.blob_prefix_dirs, sha512_hex);
         debug!("Atomically stored blob {}", npm_path.display());
 
         Ok(())
@@ -1030,6 +1126,17 @@ impl Cache {
         buf.push(b'\n');
 
         let temp_path = self.write_temp_file("index", &buf)?;
+
+        let _shard_guard = self.lock_shards[shard_index_for_str(hash)]
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        if !prefix_bitset_has(&self.index_prefix_dirs, hash) {
+            if let Some(parent) = npm_path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            prefix_bitset_set(&self.index_prefix_dirs, hash);
+        }
 
         match fs::rename(&temp_path, &npm_path) {
             Ok(()) => return Ok(()),
@@ -1260,7 +1367,7 @@ impl Cache {
         };
 
         let mut hasher = Sha512::new();
-        let mut buffer = [0u8; 65536];
+        let mut buffer = [0u8; 131072];
         let mut total_size = 0u64;
 
         let read_res: Result<(), CacheError> = (|| {
@@ -1328,6 +1435,15 @@ impl Cache {
         let npm_path = self.npm_blob_path_for_algo(Algorithm::Sha512, &sha512_hex);
         let mut stored = false;
         if fs::symlink_metadata(&npm_path).is_err() {
+            if !prefix_bitset_has(&self.blob_prefix_dirs, &sha512_hex) {
+                if let Some(parent) = npm_path.parent() {
+                    if let Err(dir_err) = fs::create_dir_all(parent) {
+                        let _ = remove_file_with_retries(&temp_blob);
+                        return Err(CacheError::Io(dir_err));
+                    }
+                }
+                prefix_bitset_set(&self.blob_prefix_dirs, &sha512_hex);
+            }
             match fs::rename(&temp_blob, &npm_path) {
                 Ok(()) => stored = true,
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -1350,6 +1466,9 @@ impl Cache {
         }
 
         if !stored {
+            let _shard_guard = self.lock_shards[shard_index_for_str(&sha512_hex)]
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             let _blob_lock = match self.lock_blob(&sha512_hex) {
                 Ok(l) => l,
                 Err(e) => {
@@ -1756,6 +1875,8 @@ impl Cache {
         }
 
         // Recreate essential cache directory layout
+        clear_prefix_bitset(&self.blob_prefix_dirs);
+        clear_prefix_bitset(&self.index_prefix_dirs);
         fs::create_dir_all(self.root.join("content-v2").join("sha512"))?;
         fs::create_dir_all(self.root.join("index-v5"))?;
         fs::create_dir_all(self.root.join("tmp"))?;
@@ -1910,42 +2031,32 @@ impl Cache {
 
             if blob_paths.len() >= 4 {
                 let workers = std::thread::available_parallelism()
-                    .map(|n| n.get().clamp(2, 8))
-                    .unwrap_or(4)
+                    .map(|n| n.get().clamp(2, 16))
+                    .unwrap_or(8)
                     .min(blob_paths.len());
                 let next_idx = std::sync::atomic::AtomicUsize::new(0);
-                let paths_ref = &blob_paths;
-                let next_ref = &next_idx;
-                let results = std::thread::scope(|scope| {
-                    let mut handles = Vec::with_capacity(workers);
-                    for _ in 0..workers {
-                        handles.push(scope.spawn(move || {
-                            let mut v = 0usize;
-                            let mut c = 0usize;
-                            let mut b = 0u64;
-                            let mut digests = Vec::new();
-                            loop {
-                                let idx = next_ref.fetch_add(1, Ordering::Relaxed);
-                                if idx >= paths_ref.len() {
-                                    break;
-                                }
-                                let (vi, ci, bi, dg) = Self::verify_single_blob(&paths_ref[idx]);
-                                v += vi;
-                                c += ci;
-                                b += bi;
-                                if let Some(d) = dg {
-                                    digests.push(d);
-                                }
-                            }
-                            (v, c, b, digests)
-                        }));
+                let results = Mutex::new(Vec::with_capacity(workers));
+                rnpm_fs::run_parallel(workers, &|| {
+                    let mut v = 0usize;
+                    let mut c = 0usize;
+                    let mut b = 0u64;
+                    let mut digests = Vec::new();
+                    loop {
+                        let idx = next_idx.fetch_add(1, Ordering::Relaxed);
+                        if idx >= blob_paths.len() {
+                            break;
+                        }
+                        let (vi, ci, bi, dg) = Self::verify_single_blob(&blob_paths[idx]);
+                        v += vi;
+                        c += ci;
+                        b += bi;
+                        if let Some(d) = dg {
+                            digests.push(d);
+                        }
                     }
-                    handles
-                        .into_iter()
-                        .map(|h| h.join().unwrap_or((0, 0, 0, Vec::new())))
-                        .collect::<Vec<_>>()
+                    results.lock().unwrap().push((v, c, b, digests));
                 });
-                for (v, c, b, digests) in results {
+                for (v, c, b, digests) in results.into_inner().unwrap() {
                     report.verified_blobs += v;
                     report.corrupted_blobs += c;
                     report.total_blob_bytes += b;
@@ -1972,40 +2083,29 @@ impl Cache {
 
             if index_paths.len() >= 4 {
                 let workers = std::thread::available_parallelism()
-                    .map(|n| n.get().clamp(2, 8))
-                    .unwrap_or(4)
+                    .map(|n| n.get().clamp(2, 16))
+                    .unwrap_or(8)
                     .min(index_paths.len());
                 let next_idx = std::sync::atomic::AtomicUsize::new(0);
-                let paths_ref = &index_paths;
-                let next_ref = &next_idx;
-                let valid_ref = &valid_blobs;
-                let results = std::thread::scope(|scope| {
-                    let mut handles = Vec::with_capacity(workers);
-                    for _ in 0..workers {
-                        handles.push(scope.spawn(move || {
-                            let mut v = 0usize;
-                            let mut c = 0usize;
-                            let mut o = 0usize;
-                            loop {
-                                let idx = next_ref.fetch_add(1, Ordering::Relaxed);
-                                if idx >= paths_ref.len() {
-                                    break;
-                                }
-                                let (vi, ci, oi, _) =
-                                    self.verify_single_index(&paths_ref[idx], valid_ref);
-                                v += vi;
-                                c += ci;
-                                o += oi;
-                            }
-                            (v, c, o)
-                        }));
+                let results = Mutex::new(Vec::with_capacity(workers));
+                rnpm_fs::run_parallel(workers, &|| {
+                    let mut v = 0usize;
+                    let mut c = 0usize;
+                    let mut o = 0usize;
+                    loop {
+                        let idx = next_idx.fetch_add(1, Ordering::Relaxed);
+                        if idx >= index_paths.len() {
+                            break;
+                        }
+                        let (vi, ci, oi, _) =
+                            self.verify_single_index(&index_paths[idx], &valid_blobs);
+                        v += vi;
+                        c += ci;
+                        o += oi;
                     }
-                    handles
-                        .into_iter()
-                        .map(|h| h.join().unwrap_or((0, 0, 0)))
-                        .collect::<Vec<_>>()
+                    results.lock().unwrap().push((v, c, o));
                 });
-                for (v, c, o) in results {
+                for (v, c, o) in results.into_inner().unwrap() {
                     report.verified_indices += v;
                     report.corrupted_indices += c;
                     report.orphaned_indices += o;

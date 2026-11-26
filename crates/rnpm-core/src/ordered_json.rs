@@ -203,9 +203,7 @@ impl<'de> Visitor<'de> for OrderedJsonVisitor {
     where
         M: MapAccess<'de>,
     {
-        let mut index_map = map
-            .size_hint()
-            .map_or_else(IndexMap::new, IndexMap::with_capacity);
+        let mut index_map = IndexMap::with_capacity(map.size_hint().unwrap_or(4));
         while let Some((k, v)) = map.next_entry()? {
             index_map.insert(k, v);
         }
@@ -248,10 +246,18 @@ impl OrderedJsonValue {
 #[inline]
 pub(crate) fn write_json_str(s: &str, out: &mut String) {
     const HEX: &[u8; 16] = b"0123456789abcdef";
-    out.push('"');
     let bytes = s.as_bytes();
-    let mut start = 0usize;
-    let mut i = 0usize;
+    out.push('"');
+    let Some(first_esc) = bytes.iter().position(|&b| b < 0x20 || b == b'"' || b == b'\\') else {
+        out.push_str(s);
+        out.push('"');
+        return;
+    };
+    if first_esc > 0 {
+        out.push_str(&s[..first_esc]);
+    }
+    let mut start = first_esc;
+    let mut i = first_esc;
     while i < bytes.len() {
         let b = bytes[i];
         if b < 0x20 || b == b'"' || b == b'\\' {
@@ -284,8 +290,23 @@ pub(crate) fn write_json_str(s: &str, out: &mut String) {
 
 #[inline]
 pub(crate) fn push_indent(out: &mut String, indent: &str, depth: usize) {
-    for _ in 0..depth {
-        out.push_str(indent);
+    const SPACES_16: &str = "                ";
+    if indent == "  " && depth <= 8 {
+        out.push_str(&SPACES_16[..depth * 2]);
+        return;
+    }
+    match depth {
+        0 => {}
+        1 => out.push_str(indent),
+        2 => {
+            out.push_str(indent);
+            out.push_str(indent);
+        }
+        _ => {
+            for _ in 0..depth {
+                out.push_str(indent);
+            }
+        }
     }
 }
 

@@ -4751,15 +4751,22 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
             }
         }
 
-        // Pre-create all package parent directories and bin directories in one breadth-first pass
+        // Pre-create parent directories upfront only for local git:/file:/link packages;
+        // registry packages handle their own directory precreation in `all_dirs` / `dirs_to_precreate`.
         {
-            let mut dirs_to_precreate = Vec::with_capacity(graph.nodes.len() * 2);
+            let mut dirs_to_precreate = Vec::new();
             for (loc, node) in &graph.nodes {
                 if loc.is_empty() || node.flags.skipped || node.flags.bundled {
                     continue;
                 }
-                // Match materialization below: merely reserving a parent for
-                // an incompatible optional node leaves an empty @scope behind.
+                let is_early_local = node.flags.link
+                    || node
+                        .resolved
+                        .as_deref()
+                        .is_some_and(|r| r.starts_with("git+") || r.starts_with("git:") || r.starts_with("file:"));
+                if !is_early_local {
+                    continue;
+                }
                 if (node.flags.optional || node.flags.dev_optional)
                     && !rnpm_solver::is_platform_compatible(
                         &self.options.platform(),
@@ -4798,8 +4805,10 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                     dirs_to_precreate.push(bin_dir);
                 }
             }
-            let dir_refs: Vec<&Path> = dirs_to_precreate.iter().map(|p| p.as_path()).collect();
-            let _ = precreate_directories(dir_refs);
+            if !dirs_to_precreate.is_empty() {
+                let dir_refs: Vec<&Path> = dirs_to_precreate.iter().map(|p| p.as_path()).collect();
+                let _ = precreate_directories(dir_refs);
+            }
         }
 
         let mut lifecycle_nodes: Vec<LifecyclePackageNode> = Vec::new();
@@ -5301,11 +5310,18 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
             let t_mat = std::time::Instant::now();
             let mut all_dirs = std::collections::BTreeSet::new();
             all_dirs.insert(node_modules_dir.clone());
-            all_dirs.insert(root_bin_dir.clone());
+            if self.options.bin_links {
+                all_dirs.insert(root_bin_dir.clone());
+            }
 
+            let nm_clean_slate = tree_diff_opt.is_none()
+                && !node_modules_dir.exists()
+                && !rnpm_fs::is_junction(&node_modules_dir).unwrap_or(false);
             for (loc, _) in &packages_to_download {
                 let pkg_target = loc_base_dir.join(loc);
-                if rnpm_fs::is_junction(&pkg_target).unwrap_or(false) {
+                if !(nm_clean_slate && loc.starts_with("node_modules/"))
+                    && rnpm_fs::is_junction(&pkg_target).unwrap_or(false)
+                {
                     let _ = rnpm_fs::remove_junction(&pkg_target);
                 }
                 all_dirs.insert(pkg_target.clone());
@@ -5378,6 +5394,7 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                 let block_cloning = self.pack_store().is_block_cloning_eligible(&loc_base_dir);
                 let mut files_valid = true;
                 for (loc, pkg_target, pack) in &loaded_packs {
+                    let mut last_parent: Option<PathBuf> = None;
                     for entry in &pack.index.files {
                         let clean_entry: std::borrow::Cow<'_, str> =
                             if cfg!(windows) && entry.path.contains('/') {
@@ -5388,7 +5405,11 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                         let full_path = pkg_target.join(clean_entry.as_ref());
                         if entry.path.contains('/') {
                             if let Some(parent) = full_path.parent() {
-                                all_dirs.insert(parent.to_path_buf());
+                                if last_parent.as_deref() != Some(parent) {
+                                    let p = parent.to_path_buf();
+                                    all_dirs.insert(p.clone());
+                                    last_parent = Some(p);
+                                }
                             }
                         }
                         if let Some(slice) = pack.get_entry_slice(entry) {
@@ -6637,9 +6658,10 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                 continue;
             }
             if let Some(deps) = &pkg_info.dependencies {
-                let caller_specs = pkg_info.all_dependency_specs();
+                let mut caller_specs = None;
                 for (dep_name, range_str) in deps {
                     let effective_range = if let Some(ref ov) = overrides {
+                        let specs = caller_specs.get_or_insert_with(|| pkg_info.all_dependency_specs());
                         let mut ancestors: Vec<String> = Vec::new();
                         for scope in rnpm_solver::hoisting::iter_ancestor_scopes(pkg_key) {
                             if let Some(pkg) = lockfile.packages.get(scope) {
@@ -6657,7 +6679,7 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                             dep_name,
                             range_str,
                             &ancestors,
-                            Some(&caller_specs),
+                            Some(specs),
                         )
                         .ok()
                         .flatten()
@@ -6815,9 +6837,11 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
             std::fs::create_dir_all(&bin_dir)?;
         }
 
-        // Pre-create all package parent directories and bin directories in one breadth-first pass
+        // Pre-create parent and bin directories upfront only for local links/file:/git
+        // packages when precreating on a clean slate; registry packages handle their
+        // own directory precreation inside `missing_packs` or `all_dirs`.
         {
-            let mut dirs_to_precreate = Vec::with_capacity(lockfile.packages.len() * 2);
+            let mut dirs_to_precreate = Vec::new();
             for (pkg_key, pkg_info) in &lockfile.packages {
                 if pkg_key.is_empty()
                     || platform_skipped_packages.contains(pkg_key)
@@ -6825,13 +6849,20 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                 {
                     continue;
                 }
+                let needs_early_parent = pkg_info.link == Some(true)
+                    || pkg_info
+                        .resolved
+                        .as_deref()
+                        .is_some_and(|r| r.starts_with("file:") || r.starts_with("git+") || r.starts_with("git:"))
+                    || pkg_info.integrity.as_deref().is_none_or(|i| i.trim().is_empty());
+                if !needs_early_parent {
+                    continue;
+                }
                 let is_dev = pkg_info.dev.unwrap_or(false);
                 let is_optional = pkg_info.optional.unwrap_or(false)
                     || pkg_info.is_effective_optional()
                     || pkg_info.is_peer_optional();
                 let is_dev_optional = pkg_info.dev_optional.unwrap_or(false);
-                // npm: devOptional packages are omitted only when both dev and
-                // optional are omitted.
                 if self.options.omit_dev && is_dev {
                     continue;
                 }
@@ -6840,17 +6871,6 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                 }
                 if self.options.omit_dev && self.options.omit_optional && is_dev_optional {
                     continue;
-                }
-                if is_optional {
-                    let host_platform = self.options.platform();
-                    if !rnpm_solver::is_platform_compatible(
-                        &host_platform,
-                        pkg_info.os.as_deref(),
-                        pkg_info.cpu.as_deref(),
-                        pkg_info.libc.as_deref(),
-                    ) {
-                        continue;
-                    }
                 }
                 let target_path = self.options.project_dir.join(pkg_key);
                 if let Some(parent) = target_path.parent() {
@@ -6867,9 +6887,11 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                     dirs_to_precreate.push(pkg_bin_dir);
                 }
             }
-            let dir_refs: Vec<&Path> = dirs_to_precreate.iter().map(|p| p.as_path()).collect();
-            if let Err(e) = precreate_directories(dir_refs) {
-                warn!("precreate_directories warning: {e}");
+            if !dirs_to_precreate.is_empty() {
+                let dir_refs: Vec<&Path> = dirs_to_precreate.iter().map(|p| p.as_path()).collect();
+                if let Err(e) = precreate_directories(dir_refs) {
+                    warn!("precreate_directories warning: {e}");
+                }
             }
         }
         drop(_plan2_span);
@@ -7897,11 +7919,18 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
             && missing_pack_results.len() == packages_to_process.len();
 
         let all_packs_available = !packages_to_process.is_empty()
-            && packages_to_process
-                .iter()
-                .all(|(_, _, integrity_str, _, _, _)| {
-                    !integrity_str.is_empty() && self.pack_store().has_package_pack(integrity_str)
-                });
+            && if missing_packs.is_empty() {
+                packages_to_process
+                    .iter()
+                    .all(|(_, _, integrity_str, _, _, _)| !integrity_str.is_empty())
+            } else {
+                packages_to_process
+                    .iter()
+                    .all(|(_, _, integrity_str, _, _, _)| {
+                        !integrity_str.is_empty()
+                            && self.pack_store().has_package_pack(integrity_str)
+                    })
+            };
 
         let mut used_fast_path = false;
         let mut bin_packages = packages_to_process.clone();
@@ -7945,11 +7974,15 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
             let t_mat = std::time::Instant::now();
             let mut all_dirs = std::collections::BTreeSet::new();
             all_dirs.insert(rnpm_fs::to_verbatim_path(&node_modules_dir));
-            all_dirs.insert(rnpm_fs::to_verbatim_path(&bin_dir));
+            if self.options.bin_links {
+                all_dirs.insert(rnpm_fs::to_verbatim_path(&bin_dir));
+            }
 
             for (pkg_key, _, _, _, _, _) in &packages_to_process {
                 let pkg_target = loc_base_dir.join(pkg_key);
-                if rnpm_fs::is_junction(&pkg_target).unwrap_or(false) {
+                if !(from_scratch && pkg_key.starts_with("node_modules/"))
+                    && rnpm_fs::is_junction(&pkg_target).unwrap_or(false)
+                {
                     let _ = rnpm_fs::remove_junction(&pkg_target);
                 }
                 all_dirs.insert(pkg_target.clone());
@@ -7971,6 +8004,7 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                 let mut all_symlinks = Vec::new();
 
                 'load_files: for (pkg_key, pkg_target, pack) in &loaded_packs {
+                    let mut last_parent: Option<PathBuf> = None;
                     for entry in &pack.index.files {
                         let clean_entry_path: std::borrow::Cow<'_, str> =
                             if cfg!(windows) && entry.path.contains('/') {
@@ -7981,7 +8015,11 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                         let full_path = pkg_target.join(clean_entry_path.as_ref());
                         if entry.path.contains('/') {
                             if let Some(parent) = full_path.parent() {
-                                all_dirs.insert(parent.to_path_buf());
+                                if last_parent.as_deref() != Some(parent) {
+                                    let p = parent.to_path_buf();
+                                    all_dirs.insert(p.clone());
+                                    last_parent = Some(p);
+                                }
                             }
                         }
                         if let Some(slice) = pack.get_entry_slice(entry) {

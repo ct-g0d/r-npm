@@ -253,3 +253,131 @@ fn test_parallel_batch_extraction_parity() {
         assert_eq!(content, format!("parallel-package-{idx}-payload"));
     }
 }
+
+#[test]
+#[ignore]
+fn bench_rnpm_fs_hot_paths() {
+    use rnpm_fs::junction::remove_dir_all_safe;
+    use rnpm_fs::writer::{
+        determine_writer_config, extract_packages_direct_parallel, extract_tarball_direct,
+        materialize_files_parallel, precreate_directories, BatchDirectItem, MaterializeFile,
+    };
+    use std::sync::Arc;
+    use std::time::Instant;
+
+    println!("\n=== rnpm-fs Release Performance Benchmark ===");
+
+    let tarballs: Vec<Vec<u8>> = (0..40)
+        .map(|pkg_idx| {
+            let mut entries: Vec<(String, Vec<u8>, u32)> = Vec::with_capacity(36);
+            entries.push((
+                "package/package.json".to_string(),
+                format!("{{\"name\":\"fs-pkg-{pkg_idx}\",\"version\":\"1.0.0\"}}").into_bytes(),
+                0o644,
+            ));
+            for f in 0..35 {
+                let path = format!("package/src/mod_{}/file_{f}.js", f % 8);
+                let payload = vec![b'x'; 2048];
+                entries.push((path, payload, 0o644));
+            }
+            let refs: Vec<(&str, &[u8], u32)> = entries
+                .iter()
+                .map(|(p, d, m)| (p.as_str(), d.as_slice(), *m))
+                .collect();
+            build_tar_gz(&refs)
+        })
+        .collect();
+
+    // 1. Sequential extract_tar_gz (40 pkgs)
+    let dir1 = tempdir().unwrap();
+    let t0 = Instant::now();
+    for (i, tgz) in tarballs.iter().enumerate() {
+        let dest = dir1.path().join(format!("pkg-{i}"));
+        extract_tar_gz(Cursor::new(tgz), &dest, None).unwrap();
+    }
+    let extract_tar_gz_ms = t0.elapsed().as_secs_f64() * 1000.0;
+
+    // 2. Sequential extract_tarball_direct (40 pkgs)
+    let dir2 = tempdir().unwrap();
+    let cfg2 = determine_writer_config(dir2.path(), None);
+    let t0 = Instant::now();
+    for (i, tgz) in tarballs.iter().enumerate() {
+        let dest = dir2.path().join(format!("pkg-{i}"));
+        extract_tarball_direct(Cursor::new(tgz), &dest, None, Some(&cfg2)).unwrap();
+    }
+    let extract_direct_ms = t0.elapsed().as_secs_f64() * 1000.0;
+
+    // 3. Parallel extract_packages_direct_parallel (40 pkgs)
+    let dir3 = tempdir().unwrap();
+    let cfg3 = determine_writer_config(dir3.path(), None);
+    let batch: Vec<BatchDirectItem<Cursor<&[u8]>>> = tarballs
+        .iter()
+        .enumerate()
+        .map(|(i, tgz)| BatchDirectItem {
+            reader: Cursor::new(tgz.as_slice()),
+            destination: dir3.path().join(format!("pkg-{i}")),
+            package_id: format!("fs-pkg-{i}"),
+            limits: None,
+        })
+        .collect();
+    let t0 = Instant::now();
+    let res = extract_packages_direct_parallel(batch, dir3.path(), Some(&cfg3));
+    let extract_parallel_ms = t0.elapsed().as_secs_f64() * 1000.0;
+    for r in res {
+        r.unwrap();
+    }
+
+    // 4. precreate_directories + materialize_files_parallel (1440 files across 40 pkgs)
+    let dir4 = tempdir().unwrap();
+    let cfg4 = determine_writer_config(dir4.path(), None);
+    let mut mat_files = Vec::with_capacity(40 * 36);
+    let mut mat_dirs = Vec::with_capacity(40 * 9);
+    let payload_2k = Arc::new(vec![b'y'; 2048]);
+    for i in 0..40 {
+        let pkg_dir = dir4.path().join(format!("pkg-{i}"));
+        mat_dirs.push(pkg_dir.clone());
+        for m in 0..8 {
+            mat_dirs.push(pkg_dir.join("src").join(format!("mod_{m}")));
+        }
+        mat_files.push(MaterializeFile {
+            path: pkg_dir.join("package.json"),
+            data: Arc::clone(&payload_2k),
+            mode: 0o644,
+            package_id: Some(format!("pkg-{i}")),
+        });
+        for f in 0..35 {
+            mat_files.push(MaterializeFile {
+                path: pkg_dir
+                    .join("src")
+                    .join(format!("mod_{}", f % 8))
+                    .join(format!("file_{f}.js")),
+                data: Arc::clone(&payload_2k),
+                mode: 0o644,
+                package_id: Some(format!("pkg-{i}")),
+            });
+        }
+    }
+    let t0 = Instant::now();
+    let dir_refs: Vec<&std::path::Path> = mat_dirs.iter().map(|p| p.as_path()).collect();
+    precreate_directories(dir_refs).unwrap();
+    let precreate_dirs_ms = t0.elapsed().as_secs_f64() * 1000.0;
+
+    let t0 = Instant::now();
+    materialize_files_parallel(mat_files, &cfg4).unwrap();
+    let materialize_parallel_ms = t0.elapsed().as_secs_f64() * 1000.0;
+
+    // 5. remove_dir_all_safe on dir1, dir2, dir3, dir4
+    let t0 = Instant::now();
+    remove_dir_all_safe(dir1.path()).unwrap();
+    remove_dir_all_safe(dir2.path()).unwrap();
+    let remove_dir_ms = t0.elapsed().as_secs_f64() * 1000.0;
+
+    println!("| Benchmark | Duration (ms) |");
+    println!("|---|---:|");
+    println!("| fs_extract_tar_gz (40 pkgs) | {extract_tar_gz_ms:.2} |");
+    println!("| fs_extract_tarball_direct (40 pkgs) | {extract_direct_ms:.2} |");
+    println!("| fs_extract_packages_direct_parallel (40 pkgs) | {extract_parallel_ms:.2} |");
+    println!("| fs_precreate_directories (360 dirs) | {precreate_dirs_ms:.2} |");
+    println!("| fs_materialize_files_parallel (1440 files) | {materialize_parallel_ms:.2} |");
+    println!("| fs_remove_dir_all_safe (2x 40 pkgs) | {remove_dir_ms:.2} |");
+}

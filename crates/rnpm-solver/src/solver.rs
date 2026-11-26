@@ -325,6 +325,8 @@ struct CachedPackageMeta {
     dist_tags: BTreeMap<String, String>,
     /// Version metadata kept in original `BTreeMap` ascending key order.
     entries: Vec<PackageVersionMetadata>,
+    /// Pre-parsed SemVer version per entry in `entries`.
+    parsed_versions: Vec<Option<Version>>,
     /// Exact version key -> index in `entries`.
     by_key: FastMap<String, usize>,
     /// `(parsed_semver, entry_idx)` stably sorted DESCENDING by SemVer.
@@ -337,18 +339,25 @@ impl CachedPackageMeta {
     fn from_meta(meta: PackageMetadata) -> Self {
         let len = meta.versions.len();
         let mut entries = Vec::with_capacity(len);
+        let mut parsed_versions = Vec::with_capacity(len);
         let mut by_key = fast_map_with_capacity(len);
         let mut descending = Vec::with_capacity(len);
         let mut val_versions = FastMap::default();
         for (idx, (ver_str, v_meta)) in meta.versions.into_iter().enumerate() {
-            if let Some(parsed) = cached_version_rc(&ver_str) {
-                descending.push(((*parsed).clone(), idx));
-            }
-            if v_meta.version != ver_str {
-                if let Some(pv) = cached_version_rc(&v_meta.version) {
-                    val_versions.insert(idx, (*pv).clone());
+            let key_parsed = Version::parse(&ver_str).ok();
+            let entry_parsed = if v_meta.version != ver_str {
+                let pv = Version::parse(&v_meta.version).ok();
+                if let Some(ref p) = pv {
+                    val_versions.insert(idx, p.clone());
                 }
+                pv
+            } else {
+                key_parsed.clone()
+            };
+            if let Some(parsed) = key_parsed {
+                descending.push((parsed, idx));
             }
+            parsed_versions.push(entry_parsed);
             by_key.insert(ver_str, idx);
             entries.push(v_meta);
         }
@@ -357,10 +366,18 @@ impl CachedPackageMeta {
         Self {
             dist_tags: meta.dist_tags,
             entries,
+            parsed_versions,
             by_key,
             descending,
             val_versions,
         }
+    }
+
+    #[inline]
+    fn parsed_by_key(&self, key: &str) -> Option<&Version> {
+        self.by_key
+            .get(key)
+            .and_then(|&idx| self.parsed_versions[idx].as_ref())
     }
 
     #[inline]
@@ -411,6 +428,10 @@ pub struct Solver<'a, P: PackageMetadataProvider> {
     deferred_optional_peers: FastMap<SymId, Vec<ResolveTask>>,
     /// Root/workspace edges already resolved early for a peer set (`(parent_location, install_name)`).
     preplaced: FastSet<(SymId, SymId)>,
+    /// Per-`raw_spec` `SymId` parsed target cache to avoid TLS/RefCell/Range clones on repeated specs.
+    target_cache: Vec<Option<Arc<PackageTarget>>>,
+    /// Tracks whether any pass mutated `self.graph` without updating all 7 secondary maps.
+    indices_dirty: bool,
 }
 
 /// Compares two strings using Arborist-compatible collation.
@@ -461,7 +482,8 @@ pub fn arborist_compare(a: &str, b: &str) -> std::cmp::Ordering {
 }
 
 impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
-    pub fn new(provider: &'a P, options: ResolverOptions, overrides: Overrides) -> Self {
+    pub fn new(provider: &'a P, options: ResolverOptions, mut overrides: Overrides) -> Self {
+        overrides.refresh_compiled();
         let graph = DependencyGraph {
             legacy_peer_deps: options.legacy_peer_deps,
             ..DependencyGraph::new()
@@ -482,6 +504,8 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
             deferred_ws_install_names: fast_map_with_capacity(16),
             deferred_optional_peers: fast_map_with_capacity(16),
             preplaced: fast_set_with_capacity(16),
+            target_cache: Vec::new(),
+            indices_dirty: false,
         }
     }
 
@@ -496,6 +520,7 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
         graph.legacy_peer_deps = self.options.legacy_peer_deps;
         graph.rebuild_indices();
         self.graph = graph;
+        self.indices_dirty = false;
         self
     }
 
@@ -504,6 +529,7 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
     }
 
     pub fn graph_mut(&mut self) -> &mut DependencyGraph {
+        self.indices_dirty = true;
         &mut self.graph
     }
 
@@ -663,7 +689,7 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                                 .ancestor_arena
                                 .to_vec(task.ancestor_head, &self.strings);
                             self.overrides
-                                .resolve_override_with_caller(
+                                .resolve_override_precompiled_with_caller(
                                     &provider.install_name,
                                     raw_spec,
                                     &ancestor_buf,
@@ -815,7 +841,9 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
     /// Extracts the resolved dependency graph.
     pub fn into_graph(mut self) -> DependencyGraph {
         self.graph.normalize_dependency_flags();
-        self.graph.rebuild_indices();
+        if self.indices_dirty {
+            self.graph.rebuild_indices();
+        }
         self.graph
     }
 
@@ -1050,9 +1078,59 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
         }
 
         // 1. Apply overrides without allocations if no rules exist
+        struct TaskDepSpec {
+            install_name: String,
+            package_name: String,
+            target: Arc<PackageTarget>,
+            is_alias: bool,
+        }
+
         let has_overrides = !self.overrides.rules.is_empty();
-        let effective_spec: String = if !has_overrides {
-            self.strings.get(task.raw_spec).to_string()
+        let (effective_spec, dep_spec) = if !has_overrides {
+            let raw_spec_str = self.strings.get(task.raw_spec);
+            let trimmed_spec = raw_spec_str.trim();
+            if !trimmed_spec.starts_with("npm:") {
+                let sym_idx = task.raw_spec.0 as usize;
+                let target_arc = if let Some(cached) = self
+                    .target_cache
+                    .get(sym_idx)
+                    .and_then(|opt| opt.as_ref())
+                {
+                    Arc::clone(cached)
+                } else {
+                    let parsed = PackageTarget::parse(trimmed_spec)?;
+                    let arc = Arc::new(parsed);
+                    if sym_idx >= self.target_cache.len() {
+                        self.target_cache.resize(sym_idx + 64, None);
+                    }
+                    self.target_cache[sym_idx] = Some(Arc::clone(&arc));
+                    arc
+                };
+                let install_name_trimmed = self.strings.get(task.install_name).trim().to_string();
+                let package_name = install_name_trimmed.clone();
+                let eff = raw_spec_str.to_string();
+                (
+                    eff,
+                    TaskDepSpec {
+                        install_name: install_name_trimmed,
+                        package_name,
+                        target: target_arc,
+                        is_alias: false,
+                    },
+                )
+            } else {
+                let eff = raw_spec_str.to_string();
+                let parsed = DependencySpec::parse(self.strings.get(task.install_name), &eff)?;
+                (
+                    eff,
+                    TaskDepSpec {
+                        install_name: parsed.install_name,
+                        package_name: parsed.package_name,
+                        target: Arc::new(parsed.target),
+                        is_alias: parsed.is_alias,
+                    },
+                )
+            }
         } else {
             let parent_loc = self.strings.get(task.parent_location);
             let caller_specs = if parent_loc.is_empty() {
@@ -1068,12 +1146,14 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
             let task_ancestors = self
                 .ancestor_arena
                 .to_vec(task.ancestor_head, &self.strings);
-            if let Some(overridden) = self.overrides.resolve_override_with_caller(
-                install_name,
-                raw_spec,
-                &task_ancestors,
-                caller_specs.as_ref(),
-            )? {
+            let effective_spec = if let Some(overridden) = self
+                .overrides
+                .resolve_override_precompiled_with_caller(
+                    install_name,
+                    raw_spec,
+                    &task_ancestors,
+                    caller_specs.as_ref(),
+                )? {
                 debug!(
                     "Overriding dependency '{}': '{}' -> '{}'",
                     install_name, raw_spec, overridden
@@ -1097,7 +1177,7 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                     (alias_str, "*")
                 };
 
-                if let Some(overridden) = self.overrides.resolve_override_with_caller(
+                if let Some(overridden) = self.overrides.resolve_override_precompiled_with_caller(
                     real_pkg,
                     inner_spec,
                     &task_ancestors,
@@ -1117,11 +1197,18 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                 }
             } else {
                 raw_spec.to_string()
-            }
+            };
+            let parsed = DependencySpec::parse(install_name, &effective_spec)?;
+            (
+                effective_spec,
+                TaskDepSpec {
+                    install_name: parsed.install_name,
+                    package_name: parsed.package_name,
+                    target: Arc::new(parsed.target),
+                    is_alias: parsed.is_alias,
+                },
+            )
         };
-
-        let install_name_owned = self.strings.get(task.install_name).to_string();
-        let dep_spec = DependencySpec::parse(&install_name_owned, &effective_spec)?;
         let pkg_sym = if dep_spec.is_alias {
             self.strings.intern(&dep_spec.package_name)
         } else {
@@ -1197,12 +1284,21 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                                         existing_name, existing_ver, existing_loc, effective_spec
                                     ),
                                 )
-                                .with_eresolve(self.explain_peer_set_conflict(
-                                    task,
-                                    &dep_spec,
-                                    &effective_spec,
-                                    &existing_loc,
-                                )));
+                                .with_eresolve({
+                                    let full_dep_spec = DependencySpec {
+                                        install_name: dep_spec.install_name.clone(),
+                                        package_name: dep_spec.package_name.clone(),
+                                        target: (*dep_spec.target).clone(),
+                                        raw_spec: effective_spec.clone(),
+                                        is_alias: dep_spec.is_alias,
+                                    };
+                                    self.explain_peer_set_conflict(
+                                        task,
+                                        &full_dep_spec,
+                                        &effective_spec,
+                                        &existing_loc,
+                                    )
+                                }));
                             } else {
                                 warn!(
                                     "Peer dependency conflict in cycle: {} requires {}@{}, but found {}@{} (non-strict mode)",
@@ -1296,12 +1392,21 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                                     existing_name, existing_ver, existing_loc, effective_spec
                                 ),
                             )
-                            .with_eresolve(self.explain_peer_set_conflict(
-                                task,
-                                &dep_spec,
-                                &effective_spec,
-                                &existing_loc,
-                            )));
+                            .with_eresolve({
+                                let full_dep_spec = DependencySpec {
+                                    install_name: dep_spec.install_name.clone(),
+                                    package_name: dep_spec.package_name.clone(),
+                                    target: (*dep_spec.target).clone(),
+                                    raw_spec: effective_spec.clone(),
+                                    is_alias: dep_spec.is_alias,
+                                };
+                                self.explain_peer_set_conflict(
+                                    task,
+                                    &full_dep_spec,
+                                    &effective_spec,
+                                    &existing_loc,
+                                )
+                            }));
                         } else if self.graph.nodes.contains_key(&sibling) {
                             warn!(
                                 "Peer dependency conflict: {} requires {}@{}, but found {}@{} (non-strict mode)",
@@ -1367,12 +1472,21 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                                     existing_name, existing_ver, existing_loc, effective_spec
                                 ),
                             )
-                            .with_eresolve(self.explain_placed_peer_conflict(
-                                task,
-                                &dep_spec,
-                                &effective_spec,
-                                &existing_loc,
-                            )));
+                            .with_eresolve({
+                                let full_dep_spec = DependencySpec {
+                                    install_name: dep_spec.install_name.clone(),
+                                    package_name: dep_spec.package_name.clone(),
+                                    target: (*dep_spec.target).clone(),
+                                    raw_spec: effective_spec.clone(),
+                                    is_alias: dep_spec.is_alias,
+                                };
+                                self.explain_placed_peer_conflict(
+                                    task,
+                                    &full_dep_spec,
+                                    &effective_spec,
+                                    &existing_loc,
+                                )
+                            }));
                         }
                         replace_transitive_root_peer = sibling.is_none() && !root_pins_provider;
                         if !replace_transitive_root_peer
@@ -1808,7 +1922,7 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                 {
                     continue;
                 }
-                let virtual_override = self.overrides.resolve_override_in_context(
+                let virtual_override = self.overrides.resolve_override_precompiled_in_context(
                     name,
                     spec,
                     &ancestors,
@@ -1827,7 +1941,7 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                         if let Some(parent_spec) = parent_spec {
                             let parent_spec = self
                                 .overrides
-                                .resolve_override_with_caller(
+                                .resolve_override_precompiled_with_caller(
                                     name,
                                     parent_spec,
                                     &task_ancestors,
@@ -2001,12 +2115,21 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                         ancestors,
                         "Cannot move a peer provider beneath its consumer".to_string(),
                     )
-                    .with_eresolve(self.explain_placed_peer_conflict(
-                        task,
-                        &dep_spec,
-                        &effective_spec,
-                        &existing_loc,
-                    )));
+                    .with_eresolve({
+                        let full_dep_spec = DependencySpec {
+                            install_name: dep_spec.install_name.clone(),
+                            package_name: dep_spec.package_name.clone(),
+                            target: (*dep_spec.target).clone(),
+                            raw_spec: effective_spec.clone(),
+                            is_alias: dep_spec.is_alias,
+                        };
+                        self.explain_placed_peer_conflict(
+                            task,
+                            &full_dep_spec,
+                            &effective_spec,
+                            &existing_loc,
+                        )
+                    }));
                 }
             }
             if !self.rehome_transitive_root_node(&root_slot, &dep_spec.install_name) {
@@ -2094,7 +2217,11 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                     link: false,
                 };
 
-                let parsed_ver = cached_version_rc(&chosen_version.version).map(|rc| (*rc).clone());
+                let parsed_ver = if pkg_meta.val_versions.is_empty() {
+                    pkg_meta.parsed_by_key(&chosen_version.version).cloned()
+                } else {
+                    Version::parse(&chosen_version.version).ok()
+                };
                 let node = Node {
                     location: target_loc.clone(),
                     install_name: dep_spec.install_name.clone(),
@@ -2759,6 +2886,7 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
         if candidates.is_empty() {
             return;
         }
+        self.indices_dirty = true;
 
         let has_incoming_index = !self.graph.incoming_edges_by_location.is_empty();
         for candidate in &candidates {
@@ -2867,8 +2995,8 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                     || chosen_owned.dependencies.contains_key(peer)
                     || chosen_owned.optional_dependencies.contains_key(peer)
                     // Overrides rewrite these specs per path; leave them to placement.
-                    || self.overrides.mentions(name)
-                    || self.overrides.mentions(peer)
+                    || self.overrides.mentions_precompiled(name)
+                    || self.overrides.mentions_precompiled(peer)
                 {
                     continue;
                 }
@@ -3360,7 +3488,7 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                 .chain(&version.optional_dependencies)
                 .chain(peers)
             {
-                if bundled.contains(&child.as_str()) || self.overrides.mentions(child) {
+                if bundled.contains(&child.as_str()) || self.overrides.mentions_precompiled(child) {
                     continue;
                 }
                 out.push((child.clone(), child_spec.clone(), false));
@@ -3467,7 +3595,8 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                 };
 
                 if self.options.prefer_dedupe {
-                    let mut scope_buf = String::new();
+                    let mut scope_buf =
+                        String::with_capacity(parent_location.len() + install_name.len() + 16);
                     if let Some(loc) = DependencyGraph::find_in_scope_hierarchy(
                         &self.graph.nodes,
                         parent_location,
@@ -3587,14 +3716,15 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                 // npm resolves registry ranges through the `latest` dist-tag
                 // when that tagged version satisfies the requested range.
                 if let Some(latest_version) = meta.dist_tags.get("latest") {
-                    if let Some(latest) = meta.get_by_key(latest_version) {
+                    if let Some(&latest_idx) = meta.by_key.get(latest_version) {
+                        let latest = &meta.entries[latest_idx];
                         if latest.deprecated.is_none() {
-                            if let Some(v) = cached_version_rc(&latest.version) {
-                                if range.satisfies(&v)
-                                    && is_safe(&v)
+                            if let Some(ref v) = meta.parsed_versions[latest_idx] {
+                                if range.satisfies(v)
+                                    && is_safe(v)
                                     && advisories.iter().all(|target| {
                                         parsed_version_satisfies_target(
-                                            &v,
+                                            v,
                                             Some(&latest.version),
                                             target,
                                         )
@@ -3611,7 +3741,23 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                 // ascending BTreeMap order), so the first safe + undeprecated match wins immediately.
                 let mut first_safe: Option<&'b PackageVersionMetadata> = None;
                 let mut first_any: Option<&'b PackageVersionMetadata> = None;
-                for (parsed, idx) in &meta.descending {
+                let (min_major, max_major) = if meta.val_versions.is_empty() {
+                    range.major_bounds_hint()
+                } else {
+                    (None, None)
+                };
+                let slice = meta.descending.as_slice();
+                let start = if let Some(max_m) = max_major {
+                    slice.partition_point(|(v, _)| v.major > max_m)
+                } else {
+                    0
+                };
+                for (parsed, idx) in &slice[start..] {
+                    if let Some(min_m) = min_major {
+                        if parsed.major < min_m {
+                            break;
+                        }
+                    }
                     let check_ver = meta.entry_version(*idx, parsed);
                     if !range.satisfies(check_ver) {
                         continue;
@@ -3729,10 +3875,12 @@ pub fn resolve_fast_path(
         return None;
     }
 
-    let overrides = Overrides::from_json_value(
-        manifest.extra.get("overrides"),
-        Overrides::reference_specs(manifest),
-    );
+    let overrides_val = manifest.extra.get("overrides");
+    let overrides = if overrides_val.is_some() {
+        Overrides::from_json_value(overrides_val, Overrides::reference_specs(manifest))
+    } else {
+        Overrides::default()
+    };
 
     let mut graph = DependencyGraph::from_lockfile_v3(lockfile);
     graph.legacy_peer_deps = options.legacy_peer_deps;
@@ -3934,7 +4082,9 @@ fn validate_fast_path_dep(
             }
             ancestors.reverse();
         }
-        if let Ok(Some(overridden)) = overrides.resolve_override(dep_name, raw_spec, &ancestors) {
+        if let Ok(Some(overridden)) =
+            overrides.resolve_override_precompiled_with_caller(dep_name, raw_spec, &ancestors, None)
+        {
             if let Ok(parsed_override) = DependencySpec::parse(dep_name, &overridden) {
                 return target_node.name == parsed_override.package_name
                     && crate::hoisting::node_satisfies_target(
@@ -3998,10 +4148,12 @@ pub fn resolve_dependency_graph_with_lockfile<P: PackageMetadataProvider>(
     if let Some(lf) = lockfile {
         opts.lockfile = Some(std::sync::Arc::new(lf.clone()));
     }
-    let overrides = Overrides::from_json_value(
-        manifest.extra.get("overrides"),
-        Overrides::reference_specs(manifest),
-    );
+    let overrides_val = manifest.extra.get("overrides");
+    let overrides = if overrides_val.is_some() {
+        Overrides::from_json_value(overrides_val, Overrides::reference_specs(manifest))
+    } else {
+        Overrides::default()
+    };
     let solver = Solver::new(provider, opts, overrides);
     solver.resolve(manifest)
 }
@@ -4086,5 +4238,23 @@ mod tests {
             placed_from,
             crate::explain::EdgeFrom::Node(ref loc) if loc == "node_modules/a-first-edge"
         ));
+    }
+
+    #[test]
+    fn test_solver_new_refreshes_mutated_overrides() {
+        let provider = crate::types::InMemoryPackageProvider::new();
+        let mut overrides = Overrides::default();
+        overrides.rules.insert(
+            "foo".to_string(),
+            rnpm_core::overrides::OverrideValue::Exact("2.0.0".to_string()),
+        );
+        let solver = Solver::new(&provider, ResolverOptions::default(), overrides);
+        assert_eq!(
+            solver
+                .overrides
+                .resolve_override_precompiled_with_caller("foo", "^1.0.0", &["root"], None)
+                .unwrap(),
+            Some("2.0.0".to_string())
+        );
     }
 }

@@ -11,6 +11,7 @@ pub mod junction;
 pub mod node_writer;
 pub mod parallel;
 pub mod path;
+pub mod pool;
 pub mod tarball;
 pub mod writer;
 
@@ -36,6 +37,7 @@ pub use junction::{
 };
 pub use parallel::{extract_batch_parallel, BatchExtractionItem};
 pub use path::{strip_verbatim_prefix, to_verbatim_path};
+pub use pool::run_parallel;
 pub use tarball::{
     bytes_written, collect_pack_files, compute_tarball_filename, extract_tar_gz, files_created,
     pack_directory, pure_rust_gzip, read_tarball_text, record_file_created,

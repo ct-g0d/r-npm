@@ -861,14 +861,19 @@ pub fn resolve_workspace_graph<P: PackageMetadataProvider>(
     }
 
     // 4. Resolve external third-party dependencies from root and all workspace members
-    let mut root_refs = Overrides::reference_specs(root_manifest);
-    for member in members {
-        let mem_ver = member.version.as_deref().unwrap_or("*");
-        root_refs
-            .entry(member.name.clone())
-            .or_insert_with(|| format!("workspace:{mem_ver}"));
-    }
-    let overrides = Overrides::from_json_value(root_manifest.extra.get("overrides"), root_refs);
+    let overrides_val = root_manifest.extra.get("overrides");
+    let overrides = if overrides_val.is_some() {
+        let mut root_refs = Overrides::reference_specs(root_manifest);
+        for member in members {
+            let mem_ver = member.version.as_deref().unwrap_or("*");
+            root_refs
+                .entry(member.name.clone())
+                .or_insert_with(|| format!("workspace:{mem_ver}"));
+        }
+        Overrides::from_json_value(overrides_val, root_refs)
+    } else {
+        Overrides::default()
+    };
     let mut solver = Solver::new(provider, options.clone(), overrides).with_graph(graph);
 
     let root_ancestors = std::sync::Arc::new(vec![root_name.clone()]);

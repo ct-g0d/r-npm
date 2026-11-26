@@ -4772,3 +4772,22 @@ fn test_script_base_env_with_manifest_matches_direct_hook_env_for_raw_fields() {
         assert_eq!(batched_env, direct_env);
     }
 }
+
+#[test]
+fn test_try_split_simple_args_and_ssh_auth_sock_parity() {
+    assert_eq!(
+        try_split_simple_args(r#"node -e "console.log('ok')""#),
+        Some(vec![
+            "node".to_string(),
+            "-e".to_string(),
+            "console.log('ok')".to_string()
+        ])
+    );
+    // Adjacent quotes (`""`) must fall back to shell due to MSVCRT literal quote rules.
+    assert_eq!(try_split_simple_args(r#"node -p "a""b""#), None);
+    if cfg!(windows) {
+        // `\"` starting a quoted segment is an escaped literal quote in MSVCRT.
+        assert_eq!(try_split_simple_args(r#"node foo\"bar""#), None);
+    }
+    assert!(is_sensitive_credential_key("ssh_auth_sock_author"));
+}

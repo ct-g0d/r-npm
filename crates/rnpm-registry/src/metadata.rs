@@ -455,91 +455,8 @@ fn contains_crlf(s: &str) -> bool {
     s.as_bytes().iter().any(|&b| b == b'\r' || b == b'\n')
 }
 
-/// Fast-path validation for standard canonical lowercase `http://`/`https://` ASCII URLs
-/// (no IDNA/punycode, no percent escapes, no query/fragment, alphabetic TLD label, valid port).
-/// Returns `false` for anything unusual so callers fall back to full `Url::parse` parity.
 #[inline]
-fn is_fast_valid_http_tarball_url(s: &str) -> bool {
-    let rest = if let Some(r) = s.strip_prefix("https://") {
-        r
-    } else if let Some(r) = s.strip_prefix("http://") {
-        r
-    } else {
-        return false;
-    };
-
-    let (authority, path) = match rest.find('/') {
-        Some(idx) => (&rest[..idx], &rest[idx..]),
-        None => (rest, ""),
-    };
-
-    if authority.is_empty() {
-        return false;
-    }
-
-    let host = match authority.split_once(':') {
-        Some((h, port_str)) => {
-            if port_str.is_empty()
-                || port_str.len() > 5
-                || port_str.contains(':')
-                || !port_str.bytes().all(|b| b.is_ascii_digit())
-            {
-                return false;
-            }
-            let Ok(port) = port_str.parse::<u32>() else {
-                return false;
-            };
-            if port == 0 || port > 65535 {
-                return false;
-            }
-            h
-        }
-        None => authority,
-    };
-
-    if host.is_empty()
-        || host.len() > 253
-        || host
-            .as_bytes()
-            .windows(4)
-            .any(|w| w.eq_ignore_ascii_case(b"xn--"))
-    {
-        return false;
-    }
-
-    let mut has_last_label_alpha = false;
-    let mut label_count = 0usize;
-    let mut all_valid_ipv4_octets = true;
-    for label in host.split('.') {
-        label_count += 1;
-        if label.is_empty() || label.starts_with('-') || label.ends_with('-') {
-            return false;
-        }
-        let mut label_alpha = false;
-        let mut label_digits_only = label.len() <= 3;
-        for &b in label.as_bytes() {
-            if b.is_ascii_alphabetic() {
-                label_alpha = true;
-                label_digits_only = false;
-            } else if b == b'-' {
-                label_digits_only = false;
-            } else if !b.is_ascii_digit() {
-                return false;
-            }
-        }
-        if label_digits_only {
-            if (label.len() > 1 && label.starts_with('0')) || label.parse::<u8>().is_err() {
-                all_valid_ipv4_octets = false;
-            }
-        } else {
-            all_valid_ipv4_octets = false;
-        }
-        has_last_label_alpha = label_alpha;
-    }
-    if !has_last_label_alpha && !(all_valid_ipv4_octets && label_count == 4) {
-        return false;
-    }
-
+fn is_fast_tarball_path(path: &str) -> bool {
     path.as_bytes().iter().all(|&b| {
         b.is_ascii_alphanumeric()
             || matches!(
@@ -563,6 +480,96 @@ fn is_fast_valid_http_tarball_url(s: &str) -> bool {
                     | b'*'
             )
     })
+}
+
+/// Fast-path validation returning the validated scheme+authority prefix length (`"https://host/"`)
+/// when `s` is a canonical lowercase ASCII `http://` or `https://` URL.
+#[inline]
+fn fast_http_tarball_origin_end(s: &str) -> Option<usize> {
+    let scheme_len = if s.starts_with("https://") {
+        8
+    } else if s.starts_with("http://") {
+        7
+    } else {
+        return None;
+    };
+    let rest = &s[scheme_len..];
+
+    let (authority, path, origin_end) = match rest.find('/') {
+        Some(idx) => (&rest[..idx], &rest[idx..], scheme_len + idx + 1),
+        None => (rest, "", s.len()),
+    };
+
+    if authority.is_empty() {
+        return None;
+    }
+
+    let host = match authority.split_once(':') {
+        Some((h, port_str)) => {
+            if port_str.is_empty()
+                || port_str.len() > 5
+                || port_str.contains(':')
+                || !port_str.bytes().all(|b| b.is_ascii_digit())
+            {
+                return None;
+            }
+            let port: u32 = port_str.parse().ok()?;
+            if port == 0 || port > 65535 {
+                return None;
+            }
+            h
+        }
+        None => authority,
+    };
+
+    if host.is_empty()
+        || host.len() > 253
+        || host
+            .as_bytes()
+            .windows(4)
+            .any(|w| w.eq_ignore_ascii_case(b"xn--"))
+    {
+        return None;
+    }
+
+    let mut has_last_label_alpha = false;
+    let mut label_count = 0usize;
+    let mut all_valid_ipv4_octets = true;
+    for label in host.split('.') {
+        label_count += 1;
+        if label.is_empty() || label.starts_with('-') || label.ends_with('-') {
+            return None;
+        }
+        let mut label_alpha = false;
+        let mut label_digits_only = label.len() <= 3;
+        for &b in label.as_bytes() {
+            if b.is_ascii_alphabetic() {
+                label_alpha = true;
+                label_digits_only = false;
+            } else if b == b'-' {
+                label_digits_only = false;
+            } else if !b.is_ascii_digit() {
+                return None;
+            }
+        }
+        if label_digits_only {
+            if (label.len() > 1 && label.starts_with('0')) || label.parse::<u8>().is_err() {
+                all_valid_ipv4_octets = false;
+            }
+        } else {
+            all_valid_ipv4_octets = false;
+        }
+        has_last_label_alpha = label_alpha;
+    }
+    if !has_last_label_alpha && !(all_valid_ipv4_octets && label_count == 4) {
+        return None;
+    }
+
+    if is_fast_tarball_path(path) {
+        Some(origin_end)
+    } else {
+        None
+    }
 }
 
 impl AbbreviatedPackageMetadata {
@@ -601,7 +608,9 @@ impl AbbreviatedPackageMetadata {
             }
         }
 
-        // Validate versions
+        // Validate versions, memoizing the previously validated scheme://host/ origin prefix
+        // across versions so typical N-version packuments skip redundant authority parsing.
+        let mut verified_origin_prefix: Option<&str> = None;
         for (ver_key, ver_info) in &self.versions {
             if contains_crlf(ver_key) {
                 return Err(RegistryError::MalformedMetadata(format!(
@@ -634,9 +643,31 @@ impl AbbreviatedPackageMetadata {
                 )));
             }
 
-            if !ver_info.dist.tarball.is_empty()
-                && !is_fast_valid_http_tarball_url(&ver_info.dist.tarball)
-            {
+            if !ver_info.dist.tarball.is_empty() {
+                let fast_ok = if let Some(prefix) = verified_origin_prefix {
+                    if prefix.ends_with('/')
+                        && ver_info.dist.tarball.starts_with(prefix)
+                        && is_fast_tarball_path(&ver_info.dist.tarball[prefix.len()..])
+                    {
+                        true
+                    } else if let Some(origin_end) =
+                        fast_http_tarball_origin_end(&ver_info.dist.tarball)
+                    {
+                        verified_origin_prefix = Some(&ver_info.dist.tarball[..origin_end]);
+                        true
+                    } else {
+                        false
+                    }
+                } else if let Some(origin_end) =
+                    fast_http_tarball_origin_end(&ver_info.dist.tarball)
+                {
+                    verified_origin_prefix = Some(&ver_info.dist.tarball[..origin_end]);
+                    true
+                } else {
+                    false
+                };
+
+                if !fast_ok {
                 if contains_crlf(&ver_info.dist.tarball) {
                     return Err(RegistryError::MalformedMetadata(format!(
                         "Version '{ver_key}' tarball URL contains forbidden CR/LF characters: {:?}",
@@ -675,6 +706,7 @@ impl AbbreviatedPackageMetadata {
                         )));
                     }
                 }
+                }
             }
         }
 
@@ -709,11 +741,9 @@ pub fn parse_packument_with_mode(
     bytes: &[u8],
     mode: PackumentParseMode,
 ) -> Result<AbbreviatedPackageMetadata, RegistryError> {
-    let mut de = serde_json::Deserializer::from_slice(bytes);
-    let metadata = PackageMetadataSeed { mode }
-        .deserialize(&mut de)
-        .map_err(RegistryError::Json)?;
-    de.end().map_err(RegistryError::Json)?;
+    let mut deserializer = serde_json::Deserializer::from_slice(bytes);
+    let metadata = PackageMetadataSeed { mode }.deserialize(&mut deserializer)?;
+    deserializer.end()?;
     metadata.validate()?;
     Ok(metadata)
 }
@@ -2551,4 +2581,36 @@ mod tests {
         bundled.sort();
         assert_eq!(bundled, vec!["dep1".to_string(), "dep2".to_string()]);
     }
+
+    #[test]
+    fn test_negative_zero_parity_with_serde_json() {
+        let json = r#"{
+            "name": "neg-zero",
+            "dist-tags": { "latest": "1.0.0", "neg": -0 },
+            "versions": {
+                "1.0.0": {
+                    "name": "neg-zero",
+                    "version": "1.0.0",
+                    "dependencies": { "numdep": -0 },
+                    "custom": -0,
+                    "dist": { "tarball": "https://registry.npmjs.org/neg-zero/-/neg-zero-1.0.0.tgz" }
+                }
+            }
+        }"#;
+        let parsed = parse_full_packument(json.as_bytes()).unwrap();
+        assert_eq!(parsed.dist_tags.get("neg").map(String::as_str), Some("-0.0"));
+        assert_eq!(
+            parsed.versions["1.0.0"].dependencies.get("numdep").map(String::as_str),
+            Some("-0.0")
+        );
+        assert_eq!(
+            parsed.versions["1.0.0"]
+                .extra
+                .get("custom")
+                .map(ToString::to_string)
+                .as_deref(),
+            Some("-0.0")
+        );
+    }
+
 }

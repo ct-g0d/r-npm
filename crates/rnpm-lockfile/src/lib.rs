@@ -11,6 +11,7 @@
 )]
 
 pub mod error;
+mod fast_parse;
 pub mod integrity;
 pub mod migration;
 pub mod model;
@@ -18,7 +19,8 @@ pub mod model;
 pub use error::LockfileError;
 pub use integrity::{verify_lockfile_integrity, IntegrityPolicy, LockfileIntegrityChecker};
 pub use migration::{
-    load_and_migrate, migrate_to_v3, parse_and_migrate, AnyLockfile, LegacyDependency,
+    load_and_migrate, load_and_migrate_readonly, migrate_to_v3, parse_and_migrate,
+    parse_and_migrate_readonly, AnyLockfile, LegacyDependency,
 };
 pub use model::{
     get_format_package_lock, reset_format_package_lock, set_format_package_lock,
@@ -1997,5 +1999,37 @@ mod tests {
         lockfile.save_to_file(&lock_path).unwrap();
         let content_npmrc = std::fs::read_to_string(&lock_path).unwrap();
         assert_eq!(content_npmrc.lines().count(), 1, "lockfile saved with format-package-lock=false in .npmrc must be single line");
+    }
+
+    #[test]
+    fn test_fast_parse_empty_license_and_neg_zero_parity() {
+        let json = r#"{
+  "name": "parity-app",
+  "lockfileVersion": 3,
+  "packages": {
+    "": { "version": "1.0.0" },
+    "node_modules/empty-lic": {
+      "version": "1.0.0",
+      "license": "",
+      "negZero": -0
+    }
+  }
+}"#;
+        let lf = LockfileV3::from_json_str(json).unwrap();
+        let lf_ro = LockfileV3::from_json_str_readonly(json).unwrap();
+        let p = lf.packages.get("node_modules/empty-lic").unwrap();
+        let p_ro = lf_ro.packages.get("node_modules/empty-lic").unwrap();
+        assert_eq!(p.license, None);
+        assert_eq!(p_ro.license, None);
+        assert_eq!(
+            p.raw_value
+                .as_ref()
+                .and_then(|v| v.get("license"))
+                .and_then(|v| v.as_str()),
+            Some("")
+        );
+        let expected_neg_zero: serde_json::Value = serde_json::from_str("-0").unwrap();
+        assert_eq!(p.extra.get("negZero"), Some(&expected_neg_zero));
+        assert_eq!(p_ro.extra.get("negZero"), Some(&expected_neg_zero));
     }
 }

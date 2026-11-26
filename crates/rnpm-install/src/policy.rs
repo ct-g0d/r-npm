@@ -917,10 +917,20 @@ fn os_release() -> Option<String> {
 /// npm-install-checks `checkDevEngines`, as npm runs it before arborist
 /// commands and `run`: an unmatched `devEngines` entry fails with
 /// EBADDEVENGINES (or warns with `onFail: "warn"`, or under `--force`).
+#[inline]
+fn bytes_contain_subslice(hay: &[u8], needle: &[u8]) -> bool {
+    hay.len() >= needle.len() && hay.windows(needle.len()).any(|w| w == needle)
+}
+
 pub fn check_dev_engines(project_dir: &Path, force: bool) -> Result<()> {
-    let Some(dev_engines) = std::fs::read_to_string(project_dir.join("package.json"))
+    let Ok(raw) = std::fs::read(project_dir.join("package.json")) else {
+        return Ok(());
+    };
+    if !bytes_contain_subslice(&raw, b"\"devEngines\"") && !bytes_contain_subslice(&raw, b"\\u") {
+        return Ok(());
+    }
+    let Some(dev_engines) = serde_json::from_slice::<serde_json::Value>(&raw)
         .ok()
-        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
         .and_then(|pkg| pkg.get("devEngines").cloned())
     else {
         return Ok(());
@@ -1137,6 +1147,15 @@ pub fn check_engines(
     silent: bool,
     platform: &rnpm_solver::Platform,
 ) -> Result<()> {
+    let may_have_engines = lockfile.packages.iter().any(|(loc, pkg)| {
+        !loc.is_empty()
+            && (pkg.engines.is_some()
+                || pkg.link == Some(true)
+                || !loc.contains("node_modules/"))
+    });
+    if !may_have_engines {
+        return Ok(());
+    }
     let node_version = rnpm_lifecycle::node_version();
     let npm_version = rnpm_lifecycle::NPM_VERSION;
     let node_semver = rnpm_core::semver::Version::parse(node_version.trim_start_matches('v')).ok();

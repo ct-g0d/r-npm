@@ -714,7 +714,7 @@ mod win_rm {
         let mut local_subdirs = Vec::with_capacity(16);
 
         // Traverse sequentially until queue fans out (>= 2 subdirs), avoiding thread
-        // spawning overhead on tiny trees while scaling cleanly for nested node_modules.
+        // dispatch overhead on tiny trees while scaling cleanly for nested node_modules.
         while stack.len() == 1 {
             let dir = stack.pop().unwrap();
             local_subdirs.clear();
@@ -754,71 +754,64 @@ mod win_rm {
             });
             let cvar = Condvar::new();
 
-            std::thread::scope(|scope| {
-                for _ in 0..num_threads {
-                    let state_ref = &state;
-                    let cvar_ref = &cvar;
-                    scope.spawn(move || {
-                        let mut p_buf = Vec::with_capacity(300);
-                        let mut c_buf = Vec::with_capacity(300);
-                        let mut local_subs = Vec::with_capacity(16);
+            crate::pool::run_parallel(num_threads, &|| {
+                let mut p_buf = Vec::with_capacity(300);
+                let mut c_buf = Vec::with_capacity(300);
+                let mut local_subs = Vec::with_capacity(16);
 
+                loop {
+                    let dir = {
+                        let mut guard = state.lock().unwrap_or_else(|e| e.into_inner());
                         loop {
-                            let dir = {
-                                let mut guard = state_ref.lock().unwrap_or_else(|e| e.into_inner());
-                                loop {
-                                    if guard.error.is_some() {
-                                        break None;
-                                    }
-                                    if let Some(d) = guard.pending.pop_back() {
-                                        guard.active += 1;
-                                        break Some(d);
-                                    }
-                                    if guard.active == 0 {
-                                        cvar_ref.notify_all();
-                                        break None;
-                                    }
-                                    guard = cvar_ref.wait(guard).unwrap_or_else(|e| e.into_inner());
-                                }
-                            };
-                            let Some(dir) = dir else {
-                                break;
-                            };
+                            if guard.error.is_some() {
+                                break None;
+                            }
+                            if let Some(d) = guard.pending.pop_back() {
+                                guard.active += 1;
+                                break Some(d);
+                            }
+                            if guard.active == 0 {
+                                cvar.notify_all();
+                                break None;
+                            }
+                            guard = cvar.wait(guard).unwrap_or_else(|e| e.into_inner());
+                        }
+                    };
+                    let Some(dir) = dir else {
+                        break;
+                    };
 
-                            let mut active_guard = ActiveGuard {
-                                state: state_ref,
-                                cvar: cvar_ref,
-                                armed: true,
-                            };
+                    let mut active_guard = ActiveGuard {
+                        state: &state,
+                        cvar: &cvar,
+                        armed: true,
+                    };
 
-                            local_subs.clear();
-                            let res =
-                                scan_and_unlink_dir(dir, &mut p_buf, &mut c_buf, &mut local_subs);
+                    local_subs.clear();
+                    let res = scan_and_unlink_dir(dir, &mut p_buf, &mut c_buf, &mut local_subs);
 
-                            let mut guard = state_ref.lock().unwrap_or_else(|e| e.into_inner());
-                            guard.active = guard.active.saturating_sub(1);
-                            active_guard.armed = false;
-                            match res {
-                                Ok(()) => {
-                                    if !local_subs.is_empty() {
-                                        for sub in local_subs.drain(..) {
-                                            guard.pending.push_back(sub);
-                                        }
-                                        cvar_ref.notify_all();
-                                    } else if guard.pending.is_empty() && guard.active == 0 {
-                                        cvar_ref.notify_all();
-                                    }
+                    let mut guard = state.lock().unwrap_or_else(|e| e.into_inner());
+                    guard.active = guard.active.saturating_sub(1);
+                    active_guard.armed = false;
+                    match res {
+                        Ok(()) => {
+                            if !local_subs.is_empty() {
+                                for sub in local_subs.drain(..) {
+                                    guard.pending.push_back(sub);
                                 }
-                                Err(e) => {
-                                    if guard.error.is_none() {
-                                        guard.error = Some(e);
-                                    }
-                                    cvar_ref.notify_all();
-                                    break;
-                                }
+                                cvar.notify_all();
+                            } else if guard.pending.is_empty() && guard.active == 0 {
+                                cvar.notify_all();
                             }
                         }
-                    });
+                        Err(e) => {
+                            if guard.error.is_none() {
+                                guard.error = Some(e);
+                            }
+                            cvar.notify_all();
+                            break;
+                        }
+                    }
                 }
             });
 

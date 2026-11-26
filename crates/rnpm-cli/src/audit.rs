@@ -372,6 +372,20 @@ fn extract_pkg_name(key: &str, declared_name: Option<&str>) -> String {
 }
 
 /// Load advisory database from registry or local mock storage.
+static AUDIT_HTTP_CLIENT: std::sync::OnceLock<Result<reqwest::Client, String>> =
+    std::sync::OnceLock::new();
+
+fn audit_http_client() -> anyhow::Result<&'static reqwest::Client> {
+    let cached = AUDIT_HTTP_CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .build()
+            .map_err(|e| format!("Failed to build HTTP client for audit: {e}"))
+    });
+    cached.as_ref().map_err(|msg| anyhow::anyhow!("{msg}"))
+}
+
 async fn fetch_advisories(
     registry_url: &str,
     bulk_request: &BTreeMap<String, Vec<String>>,
@@ -404,11 +418,7 @@ async fn fetch_advisories(
     let target_parsed = Url::parse(&target_url)
         .map_err(|e| anyhow::anyhow!("Invalid registry URL '{target_url}': {e}"))?;
 
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
-        .connect_timeout(std::time::Duration::from_secs(10))
-        .build()
-        .map_err(|e| anyhow::anyhow!("Failed to build HTTP client for audit: {e}"))?;
+    let client = audit_http_client()?;
 
     let mut req = client
         .post(&target_url)
@@ -490,7 +500,7 @@ pub(crate) async fn build_audit_report_with_advisories_and_config(
                  npm error Try creating one with `rnpm install`."
             ));
         }
-        owned_lockfile = rnpm_lockfile::load_and_migrate(&lock_path).map_err(|e| {
+        owned_lockfile = rnpm_lockfile::load_and_migrate_readonly(&lock_path).map_err(|e| {
             anyhow::anyhow!(
                 "Failed to parse {}: {e}",
                 if is_shrinkwrap {

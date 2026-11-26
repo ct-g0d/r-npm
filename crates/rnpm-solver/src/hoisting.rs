@@ -708,13 +708,7 @@ fn candidate_shadows_descendant_dep_parsed(
     // Arborist attaches edgesOut when a node enters the tree, before that
     // node's turn in depsQueue. Our graph.edges only contains processed
     // tasks, so also inspect pending edges from the manifest.
-    let check_node = |loc: &str| -> bool {
-        if !is_in_scope_subtree(loc, scope) {
-            return false;
-        }
-        let Some(node) = graph.nodes.get(loc) else {
-            return false;
-        };
+    let check_node_ref = |node: &crate::graph::Node| -> bool {
         let Some(spec) = node
             .optional_dependencies
             .get(install_name)
@@ -736,16 +730,6 @@ fn candidate_shadows_descendant_dep_parsed(
         })
     };
 
-    if !graph.nodes_by_dep_name.is_empty() {
-        if let Some(relevant) = graph.nodes_by_dep_name.get(install_name) {
-            if relevant.iter().any(|loc| check_node(loc)) {
-                return true;
-            }
-        }
-    } else if graph.nodes.values().any(|node| check_node(&node.location)) {
-        return true;
-    }
-
     let check_edge = |edge: &crate::graph::DependencyEdge| -> bool {
         if edge.install_name != install_name
             || !is_in_scope_subtree(&edge.from_location, scope)
@@ -765,8 +749,82 @@ fn candidate_shadows_descendant_dep_parsed(
             .is_some_and(|current| node_satisfies_target(current, &target))
     };
 
-    if !graph.edges_by_install_name.is_empty() {
-        if let Some(relevant_edges) = graph.edges_by_install_name.get(install_name) {
+    let has_dep_index = !graph.nodes_by_dep_name.is_empty();
+    let has_edge_index = !graph.edges_by_install_name.is_empty();
+    let rel_nodes = if has_dep_index {
+        graph.nodes_by_dep_name.get(install_name)
+    } else {
+        None
+    };
+    let rel_edges = if has_edge_index {
+        graph.edges_by_install_name.get(install_name)
+    } else {
+        None
+    };
+
+    // For non-root scopes when `install_name` has many dependents across the whole tree,
+    // walk only `scope`'s subtree via BTreeMap range instead of scanning 100s of unrelated nodes/edges.
+    if !scope.is_empty()
+        && !graph.outgoing_edges_by_location.is_empty()
+        && (rel_nodes.map_or(0, Vec::len) > 8 || rel_edges.map_or(0, Vec::len) > 8)
+    {
+        let mut scope_slash = String::with_capacity(scope.len() + 1);
+        scope_slash.push_str(scope);
+        scope_slash.push('/');
+        let mut scope_zero = String::with_capacity(scope.len() + 1);
+        scope_zero.push_str(scope);
+        scope_zero.push('0');
+
+        let check_subtree_entry = |loc: &str, node: &crate::graph::Node| -> bool {
+            if !is_in_scope_subtree(loc, scope) {
+                return false;
+            }
+            if check_node_ref(node) {
+                return true;
+            }
+            if let Some(out_indices) = graph.outgoing_edges_by_location.get(loc) {
+                for &idx in out_indices {
+                    if check_edge(&graph.edges[idx]) {
+                        return true;
+                    }
+                }
+            }
+            false
+        };
+
+        for (loc, node) in graph
+            .nodes
+            .range::<str, _>((std::ops::Bound::Included(scope_slash.as_str()), std::ops::Bound::Excluded(scope_zero.as_str())))
+        {
+            if check_subtree_entry(loc, node) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    let check_node = |loc: &str| -> bool {
+        if !is_in_scope_subtree(loc, scope) {
+            return false;
+        }
+        let Some(node) = graph.nodes.get(loc) else {
+            return false;
+        };
+        check_node_ref(node)
+    };
+
+    if has_dep_index {
+        if let Some(relevant) = rel_nodes {
+            if relevant.iter().any(|loc| check_node(loc)) {
+                return true;
+            }
+        }
+    } else if graph.nodes.values().any(|node| check_node(&node.location)) {
+        return true;
+    }
+
+    if has_edge_index {
+        if let Some(relevant_edges) = rel_edges {
             relevant_edges.iter().any(|&idx| check_edge(&graph.edges[idx]))
         } else {
             false
@@ -956,26 +1014,28 @@ fn is_shadowed_by_incompatible_between(
         let Some(locs) = graph.nodes_by_install_name.get(install_name) else {
             return false;
         };
-        // Fast exit: if every copy of `install_name` is at root (`node_modules/<pkg>`)
-        // or not nested along an ancestor scope of `from_scope`, no intermediate node can shadow.
-        let suffix_len = 14 + install_name.len();
-        let any_potential_intermediate = locs.iter().any(|loc| {
-            if loc.len() <= suffix_len {
+        // Fast exit for small bucket sizes; for large buckets (>8), walking the short
+        // ancestor chain directly is O(depth) instead of scanning all nested locations.
+        if locs.len() <= 8 {
+            let suffix_len = 14 + install_name.len();
+            let any_potential_intermediate = locs.iter().any(|loc| {
+                if loc.len() <= suffix_len {
+                    return false;
+                }
+                let Some((scope, leaf)) = loc.rsplit_once("/node_modules/") else {
+                    return false;
+                };
+                leaf == install_name
+                    && !scope.is_empty()
+                    && scope != to_ancestor
+                    && (from_scope == scope
+                        || (from_scope.len() > scope.len()
+                            && from_scope.starts_with(scope)
+                            && from_scope.as_bytes()[scope.len()] == b'/'))
+            });
+            if !any_potential_intermediate {
                 return false;
             }
-            let Some((scope, leaf)) = loc.rsplit_once("/node_modules/") else {
-                return false;
-            };
-            leaf == install_name
-                && !scope.is_empty()
-                && scope != to_ancestor
-                && (from_scope == scope
-                    || (from_scope.len() > scope.len()
-                        && from_scope.starts_with(scope)
-                        && from_scope.as_bytes()[scope.len()] == b'/'))
-        });
-        if !any_potential_intermediate {
-            return false;
         }
     }
     let mut current = from_scope;

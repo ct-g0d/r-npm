@@ -24,14 +24,42 @@ use tokio::sync::{Notify, OwnedSemaphorePermit, SemaphorePermit};
 use tracing::debug;
 use url::Url;
 
+static DEFAULT_USER_AGENT_STR: OnceLock<String> = OnceLock::new();
+static DEFAULT_UA_HEADER: OnceLock<HeaderValue> = OnceLock::new();
+static DEFAULT_REGISTRY_URL: OnceLock<Url> = OnceLock::new();
+
+#[inline]
+fn default_user_agent_str() -> &'static str {
+    DEFAULT_USER_AGENT_STR.get_or_init(|| {
+        format!(
+            "rnpm/{} ({}; {})",
+            env!("CARGO_PKG_VERSION"),
+            std::env::consts::OS,
+            std::env::consts::ARCH
+        )
+    })
+}
+
+#[inline]
+fn default_ua_header() -> HeaderValue {
+    DEFAULT_UA_HEADER
+        .get_or_init(|| {
+            HeaderValue::from_str(default_user_agent_str())
+                .expect("default user-agent is valid HTTP header value")
+        })
+        .clone()
+}
+
+#[inline]
+fn default_registry_url() -> Url {
+    DEFAULT_REGISTRY_URL
+        .get_or_init(|| Url::parse("https://registry.npmjs.org/").unwrap())
+        .clone()
+}
+
 /// Returns the default User-Agent header string.
 pub fn default_user_agent() -> String {
-    format!(
-        "rnpm/{} ({}; {})",
-        env!("CARGO_PKG_VERSION"),
-        std::env::consts::OS,
-        std::env::consts::ARCH
-    )
+    default_user_agent_str().to_owned()
 }
 
 /// Abbreviated metadata MIME type for npm registry.
@@ -50,13 +78,22 @@ pub fn set_cli_request_context(command: String, user_agent: String) {
 }
 
 fn packument_cache_metadata(headers: &HeaderMap) -> serde_json::Value {
-    let mut map = serde_json::Map::new();
-    for key in ["cache-control", "date", "age", "content-type", "vary"] {
+    const KEYS: [&str; 5] = ["cache-control", "date", "age", "content-type", "vary"];
+    let mut map: Option<serde_json::Map<String, serde_json::Value>> = None;
+    for key in KEYS {
         if let Some(val) = headers.get(key).and_then(|v| v.to_str().ok()) {
-            map.insert(key.into(), serde_json::Value::String(val.to_owned()));
+            let m = map.get_or_insert_with(serde_json::Map::new);
+            m.insert(key.into(), serde_json::Value::String(val.to_owned()));
         }
     }
-    serde_json::json!({ "response": { "headers": map } })
+    let mut outer = serde_json::Map::new();
+    let mut resp_map = serde_json::Map::new();
+    resp_map.insert(
+        "headers".into(),
+        serde_json::Value::Object(map.unwrap_or_default()),
+    );
+    outer.insert("response".into(), serde_json::Value::Object(resp_map));
+    serde_json::Value::Object(outer)
 }
 
 /// Negotiated HTTP representation of an npm packument.
@@ -871,13 +908,13 @@ pub struct RegistryClientConfig {
 
 impl Default for RegistryClientConfig {
     fn default() -> Self {
-        let registry_url = Url::parse("https://registry.npmjs.org/").unwrap();
-        let mut trusted_hosts = HashSet::new();
+        let registry_url = default_registry_url();
+        let mut trusted_hosts = HashSet::with_capacity(2);
         if let Some(h) = registry_url.host_str() {
             trusted_hosts.insert(h.to_ascii_lowercase());
         }
 
-        let mut retry_on_status = HashSet::new();
+        let mut retry_on_status = HashSet::with_capacity(4);
         retry_on_status.insert(429);
         retry_on_status.insert(502);
         retry_on_status.insert(503);
@@ -1685,21 +1722,32 @@ impl RegistryClient {
     /// Create a new RegistryClient with custom configuration.
     /// Defers heavy `reqwest` / `rustls` / root CA initialization until the first network request.
     pub fn with_config(config: RegistryClientConfig) -> Result<Self, RegistryError> {
-        let mut headers = HeaderMap::new();
+        let mut headers = HeaderMap::with_capacity(4);
         let cli_context = CLI_REQUEST_CONTEXT.get();
-        let agent = cli_context
-            .filter(|_| config.user_agent == default_user_agent())
-            .map(|(_, agent)| agent.as_str())
-            .unwrap_or(&config.user_agent);
-        let user_agent =
-            HeaderValue::from_str(agent).map_err(|e| RegistryError::Other(e.to_string()))?;
-        headers.insert(USER_AGENT, user_agent);
-        if let Some((command, _)) = cli_context {
+        let user_agent = if let Some((command, cli_ua)) =
+            cli_context.filter(|_| config.user_agent == default_user_agent_str())
+        {
             headers.insert(
                 "npm-command",
                 HeaderValue::from_str(command).map_err(|e| RegistryError::Other(e.to_string()))?,
             );
-        }
+            HeaderValue::from_str(cli_ua).map_err(|e| RegistryError::Other(e.to_string()))?
+        } else {
+            if let Some((command, _)) = cli_context {
+                headers.insert(
+                    "npm-command",
+                    HeaderValue::from_str(command)
+                        .map_err(|e| RegistryError::Other(e.to_string()))?,
+                );
+            }
+            if config.user_agent == default_user_agent_str() {
+                default_ua_header()
+            } else {
+                HeaderValue::from_str(&config.user_agent)
+                    .map_err(|e| RegistryError::Other(e.to_string()))?
+            }
+        };
+        headers.insert(USER_AGENT, user_agent);
         headers.insert(CONNECTION, HeaderValue::from_static("keep-alive"));
 
         // Only validate proxy / CA / TLS files eagerly when configured;
@@ -1974,7 +2022,17 @@ impl RegistryClient {
         };
 
         if let Some(port) = port_or_default {
-            if self
+            use std::io::Write as _;
+            let mut stack_buf = [0u8; 272];
+            let mut cursor = std::io::Cursor::new(&mut stack_buf[..]);
+            if write!(&mut cursor, "{host}:{port}").is_ok() {
+                let len = cursor.position() as usize;
+                if let Ok(key) = std::str::from_utf8(&stack_buf[..len]) {
+                    if self.config.trusted_hosts.contains(key) {
+                        return true;
+                    }
+                }
+            } else if self
                 .config
                 .trusted_hosts
                 .contains(&format!("{host}:{port}"))
@@ -4446,9 +4504,9 @@ impl RegistryClient {
                 }
             }
 
-            use sha2::Digest as _;
             let mut bytes = Vec::new();
-            let mut hasher = compute_sha512.then(sha2::Sha512::new);
+            let mut hasher =
+                compute_sha512.then(|| ring::digest::Context::new(&ring::digest::SHA512));
             let mut stream_err = None;
 
             loop {
@@ -4528,8 +4586,8 @@ impl RegistryClient {
             }
 
             let integrity = hasher.map(|ctx| {
-                let digest = sha2::Digest::finalize(ctx);
-                format!("sha512-{}", data_encoding::BASE64.encode(&digest))
+                let digest = ctx.finish();
+                format!("sha512-{}", data_encoding::BASE64.encode(digest.as_ref()))
             });
 
             return Ok((BytesFetchResult::Fresh { bytes, etag }, integrity));
@@ -4610,6 +4668,16 @@ impl RegistryClient {
         tarball_url: &str,
         dest_path: &Path,
     ) -> Result<u64, RegistryError> {
+        self.download_tarball_to_file_inner(tarball_url, dest_path, false)
+            .await
+    }
+
+    async fn download_tarball_to_file_inner(
+        &self,
+        tarball_url: &str,
+        dest_path: &Path,
+        parent_verified: bool,
+    ) -> Result<u64, RegistryError> {
         const DISK_BUFFER_THRESHOLD: usize = 4 * 1024 * 1024;
 
         let url = Url::parse(tarball_url)?;
@@ -4627,7 +4695,7 @@ impl RegistryClient {
             .then(|| url_host_key(&url));
 
         let parent = dest_path.parent().unwrap_or_else(|| Path::new("."));
-        if !parent.as_os_str().is_empty() && !parent.is_dir() {
+        if !parent_verified && !parent.as_os_str().is_empty() && !parent.is_dir() {
             tokio::fs::create_dir_all(parent).await.map_err(|e| {
                 RegistryError::Other(format!(
                     "Failed to create directories for {}: {e}",
@@ -4925,19 +4993,43 @@ impl RegistryClient {
         &self,
         downloads: &[(&str, &Path)],
     ) -> Vec<Result<u64, RegistryError>> {
-        let mut join_set = tokio::task::JoinSet::new();
-        for (idx, (url, dest)) in downloads.iter().enumerate() {
-            let client = self.clone();
-            let url_str = url.to_string();
-            let dest_buf = dest.to_path_buf();
-            join_set.spawn(async move {
-                let res = client.download_tarball_to_file(&url_str, &dest_buf).await;
-                (idx, res)
-            });
+        if downloads.is_empty() {
+            return Vec::new();
+        }
+        let mut unique_parents: HashSet<&Path> = HashSet::with_capacity(8);
+        let mut failed_parents: HashMap<&Path, String> = HashMap::new();
+        for &(_, dest) in downloads {
+            if let Some(p) = dest.parent() {
+                if !p.as_os_str().is_empty() && unique_parents.insert(p) && !p.is_dir() {
+                    if let Err(e) = std::fs::create_dir_all(p) {
+                        failed_parents
+                            .insert(p, format!("Failed to create directories for {}: {e}", p.display()));
+                    }
+                }
+            }
         }
 
         let mut results: Vec<Option<Result<u64, RegistryError>>> =
             (0..downloads.len()).map(|_| None).collect();
+
+        let mut join_set = tokio::task::JoinSet::new();
+        for (idx, (url, dest)) in downloads.iter().enumerate() {
+            if let Some(p) = dest.parent() {
+                if let Some(msg) = failed_parents.get(p) {
+                    results[idx] = Some(Err(RegistryError::Other(msg.clone())));
+                    continue;
+                }
+            }
+            let client = self.clone();
+            let url_str = url.to_string();
+            let dest_buf = dest.to_path_buf();
+            join_set.spawn(async move {
+                let res = client
+                    .download_tarball_to_file_inner(&url_str, &dest_buf, true)
+                    .await;
+                (idx, res)
+            });
+        }
 
         while let Some(res) = join_set.join_next().await {
             if let Ok((idx, result)) = res {
@@ -7631,6 +7723,55 @@ nB99xJBcpcklOhB/x8L3Vb9kw8ZPzUvYKI7lj0+yjYJannulkI7H7LB4hxKnVKp5\n\
             .unwrap();
         assert_eq!(bytes, payload);
         assert_eq!(sri, expected_sri);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn test_download_tarballs_to_files_concurrent_isolates_parent_dir_errors() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 2048];
+                    let _ = stream.read(&mut buf).await;
+                    let body = b"tarball-ok";
+                    let hdr = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: application/octet-stream\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = stream.write_all(hdr.as_bytes()).await;
+                    let _ = stream.write_all(body).await;
+                });
+            }
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let blocking_file = dir.path().join("not-a-dir");
+        std::fs::write(&blocking_file, b"x").unwrap();
+        let bad_dest = blocking_file.join("pkg.tgz");
+        let good_dest = dir.path().join("ok").join("pkg.tgz");
+        let url = format!("http://{addr}/pkg/-/pkg-1.0.0.tgz");
+
+        let client = RegistryClient::with_config(RegistryClientConfig {
+            default_registry: Url::parse(&format!("http://{addr}/")).unwrap(),
+            ..Default::default()
+        })
+        .unwrap();
+
+        let results = client
+            .download_tarballs_to_files_concurrent(&[
+                (url.as_str(), bad_dest.as_path()),
+                (url.as_str(), good_dest.as_path()),
+            ])
+            .await;
+        assert_eq!(results.len(), 2);
+        assert!(results[0].is_err(), "invalid parent must fail its own item");
+        assert!(results[1].is_ok(), "sibling item with valid parent must succeed");
+        assert_eq!(std::fs::read(&good_dest).unwrap(), b"tarball-ok");
         server.abort();
     }
 }

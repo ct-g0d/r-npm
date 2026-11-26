@@ -45,7 +45,35 @@ impl Comparator {
     }
 
     #[inline]
+    pub fn matches_release(&self, version: &Version) -> bool {
+        let a = (version.major, version.minor, version.patch);
+        let b = (self.version.major, self.version.minor, self.version.patch);
+        match self.op {
+            Op::Gte => a >= b,
+            Op::Lt => a < b,
+            Op::Eq => self.version.prerelease.is_empty() && a == b,
+            Op::Gt => {
+                if self.version.prerelease.is_empty() {
+                    a > b
+                } else {
+                    a >= b
+                }
+            }
+            Op::Lte => {
+                if self.version.prerelease.is_empty() {
+                    a <= b
+                } else {
+                    a < b
+                }
+            }
+        }
+    }
+
+    #[inline]
     pub fn matches(&self, version: &Version) -> bool {
+        if version.prerelease.is_empty() {
+            return self.matches_release(version);
+        }
         match self.op {
             Op::Eq => version == &self.version,
             Op::Gt => version > &self.version,

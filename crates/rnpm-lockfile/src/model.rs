@@ -809,7 +809,7 @@ impl<'de> DeserializeSeed<'de> for OptStringMapWithRawSeed {
             }
             fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
                 let mut pkg_map = BTreeMap::new();
-                let mut raw_map = serde_json::Map::with_capacity(map.size_hint().unwrap_or(0));
+                let mut raw_map = serde_json::Map::with_capacity(map.size_hint().unwrap_or(4));
                 while let Some((k, v)) = map.next_entry::<String, String>()? {
                     raw_map.insert(k.clone(), serde_json::Value::String(v.clone()));
                     pkg_map.insert(k, v);
@@ -968,7 +968,7 @@ impl<'de> DeserializeSeed<'de> for LockfilePackageSeed {
             fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
                 let mut pkg = LockfilePackage::default();
                 let mut raw_map = if self.capture_raw {
-                    Some(serde_json::Map::with_capacity(map.size_hint().unwrap_or(0)))
+                    Some(serde_json::Map::with_capacity(map.size_hint().unwrap_or(8)))
                 } else {
                     None
                 };
@@ -2385,11 +2385,16 @@ impl LockfileV3 {
                 }
             }
         } else if !manifest_has_ws && !root_has_ws && !allow_extra_lock_deps {
-            let has_non_nm_key = self.packages.keys().any(|k| {
-                !k.is_empty()
-                    && !k.starts_with("node_modules/")
-                    && !k.split(['/', '\\']).any(|seg| seg == "node_modules")
-            });
+            use std::ops::Bound::{Excluded, Included, Unbounded};
+            let is_non_nm = |k: &String| !k.split(['/', '\\']).any(|seg| seg == "node_modules");
+            let has_non_nm_key = self
+                .packages
+                .range::<str, _>((Excluded(""), Excluded("node_modules/")))
+                .any(|(k, _)| is_non_nm(k))
+                || self
+                    .packages
+                    .range::<str, _>((Included("node_modules0"), Unbounded))
+                    .any(|(k, _)| is_non_nm(k));
             if has_non_nm_key {
                 let link_targets: BTreeSet<String> = self
                     .packages
@@ -3771,6 +3776,9 @@ impl LockfileV3 {
     /// Load and parse a v3 lockfile from a string, normalizing all package keys to POSIX paths.
     /// Preserves untouched `raw_value` JSON values on packages for 100% round-trip fidelity.
     pub fn from_json_str(s: &str) -> Result<Self, LockfileError> {
+        if let Some(lockfile) = crate::fast_parse::try_parse_lockfile_v3_fast(s, true) {
+            return Ok(lockfile);
+        }
         let mut de = serde_json::Deserializer::from_str(s);
         let lockfile = LockfileV3Seed {
             capture_raw: true,
@@ -3785,6 +3793,9 @@ impl LockfileV3 {
     /// Parse a v3 lockfile in a single serde pass without building `serde_json::Value`
     /// or populating `raw_value`. Zero extra DOM allocations (ideal for `ci` / `fast_path` / `ls`).
     pub fn from_json_str_readonly(content: &str) -> Result<Self, LockfileError> {
+        if let Some(lockfile) = crate::fast_parse::try_parse_lockfile_v3_fast(content, false) {
+            return Ok(lockfile);
+        }
         let mut de = serde_json::Deserializer::from_str(content);
         let lockfile = LockfileV3Seed {
             capture_raw: false,
@@ -3940,9 +3951,20 @@ fn sw_key_rank(k: &str) -> u8 {
 pub(crate) fn write_json_str(s: &str, out: &mut String) {
     out.push('"');
     let bytes = s.as_bytes();
+    let Some(first_esc) = bytes
+        .iter()
+        .position(|&b| b < 0x20 || b == b'"' || b == b'\\')
+    else {
+        out.push_str(s);
+        out.push('"');
+        return;
+    };
     let mut start = 0usize;
-    for (i, &b) in bytes.iter().enumerate() {
+    let mut i = first_esc;
+    while i < bytes.len() {
+        let b = bytes[i];
         if b >= 0x20 && b != b'"' && b != b'\\' {
+            i += 1;
             continue;
         }
         if start < i {
@@ -3971,6 +3993,7 @@ pub(crate) fn write_json_str(s: &str, out: &mut String) {
             }
         }
         start = i + 1;
+        i += 1;
     }
     if start < bytes.len() {
         out.push_str(&s[start..]);
@@ -4160,6 +4183,7 @@ fn collect_pkg_fields<'p>(
 #[derive(Debug, Clone)]
 pub struct LockfileWriter<'a> {
     indent: &'a str,
+    indent_buf: String,
     newline: &'a str,
     compact: bool,
     root_metadata: bool,
@@ -4172,8 +4196,14 @@ impl<'a> LockfileWriter<'a> {
         compact: bool,
         root_metadata: bool,
     ) -> Self {
+        let indent_buf = if !compact && !indent.is_empty() {
+            indent.repeat(8)
+        } else {
+            String::new()
+        };
         Self {
             indent,
+            indent_buf,
             newline,
             compact,
             root_metadata,
@@ -4182,9 +4212,14 @@ impl<'a> LockfileWriter<'a> {
 
     #[inline]
     fn write_indent(&self, out: &mut String, level: usize) {
-        if !self.compact {
-            for _ in 0..level {
-                out.push_str(self.indent);
+        if !self.compact && level > 0 && !self.indent.is_empty() {
+            if level <= 8 {
+                out.push_str(&self.indent_buf[..level * self.indent.len()]);
+            } else {
+                out.push_str(&self.indent_buf);
+                for _ in 8..level {
+                    out.push_str(self.indent);
+                }
             }
         }
     }
@@ -4234,12 +4269,17 @@ impl<'a> LockfileWriter<'a> {
                     scratch.extend(map.iter().map(|(k, v)| (k.as_str(), v)));
                     let slice_len = scratch.len();
                     if slice_len - base > 1 {
-                        scratch[base..slice_len].sort_unstable_by(|(ak, av), (bk, bv)| {
+                        let cmp_entry = |(ak, av): &(&str, &serde_json::Value),
+                                         (bk, bv): &(&str, &serde_json::Value)| {
                             av.is_object()
                                 .cmp(&bv.is_object())
                                 .then_with(|| sw_key_rank(ak).cmp(&sw_key_rank(bk)))
                                 .then_with(|| npm_key_compare(ak, bk))
-                        });
+                        };
+                        let sub = &mut scratch[base..slice_len];
+                        if sub.windows(2).any(|w| cmp_entry(&w[0], &w[1]).is_gt()) {
+                            sub.sort_unstable_by(cmp_entry);
+                        }
                     }
 
                     if self.compact {
@@ -4352,7 +4392,14 @@ impl<'a> LockfileWriter<'a> {
         }
         str_scratch.clear();
         str_scratch.extend(map.iter().map(|(k, v)| (k.as_str(), v.as_str())));
-        if str_scratch.len() > 1 {
+        if str_scratch.len() > 1
+            && str_scratch.windows(2).any(|w| {
+                sw_key_rank(w[0].0)
+                    .cmp(&sw_key_rank(w[1].0))
+                    .then_with(|| npm_key_compare(w[0].0, w[1].0))
+                    .is_gt()
+            })
+        {
             str_scratch.sort_unstable_by(|(ak, _), (bk, _)| {
                 sw_key_rank(ak)
                     .cmp(&sw_key_rank(bk))
@@ -4627,7 +4674,13 @@ impl<'a> LockfileWriter<'a> {
                 for (k, v) in &lockfile.packages {
                     pkg_entries.push((to_posix_path_cow(k), v));
                 }
-                pkg_entries.sort_unstable_by(|(k1, _), (k2, _)| npm_key_compare(k1, k2));
+                if pkg_entries.len() > 1
+                    && pkg_entries
+                        .windows(2)
+                        .any(|w| npm_key_compare(&w[0].0, &w[1].0).is_gt())
+                {
+                    pkg_entries.sort_unstable_by(|(k1, _), (k2, _)| npm_key_compare(k1, k2));
+                }
 
                 let mut pkg_scratch: Vec<(&str, bool, PkgFieldVal<'_>)> = Vec::with_capacity(24);
                 let mut str_scratch: Vec<(&str, &str)> = Vec::with_capacity(16);
@@ -4793,24 +4846,38 @@ fn is_format_package_lock_enabled(project_dir: &Path) -> bool {
 pub fn npm_key_compare(a: &str, b: &str) -> std::cmp::Ordering {
     let a_bytes = a.as_bytes();
     let b_bytes = b.as_bytes();
-    if a_bytes == b_bytes {
+    let n = a_bytes.len().min(b_bytes.len());
+    let mut i = 0;
+    while i + 8 <= n {
+        let va = u64::from_ne_bytes(a_bytes[i..i + 8].try_into().unwrap());
+        let vb = u64::from_ne_bytes(b_bytes[i..i + 8].try_into().unwrap());
+        if va != vb {
+            break;
+        }
+        i += 8;
+    }
+    while i < n && a_bytes[i] == b_bytes[i] {
+        i += 1;
+    }
+    if i == n && a_bytes.len() == b_bytes.len() {
         return std::cmp::Ordering::Equal;
     }
-    let n = a_bytes.len().min(b_bytes.len());
-    for i in 0..n {
+    let first_diff = i;
+    while i < n {
         let ra = NPM_CHAR_RANK_FOLDED[a_bytes[i] as usize];
         let rb = NPM_CHAR_RANK_FOLDED[b_bytes[i] as usize];
         if ra != rb {
             return ra.cmp(&rb);
         }
+        i += 1;
     }
     a_bytes
         .len()
         .cmp(&b_bytes.len())
         .then_with(|| {
-            for i in 0..n {
-                let ra = NPM_CHAR_RANK[a_bytes[i] as usize];
-                let rb = NPM_CHAR_RANK[b_bytes[i] as usize];
+            for idx in first_diff..n {
+                let ra = NPM_CHAR_RANK[a_bytes[idx] as usize];
+                let rb = NPM_CHAR_RANK[b_bytes[idx] as usize];
                 if ra != rb {
                     return ra.cmp(&rb);
                 }

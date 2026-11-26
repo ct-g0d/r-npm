@@ -36,8 +36,8 @@ use std::collections::{HashMap, HashSet};
 use std::fs::{self, OpenOptions};
 use std::io::{BufReader, Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
 use std::thread::{sleep, yield_now};
 use std::time::Duration;
 use tracing::warn;
@@ -391,6 +391,196 @@ pub fn mtime_to_timestamp(meta: &fs::Metadata) -> Option<u64> {
         .ok()
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
         .map(|d| d.as_nanos() as u64)
+}
+
+/// Fast single-syscall metadata query returning `(file_size, mtime_nanos)` for a regular file.
+#[cfg(windows)]
+#[inline]
+fn fast_size_and_mtime_wide(wide_null: &[u16]) -> Option<(u64, Option<u64>)> {
+    #[repr(C)]
+    #[allow(non_snake_case)]
+    struct FILETIME {
+        dwLowDateTime: u32,
+        dwHighDateTime: u32,
+    }
+    #[repr(C)]
+    #[allow(non_snake_case)]
+    struct WIN32_FILE_ATTRIBUTE_DATA {
+        dwFileAttributes: u32,
+        ftCreationTime: FILETIME,
+        ftLastAccessTime: FILETIME,
+        ftLastWriteTime: FILETIME,
+        nFileSizeHigh: u32,
+        nFileSizeLow: u32,
+    }
+    extern "system" {
+        fn GetFileAttributesExW(
+            lpFileName: *const u16,
+            fInfoLevelId: i32,
+            lpFileInformation: *mut std::ffi::c_void,
+        ) -> i32;
+    }
+    const GET_FILE_EX_INFO_STANDARD: i32 = 0;
+    const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x10;
+    const WINDOWS_EPOCH_OFFSET: u64 = 116_444_736_000_000_000;
+
+    let mut data = std::mem::MaybeUninit::<WIN32_FILE_ATTRIBUTE_DATA>::uninit();
+    let ok = unsafe {
+        GetFileAttributesExW(
+            wide_null.as_ptr(),
+            GET_FILE_EX_INFO_STANDARD,
+            data.as_mut_ptr() as *mut std::ffi::c_void,
+        )
+    };
+    if ok == 0 {
+        return None;
+    }
+    let info = unsafe { data.assume_init() };
+    if (info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0 {
+        return None;
+    }
+    let size = ((info.nFileSizeHigh as u64) << 32) | (info.nFileSizeLow as u64);
+    let ft = ((info.ftLastWriteTime.dwHighDateTime as u64) << 32)
+        | (info.ftLastWriteTime.dwLowDateTime as u64);
+    let mtime = ft.checked_sub(WINDOWS_EPOCH_OFFSET).map(|t| t * 100);
+    Some((size, mtime))
+}
+
+#[inline]
+fn fast_size_and_mtime(path: &Path) -> Option<(u64, Option<u64>)> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        let v = rnpm_fs::path::to_verbatim_path(path);
+        let mut wide = Vec::with_capacity(v.as_os_str().len() + 1);
+        wide.extend(v.as_os_str().encode_wide());
+        wide.push(0);
+        fast_size_and_mtime_wide(&wide)
+    }
+    #[cfg(not(windows))]
+    {
+        let meta = fs::metadata(path).ok()?;
+        if meta.is_dir() {
+            return None;
+        }
+        Some((meta.len(), mtime_to_timestamp(&meta)))
+    }
+}
+
+#[inline]
+fn is_clean_rel_ascii_path(p: &str) -> bool {
+    p.is_ascii()
+        && !p.is_empty()
+        && !p.starts_with('/')
+        && !p.starts_with("./")
+        && !p.contains('\\')
+        && !p.contains("..")
+        && !p.contains("/./")
+        && !p.contains("//")
+        && !p.ends_with("/.")
+        && p != "."
+}
+
+#[cfg(windows)]
+#[inline]
+fn encode_verbatim_prefix_wide(dir: &Path) -> Vec<u16> {
+    use std::os::windows::ffi::OsStrExt;
+    let v = rnpm_fs::path::to_verbatim_path(dir);
+    let mut wide = Vec::with_capacity(v.as_os_str().len() + 2);
+    wide.extend(v.as_os_str().encode_wide());
+    if wide.last().copied() != Some(b'\\' as u16) {
+        wide.push(b'\\' as u16);
+    }
+    wide
+}
+
+#[cfg(windows)]
+#[inline]
+fn append_ascii_rel_wide(buf: &mut Vec<u16>, prefix: &[u16], rel: &str) {
+    buf.clear();
+    buf.extend_from_slice(prefix);
+    buf.reserve(rel.len() + 1);
+    for &b in rel.as_bytes() {
+        buf.push(if b == b'/' { b'\\' as u16 } else { b as u16 });
+    }
+    buf.push(0);
+}
+
+#[cfg(windows)]
+fn win_create_dir_all_wide(prefix: &[u16], rel_dir: &str, wide_buf: &mut Vec<u16>) -> std::io::Result<()> {
+    extern "system" {
+        fn CreateDirectoryW(lpPathName: *const u16, lpSecurityAttributes: *mut std::ffi::c_void) -> i32;
+        fn GetLastError() -> u32;
+    }
+    const ERROR_PATH_NOT_FOUND: u32 = 3;
+    const ERROR_ALREADY_EXISTS: u32 = 183;
+
+    if rel_dir.is_empty() {
+        return Ok(());
+    }
+    append_ascii_rel_wide(wide_buf, prefix, rel_dir);
+    let ok = unsafe { CreateDirectoryW(wide_buf.as_ptr(), std::ptr::null_mut()) };
+    if ok != 0 {
+        return Ok(());
+    }
+    let err = unsafe { GetLastError() };
+    if err == ERROR_ALREADY_EXISTS {
+        return Ok(());
+    }
+    if err != ERROR_PATH_NOT_FOUND {
+        return Err(std::io::Error::from_raw_os_error(err as i32));
+    }
+
+    // Create ancestor segments from prefix onward without extra string allocations.
+    let start_idx = prefix.len();
+    let end_idx = wide_buf.len().saturating_sub(1);
+    let mut i = start_idx;
+    while i < end_idx {
+        if wide_buf[i] == b'\\' as u16 && i > start_idx {
+            let saved = wide_buf[i];
+            wide_buf[i] = 0;
+            let r = unsafe { CreateDirectoryW(wide_buf.as_ptr(), std::ptr::null_mut()) };
+            wide_buf[i] = saved;
+            if r == 0 {
+                let e = unsafe { GetLastError() };
+                if e != ERROR_ALREADY_EXISTS && e != ERROR_PATH_NOT_FOUND {
+                    return Err(std::io::Error::from_raw_os_error(e as i32));
+                }
+            }
+        }
+        i += 1;
+    }
+    let final_ok = unsafe { CreateDirectoryW(wide_buf.as_ptr(), std::ptr::null_mut()) };
+    if final_ok != 0 {
+        return Ok(());
+    }
+    let final_err = unsafe { GetLastError() };
+    if final_err == ERROR_ALREADY_EXISTS {
+        Ok(())
+    } else {
+        Err(std::io::Error::from_raw_os_error(final_err as i32))
+    }
+}
+
+#[inline]
+fn hex2_byte(s: &str) -> Option<u8> {
+    let b = s.as_bytes();
+    if b.len() < 2 {
+        return None;
+    }
+    let hi = match b[0] {
+        b'0'..=b'9' => b[0] - b'0',
+        b'a'..=b'f' => b[0] - b'a' + 10,
+        b'A'..=b'F' => b[0] - b'A' + 10,
+        _ => return None,
+    };
+    let lo = match b[1] {
+        b'0'..=b'9' => b[1] - b'0',
+        b'a'..=b'f' => b[1] - b'a' + 10,
+        b'A'..=b'F' => b[1] - b'A' + 10,
+        _ => return None,
+    };
+    Some((hi << 4) | lo)
 }
 
 /// A single file entry inside the `.idx` pack index.
@@ -770,6 +960,9 @@ impl PackagePack {
         let start_time = std::time::Instant::now();
         let pack_data = self.data();
 
+        #[cfg(windows)]
+        let verbatim_prefix_wide = encode_verbatim_prefix_wide(target_dir);
+
         if !dirs_precreated {
             let mut clean_target_dir: Option<PathBuf> = None;
             // Security check: re-validate every entry path and ensure strict containment within target_dir
@@ -798,13 +991,15 @@ impl PackagePack {
                 }
             }
 
-            // 1. Directories first: deduplicate relative directories before constructing PathBufs
+            // 1. Directories first: deduplicate relative directories before issuing Win32/FS calls.
             std::fs::create_dir_all(target_dir)?;
             let mut created_rel_dirs: HashSet<&str> =
                 HashSet::with_capacity(self.index.files.len() / 2 + 4);
+            #[cfg(windows)]
+            let mut dir_wide_buf: Vec<u16> = Vec::with_capacity(260);
 
             for entry in &self.index.files {
-                if entry.path.contains('\\') {
+                if !is_clean_rel_ascii_path(&entry.path) {
                     let full_path = target_dir.join(&entry.path);
                     if let Some(parent) = full_path.parent() {
                         std::fs::create_dir_all(parent)?;
@@ -814,12 +1009,10 @@ impl PackagePack {
                 if let Some(slash) = entry.path.rfind('/') {
                     let rel_dir = &entry.path[..slash];
                     if !rel_dir.is_empty() && !created_rel_dirs.contains(rel_dir) {
-                        let dir_path = if cfg!(windows) && rel_dir.contains('/') {
-                            target_dir.join(rel_dir.replace('/', "\\"))
-                        } else {
-                            target_dir.join(rel_dir)
-                        };
-                        std::fs::create_dir_all(&dir_path)?;
+                        #[cfg(windows)]
+                        win_create_dir_all_wide(&verbatim_prefix_wide, rel_dir, &mut dir_wide_buf)?;
+                        #[cfg(not(windows))]
+                        std::fs::create_dir_all(target_dir.join(rel_dir))?;
                         let mut cur = rel_dir;
                         while !cur.is_empty() && created_rel_dirs.insert(cur) {
                             match cur.rfind('/') {
@@ -880,65 +1073,115 @@ impl PackagePack {
         // 2. Direct materialization straight from memory mapping (or ReFS block cloning).
         let files = &self.index.files;
         if !can_block_clone && files.len() >= 8 {
-            let num_threads = 6.min(files.len() / 4).max(1);
-            let next_idx = std::sync::atomic::AtomicUsize::new(0);
-            let first_err: std::sync::Mutex<Option<CacheError>> = std::sync::Mutex::new(None);
-            std::thread::scope(|scope| {
-                for _ in 0..num_threads {
-                    scope.spawn(|| loop {
-                        let idx = next_idx.fetch_add(1, Ordering::Relaxed);
-                        if idx >= files.len() {
-                            break;
-                        }
-                        if first_err.lock().unwrap().is_some() {
-                            break;
-                        }
-                        let entry = &files[idx];
-                        let full_path = target_dir.join(&entry.path);
-                        let start = entry.offset as usize;
-                        let end = start + entry.size as usize;
-                        let slice = &pack_data[start..end];
+            let num_threads = 16.min(files.len() / 2).max(2).min(files.len());
+            let next_idx = AtomicUsize::new(0);
+            let has_err = AtomicBool::new(false);
+            let first_err: Mutex<Option<CacheError>> = Mutex::new(None);
+            #[cfg(windows)]
+            let prefix_ref = &verbatim_prefix_wide;
+            rnpm_fs::run_parallel(num_threads, &|| {
+                #[cfg(windows)]
+                let mut wide_buf: Vec<u16> = Vec::with_capacity(260);
+                loop {
+                    if has_err.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    let idx = next_idx.fetch_add(1, Ordering::Relaxed);
+                    if idx >= files.len() {
+                        break;
+                    }
+                    let entry = &files[idx];
+                    let start = entry.offset as usize;
+                    let end = start + entry.size as usize;
+                    let slice = &pack_data[start..end];
 
-                        if entry.cas_verified {
-                            if let Some(ref cas_path) = entry.cas_path {
-                                let is_corrupted_or_missing = cas_path
-                                    .metadata()
-                                    .map(|metadata| {
-                                        metadata.len() != entry.size
-                                            || (entry.cas_mtime.is_some()
-                                                && mtime_to_timestamp(&metadata) != entry.cas_mtime)
-                                    })
-                                    .unwrap_or(true);
-                                if is_corrupted_or_missing {
-                                    let _ = PackStore::write_cas_file_safe(cas_path, slice);
-                                }
+                    if entry.cas_verified {
+                        if let Some(ref cas_path) = entry.cas_path {
+                            let is_corrupted_or_missing = fast_size_and_mtime(cas_path)
+                                .map(|(sz, mt)| {
+                                    sz != entry.size
+                                        || (entry.cas_mtime.is_some() && mt != entry.cas_mtime)
+                                })
+                                .unwrap_or(true);
+                            if is_corrupted_or_missing {
+                                let _ = PackStore::write_cas_file_safe(cas_path, slice);
                             }
                         }
+                    }
 
-                        if let Err(e) = clone_or_write_pack_file(
-                            None,
-                            &full_path,
-                            slice,
-                            entry.offset,
-                            entry.size,
-                            entry.mode,
-                            prealloc_thresh,
-                        ) {
-                            let mut guard = first_err.lock().unwrap();
-                            if guard.is_none() {
-                                *guard = Some(CacheError::Io(e));
+                    let write_res = {
+                        #[cfg(windows)]
+                        {
+                            if is_clean_rel_ascii_path(&entry.path) {
+                                append_ascii_rel_wide(&mut wide_buf, prefix_ref, &entry.path);
+                                rnpm_fs::writer::write_file_fast_wide_raw(
+                                    &wide_buf,
+                                    target_dir,
+                                    slice,
+                                    entry.mode,
+                                    prealloc_thresh,
+                                    true,
+                                )
+                                .or_else(|_| {
+                                    clone_or_write_pack_file(
+                                        None,
+                                        &target_dir.join(&entry.path),
+                                        slice,
+                                        entry.offset,
+                                        entry.size,
+                                        entry.mode,
+                                        prealloc_thresh,
+                                    )
+                                    .map(|_| ())
+                                })
+                            } else {
+                                clone_or_write_pack_file(
+                                    None,
+                                    &target_dir.join(&entry.path),
+                                    slice,
+                                    entry.offset,
+                                    entry.size,
+                                    entry.mode,
+                                    prealloc_thresh,
+                                )
+                                .map(|_| ())
                             }
-                            break;
                         }
-                    });
+                        #[cfg(not(windows))]
+                        {
+                            clone_or_write_pack_file(
+                                None,
+                                &target_dir.join(&entry.path),
+                                slice,
+                                entry.offset,
+                                entry.size,
+                                entry.mode,
+                                prealloc_thresh,
+                            )
+                            .map(|_| ())
+                        }
+                    };
+                    if let Err(e) = write_res {
+                        has_err.store(true, Ordering::Relaxed);
+                        let mut guard = first_err.lock().unwrap();
+                        if guard.is_none() {
+                            *guard = Some(CacheError::Io(e));
+                        }
+                        break;
+                    }
                 }
             });
             if let Some(err) = first_err.into_inner().unwrap() {
                 return Err(err);
             }
         } else {
+            #[cfg(windows)]
+            let mut wide_buf: Vec<u16> = if !can_block_clone {
+                Vec::with_capacity(260)
+            } else {
+                Vec::new()
+            };
             for entry in files {
-                let full_path = target_dir.join(&entry.path);
                 let start = entry.offset as usize;
                 let end = start + entry.size as usize;
                 let slice = &pack_data[start..end];
@@ -950,12 +1193,10 @@ impl PackagePack {
 
                 if entry.cas_verified {
                     if let Some(ref cas_path) = entry.cas_path {
-                        let is_corrupted_or_missing = cas_path
-                            .metadata()
-                            .map(|metadata| {
-                                metadata.len() != entry.size
-                                    || (entry.cas_mtime.is_some()
-                                        && mtime_to_timestamp(&metadata) != entry.cas_mtime)
+                        let is_corrupted_or_missing = fast_size_and_mtime(cas_path)
+                            .map(|(sz, mt)| {
+                                sz != entry.size
+                                    || (entry.cas_mtime.is_some() && mt != entry.cas_mtime)
                             })
                             .unwrap_or(true);
                         if is_corrupted_or_missing {
@@ -964,6 +1205,24 @@ impl PackagePack {
                     }
                 }
 
+                #[cfg(windows)]
+                if !can_block_clone && is_clean_rel_ascii_path(&entry.path) {
+                    append_ascii_rel_wide(&mut wide_buf, &verbatim_prefix_wide, &entry.path);
+                    if rnpm_fs::writer::write_file_fast_wide_raw(
+                        &wide_buf,
+                        target_dir,
+                        slice,
+                        entry.mode,
+                        prealloc_thresh,
+                        true,
+                    )
+                    .is_ok()
+                    {
+                        continue;
+                    }
+                }
+
+                let full_path = target_dir.join(&entry.path);
                 clone_or_write_pack_file(
                     src_h,
                     &full_path,
@@ -1011,8 +1270,9 @@ pub struct PackStore {
     mmap_cache: Arc<RwLock<HashMap<String, PackagePack>>>,
     block_clone_cache: Arc<RwLock<HashMap<PathBuf, bool>>>,
     cas_stamp_cache: Arc<RwLock<HashMap<PathBuf, (u64, u64)>>>,
-    has_cas_files: Arc<std::sync::atomic::AtomicBool>,
+    has_cas_files: Arc<AtomicBool>,
     created_prefixes: Arc<RwLock<std::collections::HashSet<String>>>,
+    cas_prefix_dirs: Arc<[AtomicU64; 4]>,
 }
 
 impl PackStore {
@@ -1037,8 +1297,9 @@ impl PackStore {
             mmap_cache: Arc::new(RwLock::new(HashMap::new())),
             block_clone_cache: Arc::new(RwLock::new(HashMap::new())),
             cas_stamp_cache: Arc::new(RwLock::new(HashMap::new())),
-            has_cas_files: Arc::new(std::sync::atomic::AtomicBool::new(has_cas)),
+            has_cas_files: Arc::new(AtomicBool::new(has_cas)),
             created_prefixes: Arc::new(RwLock::new(std::collections::HashSet::new())),
+            cas_prefix_dirs: Arc::new([const { AtomicU64::new(0) }; 4]),
         })
     }
 
@@ -1166,11 +1427,22 @@ impl PackStore {
         data: &[u8],
         parent_created: bool,
     ) -> std::io::Result<Option<u64>> {
-        if let Ok(meta) = cas_path.metadata() {
-            if meta.len() == data.len() as u64 {
-                if let Ok(existing) = fs::read(cas_path) {
-                    if existing == data {
-                        return Ok(mtime_to_timestamp(&meta));
+        Self::write_cas_file_with_mtime_opt(cas_path, data, parent_created, true)
+    }
+
+    fn write_cas_file_with_mtime_opt(
+        cas_path: &Path,
+        data: &[u8],
+        parent_created: bool,
+        cas_may_exist: bool,
+    ) -> std::io::Result<Option<u64>> {
+        if cas_may_exist {
+            if let Some((sz, mt)) = fast_size_and_mtime(cas_path) {
+                if sz == data.len() as u64 {
+                    if let Ok(existing) = fs::read(cas_path) {
+                        if existing == data {
+                            return Ok(mt);
+                        }
                     }
                 }
             }
@@ -1208,14 +1480,14 @@ impl PackStore {
         }
 
         match fs::rename(&tmp_path, cas_path) {
-            Ok(()) => Ok(fs::metadata(cas_path).ok().and_then(|m| mtime_to_timestamp(&m))),
+            Ok(()) => Ok(fast_size_and_mtime(cas_path).and_then(|(_, mt)| mt)),
             Err(_) => {
-                if let Ok(meta) = cas_path.metadata() {
-                    if meta.len() == data.len() as u64
+                if let Some((sz, mt)) = fast_size_and_mtime(cas_path) {
+                    if sz == data.len() as u64
                         && fs::read(cas_path).is_ok_and(|existing| existing == data)
                     {
                         let _ = fs::remove_file(&tmp_path);
-                        return Ok(mtime_to_timestamp(&meta));
+                        return Ok(mt);
                     }
                 }
                 #[cfg(windows)]
@@ -1231,19 +1503,19 @@ impl PackStore {
                 let _ = fs::remove_file(cas_path);
                 let res = fs::rename(&tmp_path, cas_path);
                 if res.is_err() {
-                    if let Ok(meta) = cas_path.metadata() {
-                        if meta.len() == data.len() as u64
+                    if let Some((sz, mt)) = fast_size_and_mtime(cas_path) {
+                        if sz == data.len() as u64
                             && fs::read(cas_path).is_ok_and(|existing| existing == data)
                         {
                             let _ = fs::remove_file(&tmp_path);
-                            return Ok(mtime_to_timestamp(&meta));
+                            return Ok(mt);
                         }
                     }
                     let _ = fs::remove_file(&tmp_path);
                     res?;
                 }
                 let _ = fs::remove_file(&tmp_path);
-                Ok(fs::metadata(cas_path).ok().and_then(|m| mtime_to_timestamp(&m)))
+                Ok(fast_size_and_mtime(cas_path).and_then(|(_, mt)| mt))
             }
         }
     }
@@ -1616,6 +1888,7 @@ impl PackStore {
         let has_cas = self.has_cas_files.load(Ordering::Relaxed);
         let cas_dir = if has_cas { Some(self.cas_dir()) } else { None };
 
+        // Ensure valid SHA-256 digests and derived CAS paths first.
         for entry in &mut index.files {
             let valid_sha = entry.sha256.as_deref().is_some_and(|s| {
                 s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit())
@@ -1640,42 +1913,47 @@ impl PackStore {
                 Some(d) => d.join(&sha[0..2]).join(sha),
                 None => self.cas_file_path(sha),
             };
-            if entry.cas_path.is_some() && entry.cas_path.as_ref() != Some(&cas_file) {
-                entry.cas_path = Some(cas_file.clone());
+            if entry.cas_path.as_ref() != Some(&cas_file) && (entry.cas_path.is_some() || has_cas) {
+                entry.cas_path = Some(cas_file);
             }
 
             if !has_cas {
                 entry.cas_verified = false;
-                continue;
             }
+        }
 
-            let start = entry.offset as usize;
-            let end = start.saturating_add(entry.size as usize);
-            let slice = if end <= buf_data.len() {
-                Some(&buf_data[start..end])
-            } else {
-                None
-            };
+        if has_cas {
+            let verify_cas_entry = |entry: &mut PackFileEntry| -> bool {
+                let Some(ref sha) = entry.sha256 else {
+                    return false;
+                };
+                let cas_file = match entry.cas_path.as_ref() {
+                    Some(p) => p,
+                    None => return false,
+                };
 
-            match cas_file.metadata() {
-                Ok(meta) => {
-                    if entry.cas_path.is_none() {
-                        entry.cas_path = Some(cas_file.clone());
-                    }
-                    let current_size = meta.len();
-                    let current_mtime = mtime_to_timestamp(&meta);
+                let start = entry.offset as usize;
+                let end = start.saturating_add(entry.size as usize);
+                let slice = if end <= buf_data.len() {
+                    Some(&buf_data[start..end])
+                } else {
+                    None
+                };
+
+                if let Some((current_size, current_mtime)) = fast_size_and_mtime(cas_file) {
                     let recorded_mtime = entry
                         .cas_mtime
-                        .or_else(|| self.get_cas_stamp(&cas_file).map(|(_s, m)| m));
+                        .or_else(|| self.get_cas_stamp(cas_file).map(|(_s, m)| m));
                     let stamp_match = current_size == entry.size
                         && recorded_mtime.is_some()
                         && current_mtime == recorded_mtime;
 
                     if stamp_match {
                         entry.cas_verified = true;
+                        false
                     } else {
                         let hash_valid = if current_size == entry.size {
-                            if let Ok(bytes) = fs::read(&cas_file) {
+                            if let Ok(bytes) = fs::read(cas_file) {
                                 let digest = Sha256::digest(&bytes);
                                 let mut hex_buf = [0u8; 64];
                                 encode_hex_lower(&digest, &mut hex_buf).eq_ignore_ascii_case(sha)
@@ -1689,31 +1967,74 @@ impl PackStore {
                         if hash_valid {
                             entry.cas_mtime = current_mtime;
                             entry.cas_verified = true;
-                            index_updated = true;
                             if let Some(m) = current_mtime {
-                                self.set_cas_stamp(&cas_file, current_size, m);
+                                self.set_cas_stamp(cas_file, current_size, m);
                             }
+                            true
                         } else if let Some(slice) = slice {
-                            match Self::write_cas_file_with_mtime(&cas_file, slice, false) {
+                            match Self::write_cas_file_with_mtime(cas_file, slice, false) {
                                 Ok(new_mt) => {
                                     if let Some(m) = new_mt {
                                         entry.cas_mtime = Some(m);
-                                        self.set_cas_stamp(&cas_file, slice.len() as u64, m);
+                                        self.set_cas_stamp(cas_file, slice.len() as u64, m);
                                     }
                                     entry.cas_verified = true;
-                                    index_updated = true;
+                                    true
                                 }
                                 Err(_) => {
                                     entry.cas_verified = false;
+                                    false
                                 }
                             }
                         } else {
                             entry.cas_verified = false;
+                            false
                         }
                     }
-                }
-                Err(_) => {
+                } else {
                     entry.cas_verified = false;
+                    false
+                }
+            };
+
+            if index.files.len() >= 12 {
+                struct EntrySlot(std::cell::UnsafeCell<PackFileEntry>);
+                // SAFETY: Each slot index is claimed once by `next_idx.fetch_add(1)` and joined before unwrapping.
+                unsafe impl Sync for EntrySlot {}
+
+                let slots: Vec<EntrySlot> = std::mem::take(&mut index.files)
+                    .into_iter()
+                    .map(|e| EntrySlot(std::cell::UnsafeCell::new(e)))
+                    .collect();
+                let next_idx = AtomicUsize::new(0);
+                let par_updated = AtomicBool::new(false);
+                let workers = 12.min(slots.len());
+                rnpm_fs::run_parallel(workers, &|| {
+                    let mut local_updated = false;
+                    loop {
+                        let idx = next_idx.fetch_add(1, Ordering::Relaxed);
+                        if idx >= slots.len() {
+                            break;
+                        }
+                        // SAFETY: `fetch_add` assigns each `idx < slots.len()` to at most one worker.
+                        let entry = unsafe { &mut *slots[idx].0.get() };
+                        if verify_cas_entry(entry) {
+                            local_updated = true;
+                        }
+                    }
+                    if local_updated {
+                        par_updated.store(true, Ordering::Relaxed);
+                    }
+                });
+                if par_updated.load(Ordering::Relaxed) {
+                    index_updated = true;
+                }
+                index.files = slots.into_iter().map(|s| s.0.into_inner()).collect();
+            } else {
+                for entry in &mut index.files {
+                    if verify_cas_entry(entry) {
+                        index_updated = true;
+                    }
                 }
             }
         }
@@ -2149,7 +2470,8 @@ impl PackStore {
         if entries.is_empty() {
             return;
         }
-        let mut prefix_dirs: HashSet<PathBuf> = HashSet::new();
+        let mut prefix_dirs: Vec<(Option<u8>, PathBuf)> = Vec::new();
+        let mut seen_prefix_mask = [0u64; 4];
         let mut unique_jobs: Vec<(PathBuf, &[u8])> = Vec::with_capacity(entries.len());
         let mut seen_cas: HashMap<&Path, usize> = HashMap::with_capacity(entries.len());
         let mut entry_job_idx: Vec<Option<usize>> = Vec::with_capacity(entries.len());
@@ -2163,8 +2485,25 @@ impl PackStore {
                         entry_job_idx.push(Some(idx));
                     } else {
                         if let Some(parent) = cas_path.parent() {
-                            if !prefix_dirs.contains(parent) {
-                                prefix_dirs.insert(parent.to_path_buf());
+                            let prefix_byte = entry.sha256.as_deref().and_then(hex2_byte);
+                            let need_dir = match prefix_byte {
+                                Some(b) => {
+                                    let w = (b >> 6) as usize;
+                                    let m = 1u64 << (b & 63);
+                                    let already_global =
+                                        (self.cas_prefix_dirs[w].load(Ordering::Relaxed) & m) != 0;
+                                    let already_local = (seen_prefix_mask[w] & m) != 0;
+                                    if !already_global && !already_local {
+                                        seen_prefix_mask[w] |= m;
+                                        true
+                                    } else {
+                                        false
+                                    }
+                                }
+                                None => !prefix_dirs.iter().any(|(_, p)| p == parent),
+                            };
+                            if need_dir {
+                                prefix_dirs.push((prefix_byte, parent.to_path_buf()));
                             }
                         }
                         let idx = unique_jobs.len();
@@ -2181,31 +2520,56 @@ impl PackStore {
         if unique_jobs.is_empty() {
             return;
         }
-        for parent in &prefix_dirs {
-            let _ = fs::create_dir_all(parent);
-        }
-
-        let mtimes: Vec<AtomicU64> = (0..unique_jobs.len()).map(|_| AtomicU64::new(0)).collect();
-        let ok_flags: Vec<std::sync::atomic::AtomicBool> = (0..unique_jobs.len())
-            .map(|_| std::sync::atomic::AtomicBool::new(false))
-            .collect();
-        let next_idx = std::sync::atomic::AtomicUsize::new(0);
-        let num_workers = 8.min(unique_jobs.len());
-        std::thread::scope(|scope| {
-            for _ in 0..num_workers {
-                scope.spawn(|| loop {
-                    let idx = next_idx.fetch_add(1, Ordering::Relaxed);
-                    if idx >= unique_jobs.len() {
+        if !prefix_dirs.is_empty() {
+            if prefix_dirs.len() >= 8 {
+                let dir_idx = AtomicUsize::new(0);
+                rnpm_fs::run_parallel(8.min(prefix_dirs.len()), &|| loop {
+                    let idx = dir_idx.fetch_add(1, Ordering::Relaxed);
+                    if idx >= prefix_dirs.len() {
                         break;
                     }
-                    let (ref cas_path, slice) = unique_jobs[idx];
-                    if let Ok(mt_opt) = Self::write_cas_file_with_mtime(cas_path, slice, true) {
-                        ok_flags[idx].store(true, Ordering::Relaxed);
-                        if let Some(mt) = mt_opt {
-                            mtimes[idx].store(mt, Ordering::Relaxed);
+                    let (pb_opt, ref parent) = prefix_dirs[idx];
+                    if fs::create_dir_all(parent).is_ok() {
+                        if let Some(b) = pb_opt {
+                            let w = (b >> 6) as usize;
+                            let m = 1u64 << (b & 63);
+                            self.cas_prefix_dirs[w].fetch_or(m, Ordering::Relaxed);
                         }
                     }
                 });
+            } else {
+                for (pb_opt, parent) in &prefix_dirs {
+                    if fs::create_dir_all(parent).is_ok() {
+                        if let Some(b) = *pb_opt {
+                            let w = (b >> 6) as usize;
+                            let m = 1u64 << (b & 63);
+                            self.cas_prefix_dirs[w].fetch_or(m, Ordering::Relaxed);
+                        }
+                    }
+                }
+            }
+        }
+
+        let cas_may_exist = self.has_cas_files.load(Ordering::Relaxed);
+        let mtimes: Vec<AtomicU64> = (0..unique_jobs.len()).map(|_| AtomicU64::new(0)).collect();
+        let ok_flags: Vec<AtomicBool> = (0..unique_jobs.len())
+            .map(|_| AtomicBool::new(false))
+            .collect();
+        let next_idx = AtomicUsize::new(0);
+        let num_workers = 24.min(unique_jobs.len());
+        rnpm_fs::run_parallel(num_workers, &|| loop {
+            let idx = next_idx.fetch_add(1, Ordering::Relaxed);
+            if idx >= unique_jobs.len() {
+                break;
+            }
+            let (ref cas_path, slice) = unique_jobs[idx];
+            if let Ok(mt_opt) =
+                Self::write_cas_file_with_mtime_opt(cas_path, slice, true, cas_may_exist)
+            {
+                ok_flags[idx].store(true, Ordering::Relaxed);
+                if let Some(mt) = mt_opt {
+                    mtimes[idx].store(mt, Ordering::Relaxed);
+                }
             }
         });
 
@@ -5341,5 +5705,28 @@ mod tests {
         store.put_package_from_tarball_deferred(&integ, &tgz).unwrap();
         let pack = store.get_package_pack(&integ).unwrap().unwrap();
         assert_eq!(pack.get_file_slice("sub/.npmignore").unwrap(), b"ignore-me\n");
+    }
+
+    #[test]
+    fn test_materialize_unnormalized_dots_and_double_slashes() {
+        let dir = tempdir().unwrap();
+        let store = PackStore::new(dir.path().join("store")).unwrap();
+        let files = vec![
+            PackInputFile::new("./nested/./a.js", 0o644, b"export const a = 1;\n"),
+            PackInputFile::new("nested//b.js", 0o644, b"export const b = 2;\n"),
+        ];
+        let integ = "sha512-unnormalizedtest0000000000000000000000000000000000000000000000000000000000000000000000000000";
+        store.put_package_pack(integ, &files).unwrap();
+        let pack = store.get_package_pack(integ).unwrap().unwrap();
+        let out = dir.path().join("out");
+        pack.materialize_to(&out, None).unwrap();
+        assert_eq!(
+            std::fs::read(out.join("nested").join("a.js")).unwrap(),
+            b"export const a = 1;\n"
+        );
+        assert_eq!(
+            std::fs::read(out.join("nested").join("b.js")).unwrap(),
+            b"export const b = 2;\n"
+        );
     }
 }

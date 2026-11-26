@@ -77,15 +77,24 @@ impl fmt::Display for Algorithm {
 
 #[inline]
 fn parse_algorithm(s: &str) -> Option<Algorithm> {
-    match s {
-        "sha512" => Some(Algorithm::Sha512),
-        "sha256" => Some(Algorithm::Sha256),
-        "sha384" => Some(Algorithm::Sha384),
-        "sha1" => Some(Algorithm::Sha1),
-        _ if s.eq_ignore_ascii_case("sha512") => Some(Algorithm::Sha512),
-        _ if s.eq_ignore_ascii_case("sha256") => Some(Algorithm::Sha256),
-        _ if s.eq_ignore_ascii_case("sha384") => Some(Algorithm::Sha384),
-        _ if s.eq_ignore_ascii_case("sha1") => Some(Algorithm::Sha1),
+    let b = s.as_bytes();
+    match b.len() {
+        4 => {
+            if b == b"sha1" || s.eq_ignore_ascii_case("sha1") {
+                Some(Algorithm::Sha1)
+            } else {
+                None
+            }
+        }
+        6 => match s {
+            "sha512" => Some(Algorithm::Sha512),
+            "sha256" => Some(Algorithm::Sha256),
+            "sha384" => Some(Algorithm::Sha384),
+            _ if s.eq_ignore_ascii_case("sha512") => Some(Algorithm::Sha512),
+            _ if s.eq_ignore_ascii_case("sha256") => Some(Algorithm::Sha256),
+            _ if s.eq_ignore_ascii_case("sha384") => Some(Algorithm::Sha384),
+            _ => None,
+        },
         _ => None,
     }
 }
@@ -152,8 +161,9 @@ pub struct IntegrityEntry {
 #[inline]
 fn decode_base64_digest(b64_bytes: &[u8]) -> Option<Vec<u8>> {
     let decode_len = BASE64.decode_len(b64_bytes.len()).ok()?;
-    if decode_len <= 64 {
-        let mut stack_buf = [0u8; 64];
+    // SHA-512 base64 is 88 bytes -> decode_len is 66, so stack buffer must exceed 66 bytes.
+    if decode_len <= 96 {
+        let mut stack_buf = [0u8; 96];
         let written = BASE64.decode_mut(b64_bytes, &mut stack_buf[..decode_len]).ok()?;
         let mut out = Vec::with_capacity(written);
         out.extend_from_slice(&stack_buf[..written]);

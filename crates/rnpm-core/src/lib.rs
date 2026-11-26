@@ -5,6 +5,7 @@
 )]
 
 pub mod error;
+mod fast_hash;
 pub mod integrity;
 pub mod manifest;
 pub mod ordered_json;

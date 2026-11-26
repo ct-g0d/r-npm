@@ -275,6 +275,15 @@ pub fn create_shim_trio(
     bin_dir: &Path,
     bin_name: &str,
 ) -> Result<ShimTrio, ShimError> {
+    create_shim_trio_with_precreated_dir(target_script, bin_dir, bin_name, false)
+}
+
+fn create_shim_trio_with_precreated_dir(
+    target_script: &Path,
+    bin_dir: &Path,
+    bin_name: &str,
+    bin_dir_precreated: bool,
+) -> Result<ShimTrio, ShimError> {
     // 1. Compute relative path with forward slashes (e.g. "../my-pkg/bin/cli.js")
     let target_rel_path = compute_relative_path(bin_dir, target_script)?;
 
@@ -288,10 +297,12 @@ pub fn create_shim_trio(
     let content = generate_shim_content(&target_rel_path, shebang.as_ref());
 
     // 4. Ensure bin_dir exists
-    std::fs::create_dir_all(bin_dir).map_err(|e| ShimError::Io {
-        path: bin_dir.to_path_buf(),
-        source: e,
-    })?;
+    if !bin_dir_precreated {
+        std::fs::create_dir_all(bin_dir).map_err(|e| ShimError::Io {
+            path: bin_dir.to_path_buf(),
+            source: e,
+        })?;
+    }
 
     // 5. Write shims to disk
     let sh_path = bin_dir.join(bin_name);
@@ -324,12 +335,19 @@ pub fn create_package_shims(
     bin_dir: &Path,
     manifest: &Manifest,
 ) -> Result<Vec<ShimTrio>, ShimError> {
-    let mut shims = Vec::new();
     let entries = manifest.bin_entries();
+    if entries.is_empty() {
+        return Ok(Vec::new());
+    }
+    std::fs::create_dir_all(bin_dir).map_err(|e| ShimError::Io {
+        path: bin_dir.to_path_buf(),
+        source: e,
+    })?;
+    let mut shims = Vec::with_capacity(entries.len());
 
     for (bin_name, script_rel) in entries {
         let target_script = pkg_dir.join(&script_rel);
-        let trio = create_shim_trio(&target_script, bin_dir, &bin_name)?;
+        let trio = create_shim_trio_with_precreated_dir(&target_script, bin_dir, &bin_name, true)?;
         shims.push(trio);
     }
 
@@ -365,10 +383,17 @@ pub fn create_shims_from_bin(
         }
     }
 
-    let mut shims = Vec::new();
+    if entries.is_empty() {
+        return Ok(Vec::new());
+    }
+    std::fs::create_dir_all(bin_dir).map_err(|e| ShimError::Io {
+        path: bin_dir.to_path_buf(),
+        source: e,
+    })?;
+    let mut shims = Vec::with_capacity(entries.len());
     for (bin_name, script_rel) in entries {
         let target_script = pkg_dir.join(&script_rel);
-        let trio = create_shim_trio(&target_script, bin_dir, &bin_name)?;
+        let trio = create_shim_trio_with_precreated_dir(&target_script, bin_dir, &bin_name, true)?;
         shims.push(trio);
     }
 
