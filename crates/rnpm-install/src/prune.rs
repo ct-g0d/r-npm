@@ -5,7 +5,7 @@
 //! and detection of extraneous package directories on disk.
 
 use anyhow::{anyhow, Context, Result};
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use tracing::{debug, info};
 
@@ -157,6 +157,16 @@ pub fn resolve_dependency_path(
     dep_name: &str,
     lockfile: Option<&LockfileV3>,
 ) -> String {
+    resolve_dependency_path_cached(project_dir, current_pkg_path, dep_name, lockfile, None)
+}
+
+fn resolve_dependency_path_cached(
+    project_dir: &Path,
+    current_pkg_path: &str,
+    dep_name: &str,
+    lockfile: Option<&LockfileV3>,
+    discovered_idx: Option<&HashMap<&str, usize>>,
+) -> String {
     let candidates = get_candidate_paths(current_pkg_path, dep_name);
 
     if let Some(lock) = lockfile {
@@ -167,10 +177,18 @@ pub fn resolve_dependency_path(
         }
     }
 
-    for cand in &candidates {
-        let full_path = project_dir.join(cand);
-        if full_path.is_dir() || is_junction(&full_path).unwrap_or(false) {
-            return cand.clone();
+    if let Some(idx_map) = discovered_idx {
+        for cand in &candidates {
+            if idx_map.contains_key(cand.as_str()) {
+                return cand.clone();
+            }
+        }
+    } else {
+        for cand in &candidates {
+            let full_path = project_dir.join(cand);
+            if full_path.is_dir() || is_junction(&full_path).unwrap_or(false) {
+                return cand.clone();
+            }
         }
     }
 
@@ -181,6 +199,30 @@ pub fn resolve_dependency_path(
         .unwrap_or_else(|| format!("node_modules/{dep_name}"))
 }
 
+fn push_manifest_deps(
+    m: &Manifest,
+    omit_optional: bool,
+    omit_peer: bool,
+    deps: &mut HashSet<String>,
+) {
+    for name in m.dependencies.keys() {
+        deps.insert(name.clone());
+    }
+    if !omit_optional {
+        for name in m.optional_dependencies.keys() {
+            deps.insert(name.clone());
+        }
+    }
+    if !omit_peer {
+        for name in m.peer_dependencies.keys() {
+            deps.insert(name.clone());
+        }
+    }
+    for name in m.bundled_package_names() {
+        deps.insert(name);
+    }
+}
+
 /// Collects required dependencies for a transitive package node.
 /// Transitive devDependencies are never included as production dependencies.
 fn collect_transitive_dependencies(
@@ -189,27 +231,22 @@ fn collect_transitive_dependencies(
     lockfile: Option<&LockfileV3>,
     omit_optional: bool,
     omit_peer: bool,
+    discovered_idx: Option<&HashMap<&str, usize>>,
+    discovered_manifests: Option<&[Option<Manifest>]>,
 ) -> HashSet<String> {
     let mut deps = HashSet::new();
 
-    // Source A: on-disk package.json
-    let disk_manifest_path = project_dir.join(pkg_path).join("package.json");
-    if let Ok(m) = Manifest::from_file_readonly(&disk_manifest_path) {
-        for name in m.dependencies.keys() {
-            deps.insert(name.clone());
-        }
-        if !omit_optional {
-            for name in m.optional_dependencies.keys() {
-                deps.insert(name.clone());
+    // Source A: on-disk package.json (reusing preloaded parallel manifest cache when available)
+    if let (Some(idx_map), Some(manifests)) = (discovered_idx, discovered_manifests) {
+        if let Some(&idx) = idx_map.get(pkg_path) {
+            if let Some(m) = &manifests[idx] {
+                push_manifest_deps(m, omit_optional, omit_peer, &mut deps);
             }
         }
-        if !omit_peer {
-            for name in m.peer_dependencies.keys() {
-                deps.insert(name.clone());
-            }
-        }
-        for name in m.bundled_package_names() {
-            deps.insert(name);
+    } else {
+        let disk_manifest_path = project_dir.join(pkg_path).join("package.json");
+        if let Ok(m) = Manifest::from_file_readonly(&disk_manifest_path) {
+            push_manifest_deps(&m, omit_optional, omit_peer, &mut deps);
         }
     }
 
@@ -220,22 +257,7 @@ fn collect_transitive_dependencies(
                 if let Some(target_rel) = &lock_pkg.resolved {
                     let target_manifest = project_dir.join(target_rel).join("package.json");
                     if let Ok(m) = Manifest::from_file_readonly(&target_manifest) {
-                        for name in m.dependencies.keys() {
-                            deps.insert(name.clone());
-                        }
-                        if !omit_optional {
-                            for name in m.optional_dependencies.keys() {
-                                deps.insert(name.clone());
-                            }
-                        }
-                        if !omit_peer {
-                            for name in m.peer_dependencies.keys() {
-                                deps.insert(name.clone());
-                            }
-                        }
-                        for name in m.bundled_package_names() {
-                            deps.insert(name);
-                        }
+                        push_manifest_deps(&m, omit_optional, omit_peer, &mut deps);
                     }
                 }
             }
@@ -274,6 +296,17 @@ pub fn analyze_reachability(
     manifest: &Manifest,
     options: &PruneOptions,
     lockfile: Option<&LockfileV3>,
+) -> Result<HashSet<String>> {
+    analyze_reachability_internal(project_dir, manifest, options, lockfile, None, None)
+}
+
+fn analyze_reachability_internal(
+    project_dir: &Path,
+    manifest: &Manifest,
+    options: &PruneOptions,
+    lockfile: Option<&LockfileV3>,
+    discovered_idx: Option<&HashMap<&str, usize>>,
+    discovered_manifests: Option<&[Option<Manifest>]>,
 ) -> Result<HashSet<String>> {
     let omit_dev = options.should_omit_dev();
     let omit_optional = options.should_omit_optional();
@@ -321,7 +354,8 @@ pub fn analyze_reachability(
 
     // Direct dependencies resolve to "node_modules/<name>"
     for dep_name in &root_dep_names {
-        let expected_key = resolve_dependency_path(project_dir, "", dep_name, lockfile);
+        let expected_key =
+            resolve_dependency_path_cached(project_dir, "", dep_name, lockfile, discovered_idx);
         if reachable_packages.insert(expected_key.clone()) {
             queue.push_back(expected_key);
         }
@@ -334,11 +368,18 @@ pub fn analyze_reachability(
             lockfile,
             omit_optional,
             omit_peer,
+            discovered_idx,
+            discovered_manifests,
         );
 
         for child_dep in deps {
-            let child_pkg_path =
-                resolve_dependency_path(project_dir, &current_pkg_path, &child_dep, lockfile);
+            let child_pkg_path = resolve_dependency_path_cached(
+                project_dir,
+                &current_pkg_path,
+                &child_dep,
+                lockfile,
+                discovered_idx,
+            );
             if reachable_packages.insert(child_pkg_path.clone()) {
                 queue.push_back(child_pkg_path);
             }
@@ -473,26 +514,72 @@ pub fn discover_extraneous_packages(
     // Attempt to load lockfile if present
     let lockfile = load_lockfile_if_exists(project_dir);
 
-    // 1. Compute reachable set
-    let reachable_packages =
-        analyze_reachability(project_dir, &manifest, options, lockfile.as_ref())?;
-
-    // 2. Scan node_modules on disk
+    // 1. Scan node_modules on disk once
     let discovered_packages = scan_node_modules(project_dir)?;
     debug!("Discovered {} packages on disk", discovered_packages.len());
 
-    // 3. Find extraneous packages
+    let discovered_normalized: Vec<String> = discovered_packages
+        .iter()
+        .map(|p| to_posix_path(p))
+        .collect();
+    let discovered_idx: HashMap<&str, usize> = discovered_normalized
+        .iter()
+        .enumerate()
+        .map(|(i, p)| (p.as_str(), i))
+        .collect();
+
+    // 2. Parallel-load package.json manifests once so BFS reachability and extraneous
+    // reporting reuse the parsed manifests with zero duplicate disk I/O.
+    let mut discovered_manifests: Vec<Option<Manifest>> = vec![None; discovered_normalized.len()];
+    let avail = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
+    let num_threads = discovered_normalized.len().div_ceil(16).min(avail).min(8);
+    if discovered_normalized.len() < 16 || num_threads <= 1 {
+        for (i, pkg_path) in discovered_normalized.iter().enumerate() {
+            discovered_manifests[i] =
+                Manifest::from_file_readonly(project_dir.join(pkg_path).join("package.json")).ok();
+        }
+    } else {
+        let chunk_size = discovered_normalized.len().div_ceil(num_threads);
+        std::thread::scope(|scope| {
+            for (chunk_paths, chunk_out) in discovered_normalized
+                .chunks(chunk_size)
+                .zip(discovered_manifests.chunks_mut(chunk_size))
+            {
+                scope.spawn(move || {
+                    for (pkg_path, slot) in chunk_paths.iter().zip(chunk_out.iter_mut()) {
+                        *slot = Manifest::from_file_readonly(
+                            project_dir.join(pkg_path).join("package.json"),
+                        )
+                        .ok();
+                    }
+                });
+            }
+        });
+    }
+
+    // 3. Compute reachable set
+    let reachable_packages = analyze_reachability_internal(
+        project_dir,
+        &manifest,
+        options,
+        lockfile.as_ref(),
+        Some(&discovered_idx),
+        Some(&discovered_manifests),
+    )?;
+
+    // 4. Find extraneous packages
     let mut extraneous_packages = Vec::new();
-    for pkg_path in &discovered_packages {
-        let normalized_path = to_posix_path(pkg_path);
+    for (i, normalized_path) in discovered_normalized.into_iter().enumerate() {
         if !reachable_packages.contains(&normalized_path) {
             let full_path = project_dir.join(&normalized_path);
-            let manifest_file = full_path.join("package.json");
-            let (name, version) = if let Ok(m) = Manifest::from_file_readonly(&manifest_file) {
+            let (name, version) = if let Some(ref m) = discovered_manifests[i] {
                 let pkg_name = m
                     .name
+                    .clone()
                     .unwrap_or_else(|| extract_package_name_from_path(&normalized_path));
-                (pkg_name, m.version)
+                (pkg_name, m.version.clone())
             } else {
                 let pkg_name = extract_package_name_from_path(&normalized_path);
                 (pkg_name, None)

@@ -2,7 +2,7 @@ use serde_json::Value;
 use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
 
-use crate::inspect_tree::{build_dependency_tree, InspectedNode, TreeOptions};
+use crate::inspect_tree::{InspectedNode, TreeOptions};
 
 /// Options for the `list` / `ls` / `la` / `ll` command.
 #[derive(Debug, Clone, Default)]
@@ -69,7 +69,8 @@ fn run_list_inner(
         is_global: options.is_global,
     };
 
-    let mut root_node = build_dependency_tree(project_dir, &tree_opts)?;
+    let mut root_node =
+        crate::inspect_tree::build_dependency_tree_with_raw(project_dir, &tree_opts, options.long)?;
 
     // Filter by packages if specified
     if !options.packages.is_empty() {

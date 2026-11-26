@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 
 use rnpm_core::manifest::Manifest;
 use rnpm_core::semver::{Range, Version};
-use rnpm_fs::junction::is_junction;
+use rnpm_fs::junction::{is_dir_entry_reparse_or_symlink, is_junction};
 use rnpm_lockfile::LockfileV3;
 
 /// A node in the dependency tree, representing either the root project or a package in node_modules.
@@ -312,6 +312,13 @@ struct RawDiskEntry {
 
 /// Scan `node_modules` directory recursively on disk and return map of location -> DiskPackage.
 pub(crate) fn scan_disk_packages(project_dir: &Path) -> HashMap<String, DiskPackage> {
+    scan_disk_packages_with_raw(project_dir, true)
+}
+
+pub(crate) fn scan_disk_packages_with_raw(
+    project_dir: &Path,
+    include_raw_json: bool,
+) -> HashMap<String, DiskPackage> {
     let root_nm = project_dir.join("node_modules");
     if !root_nm.is_dir() {
         return HashMap::new();
@@ -354,13 +361,14 @@ pub(crate) fn scan_disk_packages(project_dir: &Path) -> HashMap<String, DiskPack
                 continue;
             }
 
-            let entry_path = entry.path();
-            let is_symlink = entry.file_type().map(|ft| ft.is_symlink()).unwrap_or(false);
-            let is_junc = is_junction(&entry_path).unwrap_or(false);
-            let is_link = is_symlink || is_junc;
-            if !entry_path.is_dir() && !is_link {
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            let is_link = is_dir_entry_reparse_or_symlink(&entry, &file_type);
+            if !file_type.is_dir() && !is_link {
                 continue;
             }
+            let entry_path = entry.path();
 
             if name_str.starts_with('@') {
                 // Scoped packages
@@ -371,13 +379,14 @@ pub(crate) fn scan_disk_packages(project_dir: &Path) -> HashMap<String, DiskPack
                         if sub_name_str.starts_with('.') {
                             continue;
                         }
-                        let sub_path = scoped_entry.path();
-                        let sub_symlink = scoped_entry.file_type().map(|ft| ft.is_symlink()).unwrap_or(false);
-                        let sub_junc = is_junction(&sub_path).unwrap_or(false);
-                        let sub_is_link = sub_symlink || sub_junc;
-                        if !sub_path.is_dir() && !sub_is_link {
+                        let Ok(sub_ft) = scoped_entry.file_type() else {
+                            continue;
+                        };
+                        let sub_is_link = is_dir_entry_reparse_or_symlink(&scoped_entry, &sub_ft);
+                        if !sub_ft.is_dir() && !sub_is_link {
                             continue;
                         }
+                        let sub_path = scoped_entry.path();
 
                         let loc = format!("{nm_rel}/{name_str}/{sub_name_str}");
                         let pkg_name = format!("{name_str}/{sub_name_str}");
@@ -417,7 +426,8 @@ pub(crate) fn scan_disk_packages(project_dir: &Path) -> HashMap<String, DiskPack
     }
 
     let parse_entry = |item: &RawDiskEntry| {
-        let (manifest, raw_json, version) = load_package_manifest(&item.dir_path);
+        let (manifest, raw_json, version) =
+            load_package_manifest(&item.dir_path, include_raw_json);
         let name = manifest
             .as_ref()
             .and_then(|m| m.name.clone())
@@ -486,11 +496,18 @@ fn project_relative_realpath(project_dir: &Path, link: &Path) -> Option<String> 
     (!rel.is_empty()).then_some(rel)
 }
 
-fn load_package_manifest(dir: &Path) -> (Option<Manifest>, Option<Value>, Option<String>) {
+fn load_package_manifest(
+    dir: &Path,
+    include_raw_json: bool,
+) -> (Option<Manifest>, Option<Value>, Option<String>) {
     let manifest_path = dir.join("package.json");
     if let Ok(content) = std::fs::read_to_string(&manifest_path) {
         let manifest = Manifest::from_str_readonly(&content).ok();
-        let raw_json = serde_json::from_str::<Value>(&content).ok();
+        let raw_json = if include_raw_json {
+            serde_json::from_str::<Value>(&content).ok()
+        } else {
+            None
+        };
         let version = manifest.as_ref().and_then(|m| m.version.clone());
         return (manifest, raw_json, version);
     }
@@ -517,6 +534,16 @@ pub fn candidate_locations(current_loc: &str, dep_name: &str) -> Vec<String> {
 pub fn build_dependency_tree(
     project_dir: &Path,
     options: &TreeOptions,
+) -> anyhow::Result<InspectedNode> {
+    build_dependency_tree_with_raw(project_dir, options, true)
+}
+
+/// Builds the inspected dependency tree, optionally skipping per-package
+/// `serde_json::Value` DOM parsing when callers only need manifest metadata.
+pub fn build_dependency_tree_with_raw(
+    project_dir: &Path,
+    options: &TreeOptions,
+    include_raw_json: bool,
 ) -> anyhow::Result<InspectedNode> {
     let manifest_path = project_dir.join("package.json");
     let (root_manifest, root_raw) = if manifest_path.exists() {
@@ -574,7 +601,7 @@ pub fn build_dependency_tree(
     }
 
     // Normal mode: build from disk node_modules enriched by lockfile
-    let disk_packages = scan_disk_packages(project_dir);
+    let disk_packages = scan_disk_packages_with_raw(project_dir, include_raw_json);
 
     // Track visited disk packages for reachability analysis
     let mut reachable_locations: HashSet<String> = HashSet::new();

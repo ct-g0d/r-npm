@@ -652,6 +652,9 @@ impl Npmrc {
 
     /// Returns a copy of the settings map with all sensitive tokens safely redacted.
     pub fn scrubbed_settings(&self) -> BTreeMap<String, String> {
+        if self.settings.is_empty() {
+            return BTreeMap::new();
+        }
         self.settings
             .iter()
             .map(|(k, v)| {
@@ -1150,36 +1153,78 @@ pub fn scrub_credentials(text: &str) -> String {
     result
 }
 
-fn contains_ascii_ci(haystack: &str, needle_lower: &str) -> bool {
-    let hb = haystack.as_bytes();
-    let nb = needle_lower.as_bytes();
-    if nb.is_empty() {
-        return true;
-    }
-    hb.len() >= nb.len() && hb.windows(nb.len()).any(|w| w.eq_ignore_ascii_case(nb))
+#[inline]
+fn bytes_contain(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack.len() >= needle.len() && haystack.windows(needle.len()).any(|w| w == needle)
 }
 
 /// Checks if a key name corresponds to a sensitive credential.
 pub fn is_sensitive_credential_key(key: &str) -> bool {
-    if contains_ascii_ci(key, "password")
-        || contains_ascii_ci(key, "secret")
-        || contains_ascii_ci(key, "token")
-        || contains_ascii_ci(key, "apikey")
-        || contains_ascii_ci(key, "api_key")
+    let raw = key.as_bytes();
+    if raw.len() < 4 {
+        return false;
+    }
+    let mut stack = [0u8; 128];
+    let mut heap = Vec::new();
+    let lower: &mut [u8] = if raw.len() <= stack.len() {
+        &mut stack[..raw.len()]
+    } else {
+        heap.resize(raw.len(), 0);
+        &mut heap
+    };
+    let mut mask = 0u32;
+    for (dst, &b) in lower.iter_mut().zip(raw.iter()) {
+        let lb = b.to_ascii_lowercase();
+        *dst = lb;
+        if lb.is_ascii_lowercase() {
+            mask |= 1u32 << (lb - b'a');
+        }
+    }
+
+    const fn lmask(s: &[u8]) -> u32 {
+        let mut m = 0u32;
+        let mut i = 0;
+        while i < s.len() {
+            let c = s[i];
+            if c.is_ascii_lowercase() {
+                m |= 1u32 << (c - b'a');
+            }
+            i += 1;
+        }
+        m
+    }
+
+    const MASK_PASSWORD: u32 = lmask(b"password");
+    const MASK_SECRET: u32 = lmask(b"secret");
+    const MASK_TOKEN: u32 = lmask(b"token");
+    const MASK_APIKEY: u32 = lmask(b"apikey");
+    const MASK_AUTH: u32 = lmask(b"auth");
+
+    if (mask & MASK_PASSWORD) == MASK_PASSWORD && bytes_contain(lower, b"password") {
+        return true;
+    }
+    if (mask & MASK_SECRET) == MASK_SECRET && bytes_contain(lower, b"secret") {
+        return true;
+    }
+    if (mask & MASK_TOKEN) == MASK_TOKEN && bytes_contain(lower, b"token") {
+        return true;
+    }
+    if (mask & MASK_APIKEY) == MASK_APIKEY
+        && (bytes_contain(lower, b"apikey") || bytes_contain(lower, b"api_key"))
     {
         return true;
     }
-    if contains_ascii_ci(key, "auth") {
-        if contains_ascii_ci(key, "auth_key")
-            || contains_ascii_ci(key, "auth_token")
-            || contains_ascii_ci(key, "_authtoken")
-            || contains_ascii_ci(key, "_auth")
+    if (mask & MASK_AUTH) == MASK_AUTH && bytes_contain(lower, b"auth") {
+        if bytes_contain(lower, b"auth_key")
+            || bytes_contain(lower, b"auth_token")
+            || bytes_contain(lower, b"_authtoken")
+            || bytes_contain(lower, b"_auth")
         {
             return true;
         }
-        return !contains_ascii_ci(key, "author")
-            && !contains_ascii_ci(key, "auth-type")
-            && !contains_ascii_ci(key, "auth_type");
+        return !bytes_contain(lower, b"author")
+            && !bytes_contain(lower, b"auth-type")
+            && !bytes_contain(lower, b"auth_type");
     }
     false
 }

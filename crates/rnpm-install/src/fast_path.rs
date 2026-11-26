@@ -951,13 +951,12 @@ pub(crate) fn validate_hidden_lockfile_loaded(
     }
 
     // Execute package disk checks (package.json presence/length, junction target existence, mtime)
-    let num_threads = std::thread::available_parallelism()
+    let avail = std::thread::available_parallelism()
         .map(|n| n.get())
-        .unwrap_or(4)
-        .min(16)
-        .min(checks.len());
+        .unwrap_or(4);
+    let num_threads = checks.len().div_ceil(48).min(avail).min(8);
 
-    if checks.len() <= 32 || num_threads <= 1 {
+    if checks.len() <= 48 || num_threads <= 1 {
         for check in &checks {
             if check.is_link_or_junction && !check.folder_path.exists() {
                 debug!(

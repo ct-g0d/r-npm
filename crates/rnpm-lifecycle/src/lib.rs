@@ -687,78 +687,128 @@ impl LifecycleContext {
 }
 
 #[inline]
-fn contains_ascii_ci(haystack: &[u8], needle: &[u8]) -> bool {
-    haystack.len() >= needle.len()
-        && haystack
-            .windows(needle.len())
-            .any(|w| w.eq_ignore_ascii_case(needle))
+fn bytes_contain_lc(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack.len() >= needle.len() && haystack.windows(needle.len()).any(|w| w == needle)
 }
 
 /// Scrub sensitive authentication tokens and credentials from environment map.
 pub fn is_sensitive_credential_key(key: &str) -> bool {
     let b = key.as_bytes();
+    if b.len() < 3 {
+        return b == b"//";
+    }
+    if b.starts_with(b"//") {
+        return true;
+    }
 
-    // Specific credential keys requested for hardening
-    if contains_ascii_ci(b, b"aws_access_key_id")
-        || contains_ascii_ci(b, b"aws_secret_access_key")
-        || contains_ascii_ci(b, b"aws_session_token")
-        || contains_ascii_ci(b, b"ssh_auth_sock")
-        || contains_ascii_ci(b, b"jwt")
-        || contains_ascii_ci(b, b"deploy_key")
-        || contains_ascii_ci(b, b"deploykey")
-        || contains_ascii_ci(b, b"signing_key")
-        || contains_ascii_ci(b, b"signingkey")
-        || contains_ascii_ci(b, b"encryption_key")
-        || contains_ascii_ci(b, b"encryptionkey")
-        || contains_ascii_ci(b, b"secret_key")
-        || contains_ascii_ci(b, b"secretkey")
+    let mut stack = [0u8; 128];
+    let mut heap = Vec::new();
+    let lower: &mut [u8] = if b.len() <= stack.len() {
+        &mut stack[..b.len()]
+    } else {
+        heap.resize(b.len(), 0);
+        &mut heap
+    };
+    let mut mask = 0u32;
+    let mut has_colon = false;
+    let mut has_underscore = false;
+    for (dst, &ch) in lower.iter_mut().zip(b.iter()) {
+        let lb = ch.to_ascii_lowercase();
+        *dst = lb;
+        if lb.is_ascii_lowercase() {
+            mask |= 1u32 << (lb - b'a');
+        } else if lb == b':' {
+            has_colon = true;
+        } else if lb == b'_' {
+            has_underscore = true;
+        }
+    }
+
+    const fn lmask(s: &[u8]) -> u32 {
+        let mut m = 0u32;
+        let mut i = 0;
+        while i < s.len() {
+            let c = s[i];
+            if c >= b'a' && c <= b'z' {
+                m |= 1u32 << (c - b'a');
+            }
+            i += 1;
+        }
+        m
+    }
+
+    const M_TOKEN: u32 = lmask(b"token");
+    const M_SECRET: u32 = lmask(b"secret");
+    const M_PASSWORD: u32 = lmask(b"password");
+    const M_PASSWD: u32 = lmask(b"passwd");
+    const M_JWT: u32 = lmask(b"jwt");
+    const M_KEY: u32 = lmask(b"key");
+    const M_AUTH: u32 = lmask(b"auth");
+    const M_GHP: u32 = lmask(b"ghp_");
+    const M_GITHUB_PAT: u32 = lmask(b"github_pat_");
+    const M_CREDENTIAL: u32 = lmask(b"credential");
+    const M_BEARER: u32 = lmask(b"bearer");
+
+    if (mask & M_TOKEN) == M_TOKEN && bytes_contain_lc(lower, b"token") {
+        return true;
+    }
+    if (mask & M_SECRET) == M_SECRET && bytes_contain_lc(lower, b"secret") {
+        return true;
+    }
+    if ((mask & M_PASSWORD) == M_PASSWORD && bytes_contain_lc(lower, b"password"))
+        || ((mask & M_PASSWD) == M_PASSWD && bytes_contain_lc(lower, b"passwd"))
     {
         return true;
     }
-
-    // Token prefixes / substrings
-    if contains_ascii_ci(b, b"ghp_") || contains_ascii_ci(b, b"github_pat_") {
+    if (mask & M_JWT) == M_JWT && bytes_contain_lc(lower, b"jwt") {
         return true;
     }
-
-    if contains_ascii_ci(b, b"authtoken")
-        || contains_ascii_ci(b, b"password")
-        || contains_ascii_ci(b, b"passwd")
-        || contains_ascii_ci(b, b"secret")
-        || contains_ascii_ci(b, b"credential")
-        || contains_ascii_ci(b, b"private_key")
-        || contains_ascii_ci(b, b"privatekey")
-        || contains_ascii_ci(b, b"apikey")
-        || contains_ascii_ci(b, b"api_key")
-        || contains_ascii_ci(b, b"bearer")
+    if (mask & M_CREDENTIAL) == M_CREDENTIAL && bytes_contain_lc(lower, b"credential") {
+        return true;
+    }
+    if (mask & M_BEARER) == M_BEARER && bytes_contain_lc(lower, b"bearer") {
+        return true;
+    }
+    if has_underscore
+        && (((mask & M_GHP) == M_GHP && bytes_contain_lc(lower, b"ghp_"))
+            || ((mask & M_GITHUB_PAT) == M_GITHUB_PAT && bytes_contain_lc(lower, b"github_pat_")))
     {
         return true;
     }
-
-    if b.starts_with(b"//")
-        || contains_ascii_ci(b, b"/:_")
-        || contains_ascii_ci(b, b":_authtoken")
-        || contains_ascii_ci(b, b":_auth")
-        || contains_ascii_ci(b, b":_password")
-        || (b.len() >= 13 && b[..13].eq_ignore_ascii_case(b"npm_config_//"))
+    if (mask & M_KEY) == M_KEY
+        && (bytes_contain_lc(lower, b"apikey")
+            || bytes_contain_lc(lower, b"api_key")
+            || bytes_contain_lc(lower, b"deploy_key")
+            || bytes_contain_lc(lower, b"deploykey")
+            || bytes_contain_lc(lower, b"signing_key")
+            || bytes_contain_lc(lower, b"signingkey")
+            || bytes_contain_lc(lower, b"encryption_key")
+            || bytes_contain_lc(lower, b"encryptionkey")
+            || bytes_contain_lc(lower, b"secret_key")
+            || bytes_contain_lc(lower, b"secretkey")
+            || bytes_contain_lc(lower, b"private_key")
+            || bytes_contain_lc(lower, b"privatekey")
+            || (has_underscore && bytes_contain_lc(lower, b"aws_access_key_id")))
     {
         return true;
     }
-
-    if (contains_ascii_ci(b, b"_auth")
-        || contains_ascii_ci(b, b"auth_")
-        || (b.len() >= 4 && b[..4].eq_ignore_ascii_case(b"auth"))
-        || (b.len() >= 4 && b[b.len() - 4..].eq_ignore_ascii_case(b"auth"))
-        || b.eq_ignore_ascii_case(b"auth"))
-        && !contains_ascii_ci(b, b"author")
+    if has_colon
+        && (bytes_contain_lc(lower, b"/:_") || bytes_contain_lc(lower, b":_auth"))
     {
         return true;
     }
-
-    if contains_ascii_ci(b, b"token") {
+    if lower.len() >= 13 && &lower[..13] == b"npm_config_//" {
         return true;
     }
-
+    if (mask & M_AUTH) == M_AUTH
+        && (((has_underscore
+            && (bytes_contain_lc(lower, b"_auth") || bytes_contain_lc(lower, b"auth_")))
+            || (lower.len() >= 4
+                && (&lower[..4] == b"auth" || &lower[lower.len() - 4..] == b"auth")))
+            && !bytes_contain_lc(lower, b"author"))
+    {
+        return true;
+    }
     false
 }
 
@@ -1026,15 +1076,383 @@ pub fn node_executable() -> Option<PathBuf> {
     .clone()
 }
 
+/// Reads `RT_VERSION` (`VS_VERSION_INFO`) directly from an official Windows `node.exe`
+/// using bounded header/resource seeks instead of spawning `node.exe --version`.
+#[cfg(windows)]
+pub fn read_official_node_pe_version(path: &Path) -> Option<String> {
+    pe_version::read_official_node_pe_version(path)
+}
+
+#[cfg(not(windows))]
+pub fn read_official_node_pe_version(_path: &Path) -> Option<String> {
+    None
+}
+
+#[cfg(windows)]
+mod pe_version {
+    use std::fs::File;
+    use std::io::{Read, Seek, SeekFrom};
+    use std::path::Path;
+
+    pub(super) fn read_official_node_pe_version(path: &Path) -> Option<String> {
+        let mut file = File::open(path).ok()?;
+        let mut header = [0u8; 4096];
+        let n = file.read(&mut header).ok()?;
+        let hdr = &header[..n];
+        if hdr.len() < 64 || &hdr[0..2] != b"MZ" {
+            return None;
+        }
+
+        let e_lfanew = read_u32(hdr, 60)? as usize;
+        let pe_end = e_lfanew.checked_add(24)?;
+        let full_hdr: Vec<u8>;
+        let h = if pe_end <= hdr.len() {
+            hdr
+        } else if e_lfanew < 65536 {
+            file.seek(SeekFrom::Start(0)).ok()?;
+            full_hdr = read_exact_up_to(&mut file, pe_end.max(4096))?;
+            &full_hdr
+        } else {
+            return None;
+        };
+
+        if h.get(e_lfanew..e_lfanew + 4)? != b"PE\0\0" {
+            return None;
+        }
+        let num_sections = read_u16(h, e_lfanew + 6)? as usize;
+        let size_of_opt = read_u16(h, e_lfanew + 20)? as usize;
+        let opt_off = e_lfanew + 24;
+        let sec_off = opt_off.checked_add(size_of_opt)?;
+        let sec_table_end = sec_off.checked_add(num_sections.checked_mul(40)?)?;
+        if num_sections == 0 || num_sections > 96 || sec_table_end > 65536 {
+            return None;
+        }
+
+        let extended_hdr: Vec<u8>;
+        let h = if sec_table_end <= h.len() {
+            h
+        } else {
+            file.seek(SeekFrom::Start(0)).ok()?;
+            extended_hdr = read_exact_up_to(&mut file, sec_table_end)?;
+            &extended_hdr
+        };
+
+        let opt = h.get(opt_off..sec_off)?;
+        let magic = read_u16(opt, 0)?;
+        let (rva_count_off, dd_off) = match magic {
+            0x010b => (92usize, 96usize),   // PE32
+            0x020b => (108usize, 112usize), // PE32+
+            _ => return None,
+        };
+        let num_rva = read_u32(opt, rva_count_off)? as usize;
+        if num_rva <= 2 {
+            return None;
+        }
+        let rsrc_dir_rva = read_u32(opt, dd_off + 2 * 8)?;
+        let rsrc_dir_size = read_u32(opt, dd_off + 2 * 8 + 4)?;
+        if rsrc_dir_rva == 0 || rsrc_dir_size == 0 {
+            return None;
+        }
+
+        let mut sections = Vec::with_capacity(num_sections);
+        for i in 0..num_sections {
+            let base = sec_off + i * 40;
+            sections.push(PeSection {
+                virtual_size: read_u32(h, base + 8)?,
+                virtual_address: read_u32(h, base + 12)?,
+                size_of_raw_data: read_u32(h, base + 16)?,
+                pointer_to_raw_data: read_u32(h, base + 20)?,
+            });
+        }
+
+        let rsrc_base = rva_to_file_offset(&sections, rsrc_dir_rva)?;
+        let version_bytes = read_rt_version_resource(&mut file, &sections, rsrc_base)?;
+        parse_node_version_info(&version_bytes)
+    }
+
+    #[derive(Clone, Copy)]
+    struct PeSection {
+        virtual_size: u32,
+        virtual_address: u32,
+        size_of_raw_data: u32,
+        pointer_to_raw_data: u32,
+    }
+
+    fn rva_to_file_offset(sections: &[PeSection], rva: u32) -> Option<u64> {
+        for sec in sections {
+            let span = sec.virtual_size.max(sec.size_of_raw_data);
+            let end = sec.virtual_address.checked_add(span)?;
+            if rva >= sec.virtual_address && rva < end {
+                let delta = rva - sec.virtual_address;
+                if delta < sec.size_of_raw_data {
+                    return Some(u64::from(sec.pointer_to_raw_data) + u64::from(delta));
+                }
+            }
+        }
+        None
+    }
+
+    fn read_exact_up_to(file: &mut File, len: usize) -> Option<Vec<u8>> {
+        let mut buf = vec![0u8; len];
+        let mut read_total = 0;
+        while read_total < len {
+            match file.read(&mut buf[read_total..]) {
+                Ok(0) => break,
+                Ok(k) => read_total += k,
+                Err(_) => return None,
+            }
+        }
+        buf.truncate(read_total);
+        Some(buf)
+    }
+
+    fn read_at(file: &mut File, offset: u64, len: usize) -> Option<Vec<u8>> {
+        file.seek(SeekFrom::Start(offset)).ok()?;
+        let buf = read_exact_up_to(file, len)?;
+        if buf.len() < len {
+            None
+        } else {
+            Some(buf)
+        }
+    }
+
+    fn read_resource_dir_entries(file: &mut File, dir_offset: u64) -> Option<Vec<(u32, u32)>> {
+        let hdr = read_at(file, dir_offset, 16)?;
+        let num_named = read_u16(&hdr, 12)? as usize;
+        let num_id = read_u16(&hdr, 14)? as usize;
+        let total = num_named.checked_add(num_id)?;
+        if total == 0 || total > 512 {
+            return None;
+        }
+        let raw = read_at(file, dir_offset.checked_add(16)?, total * 8)?;
+        let mut entries = Vec::with_capacity(total);
+        for i in 0..total {
+            let base = i * 8;
+            entries.push((read_u32(&raw, base)?, read_u32(&raw, base + 4)?));
+        }
+        Some(entries)
+    }
+
+    fn read_rt_version_resource(
+        file: &mut File,
+        sections: &[PeSection],
+        rsrc_base: u64,
+    ) -> Option<Vec<u8>> {
+        const RT_VERSION: u32 = 16;
+        const SUBDIR_FLAG: u32 = 0x8000_0000;
+
+        let type_entries = read_resource_dir_entries(file, rsrc_base)?;
+        let (_, type_off) = type_entries
+            .into_iter()
+            .find(|(id, off)| *id == RT_VERSION && (*off & SUBDIR_FLAG) != 0)?;
+
+        let name_entries = read_resource_dir_entries(
+            file,
+            rsrc_base.checked_add(u64::from(type_off & !SUBDIR_FLAG))?,
+        )?;
+        let (_, name_off) = name_entries
+            .into_iter()
+            .find(|(_, off)| (*off & SUBDIR_FLAG) != 0)?;
+
+        let lang_entries = read_resource_dir_entries(
+            file,
+            rsrc_base.checked_add(u64::from(name_off & !SUBDIR_FLAG))?,
+        )?;
+        let (_, leaf_off) = lang_entries
+            .into_iter()
+            .find(|(_, off)| (*off & SUBDIR_FLAG) == 0)?;
+
+        let data_entry = read_at(file, rsrc_base.checked_add(u64::from(leaf_off))?, 16)?;
+        let data_rva = read_u32(&data_entry, 0)?;
+        let data_size = read_u32(&data_entry, 4)? as usize;
+        if !(64..=65536).contains(&data_size) {
+            return None;
+        }
+        let data_offset = rva_to_file_offset(sections, data_rva)?;
+        read_at(file, data_offset, data_size)
+    }
+
+    fn parse_node_version_info(buf: &[u8]) -> Option<String> {
+        let (key, w_type, val_start, val_len, children_start, node_end) =
+            parse_ver_node(buf, 0, buf.len())?;
+        if key != "VS_VERSION_INFO" || w_type != 0 || val_len < 52 {
+            return None;
+        }
+        let fixed_end = val_start.checked_add(52)?;
+        let fixed = buf.get(val_start..fixed_end)?;
+        if read_u32(fixed, 0)? != 0xFEEF_04BD {
+            return None;
+        }
+        let prod_ms = read_u32(fixed, 16)?;
+        let prod_ls = read_u32(fixed, 20)?;
+        if (prod_ls & 0xFFFF) != 0 {
+            return None;
+        }
+        let expected_ver = format!("{}.{}.{}", prod_ms >> 16, prod_ms & 0xFFFF, prod_ls >> 16);
+
+        let mut original_filename: Option<String> = None;
+        let mut file_description: Option<String> = None;
+        let mut product_name: Option<String> = None;
+        let mut product_version: Option<String> = None;
+
+        let mut sfi_off = children_start;
+        while sfi_off + 6 <= node_end {
+            let Some((sfi_key, _, _, _, sfi_children, sfi_end)) =
+                parse_ver_node(buf, sfi_off, node_end)
+            else {
+                break;
+            };
+            if sfi_key == "StringFileInfo" {
+                let mut tbl_off = sfi_children;
+                while tbl_off + 6 <= sfi_end {
+                    let Some((_, _, _, _, tbl_children, tbl_end)) =
+                        parse_ver_node(buf, tbl_off, sfi_end)
+                    else {
+                        break;
+                    };
+                    let mut str_off = tbl_children;
+                    while str_off + 6 <= tbl_end {
+                        let Some((str_key, str_type, sv_start, sv_len, _, str_end)) =
+                            parse_ver_node(buf, str_off, tbl_end)
+                        else {
+                            break;
+                        };
+                        if str_type == 1 {
+                            let byte_len = sv_len.saturating_mul(2);
+                            let sv_end = sv_start.saturating_add(byte_len).min(str_end);
+                            if let Some(val) = decode_utf16le_trimmed(buf.get(sv_start..sv_end)?) {
+                                match str_key.as_str() {
+                                    "OriginalFilename" => original_filename = Some(val),
+                                    "FileDescription" => file_description = Some(val),
+                                    "ProductName" => product_name = Some(val),
+                                    "ProductVersion" => product_version = Some(val),
+                                    _ => {}
+                                }
+                            }
+                        }
+                        let next = align4(str_end);
+                        if next <= str_off {
+                            break;
+                        }
+                        str_off = next;
+                    }
+                    let next = align4(tbl_end);
+                    if next <= tbl_off {
+                        break;
+                    }
+                    tbl_off = next;
+                }
+            }
+            let next = align4(sfi_end);
+            if next <= sfi_off {
+                break;
+            }
+            sfi_off = next;
+        }
+
+        if !original_filename.as_deref()?.eq_ignore_ascii_case("node.exe") {
+            return None;
+        }
+        if file_description.as_deref()? != "Node.js JavaScript Runtime" {
+            return None;
+        }
+        if product_name.as_deref()? != "Node.js" {
+            return None;
+        }
+        let pv = product_version?;
+        if pv != expected_ver {
+            return None;
+        }
+        Some(format!("v{pv}"))
+    }
+
+    fn parse_ver_node(
+        buf: &[u8],
+        offset: usize,
+        limit: usize,
+    ) -> Option<(String, u16, usize, usize, usize, usize)> {
+        let w_len = read_u16(buf, offset)? as usize;
+        let w_val_len = read_u16(buf, offset + 2)? as usize;
+        let w_type = read_u16(buf, offset + 4)?;
+        if w_len < 6 {
+            return None;
+        }
+        let node_end = offset.checked_add(w_len)?.min(limit);
+        let (key, key_end) = read_utf16le_cstr(buf, offset + 6, node_end)?;
+        let val_start = align4(key_end).min(node_end);
+        let val_bytes = if w_type == 1 {
+            w_val_len.saturating_mul(2)
+        } else {
+            w_val_len
+        };
+        let children_start = align4(val_start.saturating_add(val_bytes).min(node_end)).min(node_end);
+        Some((key, w_type, val_start, w_val_len, children_start, node_end))
+    }
+
+    fn read_utf16le_cstr(buf: &[u8], start: usize, limit: usize) -> Option<(String, usize)> {
+        let mut pos = start;
+        let mut units = Vec::new();
+        while pos + 2 <= limit {
+            let unit = u16::from_le_bytes([buf[pos], buf[pos + 1]]);
+            pos += 2;
+            if unit == 0 {
+                return Some((String::from_utf16(&units).ok()?, pos));
+            }
+            units.push(unit);
+        }
+        None
+    }
+
+    fn decode_utf16le_trimmed(bytes: &[u8]) -> Option<String> {
+        let (chunks, _) = bytes.as_chunks::<2>();
+        let mut units: Vec<u16> = chunks
+            .iter()
+            .map(|&c| u16::from_le_bytes(c))
+            .collect();
+        while units.last() == Some(&0) {
+            units.pop();
+        }
+        String::from_utf16(&units).ok()
+    }
+
+    fn read_u16(buf: &[u8], off: usize) -> Option<u16> {
+        let slice = buf.get(off..off.checked_add(2)?)?;
+        Some(u16::from_le_bytes([slice[0], slice[1]]))
+    }
+
+    fn read_u32(buf: &[u8], off: usize) -> Option<u32> {
+        let slice = buf.get(off..off.checked_add(4)?)?;
+        Some(u32::from_le_bytes([slice[0], slice[1], slice[2], slice[3]]))
+    }
+
+    const fn align4(n: usize) -> usize {
+        (n + 3) & !3
+    }
+}
+
+/// Returns the trimmed `node --version` output for `path`, avoiding a subprocess
+/// spawn on Windows when reading an official `node.exe`, or empty string on failure.
+pub fn node_version_for(path: &Path) -> String {
+    if let Some(version) = read_official_node_pe_version(path) {
+        return version;
+    }
+    std::process::Command::new(path)
+        .arg("--version")
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_default()
+}
+
 /// Version string of the `node` on PATH (`v26.13.0`), or `unknown`.
 pub fn node_version() -> String {
     static VERSION: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     VERSION
         .get_or_init(|| {
             node_executable()
-                .and_then(|n| std::process::Command::new(n).arg("--version").output().ok())
-                .filter(|o| o.status.success())
-                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                .map(|n| node_version_for(&n))
+                .filter(|v| !v.is_empty())
                 .unwrap_or_else(|| "unknown".into())
         })
         .clone()
@@ -2046,8 +2464,31 @@ pub fn precompute_lifecycle_env(
     config: &rnpm_config::Config,
     base_extra_env: Option<&HashMap<String, String>>,
 ) -> HashMap<String, String> {
+    precompute_lifecycle_env_with_manifest(
+        package_dir,
+        project_root,
+        package_name,
+        package_version,
+        config,
+        base_extra_env,
+        None,
+    )
+}
+
+/// Same as [`precompute_lifecycle_env`], reusing an already-parsed `Manifest`
+/// when available to avoid re-reading `package.json` from disk.
+#[allow(clippy::too_many_arguments)]
+pub fn precompute_lifecycle_env_with_manifest(
+    package_dir: &Path,
+    project_root: &Path,
+    package_name: &str,
+    package_version: Option<&str>,
+    config: &rnpm_config::Config,
+    base_extra_env: Option<&HashMap<String, String>>,
+    manifest: Option<&rnpm_core::Manifest>,
+) -> HashMap<String, String> {
     let base = ScriptBaseEnv::build(project_root, config, None, None, None);
-    base.build_package_env(
+    base.build_package_env_with_manifest(
         package_dir,
         package_name,
         package_version,
@@ -2055,6 +2496,7 @@ pub fn precompute_lifecycle_env(
         "",
         base_extra_env,
         None,
+        manifest,
     )
 }
 
@@ -2079,8 +2521,8 @@ pub fn is_cmd_shell(shell: &str) -> bool {
     name.eq_ignore_ascii_case("cmd") || name.eq_ignore_ascii_case("cmd.exe")
 }
 
-pub(crate) fn create_shell_command(ctx: &LifecycleContext) -> Command {
-    let configured_shell = ctx.script_shell.as_deref().or_else(|| {
+fn configured_script_shell(ctx: &LifecycleContext) -> Option<&str> {
+    ctx.script_shell.as_deref().or_else(|| {
         ctx.extra_env
             .get("npm_config_script_shell")
             .filter(|s| {
@@ -2088,7 +2530,358 @@ pub(crate) fn create_shell_command(ctx: &LifecycleContext) -> Command {
                 !trimmed.is_empty() && trimmed != "null" && *s != "null"
             })
             .map(|s| s.as_str())
-    });
+    })
+}
+
+fn is_shell_builtin(prog: &str) -> bool {
+    #[cfg(windows)]
+    let eq = |kw: &str| prog.eq_ignore_ascii_case(kw);
+    #[cfg(not(windows))]
+    let eq = |kw: &str| prog == kw;
+
+    [
+        "echo", "set", "exit", "if", "for", "call", "cd", "chdir", "copy", "del", "erase", "dir",
+        "md", "mkdir", "rd", "rmdir", "ren", "rename", "type", "rem", "ver", "vol", "pushd",
+        "popd", "start", "assoc", "ftype", "mklink", "cls", "color", "date", "time", "title",
+        "prompt", "path", "pause", "break", "verify", "goto", "shift", "setlocal", "endlocal",
+        "true", "false", ":", ".", "[", "[[", "export", "unset", "eval", "exec", "source",
+        "alias", "unalias", "trap", "umask", "wait", "read", "test", "command", "builtin",
+        "declare", "local", "readonly", "return", "times", "ulimit", "which",
+    ]
+    .into_iter()
+    .any(eq)
+}
+
+/// Conservatively splits a simple command line into argv tokens when guaranteed
+/// free of shell metacharacters, redirections, pipelines, globs, or variable
+/// expansions on both cmd.exe and /bin/sh.
+fn try_split_simple_args(cmd: &str) -> Option<Vec<String>> {
+    let trimmed = cmd.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let mut args = Vec::new();
+    let mut current = String::new();
+    let mut in_arg = false;
+    let mut in_quotes = false;
+
+    for ch in trimmed.chars() {
+        if in_quotes {
+            match ch {
+                '"' => {
+                    in_quotes = false;
+                }
+                '%' | '!' | '$' | '`' | '\\' | '\n' | '\r' | '\0' => return None,
+                c => current.push(c),
+            }
+            continue;
+        }
+        match ch {
+            ' ' | '\t' => {
+                if in_arg {
+                    args.push(std::mem::take(&mut current));
+                    in_arg = false;
+                }
+            }
+            '"' => {
+                in_quotes = true;
+                in_arg = true;
+            }
+            '&' | '|' | ';' | '<' | '>' | '(' | ')' | '^' | '%' | '!' | '$' | '`' | '*' | '?'
+            | '[' | ']' | '~' | '{' | '}' | '#' | '\'' | '\n' | '\r' | '\0' => return None,
+            '\\' => {
+                if cfg!(not(windows)) {
+                    return None;
+                }
+                in_arg = true;
+                current.push(ch);
+            }
+            c => {
+                in_arg = true;
+                current.push(c);
+            }
+        }
+    }
+    if in_quotes {
+        return None;
+    }
+    if in_arg {
+        args.push(current);
+    }
+    if args.is_empty() || args[0].is_empty() {
+        return None;
+    }
+    if cfg!(not(windows)) && args[0].contains('=') {
+        return None;
+    }
+    if is_shell_builtin(&args[0]) {
+        return None;
+    }
+    Some(args)
+}
+
+fn find_env_case_insensitive<'a>(env: &'a HashMap<String, String>, key: &str) -> Option<&'a str> {
+    env.get(key).map(String::as_str).or_else(|| {
+        env.iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(key))
+            .map(|(_, v)| v.as_str())
+    })
+}
+
+#[cfg(windows)]
+fn resolve_executable_in_env(
+    prog: &str,
+    package_dir: &Path,
+    env: &HashMap<String, String>,
+) -> Option<PathBuf> {
+    let pathext_str = find_env_case_insensitive(env, "PATHEXT").unwrap_or(".COM;.EXE;.BAT;.CMD");
+    let exts: Vec<&str> = pathext_str
+        .split(';')
+        .map(str::trim)
+        .filter(|e| !e.is_empty())
+        .collect();
+    let has_known_ext = Path::new(prog)
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| {
+            exts.iter()
+                .any(|pe| pe.trim_start_matches('.').eq_ignore_ascii_case(e))
+        });
+
+    let probe_dir = |dir: &Path, stem: &str| -> Option<PathBuf> {
+        if has_known_ext {
+            let p = dir.join(stem);
+            if p.is_file() {
+                return Some(p);
+            }
+        }
+        for ext in &exts {
+            let candidate = dir.join(format!("{stem}{ext}"));
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+        None
+    };
+
+    if prog.contains('/') || prog.contains('\\') {
+        let norm = prog.replace('/', "\\");
+        let p = Path::new(&norm);
+        let full = if p.is_absolute() {
+            p.to_path_buf()
+        } else {
+            package_dir.join(p)
+        };
+        if has_known_ext {
+            return full.is_file().then_some(full);
+        }
+        for ext in &exts {
+            let candidate = PathBuf::from(format!("{}{ext}", full.to_string_lossy()));
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+        return None;
+    }
+
+    if let Some(found) = probe_dir(package_dir, prog) {
+        return Some(found);
+    }
+    let path_str = find_env_case_insensitive(env, "PATH")?;
+    for dir in std::env::split_paths(path_str) {
+        if dir.as_os_str().is_empty() {
+            continue;
+        }
+        if let Some(found) = probe_dir(&dir, prog) {
+            return Some(found);
+        }
+    }
+    None
+}
+
+#[cfg(windows)]
+fn try_unwrap_node_cmd_shim(
+    cmd_path: &Path,
+    extra_args: &[String],
+    package_dir: &Path,
+    env: &HashMap<String, String>,
+) -> Option<Command> {
+    let meta = std::fs::metadata(cmd_path).ok()?;
+    if meta.len() > 8192 {
+        return None;
+    }
+    let content = std::fs::read_to_string(cmd_path).ok()?;
+    if !content.contains("IF EXIST \"%dp0%\\node.exe\"") {
+        return None;
+    }
+    let exec_line = content
+        .lines()
+        .find(|line| line.starts_with("endLocal & goto #_undefined_# 2>NUL || title %COMSPEC% & \"%_prog%\""))?;
+    let rest = exec_line
+        .strip_prefix("endLocal & goto #_undefined_# 2>NUL || title %COMSPEC% & \"%_prog%\"")?
+        .trim()
+        .strip_suffix("%*")?
+        .trim();
+
+    // Expect `... "%dp0%\<rel_path>"` at the end of `rest`.
+    let rest_no_trailing_quote = rest.strip_suffix('"')?;
+    let quote_start = rest_no_trailing_quote.rfind('"')?;
+    let raw_target = &rest_no_trailing_quote[quote_start + 1..];
+    let rel_target = raw_target
+        .strip_prefix("%dp0%\\")
+        .or_else(|| raw_target.strip_prefix("%dp0%/"))?;
+    if rel_target.is_empty()
+        || rel_target
+            .chars()
+            .any(|c| matches!(c, '%' | '!' | '"' | '<' | '>' | '|' | '&' | '^' | '$'))
+    {
+        return None;
+    }
+
+    let before_target = rest_no_trailing_quote[..quote_start].trim();
+    let shim_args = if before_target.is_empty() {
+        Vec::new()
+    } else {
+        try_split_simple_args(before_target)?
+    };
+
+    let cmd_dir = cmd_path.parent()?;
+    let target_script = cmd_dir.join(rel_target.replace('/', "\\"));
+    if !target_script.is_file() {
+        return None;
+    }
+
+    let local_node = cmd_dir.join("node.exe");
+    let node_bin = if local_node.is_file() {
+        local_node
+    } else {
+        let resolved = resolve_executable_in_env("node", package_dir, env)?;
+        let is_exe = resolved
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| e.eq_ignore_ascii_case("exe"));
+        if !is_exe {
+            return None;
+        }
+        resolved
+    };
+
+    let mut cmd = Command::new(node_bin);
+    cmd.args(shim_args);
+    cmd.arg(target_script);
+    cmd.args(extra_args);
+    Some(cmd)
+}
+
+#[cfg(not(windows))]
+fn is_direct_unix_binary(path: &Path) -> bool {
+    use std::io::Read;
+    use std::os::unix::fs::PermissionsExt;
+    let Ok(meta) = std::fs::metadata(path) else {
+        return false;
+    };
+    if !meta.is_file() || (meta.permissions().mode() & 0o111) == 0 {
+        return false;
+    }
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return false;
+    };
+    let mut magic = [0u8; 4];
+    let Ok(n) = file.read(&mut magic) else {
+        return false;
+    };
+    if n >= 2 && &magic[..2] == b"#!" {
+        return true;
+    }
+    n == 4
+        && (magic == [0x7f, b'E', b'L', b'F']
+            || magic == [0xfe, 0xed, 0xfa, 0xce]
+            || magic == [0xce, 0xfa, 0xed, 0xfe]
+            || magic == [0xfe, 0xed, 0xfa, 0xcf]
+            || magic == [0xcf, 0xfa, 0xed, 0xfe]
+            || magic == [0xca, 0xfe, 0xba, 0xbe])
+}
+
+#[cfg(not(windows))]
+fn resolve_unix_executable_in_env(
+    prog: &str,
+    package_dir: &Path,
+    env: &HashMap<String, String>,
+) -> Option<PathBuf> {
+    if prog.contains('/') {
+        let p = Path::new(prog);
+        let full = if p.is_absolute() {
+            p.to_path_buf()
+        } else {
+            package_dir.join(p)
+        };
+        return is_direct_unix_binary(&full).then_some(full);
+    }
+    let path_str = env.get("PATH").map(String::as_str)?;
+    for dir in std::env::split_paths(path_str) {
+        if dir.as_os_str().is_empty() {
+            continue;
+        }
+        let candidate = dir.join(prog);
+        if is_direct_unix_binary(&candidate) {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+fn try_create_direct_command(ctx: &LifecycleContext, env: &HashMap<String, String>) -> Option<Command> {
+    if configured_script_shell(ctx).is_some() {
+        return None;
+    }
+    let argv = try_split_simple_args(&ctx.script_cmd)?;
+    let (prog, rest) = argv.split_first()?;
+
+    #[cfg(windows)]
+    {
+        let resolved = resolve_executable_in_env(prog, &ctx.package_dir, env)?;
+        let ext = resolved
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase())?;
+        match ext.as_str() {
+            "exe" => {
+                let mut cmd = Command::new(resolved);
+                cmd.args(rest);
+                Some(cmd)
+            }
+            "cmd" => try_unwrap_node_cmd_shim(&resolved, rest, &ctx.package_dir, env),
+            _ => None,
+        }
+    }
+
+    #[cfg(not(windows))]
+    {
+        let resolved = resolve_unix_executable_in_env(prog, &ctx.package_dir, env)?;
+        let mut cmd = Command::new(resolved);
+        cmd.args(rest);
+        {
+            use std::os::unix::process::CommandExt;
+            cmd.process_group(0);
+        }
+        Some(cmd)
+    }
+}
+
+pub(crate) fn create_shell_command_with_env(
+    ctx: &LifecycleContext,
+    env: &HashMap<String, String>,
+) -> Command {
+    if !env.is_empty() {
+        if let Some(direct) = try_create_direct_command(ctx, env) {
+            return direct;
+        }
+    }
+    create_shell_command(ctx)
+}
+
+pub(crate) fn create_shell_command(ctx: &LifecycleContext) -> Command {
+    let configured_shell = configured_script_shell(ctx);
 
     let (shell, is_cmd) = match configured_shell {
         Some(s) => {
@@ -2176,7 +2969,7 @@ pub fn execute_lifecycle_script(ctx: &LifecycleContext) -> Result<ExitStatus> {
         );
     }
 
-    let mut cmd = create_shell_command(ctx);
+    let mut cmd = create_shell_command_with_env(ctx, &env);
 
     cmd.current_dir(&ctx.package_dir);
     cmd.env_clear();
@@ -2359,7 +3152,7 @@ where
         );
     }
 
-    let mut cmd = create_shell_command(ctx);
+    let mut cmd = create_shell_command_with_env(ctx, &env);
 
     cmd.current_dir(&ctx.package_dir);
     cmd.env_clear();

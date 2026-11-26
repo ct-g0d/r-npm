@@ -5791,7 +5791,9 @@ async fn finish_install_or_ci_output(
         let parsed_lock = if !dry_run && audit_val && fund_val {
             let (lock_path, _) = rnpm_install::resolve_lockfile_path(report_dir);
             if lock_path.exists() {
-                rnpm_lockfile::load_and_migrate(&lock_path).ok()
+                rnpm_lockfile::LockfileV3::load_from_file_readonly(&lock_path)
+                    .ok()
+                    .or_else(|| rnpm_lockfile::load_and_migrate(&lock_path).ok())
             } else {
                 None
             }
@@ -5848,7 +5850,9 @@ async fn finish_install_or_ci_output(
         let parsed_lock = if !silent && fund_val && audit_val {
             let (lock_path, _) = rnpm_install::resolve_lockfile_path(report_dir);
             if lock_path.exists() {
-                rnpm_lockfile::load_and_migrate(&lock_path).ok()
+                rnpm_lockfile::LockfileV3::load_from_file_readonly(&lock_path)
+                    .ok()
+                    .or_else(|| rnpm_lockfile::load_and_migrate(&lock_path).ok())
             } else {
                 None
             }
@@ -7792,17 +7796,25 @@ fn execute_run_sync_with_config(
     strict_sandbox: bool,
     config: &rnpm_config::Config,
 ) -> anyhow::Result<()> {
+    let manifest_path = current_dir.join("package.json");
+    let raw_bytes = match std::fs::read(&manifest_path) {
+        Ok(b) => b,
+        Err(_) => {
+            enforce_run_dev_engines_once_with_config(&current_dir, config)?;
+            return Err(anyhow::anyhow!(
+                "package.json not found in {}",
+                current_dir.display()
+            ));
+        }
+    };
     // `npm run` (and test/start/stop/restart, which run through it) checks
     // devEngines once, at the project prefix, before any script.
-    enforce_run_dev_engines_once_with_config(&current_dir, config)?;
-    let manifest_path = current_dir.join("package.json");
-    if !manifest_path.exists() {
-        return Err(anyhow::anyhow!(
-            "package.json not found in {}",
-            current_dir.display()
-        ));
+    if raw_bytes.windows(12).any(|w| w == b"\"devEngines\"")
+        || raw_bytes.windows(2).any(|w| w == b"\\u")
+    {
+        enforce_run_dev_engines_once_with_config(&current_dir, config)?;
     }
-    let mut manifest = Manifest::from_file(&manifest_path)?;
+    let mut manifest = Manifest::from_slice(&raw_bytes)?;
     let ignore_scripts = ignore_scripts || config.get_bool("ignore-scripts").unwrap_or(false);
     let foreground_scripts =
         foreground_scripts || config.get_bool("foreground-scripts").unwrap_or(false);
@@ -7930,13 +7942,14 @@ fn execute_run_sync_with_config(
         let mut hook_env = base_env
             .get_or_insert_with(|| {
                 let cfg_env = lifecycle_config_env_from_config(&current_dir, config);
-                rnpm_lifecycle::precompute_lifecycle_env(
+                rnpm_lifecycle::precompute_lifecycle_env_with_manifest(
                     &current_dir,
                     &current_dir,
                     manifest.name.as_deref().unwrap_or(""),
                     manifest.version.as_deref(),
                     config,
                     Some(&cfg_env),
+                    Some(&manifest),
                 )
             })
             .clone();
@@ -8853,6 +8866,144 @@ fn execute_sync_command_inner(
     }
 }
 
+fn try_parse_fast_command(args: &[String]) -> Option<Cli> {
+    if args.len() < 2 {
+        return None;
+    }
+    if args
+        .iter()
+        .skip(1)
+        .take_while(|a| a.as_str() != "--")
+        .any(|a| matches!(a.as_str(), "--help" | "-h" | "--version" | "-v" | "-V" | "--"))
+    {
+        return None;
+    }
+    let cmd_name = args[1].as_str();
+    let rest = &args[2..];
+    match cmd_name {
+        "prefix" | "root" | "bin" => {
+            let mut global = false;
+            for tok in rest {
+                match tok.as_str() {
+                    "-g" | "--global" => global = true,
+                    _ => return None,
+                }
+            }
+            let command = match cmd_name {
+                "prefix" => Commands::Prefix { global },
+                "root" => Commands::Root { global },
+                _ => Commands::Bin { global },
+            };
+            Some(Cli { command })
+        }
+        "get" => {
+            let mut keys = Vec::new();
+            for tok in rest {
+                if tok.starts_with('-') {
+                    return None;
+                }
+                keys.push(tok.clone());
+            }
+            let mut iter = keys.into_iter();
+            let key = iter.next();
+            let extra_keys: Vec<String> = iter.collect();
+            Some(Cli {
+                command: Commands::Get { key, extra_keys },
+            })
+        }
+        "config" | "c" => {
+            let sub = rest.first()?.as_str();
+            let tail = &rest[1..];
+            match sub {
+                "get" => {
+                    let mut keys = Vec::new();
+                    for tok in tail {
+                        if tok.starts_with('-') {
+                            return None;
+                        }
+                        keys.push(tok.clone());
+                    }
+                    let mut iter = keys.into_iter();
+                    let key = iter.next();
+                    let extra_keys: Vec<String> = iter.collect();
+                    Some(Cli {
+                        command: Commands::Config {
+                            action: ConfigAction::Get { key, extra_keys },
+                        },
+                    })
+                }
+                "list" | "ls" => {
+                    let mut json = false;
+                    let mut long = false;
+                    for tok in tail {
+                        match tok.as_str() {
+                            "--json" => json = true,
+                            "-l" | "--long" => long = true,
+                            _ => return None,
+                        }
+                    }
+                    Some(Cli {
+                        command: Commands::Config {
+                            action: ConfigAction::List { json, long },
+                        },
+                    })
+                }
+                _ => None,
+            }
+        }
+        "list" | "ls" | "la" | "ll" => {
+            let mut packages = Vec::new();
+            let mut depth = None;
+            let mut all = false;
+            let mut json = false;
+            let mut long = cmd_name == "la" || cmd_name == "ll";
+            let mut parseable = false;
+            let mut package_lock_only = false;
+            let mut global = false;
+            let mut i = 0;
+            while i < rest.len() {
+                let tok = rest[i].as_str();
+                if let Some(d_str) = tok.strip_prefix("--depth=") {
+                    depth = Some(d_str.parse::<usize>().ok()?);
+                } else if tok == "--depth" {
+                    i += 1;
+                    depth = Some(rest.get(i)?.parse::<usize>().ok()?);
+                } else {
+                    match tok {
+                        "-a" | "--all" => all = true,
+                        "--json" => json = true,
+                        "-l" | "--long" => long = true,
+                        "-p" | "--parseable" => parseable = true,
+                        "--package-lock-only" => package_lock_only = true,
+                        "-g" | "--global" => global = true,
+                        t if !t.starts_with('-') => packages.push(t.to_string()),
+                        _ => return None,
+                    }
+                }
+                i += 1;
+            }
+            Some(Cli {
+                command: Commands::List {
+                    packages,
+                    depth,
+                    all,
+                    json,
+                    long,
+                    parseable,
+                    package_lock_only,
+                    omit: Vec::new(),
+                    global,
+                    prefix: None,
+                    workspace: Vec::new(),
+                    workspaces: false,
+                    workspace_root: false,
+                },
+            })
+        }
+        _ => None,
+    }
+}
+
 fn main() {
     // Suppress mimalloc warning output on stderr under high memory pressure
     if std::env::var_os("MIMALLOC_SHOW_ERRORS").is_none() {
@@ -9015,13 +9166,17 @@ fn main() {
         }
     }
 
-    let parse_res = match cached_cmd {
-        Some(mut cmd) => cmd
-            .try_get_matches_from_mut(&filtered_args)
-            .and_then(|mut matches| {
-                <Cli as clap::FromArgMatches>::from_arg_matches_mut(&mut matches)
-            }),
-        None => Cli::try_parse_from(&filtered_args),
+    let parse_res = if let Some(fast_cli) = try_parse_fast_command(&filtered_args) {
+        Ok(fast_cli)
+    } else {
+        match cached_cmd {
+            Some(mut cmd) => cmd
+                .try_get_matches_from_mut(&filtered_args)
+                .and_then(|mut matches| {
+                    <Cli as clap::FromArgMatches>::from_arg_matches_mut(&mut matches)
+                }),
+            None => Cli::try_parse_from(&filtered_args),
+        }
     };
     let mut cli = match parse_res {
         Ok(c) => c,
