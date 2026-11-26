@@ -2952,6 +2952,12 @@ impl Installer {
         &self.cache
     }
 
+    fn has_cached_tarball_blob(&self, integrity: &str) -> bool {
+        integrity
+            .parse()
+            .is_ok_and(|expected| matches!(self.cache.get_by_integrity(&expected), Ok(Some(_))))
+    }
+
     fn read_cached_project_fingerprint(&self) -> Option<String> {
         self.cache
             .get_project_fingerprint(&self.options.project_dir)
@@ -5251,11 +5257,12 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                 if node.flags.optional || !url.starts_with("http") {
                     continue;
                 }
-                let packed = node
-                    .integrity
-                    .as_deref()
-                    .is_some_and(|i| !i.is_empty() && self.pack_store().has_package_pack(i));
-                if !packed && !matches!(self.cache().get(url), Ok(Some(_))) {
+                let cached = node.integrity.as_deref().is_some_and(|i| {
+                    !i.is_empty()
+                        && (self.pack_store().has_package_pack(i)
+                            || self.has_cached_tarball_blob(i))
+                });
+                if !cached && !matches!(self.cache().get(url), Ok(Some(_))) {
                     return Err(anyhow!(
                         "npm error code ENOTCACHED\nnpm error request to {url} failed: cache mode is 'only-if-cached' but no cached response is available."
                     ));
@@ -5693,8 +5700,12 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
 
                     let t_fetch = std::time::Instant::now();
                     let _fetch_span = tracing::info_span!("fetch", package = %loc);
-                    let cached_opt = cache.get(&resolved_url).ok().flatten();
-                    let (bytes, was_hit) = if let Some((_entry, data)) = cached_opt {
+                    let cached_blob = expected_integrity
+                        .as_ref()
+                        .and_then(|integrity| cache.get_by_integrity(integrity).ok().flatten());
+                    let (bytes, was_hit) = if let Some(data) = cached_blob {
+                        (data, true)
+                    } else if let Ok(Some((_entry, data))) = cache.get(&resolved_url) {
                         let t_v = std::time::Instant::now();
                         let is_valid = expected_integrity
                             .as_ref()
@@ -7309,7 +7320,10 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                 if resolved_url.starts_with("file:") {
                     continue;
                 }
-                if !integrity_str.is_empty() && self.pack_store().has_package_pack(integrity_str) {
+                if !integrity_str.is_empty()
+                    && (self.pack_store().has_package_pack(integrity_str)
+                        || self.has_cached_tarball_blob(integrity_str))
+                {
                     continue;
                 }
                 match self.cache().get(resolved_url) {

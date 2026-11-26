@@ -3062,7 +3062,7 @@ async fn test_offline_mode_tarball_cache_miss_enotcached() {
 }
 
 #[tokio::test]
-async fn test_offline_mode_cache_hit_success() {
+async fn test_offline_install_and_ci_accept_tarball_without_url_index() {
     use flate2::write::GzEncoder;
     use flate2::Compression;
     use sha2::{Digest, Sha512};
@@ -3092,7 +3092,6 @@ async fn test_offline_mode_cache_hit_success() {
     hasher.update(&tarball_bytes);
     let hash = hasher.finalize();
     let integrity_str = format!("sha512-{}", data_encoding::BASE64.encode(&hash));
-    let integrity: rnpm_core::integrity::Integrity = integrity_str.parse().unwrap();
 
     let tarball_url = "https://registry.npmjs.org/offline-pkg/-/offline-pkg-1.0.0.tgz";
 
@@ -3122,8 +3121,9 @@ async fn test_offline_mode_cache_hit_success() {
         )
         .unwrap();
     cache
-        .put_with_integrity(tarball_url, &tarball_bytes, Some(&integrity), None)
+        .put_blob_direct(&tarball_bytes, &data_encoding::HEXLOWER.encode(&hash))
         .unwrap();
+    assert!(cache.get(tarball_url).unwrap().is_none());
 
     // 3. Project package.json
     let pkg_json = r#"{"name": "test-app", "dependencies": {"offline-pkg": "^1.0.0"}}"#;
@@ -3138,7 +3138,7 @@ async fn test_offline_mode_cache_hit_success() {
         ..Default::default()
     };
 
-    let mut installer = crate::Installer::new(options).unwrap();
+    let mut installer = crate::Installer::new(options.clone()).unwrap();
     let summary = installer.run().await.unwrap();
 
     assert_eq!(summary.packages_installed, 1);
@@ -3149,6 +3149,16 @@ async fn test_offline_mode_cache_hit_success() {
         .join("offline-pkg")
         .join("package.json")
         .exists());
+
+    let mut ci_installer = crate::Installer::new(InstallOptions {
+        store_dir: Some(tmp.path().join("empty-store")),
+        ..options
+    })
+    .unwrap();
+    let summary = ci_installer.run_ci().await.unwrap();
+    assert_eq!(summary.packages_installed, 1);
+    assert_eq!(summary.cache_hits, 1);
+    assert_eq!(summary.cache_misses, 0);
 }
 
 #[tokio::test]
