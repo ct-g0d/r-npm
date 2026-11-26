@@ -652,8 +652,7 @@ impl PackagePack {
         jobs
     }
 
-    /// Simultaneously extracts package files to target_dir and populates the CAS store,
-    /// hardlinking target files to their CAS counterparts with zero duplicated file writes.
+    /// Extracts independent package files into target_dir.
     pub fn extract_and_populate_cas(&self, target_dir: &Path) -> std::io::Result<()> {
         let pack_data = self.data();
         fs::create_dir_all(target_dir)?;
@@ -702,10 +701,9 @@ impl PackagePack {
             if end <= pack_data.len() {
                 let slice = &pack_data[start..end];
                 let t_cw = std::time::Instant::now();
-                let _ = rnpm_fs::writer::write_file_fast(&full_path, slice, entry.mode, 65536);
+                rnpm_fs::writer::write_file_fast(&full_path, slice, entry.mode, 65536)?;
                 TIME_EXTRACT_CAS_WRITE
                     .fetch_add(t_cw.elapsed().as_nanos() as u64, Ordering::Relaxed);
-                rnpm_fs::record_file_created(entry.size);
             }
         }
 

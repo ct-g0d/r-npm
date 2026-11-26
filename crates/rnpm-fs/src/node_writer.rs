@@ -421,19 +421,12 @@ mod spawn_for_hint_tests {
     }
 
     #[test]
-    fn spawn_for_hint_large_selects_node_when_available() {
+    fn spawn_for_hint_large_selects_rust() {
         let _lock = ENV_MUTEX.lock().unwrap();
         let _guard = EnvGuard::remove("RNPM_WRITER");
-        let node_available = Command::new("node")
-            .arg("--version")
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false);
-        if node_available {
-            let writer = AsyncFileWriter::spawn_for_hint(50).expect("spawn_for_hint(50) failed");
-            assert!(matches!(writer, AsyncFileWriter::Node(_)));
-            writer.finish().expect("finish failed");
-        }
+        let writer = AsyncFileWriter::spawn_for_hint(50).expect("spawn_for_hint(50) failed");
+        assert!(matches!(writer, AsyncFileWriter::Rust(_)));
+        writer.finish().expect("finish failed");
     }
 
     #[test]
@@ -463,25 +456,6 @@ mod spawn_for_hint_tests {
         writer.finish().expect("finish failed");
     }
 
-    #[test]
-    fn spawn_for_hint_boundary_values() {
-        let _lock = ENV_MUTEX.lock().unwrap();
-        let _guard = EnvGuard::remove("RNPM_WRITER");
-        let w8 = AsyncFileWriter::spawn_for_hint(8).expect("spawn_for_hint(8) failed");
-        assert!(matches!(w8, AsyncFileWriter::Rust(_)));
-        w8.finish().expect("finish failed");
-
-        let node_available = Command::new("node")
-            .arg("--version")
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false);
-        if node_available {
-            let w9 = AsyncFileWriter::spawn_for_hint(9).expect("spawn_for_hint(9) failed");
-            assert!(matches!(w9, AsyncFileWriter::Node(_)));
-            w9.finish().expect("finish failed");
-        }
-    }
 }
 
 pub enum NodeWriterMsg {
@@ -496,7 +470,7 @@ pub enum NodeWriterMsg {
 struct NodeWriterWorker {
     child: Child,
     sender: SyncSender<NodeWriterMsg>,
-    thread_handle: Option<JoinHandle<std::io::Result<()>>>,
+    thread_handle: Option<JoinHandle<std::io::Result<(u64, u64)>>>,
 }
 
 impl NodeWriterWorker {
@@ -514,9 +488,11 @@ impl NodeWriterWorker {
         let mut stdin = std::io::BufWriter::with_capacity(512 * 1024, child.stdin.take().unwrap());
         let (tx, rx): (SyncSender<NodeWriterMsg>, Receiver<NodeWriterMsg>) = sync_channel(1024);
 
-        let handle = thread::spawn(move || -> std::io::Result<()> {
+        let handle = thread::spawn(move || -> std::io::Result<(u64, u64)> {
             use std::io::Write;
             let mut hdr = [0u8; 12];
+            let mut files = 0;
+            let mut bytes = 0;
             while let Ok(msg) = rx.recv() {
                 match msg {
                     NodeWriterMsg::File { path, data, mode } => {
@@ -548,6 +524,8 @@ impl NodeWriterWorker {
                             eprintln!("[NODE_WRITER_ERR] write data: {e}");
                             return Err(e);
                         }
+                        files += 1;
+                        bytes += u64::from(data_len);
                     }
                     NodeWriterMsg::Close => break,
                 }
@@ -557,7 +535,7 @@ impl NodeWriterWorker {
                 return Err(e);
             }
             drop(stdin);
-            Ok(())
+            Ok((files, bytes))
         });
 
         Ok(Self {
@@ -573,18 +551,19 @@ impl NodeWriterWorker {
 
     fn wait(mut self) -> Result<(), std::io::Error> {
         // A pipe failure must not skip reaping the child process.
-        let input_result = self.thread_handle.take().map_or(Ok(()), |h| {
+        let input_result = self.thread_handle.take().map_or(Ok((0, 0)), |h| {
             h.join()
                 .map_err(|_| std::io::Error::other("NodeWriter thread panicked"))?
         });
         let status_result = self.child.wait();
-        input_result?;
+        let (files, bytes) = input_result?;
         let status = status_result?;
         if !status.success() {
             return Err(std::io::Error::other(format!(
                 "NodeWriter process exited with error status: {status:?}"
             )));
         }
+        crate::tarball::record_files_created_batch(files, bytes);
         Ok(())
     }
 }
@@ -900,40 +879,17 @@ pub enum AsyncFileWriter {
 }
 
 impl AsyncFileWriter {
-    /// Spawns the async file writer taking an estimated package count into account.
-    /// Respects `RNPM_WRITER=rust` or `RNPM_WRITER=node` overrides strictly.
-    /// If `estimated_packages <= 8`, spawns `RustWriterPool` to avoid the startup cost of `node.exe`.
-    /// Otherwise defaults to `NodeWriter` if available, falling back to `RustWriterPool`.
-    pub fn spawn_for_hint(estimated_packages: usize) -> Result<Self, std::io::Error> {
-        let pref = std::env::var("RNPM_WRITER").unwrap_or_default();
-        if pref.eq_ignore_ascii_case("rust") {
-            return Ok(Self::Rust(RustWriterPool::spawn(16, 4096)?));
-        }
-        if pref.eq_ignore_ascii_case("node") {
-            return NodeWriter::spawn().map(Self::Node);
-        }
-
-        if estimated_packages <= 8 {
-            return Ok(Self::Rust(RustWriterPool::spawn(16, 4096)?));
-        }
-
-        // Try NodeWriter first
-        match NodeWriter::spawn() {
-            Ok(nw) => Ok(Self::Node(nw)),
-            Err(e) => {
-                if e.kind() == std::io::ErrorKind::InvalidInput {
-                    return Err(e);
-                }
-                // Fall back to dedicated Rust thread pool
-                Ok(Self::Rust(RustWriterPool::spawn(16, 4096)?))
-            }
-        }
+    /// Spawns the configured writer. Package counts no longer select a backend.
+    pub fn spawn_for_hint(_estimated_packages: usize) -> Result<Self, std::io::Error> {
+        Self::spawn()
     }
 
-    /// Spawns the async file writer. Respects `RNPM_WRITER=rust` or `RNPM_WRITER=node` overrides.
-    /// Defaults to `NodeWriter` if available, falling back to `RustWriterPool`.
+    /// Uses the Rust writer unless `RNPM_WRITER=node` explicitly selects Node.js.
     pub fn spawn() -> Result<Self, std::io::Error> {
-        Self::spawn_for_hint(usize::MAX)
+        if std::env::var("RNPM_WRITER").is_ok_and(|pref| pref.eq_ignore_ascii_case("node")) {
+            return NodeWriter::spawn().map(Self::Node);
+        }
+        RustWriterPool::spawn(16, 4096).map(Self::Rust)
     }
 
     /// Obtains a cloned sender for distributing write tasks.

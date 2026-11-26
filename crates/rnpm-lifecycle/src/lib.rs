@@ -4000,7 +4000,9 @@ pub async fn execute_workspace_scripts_topological_with_abort(
     let ordered_members = sort_workspace_members_topologically(members, topological_order);
     let mut summary = WorkspaceRunSummary::default();
 
-    let root_config = get_trusted_config().unwrap_or_else(|| {
+    let trusted_config = get_trusted_config();
+    let has_trusted_config = trusted_config.is_some();
+    let root_config = trusted_config.unwrap_or_else(|| {
         rnpm_config::Config::load(Some(root_dir)).unwrap_or_default()
     });
     let root_base_env = ScriptBaseEnv::build(root_dir, &root_config, None, None, None);
@@ -4058,13 +4060,14 @@ pub async fn execute_workspace_scripts_topological_with_abort(
 
         let member_config;
         let member_base_storage;
-        let (cfg_ref, base_ref) = if member.path.join(".npmrc").exists() {
+        let use_member_config = !has_trusted_config && member.path.join(".npmrc").is_file();
+        let base_ref = if use_member_config {
             member_config = rnpm_config::Config::load(Some(&member.path))
                 .unwrap_or_else(|_| root_config.clone());
             member_base_storage = ScriptBaseEnv::build(root_dir, &member_config, None, None, None);
-            (&member_config, &member_base_storage)
+            &member_base_storage
         } else {
-            (&root_config, &root_base_env)
+            &root_base_env
         };
         let mut precomputed = if hooks_to_run.len() > 1 {
             Some(base_ref.build_package_env_with_manifest(
@@ -4104,14 +4107,18 @@ pub async fn execute_workspace_scripts_topological_with_abort(
             );
             println!("> {full_cmd}\n");
 
-            let mut ctx = LifecycleContext::new_with_config(
-                root_dir,
-                &member.path,
-                &member.name,
-                hook_name,
-                &full_cmd,
-                cfg_ref.clone(),
-            );
+            let mut ctx = if use_member_config {
+                LifecycleContext::new(root_dir, &member.path, &member.name, hook_name, &full_cmd)
+            } else {
+                LifecycleContext::new_with_config(
+                    root_dir,
+                    &member.path,
+                    &member.name,
+                    hook_name,
+                    &full_cmd,
+                    root_config.clone(),
+                )
+            };
             ctx.package_version = member.manifest.version.clone();
             if let Ok(command) = std::env::var("npm_command") {
                 ctx.extra_env.insert("npm_command".to_string(), command);

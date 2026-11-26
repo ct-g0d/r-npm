@@ -3400,21 +3400,12 @@ impl RegistryClient {
                 status: 406 | 415, ..
             }) if target_repr == PackumentRepresentation::Abbreviated => {
                 stored_repr = PackumentRepresentation::Full;
-                let full_etag = {
-                    let key = PackumentCacheKey {
-                        url: url.as_str().to_owned(),
-                        representation: PackumentRepresentation::Full,
-                    };
-                    self.packument_cache
-                        .read()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .get(&key)
-                        .and_then(|c| c.etag.clone())
-                };
+                // A full 304 would refer to a different document than the
+                // caller's abbreviated cache entry.
                 self.get_package_metadata_from_url_conditional_with_accept(
                     package_name,
                     url.clone(),
-                    full_etag.as_deref(),
+                    None,
                     "application/json",
                 )
                 .await?
@@ -7275,10 +7266,12 @@ nB99xJBcpcklOhB/x8L3Vb9kw8ZPzUvYKI7lj0+yjYJannulkI7H7LB4hxKnVKp5\n\
         let abbrev_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let full_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let saw_abbrev_etag_on_full = Arc::new(AtomicBool::new(false));
+        let reject_abbrev = Arc::new(AtomicBool::new(false));
 
         let abbrev_calls_c = Arc::clone(&abbrev_calls);
         let full_calls_c = Arc::clone(&full_calls);
         let bad_etag_c = Arc::clone(&saw_abbrev_etag_on_full);
+        let reject_abbrev_c = Arc::clone(&reject_abbrev);
 
         let abbrev_body = serde_json::json!({
             "name": "neg-pkg",
@@ -7329,6 +7322,7 @@ nB99xJBcpcklOhB/x8L3Vb9kw8ZPzUvYKI7lj0+yjYJannulkI7H7LB4hxKnVKp5\n\
                 let abbrev_calls = Arc::clone(&abbrev_calls_c);
                 let full_calls = Arc::clone(&full_calls_c);
                 let bad_etag = Arc::clone(&bad_etag_c);
+                let reject_abbrev = Arc::clone(&reject_abbrev_c);
                 tokio::spawn(async move {
                     let mut buf = vec![0u8; 8192];
                     let n = stream.read(&mut buf).await.unwrap_or(0);
@@ -7350,7 +7344,9 @@ nB99xJBcpcklOhB/x8L3Vb9kw8ZPzUvYKI7lj0+yjYJannulkI7H7LB4hxKnVKp5\n\
                     let is_abbrev = accept.contains("vnd.npm.install-v1+json");
                     let resp = if is_abbrev {
                         abbrev_calls.fetch_add(1, Ordering::SeqCst);
-                        if inm == Some("\"etag-abbrev-1\"") {
+                        if reject_abbrev.load(Ordering::SeqCst) {
+                            "HTTP/1.1 406 Not Acceptable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string()
+                        } else if inm == Some("\"etag-abbrev-1\"") {
                             "HTTP/1.1 304 Not Modified\r\nETag: \"etag-abbrev-1\"\r\nContent-Type: application/vnd.npm.install-v1+json\r\nVary: Accept\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string()
                         } else {
                             format!(
@@ -7460,6 +7456,14 @@ nB99xJBcpcklOhB/x8L3Vb9kw8ZPzUvYKI7lj0+yjYJannulkI7H7LB4hxKnVKp5\n\
         assert!(!saw_abbrev_etag_on_full.load(Ordering::SeqCst));
         assert!(fb.is_fresh());
         assert!(!fb.metadata().unwrap().time.is_empty());
+
+        reject_abbrev.store(true, Ordering::SeqCst);
+        let fallback = client
+            .get_package_metadata_negotiated("neg-pkg", PackumentFetchOptions::abbreviated())
+            .await
+            .unwrap();
+        assert_eq!(fallback.versions["1.0.0"].license.as_deref(), Some("MIT"));
+        assert!(!saw_abbrev_etag_on_full.load(Ordering::SeqCst));
 
         server.abort();
     }

@@ -18,7 +18,7 @@ use rnpm_fs::junction::{is_junction, remove_junction};
 use rnpm_fs::{determine_writer_config, extract_tarball_direct, precreate_directories};
 use rnpm_lifecycle::{LifecycleOptions, LifecyclePackageNode, PackageSource};
 use rnpm_lockfile::{LockfilePackage, LockfileV3};
-use rnpm_registry::client::{RegistryClient, RegistryClientConfig};
+use rnpm_registry::client::{PackumentFetchOptions, RegistryClient, RegistryClientConfig};
 use rnpm_registry::metadata::AbbreviatedPackageMetadata;
 const INSTALL_PACKUMENT_ACCEPT: &str = "application/json";
 use rnpm_shim::{create_shims_with_force, normalize_shebang};
@@ -89,36 +89,23 @@ async fn finish_pack_tasks(tasks: Vec<tokio::task::JoinHandle<Result<()>>>) -> R
     first_error.map_or(Ok(()), Err)
 }
 
-fn spawn_writer_for_packages(estimated_packages: usize) -> Option<rnpm_fs::AsyncFileWriter> {
-    let force_node = std::env::var_os("RNPM_WRITER").is_some_and(|v| v == "node");
-    if force_node || estimated_packages > 256 {
-        rnpm_fs::AsyncFileWriter::spawn_for_hint(estimated_packages).ok()
-    } else {
-        rnpm_fs::RustWriterPool::spawn(16, 4096)
-            .map(rnpm_fs::AsyncFileWriter::Rust)
-            .ok()
-    }
-}
-
 /// Writes warm-store files. Files with a verified CAS blob are copied; small and
-/// medium installs materialize slice references zero-copy in parallel without
+/// large installs materialize slice references zero-copy in parallel without
 /// paying external `node.exe` process startup or per-file `.to_vec()` clones.
 fn materialize_warm_files(
     files: Vec<rnpm_fs::MaterializeFileRef<'_>>,
     config: &rnpm_fs::ParallelWriterConfig,
-    estimated_packages: usize,
 ) -> Result<(), rnpm_fs::FsError> {
     let writer_pref = std::env::var("RNPM_WRITER").unwrap_or_default();
     let force_node = writer_pref.eq_ignore_ascii_case("node");
-    let force_rust = writer_pref.eq_ignore_ascii_case("rust");
-    if force_rust || (!force_node && estimated_packages <= 256) {
+    if !force_node {
         let mut warm_cfg = config.clone();
         if !warm_cfg.is_hdd && warm_cfg.worker_threads < 16 {
             warm_cfg.worker_threads = 16;
         }
         return rnpm_fs::materialize_files_parallel_refs(files, &warm_cfg);
     }
-    let Ok(writer) = rnpm_fs::AsyncFileWriter::spawn_for_hint(estimated_packages) else {
+    let Ok(writer) = rnpm_fs::AsyncFileWriter::spawn() else {
         return rnpm_fs::materialize_files_parallel_refs(files, config);
     };
     let sender = writer.sender();
@@ -3361,14 +3348,16 @@ impl Installer {
                     .flatten();
                 let metadata = if cached.is_some() || self.options.offline {
                     cached
-                } else if before_cutoff().is_some() {
-                    self.registry_client()
-                        .get_package_metadata_full(&spec.package_name)
-                        .await
-                        .ok()
                 } else {
+                    // Diagnostics only select a version. Arborist's ideal-tree
+                    // fetch still needs the full manifest for lockfile parity.
+                    let fetch = if before_cutoff().is_some() {
+                        PackumentFetchOptions::full()
+                    } else {
+                        PackumentFetchOptions::abbreviated()
+                    };
                     self.registry_client()
-                        .get_package_metadata_install(&spec.package_name)
+                        .get_package_metadata_negotiated(&spec.package_name, fetch)
                         .await
                         .ok()
                 };
@@ -5423,7 +5412,7 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                 if files_valid {
                     let dir_refs: Vec<&Path> = all_dirs.iter().map(|p| p.as_path()).collect();
                     if precreate_directories(dir_refs).is_ok()
-                        && materialize_warm_files(all_file_refs, &writer_cfg, loaded_packs.len()).is_ok()
+                        && materialize_warm_files(all_file_refs, &writer_cfg).is_ok()
                     {
                         for (link_path, target_path) in all_symlinks {
                             let _ = rnpm_fs::create_link_or_copy(&link_path, &target_path);
@@ -5504,7 +5493,7 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
             let cpu_semaphore = Arc::new(tokio::sync::Semaphore::new(16));
             let pack_persist_semaphore = Arc::new(tokio::sync::Semaphore::new(32));
 
-            let mut pack_writer = spawn_writer_for_packages(packages_to_download.len());
+            let mut pack_writer = rnpm_fs::AsyncFileWriter::spawn().ok();
             let pack_sender = pack_writer.as_ref().map(|w| w.sender());
             let warm_pack_sender = matches!(
                 pack_writer,
@@ -7433,7 +7422,7 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
             let seen_dirs = Arc::new(std::sync::RwLock::new(init_dirs));
             let mut join_set = tokio::task::JoinSet::new();
 
-            let mut async_writer = spawn_writer_for_packages(missing_packs.len());
+            let mut async_writer = rnpm_fs::AsyncFileWriter::spawn().ok();
             let writer_sender = async_writer.as_ref().map(|w| w.sender());
 
             for (idx, pkg_key, resolved_url, integrity_str, is_optional) in &missing_packs {
@@ -7678,7 +7667,6 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                                     tm_nm_bytes.fetch_add(b_sum, std::sync::atomic::Ordering::Relaxed);
                                 }
                                 for file in &decoded.files {
-                                    rnpm_fs::record_file_created(file.data.len() as u64);
                                     sender
                                         .send_arc(file.path.clone(), Arc::clone(&file.data), file.mode)
                                         .map_err(|e| anyhow!("{e}"))?;
@@ -8085,7 +8073,7 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
 
                         // Bin shims read script headers, so complete the files
                         // and symlinks before selecting their interpreter.
-                        materialize_warm_files(all_file_refs, &ci_writer_cfg, packages_to_process.len())
+                        materialize_warm_files(all_file_refs, &ci_writer_cfg)
                             .map_err(|e| anyhow!("{e}"))?;
                         collector.record_phase(Phase::Materialize, t_mat.elapsed());
 
