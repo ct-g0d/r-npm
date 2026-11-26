@@ -5,6 +5,7 @@ use serde::{
     de::{self, DeserializeSeed, Deserializer, MapAccess, SeqAccess, Visitor},
     Deserialize, Serialize,
 };
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
 use url::Url;
 
@@ -27,6 +28,7 @@ pub enum PackumentParseMode {
 }
 
 /// Identifies heavy unused fields that should be dropped during install packument parsing.
+#[inline]
 pub fn is_heavy_unused_install_field(key: &str) -> bool {
     matches!(
         key,
@@ -52,10 +54,45 @@ pub fn is_heavy_unused_install_field(key: &str) -> bool {
             | "_resolved"
             | "_shasum"
             | "dist-tags"
+            | "exports"
+            | "imports"
+            | "typesVersions"
+            | "main"
+            | "module"
+            | "types"
+            | "typings"
+            | "files"
+            | "sideEffects"
+            | "browser"
+            | "unpkg"
+            | "jsdelivr"
+            | "eslintConfig"
+            | "prettier"
+            | "jest"
+            | "babel"
+            | "nyc"
+            | "publishConfig"
+            | "man"
+            | "preferGlobal"
+            | "private"
+            | "config"
+            | "commitlint"
+            | "husky"
+            | "lint-staged"
+            | "devEngines"
+            | "release"
+            | "standard"
+            | "ava"
+            | "xo"
+            | "tap"
+            | "mocha"
+            | "c8"
+            | "tsconfig"
     )
 }
 
 /// Identifies heavy bloated fields that should be dropped during full packument parsing.
+#[inline]
 pub fn is_heavy_unused_full_field(key: &str) -> bool {
     matches!(
         key,
@@ -75,6 +112,38 @@ pub fn is_heavy_unused_full_field(key: &str) -> bool {
             | "_resolved"
             | "_shasum"
             | "dist-tags"
+            | "exports"
+            | "imports"
+            | "typesVersions"
+            | "files"
+            | "publishConfig"
+            | "types"
+            | "typings"
+            | "sideEffects"
+            | "unpkg"
+            | "jsdelivr"
+            | "man"
+            | "preferGlobal"
+            | "main"
+            | "module"
+            | "browser"
+            | "eslintConfig"
+            | "prettier"
+            | "jest"
+            | "babel"
+            | "nyc"
+            | "commitlint"
+            | "husky"
+            | "lint-staged"
+            | "devEngines"
+            | "release"
+            | "standard"
+            | "ava"
+            | "xo"
+            | "tap"
+            | "mocha"
+            | "c8"
+            | "tsconfig"
     )
 }
 
@@ -158,8 +227,11 @@ where
             S: SeqAccess<'de>,
         {
             let mut list = Vec::new();
-            while let Some(item) = seq.next_element::<StringOrIgnored>()? {
-                if let StringOrIgnored::String(s) = item {
+            while let Some(OptStringOrSkip(opt)) = seq.next_element()? {
+                if let Some(s) = opt {
+                    if list.is_empty() {
+                        list.reserve(seq.size_hint().unwrap_or(4));
+                    }
                     list.push(s);
                 }
             }
@@ -378,6 +450,115 @@ where
     TimeSeed.deserialize(deserializer)
 }
 
+#[inline]
+fn contains_crlf(s: &str) -> bool {
+    s.as_bytes().iter().any(|&b| b == b'\r' || b == b'\n')
+}
+
+/// Fast-path validation for standard canonical lowercase `http://`/`https://` ASCII URLs
+/// (no IDNA/punycode, no percent escapes, no query/fragment, alphabetic TLD label, valid port).
+/// Returns `false` for anything unusual so callers fall back to full `Url::parse` parity.
+#[inline]
+fn is_fast_valid_http_tarball_url(s: &str) -> bool {
+    let rest = if let Some(r) = s.strip_prefix("https://") {
+        r
+    } else if let Some(r) = s.strip_prefix("http://") {
+        r
+    } else {
+        return false;
+    };
+
+    let (authority, path) = match rest.find('/') {
+        Some(idx) => (&rest[..idx], &rest[idx..]),
+        None => (rest, ""),
+    };
+
+    if authority.is_empty() {
+        return false;
+    }
+
+    let host = match authority.split_once(':') {
+        Some((h, port_str)) => {
+            if port_str.is_empty()
+                || port_str.len() > 5
+                || port_str.contains(':')
+                || !port_str.bytes().all(|b| b.is_ascii_digit())
+            {
+                return false;
+            }
+            let Ok(port) = port_str.parse::<u32>() else {
+                return false;
+            };
+            if port == 0 || port > 65535 {
+                return false;
+            }
+            h
+        }
+        None => authority,
+    };
+
+    if host.is_empty() || host.len() > 253 || host.contains("xn--") {
+        return false;
+    }
+
+    let mut has_last_label_alpha = false;
+    let mut label_count = 0usize;
+    let mut all_valid_ipv4_octets = true;
+    for label in host.split('.') {
+        label_count += 1;
+        if label.is_empty() || label.starts_with('-') || label.ends_with('-') {
+            return false;
+        }
+        let mut label_alpha = false;
+        let mut label_digits_only = label.len() <= 3;
+        for &b in label.as_bytes() {
+            if b.is_ascii_alphabetic() {
+                label_alpha = true;
+                label_digits_only = false;
+            } else if b == b'-' {
+                label_digits_only = false;
+            } else if !b.is_ascii_digit() {
+                return false;
+            }
+        }
+        if label_digits_only {
+            if (label.len() > 1 && label.starts_with('0')) || label.parse::<u8>().is_err() {
+                all_valid_ipv4_octets = false;
+            }
+        } else {
+            all_valid_ipv4_octets = false;
+        }
+        has_last_label_alpha = label_alpha;
+    }
+    if !has_last_label_alpha && !(all_valid_ipv4_octets && label_count == 4) {
+        return false;
+    }
+
+    path.as_bytes().iter().all(|&b| {
+        b.is_ascii_alphanumeric()
+            || matches!(
+                b,
+                b'-' | b'.'
+                    | b'_'
+                    | b'~'
+                    | b'/'
+                    | b'@'
+                    | b'+'
+                    | b'='
+                    | b','
+                    | b';'
+                    | b':'
+                    | b'!'
+                    | b'$'
+                    | b'&'
+                    | b'\''
+                    | b'('
+                    | b')'
+                    | b'*'
+            )
+    })
+}
+
 impl AbbreviatedPackageMetadata {
     /// Validates the packument according to Byzantine registry hardening rules:
     /// 1. Reject CR/LF characters in package name, dist-tag names, and target versions.
@@ -387,15 +568,13 @@ impl AbbreviatedPackageMetadata {
     /// 5. Validate that `dist.tarball` URL has a valid scheme (`http` or `https`) and does not use `file:`, `data:`, `javascript:`, etc.
     /// 6. Sanitize against CR/LF characters in version keys, inner fields, and tarball URLs.
     pub fn validate(&self) -> Result<(), RegistryError> {
-        let has_crlf = |s: &str| s.contains('\r') || s.contains('\n');
-
-        if self.name.trim().is_empty() {
+        if self.name.is_empty() || self.name.trim().is_empty() {
             return Err(RegistryError::MalformedMetadata(
                 "Package name is empty".into(),
             ));
         }
 
-        if has_crlf(&self.name) {
+        if contains_crlf(&self.name) {
             return Err(RegistryError::MalformedMetadata(format!(
                 "Package name contains forbidden CR/LF characters: {:?}",
                 self.name
@@ -404,12 +583,12 @@ impl AbbreviatedPackageMetadata {
 
         // Validate dist-tags
         for (tag_name, tag_ver) in &self.dist_tags {
-            if has_crlf(tag_name) {
+            if contains_crlf(tag_name) {
                 return Err(RegistryError::MalformedMetadata(format!(
                     "dist-tag name contains forbidden CR/LF characters: {tag_name:?}"
                 )));
             }
-            if has_crlf(tag_ver) {
+            if contains_crlf(tag_ver) {
                 return Err(RegistryError::MalformedMetadata(format!(
                     "dist-tag version target for '{tag_name}' contains forbidden CR/LF characters: {tag_ver:?}"
                 )));
@@ -418,25 +597,18 @@ impl AbbreviatedPackageMetadata {
 
         // Validate versions
         for (ver_key, ver_info) in &self.versions {
-            if has_crlf(ver_key) {
+            if contains_crlf(ver_key) {
                 return Err(RegistryError::MalformedMetadata(format!(
                     "Version key contains forbidden CR/LF characters: {ver_key:?}"
                 )));
             }
-            if has_crlf(&ver_info.version) {
-                return Err(RegistryError::MalformedMetadata(format!(
-                    "Version field contains forbidden CR/LF characters: {:?}",
-                    ver_info.version
-                )));
-            }
-            if has_crlf(&ver_info.name) {
-                return Err(RegistryError::MalformedMetadata(format!(
-                    "Version package name contains forbidden CR/LF characters: {:?}",
-                    ver_info.name
-                )));
-            }
-
             if ver_key != &ver_info.version {
+                if contains_crlf(&ver_info.version) {
+                    return Err(RegistryError::MalformedMetadata(format!(
+                        "Version field contains forbidden CR/LF characters: {:?}",
+                        ver_info.version
+                    )));
+                }
                 return Err(RegistryError::MalformedMetadata(format!(
                     "Version key '{ver_key}' does not match version field '{}' in package '{}'",
                     ver_info.version, self.name
@@ -444,26 +616,36 @@ impl AbbreviatedPackageMetadata {
             }
 
             if ver_info.name != self.name {
+                if contains_crlf(&ver_info.name) {
+                    return Err(RegistryError::MalformedMetadata(format!(
+                        "Version package name contains forbidden CR/LF characters: {:?}",
+                        ver_info.name
+                    )));
+                }
                 return Err(RegistryError::MalformedMetadata(format!(
                     "Version '{ver_key}' package name '{}' does not match packument name '{}'",
                     ver_info.name, self.name
                 )));
             }
 
-            if has_crlf(&ver_info.dist.tarball) {
-                return Err(RegistryError::MalformedMetadata(format!(
-                    "Version '{ver_key}' tarball URL contains forbidden CR/LF characters: {:?}",
-                    ver_info.dist.tarball
-                )));
-            }
-
-            if !ver_info.dist.tarball.is_empty() {
+            if !ver_info.dist.tarball.is_empty()
+                && !is_fast_valid_http_tarball_url(&ver_info.dist.tarball)
+            {
+                if contains_crlf(&ver_info.dist.tarball) {
+                    return Err(RegistryError::MalformedMetadata(format!(
+                        "Version '{ver_key}' tarball URL contains forbidden CR/LF characters: {:?}",
+                        ver_info.dist.tarball
+                    )));
+                }
                 match Url::parse(&ver_info.dist.tarball) {
                     Ok(parsed_tarball) => {
-                        let scheme = parsed_tarball.scheme().to_ascii_lowercase();
-                        if scheme != "http" && scheme != "https" {
+                        let scheme = parsed_tarball.scheme();
+                        if !scheme.eq_ignore_ascii_case("http")
+                            && !scheme.eq_ignore_ascii_case("https")
+                        {
                             return Err(RegistryError::MalformedMetadata(format!(
-                                "Version '{ver_key}' tarball URL has forbidden scheme '{scheme}' (only http and https are allowed): {}",
+                                "Version '{ver_key}' tarball URL has forbidden scheme '{}' (only http and https are allowed): {}",
+                                scheme.to_ascii_lowercase(),
                                 ver_info.dist.tarball
                             )));
                         }
@@ -534,56 +716,100 @@ pub fn parse_packument_with_mode(
 // Single-Pass Seeds and Visitors
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone)]
-enum StringOrIgnored {
-    String(String),
-    Ignored,
+/// Zero-copy string wrapper that borrows directly from slice deserializers when unescaped.
+struct CowStr<'de>(Cow<'de, str>);
+
+impl<'de> CowStr<'de> {
+    #[inline]
+    fn into_owned(self) -> String {
+        self.0.into_owned()
+    }
 }
 
-impl<'de> Deserialize<'de> for StringOrIgnored {
+impl<'de> Deserialize<'de> for CowStr<'de> {
+    #[inline]
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: Deserializer<'de>,
     {
-        struct StringOrIgnoredVisitor;
+        struct CowStrVisitor;
+        impl<'de> Visitor<'de> for CowStrVisitor {
+            type Value = CowStr<'de>;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a string")
+            }
+            #[inline]
+            fn visit_borrowed_str<E>(self, v: &'de str) -> Result<Self::Value, E> {
+                Ok(CowStr(Cow::Borrowed(v)))
+            }
+            #[inline]
+            fn visit_str<E>(self, v: &str) -> Result<Self::Value, E> {
+                Ok(CowStr(Cow::Owned(v.to_owned())))
+            }
+            #[inline]
+            fn visit_string<E>(self, v: String) -> Result<Self::Value, E> {
+                Ok(CowStr(Cow::Owned(v)))
+            }
+        }
+        deserializer.deserialize_str(CowStrVisitor)
+    }
+}
 
-        impl<'de> Visitor<'de> for StringOrIgnoredVisitor {
-            type Value = StringOrIgnored;
+struct OptStringOrSkip(Option<String>);
+
+impl<'de> Deserialize<'de> for OptStringOrSkip {
+    #[inline]
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct OptStringOrSkipVisitor;
+
+        impl<'de> Visitor<'de> for OptStringOrSkipVisitor {
+            type Value = OptStringOrSkip;
 
             fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
                 f.write_str("a string or ignorable value")
             }
 
+            #[inline]
             fn visit_str<E>(self, v: &str) -> Result<Self::Value, E> {
-                Ok(StringOrIgnored::String(v.to_string()))
+                Ok(OptStringOrSkip(Some(v.to_owned())))
             }
 
+            #[inline]
             fn visit_string<E>(self, v: String) -> Result<Self::Value, E> {
-                Ok(StringOrIgnored::String(v))
+                Ok(OptStringOrSkip(Some(v)))
             }
 
+            #[inline]
             fn visit_none<E>(self) -> Result<Self::Value, E> {
-                Ok(StringOrIgnored::Ignored)
+                Ok(OptStringOrSkip(None))
             }
 
+            #[inline]
             fn visit_unit<E>(self) -> Result<Self::Value, E> {
-                Ok(StringOrIgnored::Ignored)
+                Ok(OptStringOrSkip(None))
             }
 
+            #[inline]
             fn visit_bool<E>(self, _: bool) -> Result<Self::Value, E> {
-                Ok(StringOrIgnored::Ignored)
+                Ok(OptStringOrSkip(None))
             }
 
+            #[inline]
             fn visit_i64<E>(self, _: i64) -> Result<Self::Value, E> {
-                Ok(StringOrIgnored::Ignored)
+                Ok(OptStringOrSkip(None))
             }
 
+            #[inline]
             fn visit_u64<E>(self, _: u64) -> Result<Self::Value, E> {
-                Ok(StringOrIgnored::Ignored)
+                Ok(OptStringOrSkip(None))
             }
 
+            #[inline]
             fn visit_f64<E>(self, _: f64) -> Result<Self::Value, E> {
-                Ok(StringOrIgnored::Ignored)
+                Ok(OptStringOrSkip(None))
             }
 
             fn visit_map<M>(self, mut access: M) -> Result<Self::Value, M::Error>
@@ -591,7 +817,7 @@ impl<'de> Deserialize<'de> for StringOrIgnored {
                 M: MapAccess<'de>,
             {
                 while let Some((serde::de::IgnoredAny, serde::de::IgnoredAny)) = access.next_entry()? {}
-                Ok(StringOrIgnored::Ignored)
+                Ok(OptStringOrSkip(None))
             }
 
             fn visit_seq<S>(self, mut seq: S) -> Result<Self::Value, S::Error>
@@ -599,59 +825,47 @@ impl<'de> Deserialize<'de> for StringOrIgnored {
                 S: SeqAccess<'de>,
             {
                 while let Some(serde::de::IgnoredAny) = seq.next_element()? {}
-                Ok(StringOrIgnored::Ignored)
+                Ok(OptStringOrSkip(None))
             }
         }
 
-        deserializer.deserialize_any(StringOrIgnoredVisitor)
+        deserializer.deserialize_any(OptStringOrSkipVisitor)
     }
 }
 
-#[derive(Debug, Clone)]
-enum StringOrNum {
-    Str(String),
-    Num(serde_json::Number),
-    Other,
-}
+struct OptStringFromStrOrNum(Option<String>);
 
-impl StringOrNum {
-    fn into_string(self) -> Option<String> {
-        match self {
-            Self::Str(s) => Some(s),
-            Self::Num(n) => Some(n.to_string()),
-            Self::Other => None,
-        }
-    }
-}
-
-impl<'de> Deserialize<'de> for StringOrNum {
+impl<'de> Deserialize<'de> for OptStringFromStrOrNum {
+    #[inline]
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: Deserializer<'de>,
     {
-        struct StringOrNumVisitor;
+        struct OptStringFromStrOrNumVisitor;
 
-        impl<'de> Visitor<'de> for StringOrNumVisitor {
-            type Value = StringOrNum;
+        impl<'de> Visitor<'de> for OptStringFromStrOrNumVisitor {
+            type Value = OptStringFromStrOrNum;
 
             fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
                 formatter.write_str("a string, number, or other JSON value")
             }
 
+            #[inline]
             fn visit_str<E>(self, v: &str) -> Result<Self::Value, E> {
-                Ok(StringOrNum::Str(v.to_string()))
+                Ok(OptStringFromStrOrNum(Some(v.to_owned())))
             }
 
+            #[inline]
             fn visit_string<E>(self, v: String) -> Result<Self::Value, E> {
-                Ok(StringOrNum::Str(v))
+                Ok(OptStringFromStrOrNum(Some(v)))
             }
 
             fn visit_i64<E>(self, v: i64) -> Result<Self::Value, E> {
-                Ok(StringOrNum::Num(v.into()))
+                Ok(OptStringFromStrOrNum(Some(v.to_string())))
             }
 
             fn visit_u64<E>(self, v: u64) -> Result<Self::Value, E> {
-                Ok(StringOrNum::Num(v.into()))
+                Ok(OptStringFromStrOrNum(Some(v.to_string())))
             }
 
             fn visit_f64<E>(self, v: f64) -> Result<Self::Value, E>
@@ -659,20 +873,23 @@ impl<'de> Deserialize<'de> for StringOrNum {
                 E: de::Error,
             {
                 serde_json::Number::from_f64(v)
-                    .map(StringOrNum::Num)
+                    .map(|n| OptStringFromStrOrNum(Some(n.to_string())))
                     .ok_or_else(|| de::Error::custom("invalid float number"))
             }
 
+            #[inline]
             fn visit_bool<E>(self, _: bool) -> Result<Self::Value, E> {
-                Ok(StringOrNum::Other)
+                Ok(OptStringFromStrOrNum(None))
             }
 
+            #[inline]
             fn visit_none<E>(self) -> Result<Self::Value, E> {
-                Ok(StringOrNum::Other)
+                Ok(OptStringFromStrOrNum(None))
             }
 
+            #[inline]
             fn visit_unit<E>(self) -> Result<Self::Value, E> {
-                Ok(StringOrNum::Other)
+                Ok(OptStringFromStrOrNum(None))
             }
 
             fn visit_seq<S>(self, mut seq: S) -> Result<Self::Value, S::Error>
@@ -680,7 +897,7 @@ impl<'de> Deserialize<'de> for StringOrNum {
                 S: SeqAccess<'de>,
             {
                 while let Some(serde::de::IgnoredAny) = seq.next_element()? {}
-                Ok(StringOrNum::Other)
+                Ok(OptStringFromStrOrNum(None))
             }
 
             fn visit_map<M>(self, mut access: M) -> Result<Self::Value, M::Error>
@@ -688,11 +905,121 @@ impl<'de> Deserialize<'de> for StringOrNum {
                 M: MapAccess<'de>,
             {
                 while let Some((serde::de::IgnoredAny, serde::de::IgnoredAny)) = access.next_entry()? {}
-                Ok(StringOrNum::Other)
+                Ok(OptStringFromStrOrNum(None))
             }
         }
 
-        deserializer.deserialize_any(StringOrNumVisitor)
+        deserializer.deserialize_any(OptStringFromStrOrNumVisitor)
+    }
+}
+
+/// Pre-sized `serde_json::Value` seed that avoids repeated capacity 0 -> 1 -> 2 -> 4 growth on small objects/arrays.
+struct FastJsonValueSeed;
+
+impl<'de> DeserializeSeed<'de> for FastJsonValueSeed {
+    type Value = serde_json::Value;
+
+    #[inline]
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_any(FastJsonValueVisitor)
+    }
+}
+
+struct FastJsonValueVisitor;
+
+impl<'de> Visitor<'de> for FastJsonValueVisitor {
+    type Value = serde_json::Value;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+        formatter.write_str("any valid JSON value")
+    }
+
+    #[inline]
+    fn visit_bool<E>(self, b: bool) -> Result<Self::Value, E> {
+        Ok(serde_json::Value::Bool(b))
+    }
+
+    #[inline]
+    fn visit_i64<E>(self, v: i64) -> Result<Self::Value, E> {
+        Ok(serde_json::Value::Number(v.into()))
+    }
+
+    #[inline]
+    fn visit_u64<E>(self, v: u64) -> Result<Self::Value, E> {
+        Ok(serde_json::Value::Number(v.into()))
+    }
+
+    #[inline]
+    fn visit_f64<E>(self, v: f64) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        serde_json::Number::from_f64(v)
+            .map(serde_json::Value::Number)
+            .ok_or_else(|| de::Error::custom("invalid JSON number"))
+    }
+
+    #[inline]
+    fn visit_str<E>(self, v: &str) -> Result<Self::Value, E> {
+        Ok(serde_json::Value::String(v.to_owned()))
+    }
+
+    #[inline]
+    fn visit_string<E>(self, v: String) -> Result<Self::Value, E> {
+        Ok(serde_json::Value::String(v))
+    }
+
+    #[inline]
+    fn visit_none<E>(self) -> Result<Self::Value, E> {
+        Ok(serde_json::Value::Null)
+    }
+
+    #[inline]
+    fn visit_some<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Deserialize::deserialize(deserializer)
+    }
+
+    #[inline]
+    fn visit_unit<E>(self) -> Result<Self::Value, E> {
+        Ok(serde_json::Value::Null)
+    }
+
+    fn visit_seq<S>(self, mut seq: S) -> Result<Self::Value, S::Error>
+    where
+        S: SeqAccess<'de>,
+    {
+        let Some(first) = seq.next_element_seed(FastJsonValueSeed)? else {
+            return Ok(serde_json::Value::Array(Vec::new()));
+        };
+        let mut vec = Vec::with_capacity(seq.size_hint().unwrap_or(4));
+        vec.push(first);
+        while let Some(elem) = seq.next_element_seed(FastJsonValueSeed)? {
+            vec.push(elem);
+        }
+        Ok(serde_json::Value::Array(vec))
+    }
+
+    fn visit_map<M>(self, mut access: M) -> Result<Self::Value, M::Error>
+    where
+        M: MapAccess<'de>,
+    {
+        let Some(first_key) = access.next_key::<String>()? else {
+            return Ok(serde_json::Value::Object(serde_json::Map::new()));
+        };
+        let mut map = serde_json::Map::with_capacity(access.size_hint().unwrap_or(4));
+        let first_val = access.next_value_seed(FastJsonValueSeed)?;
+        map.insert(first_key, first_val);
+        while let Some(key) = access.next_key::<String>()? {
+            let val = access.next_value_seed(FastJsonValueSeed)?;
+            map.insert(key, val);
+        }
+        Ok(serde_json::Value::Object(map))
     }
 }
 
@@ -723,10 +1050,12 @@ impl<'de> Visitor<'de> for DependencyMapVisitor {
         M: MapAccess<'de>,
     {
         let mut map = IndexMap::new();
-        while let Some(key) = access.next_key::<String>()? {
-            let val = access.next_value::<StringOrNum>()?;
-            if let Some(s) = val.into_string() {
-                map.insert(key, s);
+        while let Some(key) = access.next_key::<CowStr<'_>>()? {
+            if let Some(s) = access.next_value::<OptStringFromStrOrNum>()?.0 {
+                if map.is_empty() {
+                    map.reserve(access.size_hint().unwrap_or(4));
+                }
+                map.insert(key.into_owned(), s);
             }
         }
         Ok(map)
@@ -787,6 +1116,9 @@ impl<'de> Visitor<'de> for PeerDepsMetaVisitor {
         while let Some((k, v)) =
             access.next_entry::<String, rnpm_core::manifest::PeerDependencyMeta>()?
         {
+            if map.is_empty() {
+                map.reserve(access.size_hint().unwrap_or(4));
+            }
             map.insert(k, v);
         }
         Ok(map)
@@ -857,8 +1189,11 @@ impl<'de> Visitor<'de> for BundleDepsVisitor {
         S: SeqAccess<'de>,
     {
         let mut list = Vec::new();
-        while let Some(item) = seq.next_element::<StringOrIgnored>()? {
-            if let StringOrIgnored::String(s) = item {
+        while let Some(OptStringOrSkip(opt)) = seq.next_element()? {
+            if let Some(s) = opt {
+                if list.is_empty() {
+                    list.reserve(seq.size_hint().unwrap_or(4));
+                }
                 list.push(s);
             }
         }
@@ -872,6 +1207,9 @@ impl<'de> Visitor<'de> for BundleDepsVisitor {
         let mut list = Vec::new();
         while let Some(k) = access.next_key::<String>()? {
             let _ = access.next_value::<serde::de::IgnoredAny>()?;
+            if list.is_empty() {
+                list.reserve(access.size_hint().unwrap_or(4));
+            }
             list.push(k);
         }
         Ok(RawBundleDeps::List(list))
@@ -921,10 +1259,9 @@ impl<'de> Visitor<'de> for BinVisitor {
         M: MapAccess<'de>,
     {
         let mut map = BTreeMap::new();
-        while let Some(k) = access.next_key::<String>()? {
-            let val = access.next_value::<StringOrIgnored>()?;
-            if let StringOrIgnored::String(v) = val {
-                map.insert(k, v);
+        while let Some(k) = access.next_key::<CowStr<'_>>()? {
+            if let Some(v) = access.next_value::<OptStringOrSkip>()?.0 {
+                map.insert(k.into_owned(), v);
             }
         }
         if map.is_empty() {
@@ -939,8 +1276,8 @@ impl<'de> Visitor<'de> for BinVisitor {
         S: SeqAccess<'de>,
     {
         let mut map = BTreeMap::new();
-        while let Some(item) = seq.next_element::<StringOrIgnored>()? {
-            if let StringOrIgnored::String(path_str) = item {
+        while let Some(OptStringOrSkip(opt)) = seq.next_element()? {
+            if let Some(path_str) = opt {
                 let name = path_str
                     .rsplit(&['/', '\\'])
                     .next()
@@ -1006,9 +1343,9 @@ impl<'de> Visitor<'de> for LicenseVisitor {
         M: MapAccess<'de>,
     {
         let mut license = None;
-        while let Some(k) = access.next_key::<String>()? {
-            if k == "type" {
-                if let StringOrIgnored::String(s) = access.next_value::<StringOrIgnored>()? {
+        while let Some(k) = access.next_key::<CowStr<'_>>()? {
+            if k.0.as_ref() == "type" {
+                if let Some(s) = access.next_value::<OptStringOrSkip>()?.0 {
                     license = Some(s);
                 }
             } else {
@@ -1113,10 +1450,12 @@ impl<'de> Visitor<'de> for EnginesVisitor {
         M: MapAccess<'de>,
     {
         let mut map = HashMap::new();
-        while let Some(k) = access.next_key::<String>()? {
-            let val = access.next_value::<StringOrNum>()?;
-            if let Some(s) = val.into_string() {
-                map.insert(k, s);
+        while let Some(k) = access.next_key::<CowStr<'_>>()? {
+            if let Some(s) = access.next_value::<OptStringFromStrOrNum>()?.0 {
+                if map.is_empty() {
+                    map.reserve(access.size_hint().unwrap_or(2));
+                }
+                map.insert(k.into_owned(), s);
             }
         }
         Ok((map, None))
@@ -1233,8 +1572,8 @@ impl<'de, 'a> Visitor<'de> for VersionVisitor<'a> {
         let mut deprecated: Option<String> = None;
         let mut extra: BTreeMap<String, serde_json::Value> = BTreeMap::new();
 
-        while let Some(key) = access.next_key::<String>()? {
-            match key.as_str() {
+        while let Some(key) = access.next_key::<CowStr<'_>>()? {
+            match key.0.as_ref() {
                 "name" => {
                     name = access.next_value::<Option<String>>()?;
                 }
@@ -1301,8 +1640,8 @@ impl<'de, 'a> Visitor<'de> for VersionVisitor<'a> {
                     if drop {
                         let _ = access.next_value::<serde::de::IgnoredAny>()?;
                     } else {
-                        let val = access.next_value::<serde_json::Value>()?;
-                        extra.insert(other.to_string(), val);
+                        let val = access.next_value_seed(FastJsonValueSeed)?;
+                        extra.insert(key.into_owned(), val);
                     }
                 }
             }
@@ -1384,17 +1723,22 @@ impl<'de, 'a> Visitor<'de> for VersionsVisitor<'a> {
     {
         let mut map = BTreeMap::new();
         while let Some(key) = access.next_key::<String>()? {
-            if map.contains_key(&key) {
-                return Err(de::Error::custom(format!(
-                    "duplicate version key '{key}' found in packument metadata"
-                )));
+            match map.entry(key) {
+                std::collections::btree_map::Entry::Occupied(occ) => {
+                    return Err(de::Error::custom(format!(
+                        "duplicate version key '{}' found in packument metadata",
+                        occ.key()
+                    )));
+                }
+                std::collections::btree_map::Entry::Vacant(vacant) => {
+                    let version = access.next_value_seed(VersionSeed {
+                        mode: self.mode,
+                        root_name: self.root_name,
+                        version_key: Some(vacant.key().as_str()),
+                    })?;
+                    vacant.insert(version);
+                }
             }
-            let version = access.next_value_seed(VersionSeed {
-                mode: self.mode,
-                root_name: self.root_name,
-                version_key: Some(&key),
-            })?;
-            map.insert(key, version);
         }
         Ok(map)
     }
@@ -1443,10 +1787,12 @@ impl<'de> Visitor<'de> for DistTagsVisitor {
         M: MapAccess<'de>,
     {
         let mut map = HashMap::new();
-        while let Some(k) = access.next_key::<String>()? {
-            let val = access.next_value::<StringOrNum>()?;
-            if let Some(s) = val.into_string() {
-                map.insert(k, s);
+        while let Some(k) = access.next_key::<CowStr<'_>>()? {
+            if let Some(s) = access.next_value::<OptStringFromStrOrNum>()?.0 {
+                if map.is_empty() {
+                    map.reserve(access.size_hint().unwrap_or(4));
+                }
+                map.insert(k.into_owned(), s);
             }
         }
         Ok(map)
@@ -1496,10 +1842,9 @@ impl<'de> Visitor<'de> for TimeVisitor {
         M: MapAccess<'de>,
     {
         let mut map = BTreeMap::new();
-        while let Some(k) = access.next_key::<String>()? {
-            let val = access.next_value::<StringOrIgnored>()?;
-            if let StringOrIgnored::String(s) = val {
-                map.insert(k, s);
+        while let Some(k) = access.next_key::<CowStr<'_>>()? {
+            if let Some(s) = access.next_value::<OptStringOrSkip>()?.0 {
+                map.insert(k.into_owned(), s);
             }
         }
         Ok(map)
@@ -1557,9 +1902,10 @@ impl<'de> Visitor<'de> for PackageMetadataVisitor {
         let mut modified: Option<String> = None;
         let mut versions: BTreeMap<String, AbbreviatedVersion> = BTreeMap::new();
         let mut time: BTreeMap<String, String> = BTreeMap::new();
+        let mut root_name_missing_during_versions = false;
 
-        while let Some(key) = access.next_key::<String>()? {
-            match key.as_str() {
+        while let Some(key) = access.next_key::<CowStr<'_>>()? {
+            match key.0.as_ref() {
                 "name" => {
                     name = access.next_value::<Option<String>>()?;
                 }
@@ -1570,6 +1916,9 @@ impl<'de> Visitor<'de> for PackageMetadataVisitor {
                     modified = access.next_value::<Option<String>>()?;
                 }
                 "versions" => {
+                    if name.is_none() {
+                        root_name_missing_during_versions = true;
+                    }
                     versions = access.next_value_seed(VersionsSeed {
                         mode: self.mode,
                         root_name: name.as_deref(),
@@ -1586,7 +1935,7 @@ impl<'de> Visitor<'de> for PackageMetadataVisitor {
 
         let pkg_name = name.unwrap_or_default();
 
-        if !pkg_name.is_empty() {
+        if root_name_missing_during_versions && !pkg_name.is_empty() {
             for ver in versions.values_mut() {
                 if ver.name.is_empty() {
                     ver.name = pkg_name.clone();
