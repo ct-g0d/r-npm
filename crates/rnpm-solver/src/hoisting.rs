@@ -765,8 +765,8 @@ fn candidate_shadows_descendant_dep_parsed(
     // For non-root scopes when `install_name` has many dependents across the whole tree,
     // walk only `scope`'s subtree via BTreeMap range instead of scanning 100s of unrelated nodes/edges.
     if !scope.is_empty()
-        && (rel_nodes.map_or(0, Vec::len) > 8
-            || (rel_edges.map_or(0, Vec::len) > 8 && !graph.outgoing_edges_by_location.is_empty()))
+        && !graph.outgoing_edges_by_location.is_empty()
+        && (rel_nodes.map_or(0, Vec::len) > 8 || rel_edges.map_or(0, Vec::len) > 8)
     {
         let mut scope_slash = String::with_capacity(scope.len() + 1);
         scope_slash.push_str(scope);
@@ -776,6 +776,9 @@ fn candidate_shadows_descendant_dep_parsed(
         scope_zero.push('0');
 
         let check_subtree_entry = |loc: &str, node: &crate::graph::Node| -> bool {
+            if !is_in_scope_subtree(loc, scope) {
+                return false;
+            }
             if check_node_ref(node) {
                 return true;
             }

@@ -1343,14 +1343,6 @@ impl DependencyGraph {
 
     /// Constructs an in-memory DependencyGraph from an npm lockfile version 3 document.
     pub fn from_lockfile_v3(lockfile: &LockfileV3) -> Self {
-        let mut graph = Self::from_lockfile_v3_unindexed(lockfile);
-        graph.rebuild_indices();
-        graph
-    }
-
-    /// Same as `from_lockfile_v3`, skipping secondary index map construction when
-    /// callers only traverse `nodes` directly.
-    pub(crate) fn from_lockfile_v3_unindexed(lockfile: &LockfileV3) -> Self {
         let mut graph = Self::new();
         graph.root_location = String::new();
         let mut estimated_edges = 0usize;

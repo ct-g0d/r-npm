@@ -2216,10 +2216,11 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                     link: false,
                 };
 
-                let parsed_ver = pkg_meta
-                    .parsed_by_key(&chosen_version.version)
-                    .cloned()
-                    .or_else(|| Version::parse(&chosen_version.version).ok());
+                let parsed_ver = if pkg_meta.val_versions.is_empty() {
+                    pkg_meta.parsed_by_key(&chosen_version.version).cloned()
+                } else {
+                    Version::parse(&chosen_version.version).ok()
+                };
                 let node = Node {
                     location: target_loc.clone(),
                     install_name: dep_spec.install_name.clone(),
@@ -3880,7 +3881,7 @@ pub fn resolve_fast_path(
         Overrides::default()
     };
 
-    let mut graph = DependencyGraph::from_lockfile_v3_unindexed(lockfile);
+    let mut graph = DependencyGraph::from_lockfile_v3(lockfile);
     graph.legacy_peer_deps = options.legacy_peer_deps;
 
     // Apply platform filters for optional dependencies

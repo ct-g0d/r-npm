@@ -234,6 +234,9 @@ impl<'a> FastLockfileScanner<'a> {
                     return None;
                 }
                 if first == b'0' {
+                    if b == b'-' {
+                        return None;
+                    }
                     self.pos += 1;
                     if self.bytes.get(self.pos).is_some_and(|c| c.is_ascii_digit()) {
                         return None;
@@ -325,6 +328,9 @@ impl<'a> FastLockfileScanner<'a> {
                     return None;
                 }
                 if first == b'0' {
+                    if b == b'-' {
+                        return None;
+                    }
                     self.pos += 1;
                     if self.bytes.get(self.pos).is_some_and(|c| c.is_ascii_digit()) {
                         return None;
@@ -512,7 +518,7 @@ impl<'a> FastLockfileScanner<'a> {
                             if let Some(ref mut rm) = raw_map {
                                 rm.insert(ks.to_owned(), serde_json::Value::String(s.clone()));
                             }
-                            pkg.license = Some(s);
+                            pkg.license = if s.is_empty() { None } else { Some(s) };
                         }
                         _ => return None,
                     }

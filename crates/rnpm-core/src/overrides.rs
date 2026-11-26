@@ -363,18 +363,18 @@ impl FastNode {
     }
 
     #[inline]
-    fn find_direct(&self, dep_name: &str, requested_spec: &str) -> Option<&str> {
+    fn find_direct(&self, dep_name: &str, requested_spec: &str) -> Option<Option<&str>> {
         let rule_list = self.rules_by_pkg.get(dep_name)?;
 
         for rule in rule_list {
             if rule.has_spec && rule.pattern.matches(requested_spec) {
-                return rule.exact_override.as_deref();
+                return Some(rule.exact_override.as_deref());
             }
         }
 
         for rule in rule_list {
             if !rule.has_spec {
-                return rule.exact_override.as_deref();
+                return Some(rule.exact_override.as_deref());
             }
         }
 
@@ -386,7 +386,7 @@ impl FastNode {
         ancestors: &[T],
         dep_name: &str,
         requested_spec: &str,
-    ) -> Option<&str> {
+    ) -> Option<Option<&str>> {
         if ancestors.is_empty() {
             return self.find_direct(dep_name, requested_spec);
         }
@@ -674,26 +674,26 @@ impl Overrides {
             return Ok(None);
         }
 
-        let mut matched_val: Option<&str> = None;
+        let mut matched: Option<Option<&str>> = None;
 
         // 1. Check nested scoped overrides along ancestor chain (skip entirely if dep_name has no nested rules)
         if !ancestors.is_empty() && fast.nested_target_names.contains(dep_name) {
             for i in 0..ancestors.len() {
                 let slice = &ancestors[i..];
                 if let Some(val) = fast.root_node.find_in_nested(slice, dep_name, requested_spec) {
-                    matched_val = Some(val);
+                    matched = Some(val);
                     break;
                 }
             }
         }
 
         // 2. If no nested override matched, check top-level global overrides
-        if matched_val.is_none() {
-            matched_val = fast.root_node.find_direct(dep_name, requested_spec);
+        if matched.is_none() {
+            matched = fast.root_node.find_direct(dep_name, requested_spec);
         }
 
-        // 3. Extract the target spec string
-        let Some(raw_override) = matched_val else {
+        // 3. Extract the target spec string (Some(None) means matched a nested map lacking ".")
+        let Some(Some(raw_override)) = matched else {
             return Ok(None);
         };
 

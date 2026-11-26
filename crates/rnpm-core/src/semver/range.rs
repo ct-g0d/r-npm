@@ -762,7 +762,7 @@ impl Range {
         Self::parse(range_str).map(|r| r.satisfies(version))
     }
 
-    /// Returns `(min_major, max_major_exclusive)` bounds when the range is a single comparator set
+    /// Returns `(min_major, max_major_inclusive)` bounds when the range is a single comparator set
     /// with a simple major-version window, enabling binary search on descending version lists.
     #[doc(hidden)]
     #[inline]

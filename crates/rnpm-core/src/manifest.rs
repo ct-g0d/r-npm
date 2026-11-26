@@ -389,7 +389,7 @@ impl ManifestFormat {
         let bytes = clean.as_bytes();
         let trailing_newline = bytes.last().is_some_and(|&b| b == b'\n' || b == b'\r');
 
-        // Trim leading and trailing ASCII whitespace cheaply (fall back to .trim() only on non-ASCII)
+        // Trim leading and trailing ASCII whitespace
         let mut start = 0usize;
         while start < bytes.len() && bytes[start].is_ascii_whitespace() {
             start += 1;
@@ -1410,6 +1410,9 @@ impl<'a> FastManifestScanner<'a> {
                     return None;
                 }
                 if first == b'0' {
+                    if b == b'-' {
+                        return None;
+                    }
                     self.pos += 1;
                     if self.bytes.get(self.pos).is_some_and(|c| c.is_ascii_digit()) {
                         return None;

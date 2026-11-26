@@ -1847,3 +1847,37 @@ fn test_manifest_engines_float_formatting_parity() {
     assert_eq!(m_ro.engines.get("node").map(String::as_str), Some("18.0"));
     assert_eq!(m_ro.engines.get("npm").map(String::as_str), Some("10"));
 }
+
+#[test]
+fn test_overrides_nested_without_dot_blocks_global_fallback_parity() {
+    use crate::overrides::Overrides;
+    use std::collections::BTreeMap;
+    let json = serde_json::json!({
+        "foo": "1.0.0",
+        "a": {
+            "foo": {
+                "bar": "2.0.0"
+            }
+        }
+    });
+    let ov = Overrides::from_json_value(Some(&json), BTreeMap::new());
+    assert_eq!(ov.resolve_override("foo", "^1.0.0", &["a"]).unwrap(), None);
+    assert_eq!(
+        ov.resolve_override_precompiled_with_caller("foo", "^1.0.0", &["a"], None)
+            .unwrap(),
+        None
+    );
+    assert_eq!(
+        ov.resolve_override_precompiled_with_caller("bar", "^2.0.0", &["a", "foo"], None)
+            .unwrap(),
+        Some("2.0.0".to_string())
+    );
+}
+
+#[test]
+fn test_manifest_readonly_neg_zero_extra_parity() {
+    let json = r#"{"name": "neg-zero", "custom": -0}"#;
+    let m_raw = Manifest::from_str(json).expect("Manifest::from_str");
+    let m_ro = Manifest::from_str_readonly(json).expect("Manifest::from_str_readonly");
+    assert_eq!(m_raw.extra.get("custom"), m_ro.extra.get("custom"));
+}
