@@ -873,17 +873,8 @@ pub fn resolve_workspace_graph<P: PackageMetadataProvider>(
 
     let root_ancestors = std::sync::Arc::new(vec![root_name.clone()]);
 
-    // Enqueue root external dependencies borrowing manifest strings until enqueued
-    let mut root_deps: FastMap<&str, (&str, DependencyType)> = fast_map_with_capacity(
-        root_manifest.dependencies.len()
-            + root_manifest.optional_dependencies.len()
-            + root_manifest.peer_dependencies.len()
-            + if options.dev {
-                root_manifest.dev_dependencies.len()
-            } else {
-                0
-            },
-    );
+    // Enqueue root external dependencies borrowing manifest strings in sorted order
+    let mut root_deps: BTreeMap<&str, (&str, DependencyType)> = BTreeMap::new();
     if options.dev {
         for (k, v) in &root_manifest.dev_dependencies {
             if !(ws_graph.is_member(k) || v.trim().starts_with("workspace:")) {
@@ -930,8 +921,8 @@ pub fn resolve_workspace_graph<P: PackageMetadataProvider>(
         );
     }
 
-    // Enqueue member external dependencies
-    let mut member_deps: FastMap<&str, (&str, DependencyType)> = fast_map_with_capacity(32);
+    // Enqueue member external dependencies in deterministic sorted order
+    let mut member_deps: BTreeMap<&str, (&str, DependencyType)> = BTreeMap::new();
     for member in members {
         let member_ancestors = std::sync::Arc::new(vec![root_name.clone(), member.name.clone()]);
         member_deps.clear();

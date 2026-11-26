@@ -309,7 +309,8 @@ fn build_monorepo_workload() -> (Manifest, Vec<WorkspaceMember>, InMemoryPackage
         let pkg = format!("ws-ext-{i:03}");
         for maj in [1u64, 2u64] {
             for pat in 0..3u64 {
-                provider.add_version(&pkg, &format!("{maj}.0.{pat}"), |v| {
+                let ver = format!("{maj}.0.{pat}");
+                provider.add_version(&pkg, &ver, |v| {
                     if i + 1 < 180 && i % 6 != 5 {
                         v.dependencies
                             .insert(format!("ws-ext-{:03}", i + 1), format!("^{maj}.0.0"));

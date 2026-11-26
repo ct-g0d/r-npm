@@ -183,6 +183,11 @@ impl Node {
                 }
                 Some(rnpm_core::manifest::BundledDependencies::List(list))
             }
+            serde_json::Value::Object(map) => {
+                Some(rnpm_core::manifest::BundledDependencies::List(
+                    map.keys().cloned().collect(),
+                ))
+            }
             _ => None,
         }
     }
@@ -203,6 +208,7 @@ impl Node {
             serde_json::Value::Array(arr) => {
                 arr.iter().all(|v| v.is_string()) && arr.iter().any(|v| v.as_str() == Some(name))
             }
+            serde_json::Value::Object(map) => map.contains_key(name),
             _ => false,
         }
     }
@@ -440,6 +446,9 @@ impl DependencyGraph {
         let remove_loc = |map: &mut HashMap<String, Vec<String>>, key: &str| {
             if let Some(vec) = map.get_mut(key) {
                 vec.retain(|l| l != location);
+                if vec.is_empty() {
+                    map.remove(key);
+                }
             }
         };
 
@@ -618,7 +627,7 @@ impl DependencyGraph {
                     let parsed_ver = target
                         .parsed_version
                         .as_ref()
-                        .map(|v| std::borrow::Cow::Borrowed(v))
+                        .map(std::borrow::Cow::Borrowed)
                         .or_else(|| {
                             crate::hoisting::cached_version_rc(&target.version)
                                 .map(|rc| std::borrow::Cow::Owned((*rc).clone()))
@@ -627,6 +636,12 @@ impl DependencyGraph {
                         crate::hoisting::cached_target_rc(spec).is_some_and(|t| match &*t {
                             rnpm_core::PackageTarget::Range(r) => r.satisfies(v.as_ref()),
                             rnpm_core::PackageTarget::Version(tv) => tv == v.as_ref(),
+                            // PackageTarget::parse classifies wildcard aliases like "x"/"X"/"x.x"
+                            // as Tag, while Range::parse accepts them as >=0.0.0.
+                            rnpm_core::PackageTarget::Tag(_) => {
+                                rnpm_core::semver::Range::parse(spec)
+                                    .is_ok_and(|r| r.satisfies(v.as_ref()))
+                            }
                             _ => false,
                         })
                     });
@@ -643,8 +658,15 @@ impl DependencyGraph {
                 }
             }
         }
-        for edge in late {
-            self.add_edge(edge);
+        if !late.is_empty() {
+            if has_outgoing_index {
+                for edge in late {
+                    self.add_edge(edge);
+                }
+            } else {
+                self.edges.extend(late);
+                self.rebuild_edge_indices();
+            }
         }
     }
 

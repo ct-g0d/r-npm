@@ -329,6 +329,8 @@ struct CachedPackageMeta {
     by_key: FastMap<String, usize>,
     /// `(parsed_semver, entry_idx)` stably sorted DESCENDING by SemVer.
     descending: Vec<(Version, usize)>,
+    /// Rare fallback when `v_meta.version != key` so prerelease/advisory checks still match `v_meta.version`.
+    val_versions: FastMap<usize, Version>,
 }
 
 impl CachedPackageMeta {
@@ -337,9 +339,15 @@ impl CachedPackageMeta {
         let mut entries = Vec::with_capacity(len);
         let mut by_key = fast_map_with_capacity(len);
         let mut descending = Vec::with_capacity(len);
+        let mut val_versions = FastMap::default();
         for (idx, (ver_str, v_meta)) in meta.versions.into_iter().enumerate() {
             if let Some(parsed) = cached_version_rc(&ver_str) {
                 descending.push(((*parsed).clone(), idx));
+            }
+            if v_meta.version != ver_str {
+                if let Some(pv) = cached_version_rc(&v_meta.version) {
+                    val_versions.insert(idx, (*pv).clone());
+                }
             }
             by_key.insert(ver_str, idx);
             entries.push(v_meta);
@@ -351,6 +359,16 @@ impl CachedPackageMeta {
             entries,
             by_key,
             descending,
+            val_versions,
+        }
+    }
+
+    #[inline]
+    fn entry_version<'b>(&'b self, idx: usize, key_parsed: &'b Version) -> &'b Version {
+        if self.val_versions.is_empty() {
+            key_parsed
+        } else {
+            self.val_versions.get(&idx).unwrap_or(key_parsed)
         }
     }
 
@@ -716,7 +734,9 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                 } else {
                     entry.allowed_transitive = true;
                 }
-                if arc_meta.entries.len() != entry.meta.entries.len() {
+                if arc_meta.entries.len() >= entry.meta.entries.len()
+                    || arc_meta.dist_tags != entry.meta.dist_tags
+                {
                     entry.meta = Arc::clone(&arc_meta);
                 }
             } else {
@@ -736,7 +756,7 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
     #[inline]
     fn is_cacheable_target(target: &PackageTarget) -> bool {
         match target {
-            PackageTarget::Range(_) | PackageTarget::Version(_) | PackageTarget::Tag(_) => true,
+            PackageTarget::Range(_) | PackageTarget::Version(_) => true,
             PackageTarget::Alias { target, .. } => Self::is_cacheable_target(target),
             _ => false,
         }
@@ -785,8 +805,7 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
             {
                 siblings.push(self.queue.pop_front().unwrap());
             }
-            for i in 0..siblings.len() {
-                let task = siblings[i];
+            for &task in &siblings {
                 self.process_task(task)?;
             }
         }
@@ -1603,7 +1622,29 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                 task.is_root,
             )? {
                 let fresh_arc = Arc::new(CachedPackageMeta::from_meta(fresh_raw));
-                if fresh_arc.entries.len() != pkg_meta.entries.len() {
+                let retried = self
+                    .select_version_cached(
+                        parent_loc,
+                        &dep_spec.install_name,
+                        &dep_spec.package_name,
+                        &fresh_arc,
+                        &dep_spec.target,
+                        &peer_advisories,
+                    )
+                    .or_else(|| {
+                        self.select_version_cached(
+                            parent_loc,
+                            &dep_spec.install_name,
+                            &dep_spec.package_name,
+                            &fresh_arc,
+                            &dep_spec.target,
+                            &[],
+                        )
+                    });
+                if retried.is_some()
+                    || fresh_arc.entries.len() >= pkg_meta.entries.len()
+                    || fresh_arc.dist_tags != pkg_meta.dist_tags
+                {
                     if let Some(entry) = self.pkg_cache.get_mut(&dep_spec.package_name) {
                         entry.meta = Arc::clone(&fresh_arc);
                     }
@@ -2722,7 +2763,9 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
         let has_incoming_index = !self.graph.incoming_edges_by_location.is_empty();
         for candidate in &candidates {
             if has_incoming_index {
-                if let Some(edge_indices) = self.graph.incoming_edges_by_location.remove(candidate) {
+                if let Some(mut edge_indices) =
+                    self.graph.incoming_edges_by_location.remove(candidate)
+                {
                     for &idx in &edge_indices {
                         if let Some(edge) = self.graph.edges.get_mut(idx) {
                             edge.to_location = root_location.to_string();
@@ -2732,7 +2775,9 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                         self.graph.incoming_edges_by_location.get_mut(root_location)
                     {
                         root_incoming.extend(edge_indices);
+                        root_incoming.sort_unstable();
                     } else {
+                        edge_indices.sort_unstable();
                         self.graph
                             .incoming_edges_by_location
                             .insert(root_location.to_string(), edge_indices);
@@ -2846,31 +2891,80 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                 {
                     continue;
                 }
-                let Some(peer_meta) = self
-                    .get_cached_meta(peer, root_spec, &root_target, true)
-                    .ok()
-                    .flatten()
-                else {
-                    continue;
-                };
-                // nodeFromEdge(parentEdge, ..., peerEdge): the root's choice,
-                // steered by the peer edge, must also satisfy the peer edge.
-                let peer_target_slice = std::slice::from_ref(peer_target.as_ref());
-                let root_choice = self
-                    .select_version_cached(
-                        "",
-                        peer,
-                        peer,
-                        &peer_meta,
-                        &root_target,
-                        peer_target_slice,
-                    )
-                    .or_else(|| {
-                        self.select_version_cached("", peer, peer, &peer_meta, &root_target, &[])
-                    });
-                let Some(root_choice) = root_choice else {
-                    continue;
-                };
+            let peer_used_cache = Self::is_cacheable_target(&root_target)
+                && self.pkg_cache.get(peer).is_some_and(|e| e.allowed_root);
+            let Some(mut peer_meta) = self
+                .get_cached_meta(peer, root_spec, &root_target, true)
+                .ok()
+                .flatten()
+            else {
+                continue;
+            };
+            // nodeFromEdge(parentEdge, ..., peerEdge): the root's choice,
+            // steered by the peer edge, must also satisfy the peer edge.
+            let peer_target_slice = std::slice::from_ref(peer_target.as_ref());
+            let mut root_choice_opt = self
+                .select_version_cached("", peer, peer, &peer_meta, &root_target, peer_target_slice)
+                .or_else(|| {
+                    self.select_version_cached("", peer, peer, &peer_meta, &root_target, &[])
+                });
+            if root_choice_opt.is_none() && peer_used_cache {
+                if let Ok(Some(fresh_raw)) =
+                    self.provider.get_package_for_edge(peer, root_spec, true)
+                {
+                    let fresh_arc = Arc::new(CachedPackageMeta::from_meta(fresh_raw));
+                    let retried = self
+                        .select_version_cached(
+                            "",
+                            peer,
+                            peer,
+                            &fresh_arc,
+                            &root_target,
+                            peer_target_slice,
+                        )
+                        .or_else(|| {
+                            self.select_version_cached(
+                                "",
+                                peer,
+                                peer,
+                                &fresh_arc,
+                                &root_target,
+                                &[],
+                            )
+                        });
+                    if retried.is_some()
+                        || fresh_arc.entries.len() >= peer_meta.entries.len()
+                        || fresh_arc.dist_tags != peer_meta.dist_tags
+                    {
+                        if let Some(entry) = self.pkg_cache.get_mut(peer) {
+                            entry.meta = Arc::clone(&fresh_arc);
+                        }
+                        peer_meta = fresh_arc;
+                        root_choice_opt = self
+                            .select_version_cached(
+                                "",
+                                peer,
+                                peer,
+                                &peer_meta,
+                                &root_target,
+                                peer_target_slice,
+                            )
+                            .or_else(|| {
+                                self.select_version_cached(
+                                    "",
+                                    peer,
+                                    peer,
+                                    &peer_meta,
+                                    &root_target,
+                                    &[],
+                                )
+                            });
+                    }
+                }
+            }
+            let Some(root_choice) = root_choice_opt else {
+                continue;
+            };
                 let satisfies =
                     crate::hoisting::version_satisfies_target(&root_choice.version, &peer_target);
                 if satisfies {
@@ -2989,7 +3083,7 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
             self.graph
                 .incoming_edges_by_location
                 .get(location)
-                .and_then(|idxs| idxs.first())
+                .and_then(|idxs| idxs.iter().min())
                 .map(|&idx| &self.graph.edges[idx])
         } else {
             self.graph.edges.iter().find(|e| e.to_location == location)
@@ -3348,7 +3442,7 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                     if let Some((_, idx)) = meta
                         .descending
                         .iter()
-                        .find(|(parsed, _)| !parsed.is_prerelease())
+                        .find(|(parsed, idx)| !meta.entry_version(*idx, parsed).is_prerelease())
                     {
                         return Some(&meta.entries[*idx]);
                     }
@@ -3518,16 +3612,17 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                 let mut first_safe: Option<&'b PackageVersionMetadata> = None;
                 let mut first_any: Option<&'b PackageVersionMetadata> = None;
                 for (parsed, idx) in &meta.descending {
-                    if !range.satisfies(parsed) {
+                    let check_ver = meta.entry_version(*idx, parsed);
+                    if !range.satisfies(check_ver) {
                         continue;
                     }
                     let v_meta = &meta.entries[*idx];
                     if !advisories.iter().all(|target| {
-                        parsed_version_satisfies_target(parsed, Some(&v_meta.version), target)
+                        parsed_version_satisfies_target(check_ver, Some(&v_meta.version), target)
                     }) {
                         continue;
                     }
-                    if is_safe(parsed) {
+                    if is_safe(check_ver) {
                         if v_meta.deprecated.is_none() {
                             return Some(v_meta);
                         }
@@ -3934,5 +4029,62 @@ mod tests {
             arborist_compare("@eslint-community/regexpp", "@eslint/js"),
             std::cmp::Ordering::Less
         );
+    }
+
+    #[test]
+    fn test_dedupe_multi_candidate_placing_edge_uses_first_graph_edge() {
+        let provider = crate::types::InMemoryPackageProvider::new();
+        let mut solver = Solver::new(&provider, ResolverOptions::default(), Overrides::default());
+        {
+            let g = solver.graph_mut();
+            for (loc, name) in [
+                ("", "root"),
+                ("node_modules/b-later-edge", "b-later-edge"),
+                ("node_modules/a-first-edge", "a-first-edge"),
+                ("node_modules/b-later-edge/node_modules/shared", "shared"),
+                ("node_modules/a-first-edge/node_modules/shared", "shared"),
+                ("node_modules/shared", "shared"),
+            ] {
+                g.add_node(
+                    loc.to_string(),
+                    Node {
+                        location: loc.to_string(),
+                        install_name: name.to_string(),
+                        name: name.to_string(),
+                        version: "1.0.0".to_string(),
+                        parsed_version: Some(Version::parse("1.0.0").unwrap()),
+                        ..Default::default()
+                    },
+                );
+            }
+            // Edge 0 is from a-first-edge; Edge 1 is from b-later-edge (whose candidate was indexed first).
+            g.add_edge(DependencyEdge {
+                from_location: "node_modules/a-first-edge".to_string(),
+                to_location: "node_modules/a-first-edge/node_modules/shared".to_string(),
+                install_name: "shared".to_string(),
+                package_name: "shared".to_string(),
+                spec: "^1.0.0".to_string(),
+                dep_type: DependencyType::Prod,
+            });
+            g.add_edge(DependencyEdge {
+                from_location: "node_modules/b-later-edge".to_string(),
+                to_location: "node_modules/b-later-edge/node_modules/shared".to_string(),
+                install_name: "shared".to_string(),
+                package_name: "shared".to_string(),
+                spec: "^1.0.0".to_string(),
+                dep_type: DependencyType::Prod,
+            });
+        }
+        let target = PackageTarget::Range(rnpm_core::semver::Range::parse("^1.0.0").unwrap());
+        solver.dedupe_nested_compatible_nodes("node_modules/shared", "shared", "shared", &target);
+        assert_eq!(
+            solver.graph().incoming_edges_by_location["node_modules/shared"],
+            vec![0, 1]
+        );
+        let placed_from = solver.placing_edge("node_modules/shared").unwrap().from;
+        assert!(matches!(
+            placed_from,
+            crate::explain::EdgeFrom::Node(ref loc) if loc == "node_modules/a-first-edge"
+        ));
     }
 }
