@@ -485,7 +485,7 @@ function Run-Scenario {
             Write-Host "  [harness] Simulating environmental system load on trial $Index ($InjectOutlierDelayMs ms)..." -ForegroundColor Yellow
             $coreCount = [Environment]::ProcessorCount
             for ($c = 0; $c -lt [Math]::Min(2, $coreCount); $c++) {
-                $p = Start-Process -FilePath "powershell.exe" -ArgumentList "-NoProfile -Command `"`$sw=[Diagnostics.Stopwatch]::StartNew(); while(`$sw.ElapsedMilliseconds -lt $InjectOutlierDelayMs){ [Math]::Sin(1.23) }`"" -PassThru
+                $p = Start-Process -FilePath "powershell.exe" -ArgumentList "-NoProfile -Command `"`$sw=[Diagnostics.Stopwatch]::StartNew(); while(`$sw.ElapsedMilliseconds -lt $InjectOutlierDelayMs){ [Math]::Sin(1.23) }`"" -WindowStyle Hidden -PassThru
                 $loadProcs += $p
             }
         }
@@ -502,7 +502,7 @@ function Run-Scenario {
         foreach ($lp in $loadProcs) {
             if (-not $lp.HasExited) {
                 Stop-Process -Id $lp.Id -Force -ErrorAction SilentlyContinue
-                $lp.WaitForExit(1000)
+                $null = $lp.WaitForExit(1000)
             }
         }
 

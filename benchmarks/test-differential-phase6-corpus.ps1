@@ -283,9 +283,11 @@ try {
     $auditTextLines = cmd.exe /c "cd /d `"$vulnDir`" && `"$RnpmPath`" audit --registry $RegistryUrl 2>&1"
     $auditText = $auditTextLines -join "`n"
     Assert-Condition ($auditText -match "# npm audit report") "Report header present"
-    Assert-Condition ($auditText -match "lodash\s+<4.17.21") "lodash range present"
+    Assert-Condition ($auditText -match '(?m)^lodash[ \t]+4\.17\.20$' -and
+        $auditJson.vulnerabilities.lodash.via.range -contains '<4.17.21') "lodash installed version and advisory range match npm's report"
     Assert-Condition ($auditText -match "Severity:\s+high") "High severity displayed"
-    Assert-Condition ($auditText -match "minimist\s+<1.2.6") "minimist range present"
+    Assert-Condition ($auditText -match '(?m)^minimist[ \t]+1\.2\.5$' -and
+        $auditJson.vulnerabilities.minimist.via.range -contains '<1.2.6') "minimist installed version and advisory range match npm's report"
     Assert-Condition ($auditText -match "Severity:\s+critical") "Critical severity displayed"
 
     # Audit level threshold tests
