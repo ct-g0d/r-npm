@@ -124,29 +124,59 @@ fn fast_validate_entry_path(path_str: &str) -> Result<(), rnpm_fs::FsError> {
     Ok(())
 }
 
+struct CountingSlice<'a> {
+    rem: &'a [u8],
+    read_bytes: Arc<AtomicU64>,
+}
+
+impl<'a> Read for CountingSlice<'a> {
+    #[inline]
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.rem.len().min(buf.len());
+        if n > 0 {
+            buf[..n].copy_from_slice(&self.rem[..n]);
+            self.rem = &self.rem[n..];
+            self.read_bytes.fetch_add(n as u64, Ordering::Relaxed);
+        }
+        Ok(n)
+    }
+}
+
+impl<'a> std::io::BufRead for CountingSlice<'a> {
+    #[inline]
+    fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
+        Ok(self.rem)
+    }
+
+    #[inline]
+    fn consume(&mut self, amt: usize) {
+        let n = amt.min(self.rem.len());
+        self.rem = &self.rem[n..];
+        self.read_bytes.fetch_add(n as u64, Ordering::Relaxed);
+    }
+}
+
 /// Enum reader avoiding Box<dyn Read> and double-buffering over &[u8] via flate2::bufread::GzDecoder.
 enum TarStreamReader<'a> {
-    Gz(BufReader<GzDecoder<&'a [u8]>>),
-    Raw(&'a [u8]),
+    Gz(Box<BufReader<GzDecoder<CountingSlice<'a>>>>),
+    Raw(CountingSlice<'a>),
 }
 
 impl<'a> TarStreamReader<'a> {
     #[inline]
-    fn new(tarball_bytes: &'a [u8]) -> Self {
-        if tarball_bytes.starts_with(&[0x1f, 0x8b]) {
-            Self::Gz(BufReader::with_capacity(16 * 1024, GzDecoder::new(tarball_bytes)))
-        } else {
-            Self::Raw(tarball_bytes)
-        }
-    }
-
-    #[inline]
-    fn compressed_bytes_read(&self, total_compressed_len: usize) -> u64 {
-        let rem = match self {
-            Self::Gz(r) => r.get_ref().get_ref().len(),
-            Self::Raw(s) => s.len(),
+    fn new(tarball_bytes: &'a [u8], read_bytes: Arc<AtomicU64>) -> Self {
+        let slice = CountingSlice {
+            rem: tarball_bytes,
+            read_bytes,
         };
-        total_compressed_len.saturating_sub(rem) as u64
+        if tarball_bytes.starts_with(&[0x1f, 0x8b]) {
+            Self::Gz(Box::new(BufReader::with_capacity(
+                16 * 1024,
+                GzDecoder::new(slice),
+            )))
+        } else {
+            Self::Raw(slice)
+        }
     }
 }
 
@@ -178,7 +208,10 @@ fn try_fast_strip_ascii_tar_path(bytes: &[u8]) -> Option<Option<&str>> {
     while let Some(rest) = s.strip_prefix("./") {
         s = rest;
     }
-    if s.is_empty() || s.starts_with('/') || (s.len() >= 2 && s.as_bytes()[1] == b':' && s.as_bytes()[0].is_ascii_alphabetic()) {
+    if s.is_empty()
+        || s.starts_with('/')
+        || (s.len() >= 2 && s.as_bytes()[1] == b':' && s.as_bytes()[0].is_ascii_alphabetic())
+    {
         return Some(None);
     }
     // Strip first normal component (package root like "package/")
@@ -187,11 +220,16 @@ fn try_fast_strip_ascii_tar_path(bytes: &[u8]) -> Option<Option<&str>> {
         return None;
     };
     let mut rest = &s[slash + 1..];
-    while let Some(r) = rest.strip_prefix("./") {
-        rest = r;
+    loop {
+        if let Some(r) = rest.strip_prefix("./") {
+            rest = r;
+        } else if let Some(r) = rest.strip_prefix('/') {
+            rest = r;
+        } else {
+            break;
+        }
     }
-    rest = rest.trim_start_matches('/');
-    // Trim trailing slashes for directory checks if needed; caller decides emptiness
+    // Trim trailing slashes; empty or "." yields no payload
     if rest.is_empty() || rest == "." {
         return None;
     }
@@ -200,6 +238,64 @@ fn try_fast_strip_ascii_tar_path(bytes: &[u8]) -> Option<Option<&str>> {
         return Some(None);
     }
     Some(Some(rest))
+}
+
+fn fallback_normalize_tar_path(
+    entry: &tar::Entry<'_, TarStreamReader<'_>>,
+    limits: &rnpm_fs::TarLimits,
+    saw_npmignores: &mut HashSet<String>,
+) -> Result<Option<String>, CacheError> {
+    let raw_path = entry.path().map_err(CacheError::Io)?.to_path_buf();
+    let mut relative_path = match rnpm_fs::strip_package_prefix(&raw_path) {
+        Some(p) => {
+            let cleaned: PathBuf = p
+                .components()
+                .filter(|c| !matches!(c, std::path::Component::CurDir))
+                .collect();
+            if cleaned.as_os_str().is_empty() {
+                return Ok(None);
+            }
+            cleaned
+        }
+        None => return Ok(None),
+    };
+    if relative_path.file_name() == Some(std::ffi::OsStr::new(".npmignore")) {
+        let s = relative_path.to_string_lossy().replace('\\', "/");
+        saw_npmignores.insert(s);
+    } else if relative_path.file_name() == Some(std::ffi::OsStr::new(".gitignore")) {
+        let ni = relative_path.with_file_name(".npmignore");
+        let ni_str = ni.to_string_lossy().replace('\\', "/");
+        if saw_npmignores.contains(&ni_str) {
+            return Ok(None);
+        }
+        relative_path = ni;
+    }
+    rnpm_fs::validate_entry_path(&relative_path).map_err(CacheError::Fs)?;
+    let path_depth = relative_path
+        .components()
+        .filter(|c| matches!(c, std::path::Component::Normal(_)))
+        .count();
+    if path_depth > limits.max_path_depth {
+        return Err(CacheError::Fs(rnpm_fs::FsError::TarBombLimitExceeded {
+            limit_type: "path depth".to_string(),
+            detail: format!(
+                "Path depth {} exceeded maximum allowed path depth of {}: '{}'",
+                path_depth,
+                limits.max_path_depth,
+                relative_path.display()
+            ),
+        }));
+    }
+    let clean_path = relative_path.to_string_lossy().replace('\\', "/");
+    let np = clean_path
+        .trim_start_matches("./")
+        .trim_start_matches('/')
+        .to_string();
+    if np.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(np))
+    }
 }
 
 #[inline]
@@ -1120,11 +1216,11 @@ impl PackStore {
             Ok(()) => Ok(fs::metadata(cas_path).ok().and_then(|m| mtime_to_timestamp(&m))),
             Err(_) => {
                 if let Ok(meta) = cas_path.metadata() {
-                    if meta.len() == data.len() as u64 {
-                        if fs::read(cas_path).is_ok_and(|existing| existing == data) {
-                            let _ = fs::remove_file(&tmp_path);
-                            return Ok(mtime_to_timestamp(&meta));
-                        }
+                    if meta.len() == data.len() as u64
+                        && fs::read(cas_path).is_ok_and(|existing| existing == data)
+                    {
+                        let _ = fs::remove_file(&tmp_path);
+                        return Ok(mtime_to_timestamp(&meta));
                     }
                 }
                 #[cfg(windows)]
@@ -1141,7 +1237,9 @@ impl PackStore {
                 let res = fs::rename(&tmp_path, cas_path);
                 if res.is_err() {
                     if let Ok(meta) = cas_path.metadata() {
-                        if meta.len() == data.len() as u64 {
+                        if meta.len() == data.len() as u64
+                            && fs::read(cas_path).is_ok_and(|existing| existing == data)
+                        {
                             let _ = fs::remove_file(&tmp_path);
                             return Ok(mtime_to_timestamp(&meta));
                         }
@@ -1524,7 +1622,10 @@ impl PackStore {
         let cas_dir = if has_cas { Some(self.cas_dir()) } else { None };
 
         for entry in &mut index.files {
-            if entry.sha256.is_none() {
+            let valid_sha = entry.sha256.as_deref().is_some_and(|s| {
+                s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit())
+            });
+            if !valid_sha {
                 let start = entry.offset as usize;
                 let end = start + entry.size as usize;
                 if end <= buf_data.len() {
@@ -1535,21 +1636,23 @@ impl PackStore {
                 }
             }
 
+            let Some(ref sha) = entry.sha256 else {
+                continue;
+            };
+            // Always derive CAS path from this store's cas_dir + validated SHA-256;
+            // never trust arbitrary deserialized paths from `.idx`.
+            let cas_file = match cas_dir.as_ref() {
+                Some(d) => d.join(&sha[0..2]).join(sha),
+                None => self.cas_file_path(sha),
+            };
+            if entry.cas_path.is_some() && entry.cas_path.as_ref() != Some(&cas_file) {
+                entry.cas_path = Some(cas_file.clone());
+            }
+
             if !has_cas {
                 entry.cas_verified = false;
                 continue;
             }
-
-            let Some(ref sha) = entry.sha256 else {
-                continue;
-            };
-            let cas_file = match entry.cas_path {
-                Some(ref existing) => existing.clone(),
-                None => {
-                    let prefix = if sha.len() >= 2 { &sha[0..2] } else { "00" };
-                    cas_dir.as_ref().unwrap().join(prefix).join(sha)
-                }
-            };
 
             let start = entry.offset as usize;
             let end = start.saturating_add(entry.size as usize);
@@ -1580,7 +1683,7 @@ impl PackStore {
                             if let Ok(bytes) = fs::read(&cas_file) {
                                 let digest = Sha256::digest(&bytes);
                                 let mut hex_buf = [0u8; 64];
-                                encode_hex_lower(&digest, &mut hex_buf) == sha.as_str()
+                                encode_hex_lower(&digest, &mut hex_buf).eq_ignore_ascii_case(sha)
                             } else {
                                 false
                             }
@@ -1596,15 +1699,19 @@ impl PackStore {
                                 self.set_cas_stamp(&cas_file, current_size, m);
                             }
                         } else if let Some(slice) = slice {
-                            let new_mt = Self::write_cas_file_with_mtime(&cas_file, slice, false)
-                                .ok()
-                                .flatten();
-                            if let Some(m) = new_mt {
-                                entry.cas_mtime = Some(m);
-                                self.set_cas_stamp(&cas_file, slice.len() as u64, m);
+                            match Self::write_cas_file_with_mtime(&cas_file, slice, false) {
+                                Ok(new_mt) => {
+                                    if let Some(m) = new_mt {
+                                        entry.cas_mtime = Some(m);
+                                        self.set_cas_stamp(&cas_file, slice.len() as u64, m);
+                                    }
+                                    entry.cas_verified = true;
+                                    index_updated = true;
+                                }
+                                Err(_) => {
+                                    entry.cas_verified = false;
+                                }
                             }
-                            entry.cas_verified = true;
-                            index_updated = true;
                         } else {
                             entry.cas_verified = false;
                         }
@@ -1794,8 +1901,7 @@ impl PackStore {
         }
 
         // Deduplicate input files by lowercased path, ensuring LAST entry wins
-        let mut seen_lower: HashMap<std::borrow::Cow<'_, str>, usize> =
-            HashMap::with_capacity(files.len());
+        let mut seen_lower: HashMap<String, usize> = HashMap::with_capacity(files.len());
         let mut deduped_files: Vec<(String, u32, &[u8])> = Vec::with_capacity(files.len());
         let mut total_size: usize = 0;
 
@@ -1823,22 +1929,30 @@ impl PackStore {
                 fast_validate_entry_path(&norm_path).map_err(CacheError::Fs)?;
             }
 
-            let lower_key: std::borrow::Cow<'_, str> =
-                if norm_path.bytes().any(|b| b.is_ascii_uppercase() || !b.is_ascii()) {
-                    std::borrow::Cow::Owned(norm_path.to_lowercase())
+            let needs_lower = norm_path.bytes().any(|b| b.is_ascii_uppercase() || !b.is_ascii());
+            let prev_idx = if needs_lower {
+                let lk = norm_path.to_lowercase();
+                if let Some(&idx) = seen_lower.get(&lk) {
+                    Some((idx, Some(lk)))
                 } else {
-                    std::borrow::Cow::Borrowed(file.path.as_str())
-                };
+                    None
+                }
+            } else if let Some(&idx) = seen_lower.get(norm_path.as_str()) {
+                Some((idx, None))
+            } else {
+                None
+            };
 
-            if let Some(&prev_idx) = seen_lower.get(lower_key.as_ref()) {
-                deduped_files[prev_idx] = (norm_path, file.mode, file.data);
+            if let Some((idx, _)) = prev_idx {
+                deduped_files[idx] = (norm_path, file.mode, file.data);
             } else {
                 total_size += file.data.len() + PACK_ALIGNMENT;
-                let idx = deduped_files.len();
-                let owned_key = match lower_key {
-                    std::borrow::Cow::Owned(s) => std::borrow::Cow::Owned(s),
-                    std::borrow::Cow::Borrowed(_) => std::borrow::Cow::Owned(norm_path.clone()),
+                let owned_key = if needs_lower {
+                    norm_path.to_lowercase()
+                } else {
+                    norm_path.clone()
                 };
+                let idx = deduped_files.len();
                 deduped_files.push((norm_path, file.mode, file.data));
                 seen_lower.insert(owned_key, idx);
             }
@@ -1892,7 +2006,7 @@ impl PackStore {
                 aligned_offset: aligned_offset as u64,
                 sha256: Some(sha),
                 cas_path,
-                cas_verified: populate_cas,
+                cas_verified: false,
                 cas_mtime: None,
             });
         }
@@ -2100,18 +2214,26 @@ impl PackStore {
             }
         });
 
+        let mut any_ok = false;
         for (entry, job_opt) in entries.iter_mut().zip(entry_job_idx) {
             if let Some(idx) = job_opt {
                 if ok_flags[idx].load(Ordering::Relaxed) {
+                    any_ok = true;
                     entry.cas_verified = true;
                     let mt = mtimes[idx].load(Ordering::Relaxed);
                     if mt != 0 {
                         entry.cas_mtime = Some(mt);
                     }
+                } else {
+                    entry.cas_verified = false;
                 }
+            } else {
+                entry.cas_verified = false;
             }
         }
-        self.has_cas_files.store(true, Ordering::Relaxed);
+        if any_ok {
+            self.has_cas_files.store(true, Ordering::Relaxed);
+        }
     }
 
     /// Extract a tarball into the pack store atomically.
@@ -2237,7 +2359,8 @@ impl PackStore {
         }
 
         let t_gz = std::time::Instant::now();
-        let mut archive = tar::Archive::new(TarStreamReader::new(tarball_bytes));
+        let compressed_read = Arc::new(AtomicU64::new(0));
+        let mut archive = tar::Archive::new(TarStreamReader::new(tarball_bytes, compressed_read));
 
         let limits = rnpm_fs::TarLimits::default();
         let build_pack = populate_cas || target_dir.is_none();
@@ -2313,53 +2436,10 @@ impl PackStore {
                     Some(Some(rel_str)) => {
                         let rel_trimmed = rel_str.trim_end_matches('/');
                         if rel_trimmed.is_empty() || rel_trimmed == "." || rel_str.ends_with('/') {
-                            // Empty after trim or trailing slash on a file -> fall back or skip
-                            let raw_path = entry.path().map_err(CacheError::Io)?.to_path_buf();
-                            let Some(mut relative_path) = rnpm_fs::strip_package_prefix(&raw_path)
-                            else {
-                                continue;
-                            };
-                            if relative_path.file_name() == Some(std::ffi::OsStr::new(".npmignore"))
-                            {
-                                let s = relative_path.to_string_lossy().replace('\\', "/");
-                                saw_npmignores.insert(s);
-                            } else if relative_path.file_name()
-                                == Some(std::ffi::OsStr::new(".gitignore"))
-                            {
-                                let ni = relative_path.with_file_name(".npmignore");
-                                let ni_str = ni.to_string_lossy().replace('\\', "/");
-                                if saw_npmignores.contains(&ni_str) {
-                                    continue;
-                                }
-                                relative_path = ni;
+                            match fallback_normalize_tar_path(&entry, &limits, &mut saw_npmignores)? {
+                                Some(np) => np,
+                                None => continue,
                             }
-                            rnpm_fs::validate_entry_path(&relative_path).map_err(CacheError::Fs)?;
-                            let path_depth = relative_path
-                                .components()
-                                .filter(|c| matches!(c, std::path::Component::Normal(_)))
-                                .count();
-                            if path_depth > limits.max_path_depth {
-                                return Err(CacheError::Fs(
-                                    rnpm_fs::FsError::TarBombLimitExceeded {
-                                        limit_type: "path depth".to_string(),
-                                        detail: format!(
-                                            "Path depth {} exceeded maximum allowed path depth of {}: '{}'",
-                                            path_depth,
-                                            limits.max_path_depth,
-                                            relative_path.display()
-                                        ),
-                                    },
-                                ));
-                            }
-                            let clean_path = relative_path.to_string_lossy().replace('\\', "/");
-                            let np = clean_path
-                                .trim_start_matches("./")
-                                .trim_start_matches('/')
-                                .to_string();
-                            if np.is_empty() {
-                                continue;
-                            }
-                            np
                         } else {
                             let is_ni = rel_trimmed == ".npmignore"
                                 || rel_trimmed.ends_with("/.npmignore");
@@ -2401,49 +2481,10 @@ impl PackStore {
                         }
                     }
                     Some(None) => {
-                        let raw_path = entry.path().map_err(CacheError::Io)?.to_path_buf();
-                        let Some(mut relative_path) = rnpm_fs::strip_package_prefix(&raw_path)
-                        else {
-                            continue;
-                        };
-                        if relative_path.file_name() == Some(std::ffi::OsStr::new(".npmignore")) {
-                            let s = relative_path.to_string_lossy().replace('\\', "/");
-                            saw_npmignores.insert(s);
-                        } else if relative_path.file_name()
-                            == Some(std::ffi::OsStr::new(".gitignore"))
-                        {
-                            let ni = relative_path.with_file_name(".npmignore");
-                            let ni_str = ni.to_string_lossy().replace('\\', "/");
-                            if saw_npmignores.contains(&ni_str) {
-                                continue;
-                            }
-                            relative_path = ni;
+                        match fallback_normalize_tar_path(&entry, &limits, &mut saw_npmignores)? {
+                            Some(np) => np,
+                            None => continue,
                         }
-                        rnpm_fs::validate_entry_path(&relative_path).map_err(CacheError::Fs)?;
-                        let path_depth = relative_path
-                            .components()
-                            .filter(|c| matches!(c, std::path::Component::Normal(_)))
-                            .count();
-                        if path_depth > limits.max_path_depth {
-                            return Err(CacheError::Fs(rnpm_fs::FsError::TarBombLimitExceeded {
-                                limit_type: "path depth".to_string(),
-                                detail: format!(
-                                    "Path depth {} exceeded maximum allowed path depth of {}: '{}'",
-                                    path_depth,
-                                    limits.max_path_depth,
-                                    relative_path.display()
-                                ),
-                            }));
-                        }
-                        let clean_path = relative_path.to_string_lossy().replace('\\', "/");
-                        let np = clean_path
-                            .trim_start_matches("./")
-                            .trim_start_matches('/')
-                            .to_string();
-                        if np.is_empty() {
-                            continue;
-                        }
-                        np
                     }
                 }
             };
@@ -2534,7 +2575,7 @@ impl PackStore {
                     aligned_offset: aligned_offset as u64,
                     sha256: Some(sha),
                     cas_path,
-                    cas_verified: populate_cas,
+                    cas_verified: false,
                     cas_mtime: None,
                 };
                 let lower_key = norm_path.to_lowercase();
@@ -2630,8 +2671,20 @@ impl PackStore {
         }
 
         if had_duplicates {
-            // Compact pack_bytes contiguously with 4 KiB alignment in entry order
-            let mut compacted = Vec::with_capacity(pack_bytes.len());
+            // S9: Allocate only the space needed for retained live entries + 4 KiB alignment,
+            // freeing any oversized pre-compaction buffer immediately.
+            let retained_size: usize = index_files
+                .iter()
+                .map(|entry| {
+                    let s = entry.size as usize;
+                    if s == 0 {
+                        0
+                    } else {
+                        (s + PACK_ALIGNMENT - 1) & !(PACK_ALIGNMENT - 1)
+                    }
+                })
+                .sum();
+            let mut compacted = Vec::with_capacity(retained_size);
             for entry in &mut index_files {
                 let start = entry.offset as usize;
                 let end = start + entry.size as usize;
@@ -2685,8 +2738,11 @@ impl PackStore {
         let clean_dest = clean(&verbatim_dest);
         let dest_exists = verbatim_dest.symlink_metadata().is_ok();
 
-        let compressed_len = tarball_bytes.len();
-        let mut archive = tar::Archive::new(TarStreamReader::new(tarball_bytes));
+        let compressed_counter = Arc::new(AtomicU64::new(0));
+        let mut archive = tar::Archive::new(TarStreamReader::new(
+            tarball_bytes,
+            Arc::clone(&compressed_counter),
+        ));
 
         let mut entry_count = 0usize;
         let mut total_uncompressed = 0u64;
@@ -2709,9 +2765,8 @@ impl PackStore {
         let mut saw_npmignores: HashSet<String> = HashSet::new();
 
         let pkg_id = Some(pkg_key.to_string());
-        let mut entries = archive.entries().map_err(CacheError::Io)?;
-
-        for entry_res in &mut entries {
+        let entries = archive.entries().map_err(CacheError::Io)?;
+        for entry_res in entries {
             let mut entry = entry_res.map_err(CacheError::Io)?;
             let entry_type = entry.header().entry_type();
 
@@ -2738,7 +2793,7 @@ impl PackStore {
                 }));
             }
 
-            let (fast_rel_or_fallback, raw_err_path): (Option<Result<String, ()>>, Option<PathBuf>) = {
+            let (fast_ok, raw_err_path, raw_str_owned): (bool, Option<PathBuf>, Option<String>) = {
                 let path_bytes = entry.path_bytes();
                 if path_bytes.contains(&0) {
                     return Err(CacheError::Fs(rnpm_fs::FsError::PathTraversal {
@@ -2758,41 +2813,9 @@ impl PackStore {
                     && !s.contains("//")
                     && !s.ends_with("/.");
                 if fast_ok {
-                    fast_validate_entry_path(s).map_err(CacheError::Fs)?;
-                    match try_fast_strip_ascii_tar_path(s.as_bytes()) {
-                        None => (None, None),
-                        Some(None) => (Some(Err(())), None),
-                        Some(Some(stripped)) => {
-                            let trimmed = stripped.trim_end_matches('/');
-                            if trimmed.is_empty() || trimmed == "." {
-                                (None, None)
-                            } else if entry_type.is_file() {
-                                if trimmed == ".npmignore" || trimmed.ends_with("/.npmignore") {
-                                    if !saw_npmignores.contains(trimmed) {
-                                        saw_npmignores.insert(trimmed.to_string());
-                                    }
-                                    (Some(Ok(trimmed.to_string())), None)
-                                } else if trimmed == ".gitignore" || trimmed.ends_with("/.gitignore")
-                                {
-                                    let prefix_len = trimmed.len() - ".gitignore".len();
-                                    let mut ni = String::with_capacity(prefix_len + 10);
-                                    ni.push_str(&trimmed[..prefix_len]);
-                                    ni.push_str(".npmignore");
-                                    if saw_npmignores.contains(&ni) {
-                                        (None, None)
-                                    } else {
-                                        (Some(Ok(ni)), None)
-                                    }
-                                } else {
-                                    (Some(Ok(trimmed.to_string())), None)
-                                }
-                            } else {
-                                (Some(Ok(trimmed.to_string())), None)
-                            }
-                        }
-                    }
+                    (true, None, Some(s.to_string()))
                 } else {
-                    (Some(Err(())), Some(PathBuf::from(s)))
+                    (false, Some(PathBuf::from(s)), None)
                 }
             };
 
@@ -2808,7 +2831,7 @@ impl PackStore {
                 false
             };
             if is_sparse || has_pax_sparse {
-                let p = match raw_err_path {
+                let p = match raw_err_path.or_else(|| raw_str_owned.map(PathBuf::from)) {
                     Some(p) => p,
                     None => entry.path().unwrap_or_default().to_path_buf(),
                 };
@@ -2816,6 +2839,44 @@ impl PackStore {
                     path: p,
                 }));
             }
+
+            let fast_rel_or_fallback: Option<Result<String, ()>> = if fast_ok {
+                let s = raw_str_owned.as_deref().unwrap();
+                fast_validate_entry_path(s).map_err(CacheError::Fs)?;
+                match try_fast_strip_ascii_tar_path(s.as_bytes()) {
+                    None => None,
+                    Some(None) => Some(Err(())),
+                    Some(Some(stripped)) => {
+                        let trimmed = stripped.trim_end_matches('/');
+                        if trimmed.is_empty() || trimmed == "." {
+                            None
+                        } else if entry_type.is_file() {
+                            if trimmed == ".npmignore" || trimmed.ends_with("/.npmignore") {
+                                if !saw_npmignores.contains(trimmed) {
+                                    saw_npmignores.insert(trimmed.to_string());
+                                }
+                                Some(Ok(trimmed.to_string()))
+                            } else if trimmed == ".gitignore" || trimmed.ends_with("/.gitignore") {
+                                let prefix_len = trimmed.len() - ".gitignore".len();
+                                let mut ni = String::with_capacity(prefix_len + 10);
+                                ni.push_str(&trimmed[..prefix_len]);
+                                ni.push_str(".npmignore");
+                                if saw_npmignores.contains(&ni) {
+                                    None
+                                } else {
+                                    Some(Ok(ni))
+                                }
+                            } else {
+                                Some(Ok(trimmed.to_string()))
+                            }
+                        } else {
+                            Some(Ok(trimmed.to_string()))
+                        }
+                    }
+                }
+            } else {
+                Some(Err(()))
+            };
 
             let Some(fast_or_fb) = fast_rel_or_fallback else {
                 continue;
@@ -3078,8 +3139,7 @@ impl PackStore {
                         }
                         rnpm_fs::validate_entry_path(&cleaned_target).map_err(CacheError::Fs)?;
 
-                        let source_full = verbatim_dest.join(&cleaned_target);
-                        let clean_source = clean(&source_full);
+                        let clean_source = clean(verbatim_dest.join(&cleaned_target));
                         if !clean_source.starts_with(&clean_dest) {
                             return Err(CacheError::Fs(rnpm_fs::FsError::EscapingSymlink {
                                 link: relative_path,
@@ -3128,7 +3188,7 @@ impl PackStore {
                         }
                         symlinks.retain(|(p, _)| p != &target_path);
                         hardlinks.retain(|(p, _)| p != &target_path);
-                        hardlinks.push((target_path, source_full));
+                        hardlinks.push((target_path, clean_source));
                     }
                 }
                 continue;
@@ -3176,10 +3236,11 @@ impl PackStore {
                 }
 
                 if total_uncompressed > 50_000 {
-                    let ratio = if compressed_len == 0 {
+                    let compressed_so_far = compressed_counter.load(Ordering::Relaxed);
+                    let ratio = if compressed_so_far == 0 {
                         f64::INFINITY
                     } else {
-                        total_uncompressed as f64 / compressed_len as f64
+                        total_uncompressed as f64 / compressed_so_far as f64
                     };
                     if ratio > limits.max_compression_ratio {
                         return Err(CacheError::Fs(rnpm_fs::FsError::TarBombLimitExceeded {
@@ -3225,8 +3286,7 @@ impl PackStore {
                 }
             }
         }
-        drop(entries);
-        let compressed_bytes = archive.into_inner().compressed_bytes_read(compressed_len);
+        let compressed_bytes = compressed_counter.load(Ordering::Relaxed);
         if total_uncompressed > 50_000 {
             let ratio = if compressed_bytes == 0 {
                 f64::INFINITY
@@ -5092,5 +5152,177 @@ mod tests {
             fs::read(missing_cas_target.join("index.js")).unwrap(),
             b"module.exports = 42;"
         );
+    }
+
+    #[test]
+    fn test_tampered_idx_cas_path_ignored_and_confined_to_store() {
+        let dir = tempdir().unwrap();
+        let store = PackStore::new(dir.path().join("store")).unwrap();
+        let outside_victim = dir.path().join("outside_victim.txt");
+        fs::write(&outside_victim, b"DO_NOT_OVERWRITE_SECRET").unwrap();
+
+        let payload = b"legit-cas-file-payload-bytes";
+        let integrity = "sha512-tampered-cas-path-test==";
+        store
+            .put_package_pack(
+                integrity,
+                &[PackInputFile::new("index.js", 0o644, payload)],
+            )
+            .unwrap();
+
+        // Tamper .idx on disk so entry.cas_path points outside cas_dir
+        let idx_path = store.idx_path(integrity);
+        let mut idx = PackIndex::from_bytes(&fs::read(&idx_path).unwrap()).unwrap();
+        idx.files[0].cas_path = Some(outside_victim.clone());
+        idx.files[0].cas_mtime = Some(1); // force stamp mismatch -> repair path
+        fs::write(&idx_path, idx.to_bytes().unwrap()).unwrap();
+
+        store.clear_mmap_cache();
+        let loaded = store.get_package_pack(integrity).unwrap().unwrap();
+
+        assert_eq!(
+            fs::read(&outside_victim).unwrap(),
+            b"DO_NOT_OVERWRITE_SECRET",
+            "Tampered entry.cas_path in .idx must NEVER cause reads/writes outside store.cas_dir()"
+        );
+        let resolved_cas = loaded.index.files[0].cas_path.as_ref().unwrap();
+        assert!(resolved_cas.starts_with(store.cas_dir()));
+    }
+
+    #[test]
+    fn test_put_package_pack_normalizes_and_deduplicates_mixed_prefixes() {
+        let dir = tempdir().unwrap();
+        let store = PackStore::new(dir.path().join("store")).unwrap();
+        let integrity = "sha512-norm-dedup-mixed-prefixes==";
+        let files = [
+            PackInputFile::new("foo/bar.js", 0o644, b"first"),
+            PackInputFile::new("./foo/bar.js", 0o644, b"second"),
+            PackInputFile::new("././foo/bar.js", 0o644, b"third"),
+            PackInputFile::new("foo\\bar.js", 0o644, b"fourth-winner"),
+        ];
+        let idx = store.put_package_pack_deferred(integrity, &files).unwrap();
+        assert_eq!(idx.files.len(), 1);
+        assert_eq!(idx.files[0].path, "foo/bar.js");
+
+        // Leading '/' must still be rejected as an absolute path.
+        let abs_err = store
+            .put_package_pack_deferred(integrity, &[PackInputFile::new("/foo/bar.js", 0o644, b"bad")])
+            .unwrap_err();
+        assert!(matches!(abs_err, CacheError::Fs(rnpm_fs::FsError::AbsolutePath { .. })));
+
+        store.clear_mmap_cache();
+        let pack = store.get_package_pack(integrity).unwrap().unwrap();
+        assert_eq!(pack.get_file_slice("foo/bar.js").unwrap(), b"fourth-winner");
+    }
+
+    #[test]
+    fn test_put_package_from_tarball_duplicate_compaction_bounded_size() {
+        let dir = tempdir().unwrap();
+        let store = PackStore::new(dir.path().join("store")).unwrap();
+
+        let big_old = vec![b'A'; 128 * 1024];
+        let small_new = b"tiny-final-content";
+        let mut gz = GzEncoder::new(Vec::new(), Compression::fast());
+        {
+            let mut tar = tar::Builder::new(&mut gz);
+            for path in ["package/sub/data.bin", "package/sub/./data.bin"] {
+                let mut h = tar::Header::new_gnu();
+                h.set_size(big_old.len() as u64);
+                h.set_mode(0o644);
+                h.set_cksum();
+                tar.append_data(&mut h, path, &big_old[..]).unwrap();
+            }
+            let mut h_final = tar::Header::new_gnu();
+            h_final.set_size(small_new.len() as u64);
+            h_final.set_mode(0o644);
+            h_final.set_cksum();
+            tar.append_data(&mut h_final, "package//./sub/data.bin", &small_new[..])
+                .unwrap();
+            tar.finish().unwrap();
+        }
+        let tgz = gz.finish().unwrap();
+        let integrity = rnpm_core::Integrity::from_bytes(&tgz, Algorithm::Sha512).to_string();
+
+        let idx = store.put_package_from_tarball(&integrity, &tgz).unwrap();
+        assert_eq!(idx.files.len(), 1);
+        assert_eq!(idx.files[0].path, "sub/data.bin");
+        assert!(
+            idx.total_pack_size <= PACK_ALIGNMENT as u64,
+            "Compacted pack size {} must match retained live entry (<= 4096), not 256KB+ discarded duplicates",
+            idx.total_pack_size
+        );
+        let pack_disk_len = fs::metadata(store.pack_path(&integrity)).unwrap().len();
+        assert_eq!(pack_disk_len, PACK_ALIGNMENT as u64);
+
+        store.clear_mmap_cache();
+        let pack = store.get_package_pack(&integrity).unwrap().unwrap();
+        assert_eq!(pack.get_file_slice("sub/data.bin").unwrap(), small_new);
+    }
+
+    #[test]
+    fn test_decode_package_tarball_subdirectory_hardlink_and_gitignore_curdir() {
+        let mut gz = GzEncoder::new(Vec::new(), Compression::fast());
+        {
+            let mut tar = tar::Builder::new(&mut gz);
+            let target_bytes = b"export const ok = true;\n";
+            let mut h1 = tar::Header::new_gnu();
+            h1.set_size(target_bytes.len() as u64);
+            h1.set_mode(0o644);
+            h1.set_cksum();
+            tar.append_data(&mut h1, "package/lib/src/target.js", &target_bytes[..])
+                .unwrap();
+
+            let mut hl = tar::Header::new_gnu();
+            hl.set_entry_type(tar::EntryType::Link);
+            hl.set_size(0);
+            hl.set_mode(0o644);
+            hl.set_cksum();
+            tar.append_link(&mut hl, "package/lib/src/alias.js", "package/lib/src/target.js")
+                .unwrap();
+
+            let ni = b"ignore-me\n";
+            let mut h_ni = tar::Header::new_gnu();
+            h_ni.set_size(ni.len() as u64);
+            h_ni.set_mode(0o644);
+            h_ni.set_cksum();
+            tar.append_data(&mut h_ni, "package/sub/./.npmignore", &ni[..])
+                .unwrap();
+
+            let gi = b"git-ignore-should-not-win\n";
+            let mut h_gi = tar::Header::new_gnu();
+            h_gi.set_size(gi.len() as u64);
+            h_gi.set_mode(0o644);
+            h_gi.set_cksum();
+            tar.append_data(&mut h_gi, "package/sub/.gitignore", &gi[..])
+                .unwrap();
+
+            tar.finish().unwrap();
+        }
+        let tgz = gz.finish().unwrap();
+
+        let dir = tempdir().unwrap();
+        let target_dir = dir.path().join("pkg");
+        let decoded = PackStore::decode_package_tarball(&tgz, &target_dir, "pkg").unwrap();
+
+        let alias_file = decoded
+            .files
+            .iter()
+            .find(|f| f.path.ends_with("alias.js"))
+            .expect("subdirectory hardlink must resolve across platforms");
+        assert_eq!(alias_file.data.as_slice(), b"export const ok = true;\n");
+
+        let npmignore_file = decoded
+            .files
+            .iter()
+            .find(|f| f.path.ends_with(".npmignore"))
+            .expect(".npmignore must be retained");
+        assert_eq!(npmignore_file.data.as_slice(), b"ignore-me\n");
+
+        // Verify put_package_from_tarball_deferred also preserves sub/.npmignore over sub/.gitignore
+        let store = PackStore::new(dir.path().join("store")).unwrap();
+        let integ = rnpm_core::Integrity::from_bytes(&tgz, Algorithm::Sha512).to_string();
+        store.put_package_from_tarball_deferred(&integ, &tgz).unwrap();
+        let pack = store.get_package_pack(&integ).unwrap().unwrap();
+        assert_eq!(pack.get_file_slice("sub/.npmignore").unwrap(), b"ignore-me\n");
     }
 }

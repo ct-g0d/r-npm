@@ -257,7 +257,7 @@ fn bench_rnpm_cache_hot_paths() {
     }
     let large_tarball_pack_ms = t0.elapsed().as_secs_f64() * 1000.0;
 
-    // 14. PackStore: cold disk has_package_pack + get_package_pack across 16 threads (mmap_cache cleared)
+    // 14. PackStore: cold disk has_package_pack + get_package_pack across 8 threads (mmap_cache cleared)
     store.clear_mmap_cache();
     let t0 = Instant::now();
     for _ in 0..3 {

@@ -47,14 +47,16 @@ impl CacheLock {
         let start = Instant::now();
         let mut attempt = 0u64;
         let mut delay = Duration::from_micros(300);
+        let pid_mix = (std::process::id() as u64).wrapping_mul(2654435761);
 
         loop {
             attempt += 1;
-            match Self::try_acquire_exclusive_inner(path, false)? {
+            match Self::try_acquire_exclusive_inner(path, true)? {
                 Some(lock) => return Ok(lock),
                 None => {
-                    // Check if current lock owner process has died; if so, break and reclaim stale lock immediately
-                    if attempt == 1 || attempt.is_multiple_of(8) {
+                    // Check if current lock owner process has died; delay past initial yield
+                    // attempts so a new holder finishing its PID write is not preempted.
+                    if attempt == 3 || attempt.is_multiple_of(8) {
                         if let Some(pid) = Self::read_lock_pid(path) {
                             if !is_process_alive(pid) {
                                 warn!(
@@ -95,7 +97,7 @@ impl CacheLock {
                     if attempt <= 2 {
                         std::thread::yield_now();
                     } else {
-                        let jitter_us = (attempt * 97) % 400;
+                        let jitter_us = pid_mix.wrapping_add(attempt.wrapping_mul(97)) % 400;
                         let remaining = timeout.saturating_sub(elapsed);
                         let sleep_dur = (delay + Duration::from_micros(jitter_us)).min(remaining);
                         sleep(sleep_dur);
@@ -219,7 +221,7 @@ impl CacheLock {
         false
     }
 
-    /// Attempt to recover a stale lock by removing or truncating an abandoned lock file.
+    /// Attempt to recover a stale lock by reclaiming or removing an abandoned lock file.
     pub fn force_recover_stale_lock(path: &Path) -> Result<Option<Self>, std::io::Error> {
         #[cfg(windows)]
         if let Ok(meta) = std::fs::metadata(path) {
@@ -228,6 +230,10 @@ impl CacheLock {
                 perms.set_readonly(false);
                 let _ = std::fs::set_permissions(path, perms);
             }
+        }
+
+        if let Some(lock) = Self::try_acquire_exclusive(path)? {
+            return Ok(Some(lock));
         }
 
         let _ = std::fs::remove_file(path);

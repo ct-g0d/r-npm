@@ -1554,4 +1554,94 @@ mod tests {
         let legacy_read = cache.get_by_sha512(&entry.sha512_hex).unwrap();
         assert_eq!(legacy_read.as_deref(), Some(&data[..]));
     }
+
+    #[test]
+    fn test_purge_key_cleans_coexisting_legacy_index_and_blob() {
+        let dir = tempdir().unwrap();
+        let cache = Cache::new(dir.path()).unwrap();
+        let key = "https://registry.npmjs.org/legacy-resurrect/-/legacy-resurrect-1.0.0.tgz";
+        let v1_data = b"stale-v1-payload";
+        let v1_entry = cache.put(key, v1_data, None).unwrap();
+
+        let npm_idx = IndexEntry::path_for_key(dir.path(), key);
+        let mut hex_buf = [0u8; 64];
+        let key_hash = crate::index::sha256_hex_stack(key.as_bytes(), &mut hex_buf);
+        let mut legacy_idx = npm_idx.clone();
+        legacy_idx.set_file_name(key_hash);
+        std::fs::rename(&npm_idx, &legacy_idx).unwrap();
+        assert!(legacy_idx.exists());
+
+        // Overwrite with V2 (writes npm_idx) and then purge_key: V1 must NOT resurrect.
+        let v2_data = b"updated-v2-payload";
+        let v2_entry = cache.put(key, v2_data, None).unwrap();
+        assert!(npm_idx.exists());
+        assert!(legacy_idx.exists());
+
+        cache.purge_key(key).unwrap();
+        assert!(!npm_idx.exists());
+        assert!(!legacy_idx.exists());
+        assert!(cache.get(key).unwrap().is_none());
+        assert!(cache.get_by_sha512(&v2_entry.sha512_hex).unwrap().is_none());
+        assert!(cache.get_by_sha512(&v1_entry.sha512_hex).unwrap().is_some());
+    }
+
+    #[test]
+    fn test_put_file_with_integrity_repairs_corrupt_same_size_and_checks_non_sha512() {
+        let dir = tempdir().unwrap();
+        let cache = Cache::new(dir.path()).unwrap();
+        let src = dir.path().join("src.tgz");
+        let payload = b"valid-file-stream-content-12345";
+        std::fs::write(&src, payload).unwrap();
+
+        // Non-SHA-512 integrity mismatch must fail
+        let wrong_sha256 = Integrity::from_bytes(b"different", Algorithm::Sha256);
+        let err = cache
+            .put_file_with_integrity("sha256-mismatch-key", &src, Some(&wrong_sha256), None)
+            .unwrap_err();
+        assert!(matches!(err, CacheError::IntegrityMismatch { .. }));
+
+        // Pre-populate destination with a same-size corrupted blob before calling put_file_with_integrity
+        let expected_sha512 = Integrity::from_bytes(payload, Algorithm::Sha512);
+        let digest_hex = expected_sha512.entries[0]
+            .digest
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>();
+        let blob_path = cache.blob_path(&digest_hex);
+        std::fs::create_dir_all(blob_path.parent().unwrap()).unwrap();
+        std::fs::write(&blob_path, vec![b'X'; payload.len()]).unwrap();
+
+        let entry = cache
+            .put_file_with_integrity("repair-same-size-key", &src, Some(&expected_sha512), None)
+            .unwrap();
+        let (_, stored) = cache.get("repair-same-size-key").unwrap().unwrap();
+        assert_eq!(stored, payload);
+        assert_eq!(entry.size, payload.len() as u64);
+    }
+
+    #[test]
+    fn test_get_corrupt_non_ascii_sha512_hex_index_does_not_panic() {
+        let dir = tempdir().unwrap();
+        let cache = Cache::new(dir.path()).unwrap();
+        let key = "https://registry.npmjs.org/bad-utf8-hex/-/bad-utf8-hex-1.0.0.tgz";
+        let integ = Integrity::from_bytes(b"hello", Algorithm::Sha512);
+        let npm_idx = IndexEntry::path_for_key(dir.path(), key);
+        std::fs::create_dir_all(npm_idx.parent().unwrap()).unwrap();
+
+        let bad_entry = IndexEntry {
+            key: key.to_string(),
+            integrity: integ.to_string(),
+            // 2-byte UTF-8 char at byte boundary 1..3 so &[0..2] would panic if unguarded
+            sha512_hex: "aé".repeat(32),
+            size: 5,
+            time: 0,
+            metadata: None,
+        };
+        let json = serde_json::to_string(&bad_entry).unwrap();
+        std::fs::write(&npm_idx, format!("0000000000000000000000000000000000000000\t{json}\n"))
+            .unwrap();
+
+        assert!(cache.get(key).unwrap().is_none());
+        assert!(cache.get_blob_path(key).unwrap().is_none());
+    }
 }
