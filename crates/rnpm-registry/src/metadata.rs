@@ -572,16 +572,6 @@ fn fast_http_tarball_origin_end(s: &str) -> Option<usize> {
     }
 }
 
-/// Fast-path validation for standard canonical lowercase `http://`/`https://` ASCII URLs
-/// (no IDNA/punycode, no percent escapes, no query/fragment, alphabetic TLD label, valid port).
-/// Returns `false` for anything unusual so callers fall back to full `Url::parse` parity.
-#[cfg(test)]
-#[inline]
-#[allow(dead_code)]
-fn is_fast_valid_http_tarball_url(s: &str) -> bool {
-    fast_http_tarball_origin_end(s).is_some()
-}
-
 impl AbbreviatedPackageMetadata {
     /// Validates the packument according to Byzantine registry hardening rules:
     /// 1. Reject CR/LF characters in package name, dist-tag names, and target versions.

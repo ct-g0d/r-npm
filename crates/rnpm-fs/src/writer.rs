@@ -802,6 +802,12 @@ pub fn write_file_fast_wide_raw(
     prealloc_threshold: usize,
     record_stats: bool,
 ) -> std::io::Result<()> {
+    if path_wide.last() != Some(&0) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "path_wide must be NUL-terminated",
+        ));
+    }
     write_file_fast_wide(path_wide, path_hint, data, mode, prealloc_threshold, record_stats)
 }
 
@@ -814,6 +820,7 @@ pub(crate) fn write_file_fast_wide(
     _prealloc_threshold: usize,
     record_stats: bool,
 ) -> std::io::Result<()> {
+    debug_assert_eq!(path_wide.last().copied(), Some(0));
     extern "system" {
         fn CreateFileW(
             lpFileName: *const u16,
@@ -2541,4 +2548,25 @@ pub fn extract_packages_direct_parallel<R: Read + Send>(
             })
         })
         .collect()
+}
+
+#[cfg(all(test, windows))]
+mod write_wide_raw_tests {
+    use super::*;
+    use std::os::windows::ffi::OsStrExt;
+
+    #[test]
+    fn write_file_fast_wide_raw_rejects_missing_nul_terminator() {
+        let dir = tempfile::tempdir().unwrap();
+        let hint = dir.path().join("x.txt");
+
+        let empty: &[u16] = &[];
+        let err = write_file_fast_wide_raw(empty, &hint, b"hi", 0o644, 0, false).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+
+        let unterminated: Vec<u16> = hint.as_os_str().encode_wide().collect();
+        let err =
+            write_file_fast_wide_raw(&unterminated, &hint, b"hi", 0o644, 0, false).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    }
 }
