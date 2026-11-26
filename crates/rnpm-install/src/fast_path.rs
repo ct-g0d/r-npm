@@ -357,7 +357,7 @@ pub(crate) fn validate_hidden_lockfile_loaded(
 
     // Verify root package.json if present on disk
     let pkg_json_path = project_dir.join("package.json");
-    let root_manifest = match std::fs::read(&pkg_json_path) {
+    let (root_manifest, root_may_have_overrides) = match std::fs::read(&pkg_json_path) {
         Ok(bytes) => {
             if let Ok(meta) = std::fs::symlink_metadata(&pkg_json_path) {
                 if let Ok(mtime) = meta.modified() {
@@ -370,9 +370,10 @@ pub(crate) fn validate_hidden_lockfile_loaded(
                     }
                 }
             }
-            Manifest::from_slice_readonly(&bytes).ok()
+            let has_overrides = bytes.windows(9).any(|w| w == b"overrides");
+            (Manifest::from_slice_readonly(&bytes).ok(), has_overrides)
         }
-        Err(_) => None,
+        Err(_) => (None, false),
     };
 
     if let (Some(manifest), Some(root_pkg)) = (&root_manifest, lockfile.packages.get("")) {
@@ -511,20 +512,59 @@ pub(crate) fn validate_hidden_lockfile_loaded(
             }
         }
     } else if let Some(manifest) = &root_manifest {
-        for name in manifest.dependencies.keys() {
+        let check_direct_spec = |key: &str, name: &str, spec: &str| -> bool {
+            if root_may_have_overrides || platform_skipped.contains(key) {
+                return true;
+            }
+            let Some(pkg) = lockfile.packages.get(key) else {
+                return true;
+            };
+            if pkg.link == Some(true) || pkg.name.as_deref().is_some_and(|n| n != name) {
+                return true;
+            }
+            let Some(ver_str) = pkg.version.as_deref() else {
+                return true;
+            };
+            if let (Ok(range), Ok(ver)) = (
+                rnpm_core::semver::Range::parse(spec),
+                rnpm_core::semver::Version::parse(ver_str),
+            ) {
+                if !range.satisfies(&ver) {
+                    debug!(
+                        "Hidden lockfile invalid: installed {}@{} does not satisfy package.json spec '{}'",
+                        name, ver_str, spec
+                    );
+                    return false;
+                }
+            }
+            true
+        };
+
+        for (name, spec) in &manifest.dependencies {
             if manifest.optional_dependencies.contains_key(name) {
                 continue;
             }
-            direct_top_level_deps.insert(format!("node_modules/{name}"));
+            let key = format!("node_modules/{name}");
+            if !check_direct_spec(&key, name, spec) {
+                return None;
+            }
+            direct_top_level_deps.insert(key);
         }
         if !omit_dev {
-            for name in manifest.dev_dependencies.keys() {
-                direct_top_level_deps.insert(format!("node_modules/{name}"));
+            for (name, spec) in &manifest.dev_dependencies {
+                let key = format!("node_modules/{name}");
+                if !check_direct_spec(&key, name, spec) {
+                    return None;
+                }
+                direct_top_level_deps.insert(key);
             }
         }
         if !omit_optional {
-            for name in manifest.optional_dependencies.keys() {
+            for (name, spec) in &manifest.optional_dependencies {
                 let key = format!("node_modules/{name}");
+                if !check_direct_spec(&key, name, spec) {
+                    return None;
+                }
                 direct_top_level_deps.insert(key.clone());
                 optional_or_opt_peer_direct_deps.insert(key);
             }
