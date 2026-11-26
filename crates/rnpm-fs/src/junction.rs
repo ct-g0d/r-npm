@@ -2,6 +2,8 @@ use crate::error::FsError;
 use path_clean::clean;
 use std::fs;
 use std::path::Path;
+#[cfg(not(windows))]
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 static JUNCTIONS_CREATED: AtomicU64 = AtomicU64::new(0);
@@ -325,20 +327,9 @@ fn remove_file_safe(path: &Path, meta: Option<&fs::Metadata>) -> Result<(), FsEr
     }
 }
 
-/// Helper to remove an empty directory, clearing read-only attributes on Windows and retrying on transient locks.
+/// Helper to remove an empty directory on non-Windows targets, retrying on transient errors.
 #[cfg(not(windows))]
 fn remove_dir_safe(path: &Path) -> Result<(), FsError> {
-    #[cfg(windows)]
-    {
-        if let Ok(meta) = fs::symlink_metadata(path) {
-            let mut perms = meta.permissions();
-            if perms.readonly() {
-                perms.set_readonly(false);
-                let _ = fs::set_permissions(path, perms);
-            }
-        }
-    }
-
     let mut attempts = 0;
     let mut delay = std::time::Duration::from_millis(5);
     loop {
@@ -732,6 +723,26 @@ mod win_rm {
         }
 
         if !stack.is_empty() {
+            struct ActiveGuard<'a> {
+                state: &'a Mutex<QueueState>,
+                cvar: &'a Condvar,
+                armed: bool,
+            }
+            impl Drop for ActiveGuard<'_> {
+                fn drop(&mut self) {
+                    if self.armed {
+                        let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                        guard.active = guard.active.saturating_sub(1);
+                        if guard.error.is_none() {
+                            guard.error = Some(FsError::Io(std::io::Error::other(
+                                "Directory removal worker panicked",
+                            )));
+                        }
+                        self.cvar.notify_all();
+                    }
+                }
+            }
+
             let num_threads = std::thread::available_parallelism()
                 .map(|n| n.get())
                 .unwrap_or(4)
@@ -754,7 +765,7 @@ mod win_rm {
 
                         loop {
                             let dir = {
-                                let mut guard = state_ref.lock().unwrap();
+                                let mut guard = state_ref.lock().unwrap_or_else(|e| e.into_inner());
                                 loop {
                                     if guard.error.is_some() {
                                         break None;
@@ -767,19 +778,26 @@ mod win_rm {
                                         cvar_ref.notify_all();
                                         break None;
                                     }
-                                    guard = cvar_ref.wait(guard).unwrap();
+                                    guard = cvar_ref.wait(guard).unwrap_or_else(|e| e.into_inner());
                                 }
                             };
                             let Some(dir) = dir else {
                                 break;
                             };
 
+                            let mut active_guard = ActiveGuard {
+                                state: state_ref,
+                                cvar: cvar_ref,
+                                armed: true,
+                            };
+
                             local_subs.clear();
                             let res =
                                 scan_and_unlink_dir(dir, &mut p_buf, &mut c_buf, &mut local_subs);
 
-                            let mut guard = state_ref.lock().unwrap();
-                            guard.active -= 1;
+                            let mut guard = state_ref.lock().unwrap_or_else(|e| e.into_inner());
+                            guard.active = guard.active.saturating_sub(1);
+                            active_guard.armed = false;
                             match res {
                                 Ok(()) => {
                                     if !local_subs.is_empty() {
@@ -804,7 +822,7 @@ mod win_rm {
                 }
             });
 
-            let st = state.into_inner().unwrap();
+            let st = state.into_inner().unwrap_or_else(|e| e.into_inner());
             if let Some(err) = st.error {
                 return Err(err);
             }
@@ -906,7 +924,11 @@ pub fn remove_dir_all_safe(path: &Path) -> Result<(), FsError> {
         if total_unlinks < 32 {
             for (p, is_sym) in unlinks {
                 if is_sym {
-                    let _ = fs::remove_file(&p);
+                    match fs::remove_file(&p) {
+                        Ok(()) => {}
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(e) => return Err(FsError::Io(e)),
+                    }
                 } else {
                     remove_file_safe(&p, None)?;
                 }

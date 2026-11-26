@@ -678,7 +678,7 @@ where
             .iter()
             .map(|_| std::sync::atomic::AtomicUsize::new(0))
             .collect();
-        let barrier = LevelBarrier::new();
+        let barrier = std::sync::Barrier::new(num_threads);
 
         std::thread::scope(|scope| {
             for _ in 0..num_threads {
@@ -702,7 +702,7 @@ where
                             }
                         }
                         if idx + 1 < levels.len() {
-                            barrier.wait(num_threads);
+                            barrier.wait();
                         }
                     }
                 });
@@ -944,11 +944,10 @@ fn write_file_fast_impl(
 }
 
 /// Writes a single file using native OS primitives:
-/// - Verbatim `\\?\` path formatting to bypass MAX_PATH limit
-/// - Direct handle creation with `CREATE_NEW` fast path
-/// - Preallocation for files >= 64 KiB using `FileAllocationInfo`
-/// - Single cheap write straight from memory
-/// - `CloseHandle` without per-file `fsync`
+/// - Verbatim `\\?\` path formatting on Windows to bypass MAX_PATH limit
+/// - Exclusive creation (`CREATE_NEW` / `O_EXCL`) fast path with unlink-and-recreate on collision
+/// - Optional length preallocation (`set_len`) on non-Windows targets
+/// - Single cheap write straight from memory without per-file `fsync`
 pub fn write_file_fast(
     path: &Path,
     data: &[u8],
@@ -1078,7 +1077,32 @@ pub fn copy_file_fast(source: &Path, destination: &Path) -> std::io::Result<()> 
 
     #[cfg(not(windows))]
     {
-        std::fs::copy(source, destination).map(|_| ())
+        let mut src = std::fs::File::open(source)?;
+        let mut dst = match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(destination)
+        {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                unlink_target_path(destination);
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(destination)?
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                if let Some(parent) = destination.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(destination)?
+            }
+            Err(e) => return Err(e),
+        };
+        std::io::copy(&mut src, &mut dst).map(|_| ())
     }
 }
 
@@ -1164,20 +1188,20 @@ pub fn repair_cas_file(path: &Path, data: &[u8], mode: u32, prealloc_threshold: 
         && std::fs::rename(&tmp_path, path).is_err()
     {
         // Check if another concurrent thread already placed a valid file
-            if let Ok(meta) = std::fs::metadata(path) {
-                if meta.len() == data.len() as u64 {
-                    let _ = std::fs::remove_file(&tmp_path);
-                    return;
-                }
+        if let Ok(meta) = std::fs::metadata(path) {
+            if meta.len() == data.len() as u64 {
+                let _ = std::fs::remove_file(&tmp_path);
+                return;
             }
-            #[cfg(windows)]
-            if let Ok(meta) = std::fs::metadata(path) {
-                let mut perms = meta.permissions();
-                if perms.readonly() {
-                    perms.set_readonly(false);
-                    let _ = std::fs::set_permissions(path, perms);
-                }
+        }
+        #[cfg(windows)]
+        if let Ok(meta) = std::fs::metadata(path) {
+            let mut perms = meta.permissions();
+            if perms.readonly() {
+                perms.set_readonly(false);
+                let _ = std::fs::set_permissions(path, perms);
             }
+        }
         let _ = std::fs::remove_file(path);
         let _ = std::fs::rename(&tmp_path, path);
         let _ = std::fs::remove_file(&tmp_path);

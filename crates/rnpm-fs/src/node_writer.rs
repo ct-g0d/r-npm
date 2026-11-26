@@ -521,9 +521,21 @@ impl NodeWriterWorker {
                 match msg {
                     NodeWriterMsg::File { path, data, mode } => {
                         let path_bytes = path.as_bytes();
-                        hdr[0..4].copy_from_slice(&(path_bytes.len() as u32).to_le_bytes());
+                        let Ok(path_len) = u32::try_from(path_bytes.len()) else {
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::InvalidInput,
+                                "NodeWriter path exceeds u32::MAX bytes",
+                            ));
+                        };
+                        let Ok(data_len) = u32::try_from(data.len()) else {
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::InvalidInput,
+                                "NodeWriter file payload exceeds u32::MAX bytes",
+                            ));
+                        };
+                        hdr[0..4].copy_from_slice(&path_len.to_le_bytes());
                         hdr[4..8].copy_from_slice(&mode.to_le_bytes());
-                        hdr[8..12].copy_from_slice(&(data.len() as u32).to_le_bytes());
+                        hdr[8..12].copy_from_slice(&data_len.to_le_bytes());
                         if let Err(e) = stdin.write_all(&hdr) {
                             eprintln!("[NODE_WRITER_ERR] write hdr: {e}");
                             return Err(e);
