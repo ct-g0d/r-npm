@@ -1,7 +1,9 @@
 use crate::error::FsError;
 use path_clean::clean;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(not(windows))]
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 static JUNCTIONS_CREATED: AtomicU64 = AtomicU64::new(0);
@@ -86,26 +88,24 @@ fn compute_relative_symlink_target(from_dir: &Path, target: &Path) -> Option<std
 /// Create a non-admin directory junction on Windows, or a relative POSIX symlink on Unix
 /// (matching npm's `@npmcli/arborist` `symlink(relative(dirname(link), target), link, 'junction')`).
 pub fn create_junction(link: &Path, target: &Path) -> Result<(), FsError> {
-    if let Some(parent) = link.parent() {
-        let _ = fs::create_dir_all(parent);
-    }
-    let link_v = crate::path::to_verbatim_path(link);
-    let target_v = crate::path::to_verbatim_path(target);
-
-    // If link already exists as a junction or symlink, safely remove the reparse point first
-    // so replacing a junction/symlink succeeds without clobbering target contents!
-    if is_reparse_point_or_symlink(&link_v).unwrap_or(false) {
-        let _ = remove_junction(&link_v);
-    }
-
     let res = {
         #[cfg(windows)]
         {
-            create_windows_junction(&link_v, &target_v)
+            create_windows_junction(link, target)
         }
 
         #[cfg(not(windows))]
         {
+            if let Some(parent) = link.parent() {
+                let _ = fs::create_dir_all(parent);
+            }
+            let link_v = crate::path::to_verbatim_path(link);
+            let target_v = crate::path::to_verbatim_path(target);
+            if let Ok(meta) = fs::symlink_metadata(&link_v) {
+                if meta.file_type().is_symlink() {
+                    let _ = remove_junction_with_meta(&link_v, link, &meta);
+                }
+            }
             let link_target = link
                 .parent()
                 .and_then(|parent| compute_relative_symlink_target(parent, target))
@@ -183,63 +183,41 @@ pub fn create_link_or_copy(link: &Path, target: &Path) -> Result<(), FsError> {
     }
 }
 
-/// Safely remove a junction or symlink.
-/// Ensures deleting the junction removes ONLY the reparse point, never target contents!
-/// Returns an error if the path exists but is not a junction or symlink.
-pub fn remove_junction(path: &Path) -> Result<(), FsError> {
-    let path_v = crate::path::to_verbatim_path(path);
-    if !path_v.exists() && !is_reparse_point_or_symlink(&path_v)? {
-        return Ok(());
-    }
-
-    if !is_reparse_point_or_symlink(&path_v)? {
-        return Err(FsError::JunctionError {
-            path: path.to_path_buf(),
-            detail: "Refusing to remove path: target exists but is not a junction or symlink"
-                .to_string(),
-        });
-    }
-
+fn remove_junction_with_meta(
+    path_v: &Path,
+    orig_path: &Path,
+    meta: &fs::Metadata,
+) -> Result<(), FsError> {
     #[cfg(windows)]
     {
-        // On Windows, remove_dir calls RemoveDirectoryW, which removes the reparse point
-        // and does NOT touch any contents inside the target directory.
-        // Clear readonly attribute if set before attempting removal
-        if let Ok(meta) = fs::symlink_metadata(&path_v) {
-            let mut perms = meta.permissions();
-            if perms.readonly() {
-                perms.set_readonly(false);
-                let _ = fs::set_permissions(&path_v, perms);
-            }
+        use std::os::windows::fs::MetadataExt;
+        let mut perms = meta.permissions();
+        if perms.readonly() {
+            perms.set_readonly(false);
+            let _ = fs::set_permissions(path_v, perms);
         }
-
-        let is_dir = fs::symlink_metadata(&path_v)
-            .map(|m| {
-                use std::os::windows::fs::MetadataExt;
-                m.file_attributes() & 0x10 != 0
-            })
-            .unwrap_or(true);
+        let is_dir = (meta.file_attributes() & 0x10) != 0;
 
         let mut attempts = 0;
         let mut delay = std::time::Duration::from_millis(5);
         loop {
             attempts += 1;
             let res = if is_dir {
-                fs::remove_dir(&path_v)
+                fs::remove_dir(path_v)
             } else {
-                fs::remove_file(&path_v)
+                fs::remove_file(path_v)
             };
             match res {
                 Ok(()) => return Ok(()),
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
                 Err(err) => {
-                    // If remove_dir failed because it's a file symlink, try remove_file
-                    if is_dir && err.raw_os_error() == Some(267) && fs::remove_file(&path_v).is_ok() {
+                    if is_dir && err.raw_os_error() == Some(267) && fs::remove_file(path_v).is_ok()
+                    {
                         return Ok(());
                     }
                     if attempts >= 15 || !crate::atomic::is_retryable_error(&err) {
                         return Err(FsError::JunctionError {
-                            path: path.to_path_buf(),
+                            path: orig_path.to_path_buf(),
                             detail: format!(
                                 "Failed to remove junction after {attempts} attempts: {err}"
                             ),
@@ -257,9 +235,39 @@ pub fn remove_junction(path: &Path) -> Result<(), FsError> {
 
     #[cfg(not(windows))]
     {
-        // On Unix, symlinks are removed with unlink (remove_file)
-        fs::remove_file(path).map_err(FsError::Io)
+        let _ = (path_v, meta);
+        fs::remove_file(orig_path).map_err(FsError::Io)
     }
+}
+
+/// Safely remove a junction or symlink.
+/// Ensures deleting the junction removes ONLY the reparse point, never target contents!
+/// Returns an error if the path exists but is not a junction or symlink.
+pub fn remove_junction(path: &Path) -> Result<(), FsError> {
+    let path_v = crate::path::to_verbatim_path(path);
+    let meta = match fs::symlink_metadata(&path_v) {
+        Ok(m) => m,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(FsError::Io(err)),
+    };
+
+    #[cfg(windows)]
+    let is_reparse = {
+        use std::os::windows::fs::MetadataExt;
+        (meta.file_attributes() & 0x400) != 0
+    };
+    #[cfg(not(windows))]
+    let is_reparse = meta.file_type().is_symlink();
+
+    if !is_reparse {
+        return Err(FsError::JunctionError {
+            path: path.to_path_buf(),
+            detail: "Refusing to remove path: target exists but is not a junction or symlink"
+                .to_string(),
+        });
+    }
+
+    remove_junction_with_meta(&path_v, path, &meta)
 }
 
 /// Helper to unlink a single regular file, clearing read-only attributes and retrying on transient Windows locks.
@@ -319,19 +327,9 @@ fn remove_file_safe(path: &Path, meta: Option<&fs::Metadata>) -> Result<(), FsEr
     }
 }
 
-/// Helper to remove an empty directory, clearing read-only attributes on Windows and retrying on transient locks.
+/// Helper to remove an empty directory on non-Windows targets, retrying on transient errors.
+#[cfg(not(windows))]
 fn remove_dir_safe(path: &Path) -> Result<(), FsError> {
-    #[cfg(windows)]
-    {
-        if let Ok(meta) = fs::symlink_metadata(path) {
-            let mut perms = meta.permissions();
-            if perms.readonly() {
-                perms.set_readonly(false);
-                let _ = fs::set_permissions(path, perms);
-            }
-        }
-    }
-
     let mut attempts = 0;
     let mut delay = std::time::Duration::from_millis(5);
     loop {
@@ -353,19 +351,490 @@ fn remove_dir_safe(path: &Path) -> Result<(), FsError> {
     }
 }
 
-enum UnlinkKind {
-    File,
-    ReparsePoint,
-}
+#[cfg(windows)]
+mod win_rm {
+    use super::*;
+    use std::collections::VecDeque;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::{Arc, Condvar, Mutex};
 
-struct UnlinkEntry {
-    path: PathBuf,
-    kind: UnlinkKind,
+    const FILE_ATTRIBUTE_READONLY: u32 = 0x1;
+    const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x10;
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+    const FILE_ATTRIBUTE_NORMAL: u32 = 0x80;
+    const INVALID_HANDLE_VALUE: *mut std::ffi::c_void = -1isize as *mut std::ffi::c_void;
+    const FIND_EX_INFO_BASIC: u32 = 1;
+    const FIND_EX_INFO_STANDARD: u32 = 0;
+    const FIND_EX_SEARCH_NAME_MATCH: u32 = 0;
+    const FIND_FIRST_EX_LARGE_FETCH: u32 = 2;
+    const ERROR_FILE_NOT_FOUND: u32 = 2;
+    const ERROR_PATH_NOT_FOUND: u32 = 3;
+    const ERROR_ACCESS_DENIED: u32 = 5;
+    const ERROR_NO_MORE_FILES: u32 = 18;
+    const ERROR_NOT_SUPPORTED: u32 = 50;
+    const ERROR_INVALID_PARAMETER: u32 = 87;
+    const ERROR_DIRECTORY: u32 = 267;
+
+    #[repr(C)]
+    #[allow(non_snake_case, clippy::upper_case_acronyms)]
+    struct FILETIME {
+        dwLowDateTime: u32,
+        dwHighDateTime: u32,
+    }
+
+    #[repr(C)]
+    #[allow(non_snake_case)]
+    struct WIN32_FIND_DATAW {
+        dwFileAttributes: u32,
+        ftCreationTime: FILETIME,
+        ftLastAccessTime: FILETIME,
+        ftLastWriteTime: FILETIME,
+        nFileSizeHigh: u32,
+        nFileSizeLow: u32,
+        dwReserved0: u32,
+        dwReserved1: u32,
+        cFileName: [u16; 260],
+        cAlternateFileName: [u16; 14],
+    }
+
+    extern "system" {
+        fn FindFirstFileExW(
+            lpFileName: *const u16,
+            fInfoLevelId: u32,
+            lpFindFileData: *mut WIN32_FIND_DATAW,
+            fSearchOp: u32,
+            lpSearchFilter: *mut std::ffi::c_void,
+            dwAdditionalFlags: u32,
+        ) -> *mut std::ffi::c_void;
+        fn FindNextFileW(
+            hFindFile: *mut std::ffi::c_void,
+            lpFindFileData: *mut WIN32_FIND_DATAW,
+        ) -> i32;
+        fn FindClose(hFindFile: *mut std::ffi::c_void) -> i32;
+        fn DeleteFileW(lpFileName: *const u16) -> i32;
+        fn RemoveDirectoryW(lpPathName: *const u16) -> i32;
+        fn SetFileAttributesW(lpFileName: *const u16, dwFileAttributes: u32) -> i32;
+        fn GetLastError() -> u32;
+    }
+
+    struct FindGuard(*mut std::ffi::c_void);
+    impl Drop for FindGuard {
+        fn drop(&mut self) {
+            if self.0 != INVALID_HANDLE_VALUE && !self.0.is_null() {
+                unsafe {
+                    FindClose(self.0);
+                }
+            }
+        }
+    }
+
+    #[inline]
+    fn remove_file_wide(wide: &[u16], is_ro: bool) -> Result<(), FsError> {
+        if is_ro {
+            unsafe {
+                SetFileAttributesW(wide.as_ptr(), FILE_ATTRIBUTE_NORMAL);
+            }
+        }
+        if unsafe { DeleteFileW(wide.as_ptr()) } != 0 {
+            return Ok(());
+        }
+        let mut attempts = 0;
+        let mut delay = std::time::Duration::from_millis(5);
+        loop {
+            let err_code = unsafe { GetLastError() };
+            if err_code == ERROR_FILE_NOT_FOUND || err_code == ERROR_PATH_NOT_FOUND {
+                return Ok(());
+            }
+            if err_code == ERROR_ACCESS_DENIED && attempts == 0 {
+                unsafe {
+                    SetFileAttributesW(wide.as_ptr(), FILE_ATTRIBUTE_NORMAL);
+                }
+            }
+            let err = std::io::Error::from_raw_os_error(err_code as i32);
+            attempts += 1;
+            if attempts >= 15 || !crate::atomic::is_retryable_error(&err) {
+                return Err(FsError::Io(err));
+            }
+            let jitter_ms = (attempts as u64 * 3) % 7;
+            std::thread::sleep(delay + std::time::Duration::from_millis(jitter_ms));
+            delay = delay
+                .saturating_mul(2)
+                .min(std::time::Duration::from_millis(250));
+            if unsafe { DeleteFileW(wide.as_ptr()) } != 0 {
+                return Ok(());
+            }
+        }
+    }
+
+    #[inline]
+    fn remove_dir_wide(wide: &[u16], is_ro: bool) -> Result<(), FsError> {
+        if is_ro {
+            unsafe {
+                SetFileAttributesW(wide.as_ptr(), FILE_ATTRIBUTE_NORMAL);
+            }
+        }
+        if unsafe { RemoveDirectoryW(wide.as_ptr()) } != 0 {
+            return Ok(());
+        }
+        let mut attempts = 0;
+        let mut delay = std::time::Duration::from_millis(5);
+        loop {
+            let err_code = unsafe { GetLastError() };
+            if err_code == ERROR_FILE_NOT_FOUND || err_code == ERROR_PATH_NOT_FOUND {
+                return Ok(());
+            }
+            if err_code == ERROR_ACCESS_DENIED && attempts == 0 {
+                unsafe {
+                    SetFileAttributesW(wide.as_ptr(), FILE_ATTRIBUTE_NORMAL);
+                }
+            }
+            let err = std::io::Error::from_raw_os_error(err_code as i32);
+            attempts += 1;
+            if attempts >= 15 || !crate::atomic::is_retryable_error(&err) {
+                return Err(FsError::Io(err));
+            }
+            let jitter_ms = (attempts as u64 * 3) % 7;
+            std::thread::sleep(delay + std::time::Duration::from_millis(jitter_ms));
+            delay = delay
+                .saturating_mul(2)
+                .min(std::time::Duration::from_millis(250));
+            if unsafe { RemoveDirectoryW(wide.as_ptr()) } != 0 {
+                return Ok(());
+            }
+        }
+    }
+
+    #[inline]
+    fn remove_reparse_wide(wide: &[u16], is_dir: bool, is_ro: bool) -> Result<(), FsError> {
+        if is_ro {
+            unsafe {
+                SetFileAttributesW(wide.as_ptr(), FILE_ATTRIBUTE_NORMAL);
+            }
+        }
+        if is_dir {
+            if unsafe { RemoveDirectoryW(wide.as_ptr()) } != 0 {
+                return Ok(());
+            }
+            let err_code = unsafe { GetLastError() };
+            if err_code == ERROR_DIRECTORY && unsafe { DeleteFileW(wide.as_ptr()) } != 0 {
+                return Ok(());
+            }
+            if err_code == ERROR_FILE_NOT_FOUND || err_code == ERROR_PATH_NOT_FOUND {
+                return Ok(());
+            }
+            remove_dir_wide(wide, true)
+        } else {
+            remove_file_wide(wide, is_ro)
+        }
+    }
+
+    struct ParentDir {
+        wide_null: Vec<u16>,
+        remaining: AtomicUsize,
+        parent: Option<Arc<ParentDir>>,
+    }
+
+    struct DirItem {
+        wide_no_null: Vec<u16>,
+        is_ro: bool,
+        parent: Option<Arc<ParentDir>>,
+    }
+
+    #[inline]
+    fn cascade_remove_parents(mut curr_parent: Option<Arc<ParentDir>>) -> Result<(), FsError> {
+        while let Some(p) = curr_parent {
+            if p.remaining.fetch_sub(1, Ordering::AcqRel) == 1 {
+                remove_dir_wide(&p.wide_null, false)?;
+                curr_parent = p.parent.as_ref().map(Arc::clone);
+            } else {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    fn scan_and_unlink_dir(
+        mut dir: DirItem,
+        pattern_buf: &mut Vec<u16>,
+        child_buf: &mut Vec<u16>,
+        subdirs_out: &mut Vec<DirItem>,
+    ) -> Result<(), FsError> {
+        if dir.is_ro {
+            dir.wide_no_null.push(0);
+            unsafe {
+                SetFileAttributesW(dir.wide_no_null.as_ptr(), FILE_ATTRIBUTE_NORMAL);
+            }
+            dir.wide_no_null.pop();
+        }
+
+        let needs_sep = !dir.wide_no_null.ends_with(&[b'\\' as u16]);
+        pattern_buf.clear();
+        pattern_buf.extend_from_slice(&dir.wide_no_null);
+        if needs_sep {
+            pattern_buf.push(b'\\' as u16);
+        }
+        pattern_buf.push(b'*' as u16);
+        pattern_buf.push(0);
+
+        let mut find_data: WIN32_FIND_DATAW = unsafe { std::mem::zeroed() };
+        let mut handle = unsafe {
+            FindFirstFileExW(
+                pattern_buf.as_ptr(),
+                FIND_EX_INFO_BASIC,
+                &mut find_data,
+                FIND_EX_SEARCH_NAME_MATCH,
+                std::ptr::null_mut(),
+                FIND_FIRST_EX_LARGE_FETCH,
+            )
+        };
+        if handle == INVALID_HANDLE_VALUE {
+            let err = unsafe { GetLastError() };
+            if err == ERROR_INVALID_PARAMETER || err == ERROR_NOT_SUPPORTED {
+                handle = unsafe {
+                    FindFirstFileExW(
+                        pattern_buf.as_ptr(),
+                        FIND_EX_INFO_STANDARD,
+                        &mut find_data,
+                        FIND_EX_SEARCH_NAME_MATCH,
+                        std::ptr::null_mut(),
+                        0,
+                    )
+                };
+            }
+        }
+        if handle == INVALID_HANDLE_VALUE {
+            let err = unsafe { GetLastError() };
+            if err == ERROR_ACCESS_DENIED {
+                dir.wide_no_null.push(0);
+                unsafe {
+                    SetFileAttributesW(dir.wide_no_null.as_ptr(), FILE_ATTRIBUTE_NORMAL);
+                }
+                dir.wide_no_null.pop();
+                handle = unsafe {
+                    FindFirstFileExW(
+                        pattern_buf.as_ptr(),
+                        FIND_EX_INFO_BASIC,
+                        &mut find_data,
+                        FIND_EX_SEARCH_NAME_MATCH,
+                        std::ptr::null_mut(),
+                        FIND_FIRST_EX_LARGE_FETCH,
+                    )
+                };
+            }
+        }
+        if handle == INVALID_HANDLE_VALUE {
+            let err = unsafe { GetLastError() };
+            if err == ERROR_FILE_NOT_FOUND || err == ERROR_PATH_NOT_FOUND {
+                return cascade_remove_parents(dir.parent);
+            }
+            return Err(FsError::Io(std::io::Error::from_raw_os_error(err as i32)));
+        }
+
+        let mut raw_subdirs: Vec<(Vec<u16>, bool)> = Vec::new();
+        {
+            let _guard = FindGuard(handle);
+            loop {
+                let c = &find_data.cFileName;
+                let is_dot = (c[0] == b'.' as u16 && c[1] == 0)
+                    || (c[0] == b'.' as u16 && c[1] == b'.' as u16 && c[2] == 0);
+                if !is_dot {
+                    let name_len = c.iter().position(|&ch| ch == 0).unwrap_or(c.len());
+                    child_buf.clear();
+                    child_buf.extend_from_slice(&dir.wide_no_null);
+                    if needs_sep {
+                        child_buf.push(b'\\' as u16);
+                    }
+                    child_buf.extend_from_slice(&c[..name_len]);
+
+                    let attrs = find_data.dwFileAttributes;
+                    let is_ro = (attrs & FILE_ATTRIBUTE_READONLY) != 0;
+                    let is_reparse = (attrs & FILE_ATTRIBUTE_REPARSE_POINT) != 0;
+                    let is_dir = (attrs & FILE_ATTRIBUTE_DIRECTORY) != 0;
+
+                    if is_reparse {
+                        // Reparse points / junctions / symlinks: NEVER push to subdirs!
+                        child_buf.push(0);
+                        remove_reparse_wide(child_buf, is_dir, is_ro)?;
+                    } else if is_dir {
+                        raw_subdirs.push((child_buf.clone(), is_ro));
+                    } else {
+                        child_buf.push(0);
+                        remove_file_wide(child_buf, is_ro)?;
+                    }
+                }
+
+                if unsafe { FindNextFileW(handle, &mut find_data) } == 0 {
+                    let err = unsafe { GetLastError() };
+                    if err == ERROR_NO_MORE_FILES {
+                        break;
+                    }
+                    return Err(FsError::Io(std::io::Error::from_raw_os_error(err as i32)));
+                }
+            }
+        }
+
+        dir.wide_no_null.push(0);
+        if raw_subdirs.is_empty() {
+            // Leaf directory: all files are unlinked and FindHandle is closed.
+            remove_dir_wide(&dir.wide_no_null, false)?;
+            return cascade_remove_parents(dir.parent);
+        }
+
+        let parent_node = Arc::new(ParentDir {
+            wide_null: dir.wide_no_null,
+            remaining: AtomicUsize::new(raw_subdirs.len()),
+            parent: dir.parent,
+        });
+        for (sub_wide, is_ro) in raw_subdirs {
+            subdirs_out.push(DirItem {
+                wide_no_null: sub_wide,
+                is_ro,
+                parent: Some(Arc::clone(&parent_node)),
+            });
+        }
+        Ok(())
+    }
+
+    struct QueueState {
+        pending: VecDeque<DirItem>,
+        active: usize,
+        error: Option<FsError>,
+    }
+
+    pub(super) fn remove_dir_tree_windows(path_v: &Path, is_ro: bool) -> Result<(), FsError> {
+        use std::os::windows::ffi::OsStrExt;
+        let root_wide: Vec<u16> = path_v.as_os_str().encode_wide().collect();
+        let mut stack = vec![DirItem {
+            wide_no_null: root_wide,
+            is_ro,
+            parent: None,
+        }];
+        let mut pattern_buf = Vec::with_capacity(300);
+        let mut child_buf = Vec::with_capacity(300);
+        let mut local_subdirs = Vec::with_capacity(16);
+
+        // Traverse sequentially until queue fans out (>= 2 subdirs), avoiding thread
+        // spawning overhead on tiny trees while scaling cleanly for nested node_modules.
+        while stack.len() == 1 {
+            let dir = stack.pop().unwrap();
+            local_subdirs.clear();
+            scan_and_unlink_dir(dir, &mut pattern_buf, &mut child_buf, &mut local_subdirs)?;
+            stack.append(&mut local_subdirs);
+        }
+
+        if !stack.is_empty() {
+            struct ActiveGuard<'a> {
+                state: &'a Mutex<QueueState>,
+                cvar: &'a Condvar,
+                armed: bool,
+            }
+            impl Drop for ActiveGuard<'_> {
+                fn drop(&mut self) {
+                    if self.armed {
+                        let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                        guard.active = guard.active.saturating_sub(1);
+                        if guard.error.is_none() {
+                            guard.error = Some(FsError::Io(std::io::Error::other(
+                                "Directory removal worker panicked",
+                            )));
+                        }
+                        self.cvar.notify_all();
+                    }
+                }
+            }
+
+            let num_threads = std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(4)
+                .clamp(2, 16);
+            let state = Mutex::new(QueueState {
+                pending: stack.into_iter().collect(),
+                active: 0,
+                error: None,
+            });
+            let cvar = Condvar::new();
+
+            std::thread::scope(|scope| {
+                for _ in 0..num_threads {
+                    let state_ref = &state;
+                    let cvar_ref = &cvar;
+                    scope.spawn(move || {
+                        let mut p_buf = Vec::with_capacity(300);
+                        let mut c_buf = Vec::with_capacity(300);
+                        let mut local_subs = Vec::with_capacity(16);
+
+                        loop {
+                            let dir = {
+                                let mut guard = state_ref.lock().unwrap_or_else(|e| e.into_inner());
+                                loop {
+                                    if guard.error.is_some() {
+                                        break None;
+                                    }
+                                    if let Some(d) = guard.pending.pop_back() {
+                                        guard.active += 1;
+                                        break Some(d);
+                                    }
+                                    if guard.active == 0 {
+                                        cvar_ref.notify_all();
+                                        break None;
+                                    }
+                                    guard = cvar_ref.wait(guard).unwrap_or_else(|e| e.into_inner());
+                                }
+                            };
+                            let Some(dir) = dir else {
+                                break;
+                            };
+
+                            let mut active_guard = ActiveGuard {
+                                state: state_ref,
+                                cvar: cvar_ref,
+                                armed: true,
+                            };
+
+                            local_subs.clear();
+                            let res =
+                                scan_and_unlink_dir(dir, &mut p_buf, &mut c_buf, &mut local_subs);
+
+                            let mut guard = state_ref.lock().unwrap_or_else(|e| e.into_inner());
+                            guard.active = guard.active.saturating_sub(1);
+                            active_guard.armed = false;
+                            match res {
+                                Ok(()) => {
+                                    if !local_subs.is_empty() {
+                                        for sub in local_subs.drain(..) {
+                                            guard.pending.push_back(sub);
+                                        }
+                                        cvar_ref.notify_all();
+                                    } else if guard.pending.is_empty() && guard.active == 0 {
+                                        cvar_ref.notify_all();
+                                    }
+                                }
+                                Err(e) => {
+                                    if guard.error.is_none() {
+                                        guard.error = Some(e);
+                                    }
+                                    cvar_ref.notify_all();
+                                    break;
+                                }
+                            }
+                        }
+                    });
+                }
+            });
+
+            let st = state.into_inner().unwrap_or_else(|e| e.into_inner());
+            if let Some(err) = st.error {
+                return Err(err);
+            }
+        }
+
+        Ok(())
+    }
 }
 
 /// Recursively removes a directory tree while guaranteeing that junctions and symlinks
 /// are NEVER recursively traversed (only their reparse points are unlinked).
-/// Uses parallel file unlinking across worker threads for large trees.
+/// Uses parallel directory traversal, immediate leaf unlinking, and bottom-up parallel dir removal.
 /// Also handles Windows read-only attributes and transient file locks with backoff retries.
 pub fn remove_dir_all_safe(path: &Path) -> Result<(), FsError> {
     let path_v = crate::path::to_verbatim_path(path);
@@ -387,7 +856,7 @@ pub fn remove_dir_all_safe(path: &Path) -> Result<(), FsError> {
 
     // 2. If it's a junction or symlink, remove ONLY the reparse point/link, never target contents!
     if is_reparse {
-        return remove_junction(&path_v);
+        return remove_junction_with_meta(&path_v, path, &meta);
     }
 
     // 3. Regular file: unlink directly
@@ -395,133 +864,128 @@ pub fn remove_dir_all_safe(path: &Path) -> Result<(), FsError> {
         return remove_file_safe(&path_v, Some(&meta));
     }
 
-    // 4. Directory: traverse iteratively, collecting files/links to unlink and directories to remove in post-order
-    let mut dir_stack = vec![path_v];
-    let mut dirs_collected = Vec::new();
-    let mut unlinks = Vec::new();
-
-    while let Some(current_dir) = dir_stack.pop() {
-        // Ensure directory has write permissions so its child items can be read/deleted
-        #[cfg(windows)]
-        {
-            if let Ok(m) = fs::symlink_metadata(&current_dir) {
-                let mut perms = m.permissions();
-                if perms.readonly() {
-                    perms.set_readonly(false);
-                    let _ = fs::set_permissions(&current_dir, perms);
-                }
-            }
-        }
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            if let Ok(m) = fs::symlink_metadata(&current_dir) {
-                let mut perms = m.permissions();
-                if perms.mode() & 0o200 == 0 {
-                    perms.set_mode(perms.mode() | 0o700);
-                    let _ = fs::set_permissions(&current_dir, perms);
-                }
-            }
-        }
-
-        match fs::read_dir(&current_dir) {
-            Ok(entries) => {
-                for entry_res in entries {
-                    let entry = match entry_res {
-                        Ok(e) => e,
-                        Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
-                        Err(err) => return Err(FsError::Io(err)),
-                    };
-                    let entry_path = entry.path();
-                    let entry_meta = match fs::symlink_metadata(&entry_path) {
-                        Ok(m) => m,
-                        Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
-                        Err(err) => return Err(FsError::Io(err)),
-                    };
-
-                    #[cfg(windows)]
-                    let entry_is_reparse = {
-                        use std::os::windows::fs::MetadataExt;
-                        (entry_meta.file_attributes() & 0x400) != 0
-                    };
-                    #[cfg(not(windows))]
-                    let entry_is_reparse = entry_meta.file_type().is_symlink();
-
-                    if entry_is_reparse {
-                        // Reparse points / symlinks: add to unlinks, NEVER push to dir_stack!
-                        unlinks.push(UnlinkEntry {
-                            path: entry_path,
-                            kind: UnlinkKind::ReparsePoint,
-                        });
-                    } else if entry_meta.is_dir() {
-                        dir_stack.push(entry_path);
-                    } else {
-                        unlinks.push(UnlinkEntry {
-                            path: entry_path,
-                            kind: UnlinkKind::File,
-                        });
-                    }
-                }
-                dirs_collected.push(current_dir);
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(FsError::Io(e)),
-        }
+    #[cfg(windows)]
+    {
+        let is_ro = meta.permissions().readonly();
+        win_rm::remove_dir_tree_windows(&path_v, is_ro)
     }
 
-    // 5. Parallel file/reparse-point unlinking
-    let total_unlinks = unlinks.len();
-    if total_unlinks < 32 {
-        for item in unlinks {
-            match item.kind {
-                UnlinkKind::ReparsePoint => remove_junction(&item.path)?,
-                UnlinkKind::File => remove_file_safe(&item.path, None)?,
-            }
-        }
-    } else {
-        let concurrency = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(4)
-            .clamp(2, 16)
-            .min(total_unlinks);
-        let chunk_size = total_unlinks.div_ceil(concurrency);
-        let first_error = std::sync::Mutex::new(None);
+    #[cfg(not(windows))]
+    {
+        // 4. Directory: traverse iteratively using DirEntry::file_type (zero lstat on Linux/macOS),
+        // unlinking files/symlinks in parallel and removing directories bottom-up by depth.
+        let mut dir_stack = vec![(path_v, 0usize)];
+        let mut dirs_collected: Vec<(PathBuf, usize)> = Vec::new();
+        let mut unlinks: Vec<(PathBuf, bool)> = Vec::new();
 
-        std::thread::scope(|scope| {
-            for chunk in unlinks.chunks(chunk_size) {
-                let err_ref = &first_error;
-                scope.spawn(move || {
-                    for item in chunk {
-                        let res = match item.kind {
-                            UnlinkKind::ReparsePoint => remove_junction(&item.path),
-                            UnlinkKind::File => remove_file_safe(&item.path, None),
+        while let Some((current_dir, depth)) = dir_stack.pop() {
+            {
+                use std::os::unix::fs::PermissionsExt;
+                if let Ok(m) = fs::symlink_metadata(&current_dir) {
+                    let mut perms = m.permissions();
+                    if perms.mode() & 0o200 == 0 {
+                        perms.set_mode(perms.mode() | 0o700);
+                        let _ = fs::set_permissions(&current_dir, perms);
+                    }
+                }
+            }
+
+            match fs::read_dir(&current_dir) {
+                Ok(entries) => {
+                    for entry_res in entries {
+                        let entry = match entry_res {
+                            Ok(e) => e,
+                            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+                            Err(err) => return Err(FsError::Io(err)),
                         };
-                        if let Err(e) = res {
-                            let mut guard = err_ref.lock().unwrap();
-                            if guard.is_none() {
-                                *guard = Some(e);
-                            }
-                            break;
+                        let entry_path = entry.path();
+                        let ft = match entry.file_type() {
+                            Ok(ft) => ft,
+                            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+                            Err(err) => return Err(FsError::Io(err)),
+                        };
+
+                        if ft.is_symlink() {
+                            unlinks.push((entry_path, true));
+                        } else if ft.is_dir() {
+                            dir_stack.push((entry_path, depth + 1));
+                        } else {
+                            unlinks.push((entry_path, false));
                         }
                     }
-                });
+                    dirs_collected.push((current_dir, depth));
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(FsError::Io(e)),
             }
-        });
-
-        if let Some(err) = first_error.into_inner().unwrap() {
-            return Err(err);
         }
+
+        let total_unlinks = unlinks.len();
+        if total_unlinks < 32 {
+            for (p, is_sym) in unlinks {
+                if is_sym {
+                    match fs::remove_file(&p) {
+                        Ok(()) => {}
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(e) => return Err(FsError::Io(e)),
+                    }
+                } else {
+                    remove_file_safe(&p, None)?;
+                }
+            }
+        } else {
+            let concurrency = std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(4)
+                .clamp(2, 16)
+                .min(total_unlinks);
+            let chunk_size = total_unlinks.div_ceil(concurrency);
+            let first_error = std::sync::Mutex::new(None);
+
+            std::thread::scope(|scope| {
+                for chunk in unlinks.chunks(chunk_size) {
+                    let err_ref = &first_error;
+                    scope.spawn(move || {
+                        for (p, is_sym) in chunk {
+                            let res = if *is_sym {
+                                match fs::remove_file(p) {
+                                    Ok(()) => Ok(()),
+                                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                                    Err(e) => Err(FsError::Io(e)),
+                                }
+                            } else {
+                                remove_file_safe(p, None)
+                            };
+                            if let Err(e) = res {
+                                let mut guard = err_ref.lock().unwrap();
+                                if guard.is_none() {
+                                    *guard = Some(e);
+                                }
+                                break;
+                            }
+                        }
+                    });
+                }
+            });
+
+            if let Some(err) = first_error.into_inner().unwrap() {
+                return Err(err);
+            }
+        }
+
+        let max_depth = dirs_collected.iter().map(|(_, d)| *d).max().unwrap_or(0);
+        let mut by_depth: Vec<Vec<PathBuf>> = (0..=max_depth).map(|_| Vec::new()).collect();
+        for (dir, depth) in dirs_collected {
+            by_depth[depth].push(dir);
+        }
+        for level in by_depth.into_iter().rev() {
+            for dir in level {
+                remove_dir_safe(&dir)?;
+            }
+        }
+
+        Ok(())
     }
-
-    // 6. Remove empty directories bottom-up: sort descending by depth (component count)
-    // so leaf directories are strictly removed before their parents!
-    dirs_collected.sort_by_key(|a| std::cmp::Reverse(a.components().count()));
-
-    for dir in dirs_collected {
-        remove_dir_safe(&dir)?;
-    }
-
-    Ok(())
 }
 
 /// Check if a path is a junction or symlink.
@@ -584,17 +1048,33 @@ fn is_reparse_point_or_symlink(path: &Path) -> Result<bool, FsError> {
 
 #[cfg(windows)]
 fn create_windows_junction(link: &Path, target: &Path) -> Result<(), FsError> {
-    // Ensure parent directory of link exists
-    if let Some(parent) = link.parent() {
-        fs::create_dir_all(parent)?;
+    extern "system" {
+        fn GetFileAttributesW(lpFileName: *const u16) -> u32;
     }
+    const INVALID_FILE_ATTRIBUTES: u32 = u32::MAX;
 
-    // Target must exist for a junction
-    if !target.exists() {
-        return Err(FsError::Io(std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            format!("junction target does not exist: {}", target.display()),
-        )));
+    let res = crate::path::with_verbatim_wide(target, |target_wide| {
+        let attrs = unsafe { GetFileAttributesW(target_wide.as_ptr()) };
+        if attrs == INVALID_FILE_ATTRIBUTES {
+            return Err(FsError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("junction target does not exist: {}", target.display()),
+            )));
+        }
+        create_junction_win32_wide(link, target_wide)
+    });
+
+    match res {
+        Ok(()) => return Ok(()),
+        Err(FsError::Io(ref e)) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(FsError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("junction target does not exist: {}", target.display()),
+            )));
+        }
+        Err(e) => {
+            tracing::debug!("Direct Win32 junction creation failed ({e:?}), attempting fallback");
+        }
     }
 
     let target_abs = if target.is_absolute() {
@@ -602,89 +1082,28 @@ fn create_windows_junction(link: &Path, target: &Path) -> Result<(), FsError> {
     } else {
         std::env::current_dir().map_err(FsError::Io)?.join(target)
     };
-
-    // Primary: direct Win32 FSCTL_SET_REPARSE_POINT (immune to shell escaping & space/metacharacter issues)
-    match create_junction_win32(link, &target_abs) {
-        Ok(()) => return Ok(()),
-        Err(e) => {
-            tracing::debug!("Direct Win32 junction creation failed ({e:?}), attempting fallback");
-        }
-    }
-
-    // Fallback: hardened cmd.exe mklink /J with safe quoting and escaping
     create_junction_cmd_fallback(link, &target_abs)
 }
 
 #[cfg(windows)]
 fn create_junction_win32(link: &Path, target: &Path) -> Result<(), FsError> {
-    use std::os::windows::ffi::OsStrExt;
+    crate::path::with_verbatim_wide(target, |target_wide| {
+        create_junction_win32_wide(link, target_wide)
+    })
+}
 
-    let clean_target = crate::path::strip_verbatim_prefix(target);
-    let clean_str = clean_target.to_string_lossy();
-
-    let substitute_name = if clean_str.starts_with(r"\\") {
-        format!(r"\??\UNC\{}", &clean_str[2..])
-    } else {
-        format!(r"\??\{}", clean_str)
-    };
-    let print_name = clean_str.to_string();
-
-    let sub_w: Vec<u16> = std::ffi::OsStr::new(&substitute_name)
-        .encode_wide()
-        .collect();
-    let print_w: Vec<u16> = std::ffi::OsStr::new(&print_name).encode_wide().collect();
-
-    let sub_len_bytes = (sub_w.len() * 2) as u16;
-    let print_len_bytes = (print_w.len() * 2) as u16;
-
-    let reparse_data_len = 8 + sub_len_bytes + 2 + print_len_bytes + 2;
-    let total_buffer_len = 8 + reparse_data_len as usize;
-
-    let mut buffer = vec![0u8; total_buffer_len];
-
-    // IO_REPARSE_TAG_MOUNT_POINT = 0xA0000003
-    let tag = 0xA0000003u32;
-    buffer[0..4].copy_from_slice(&tag.to_le_bytes());
-    buffer[4..6].copy_from_slice(&reparse_data_len.to_le_bytes());
-    buffer[6..8].copy_from_slice(&0u16.to_le_bytes());
-
-    buffer[8..10].copy_from_slice(&0u16.to_le_bytes());
-    buffer[10..12].copy_from_slice(&sub_len_bytes.to_le_bytes());
-    let print_offset = sub_len_bytes + 2;
-    buffer[12..14].copy_from_slice(&print_offset.to_le_bytes());
-    buffer[14..16].copy_from_slice(&print_len_bytes.to_le_bytes());
-
-    let path_buf_start = 16;
-    let sub_byte_slice: &[u8] =
-        unsafe { std::slice::from_raw_parts(sub_w.as_ptr() as *const u8, sub_len_bytes as usize) };
-    buffer[path_buf_start..path_buf_start + sub_len_bytes as usize].copy_from_slice(sub_byte_slice);
-
-    let print_byte_start = path_buf_start + print_offset as usize;
-    let print_byte_slice: &[u8] = unsafe {
-        std::slice::from_raw_parts(print_w.as_ptr() as *const u8, print_len_bytes as usize)
-    };
-    buffer[print_byte_start..print_byte_start + print_len_bytes as usize]
-        .copy_from_slice(print_byte_slice);
-
-    let link_v = crate::path::to_verbatim_path(link);
-    match fs::create_dir(&link_v) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-            if !is_reparse_point_or_symlink(&link_v)?
-                && fs::read_dir(&link_v).map_err(FsError::Io)?.next().is_some()
-            {
-                return Err(FsError::JunctionError {
-                    path: link.to_path_buf(),
-                    detail: "Destination directory already exists and is not empty".to_string(),
-                });
-            }
-        }
-        Err(e) => return Err(FsError::Io(e)),
-    }
-
-    let link_wide: Vec<u16> = link_v.as_os_str().encode_wide().chain(Some(0)).collect();
-
+#[cfg(windows)]
+fn create_junction_win32_wide(link: &Path, target_wide_null: &[u16]) -> Result<(), FsError> {
     extern "system" {
+        fn CreateDirectoryW(
+            lpPathName: *const u16,
+            lpSecurityAttributes: *mut std::ffi::c_void,
+        ) -> i32;
+
+        fn RemoveDirectoryW(lpPathName: *const u16) -> i32;
+
+        fn GetFileAttributesW(lpFileName: *const u16) -> u32;
+
         fn CreateFileW(
             lpFileName: *const u16,
             dwDesiredAccess: u32,
@@ -720,56 +1139,205 @@ fn create_junction_win32(link: &Path, target: &Path) -> Result<(), FsError> {
     const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x00200000;
     const FSCTL_SET_REPARSE_POINT: u32 = 0x000900A4;
     const INVALID_HANDLE_VALUE: *mut std::ffi::c_void = -1isize as *mut std::ffi::c_void;
+    const INVALID_FILE_ATTRIBUTES: u32 = u32::MAX;
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+    const ERROR_PATH_NOT_FOUND: u32 = 3;
+    const ERROR_ALREADY_EXISTS: u32 = 183;
 
-    let handle = unsafe {
-        CreateFileW(
-            link_wide.as_ptr(),
-            GENERIC_READ | GENERIC_WRITE,
-            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-            std::ptr::null_mut(),
-            OPEN_EXISTING,
-            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
-            std::ptr::null_mut(),
-        )
+    let tw = target_wide_null
+        .strip_suffix(&[0])
+        .unwrap_or(target_wide_null);
+    let unc_prefix: [u16; 8] = [
+        b'\\' as u16,
+        b'\\' as u16,
+        b'?' as u16,
+        b'\\' as u16,
+        b'U' as u16,
+        b'N' as u16,
+        b'C' as u16,
+        b'\\' as u16,
+    ];
+    let verb_prefix: [u16; 4] = [b'\\' as u16, b'\\' as u16, b'?' as u16, b'\\' as u16];
+    let nt_prefix: [u16; 4] = [b'\\' as u16, b'?' as u16, b'?' as u16, b'\\' as u16];
+
+    let (is_unc, has_verb_prefix) = if tw.starts_with(&unc_prefix) {
+        (true, true)
+    } else if tw.starts_with(&verb_prefix) || tw.starts_with(&nt_prefix) {
+        (false, true)
+    } else {
+        (false, false)
     };
 
-    if handle == INVALID_HANDLE_VALUE {
-        let err = unsafe { GetLastError() };
-        let _ = fs::remove_dir(&link_v);
-        return Err(FsError::JunctionError {
-            path: link.to_path_buf(),
-            detail: format!("CreateFileW failed with error code {err}"),
-        });
-    }
-
-    let mut bytes_returned = 0u32;
-    let success = unsafe {
-        DeviceIoControl(
-            handle,
-            FSCTL_SET_REPARSE_POINT,
-            buffer.as_ptr() as *const std::ffi::c_void,
-            buffer.len() as u32,
-            std::ptr::null_mut(),
-            0,
-            &mut bytes_returned,
-            std::ptr::null_mut(),
-        )
+    let sub_len_u16 = if has_verb_prefix { tw.len() } else { tw.len() + 4 };
+    let print_len_u16 = if is_unc {
+        2 + (tw.len() - 8)
+    } else if has_verb_prefix {
+        tw.len() - 4
+    } else {
+        tw.len()
     };
 
-    unsafe { CloseHandle(handle) };
+    let sub_len_bytes = (sub_len_u16 * 2) as u16;
+    let print_len_bytes = (print_len_u16 * 2) as u16;
+    let reparse_data_len = 8 + sub_len_bytes + 2 + print_len_bytes + 2;
+    let total_buffer_len = 8 + reparse_data_len as usize;
 
-    if success == 0 {
-        let err = unsafe { GetLastError() };
-        let _ = fs::remove_dir(&link_v);
-        return Err(FsError::JunctionError {
-            path: link.to_path_buf(),
-            detail: format!(
-                "DeviceIoControl(FSCTL_SET_REPARSE_POINT) failed with error code {err}"
-            ),
-        });
+    let mut stack_buf = [0u8; 1024];
+    let mut heap_buf: Vec<u8> = Vec::new();
+    let buffer: &mut [u8] = if total_buffer_len <= stack_buf.len() {
+        &mut stack_buf[..total_buffer_len]
+    } else {
+        heap_buf.resize(total_buffer_len, 0);
+        &mut heap_buf[..total_buffer_len]
+    };
+
+    // IO_REPARSE_TAG_MOUNT_POINT = 0xA0000003
+    let tag = 0xA0000003u32;
+    buffer[0..4].copy_from_slice(&tag.to_le_bytes());
+    buffer[4..6].copy_from_slice(&reparse_data_len.to_le_bytes());
+    buffer[6..8].copy_from_slice(&0u16.to_le_bytes());
+
+    buffer[8..10].copy_from_slice(&0u16.to_le_bytes());
+    buffer[10..12].copy_from_slice(&sub_len_bytes.to_le_bytes());
+    let print_offset = sub_len_bytes + 2;
+    buffer[12..14].copy_from_slice(&print_offset.to_le_bytes());
+    buffer[14..16].copy_from_slice(&print_len_bytes.to_le_bytes());
+
+    let path_buf_start = 16usize;
+    if has_verb_prefix {
+        let tw_bytes: &[u8] =
+            unsafe { std::slice::from_raw_parts(tw.as_ptr() as *const u8, tw.len() * 2) };
+        buffer[path_buf_start..path_buf_start + tw_bytes.len()].copy_from_slice(tw_bytes);
+        // Flip `\\?\` -> `\??\` at UTF-16 index 1
+        buffer[path_buf_start + 2..path_buf_start + 4].copy_from_slice(&(b'?' as u16).to_le_bytes());
+    } else {
+        let nt_bytes: &[u8] =
+            unsafe { std::slice::from_raw_parts(nt_prefix.as_ptr() as *const u8, 8) };
+        buffer[path_buf_start..path_buf_start + 8].copy_from_slice(nt_bytes);
+        let tw_bytes: &[u8] =
+            unsafe { std::slice::from_raw_parts(tw.as_ptr() as *const u8, tw.len() * 2) };
+        buffer[path_buf_start + 8..path_buf_start + 8 + tw_bytes.len()].copy_from_slice(tw_bytes);
     }
 
-    Ok(())
+    let print_byte_start = path_buf_start + print_offset as usize;
+    if is_unc {
+        let double_slash: [u16; 2] = [b'\\' as u16, b'\\' as u16];
+        let ds_bytes: &[u8] =
+            unsafe { std::slice::from_raw_parts(double_slash.as_ptr() as *const u8, 4) };
+        buffer[print_byte_start..print_byte_start + 4].copy_from_slice(ds_bytes);
+        let tail = &tw[8..];
+        let tail_bytes: &[u8] =
+            unsafe { std::slice::from_raw_parts(tail.as_ptr() as *const u8, tail.len() * 2) };
+        buffer[print_byte_start + 4..print_byte_start + 4 + tail_bytes.len()]
+            .copy_from_slice(tail_bytes);
+    } else {
+        let tail = if has_verb_prefix { &tw[4..] } else { tw };
+        let tail_bytes: &[u8] =
+            unsafe { std::slice::from_raw_parts(tail.as_ptr() as *const u8, tail.len() * 2) };
+        buffer[print_byte_start..print_byte_start + tail_bytes.len()].copy_from_slice(tail_bytes);
+    }
+
+    crate::path::with_verbatim_wide(link, |link_wide| {
+        let mut created = unsafe { CreateDirectoryW(link_wide.as_ptr(), std::ptr::null_mut()) };
+        if created == 0 {
+            let mut err = unsafe { GetLastError() };
+            if err == ERROR_PATH_NOT_FOUND {
+                if let Some(parent) = link.parent() {
+                    let parent_v = crate::path::to_verbatim_path(parent);
+                    let _ = fs::create_dir_all(&parent_v);
+                }
+                created = unsafe { CreateDirectoryW(link_wide.as_ptr(), std::ptr::null_mut()) };
+                if created == 0 {
+                    err = unsafe { GetLastError() };
+                }
+            }
+            if created == 0 {
+                if err == ERROR_ALREADY_EXISTS {
+                    let attrs = unsafe { GetFileAttributesW(link_wide.as_ptr()) };
+                    if attrs != INVALID_FILE_ATTRIBUTES
+                        && (attrs & FILE_ATTRIBUTE_REPARSE_POINT) != 0
+                    {
+                        let _ = remove_junction(link);
+                        created =
+                            unsafe { CreateDirectoryW(link_wide.as_ptr(), std::ptr::null_mut()) };
+                        if created == 0 {
+                            let err2 = unsafe { GetLastError() };
+                            if err2 != ERROR_ALREADY_EXISTS {
+                                return Err(FsError::Io(std::io::Error::from_raw_os_error(
+                                    err2 as i32,
+                                )));
+                            }
+                        }
+                    } else {
+                        let link_v = crate::path::to_verbatim_path(link);
+                        if fs::read_dir(&link_v).map_err(FsError::Io)?.next().is_some() {
+                            return Err(FsError::JunctionError {
+                                path: link.to_path_buf(),
+                                detail: "Destination directory already exists and is not empty"
+                                    .to_string(),
+                            });
+                        }
+                    }
+                } else {
+                    return Err(FsError::Io(std::io::Error::from_raw_os_error(err as i32)));
+                }
+            }
+        }
+
+        let handle = unsafe {
+            CreateFileW(
+                link_wide.as_ptr(),
+                GENERIC_READ | GENERIC_WRITE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                std::ptr::null_mut(),
+                OPEN_EXISTING,
+                FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+                std::ptr::null_mut(),
+            )
+        };
+
+        if handle == INVALID_HANDLE_VALUE {
+            let err = unsafe { GetLastError() };
+            unsafe {
+                RemoveDirectoryW(link_wide.as_ptr());
+            }
+            return Err(FsError::JunctionError {
+                path: link.to_path_buf(),
+                detail: format!("CreateFileW failed with error code {err}"),
+            });
+        }
+
+        let mut bytes_returned = 0u32;
+        let success = unsafe {
+            DeviceIoControl(
+                handle,
+                FSCTL_SET_REPARSE_POINT,
+                buffer.as_ptr() as *const std::ffi::c_void,
+                total_buffer_len as u32,
+                std::ptr::null_mut(),
+                0,
+                &mut bytes_returned,
+                std::ptr::null_mut(),
+            )
+        };
+
+        unsafe { CloseHandle(handle) };
+
+        if success == 0 {
+            let err = unsafe { GetLastError() };
+            unsafe {
+                RemoveDirectoryW(link_wide.as_ptr());
+            }
+            return Err(FsError::JunctionError {
+                path: link.to_path_buf(),
+                detail: format!(
+                    "DeviceIoControl(FSCTL_SET_REPARSE_POINT) failed with error code {err}"
+                ),
+            });
+        }
+
+        Ok(())
+    })
 }
 
 #[cfg(windows)]

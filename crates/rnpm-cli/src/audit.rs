@@ -404,38 +404,6 @@ async fn fetch_advisories(
     let target_parsed = Url::parse(&target_url)
         .map_err(|e| anyhow::anyhow!("Invalid registry URL '{target_url}': {e}"))?;
 
-    let mut client_config = rnpm_registry::RegistryClientConfig {
-        default_registry: target_parsed.clone(),
-        auth_tokens: config.npmrc.auth_tokens.clone(),
-        scoped_registries: config.npmrc.scoped_registries.clone(),
-        ..Default::default()
-    };
-    if let Some(token) = config.npmrc.get_auth_token(&target_parsed) {
-        client_config.auth_token = Some(token.to_string());
-    }
-    if let Some(host) = target_parsed.host_str() {
-        client_config
-            .trusted_hosts
-            .insert(host.to_ascii_lowercase());
-        if let Some(port) = target_parsed.port_or_known_default() {
-            client_config
-                .trusted_hosts
-                .insert(format!("{}:{}", host.to_ascii_lowercase(), port));
-        }
-    }
-    for scoped_reg in config.npmrc.scoped_registries.values() {
-        if let Some(h) = scoped_reg.host_str() {
-            client_config.trusted_hosts.insert(h.to_ascii_lowercase());
-            if let Some(p) = scoped_reg.port_or_known_default() {
-                client_config
-                    .trusted_hosts
-                    .insert(format!("{}:{}", h.to_ascii_lowercase(), p));
-            }
-        }
-    }
-
-    let reg_client = rnpm_registry::RegistryClient::with_config(client_config);
-
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
         .connect_timeout(std::time::Duration::from_secs(10))
@@ -450,11 +418,7 @@ async fn fetch_advisories(
         )
         .header(reqwest::header::ACCEPT, "application/json");
 
-    if let Ok(ref rc) = reg_client {
-        if let Some(token) = rc.auth_token_for_url(&target_parsed) {
-            req = req.header(reqwest::header::AUTHORIZATION, format!("Bearer {token}"));
-        }
-    } else if let Some(token) = config.npmrc.get_auth_token(&target_parsed) {
+    if let Some(token) = config.npmrc.get_auth_token(&target_parsed) {
         req = req.header(reqwest::header::AUTHORIZATION, format!("Bearer {token}"));
     }
 
@@ -505,27 +469,48 @@ pub async fn build_audit_report_with_advisories(
     project_dir: &Path,
     registry_url: Option<String>,
 ) -> anyhow::Result<(AuditReport, Option<Severity>, Vec<AuditAdvisory>)> {
-    let (lock_path, is_shrinkwrap) = rnpm_install::resolve_lockfile_path(project_dir);
-    if !lock_path.exists() {
-        return Err(anyhow::anyhow!(
-            "npm error code ENOLOCK\n\
-             npm error This command requires an existing lockfile.\n\
-             npm error Try creating one with `rnpm install`."
-        ));
-    }
+    build_audit_report_with_advisories_and_config(project_dir, registry_url, None, None).await
+}
 
-    let lockfile = rnpm_lockfile::load_and_migrate(&lock_path).map_err(|e| {
-        anyhow::anyhow!(
-            "Failed to parse {}: {e}",
-            if is_shrinkwrap {
-                "npm-shrinkwrap.json"
-            } else {
-                "package-lock.json"
-            }
-        )
-    })?;
+pub(crate) async fn build_audit_report_with_advisories_and_config(
+    project_dir: &Path,
+    registry_url: Option<String>,
+    preloaded_config: Option<&rnpm_config::Config>,
+    preloaded_lockfile: Option<&rnpm_lockfile::LockfileV3>,
+) -> anyhow::Result<(AuditReport, Option<Severity>, Vec<AuditAdvisory>)> {
+    let owned_lockfile;
+    let lockfile = if let Some(lock) = preloaded_lockfile {
+        lock
+    } else {
+        let (lock_path, is_shrinkwrap) = rnpm_install::resolve_lockfile_path(project_dir);
+        if !lock_path.exists() {
+            return Err(anyhow::anyhow!(
+                "npm error code ENOLOCK\n\
+                 npm error This command requires an existing lockfile.\n\
+                 npm error Try creating one with `rnpm install`."
+            ));
+        }
+        owned_lockfile = rnpm_lockfile::load_and_migrate(&lock_path).map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to parse {}: {e}",
+                if is_shrinkwrap {
+                    "npm-shrinkwrap.json"
+                } else {
+                    "package-lock.json"
+                }
+            )
+        })?;
+        &owned_lockfile
+    };
 
-    let config = rnpm_config::Config::load(Some(project_dir)).unwrap_or_default();
+    let owned_config;
+    let config = match preloaded_config {
+        Some(cfg) => cfg,
+        None => {
+            owned_config = rnpm_config::Config::load(Some(project_dir)).unwrap_or_default();
+            &owned_config
+        }
+    };
 
     // Direct dependencies of the root project
     let root_pkg = lockfile.packages.get("");
@@ -549,7 +534,7 @@ pub async fn build_audit_report_with_advisories(
     let mut bulk_request: BTreeMap<String, Vec<String>> = BTreeMap::new();
     let mut installed_packages: Vec<(String, String, String, bool)> = Vec::new(); // (key, name, version, is_direct)
 
-    let dep_counts = dependency_counts(&lockfile);
+    let dep_counts = dependency_counts(lockfile);
 
     for (key, pkg) in &lockfile.packages {
         if key.is_empty() {
@@ -587,7 +572,7 @@ pub async fn build_audit_report_with_advisories(
         .unwrap_or_else(|| config.npmrc.registry.to_string());
 
     let advisories_by_pkg =
-        fetch_advisories(&registry, &bulk_request, project_dir, &config).await?;
+        fetch_advisories(&registry, &bulk_request, project_dir, config).await?;
 
     // Scan for vulnerabilities
     let mut vulnerabilities: BTreeMap<String, PackageVulnerability> = BTreeMap::new();
@@ -679,7 +664,7 @@ pub async fn build_audit_report_with_advisories(
         }
     }
 
-    graph::complete_graph(&mut vulnerabilities, &lockfile, &registry, &config).await?;
+    graph::complete_graph(&mut vulnerabilities, lockfile, &registry, config).await?;
 
     // npm 11 counts vulnerable packages using each package's highest severity
     let mut pkg_vuln_counts = VulnerabilitiesCount::default();
@@ -707,25 +692,44 @@ pub async fn build_audit_report_with_advisories(
     Ok((report, highest_severity, advisories_found))
 }
 
-/// Builds the audit report scanning lockfile dependencies against security advisories.
-pub async fn build_audit_report(
+pub(crate) async fn build_audit_report_with_config_and_lockfile(
     project_dir: &Path,
     registry_url: Option<String>,
+    preloaded_config: Option<&rnpm_config::Config>,
+    preloaded_lockfile: Option<&rnpm_lockfile::LockfileV3>,
 ) -> anyhow::Result<(AuditReport, Option<Severity>)> {
-    let (report, highest, _) =
-        build_audit_report_with_advisories(project_dir, registry_url).await?;
+    let (report, highest, _) = build_audit_report_with_advisories_and_config(
+        project_dir,
+        registry_url,
+        preloaded_config,
+        preloaded_lockfile,
+    )
+    .await?;
     Ok((report, highest))
 }
 
 /// Execute the audit workflow (full report).
+#[allow(dead_code)]
 pub async fn run_audit(
     project_dir: &Path,
     registry_url: Option<String>,
     json_output: bool,
     audit_level: &str,
 ) -> anyhow::Result<()> {
+    run_audit_with_config(project_dir, registry_url, json_output, audit_level, None).await
+}
+
+pub(crate) async fn run_audit_with_config(
+    project_dir: &Path,
+    registry_url: Option<String>,
+    json_output: bool,
+    audit_level: &str,
+    preloaded_config: Option<&rnpm_config::Config>,
+) -> anyhow::Result<()> {
     let threshold_opt = parse_audit_level(audit_level)?;
-    let (report, highest_severity) = build_audit_report(project_dir, registry_url).await?;
+    let (report, highest_severity) =
+        build_audit_report_with_config_and_lockfile(project_dir, registry_url, preloaded_config, None)
+            .await?;
 
     if json_output {
         println!("{}", serde_json::to_string_pretty(&report)?);
@@ -940,16 +944,42 @@ fn format_vulnerability(
 }
 
 /// Runs a post-install vulnerability audit check emitting only a concise summary.
+#[allow(dead_code)]
 pub async fn run_post_install_audit(
     project_dir: &Path,
     registry_url: Option<String>,
 ) -> anyhow::Result<()> {
-    let (lock_path, _) = rnpm_install::resolve_lockfile_path(project_dir);
-    if !lock_path.exists() {
-        return Ok(());
+    run_post_install_audit_with_config(project_dir, registry_url, None, None).await
+}
+
+pub(crate) async fn run_post_install_audit_with_config(
+    project_dir: &Path,
+    registry_url: Option<String>,
+    preloaded_config: Option<&rnpm_config::Config>,
+    preloaded_lockfile: Option<&rnpm_lockfile::LockfileV3>,
+) -> anyhow::Result<()> {
+    if preloaded_lockfile.is_none() {
+        let (lock_path, _) = rnpm_install::resolve_lockfile_path(project_dir);
+        if !lock_path.exists() {
+            return Ok(());
+        }
     }
-    if let Ok((report, _)) = build_audit_report(project_dir, registry_url).await {
-        let config = rnpm_config::Config::load(Some(project_dir))?;
+    if let Ok((report, _)) = build_audit_report_with_config_and_lockfile(
+        project_dir,
+        registry_url,
+        preloaded_config,
+        preloaded_lockfile,
+    )
+    .await
+    {
+        let owned_config;
+        let config = match preloaded_config {
+            Some(cfg) => cfg,
+            None => {
+                owned_config = rnpm_config::Config::load(Some(project_dir))?;
+                &owned_config
+            }
+        };
         if config.get("loglevel") != Some("silent") {
             print_concise_audit_summary(&report);
         }
@@ -957,19 +987,28 @@ pub async fn run_post_install_audit(
     Ok(())
 }
 
-/// Counts installed packages that declare funding notices.
-pub fn count_funding_packages(project_dir: &Path) -> usize {
-    let (lock_path, _) = rnpm_install::resolve_lockfile_path(project_dir);
-    if lock_path.exists() {
-        if let Ok(lockfile) = rnpm_lockfile::load_and_migrate(&lock_path) {
-            let count = lockfile
-                .packages
-                .iter()
-                .filter(|(k, p)| !k.is_empty() && p.extra.contains_key("funding"))
-                .count();
-            if count > 0 {
-                return count;
-            }
+pub(crate) fn count_funding_packages_with_lockfile(
+    project_dir: &Path,
+    preloaded_lockfile: Option<&rnpm_lockfile::LockfileV3>,
+) -> usize {
+    let loaded_lockfile = if preloaded_lockfile.is_none() {
+        let (lock_path, _) = rnpm_install::resolve_lockfile_path(project_dir);
+        if lock_path.exists() {
+            rnpm_lockfile::load_and_migrate(&lock_path).ok()
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    if let Some(lockfile) = preloaded_lockfile.or(loaded_lockfile.as_ref()) {
+        let count = lockfile
+            .packages
+            .iter()
+            .filter(|(k, p)| !k.is_empty() && p.extra.contains_key("funding"))
+            .count();
+        if count > 0 {
+            return count;
         }
     }
     let nm_dir = project_dir.join("node_modules");

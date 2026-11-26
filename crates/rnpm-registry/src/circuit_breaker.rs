@@ -1,7 +1,7 @@
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
-use tokio::sync::RwLock;
 
 /// State of a circuit breaker for a remote registry host.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -21,6 +21,7 @@ struct HostCircuit {
     consecutive_failures: usize,
     state: CircuitBreakerState,
     last_state_change: Instant,
+    dirty: bool,
 }
 
 impl Default for HostCircuit {
@@ -29,6 +30,7 @@ impl Default for HostCircuit {
             consecutive_failures: 0,
             state: CircuitBreakerState::Closed,
             last_state_change: Instant::now(),
+            dirty: false,
         }
     }
 }
@@ -39,6 +41,9 @@ pub struct CircuitBreaker {
     failure_threshold: usize,
     reset_timeout: Duration,
     hosts: Arc<RwLock<HashMap<String, HostCircuit>>>,
+    /// Count of host entries with non-zero failures or non-Closed state.
+    /// When 0, all hosts are Closed and healthy fast-paths avoid locking entirely.
+    dirty_hosts: Arc<AtomicUsize>,
 }
 
 impl CircuitBreaker {
@@ -47,37 +52,68 @@ impl CircuitBreaker {
             failure_threshold,
             reset_timeout,
             hosts: Arc::new(RwLock::new(HashMap::new())),
+            dirty_hosts: Arc::new(AtomicUsize::new(0)),
         }
     }
 
     /// Check the circuit state for a host.
     /// If Open and the reset timeout has elapsed, transitions automatically to HalfOpen.
     pub async fn check_state(&self, host: &str) -> CircuitBreakerState {
-        if self.failure_threshold == 0 {
+        if self.failure_threshold == 0 || self.dirty_hosts.load(Ordering::Acquire) == 0 {
             return CircuitBreakerState::Closed;
         }
 
-        let mut hosts = self.hosts.write().await;
-        let entry = hosts.entry(host.to_string()).or_default();
+        {
+            let hosts = self.hosts.read().unwrap_or_else(|e| e.into_inner());
+            let Some(entry) = hosts.get(host) else {
+                return CircuitBreakerState::Closed;
+            };
+            if entry.state != CircuitBreakerState::Open
+                || entry.last_state_change.elapsed() < self.reset_timeout
+            {
+                return entry.state;
+            }
+        }
 
+        let mut hosts = self.hosts.write().unwrap_or_else(|e| e.into_inner());
+        let Some(entry) = hosts.get_mut(host) else {
+            return CircuitBreakerState::Closed;
+        };
         if entry.state == CircuitBreakerState::Open
             && entry.last_state_change.elapsed() >= self.reset_timeout
         {
             entry.state = CircuitBreakerState::HalfOpen;
             entry.last_state_change = Instant::now();
         }
-
         entry.state
     }
 
     /// Record a successful request to a host, closing the circuit and resetting failure counts.
     pub async fn record_success(&self, host: &str) {
-        if self.failure_threshold == 0 {
+        if self.failure_threshold == 0 || self.dirty_hosts.load(Ordering::Acquire) == 0 {
             return;
         }
 
-        let mut hosts = self.hosts.write().await;
+        {
+            let hosts = self.hosts.read().unwrap_or_else(|e| e.into_inner());
+            match hosts.get(host) {
+                None => return,
+                Some(entry)
+                    if entry.state == CircuitBreakerState::Closed
+                        && entry.consecutive_failures == 0 =>
+                {
+                    return;
+                }
+                _ => {}
+            }
+        }
+
+        let mut hosts = self.hosts.write().unwrap_or_else(|e| e.into_inner());
         if let Some(entry) = hosts.get_mut(host) {
+            if entry.dirty {
+                entry.dirty = false;
+                self.dirty_hosts.fetch_sub(1, Ordering::Release);
+            }
             entry.consecutive_failures = 0;
             entry.state = CircuitBreakerState::Closed;
             entry.last_state_change = Instant::now();
@@ -92,8 +128,13 @@ impl CircuitBreaker {
             return CircuitBreakerState::Closed;
         }
 
-        let mut hosts = self.hosts.write().await;
+        let mut hosts = self.hosts.write().unwrap_or_else(|e| e.into_inner());
         let entry = hosts.entry(host.to_string()).or_default();
+
+        if !entry.dirty {
+            entry.dirty = true;
+            self.dirty_hosts.fetch_add(1, Ordering::Release);
+        }
 
         entry.consecutive_failures += 1;
         if entry.consecutive_failures >= self.failure_threshold
@@ -108,8 +149,12 @@ impl CircuitBreaker {
 
     /// Explicitly reset the circuit for a host to Closed.
     pub async fn reset(&self, host: &str) {
-        let mut hosts = self.hosts.write().await;
+        let mut hosts = self.hosts.write().unwrap_or_else(|e| e.into_inner());
         if let Some(entry) = hosts.get_mut(host) {
+            if entry.dirty {
+                entry.dirty = false;
+                self.dirty_hosts.fetch_sub(1, Ordering::Release);
+            }
             entry.consecutive_failures = 0;
             entry.state = CircuitBreakerState::Closed;
             entry.last_state_change = Instant::now();
@@ -118,8 +163,12 @@ impl CircuitBreaker {
 
     /// Explicitly trip the circuit for a host to Open.
     pub async fn trip(&self, host: &str) {
-        let mut hosts = self.hosts.write().await;
+        let mut hosts = self.hosts.write().unwrap_or_else(|e| e.into_inner());
         let entry = hosts.entry(host.to_string()).or_default();
+        if !entry.dirty {
+            entry.dirty = true;
+            self.dirty_hosts.fetch_add(1, Ordering::Release);
+        }
         entry.state = CircuitBreakerState::Open;
         entry.consecutive_failures = self.failure_threshold;
         entry.last_state_change = Instant::now();

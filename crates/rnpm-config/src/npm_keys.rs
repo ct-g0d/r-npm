@@ -262,16 +262,51 @@ pub static NPM_BOOLEAN_CONFIG_KEYS: &[&str] = &[
     "yes",
 ];
 
+/// Normalize a CLI flag or configuration key name into a caller-provided stack buffer when possible.
+fn normalize_key_cow<'a>(key: &'a str, buf: &'a mut [u8; 128]) -> std::borrow::Cow<'a, str> {
+    let stripped = key.strip_prefix("--").unwrap_or(key);
+    let bytes = stripped.as_bytes();
+    if bytes.len() <= buf.len() {
+        let mut changed = false;
+        for (dst, &b) in buf.iter_mut().zip(bytes.iter()) {
+            let nb = if b == b'_' {
+                b'-'
+            } else {
+                b.to_ascii_lowercase()
+            };
+            if nb != b {
+                changed = true;
+            }
+            *dst = nb;
+        }
+        if !changed {
+            return std::borrow::Cow::Borrowed(stripped);
+        }
+        // Replacing ASCII '_' -> '-' and A-Z -> a-z preserves UTF-8 validity.
+        let s = std::str::from_utf8(&buf[..bytes.len()]).expect("valid UTF-8 after ASCII mapping");
+        return std::borrow::Cow::Borrowed(s);
+    }
+    std::borrow::Cow::Owned(normalize_config_key(stripped))
+}
+
 /// Normalize a CLI flag or configuration key name to standard kebab-case.
 pub fn normalize_config_key(key: &str) -> String {
-    let lower = key.to_ascii_lowercase();
-    let stripped = lower.strip_prefix("--").unwrap_or(&lower);
-    stripped.replace('_', "-")
+    let stripped = key.strip_prefix("--").unwrap_or(key);
+    let mut out = String::with_capacity(stripped.len());
+    for ch in stripped.chars() {
+        if ch == '_' {
+            out.push('-');
+        } else {
+            out.push(ch.to_ascii_lowercase());
+        }
+    }
+    out
 }
 
 /// Returns true if the key is a recognized npm configuration key (or scoped registry/auth token).
 pub fn is_known_npm_config_key(key: &str) -> bool {
-    let norm = normalize_config_key(key);
+    let mut buf = [0u8; 128];
+    let norm = normalize_key_cow(key, &mut buf);
     let norm_stripped = norm.strip_prefix("no-").unwrap_or(&norm);
     if (norm_stripped.starts_with('@') || norm_stripped.contains(':'))
         && (norm_stripped.ends_with(":registry") || norm_stripped.ends_with("/registry"))
@@ -281,14 +316,29 @@ pub fn is_known_npm_config_key(key: &str) -> bool {
     if norm_stripped.starts_with("//") {
         return true;
     }
-    NPM_CONFIG_KEYS.contains(&norm_stripped) || NPM_BOOLEAN_CONFIG_KEYS.contains(&norm_stripped)
+    NPM_CONFIG_KEYS.binary_search(&norm_stripped).is_ok()
+        || NPM_BOOLEAN_CONFIG_KEYS
+            .binary_search(&norm_stripped)
+            .is_ok()
 }
 
 /// Returns true if the flag represents a boolean configuration property in npm.
 pub fn is_boolean_npm_config_key(key: &str) -> bool {
-    let norm = normalize_config_key(key);
+    let mut buf = [0u8; 128];
+    let norm = normalize_key_cow(key, &mut buf);
     if norm.starts_with("no-") {
         return true;
     }
-    NPM_BOOLEAN_CONFIG_KEYS.contains(&norm.as_str())
+    NPM_BOOLEAN_CONFIG_KEYS.binary_search(&norm.as_ref()).is_ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn static_key_tables_are_sorted_for_binary_search() {
+        assert!(NPM_CONFIG_KEYS.windows(2).all(|w| w[0] < w[1]));
+        assert!(NPM_BOOLEAN_CONFIG_KEYS.windows(2).all(|w| w[0] < w[1]));
+    }
 }

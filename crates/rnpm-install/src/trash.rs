@@ -134,7 +134,9 @@ fn clean_trash_in_dir(parent: &Path) {
             if name_str.starts_with(".rnpm-trash") {
                 let path = entry.path();
                 let _ = rnpm_fs::remove_dir_all_safe(&path);
-            } else if name_str.starts_with('@') && entry.path().is_dir() {
+            } else if name_str.starts_with('@')
+                && entry.file_type().is_ok_and(|t| t.is_dir())
+            {
                 if let Ok(scoped_entries) = std::fs::read_dir(entry.path()) {
                     for scoped_entry in scoped_entries.flatten() {
                         let s_name = scoped_entry.file_name();

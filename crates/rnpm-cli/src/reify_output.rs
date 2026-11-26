@@ -20,8 +20,12 @@ pub(crate) struct ReifyOutputOptions {
 }
 
 impl ReifyOutputOptions {
-    pub fn from_config(project_dir: &Path, json: bool, dry_run: bool, fund: bool) -> Self {
-        let config = rnpm_config::Config::load(Some(project_dir)).unwrap_or_default();
+    pub fn from_config_loaded(
+        config: &rnpm_config::Config,
+        json: bool,
+        dry_run: bool,
+        fund: bool,
+    ) -> Self {
         Self {
             json: json || config.get_bool("json").unwrap_or(false),
             silent: config.get("loglevel") == Some("silent")
@@ -318,6 +322,7 @@ pub(crate) fn report_between(before: &Tree, after: &Tree) -> ReifyReport {
 
 /// Prints reify output for a command that mutated (or, in a dry run,
 /// planned) the tree, auditing the result unless audit is disabled.
+#[allow(dead_code)]
 pub(crate) async fn finish(
     project_dir: &Path,
     report: &ReifyReport,
@@ -326,22 +331,56 @@ pub(crate) async fn finish(
     silent: bool,
     elapsed: std::time::Duration,
 ) -> anyhow::Result<()> {
-    let config = rnpm_config::Config::load(Some(project_dir)).unwrap_or_default();
+    finish_with_config(project_dir, report, json, dry_run, silent, elapsed, None).await
+}
+
+pub(crate) async fn finish_with_config(
+    project_dir: &Path,
+    report: &ReifyReport,
+    json: bool,
+    dry_run: bool,
+    silent: bool,
+    elapsed: std::time::Duration,
+    preloaded_config: Option<&rnpm_config::Config>,
+) -> anyhow::Result<()> {
+    let owned_config;
+    let config = match preloaded_config {
+        Some(cfg) => cfg,
+        None => {
+            owned_config = rnpm_config::Config::load(Some(project_dir)).unwrap_or_default();
+            &owned_config
+        }
+    };
     let audit_enabled = config.get_bool("audit").unwrap_or(true);
     let fund_enabled = config.get_bool("fund").unwrap_or(true);
-    let mut opts = ReifyOutputOptions::from_config(project_dir, json, dry_run, fund_enabled);
+    let mut opts = ReifyOutputOptions::from_config_loaded(config, json, dry_run, fund_enabled);
     opts.silent |= silent;
+    let parsed_lock = if !opts.dry_run && audit_enabled && fund_enabled {
+        let (lock_path, _) = rnpm_install::resolve_lockfile_path(project_dir);
+        if lock_path.exists() {
+            rnpm_lockfile::load_and_migrate(&lock_path).ok()
+        } else {
+            None
+        }
+    } else {
+        None
+    };
     let audit = if audit_enabled && !opts.dry_run && project_dir.join("package-lock.json").exists()
     {
-        crate::audit::build_audit_report(project_dir, None)
-            .await
-            .ok()
-            .map(|(r, _)| r)
+        crate::audit::build_audit_report_with_config_and_lockfile(
+            project_dir,
+            None,
+            Some(config),
+            parsed_lock.as_ref(),
+        )
+        .await
+        .ok()
+        .map(|(r, _)| r)
     } else {
         None
     };
     let funding = if fund_enabled && !opts.dry_run {
-        crate::audit::count_funding_packages(project_dir)
+        crate::audit::count_funding_packages_with_lockfile(project_dir, parsed_lock.as_ref())
     } else {
         0
     };

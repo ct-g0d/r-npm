@@ -331,8 +331,8 @@ fn load_embedded_docs() -> Result<Vec<(String, String)>> {
     Ok(entries)
 }
 
-/// Execute help-search command.
-pub async fn run(terms: Vec<String>, long: bool, custom_docs_dir: Option<&Path>) -> Result<()> {
+/// Execute help-search command synchronously.
+pub fn run_sync(terms: &[String], long: bool, custom_docs_dir: Option<&Path>) -> Result<()> {
     if terms.is_empty() {
         return Err(anyhow::anyhow!(
             "npm error code EUSAGE\n\
@@ -354,10 +354,15 @@ pub async fn run(terms: Vec<String>, long: bool, custom_docs_dir: Option<&Path>)
     }
 
     let docs = load_documentation(custom_docs_dir)?;
-    let results = search_documents(&terms, &docs);
-    let output = format_search_results(&terms, &results, long);
+    let results = search_documents(terms, &docs);
+    let output = format_search_results(terms, &results, long);
     print!("{output}");
     Ok(())
+}
+
+/// Execute help-search command.
+pub async fn run(terms: Vec<String>, long: bool, custom_docs_dir: Option<&Path>) -> Result<()> {
+    run_sync(&terms, long, custom_docs_dir)
 }
 
 #[cfg(test)]

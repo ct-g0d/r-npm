@@ -143,6 +143,13 @@ pub trait PackageMetadataProvider: Send + Sync {
         let names: Vec<&str> = edges.iter().map(|(n, _)| *n).collect();
         self.prefetch_packages(&names);
     }
+
+    /// Whether this provider benefits from multi-threaded closure prefetching (e.g. network/disk).
+    /// Pure in-memory providers can return `false` to avoid spawning prefetch worker threads.
+    #[doc(hidden)]
+    fn needs_closure_prefetch(&self) -> bool {
+        true
+    }
 }
 
 /// In-memory package provider convenient for unit tests, fixtures, and synthetic graph creation.
@@ -219,5 +226,9 @@ impl InMemoryPackageProvider {
 impl PackageMetadataProvider for InMemoryPackageProvider {
     fn get_package(&self, name: &str) -> Result<Option<PackageMetadata>, SolverError> {
         Ok(self.packages.get(name).cloned())
+    }
+
+    fn needs_closure_prefetch(&self) -> bool {
+        false
     }
 }

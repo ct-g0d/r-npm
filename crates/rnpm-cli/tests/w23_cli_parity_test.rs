@@ -3,6 +3,41 @@ use std::process::Command;
 use tempfile::tempdir;
 
 #[test]
+fn empty_run_scripts_skip_shell_and_keep_nonempty_hooks() {
+    let tmp = tempdir().unwrap();
+    let manifest = serde_json::json!({
+        "name": "empty-script-test",
+        "version": "1.0.0",
+        "scripts": {
+            "noop": "",
+            "precheck": "echo before",
+            "check": "",
+            "postcheck": "echo after"
+        }
+    });
+    fs::write(tmp.path().join("package.json"), manifest.to_string()).unwrap();
+
+    let noop = Command::new(env!("CARGO_BIN_EXE_rnpm"))
+        .args(["run", "noop", "--", "echo", "unexpected"])
+        .current_dir(tmp.path())
+        .output()
+        .unwrap();
+    assert!(noop.status.success());
+    assert!(noop.stdout.is_empty());
+
+    let checked = Command::new(env!("CARGO_BIN_EXE_rnpm"))
+        .args(["run", "check"])
+        .current_dir(tmp.path())
+        .output()
+        .unwrap();
+    assert!(checked.status.success());
+    let stdout = String::from_utf8(checked.stdout).unwrap();
+    assert!(stdout.lines().any(|line| line == "before"));
+    assert!(stdout.lines().any(|line| line == "after"));
+    assert!(!stdout.lines().any(|line| line == "> empty-script-test@1.0.0 check"));
+}
+
+#[test]
 fn test_version_invalid_arg_no_eunknown() {
     let tmp = tempdir().unwrap();
     let rnpm_bin = env!("CARGO_BIN_EXE_rnpm");

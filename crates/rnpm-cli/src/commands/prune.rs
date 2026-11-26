@@ -14,7 +14,16 @@ pub(crate) struct PruneCommandArgs {
     pub workspaces: bool,
 }
 
+#[allow(dead_code)]
 pub(crate) async fn run(args: PruneCommandArgs, current_dir: PathBuf) -> Result<()> {
+    run_with_config(args, current_dir, None).await
+}
+
+pub(crate) async fn run_with_config(
+    args: PruneCommandArgs,
+    current_dir: PathBuf,
+    preloaded_config: Option<&rnpm_config::Config>,
+) -> Result<()> {
     let start_time = std::time::Instant::now();
     let (mut omit_dev, omit_optional, omit_peer) =
         crate::parse_omit_and_include_options(&args.omit, &args.include);
@@ -43,6 +52,7 @@ pub(crate) async fn run(args: PruneCommandArgs, current_dir: PathBuf) -> Result<
         workspace_root: args.workspace_root,
         workspace: args.workspace,
         workspaces: args.workspaces,
+        config_override: preloaded_config.cloned(),
         ..Default::default()
     };
 
@@ -82,13 +92,14 @@ pub(crate) async fn run(args: PruneCommandArgs, current_dir: PathBuf) -> Result<
         crate::reify_output::report_between(&before, &crate::reify_output::snapshot(&current_dir))
     };
 
-    crate::reify_output::finish(
+    crate::reify_output::finish_with_config(
         &current_dir,
         &report,
         args.json,
         args.dry_run,
         args.silent,
         start_time.elapsed(),
+        preloaded_config,
     )
     .await
 }

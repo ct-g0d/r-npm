@@ -1,4 +1,5 @@
 use rnpm_core::integrity::{Algorithm, Integrity};
+use std::borrow::Cow;
 use std::collections::HashSet;
 use std::net::IpAddr;
 use std::str::FromStr;
@@ -133,20 +134,25 @@ pub fn verify_lockfile_integrity(
     lockfile: &LockfileV3,
     policy: &IntegrityPolicy,
 ) -> Result<(), LockfileError> {
-    // Collect direct dependency names from root package
-    let mut direct_deps: HashSet<String> = HashSet::new();
+    // Collect direct dependency names from root package (borrowed slices, zero String clones)
+    let mut direct_deps: HashSet<&str> = HashSet::new();
     if let Some(root) = lockfile.root_package() {
+        let cap = root.dependencies.as_ref().map_or(0, |d| d.len())
+            + root.dev_dependencies.as_ref().map_or(0, |d| d.len())
+            + root.optional_dependencies.as_ref().map_or(0, |d| d.len())
+            + root.peer_dependencies.as_ref().map_or(0, |d| d.len());
+        direct_deps.reserve(cap);
         if let Some(ref d) = root.dependencies {
-            direct_deps.extend(d.keys().cloned());
+            direct_deps.extend(d.keys().map(String::as_str));
         }
         if let Some(ref d) = root.dev_dependencies {
-            direct_deps.extend(d.keys().cloned());
+            direct_deps.extend(d.keys().map(String::as_str));
         }
         if let Some(ref d) = root.optional_dependencies {
-            direct_deps.extend(d.keys().cloned());
+            direct_deps.extend(d.keys().map(String::as_str));
         }
         if let Some(ref d) = root.peer_dependencies {
-            direct_deps.extend(d.keys().cloned());
+            direct_deps.extend(d.keys().map(String::as_str));
         }
     }
 
@@ -161,23 +167,15 @@ pub fn verify_lockfile_integrity(
             continue;
         }
 
-        // Determine the package's declared or inferred name
-        let inferred_name = pkg
-            .name
-            .clone()
-            .unwrap_or_else(|| extract_package_name_from_path(pkg_path));
-
-        // Determine if this package is a direct root dependency or transitive
-        let is_direct = is_direct_dependency(pkg_path, &direct_deps);
-
-        // 1. Audit integrity hash presence and strength
+        // 1. Audit integrity hash presence and strength (zero-allocation validation)
         audit_integrity(pkg_path, pkg, policy)?;
 
         // 2. Audit resolved URL if present
         if let Some(ref resolved) = pkg.resolved {
+            let is_direct = is_direct_dependency(pkg_path, &direct_deps);
             audit_resolved_url(
                 pkg_path,
-                &inferred_name,
+                pkg.name.as_deref(),
                 pkg.version.as_deref(),
                 resolved,
                 is_direct,
@@ -201,17 +199,15 @@ fn audit_integrity(
             }
         }
         Some(integrity_str) => {
-            let integrity = Integrity::parse(integrity_str).map_err(|e| {
-                LockfileError::InvalidStructure(format!(
-                    "Invalid integrity hash in package '{pkg_path}': {e}"
-                ))
-            })?;
+            let strongest = Integrity::strongest_algorithm_str(integrity_str)
+                .map_err(|e| {
+                    LockfileError::InvalidStructure(format!(
+                        "Invalid integrity hash in package '{pkg_path}': {e}"
+                    ))
+                })?
+                .ok_or_else(|| LockfileError::MissingIntegrity(pkg_path.to_string()))?;
 
             if let Some(min_algo) = policy.min_algorithm {
-                let strongest = integrity
-                    .strongest_algorithm()
-                    .ok_or_else(|| LockfileError::MissingIntegrity(pkg_path.to_string()))?;
-
                 if strongest < min_algo {
                     return Err(LockfileError::WeakIntegrity {
                         package: pkg_path.to_string(),
@@ -226,23 +222,121 @@ fn audit_integrity(
     Ok(())
 }
 
+#[inline]
+fn starts_with_ignore_ascii_case(s: &str, prefix: &str) -> bool {
+    s.get(..prefix.len())
+        .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
+}
+
+#[inline]
+fn host_matches_domain(host_lower: &str, domain_lower: &str) -> bool {
+    host_lower == domain_lower
+        || (host_lower.len() > domain_lower.len()
+            && host_lower.ends_with(domain_lower)
+            && host_lower.as_bytes()[host_lower.len() - domain_lower.len() - 1] == b'.')
+}
+
+/// Fast path for canonical lowercase ASCII registry URLs without userinfo, ports,
+/// IP hosts, percent-encoding, queries, fragments, backslashes, or dot-segments.
+/// Any non-trivial URL returns `None` and falls back to full `Url::parse`.
+#[inline]
+fn try_split_fast_http_url(resolved: &str) -> Option<(&str, &str, &str)> {
+    let (scheme, rest) = if let Some(r) = resolved.strip_prefix("https://") {
+        ("https", r)
+    } else {
+        ("http", resolved.strip_prefix("http://")?)
+    };
+
+    let slash_idx = rest.find('/')?;
+    let host = &rest[..slash_idx];
+    let path = &rest[slash_idx..];
+
+    let hb = host.as_bytes();
+    if hb.is_empty() || hb.len() > 253 {
+        return None;
+    }
+    let mut last_dot = None;
+    let mut prev_dot = true;
+    for (i, &b) in hb.iter().enumerate() {
+        if b == b'.' {
+            if prev_dot {
+                return None;
+            }
+            last_dot = Some(i);
+            prev_dot = true;
+        } else if b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' {
+            if prev_dot && b == b'-' {
+                return None;
+            }
+            prev_dot = false;
+        } else {
+            return None;
+        }
+    }
+    if prev_dot {
+        return None;
+    }
+    let dot_idx = last_dot?;
+    let tld = &hb[dot_idx + 1..];
+    if tld.is_empty() || !tld.iter().all(|b| b.is_ascii_lowercase()) {
+        return None;
+    }
+
+    let pb = path.as_bytes();
+    for (i, &b) in pb.iter().enumerate() {
+        if !(b.is_ascii_alphanumeric()
+            || matches!(b, b'/' | b'-' | b'_' | b'.' | b'@' | b'+' | b'~'))
+        {
+            return None;
+        }
+        if b == b'.' && (i == 0 || pb[i - 1] == b'/' || pb[i - 1] == b'.') {
+            return None;
+        }
+    }
+
+    Some((scheme, host, path))
+}
+
 fn audit_resolved_url(
     pkg_path: &str,
-    pkg_name: &str,
+    declared_name: Option<&str>,
     pkg_version: Option<&str>,
     resolved: &str,
     is_direct: bool,
     policy: &IntegrityPolicy,
 ) -> Result<(), LockfileError> {
-    let lower_trimmed = resolved.trim().to_ascii_lowercase();
+    if let Some((scheme, host_str, url_path)) = try_split_fast_http_url(resolved) {
+        if scheme == "http" && !policy.allow_insecure_http {
+            return Err(LockfileError::InsecureResolvedUrl {
+                package: pkg_path.to_string(),
+                url: resolved.to_string(),
+            });
+        }
+        if !policy.allowed_registries.is_empty() {
+            check_allowed_registries(pkg_path, host_str, policy)?;
+        }
+        let pkg_name: Cow<'_, str> = match declared_name {
+            Some(n) => Cow::Borrowed(n),
+            None => extract_package_name_from_path_cow(pkg_path),
+        };
+        return audit_tarball_name_and_version(
+            pkg_path,
+            pkg_name.as_ref(),
+            pkg_version,
+            url_path,
+            resolved,
+        );
+    }
+
+    let trimmed = resolved.trim();
 
     // Check for git protocols
-    let is_git = lower_trimmed.starts_with("git://")
-        || lower_trimmed.starts_with("git+http://")
-        || lower_trimmed.starts_with("git+https://")
-        || lower_trimmed.starts_with("git+ssh://")
-        || lower_trimmed.starts_with("git+file://")
-        || lower_trimmed.starts_with("git@");
+    let is_git = starts_with_ignore_ascii_case(trimmed, "git://")
+        || starts_with_ignore_ascii_case(trimmed, "git+http://")
+        || starts_with_ignore_ascii_case(trimmed, "git+https://")
+        || starts_with_ignore_ascii_case(trimmed, "git+ssh://")
+        || starts_with_ignore_ascii_case(trimmed, "git+file://")
+        || starts_with_ignore_ascii_case(trimmed, "git@");
 
     if is_git {
         if !is_direct && !policy.allow_transitive_git {
@@ -257,7 +351,7 @@ fn audit_resolved_url(
     }
 
     // Check for file protocol
-    let is_file = lower_trimmed.starts_with("file:") || lower_trimmed.starts_with("../");
+    let is_file = starts_with_ignore_ascii_case(trimmed, "file:") || trimmed.starts_with("../");
     if is_file {
         if !is_direct && !policy.allow_transitive_file {
             return Err(LockfileError::PoisonedDependency {
@@ -326,53 +420,78 @@ fn audit_resolved_url(
 
     // Check allowed_registries filter if configured
     if !policy.allowed_registries.is_empty() {
-        let host_lower = host_str.to_ascii_lowercase();
-        let matches_allowed = policy.allowed_registries.iter().any(|reg| {
-            let reg_lower = reg.to_ascii_lowercase();
-            if reg_lower.starts_with("http://") || reg_lower.starts_with("https://") {
-                if let Ok(reg_url) = Url::parse(&reg_lower) {
-                    if let Some(reg_host) = reg_url.host_str() {
-                        return host_lower == reg_host
-                            || host_lower.ends_with(&format!(".{reg_host}"));
-                    }
-                }
-            }
-            host_lower == reg_lower || host_lower.ends_with(&format!(".{reg_lower}"))
-        });
-
-        if !matches_allowed {
-            return Err(LockfileError::SuspiciousResolution {
-                package: pkg_path.to_string(),
-                reason: format!(
-                    "Host '{host_str}' is not in allowed registries: {:?}",
-                    policy.allowed_registries
-                ),
-            });
-        }
+        check_allowed_registries(pkg_path, host_str, policy)?;
     }
 
     // Audit package name and version against resolved tarball URL
-    audit_tarball_name_and_version(pkg_path, pkg_name, pkg_version, &parsed_url, resolved)?;
+    let pkg_name: Cow<'_, str> = match declared_name {
+        Some(n) => Cow::Borrowed(n),
+        None => extract_package_name_from_path_cow(pkg_path),
+    };
+    audit_tarball_name_and_version(
+        pkg_path,
+        pkg_name.as_ref(),
+        pkg_version,
+        parsed_url.path(),
+        resolved,
+    )?;
 
+    Ok(())
+}
+
+fn check_allowed_registries(
+    pkg_path: &str,
+    host_str: &str,
+    policy: &IntegrityPolicy,
+) -> Result<(), LockfileError> {
+    let host_lower: Cow<'_, str> = if host_str.bytes().any(|b| b.is_ascii_uppercase()) {
+        Cow::Owned(host_str.to_ascii_lowercase())
+    } else {
+        Cow::Borrowed(host_str)
+    };
+    let matches_allowed = policy.allowed_registries.iter().any(|reg| {
+        let reg_lower = reg.to_ascii_lowercase();
+        if reg_lower.starts_with("http://") || reg_lower.starts_with("https://") {
+            if let Ok(reg_url) = Url::parse(&reg_lower) {
+                if let Some(reg_host) = reg_url.host_str() {
+                    return host_matches_domain(&host_lower, reg_host);
+                }
+            }
+        }
+        host_matches_domain(&host_lower, &reg_lower)
+    });
+
+    if !matches_allowed {
+        return Err(LockfileError::SuspiciousResolution {
+            package: pkg_path.to_string(),
+            reason: format!(
+                "Host '{host_str}' is not in allowed registries: {:?}",
+                policy.allowed_registries
+            ),
+        });
+    }
     Ok(())
 }
 
 /// Checks that standard npm registry tarball URLs match the package name and version.
 /// E.g. `https://registry.npmjs.org/@scope/pkg/-/pkg-1.0.0.tgz` or
 /// `https://registry.npmjs.org/pkg/-/pkg-1.0.0.tgz`.
+#[inline]
 fn audit_tarball_name_and_version(
     pkg_path: &str,
     pkg_name: &str,
     pkg_version: Option<&str>,
-    parsed_url: &Url,
+    path: &str,
     resolved: &str,
 ) -> Result<(), LockfileError> {
-    let path = parsed_url.path();
-
     // Check standard npm registry tarball pattern containing `/-/`
     if let Some((prefix, tarball_filename)) = path.split_once("/-/") {
-        let expected_unscoped_name = if pkg_name.starts_with('@') && pkg_name.contains('/') {
-            pkg_name.split('/').nth(1).unwrap_or(pkg_name)
+        let expected_unscoped_name = if pkg_name.starts_with('@') {
+            if let Some((_, unscoped)) = pkg_name.split_once('/') {
+                unscoped
+            } else {
+                pkg_name
+            }
         } else {
             pkg_name
         };
@@ -397,8 +516,12 @@ fn audit_tarball_name_and_version(
         if let Some(stem) = clean_tarball {
             // Tarball filename is expected to be `<unscoped_name>-<version>`
             if let Some(expected_ver) = pkg_version {
-                let expected_tarball_stem = format!("{expected_unscoped_name}-{expected_ver}");
-                if stem != expected_tarball_stem {
+                let matches_stem = stem.len()
+                    == expected_unscoped_name.len() + 1 + expected_ver.len()
+                    && stem.starts_with(expected_unscoped_name)
+                    && stem.as_bytes()[expected_unscoped_name.len()] == b'-'
+                    && stem.ends_with(expected_ver);
+                if !matches_stem {
                     return Err(LockfileError::PoisonedDependency {
                         package: pkg_path.to_string(),
                         reason: format!(
@@ -406,7 +529,10 @@ fn audit_tarball_name_and_version(
                         ),
                     });
                 }
-            } else if !stem.starts_with(&format!("{expected_unscoped_name}-")) {
+            } else if !(stem.len() > expected_unscoped_name.len()
+                && stem.starts_with(expected_unscoped_name)
+                && stem.as_bytes()[expected_unscoped_name.len()] == b'-')
+            {
                 return Err(LockfileError::PoisonedDependency {
                     package: pkg_path.to_string(),
                     reason: format!(
@@ -420,30 +546,35 @@ fn audit_tarball_name_and_version(
     Ok(())
 }
 
-fn extract_package_name_from_path(pkg_path: &str) -> String {
-    let clean = pkg_path.replace('\\', "/");
-    let after_nm = if let Some(pos) = clean.rfind("node_modules/") {
-        &clean[pos + "node_modules/".len()..]
-    } else {
-        &clean
-    };
-    after_nm.to_string()
+#[inline]
+fn extract_package_name_from_path_cow(pkg_path: &str) -> Cow<'_, str> {
+    match rnpm_core::to_posix_path_cow(pkg_path) {
+        Cow::Borrowed(clean) => {
+            if let Some(pos) = clean.rfind("node_modules/") {
+                Cow::Borrowed(&clean[pos + "node_modules/".len()..])
+            } else {
+                Cow::Borrowed(clean)
+            }
+        }
+        Cow::Owned(clean) => {
+            if let Some(pos) = clean.rfind("node_modules/") {
+                Cow::Owned(clean[pos + "node_modules/".len()..].to_string())
+            } else {
+                Cow::Owned(clean)
+            }
+        }
+    }
 }
 
-fn is_direct_dependency(
-    pkg_path: &str,
-    direct_deps: &HashSet<String>,
-) -> bool {
-    let clean = pkg_path.replace('\\', "/");
-    let clean = clean.trim_end_matches('/');
-
-    // If path contains multiple node_modules segments, it's definitely nested (transitive)
-    let nm_count = clean.split("node_modules").count() - 1;
-    if nm_count > 1 {
-        return false;
-    }
+#[inline]
+fn is_direct_dependency(pkg_path: &str, direct_deps: &HashSet<&str>) -> bool {
+    let clean_cow = rnpm_core::to_posix_path_cow(pkg_path);
+    let clean = clean_cow.trim_end_matches('/');
 
     if let Some(folder_name) = clean.strip_prefix("node_modules/") {
+        if folder_name.contains("node_modules") {
+            return false;
+        }
         if direct_deps.contains(folder_name) {
             return true;
         }

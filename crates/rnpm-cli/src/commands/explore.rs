@@ -94,6 +94,17 @@ pub async fn run(
     shell_opt: Option<String>,
     current_dir: PathBuf,
 ) -> Result<()> {
+    run_sync(package, args, shell_opt, current_dir, None)
+}
+
+/// Execute `npm explore <pkg> [ -- <command>]` synchronously using preloaded config when available.
+pub fn run_sync(
+    package: Option<String>,
+    args: Vec<String>,
+    shell_opt: Option<String>,
+    current_dir: PathBuf,
+    preloaded_config: Option<&rnpm_config::Config>,
+) -> Result<()> {
     let pkgname = package.ok_or_else(usage_error)?;
 
     let node_modules_dir = current_dir.join("node_modules");
@@ -131,8 +142,12 @@ pub async fn run(
     let pkg_version = manifest.version.unwrap_or_default();
 
     let new_path = build_explore_path(&pkg_dir);
-    let config = rnpm_config::Config::load(Some(&current_dir)).unwrap_or_default();
-    let configured_shell = shell_opt.or_else(|| config.get("shell").map(String::from));
+    let configured_shell = shell_opt.or_else(|| match preloaded_config {
+        Some(cfg) => cfg.get("shell").map(String::from),
+        None => rnpm_config::Config::load(Some(&current_dir))
+            .ok()
+            .and_then(|cfg| cfg.get("shell").map(String::from)),
+    });
 
     // Determine command to run
     let is_interactive = args.is_empty();

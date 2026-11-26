@@ -24,22 +24,24 @@ impl DependencySpec {
 
         if let Some(alias_str) = trimmed_spec.strip_prefix("npm:") {
             // Can be "pkg@spec", "@scope/pkg@spec", "pkg", or "@scope/pkg"
-            let (real_name, sub_spec) = split_alias_name_and_spec(alias_str)?;
-            let inner_target = if let Some(spec) = sub_spec {
-                PackageTarget::parse(spec)?
-            } else {
-                PackageTarget::parse("*")?
+            let (real_name, sub_spec) = split_npm_alias(alias_str)?;
+            let inner_target = match crate::hoisting::cached_parse_package_target(sub_spec.unwrap_or("*")) {
+                Some(t) => t,
+                None => PackageTarget::parse(sub_spec.unwrap_or("*"))?,
             };
 
             Ok(Self {
                 install_name: trimmed_install.to_string(),
-                package_name: real_name,
+                package_name: real_name.to_string(),
                 target: inner_target,
                 raw_spec: trimmed_spec.to_string(),
                 is_alias: true,
             })
         } else {
-            let target = PackageTarget::parse(trimmed_spec)?;
+            let target = match crate::hoisting::cached_parse_package_target(trimmed_spec) {
+                Some(t) => t,
+                None => PackageTarget::parse(trimmed_spec)?,
+            };
             Ok(Self {
                 install_name: trimmed_install.to_string(),
                 package_name: trimmed_install.to_string(),
@@ -52,8 +54,8 @@ impl DependencySpec {
 }
 
 /// Splits alias contents (e.g. `foo@^1.0.0` or `@scope/foo@~2.0.0` or `foo`)
-/// into real package name and optional inner spec.
-fn split_alias_name_and_spec(input: &str) -> Result<(String, Option<&str>), SolverError> {
+/// into borrowed real package name and optional inner spec.
+pub(crate) fn split_npm_alias(input: &str) -> Result<(&str, Option<&str>), SolverError> {
     let s = input.trim();
     if s.is_empty() {
         return Err(SolverError::UnresolvedDependency {
@@ -74,14 +76,14 @@ fn split_alias_name_and_spec(input: &str) -> Result<(String, Option<&str>), Solv
         let after_slash = &s[slash + 1..];
         if let Some(at) = after_slash.find('@') {
             let full_at = slash + 1 + at;
-            Ok((s[..full_at].to_string(), Some(&s[full_at + 1..])))
+            Ok((&s[..full_at], Some(&s[full_at + 1..])))
         } else {
-            Ok((s.to_string(), None))
+            Ok((s, None))
         }
     } else if let Some(at) = s.find('@') {
-        Ok((s[..at].to_string(), Some(&s[at + 1..])))
+        Ok((&s[..at], Some(&s[at + 1..])))
     } else {
-        Ok((s.to_string(), None))
+        Ok((s, None))
     }
 }
 

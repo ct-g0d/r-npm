@@ -5,17 +5,16 @@
 .DESCRIPTION
     Validates Gate C / Phase 2 Expansion criteria:
     1. Extreme 50+ Package Monorepo Workspace DAG (52 packages: pkg-01 .. pkg-52):
-       - Full install differential parity between npm 10.x oracle and rnpm
+       - Full install differential parity between npm and rnpm
        - 100% normalized tree match (files, hashes, structure)
        - Lockfile v3 deterministic match (POSIX keys, integrity, version, resolved)
        - Clean-slate CI install parity (rnpm ci vs npm ci)
     2. Complex Postinstall Build Pipeline & Cross-Package Artifact Propagation:
        - Verifies dist/pkg-01-artifact.json, dist/pkg-15-artifact.json, and dist/pkg-49-artifact.json produced in topological sequence
        - Verifies process group containment (no orphaned processes remaining)
-    3. Circular Workspace Reference Detection:
-       - Runs rnpm install on benchmarks/fixtures/extreme-circular-monorepo
-       - Asserts exit code is non-zero (fails)
-       - Asserts error message contains cycle detection mentioning circ-a and circ-b
+    3. Unsupported Workspace Protocol Parity:
+       - Runs npm and rnpm on benchmarks/fixtures/extreme-circular-monorepo
+       - Compares the exit code and unsupported workspace:* diagnostic
     4. Statistical Stability & Outlier Replacement under Environmental Noise:
        - Validates Median Absolute Deviation (>3 MAD) threshold detection
        - Runs repeated benchmark sweeps under simulated environmental noise (run-npm.ps1 -SimulateLoad -InjectOutlierDelayMs 400.0)
@@ -234,22 +233,27 @@ try {
     # Part 3: Circular Workspace Reference Detection
     # =========================================================================
     Write-Host "`n=================================================================" -ForegroundColor Yellow
-    Write-Host "Part 3: Circular Workspace Reference Detection" -ForegroundColor Yellow
+    Write-Host "Part 3: Unsupported Workspace Protocol Parity" -ForegroundColor Yellow
     Write-Host "=================================================================" -ForegroundColor Yellow
 
     $circFixture = Join-Path $ScriptDir "fixtures\extreme-circular-monorepo"
+    $npmCircDir = Join-Path $TempBase "npm-circular"
     $rnpmCircDir = Join-Path $TempBase "rnpm-circular"
+    Copy-Item $circFixture -Destination $npmCircDir -Recurse
     Copy-Item $circFixture -Destination $rnpmCircDir -Recurse
 
-    Write-Host "[3.1] Running rnpm install on circular monorepo fixture..." -ForegroundColor Gray
-    $circOut = cmd.exe /c "cd /d `"$rnpmCircDir`" && `"$RnpmPath`" install --offline 2>&1"
+    Write-Host "[3.1] Running npm and rnpm on the workspace: fixture..." -ForegroundColor Gray
+    $npmCircOut = cmd.exe /c "cd /d `"$npmCircDir`" && $NpmPath install --offline --registry $RegistryUrl 2>&1"
+    $npmCircExit = $LASTEXITCODE
+    $circOut = cmd.exe /c "cd /d `"$rnpmCircDir`" && `"$RnpmPath`" install --offline --registry $RegistryUrl 2>&1"
     $circExit = $LASTEXITCODE
 
-    Assert-Condition ($circExit -ne 0) "rnpm install fails on circular monorepo with non-zero exit code (exit: $circExit)"
-    $mentionsCircA = $circOut -match "circ-a"
-    $mentionsCircB = $circOut -match "circ-b"
-    $mentionsCycle = $circOut -match "(?i)(cycle|circular)"
-    Assert-Condition ($mentionsCycle -and $mentionsCircA -and $mentionsCircB) "Cycle detection error mentions circ-a and circ-b" "Output: $circOut"
+    Assert-Condition ($npmCircExit -ne 0 -and $circExit -eq $npmCircExit) "rnpm matches npm's install failure on the workspace: fixture"
+    $protocolError = [regex]::Escape('Unsupported URL Type "workspace:": workspace:*')
+    $npmDiagnostic = $npmCircOut -join "`n"
+    $rnpmDiagnostic = $circOut -join "`n"
+    Assert-Condition ($npmDiagnostic -match 'EUNSUPPORTEDPROTOCOL' -and $rnpmDiagnostic -match 'EUNSUPPORTEDPROTOCOL' -and
+        $npmDiagnostic -match $protocolError -and $rnpmDiagnostic -match $protocolError) "Both reject workspace:* with EUNSUPPORTEDPROTOCOL" "npm: $npmDiagnostic | rnpm: $rnpmDiagnostic"
 
     # =========================================================================
     # Part 4: Statistical Stability & Noise Benchmarks

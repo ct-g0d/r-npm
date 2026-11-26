@@ -2,10 +2,12 @@ use crate::error::LockfileError;
 use rnpm_core::manifest::BundledDependencies;
 use rnpm_core::semver::Version;
 use rnpm_core::spec::PackageTarget;
-use rnpm_core::to_posix_path;
+use rnpm_core::{to_posix_path, to_posix_path_cow};
 use rnpm_core::PlatformList;
-use serde::{Deserialize, Serialize};
+use serde::de::{DeserializeSeed, MapAccess, SeqAccess, Visitor};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
 use std::fs;
 use std::path::Path;
 
@@ -44,13 +46,170 @@ fn is_none_or_empty_platform(v: &Option<PlatformList>) -> bool {
 /// In npm package-lock files, `engines` is usually a map of engine names to semver constraints,
 /// but npm has also published and tolerated array, string, and arbitrary JSON representations.
 /// Uninterpreted representations are preserved during deserialization and serialization.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(untagged)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PackageEngines {
     Map(BTreeMap<String, String>),
     List(Vec<serde_json::Value>),
     String(String),
     Other(serde_json::Value),
+}
+
+impl Serialize for PackageEngines {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            PackageEngines::Map(m) => m.serialize(serializer),
+            PackageEngines::List(l) => l.serialize(serializer),
+            PackageEngines::String(s) => s.serialize(serializer),
+            PackageEngines::Other(v) => v.serialize(serializer),
+        }
+    }
+}
+
+enum StringOrJsonValue {
+    Str(String),
+    Other(serde_json::Value),
+}
+
+impl<'de> Deserialize<'de> for StringOrJsonValue {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct StringOrJsonVisitor;
+        impl<'de> Visitor<'de> for StringOrJsonVisitor {
+            type Value = StringOrJsonValue;
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                f.write_str("any JSON value")
+            }
+            fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Self::Value, E> {
+                Ok(StringOrJsonValue::Str(v.to_owned()))
+            }
+            fn visit_string<E: serde::de::Error>(self, v: String) -> Result<Self::Value, E> {
+                Ok(StringOrJsonValue::Str(v))
+            }
+            fn visit_bool<E: serde::de::Error>(self, v: bool) -> Result<Self::Value, E> {
+                Ok(StringOrJsonValue::Other(serde_json::Value::Bool(v)))
+            }
+            fn visit_i64<E: serde::de::Error>(self, v: i64) -> Result<Self::Value, E> {
+                Ok(StringOrJsonValue::Other(serde_json::Value::from(v)))
+            }
+            fn visit_u64<E: serde::de::Error>(self, v: u64) -> Result<Self::Value, E> {
+                Ok(StringOrJsonValue::Other(serde_json::Value::from(v)))
+            }
+            fn visit_f64<E: serde::de::Error>(self, v: f64) -> Result<Self::Value, E> {
+                serde_json::Number::from_f64(v)
+                    .map(|n| StringOrJsonValue::Other(serde_json::Value::Number(n)))
+                    .ok_or_else(|| E::custom("non-finite float"))
+            }
+            fn visit_none<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+                Ok(StringOrJsonValue::Other(serde_json::Value::Null))
+            }
+            fn visit_unit<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+                Ok(StringOrJsonValue::Other(serde_json::Value::Null))
+            }
+            fn visit_some<D: Deserializer<'de>>(
+                self,
+                deserializer: D,
+            ) -> Result<Self::Value, D::Error> {
+                Self::Value::deserialize(deserializer)
+            }
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+                let mut vec = Vec::with_capacity(seq.size_hint().unwrap_or(0));
+                while let Some(elem) = seq.next_element::<serde_json::Value>()? {
+                    vec.push(elem);
+                }
+                Ok(StringOrJsonValue::Other(serde_json::Value::Array(vec)))
+            }
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+                let mut obj = serde_json::Map::with_capacity(map.size_hint().unwrap_or(0));
+                while let Some((k, v)) = map.next_entry::<String, serde_json::Value>()? {
+                    obj.insert(k, v);
+                }
+                Ok(StringOrJsonValue::Other(serde_json::Value::Object(obj)))
+            }
+        }
+        deserializer.deserialize_any(StringOrJsonVisitor)
+    }
+}
+
+impl<'de> Deserialize<'de> for PackageEngines {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct PackageEnginesVisitor;
+        impl<'de> Visitor<'de> for PackageEnginesVisitor {
+            type Value = PackageEngines;
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                f.write_str("a map, list, string, or arbitrary JSON value for engines")
+            }
+            fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Self::Value, E> {
+                Ok(PackageEngines::String(v.to_owned()))
+            }
+            fn visit_string<E: serde::de::Error>(self, v: String) -> Result<Self::Value, E> {
+                Ok(PackageEngines::String(v))
+            }
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+                let mut vec = Vec::with_capacity(seq.size_hint().unwrap_or(0));
+                while let Some(elem) = seq.next_element::<serde_json::Value>()? {
+                    vec.push(elem);
+                }
+                Ok(PackageEngines::List(vec))
+            }
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+                let mut str_map: Option<BTreeMap<String, String>> = Some(BTreeMap::new());
+                let mut obj_map: Option<serde_json::Map<String, serde_json::Value>> = None;
+                while let Some(k) = map.next_key::<String>()? {
+                    if let Some(ref mut sm) = str_map {
+                        match map.next_value::<StringOrJsonValue>()? {
+                            StringOrJsonValue::Str(s) => {
+                                sm.insert(k, s);
+                            }
+                            StringOrJsonValue::Other(val) => {
+                                let prev = str_map.take().unwrap();
+                                let mut m = serde_json::Map::with_capacity(prev.len() + 4);
+                                for (pk, pv) in prev {
+                                    m.insert(pk, serde_json::Value::String(pv));
+                                }
+                                m.insert(k, val);
+                                obj_map = Some(m);
+                            }
+                        }
+                    } else if let Some(ref mut om) = obj_map {
+                        let val = map.next_value::<serde_json::Value>()?;
+                        om.insert(k, val);
+                    }
+                }
+                if let Some(m) = obj_map {
+                    Ok(PackageEngines::Other(serde_json::Value::Object(m)))
+                } else {
+                    Ok(PackageEngines::Map(str_map.unwrap_or_default()))
+                }
+            }
+            fn visit_bool<E: serde::de::Error>(self, v: bool) -> Result<Self::Value, E> {
+                Ok(PackageEngines::Other(serde_json::Value::Bool(v)))
+            }
+            fn visit_i64<E: serde::de::Error>(self, v: i64) -> Result<Self::Value, E> {
+                Ok(PackageEngines::Other(serde_json::Value::from(v)))
+            }
+            fn visit_u64<E: serde::de::Error>(self, v: u64) -> Result<Self::Value, E> {
+                Ok(PackageEngines::Other(serde_json::Value::from(v)))
+            }
+            fn visit_f64<E: serde::de::Error>(self, v: f64) -> Result<Self::Value, E> {
+                serde_json::Number::from_f64(v)
+                    .map(serde_json::Value::Number)
+                    .map(PackageEngines::Other)
+                    .ok_or_else(|| E::custom("non-finite float in engines"))
+            }
+            fn visit_none<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+                Ok(PackageEngines::Other(serde_json::Value::Null))
+            }
+            fn visit_unit<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+                Ok(PackageEngines::Other(serde_json::Value::Null))
+            }
+            fn visit_some<D: Deserializer<'de>>(
+                self,
+                deserializer: D,
+            ) -> Result<Self::Value, D::Error> {
+                Self::Value::deserialize(deserializer)
+            }
+        }
+        deserializer.deserialize_any(PackageEnginesVisitor)
+    }
 }
 
 impl PackageEngines {
@@ -261,50 +420,274 @@ impl From<&str> for PackageEngines {
 }
 
 /// Package executable configuration: single path or named binaries.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(untagged)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PackageBin {
     Single(String),
     Map(BTreeMap<String, String>),
 }
 
-/// Helper deserializer to tolerate object or array license forms and extract the license type/expression.
-pub(crate) fn deserialize_license<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let val = serde_json::Value::deserialize(deserializer)?;
-    match val {
-        serde_json::Value::String(s) => {
-            if s.is_empty() {
-                Ok(None)
-            } else {
-                Ok(Some(s))
-            }
+impl Serialize for PackageBin {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            PackageBin::Single(s) => s.serialize(serializer),
+            PackageBin::Map(m) => m.serialize(serializer),
         }
-        serde_json::Value::Object(map) => {
-            if let Some(t) = map.get("type").and_then(|v| v.as_str()) {
-                Ok(Some(t.to_string()))
-            } else if let Some(n) = map.get("name").and_then(|v| v.as_str()) {
-                Ok(Some(n.to_string()))
-            } else {
-                Ok(None)
-            }
-        }
-        serde_json::Value::Array(arr) => {
-            let joined: Vec<&str> = arr.iter().filter_map(|v| v.as_str()).collect();
-            if joined.is_empty() {
-                Ok(None)
-            } else {
-                Ok(Some(joined.join(" OR ")))
-            }
-        }
-        _ => Ok(None),
     }
 }
 
+impl<'de> Deserialize<'de> for PackageBin {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct PackageBinVisitor;
+        impl<'de> Visitor<'de> for PackageBinVisitor {
+            type Value = PackageBin;
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                f.write_str("a string or a map of binary names to paths")
+            }
+            fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Self::Value, E> {
+                Ok(PackageBin::Single(v.to_owned()))
+            }
+            fn visit_string<E: serde::de::Error>(self, v: String) -> Result<Self::Value, E> {
+                Ok(PackageBin::Single(v))
+            }
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+                let mut out = BTreeMap::new();
+                while let Some((k, v)) = map.next_entry::<String, String>()? {
+                    out.insert(k, v);
+                }
+                Ok(PackageBin::Map(out))
+            }
+        }
+        deserializer.deserialize_any(PackageBinVisitor)
+    }
+}
+
+pub(crate) fn license_from_value(val: &serde_json::Value) -> Option<String> {
+    match val {
+        serde_json::Value::String(s) => {
+            if s.is_empty() {
+                None
+            } else {
+                Some(s.clone())
+            }
+        }
+        serde_json::Value::Object(map) => map
+            .get("type")
+            .and_then(|v| v.as_str())
+            .or_else(|| map.get("name").and_then(|v| v.as_str()))
+            .map(str::to_string),
+        serde_json::Value::Array(arr) => {
+            let mut out = String::new();
+            let mut any = false;
+            for item in arr {
+                if let Some(s) = item.as_str() {
+                    if any {
+                        out.push_str(" OR ");
+                    }
+                    any = true;
+                    out.push_str(s);
+                }
+            }
+            if any {
+                Some(out)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+struct OptString(Option<String>);
+
+impl<'de> Deserialize<'de> for OptString {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct OptStringVisitor;
+        impl<'de> Visitor<'de> for OptStringVisitor {
+            type Value = OptString;
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                f.write_str("any JSON value")
+            }
+            fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Self::Value, E> {
+                Ok(OptString(Some(v.to_owned())))
+            }
+            fn visit_string<E: serde::de::Error>(self, v: String) -> Result<Self::Value, E> {
+                Ok(OptString(Some(v)))
+            }
+            fn visit_bool<E: serde::de::Error>(self, _: bool) -> Result<Self::Value, E> {
+                Ok(OptString(None))
+            }
+            fn visit_i64<E: serde::de::Error>(self, _: i64) -> Result<Self::Value, E> {
+                Ok(OptString(None))
+            }
+            fn visit_u64<E: serde::de::Error>(self, _: u64) -> Result<Self::Value, E> {
+                Ok(OptString(None))
+            }
+            fn visit_f64<E: serde::de::Error>(self, _: f64) -> Result<Self::Value, E> {
+                Ok(OptString(None))
+            }
+            fn visit_none<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+                Ok(OptString(None))
+            }
+            fn visit_unit<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+                Ok(OptString(None))
+            }
+            fn visit_some<D: Deserializer<'de>>(self, d: D) -> Result<Self::Value, D::Error> {
+                Self::Value::deserialize(d)
+            }
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+                while seq.next_element::<serde::de::IgnoredAny>()?.is_some() {}
+                Ok(OptString(None))
+            }
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+                while map
+                    .next_entry::<serde::de::IgnoredAny, serde::de::IgnoredAny>()?
+                    .is_some()
+                {}
+                Ok(OptString(None))
+            }
+        }
+        deserializer.deserialize_any(OptStringVisitor)
+    }
+}
+
+pub(crate) enum KeyStr<'de> {
+    Borrowed(&'de str),
+    Owned(String),
+}
+
+impl<'de> KeyStr<'de> {
+    #[inline]
+    pub(crate) fn as_str(&self) -> &str {
+        match self {
+            KeyStr::Borrowed(s) => s,
+            KeyStr::Owned(s) => s.as_str(),
+        }
+    }
+
+    #[inline]
+    pub(crate) fn into_string(self) -> String {
+        match self {
+            KeyStr::Borrowed(s) => s.to_owned(),
+            KeyStr::Owned(s) => s,
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for KeyStr<'de> {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct KeyStrVisitor;
+        impl<'de> Visitor<'de> for KeyStrVisitor {
+            type Value = KeyStr<'de>;
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                f.write_str("a string key")
+            }
+            fn visit_borrowed_str<E: serde::de::Error>(self, v: &'de str) -> Result<Self::Value, E> {
+                Ok(KeyStr::Borrowed(v))
+            }
+            fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Self::Value, E> {
+                Ok(KeyStr::Owned(v.to_owned()))
+            }
+            fn visit_string<E: serde::de::Error>(self, v: String) -> Result<Self::Value, E> {
+                Ok(KeyStr::Owned(v))
+            }
+        }
+        deserializer.deserialize_str(KeyStrVisitor)
+    }
+}
+
+struct LicenseSeed;
+
+impl<'de> DeserializeSeed<'de> for LicenseSeed {
+    type Value = Option<String>;
+    fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<Self::Value, D::Error> {
+        deserialize_license(deserializer)
+    }
+}
+
+/// Helper deserializer to tolerate object or array license forms and extract the license type/expression.
+pub(crate) fn deserialize_license<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct LicenseVisitor;
+    impl<'de> Visitor<'de> for LicenseVisitor {
+        type Value = Option<String>;
+        fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            f.write_str("a license string, object, or array")
+        }
+        fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Self::Value, E> {
+            if v.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(v.to_owned()))
+            }
+        }
+        fn visit_string<E: serde::de::Error>(self, v: String) -> Result<Self::Value, E> {
+            if v.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(v))
+            }
+        }
+        fn visit_none<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+        fn visit_unit<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+        fn visit_bool<E: serde::de::Error>(self, _: bool) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+        fn visit_i64<E: serde::de::Error>(self, _: i64) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+        fn visit_u64<E: serde::de::Error>(self, _: u64) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+        fn visit_f64<E: serde::de::Error>(self, _: f64) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+        fn visit_some<D: Deserializer<'de>>(self, d: D) -> Result<Self::Value, D::Error> {
+            deserialize_license(d)
+        }
+        fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+            let mut type_val: Option<String> = None;
+            let mut name_val: Option<String> = None;
+            while let Some(key) = map.next_key::<KeyStr<'de>>()? {
+                match key.as_str() {
+                    "type" => type_val = map.next_value::<OptString>()?.0,
+                    "name" => name_val = map.next_value::<OptString>()?.0,
+                    _ => {
+                        map.next_value::<serde::de::IgnoredAny>()?;
+                    }
+                }
+            }
+            Ok(type_val.or(name_val))
+        }
+        fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+            let mut out = String::new();
+            let mut any = false;
+            while let Some(OptString(opt)) = seq.next_element::<OptString>()? {
+                if let Some(s) = opt {
+                    if any {
+                        out.push_str(" OR ");
+                    }
+                    any = true;
+                    out.push_str(&s);
+                }
+            }
+            if any {
+                Ok(Some(out))
+            } else {
+                Ok(None)
+            }
+        }
+    }
+    deserializer.deserialize_any(LicenseVisitor)
+}
+
 /// Metadata for a package node in lockfile v3 `packages`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Default)]
 pub struct LockfilePackage {
     /// Internal marker used for freshly generated npm 11 lockfiles. npm 11
     /// writes `dev` and `optional` separately for a package reachable only
@@ -317,138 +700,495 @@ pub struct LockfilePackage {
     #[serde(skip)]
     pub raw_value: Option<serde_json::Value>,
 
-    #[serde(skip_serializing_if = "Option::is_none", default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
 
-    #[serde(skip_serializing_if = "Option::is_none", default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
 
-    #[serde(skip_serializing_if = "Option::is_none", default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub resolved: Option<String>,
 
-    #[serde(skip_serializing_if = "Option::is_none", alias = "_integrity", default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub integrity: Option<String>,
 
-    #[serde(skip_serializing_if = "is_false_or_none", default)]
+    #[serde(skip_serializing_if = "is_false_or_none")]
     pub link: Option<bool>,
 
-    #[serde(skip_serializing_if = "is_false_or_none", default)]
+    #[serde(skip_serializing_if = "is_false_or_none")]
     pub dev: Option<bool>,
 
-    #[serde(skip_serializing_if = "is_false_or_none", default)]
+    #[serde(skip_serializing_if = "is_false_or_none")]
     pub optional: Option<bool>,
 
-    #[serde(
-        rename = "devOptional",
-        skip_serializing_if = "is_false_or_none",
-        default
-    )]
+    #[serde(rename = "devOptional", skip_serializing_if = "is_false_or_none")]
     pub dev_optional: Option<bool>,
 
-    #[serde(skip_serializing_if = "is_false_or_none", default)]
+    #[serde(skip_serializing_if = "is_false_or_none")]
     pub peer: Option<bool>,
 
-    #[serde(
-        rename = "peerOptional",
-        skip_serializing_if = "is_false_or_none",
-        default
-    )]
+    #[serde(rename = "peerOptional", skip_serializing_if = "is_false_or_none")]
     pub peer_optional: Option<bool>,
 
-    #[serde(
-        rename = "inBundle",
-        alias = "bundled",
-        skip_serializing_if = "is_false_or_none",
-        default
-    )]
+    #[serde(rename = "inBundle", skip_serializing_if = "is_false_or_none")]
     pub in_bundle: Option<bool>,
 
-    #[serde(
-        rename = "hasInstallScript",
-        skip_serializing_if = "is_false_or_none",
-        default
-    )]
+    #[serde(rename = "hasInstallScript", skip_serializing_if = "is_false_or_none")]
     pub has_install_script: Option<bool>,
 
-    #[serde(
-        rename = "hasShrinkwrap",
-        alias = "_hasShrinkwrap",
-        skip_serializing_if = "is_false_or_none",
-        default
-    )]
+    #[serde(rename = "hasShrinkwrap", skip_serializing_if = "is_false_or_none")]
     pub has_shrinkwrap: Option<bool>,
 
-    #[serde(skip_serializing_if = "is_false_or_none", default)]
+    #[serde(skip_serializing_if = "is_false_or_none")]
     pub extraneous: Option<bool>,
 
-    #[serde(
-        skip_serializing_if = "Option::is_none",
-        deserialize_with = "deserialize_license",
-        default
-    )]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub license: Option<String>,
 
-    #[serde(skip_serializing_if = "is_none_or_empty_platform", default)]
+    #[serde(skip_serializing_if = "is_none_or_empty_platform")]
     pub os: Option<PlatformList>,
 
-    #[serde(skip_serializing_if = "is_none_or_empty_platform", default)]
+    #[serde(skip_serializing_if = "is_none_or_empty_platform")]
     pub cpu: Option<PlatformList>,
 
-    #[serde(skip_serializing_if = "is_none_or_empty_platform", default)]
+    #[serde(skip_serializing_if = "is_none_or_empty_platform")]
     pub libc: Option<PlatformList>,
 
-    #[serde(skip_serializing_if = "is_none_or_empty_map", default)]
+    #[serde(skip_serializing_if = "is_none_or_empty_map")]
     pub dependencies: Option<BTreeMap<String, String>>,
 
     // npm-normalize-package-bin drops a bin map with no entries.
-    #[serde(skip_serializing_if = "bin_is_empty", default)]
+    #[serde(skip_serializing_if = "bin_is_empty")]
     pub bin: Option<PackageBin>,
 
-    #[serde(
-        rename = "devDependencies",
-        skip_serializing_if = "is_none_or_empty_map",
-        default
-    )]
+    #[serde(rename = "devDependencies", skip_serializing_if = "is_none_or_empty_map")]
     pub dev_dependencies: Option<BTreeMap<String, String>>,
 
-    #[serde(skip_serializing_if = "is_none_or_empty_engines", default)]
+    #[serde(skip_serializing_if = "is_none_or_empty_engines")]
     pub engines: Option<PackageEngines>,
 
-    #[serde(
-        rename = "optionalDependencies",
-        skip_serializing_if = "is_none_or_empty_map",
-        default
-    )]
+    #[serde(rename = "optionalDependencies", skip_serializing_if = "is_none_or_empty_map")]
     pub optional_dependencies: Option<BTreeMap<String, String>>,
 
-    #[serde(
-        rename = "peerDependencies",
-        skip_serializing_if = "is_none_or_empty_map",
-        default
-    )]
+    #[serde(rename = "peerDependencies", skip_serializing_if = "is_none_or_empty_map")]
     pub peer_dependencies: Option<BTreeMap<String, String>>,
 
-    #[serde(
-        rename = "peerDependenciesMeta",
-        skip_serializing_if = "is_none_or_empty_map",
-        default
-    )]
+    #[serde(rename = "peerDependenciesMeta", skip_serializing_if = "is_none_or_empty_map")]
     pub peer_dependencies_meta: Option<BTreeMap<String, serde_json::Value>>,
 
-    #[serde(
-        rename = "bundleDependencies",
-        alias = "bundledDependencies",
-        skip_serializing_if = "is_empty_bundle_deps",
-        default
-    )]
+    #[serde(rename = "bundleDependencies", skip_serializing_if = "is_empty_bundle_deps")]
     pub bundle_dependencies: Option<BundledDependencies>,
 
-    #[serde(skip_serializing_if = "Option::is_none", default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub workspaces: Option<Vec<String>>,
 
     /// Preserved hidden-tree metadata or arbitrary package properties.
-    #[serde(flatten, default)]
+    #[serde(flatten)]
     pub extra: BTreeMap<String, serde_json::Value>,
+}
+
+struct OptStringMapWithRawSeed;
+
+impl<'de> DeserializeSeed<'de> for OptStringMapWithRawSeed {
+    type Value = (Option<BTreeMap<String, String>>, serde_json::Value);
+    fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<Self::Value, D::Error> {
+        struct OptStringMapVisitor;
+        impl<'de> Visitor<'de> for OptStringMapVisitor {
+            type Value = (Option<BTreeMap<String, String>>, serde_json::Value);
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                f.write_str("a map of strings or null")
+            }
+            fn visit_none<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+                Ok((None, serde_json::Value::Null))
+            }
+            fn visit_unit<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+                Ok((None, serde_json::Value::Null))
+            }
+            fn visit_some<D: Deserializer<'de>>(self, d: D) -> Result<Self::Value, D::Error> {
+                d.deserialize_any(self)
+            }
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+                let mut pkg_map = BTreeMap::new();
+                let mut raw_map = serde_json::Map::with_capacity(map.size_hint().unwrap_or(0));
+                while let Some((k, v)) = map.next_entry::<String, String>()? {
+                    raw_map.insert(k.clone(), serde_json::Value::String(v.clone()));
+                    pkg_map.insert(k, v);
+                }
+                Ok((Some(pkg_map), serde_json::Value::Object(raw_map)))
+            }
+        }
+        deserializer.deserialize_any(OptStringMapVisitor)
+    }
+}
+
+fn platform_list_from_json_value<E: serde::de::Error>(
+    val: &serde_json::Value,
+) -> Result<Option<PlatformList>, E> {
+    match val {
+        serde_json::Value::Null => Ok(None),
+        serde_json::Value::String(s) => Ok(Some(PlatformList::from(s.clone()))),
+        serde_json::Value::Array(arr) => {
+            let mut out = Vec::with_capacity(arr.len());
+            for item in arr {
+                let s = item
+                    .as_str()
+                    .ok_or_else(|| E::custom("expected a string in platform array"))?;
+                out.push(s.to_owned());
+            }
+            Ok(Some(PlatformList::from(out)))
+        }
+        _ => Err(E::custom("expected a string or an array of strings")),
+    }
+}
+
+fn bin_from_json_value<E: serde::de::Error>(
+    val: &serde_json::Value,
+) -> Result<Option<PackageBin>, E> {
+    match val {
+        serde_json::Value::Null => Ok(None),
+        serde_json::Value::String(s) => Ok(Some(PackageBin::Single(s.clone()))),
+        serde_json::Value::Object(map) => {
+            let mut out = BTreeMap::new();
+            for (k, v) in map {
+                let s = v
+                    .as_str()
+                    .ok_or_else(|| E::custom("expected string value in bin map"))?;
+                out.insert(k.clone(), s.to_owned());
+            }
+            Ok(Some(PackageBin::Map(out)))
+        }
+        _ => Err(E::custom("expected a string or a map of binary names to paths")),
+    }
+}
+
+fn engines_from_json_value(val: &serde_json::Value) -> Option<PackageEngines> {
+    match val {
+        serde_json::Value::Null => None,
+        serde_json::Value::String(s) => Some(PackageEngines::String(s.clone())),
+        serde_json::Value::Array(arr) => Some(PackageEngines::List(arr.clone())),
+        serde_json::Value::Object(map) => {
+            let mut str_map = BTreeMap::new();
+            for (k, v) in map {
+                if let Some(s) = v.as_str() {
+                    str_map.insert(k.clone(), s.to_owned());
+                } else {
+                    return Some(PackageEngines::Other(val.clone()));
+                }
+            }
+            Some(PackageEngines::Map(str_map))
+        }
+        other => Some(PackageEngines::Other(other.clone())),
+    }
+}
+
+fn peer_meta_from_json_value<E: serde::de::Error>(
+    val: &serde_json::Value,
+) -> Result<Option<BTreeMap<String, serde_json::Value>>, E> {
+    match val {
+        serde_json::Value::Null => Ok(None),
+        serde_json::Value::Object(map) => Ok(Some(
+            map.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+        )),
+        _ => Err(E::custom("expected a map or null for peerDependenciesMeta")),
+    }
+}
+
+fn bundle_deps_from_json_value<E: serde::de::Error>(
+    val: &serde_json::Value,
+) -> Result<Option<BundledDependencies>, E> {
+    match val {
+        serde_json::Value::Null => Ok(None),
+        serde_json::Value::Bool(b) => Ok(Some(BundledDependencies::Boolean(*b))),
+        serde_json::Value::Array(arr) => {
+            let mut out = Vec::with_capacity(arr.len());
+            for item in arr {
+                let s = item
+                    .as_str()
+                    .ok_or_else(|| E::custom("expected string in bundleDependencies"))?;
+                out.push(s.to_owned());
+            }
+            Ok(Some(BundledDependencies::List(out)))
+        }
+        serde_json::Value::Object(map) => Ok(Some(BundledDependencies::List(
+            map.keys().cloned().collect(),
+        ))),
+        _ => Err(E::custom("expected a boolean, array of strings, or object for bundleDependencies")),
+    }
+}
+
+fn string_vec_from_json_value<E: serde::de::Error>(
+    val: &serde_json::Value,
+) -> Result<Option<Vec<String>>, E> {
+    match val {
+        serde_json::Value::Null => Ok(None),
+        serde_json::Value::Array(arr) => {
+            let mut out = Vec::with_capacity(arr.len());
+            for item in arr {
+                let s = item
+                    .as_str()
+                    .ok_or_else(|| E::custom("expected string in workspaces"))?;
+                out.push(s.to_owned());
+            }
+            Ok(Some(out))
+        }
+        _ => Err(E::custom("expected an array of strings or null for workspaces")),
+    }
+}
+
+#[inline]
+fn mark_seen<E: serde::de::Error>(seen: &mut u32, bit: u32, field: &'static str) -> Result<(), E> {
+    if (*seen & bit) != 0 {
+        return Err(E::duplicate_field(field));
+    }
+    *seen |= bit;
+    Ok(())
+}
+
+pub(crate) struct LockfilePackageSeed {
+    pub(crate) capture_raw: bool,
+    pub(crate) normalize: bool,
+}
+
+impl<'de> DeserializeSeed<'de> for LockfilePackageSeed {
+    type Value = LockfilePackage;
+
+    fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<Self::Value, D::Error> {
+        struct LockfilePackageVisitor {
+            capture_raw: bool,
+            normalize: bool,
+        }
+
+        impl<'de> Visitor<'de> for LockfilePackageVisitor {
+            type Value = LockfilePackage;
+
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                f.write_str("a lockfile package object")
+            }
+
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+                let mut pkg = LockfilePackage::default();
+                let mut raw_map = if self.capture_raw {
+                    Some(serde_json::Map::with_capacity(map.size_hint().unwrap_or(0)))
+                } else {
+                    None
+                };
+                let mut seen: u32 = 0;
+
+                while let Some(key) = map.next_key::<KeyStr<'de>>()? {
+                    let ks = key.as_str();
+                    macro_rules! raw_str_opt {
+                        ($field:ident, $bit:expr, $fname:expr) => {{
+                            mark_seen(&mut seen, 1 << $bit, $fname)?;
+                            let v = map.next_value::<Option<String>>()?;
+                            if let Some(ref mut rm) = raw_map {
+                                let rv = match &v {
+                                    Some(s) => serde_json::Value::String(s.clone()),
+                                    None => serde_json::Value::Null,
+                                };
+                                rm.insert(key.into_string(), rv);
+                            }
+                            pkg.$field = v;
+                        }};
+                    }
+                    macro_rules! raw_bool_opt {
+                        ($field:ident, $bit:expr, $fname:expr) => {{
+                            mark_seen(&mut seen, 1 << $bit, $fname)?;
+                            let v = map.next_value::<Option<bool>>()?;
+                            if let Some(ref mut rm) = raw_map {
+                                let rv = match v {
+                                    Some(b) => serde_json::Value::Bool(b),
+                                    None => serde_json::Value::Null,
+                                };
+                                rm.insert(key.into_string(), rv);
+                            }
+                            pkg.$field = v;
+                        }};
+                    }
+                    macro_rules! raw_map_opt {
+                        ($field:ident, $bit:expr, $fname:expr) => {{
+                            mark_seen(&mut seen, 1 << $bit, $fname)?;
+                            if let Some(ref mut rm) = raw_map {
+                                let (parsed, rv) = map.next_value_seed(OptStringMapWithRawSeed)?;
+                                rm.insert(key.into_string(), rv);
+                                pkg.$field = parsed;
+                            } else {
+                                pkg.$field = map.next_value::<Option<BTreeMap<String, String>>>()?;
+                            }
+                        }};
+                    }
+
+                    match ks {
+                        "name" => raw_str_opt!(name, 0, "name"),
+                        "version" => raw_str_opt!(version, 1, "version"),
+                        "resolved" => raw_str_opt!(resolved, 2, "resolved"),
+                        "integrity" | "_integrity" => raw_str_opt!(integrity, 3, "integrity"),
+                        "link" => raw_bool_opt!(link, 4, "link"),
+                        "dev" => raw_bool_opt!(dev, 5, "dev"),
+                        "optional" => raw_bool_opt!(optional, 6, "optional"),
+                        "devOptional" => raw_bool_opt!(dev_optional, 7, "devOptional"),
+                        "peer" => raw_bool_opt!(peer, 8, "peer"),
+                        "peerOptional" => raw_bool_opt!(peer_optional, 9, "peerOptional"),
+                        "inBundle" | "bundled" => raw_bool_opt!(in_bundle, 10, "inBundle"),
+                        "hasInstallScript" => {
+                            raw_bool_opt!(has_install_script, 11, "hasInstallScript")
+                        }
+                        "hasShrinkwrap" | "_hasShrinkwrap" => {
+                            raw_bool_opt!(has_shrinkwrap, 12, "hasShrinkwrap")
+                        }
+                        "extraneous" => raw_bool_opt!(extraneous, 13, "extraneous"),
+                        "license" => {
+                            mark_seen(&mut seen, 1 << 14, "license")?;
+                            if let Some(ref mut rm) = raw_map {
+                                let rv = map.next_value::<serde_json::Value>()?;
+                                pkg.license = license_from_value(&rv);
+                                rm.insert(key.into_string(), rv);
+                            } else {
+                                pkg.license = map.next_value_seed(LicenseSeed)?;
+                            }
+                        }
+                        "os" => {
+                            mark_seen(&mut seen, 1 << 15, "os")?;
+                            if let Some(ref mut rm) = raw_map {
+                                let rv = map.next_value::<serde_json::Value>()?;
+                                pkg.os = platform_list_from_json_value(&rv)?;
+                                rm.insert(key.into_string(), rv);
+                            } else {
+                                pkg.os = map.next_value::<Option<PlatformList>>()?;
+                            }
+                        }
+                        "cpu" => {
+                            mark_seen(&mut seen, 1 << 16, "cpu")?;
+                            if let Some(ref mut rm) = raw_map {
+                                let rv = map.next_value::<serde_json::Value>()?;
+                                pkg.cpu = platform_list_from_json_value(&rv)?;
+                                rm.insert(key.into_string(), rv);
+                            } else {
+                                pkg.cpu = map.next_value::<Option<PlatformList>>()?;
+                            }
+                        }
+                        "libc" => {
+                            mark_seen(&mut seen, 1 << 17, "libc")?;
+                            if let Some(ref mut rm) = raw_map {
+                                let rv = map.next_value::<serde_json::Value>()?;
+                                pkg.libc = platform_list_from_json_value(&rv)?;
+                                rm.insert(key.into_string(), rv);
+                            } else {
+                                pkg.libc = map.next_value::<Option<PlatformList>>()?;
+                            }
+                        }
+                        "dependencies" => raw_map_opt!(dependencies, 18, "dependencies"),
+                        "bin" => {
+                            mark_seen(&mut seen, 1 << 19, "bin")?;
+                            if let Some(ref mut rm) = raw_map {
+                                let rv = map.next_value::<serde_json::Value>()?;
+                                pkg.bin = bin_from_json_value(&rv)?;
+                                rm.insert(key.into_string(), rv);
+                            } else {
+                                pkg.bin = map.next_value::<Option<PackageBin>>()?;
+                            }
+                        }
+                        "devDependencies" => {
+                            raw_map_opt!(dev_dependencies, 20, "devDependencies")
+                        }
+                        "engines" => {
+                            mark_seen(&mut seen, 1 << 21, "engines")?;
+                            if let Some(ref mut rm) = raw_map {
+                                let rv = map.next_value::<serde_json::Value>()?;
+                                pkg.engines = engines_from_json_value(&rv);
+                                rm.insert(key.into_string(), rv);
+                            } else {
+                                pkg.engines = map.next_value::<Option<PackageEngines>>()?;
+                            }
+                        }
+                        "optionalDependencies" => {
+                            raw_map_opt!(optional_dependencies, 22, "optionalDependencies")
+                        }
+                        "peerDependencies" => {
+                            raw_map_opt!(peer_dependencies, 23, "peerDependencies")
+                        }
+                        "peerDependenciesMeta" => {
+                            mark_seen(&mut seen, 1 << 24, "peerDependenciesMeta")?;
+                            if let Some(ref mut rm) = raw_map {
+                                let rv = map.next_value::<serde_json::Value>()?;
+                                pkg.peer_dependencies_meta = peer_meta_from_json_value(&rv)?;
+                                rm.insert(key.into_string(), rv);
+                            } else {
+                                pkg.peer_dependencies_meta = map
+                                    .next_value::<Option<BTreeMap<String, serde_json::Value>>>()?;
+                            }
+                        }
+                        "bundleDependencies" | "bundledDependencies" => {
+                            mark_seen(&mut seen, 1 << 25, "bundleDependencies")?;
+                            if let Some(ref mut rm) = raw_map {
+                                let rv = map.next_value::<serde_json::Value>()?;
+                                pkg.bundle_dependencies = bundle_deps_from_json_value(&rv)?;
+                                rm.insert(key.into_string(), rv);
+                            } else {
+                                pkg.bundle_dependencies =
+                                    map.next_value::<Option<BundledDependencies>>()?;
+                            }
+                        }
+                        "workspaces" => {
+                            mark_seen(&mut seen, 1 << 26, "workspaces")?;
+                            if let Some(ref mut rm) = raw_map {
+                                let rv = map.next_value::<serde_json::Value>()?;
+                                pkg.workspaces = string_vec_from_json_value(&rv)?;
+                                rm.insert(key.into_string(), rv);
+                            } else {
+                                pkg.workspaces = map.next_value::<Option<Vec<String>>>()?;
+                            }
+                        }
+                        _ => {
+                            let val = map.next_value::<serde_json::Value>()?;
+                            let is_dir = ks == "directories";
+                            let is_falsy_deprecated = ks == "deprecated"
+                                && (val == serde_json::Value::Bool(false)
+                                    || val.is_null()
+                                    || val == "");
+                            if self.normalize && (is_dir || is_falsy_deprecated) {
+                                if is_falsy_deprecated {
+                                    pkg.extra.remove("deprecated");
+                                }
+                                if let Some(ref mut rm) = raw_map {
+                                    rm.insert(key.into_string(), val);
+                                }
+                            } else {
+                                let key_owned = key.into_string();
+                                if let Some(ref mut rm) = raw_map {
+                                    rm.insert(key_owned.clone(), val.clone());
+                                }
+                                pkg.extra.insert(key_owned, val);
+                            }
+                        }
+                    }
+                }
+
+                if self.normalize {
+                    pkg.normalize_flags_keeping_raw();
+                }
+                if let Some(rm) = raw_map {
+                    pkg.raw_value = Some(serde_json::Value::Object(rm));
+                }
+
+                Ok(pkg)
+            }
+        }
+
+        deserializer.deserialize_map(LockfilePackageVisitor {
+            capture_raw: self.capture_raw,
+            normalize: self.normalize,
+        })
+    }
+}
+
+impl<'de> Deserialize<'de> for LockfilePackage {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        LockfilePackageSeed {
+            capture_raw: false,
+            normalize: false,
+        }
+        .deserialize(deserializer)
+    }
 }
 
 impl LockfilePackage {
@@ -672,6 +1412,10 @@ impl LockfilePackage {
     /// - Any `false` boolean flags are normalized to `None`.
     pub fn normalize_flags(&mut self) {
         self.raw_value = None;
+        self.normalize_flags_keeping_raw();
+    }
+
+    pub(crate) fn normalize_flags_keeping_raw(&mut self) {
         if self.dev == Some(false) {
             self.dev = None;
         }
@@ -802,29 +1546,249 @@ impl LockfilePackage {
 }
 
 /// npm `package-lock.json` lockfile version 3 document.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct LockfileV3 {
     // npm omits root metadata from the hidden lock with --no-package-lock.
-    #[serde(default)]
     pub name: String,
 
-    #[serde(skip_serializing_if = "Option::is_none", default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
 
-    #[serde(
-        rename = "lockfileVersion",
-        default = "crate::migration::default_lockfile_version",
-        deserialize_with = "crate::migration::deserialize_lockfile_version"
-    )]
+    #[serde(rename = "lockfileVersion")]
     pub lockfile_version: u32,
 
-    #[serde(skip_serializing_if = "Option::is_none", default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub requires: Option<bool>,
 
     /// Node packages keyed by their POSIX forward-slash path (e.g. `""`, `"node_modules/foo"`).
     /// Sorted keys via `BTreeMap` guarantee deterministic byte output across runs.
-    #[serde(default)]
     pub packages: BTreeMap<String, LockfilePackage>,
+}
+
+fn read_packages_map<'de, A: MapAccess<'de>>(
+    mut map: A,
+    capture_raw: bool,
+    normalize: bool,
+    normalize_keys: bool,
+) -> Result<BTreeMap<String, LockfilePackage>, A::Error> {
+    let mut packages = BTreeMap::new();
+    while let Some(key) = map.next_key::<String>()? {
+        let pkg = map.next_value_seed(LockfilePackageSeed {
+            capture_raw,
+            normalize,
+        })?;
+        let norm_key = if normalize_keys {
+            match to_posix_path_cow(&key) {
+                std::borrow::Cow::Borrowed(_) => key,
+                std::borrow::Cow::Owned(s) => s,
+            }
+        } else {
+            key
+        };
+        packages.insert(norm_key, pkg);
+    }
+    Ok(packages)
+}
+
+pub(crate) struct PackagesMapSeed {
+    pub(crate) capture_raw: bool,
+    pub(crate) normalize: bool,
+    pub(crate) normalize_keys: bool,
+}
+
+impl<'de> DeserializeSeed<'de> for PackagesMapSeed {
+    type Value = BTreeMap<String, LockfilePackage>;
+
+    fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<Self::Value, D::Error> {
+        struct PackagesMapVisitor {
+            capture_raw: bool,
+            normalize: bool,
+            normalize_keys: bool,
+        }
+
+        impl<'de> Visitor<'de> for PackagesMapVisitor {
+            type Value = BTreeMap<String, LockfilePackage>;
+
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                f.write_str("a map of package paths to package entries")
+            }
+
+            fn visit_map<A: MapAccess<'de>>(self, map: A) -> Result<Self::Value, A::Error> {
+                read_packages_map(map, self.capture_raw, self.normalize, self.normalize_keys)
+            }
+        }
+
+        deserializer.deserialize_map(PackagesMapVisitor {
+            capture_raw: self.capture_raw,
+            normalize: self.normalize,
+            normalize_keys: self.normalize_keys,
+        })
+    }
+}
+
+pub(crate) enum OptPackagesField {
+    Null,
+    Map(BTreeMap<String, LockfilePackage>),
+}
+
+pub(crate) struct OptPackagesMapSeed {
+    pub(crate) capture_raw: bool,
+    pub(crate) normalize: bool,
+    pub(crate) normalize_keys: bool,
+}
+
+impl<'de> DeserializeSeed<'de> for OptPackagesMapSeed {
+    type Value = OptPackagesField;
+
+    fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<Self::Value, D::Error> {
+        struct OptPackagesMapVisitor {
+            capture_raw: bool,
+            normalize: bool,
+            normalize_keys: bool,
+        }
+
+        impl<'de> Visitor<'de> for OptPackagesMapVisitor {
+            type Value = OptPackagesField;
+
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                f.write_str("a map of package paths or null")
+            }
+
+            fn visit_none<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+                Ok(OptPackagesField::Null)
+            }
+
+            fn visit_unit<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+                Ok(OptPackagesField::Null)
+            }
+
+            fn visit_some<D: Deserializer<'de>>(self, d: D) -> Result<Self::Value, D::Error> {
+                d.deserialize_any(self)
+            }
+
+            fn visit_map<A: MapAccess<'de>>(self, map: A) -> Result<Self::Value, A::Error> {
+                read_packages_map(map, self.capture_raw, self.normalize, self.normalize_keys)
+                    .map(OptPackagesField::Map)
+            }
+        }
+
+        deserializer.deserialize_any(OptPackagesMapVisitor {
+            capture_raw: self.capture_raw,
+            normalize: self.normalize,
+            normalize_keys: self.normalize_keys,
+        })
+    }
+}
+
+pub(crate) struct LockfileVersionSeed;
+
+impl<'de> DeserializeSeed<'de> for LockfileVersionSeed {
+    type Value = u32;
+    fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<Self::Value, D::Error> {
+        crate::migration::deserialize_lockfile_version(deserializer)
+    }
+}
+
+pub(crate) struct LockfileV3Seed {
+    pub(crate) capture_raw: bool,
+    pub(crate) normalize: bool,
+    pub(crate) normalize_keys: bool,
+}
+
+impl<'de> DeserializeSeed<'de> for LockfileV3Seed {
+    type Value = LockfileV3;
+
+    fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<Self::Value, D::Error> {
+        struct LockfileV3Visitor {
+            capture_raw: bool,
+            normalize: bool,
+            normalize_keys: bool,
+        }
+
+        impl<'de> Visitor<'de> for LockfileV3Visitor {
+            type Value = LockfileV3;
+
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                f.write_str("a lockfile v3 object")
+            }
+
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+                let mut name: Option<String> = None;
+                let mut version: Option<Option<String>> = None;
+                let mut lockfile_version: Option<u32> = None;
+                let mut requires: Option<Option<bool>> = None;
+                let mut packages: Option<BTreeMap<String, LockfilePackage>> = None;
+
+                while let Some(key) = map.next_key::<KeyStr<'de>>()? {
+                    match key.as_str() {
+                        "name" => {
+                            if name.is_some() {
+                                return Err(serde::de::Error::duplicate_field("name"));
+                            }
+                            name = Some(map.next_value()?);
+                        }
+                        "version" => {
+                            if version.is_some() {
+                                return Err(serde::de::Error::duplicate_field("version"));
+                            }
+                            version = Some(map.next_value()?);
+                        }
+                        "lockfileVersion" => {
+                            if lockfile_version.is_some() {
+                                return Err(serde::de::Error::duplicate_field("lockfileVersion"));
+                            }
+                            lockfile_version = Some(map.next_value_seed(LockfileVersionSeed)?);
+                        }
+                        "requires" => {
+                            if requires.is_some() {
+                                return Err(serde::de::Error::duplicate_field("requires"));
+                            }
+                            requires = Some(map.next_value()?);
+                        }
+                        "packages" => {
+                            if packages.is_some() {
+                                return Err(serde::de::Error::duplicate_field("packages"));
+                            }
+                            packages = Some(map.next_value_seed(PackagesMapSeed {
+                                capture_raw: self.capture_raw,
+                                normalize: self.normalize,
+                                normalize_keys: self.normalize_keys,
+                            })?);
+                        }
+                        _ => {
+                            map.next_value::<serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+
+                Ok(LockfileV3 {
+                    name: name.unwrap_or_default(),
+                    version: version.unwrap_or(None),
+                    lockfile_version: lockfile_version
+                        .unwrap_or_else(crate::migration::default_lockfile_version),
+                    requires: requires.unwrap_or(None),
+                    packages: packages.unwrap_or_default(),
+                })
+            }
+        }
+
+        deserializer.deserialize_map(LockfileV3Visitor {
+            capture_raw: self.capture_raw,
+            normalize: self.normalize,
+            normalize_keys: self.normalize_keys,
+        })
+    }
+}
+
+impl<'de> Deserialize<'de> for LockfileV3 {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        LockfileV3Seed {
+            capture_raw: false,
+            normalize: false,
+            normalize_keys: false,
+        }
+        .deserialize(deserializer)
+    }
 }
 
 // Shrinkwrap.inferFormattingOptions takes formatting from package.json, even
@@ -1289,23 +2253,24 @@ impl LockfileV3 {
         }
 
         // Check workspaces drift
-        let manifest_ws: Option<Vec<String>> = match &manifest.workspaces {
-            Some(rnpm_core::manifest::PackageWorkspaces::List(list)) => Some(list.clone()),
-            Some(rnpm_core::manifest::PackageWorkspaces::Config { packages }) => {
-                Some(packages.clone())
-            }
-            None => None,
+        let manifest_ws: &[String] = match &manifest.workspaces {
+            Some(rnpm_core::manifest::PackageWorkspaces::List(list)) => list.as_slice(),
+            Some(rnpm_core::manifest::PackageWorkspaces::Config { packages }) => packages.as_slice(),
+            None => &[],
         };
-        let manifest_has_ws = manifest_ws.as_ref().is_some_and(|w| !w.is_empty());
-        let root_has_ws = root_pkg.workspaces.as_ref().is_some_and(|w| !w.is_empty());
+        let manifest_has_ws = !manifest_ws.is_empty();
+        let root_ws: &[String] = root_pkg.workspaces.as_deref().unwrap_or(&[]);
+        let root_has_ws = !root_ws.is_empty();
 
         if manifest_has_ws && root_has_ws {
-            let mut m = manifest_ws.clone().unwrap();
-            let mut r = root_pkg.workspaces.clone().unwrap_or_default();
-            m.sort();
-            r.sort();
-            if m != r {
-                return false;
+            if manifest_ws != root_ws {
+                let mut m = manifest_ws.to_vec();
+                let mut r = root_ws.to_vec();
+                m.sort();
+                r.sort();
+                if m != r {
+                    return false;
+                }
             }
         } else if !manifest_has_ws && root_has_ws {
             return false;
@@ -1420,83 +2385,96 @@ impl LockfileV3 {
                 }
             }
         } else if !manifest_has_ws && !root_has_ws && !allow_extra_lock_deps {
-            let link_targets: BTreeSet<String> = self
-                .packages
-                .iter()
-                .filter(|(pkg_key, p)| {
-                    if p.link != Some(true) {
+            let has_non_nm_key = self.packages.keys().any(|k| {
+                !k.is_empty()
+                    && !k.starts_with("node_modules/")
+                    && !k.split(['/', '\\']).any(|seg| seg == "node_modules")
+            });
+            if has_non_nm_key {
+                let link_targets: BTreeSet<String> = self
+                    .packages
+                    .iter()
+                    .filter(|(pkg_key, p)| {
+                        if p.link != Some(true) {
+                            return false;
+                        }
+                        let norm_key = to_posix_path_cow(pkg_key);
+                        // A direct `node_modules/<dep>` link is only a non-workspace `file:` target
+                        // when `<dep>` is declared in the root manifest; otherwise it is an orphaned
+                        // workspace link left over after removing `workspaces` from package.json.
+                        if let Some(dep_name) = norm_key.strip_prefix("node_modules/") {
+                            if !dep_name.contains("node_modules/") {
+                                return manifest.dependencies.contains_key(dep_name)
+                                    || manifest.dev_dependencies.contains_key(dep_name)
+                                    || manifest.optional_dependencies.contains_key(dep_name)
+                                    || manifest.peer_dependencies.contains_key(dep_name);
+                            }
+                        }
+                        true
+                    })
+                    .filter_map(|(_, p)| p.resolved.as_deref().or(p.version.as_deref()))
+                    .map(|r| {
+                        let s = to_posix_path_cow(r);
+                        let s = s.strip_prefix("file:").unwrap_or(s.as_ref());
+                        let s = s.strip_prefix("./").unwrap_or(s).trim_end_matches('/');
+                        if cfg!(windows) {
+                            s.to_ascii_lowercase()
+                        } else {
+                            s.to_string()
+                        }
+                    })
+                    .collect();
+                let has_lockfile_members = self.packages.keys().any(|k| {
+                    if k.is_empty() || k.split(['/', '\\']).any(|seg| seg == "node_modules") {
                         return false;
                     }
-                    let norm_key = pkg_key.replace('\\', "/");
-                    // A direct `node_modules/<dep>` link is only a non-workspace `file:` target
-                    // when `<dep>` is declared in the root manifest; otherwise it is an orphaned
-                    // workspace link left over after removing `workspaces` from package.json.
-                    if let Some(dep_name) = norm_key.strip_prefix("node_modules/") {
-                        if !dep_name.contains("node_modules/") {
-                            return manifest.dependencies.contains_key(dep_name)
-                                || manifest.dev_dependencies.contains_key(dep_name)
-                                || manifest.optional_dependencies.contains_key(dep_name)
-                                || manifest.peer_dependencies.contains_key(dep_name);
-                        }
-                    }
-                    true
-                })
-                .filter_map(|(_, p)| p.resolved.as_deref().or(p.version.as_deref()))
-                .map(|r| {
-                    let s = r.replace('\\', "/");
-                    let s = s.strip_prefix("file:").unwrap_or(&s);
-                    let s = s.strip_prefix("./").unwrap_or(s).trim_end_matches('/');
-                    if cfg!(windows) {
-                        s.to_ascii_lowercase()
+                    let norm = to_posix_path_cow(k);
+                    let norm = norm.strip_prefix("file:").unwrap_or(norm.as_ref());
+                    let norm = norm
+                        .strip_prefix("./")
+                        .unwrap_or(norm)
+                        .trim_end_matches('/');
+                    let key_to_check = if cfg!(windows) {
+                        norm.to_ascii_lowercase()
                     } else {
-                        s.to_string()
-                    }
-                })
-                .collect();
-            let has_lockfile_members = self.packages.keys().any(|k| {
-                if k.is_empty() || k.split(['/', '\\']).any(|seg| seg == "node_modules") {
+                        norm.to_string()
+                    };
+                    !link_targets.contains(&key_to_check)
+                });
+                if has_lockfile_members {
                     return false;
                 }
-                let norm = k.replace('\\', "/");
-                let norm = norm.strip_prefix("file:").unwrap_or(&norm);
-                let norm = norm
-                    .strip_prefix("./")
-                    .unwrap_or(norm)
-                    .trim_end_matches('/');
-                let key_to_check = if cfg!(windows) {
-                    norm.to_ascii_lowercase()
-                } else {
-                    norm.to_string()
-                };
-                !link_targets.contains(&key_to_check)
-            });
-            if has_lockfile_members {
-                return false;
             }
         }
 
-        // Check direct overrides
-        let overrides = rnpm_core::overrides::Overrides::from_manifest(manifest).ok();
+        // Check direct overrides (skip entirely if manifest has no "overrides" field)
+        let overrides = if manifest.extra.contains_key("overrides") {
+            rnpm_core::overrides::Overrides::from_manifest(manifest)
+                .ok()
+                .filter(|ov| !ov.rules.is_empty())
+        } else {
+            None
+        };
         let mut key_buf = String::with_capacity(64);
 
         if let Some(ref ov) = overrides {
             for rule_key in ov.rules.keys() {
-                let dep_name = rule_key
+                let dep_name: std::borrow::Cow<'_, str> = rule_key
                     .split_once('@')
                     .map(|(name, _)| {
                         if name.is_empty() && rule_key.starts_with('@') {
                             if let Some((sub_name, _)) = rule_key[1..].split_once('@') {
-                                format!("@{sub_name}")
+                                std::borrow::Cow::Owned(format!("@{sub_name}"))
                             } else {
-                                rule_key.clone()
+                                std::borrow::Cow::Borrowed(rule_key.as_str())
                             }
                         } else if name.is_empty() {
-                            rule_key.clone()
+                            std::borrow::Cow::Borrowed(rule_key.as_str())
                         } else {
-                            name.to_string()
+                            std::borrow::Cow::Borrowed(name)
                         }
                     })
-                    .unwrap_or_else(|| rule_key.clone());
+                    .unwrap_or(std::borrow::Cow::Borrowed(rule_key.as_str()));
 
                 key_buf.clear();
                 key_buf.push_str("node_modules/");
@@ -1512,38 +2490,19 @@ impl LockfileV3 {
             }
         }
 
-
         // 7. Verify direct dependencies exist in packages map and satisfy specs
         for (dep, spec) in &manifest.dependencies {
             if manifest.optional_dependencies.contains_key(dep) {
                 continue;
             }
-            key_buf.clear();
-            key_buf.push_str("node_modules/");
-            key_buf.push_str(dep);
-            let Some(pkg) = self.packages.get(key_buf.as_str()) else {
-                return false;
-            };
-            let eff_spec = if let Some(ref ov) = overrides {
-                ov.resolve_override(dep, spec, &[])
-                    .ok()
-                    .flatten()
-                    .unwrap_or_else(|| spec.clone())
-            } else {
-                spec.clone()
-            };
-            if let Some(ref lock_deps) = root_pkg.dependencies {
-                if let Some(lock_spec) = lock_deps.get(dep) {
-                    let eff_non_reg = Self::is_non_registry_spec(&eff_spec);
-                    let lock_non_reg = Self::is_non_registry_spec(lock_spec);
-                    if eff_non_reg != lock_non_reg
-                        || (eff_non_reg && !Self::non_registry_specs_match(&eff_spec, lock_spec))
-                    {
-                        return false;
-                    }
-                }
-            }
-            if !Self::package_satisfies_spec(dep, pkg, &eff_spec) {
+            if !self.check_direct_dep_entry(
+                dep,
+                spec,
+                root_pkg.dependencies.as_ref(),
+                overrides.as_ref(),
+                false,
+                &mut key_buf,
+            ) {
                 return false;
             }
         }
@@ -1551,32 +2510,14 @@ impl LockfileV3 {
         // 8. Verify direct devDependencies exist in packages map and satisfy specs
         if include_dev {
             for (dep, spec) in &manifest.dev_dependencies {
-                key_buf.clear();
-                key_buf.push_str("node_modules/");
-                key_buf.push_str(dep);
-                let Some(pkg) = self.packages.get(key_buf.as_str()) else {
-                    return false;
-                };
-                let eff_spec = if let Some(ref ov) = overrides {
-                    ov.resolve_override(dep, spec, &[])
-                        .ok()
-                        .flatten()
-                        .unwrap_or_else(|| spec.clone())
-                } else {
-                    spec.clone()
-                };
-                if let Some(ref lock_dev) = root_pkg.dev_dependencies {
-                    if let Some(lock_spec) = lock_dev.get(dep) {
-                        let eff_non_reg = Self::is_non_registry_spec(&eff_spec);
-                        let lock_non_reg = Self::is_non_registry_spec(lock_spec);
-                        if eff_non_reg != lock_non_reg
-                            || (eff_non_reg && !Self::non_registry_specs_match(&eff_spec, lock_spec))
-                        {
-                            return false;
-                        }
-                    }
-                }
-                if !Self::package_satisfies_spec(dep, pkg, &eff_spec) {
+                if !self.check_direct_dep_entry(
+                    dep,
+                    spec,
+                    root_pkg.dev_dependencies.as_ref(),
+                    overrides.as_ref(),
+                    false,
+                    &mut key_buf,
+                ) {
                     return false;
                 }
             }
@@ -1584,32 +2525,15 @@ impl LockfileV3 {
 
         // 9. Verify optional dependencies in packages map satisfy specs if present
         for (dep, spec) in &manifest.optional_dependencies {
-            key_buf.clear();
-            key_buf.push_str("node_modules/");
-            key_buf.push_str(dep);
-            if let Some(pkg) = self.packages.get(key_buf.as_str()) {
-                let eff_spec = if let Some(ref ov) = overrides {
-                    ov.resolve_override(dep, spec, &[])
-                        .ok()
-                        .flatten()
-                        .unwrap_or_else(|| spec.clone())
-                } else {
-                    spec.clone()
-                };
-                if let Some(ref lock_opt) = root_pkg.optional_dependencies {
-                    if let Some(lock_spec) = lock_opt.get(dep) {
-                        let eff_non_reg = Self::is_non_registry_spec(&eff_spec);
-                        let lock_non_reg = Self::is_non_registry_spec(lock_spec);
-                        if eff_non_reg != lock_non_reg
-                            || (eff_non_reg && !Self::non_registry_specs_match(&eff_spec, lock_spec))
-                        {
-                            return false;
-                        }
-                    }
-                }
-                if !Self::package_satisfies_spec(dep, pkg, &eff_spec) {
-                    return false;
-                }
+            if !self.check_direct_dep_entry(
+                dep,
+                spec,
+                root_pkg.optional_dependencies.as_ref(),
+                overrides.as_ref(),
+                true,
+                &mut key_buf,
+            ) {
+                return false;
             }
         }
 
@@ -1620,34 +2544,14 @@ impl LockfileV3 {
                 .get(dep)
                 .map(|m| m.optional)
                 .unwrap_or_else(|| root_pkg.is_peer_dep_optional(dep));
-
-            key_buf.clear();
-            key_buf.push_str("node_modules/");
-            key_buf.push_str(dep);
-            let eff_spec = if let Some(ref ov) = overrides {
-                ov.resolve_override(dep, spec, &[])
-                    .ok()
-                    .flatten()
-                    .unwrap_or_else(|| spec.clone())
-            } else {
-                spec.clone()
-            };
-            if let Some(ref lock_peer) = root_pkg.peer_dependencies {
-                if let Some(lock_spec) = lock_peer.get(dep) {
-                    let eff_non_reg = Self::is_non_registry_spec(&eff_spec);
-                    let lock_non_reg = Self::is_non_registry_spec(lock_spec);
-                    if eff_non_reg != lock_non_reg
-                        || (eff_non_reg && !Self::non_registry_specs_match(&eff_spec, lock_spec))
-                    {
-                        return false;
-                    }
-                }
-            }
-            if let Some(pkg) = self.packages.get(key_buf.as_str()) {
-                if !Self::package_satisfies_spec(dep, pkg, &eff_spec) {
-                    return false;
-                }
-            } else if !is_optional {
+            if !self.check_direct_dep_entry(
+                dep,
+                spec,
+                root_pkg.peer_dependencies.as_ref(),
+                overrides.as_ref(),
+                is_optional,
+                &mut key_buf,
+            ) {
                 return false;
             }
         }
@@ -1655,11 +2559,115 @@ impl LockfileV3 {
         true
     }
 
+    fn check_direct_dep_entry(
+        &self,
+        dep: &str,
+        spec: &str,
+        lock_map: Option<&BTreeMap<String, String>>,
+        overrides: Option<&rnpm_core::overrides::Overrides>,
+        allow_missing_pkg: bool,
+        key_buf: &mut String,
+    ) -> bool {
+        key_buf.clear();
+        key_buf.push_str("node_modules/");
+        key_buf.push_str(dep);
+        let pkg = self.packages.get(key_buf.as_str());
+        if pkg.is_none() && !allow_missing_pkg {
+            return false;
+        }
+        let eff_spec: std::borrow::Cow<'_, str> = if let Some(ov) = overrides {
+            ov.resolve_override(dep, spec, &[])
+                .ok()
+                .flatten()
+                .map(std::borrow::Cow::Owned)
+                .unwrap_or(std::borrow::Cow::Borrowed(spec))
+        } else {
+            std::borrow::Cow::Borrowed(spec)
+        };
+        if let Some(lock_spec) = lock_map.and_then(|m| m.get(dep)) {
+            if lock_spec != eff_spec.as_ref() {
+                let eff_non_reg = Self::is_non_registry_spec(&eff_spec);
+                let lock_non_reg = Self::is_non_registry_spec(lock_spec);
+                if eff_non_reg != lock_non_reg
+                    || (eff_non_reg && !Self::non_registry_specs_match(&eff_spec, lock_spec))
+                {
+                    return false;
+                }
+            }
+        }
+        if let Some(pkg) = pkg {
+            Self::package_satisfies_spec(dep, pkg, &eff_spec)
+        } else {
+            allow_missing_pkg
+        }
+    }
+
     pub fn path_matches_workspace_patterns(path: &str, patterns: &[String]) -> bool {
         rnpm_core::workspace::path_matches_workspace_patterns(path, patterns)
     }
 
     pub fn package_satisfies_spec(install_name: &str, pkg: &LockfilePackage, spec: &str) -> bool {
+        if pkg.link != Some(true) {
+            if let Some(ref ver_str) = pkg.version {
+                let trimmed = spec.trim();
+                let bytes = trimmed.as_bytes();
+                let is_non_alias_semver = trimmed.is_empty()
+                    || trimmed == "*"
+                    || (!bytes.is_empty()
+                        && (matches!(bytes[0], b'^' | b'>' | b'<')
+                            || (bytes[0] == b'~' && !trimmed.starts_with("~/"))
+                            || bytes[0] == b'='
+                            || ((bytes[0].is_ascii_digit()
+                                || ((bytes[0] == b'v' || bytes[0] == b'V')
+                                    && bytes.len() > 1
+                                    && bytes[1].is_ascii_digit()))
+                                && !trimmed.contains(':')
+                                && !trimmed.contains('/')
+                                && !trimmed.contains('@'))));
+
+                if is_non_alias_semver {
+                    if let Some(ref real_name) = pkg.name {
+                        if real_name != install_name {
+                            return false;
+                        }
+                    }
+                    if let Ok(v) = Version::parse(ver_str) {
+                        if trimmed.is_empty() || trimmed == "*" {
+                            return true;
+                        }
+                        if matches!(bytes[0], b'^' | b'>' | b'<') || bytes[0] == b'~' {
+                            if let Ok(matched) =
+                                rnpm_core::semver::Range::satisfies_str(trimmed, &v)
+                            {
+                                return matched;
+                            }
+                        } else {
+                            if let Ok(expected) = Version::parse(trimmed) {
+                                return v == expected;
+                            }
+                            if let Ok(matched) =
+                                rnpm_core::semver::Range::satisfies_str(trimmed, &v)
+                            {
+                                return matched;
+                            }
+                        }
+                    }
+                } else if !bytes.is_empty()
+                    && bytes[0].is_ascii_alphabetic()
+                    && !matches!(bytes[0], b'v' | b'V' | b'x' | b'X')
+                    && bytes
+                        .iter()
+                        .all(|&b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.')
+                {
+                    if let Some(ref real_name) = pkg.name {
+                        if real_name != install_name {
+                            return false;
+                        }
+                    }
+                    return true;
+                }
+            }
+        }
         let Ok(target) = PackageTarget::parse(spec) else {
             // Handle SCP-like git specs (e.g. git@host:path#ref) or ssh:// that PackageTarget doesn't parse
             if spec.starts_with("git@") || spec.starts_with("ssh://") {
@@ -2344,14 +3352,18 @@ impl LockfileV3 {
         lock_map: &Option<std::collections::BTreeMap<String, String>>,
         allow_extra_lock_deps: bool,
     ) -> bool {
-        let empty_lock = std::collections::BTreeMap::new();
-        let lock = lock_map.as_ref().unwrap_or(&empty_lock);
-
-        if !allow_extra_lock_deps && manifest_map.len() != lock.len() {
+        let lock_len = lock_map.as_ref().map_or(0, |m| m.len());
+        if !allow_extra_lock_deps && manifest_map.len() != lock_len {
             return false;
         }
+        if manifest_map.is_empty() {
+            return true;
+        }
+        let Some(lock) = lock_map else {
+            return false;
+        };
 
-        let mut key_buf = String::with_capacity(64);
+        let mut key_buf: Option<String> = None;
 
         for (k, manifest_spec) in manifest_map {
             let Some(lock_spec) = lock.get(k) else {
@@ -2363,18 +3375,14 @@ impl LockfileV3 {
             }
             // If lock spec is a Version and manifest spec is a Range, check satisfies
             if let Ok(v) = Version::parse(lock_spec) {
-                if let Ok(r) = rnpm_core::semver::Range::parse(manifest_spec) {
-                    if r.satisfies(&v) {
-                        continue;
-                    }
+                if rnpm_core::semver::Range::satisfies_str(manifest_spec, &v) == Ok(true) {
+                    continue;
                 }
             }
             // If lock spec is a Range and manifest spec is a Version, check satisfies
             if let Ok(v) = Version::parse(manifest_spec) {
-                if let Ok(r) = rnpm_core::semver::Range::parse(lock_spec) {
-                    if r.satisfies(&v) {
-                        continue;
-                    }
+                if rnpm_core::semver::Range::satisfies_str(lock_spec, &v) == Ok(true) {
+                    continue;
                 }
             }
 
@@ -2415,21 +3423,12 @@ impl LockfileV3 {
                 if m_name != l_name {
                     return false;
                 }
-                key_buf.clear();
-                key_buf.push_str("node_modules/");
-                key_buf.push_str(k);
-                let Some(pkg) = packages.get(key_buf.as_str()) else {
-                    return false;
-                };
-                if !Self::package_satisfies_spec(k, pkg, manifest_spec) {
-                    return false;
-                }
-                continue;
             }
-            key_buf.clear();
-            key_buf.push_str("node_modules/");
-            key_buf.push_str(k);
-            let Some(pkg) = packages.get(key_buf.as_str()) else {
+            let buf = key_buf.get_or_insert_with(|| String::with_capacity(64));
+            buf.clear();
+            buf.push_str("node_modules/");
+            buf.push_str(k);
+            let Some(pkg) = packages.get(buf.as_str()) else {
                 return false;
             };
             if !Self::package_satisfies_spec(k, pkg, manifest_spec) {
@@ -2443,35 +3442,41 @@ impl LockfileV3 {
         manifest_meta: &BTreeMap<String, rnpm_core::manifest::PeerDependencyMeta>,
         lock_meta: &Option<BTreeMap<String, serde_json::Value>>,
     ) -> bool {
-        let manifest_opts: BTreeMap<&str, bool> = manifest_meta
-            .iter()
-            .filter(|(_, meta)| meta.optional)
-            .map(|(k, meta)| (k.as_str(), meta.optional))
-            .collect();
-
-        let lock_opts: BTreeMap<&str, bool> = lock_meta
-            .as_ref()
-            .map(|map| {
-                map.iter()
-                    .filter_map(|(k, v)| {
-                        let opt = v.get("optional").and_then(|o| o.as_bool()).unwrap_or(false);
-                        if opt {
-                            Some((k.as_str(), true))
-                        } else {
-                            None
-                        }
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        manifest_opts == lock_opts
+        let Some(lock_map) = lock_meta else {
+            return manifest_meta.values().all(|m| !m.optional);
+        };
+        if manifest_meta.is_empty() && lock_map.is_empty() {
+            return true;
+        }
+        let mut m_opt_count = 0usize;
+        for meta in manifest_meta.values() {
+            if meta.optional {
+                m_opt_count += 1;
+            }
+        }
+        let mut l_opt_count = 0usize;
+        for (k, v) in lock_map {
+            if v.get("optional").and_then(|o| o.as_bool()).unwrap_or(false) {
+                if !manifest_meta.get(k).is_some_and(|m| m.optional) {
+                    return false;
+                }
+                l_opt_count += 1;
+            }
+        }
+        l_opt_count == m_opt_count
     }
 
     fn bundled_deps_matches(
         manifest: &rnpm_core::manifest::Manifest,
         root_pkg: &LockfilePackage,
     ) -> bool {
+        if manifest.bundled_dependencies.is_none()
+            && root_pkg.bundle_dependencies.is_none()
+            && !root_pkg.extra.contains_key("bundleDependencies")
+            && !root_pkg.extra.contains_key("bundledDependencies")
+        {
+            return true;
+        }
         let mut m_names = manifest.bundled_package_names();
         let mut r_names = root_pkg.bundled_package_names();
         if m_names.is_empty() && r_names.is_empty() {
@@ -2511,7 +3516,7 @@ impl LockfileV3 {
         if version != 1 && version != 2 && version != 3 {
             return Err(LockfileError::UnsupportedVersion(version));
         }
-        let mut out = String::with_capacity(self.packages.len() * 200);
+        let mut out = String::with_capacity(self.packages.len() * 512 + 256);
         let writer = LockfileWriter::new(&format.indent, &format.newline, false, true);
         writer.write_lockfile(self, version, &mut out)?;
         Ok(out)
@@ -2527,7 +3532,7 @@ impl LockfileV3 {
         if version != 1 && version != 2 && version != 3 {
             return Err(LockfileError::UnsupportedVersion(version));
         }
-        let mut out = String::with_capacity(self.packages.len() * 100);
+        let mut out = String::with_capacity(self.packages.len() * 384 + 128);
         let writer = LockfileWriter::new("", "", true, true);
         writer.write_lockfile(self, version, &mut out)?;
         Ok(out)
@@ -2766,36 +3771,28 @@ impl LockfileV3 {
     /// Load and parse a v3 lockfile from a string, normalizing all package keys to POSIX paths.
     /// Preserves untouched `raw_value` JSON values on packages for 100% round-trip fidelity.
     pub fn from_json_str(s: &str) -> Result<Self, LockfileError> {
-        let mut lockfile: Self = serde_json::from_str(s)?;
-        let mut raw_val: Option<serde_json::Value> = serde_json::from_str(s).ok();
-        let mut raw_packages = raw_val
-            .as_mut()
-            .and_then(|v| v.get_mut("packages"))
-            .and_then(|p| p.as_object_mut())
-            .map(std::mem::take);
-        let packages = std::mem::take(&mut lockfile.packages);
-        for (k, mut v) in packages {
-            v.normalize_flags();
-            let posix_k = to_posix_path(&k);
-            if let Some(ref mut raw_pkgs) = raw_packages {
-                if let Some(raw_p) = raw_pkgs.remove(&k).or_else(|| raw_pkgs.remove(&posix_k)) {
-                    v.raw_value = Some(raw_p);
-                }
-            }
-            lockfile.packages.insert(posix_k, v);
+        let mut de = serde_json::Deserializer::from_str(s);
+        let lockfile = LockfileV3Seed {
+            capture_raw: true,
+            normalize: true,
+            normalize_keys: true,
         }
+        .deserialize(&mut de)?;
+        de.end()?;
         Ok(lockfile)
     }
 
     /// Parse a v3 lockfile in a single serde pass without building `serde_json::Value`
     /// or populating `raw_value`. Zero extra DOM allocations (ideal for `ci` / `fast_path` / `ls`).
     pub fn from_json_str_readonly(content: &str) -> Result<Self, LockfileError> {
-        let mut lockfile: Self = serde_json::from_str(content)?;
-        let packages = std::mem::take(&mut lockfile.packages);
-        for (k, mut v) in packages {
-            v.normalize_flags();
-            lockfile.packages.insert(to_posix_path(&k), v);
+        let mut de = serde_json::Deserializer::from_str(content);
+        let lockfile = LockfileV3Seed {
+            capture_raw: false,
+            normalize: true,
+            normalize_keys: true,
         }
+        .deserialize(&mut de)?;
+        de.end()?;
         Ok(lockfile)
     }
 
@@ -2906,7 +3903,7 @@ impl LockfileV3 {
         format: &rnpm_core::ManifestFormat,
         root_metadata: bool,
     ) -> Result<String, LockfileError> {
-        let mut out = String::with_capacity(self.packages.len() * 200);
+        let mut out = String::with_capacity(self.packages.len() * 512 + 256);
         let writer = LockfileWriter::new(&format.indent, &format.newline, false, root_metadata);
         writer.write_lockfile(self, self.lockfile_version, &mut out)?;
         Ok(out)
@@ -2925,15 +3922,236 @@ pub const SW_KEY_ORDER: &[&str] = &[
 ];
 
 #[inline]
+fn sw_key_rank(k: &str) -> u8 {
+    match k {
+        "name" => 0,
+        "version" => 1,
+        "lockfileVersion" => 2,
+        "resolved" => 3,
+        "integrity" => 4,
+        "requires" => 5,
+        "packages" => 6,
+        "dependencies" => 7,
+        _ => 8,
+    }
+}
+
+#[inline]
 pub(crate) fn write_json_str(s: &str, out: &mut String) {
+    out.push('"');
     let bytes = s.as_bytes();
-    if bytes.iter().all(|&b| b >= 0x20 && b != b'"' && b != b'\\') {
-        out.push('"');
-        out.push_str(s);
-        out.push('"');
-    } else {
-        let escaped = serde_json::to_string(s).unwrap_or_default();
-        out.push_str(&escaped);
+    let mut start = 0usize;
+    for (i, &b) in bytes.iter().enumerate() {
+        if b >= 0x20 && b != b'"' && b != b'\\' {
+            continue;
+        }
+        if start < i {
+            out.push_str(&s[start..i]);
+        }
+        match b {
+            b'"' => out.push_str("\\\""),
+            b'\\' => out.push_str("\\\\"),
+            b'\x08' => out.push_str("\\b"),
+            b'\x0c' => out.push_str("\\f"),
+            b'\n' => out.push_str("\\n"),
+            b'\r' => out.push_str("\\r"),
+            b'\t' => out.push_str("\\t"),
+            _ => {
+                const HEX: &[u8; 16] = b"0123456789abcdef";
+                let esc = [
+                    b'\\',
+                    b'u',
+                    b'0',
+                    b'0',
+                    HEX[(b >> 4) as usize],
+                    HEX[(b & 0xf) as usize],
+                ];
+                // All bytes in `esc` are valid ASCII.
+                out.push_str(unsafe { std::str::from_utf8_unchecked(&esc) });
+            }
+        }
+        start = i + 1;
+    }
+    if start < bytes.len() {
+        out.push_str(&s[start..]);
+    }
+    out.push('"');
+}
+
+#[derive(Clone, Copy)]
+enum PkgFieldVal<'p> {
+    Str(&'p str),
+    BoolTrue,
+    StrSlice(&'p [String]),
+    StrMap(&'p BTreeMap<String, String>),
+    PeerMeta(&'p BTreeMap<String, serde_json::Value>),
+    JsonArr(&'p [serde_json::Value]),
+    JsonVal(&'p serde_json::Value),
+}
+
+#[inline]
+fn is_stripped_extra_entry(k: &str, v: &serde_json::Value) -> bool {
+    k == "directories"
+        || (k == "deprecated"
+            && (v == &serde_json::Value::Bool(false) || v.is_null() || v == ""))
+}
+
+fn collect_pkg_fields<'p>(
+    pkg: &'p LockfilePackage,
+    out: &mut Vec<(&'p str, bool, PkgFieldVal<'p>)>,
+) {
+    // 1. Non-object fields in exact (sw_key_rank, npm_key_compare) order.
+    if let Some(ref s) = pkg.name {
+        out.push(("name", false, PkgFieldVal::Str(s)));
+    }
+    if let Some(ref s) = pkg.version {
+        out.push(("version", false, PkgFieldVal::Str(s)));
+    }
+    if let Some(ref s) = pkg.resolved {
+        out.push(("resolved", false, PkgFieldVal::Str(s)));
+    }
+    if let Some(ref s) = pkg.integrity {
+        out.push(("integrity", false, PkgFieldVal::Str(s)));
+    }
+    if let Some(PackageBin::Single(ref s)) = pkg.bin {
+        out.push(("bin", false, PkgFieldVal::Str(s)));
+    }
+    match pkg.bundle_dependencies {
+        Some(BundledDependencies::Boolean(true)) => {
+            out.push(("bundleDependencies", false, PkgFieldVal::BoolTrue));
+        }
+        Some(BundledDependencies::List(ref list)) if !list.is_empty() => {
+            out.push(("bundleDependencies", false, PkgFieldVal::StrSlice(list)));
+        }
+        _ => {}
+    }
+    if let Some(ref pl) = pkg.cpu {
+        if !pl.is_empty() {
+            let val = if pl.is_scalar() {
+                PkgFieldVal::Str(&pl[0])
+            } else {
+                PkgFieldVal::StrSlice(pl.as_slice())
+            };
+            out.push(("cpu", false, val));
+        }
+    }
+    let dev_optional_true = pkg.dev_optional == Some(true);
+    if pkg.dev == Some(true) && !dev_optional_true {
+        out.push(("dev", false, PkgFieldVal::BoolTrue));
+    }
+    if dev_optional_true {
+        out.push(("devOptional", false, PkgFieldVal::BoolTrue));
+    }
+    if let Some(ref eng) = pkg.engines {
+        if !eng.is_empty() {
+            match eng {
+                PackageEngines::List(arr) => {
+                    out.push(("engines", false, PkgFieldVal::JsonArr(arr)));
+                }
+                PackageEngines::String(s) => {
+                    out.push(("engines", false, PkgFieldVal::Str(s)));
+                }
+                PackageEngines::Other(v) if !v.is_object() => {
+                    out.push(("engines", false, PkgFieldVal::JsonVal(v)));
+                }
+                _ => {}
+            }
+        }
+    }
+    if pkg.extraneous == Some(true) {
+        out.push(("extraneous", false, PkgFieldVal::BoolTrue));
+    }
+    if pkg.has_install_script == Some(true) {
+        out.push(("hasInstallScript", false, PkgFieldVal::BoolTrue));
+    }
+    if pkg.has_shrinkwrap == Some(true) {
+        out.push(("hasShrinkwrap", false, PkgFieldVal::BoolTrue));
+    }
+    if pkg.in_bundle == Some(true) {
+        out.push(("inBundle", false, PkgFieldVal::BoolTrue));
+    }
+    if let Some(ref pl) = pkg.libc {
+        if !pl.is_empty() {
+            let val = if pl.is_scalar() {
+                PkgFieldVal::Str(&pl[0])
+            } else {
+                PkgFieldVal::StrSlice(pl.as_slice())
+            };
+            out.push(("libc", false, val));
+        }
+    }
+    if let Some(ref s) = pkg.license {
+        out.push(("license", false, PkgFieldVal::Str(s)));
+    }
+    if pkg.link == Some(true) {
+        out.push(("link", false, PkgFieldVal::BoolTrue));
+    }
+    if pkg.optional == Some(true) && !dev_optional_true {
+        out.push(("optional", false, PkgFieldVal::BoolTrue));
+    }
+    if let Some(ref pl) = pkg.os {
+        if !pl.is_empty() {
+            let val = if pl.is_scalar() {
+                PkgFieldVal::Str(&pl[0])
+            } else {
+                PkgFieldVal::StrSlice(pl.as_slice())
+            };
+            out.push(("os", false, val));
+        }
+    }
+    if pkg.peer == Some(true) {
+        out.push(("peer", false, PkgFieldVal::BoolTrue));
+    }
+    if pkg.peer_optional == Some(true) {
+        out.push(("peerOptional", false, PkgFieldVal::BoolTrue));
+    }
+    if let Some(ref ws) = pkg.workspaces {
+        out.push(("workspaces", false, PkgFieldVal::StrSlice(ws)));
+    }
+
+    // 2. Object fields in exact (sw_key_rank, npm_key_compare) order.
+    if let Some(ref m) = pkg.dependencies {
+        if !m.is_empty() {
+            out.push(("dependencies", true, PkgFieldVal::StrMap(m)));
+        }
+    }
+    if let Some(PackageBin::Map(ref m)) = pkg.bin {
+        if !m.is_empty() {
+            out.push(("bin", true, PkgFieldVal::StrMap(m)));
+        }
+    }
+    if let Some(ref m) = pkg.dev_dependencies {
+        if !m.is_empty() {
+            out.push(("devDependencies", true, PkgFieldVal::StrMap(m)));
+        }
+    }
+    if let Some(ref eng) = pkg.engines {
+        if !eng.is_empty() {
+            match eng {
+                PackageEngines::Map(m) => {
+                    out.push(("engines", true, PkgFieldVal::StrMap(m)));
+                }
+                PackageEngines::Other(v) if v.is_object() => {
+                    out.push(("engines", true, PkgFieldVal::JsonVal(v)));
+                }
+                _ => {}
+            }
+        }
+    }
+    if let Some(ref m) = pkg.optional_dependencies {
+        if !m.is_empty() {
+            out.push(("optionalDependencies", true, PkgFieldVal::StrMap(m)));
+        }
+    }
+    if let Some(ref m) = pkg.peer_dependencies {
+        if !m.is_empty() {
+            out.push(("peerDependencies", true, PkgFieldVal::StrMap(m)));
+        }
+    }
+    if let Some(ref m) = pkg.peer_dependencies_meta {
+        if !m.is_empty() {
+            out.push(("peerDependenciesMeta", true, PkgFieldVal::PeerMeta(m)));
+        }
     }
 }
 
@@ -2988,72 +4206,50 @@ impl<'a> LockfileWriter<'a> {
     }
 
     pub fn write_value(&self, val: &serde_json::Value, level: usize, out: &mut String) {
+        let mut scratch = Vec::with_capacity(16);
+        self.write_value_inner(val, level, out, &mut scratch);
+    }
+
+    fn write_value_inner<'v>(
+        &self,
+        val: &'v serde_json::Value,
+        level: usize,
+        out: &mut String,
+        scratch: &mut Vec<(&'v str, &'v serde_json::Value)>,
+    ) {
         match val {
             serde_json::Value::Null => out.push_str("null"),
             serde_json::Value::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
-            serde_json::Value::Number(n) => out.push_str(&n.to_string()),
-            serde_json::Value::String(s) => write_json_str(s, out),
-            serde_json::Value::Array(arr) => {
-                if arr.is_empty() {
-                    out.push_str("[]");
-                } else if self.compact {
-                    out.push('[');
-                    for (i, item) in arr.iter().enumerate() {
-                        self.write_value(item, 0, out);
-                        if i + 1 < arr.len() {
-                            out.push(',');
-                        }
-                    }
-                    out.push(']');
-                } else {
-                    out.push('[');
-                    out.push_str(self.newline);
-                    for (i, item) in arr.iter().enumerate() {
-                        self.write_indent(out, level + 1);
-                        self.write_value(item, level + 1, out);
-                        if i + 1 < arr.len() {
-                            out.push(',');
-                        }
-                        out.push_str(self.newline);
-                    }
-                    self.write_indent(out, level);
-                    out.push(']');
-                }
+            serde_json::Value::Number(n) => {
+                use std::fmt::Write;
+                let _ = write!(out, "{n}");
             }
+            serde_json::Value::String(s) => write_json_str(s, out),
+            serde_json::Value::Array(arr) => self.write_json_array(arr, level, out, scratch),
             serde_json::Value::Object(map) => {
                 if map.is_empty() {
                     out.push_str("{}");
                 } else {
-                    let mut entries: Vec<(&String, &serde_json::Value)> = map.iter().collect();
-                    let is_obj = |v: &serde_json::Value| -> bool { v.is_object() };
-                    let key_priority =
-                        |k: &str| -> Option<usize> { SW_KEY_ORDER.iter().position(|&p| p == k) };
-                    entries.sort_by(|(ak, av), (bk, bv)| {
-                        let a_obj = is_obj(av);
-                        let b_obj = is_obj(bv);
-                        if a_obj != b_obj {
-                            if a_obj {
-                                std::cmp::Ordering::Greater
-                            } else {
-                                std::cmp::Ordering::Less
-                            }
-                        } else {
-                            match (key_priority(ak), key_priority(bk)) {
-                                (Some(pa), Some(pb)) => pa.cmp(&pb),
-                                (Some(_), None) => std::cmp::Ordering::Less,
-                                (None, Some(_)) => std::cmp::Ordering::Greater,
-                                (None, None) => npm_key_compare(ak, bk),
-                            }
-                        }
-                    });
+                    let base = scratch.len();
+                    scratch.extend(map.iter().map(|(k, v)| (k.as_str(), v)));
+                    let slice_len = scratch.len();
+                    if slice_len - base > 1 {
+                        scratch[base..slice_len].sort_unstable_by(|(ak, av), (bk, bv)| {
+                            av.is_object()
+                                .cmp(&bv.is_object())
+                                .then_with(|| sw_key_rank(ak).cmp(&sw_key_rank(bk)))
+                                .then_with(|| npm_key_compare(ak, bk))
+                        });
+                    }
 
                     if self.compact {
                         out.push('{');
-                        for (i, (k, v)) in entries.iter().enumerate() {
+                        for i in base..slice_len {
+                            let (k, v) = scratch[i];
                             write_json_str(k, out);
                             out.push(':');
-                            self.write_value(v, 0, out);
-                            if i + 1 < entries.len() {
+                            self.write_value_inner(v, 0, out, scratch);
+                            if i + 1 < slice_len {
                                 out.push(',');
                             }
                         }
@@ -3061,12 +4257,13 @@ impl<'a> LockfileWriter<'a> {
                     } else {
                         out.push('{');
                         out.push_str(self.newline);
-                        for (i, (k, v)) in entries.iter().enumerate() {
+                        for i in base..slice_len {
+                            let (k, v) = scratch[i];
                             self.write_indent(out, level + 1);
                             write_json_str(k, out);
                             out.push_str(": ");
-                            self.write_value(v, level + 1, out);
-                            if i + 1 < entries.len() {
+                            self.write_value_inner(v, level + 1, out, scratch);
+                            if i + 1 < slice_len {
                                 out.push(',');
                             }
                             out.push_str(self.newline);
@@ -3074,8 +4271,265 @@ impl<'a> LockfileWriter<'a> {
                         self.write_indent(out, level);
                         out.push('}');
                     }
+                    scratch.truncate(base);
                 }
             }
+        }
+    }
+
+    fn write_json_array<'v>(
+        &self,
+        arr: &'v [serde_json::Value],
+        level: usize,
+        out: &mut String,
+        scratch: &mut Vec<(&'v str, &'v serde_json::Value)>,
+    ) {
+        if arr.is_empty() {
+            out.push_str("[]");
+        } else if self.compact {
+            out.push('[');
+            for (i, item) in arr.iter().enumerate() {
+                self.write_value_inner(item, 0, out, scratch);
+                if i + 1 < arr.len() {
+                    out.push(',');
+                }
+            }
+            out.push(']');
+        } else {
+            out.push('[');
+            out.push_str(self.newline);
+            for (i, item) in arr.iter().enumerate() {
+                self.write_indent(out, level + 1);
+                self.write_value_inner(item, level + 1, out, scratch);
+                if i + 1 < arr.len() {
+                    out.push(',');
+                }
+                out.push_str(self.newline);
+            }
+            self.write_indent(out, level);
+            out.push(']');
+        }
+    }
+
+    fn write_str_slice(&self, arr: &[String], level: usize, out: &mut String) {
+        if arr.is_empty() {
+            out.push_str("[]");
+        } else if self.compact {
+            out.push('[');
+            for (i, item) in arr.iter().enumerate() {
+                write_json_str(item, out);
+                if i + 1 < arr.len() {
+                    out.push(',');
+                }
+            }
+            out.push(']');
+        } else {
+            out.push('[');
+            out.push_str(self.newline);
+            for (i, item) in arr.iter().enumerate() {
+                self.write_indent(out, level + 1);
+                write_json_str(item, out);
+                if i + 1 < arr.len() {
+                    out.push(',');
+                }
+                out.push_str(self.newline);
+            }
+            self.write_indent(out, level);
+            out.push(']');
+        }
+    }
+
+    fn write_str_map<'m>(
+        &self,
+        map: &'m BTreeMap<String, String>,
+        level: usize,
+        out: &mut String,
+        str_scratch: &mut Vec<(&'m str, &'m str)>,
+    ) {
+        if map.is_empty() {
+            out.push_str("{}");
+            return;
+        }
+        str_scratch.clear();
+        str_scratch.extend(map.iter().map(|(k, v)| (k.as_str(), v.as_str())));
+        if str_scratch.len() > 1 {
+            str_scratch.sort_unstable_by(|(ak, _), (bk, _)| {
+                sw_key_rank(ak)
+                    .cmp(&sw_key_rank(bk))
+                    .then_with(|| npm_key_compare(ak, bk))
+            });
+        }
+        let len = str_scratch.len();
+        if self.compact {
+            out.push('{');
+            for (i, &(k, v)) in str_scratch.iter().enumerate() {
+                write_json_str(k, out);
+                out.push(':');
+                write_json_str(v, out);
+                if i + 1 < len {
+                    out.push(',');
+                }
+            }
+            out.push('}');
+        } else {
+            out.push('{');
+            out.push_str(self.newline);
+            for (i, &(k, v)) in str_scratch.iter().enumerate() {
+                self.write_indent(out, level + 1);
+                write_json_str(k, out);
+                out.push_str(": ");
+                write_json_str(v, out);
+                if i + 1 < len {
+                    out.push(',');
+                }
+                out.push_str(self.newline);
+            }
+            self.write_indent(out, level);
+            out.push('}');
+        }
+    }
+
+    fn write_peer_meta<'m>(
+        &self,
+        map: &'m BTreeMap<String, serde_json::Value>,
+        level: usize,
+        out: &mut String,
+        val_scratch: &mut Vec<(&'m str, &'m serde_json::Value)>,
+    ) {
+        if map.is_empty() {
+            out.push_str("{}");
+            return;
+        }
+        let base = val_scratch.len();
+        val_scratch.extend(map.iter().map(|(k, v)| (k.as_str(), v)));
+        let slice_len = val_scratch.len();
+        if slice_len - base > 1 {
+            val_scratch[base..slice_len].sort_unstable_by(|(ak, av), (bk, bv)| {
+                av.is_object()
+                    .cmp(&bv.is_object())
+                    .then_with(|| sw_key_rank(ak).cmp(&sw_key_rank(bk)))
+                    .then_with(|| npm_key_compare(ak, bk))
+            });
+        }
+        if self.compact {
+            out.push('{');
+            for i in base..slice_len {
+                let (k, v) = val_scratch[i];
+                write_json_str(k, out);
+                out.push(':');
+                self.write_value_inner(v, 0, out, val_scratch);
+                if i + 1 < slice_len {
+                    out.push(',');
+                }
+            }
+            out.push('}');
+        } else {
+            out.push('{');
+            out.push_str(self.newline);
+            for i in base..slice_len {
+                let (k, v) = val_scratch[i];
+                self.write_indent(out, level + 1);
+                write_json_str(k, out);
+                out.push_str(": ");
+                self.write_value_inner(v, level + 1, out, val_scratch);
+                if i + 1 < slice_len {
+                    out.push(',');
+                }
+                out.push_str(self.newline);
+            }
+            self.write_indent(out, level);
+            out.push('}');
+        }
+        val_scratch.truncate(base);
+    }
+
+    fn write_pkg_field_val<'p>(
+        &self,
+        val: PkgFieldVal<'p>,
+        level: usize,
+        out: &mut String,
+        val_scratch: &mut Vec<(&'p str, &'p serde_json::Value)>,
+        str_scratch: &mut Vec<(&'p str, &'p str)>,
+    ) {
+        match val {
+            PkgFieldVal::Str(s) => write_json_str(s, out),
+            PkgFieldVal::BoolTrue => out.push_str("true"),
+            PkgFieldVal::StrSlice(arr) => self.write_str_slice(arr, level, out),
+            PkgFieldVal::StrMap(m) => self.write_str_map(m, level, out, str_scratch),
+            PkgFieldVal::PeerMeta(m) => self.write_peer_meta(m, level, out, val_scratch),
+            PkgFieldVal::JsonArr(arr) => self.write_json_array(arr, level, out, val_scratch),
+            PkgFieldVal::JsonVal(v) => self.write_value_inner(v, level, out, val_scratch),
+        }
+    }
+
+    fn write_package<'p>(
+        &self,
+        pkg: &'p LockfilePackage,
+        level: usize,
+        out: &mut String,
+        pkg_scratch: &mut Vec<(&'p str, bool, PkgFieldVal<'p>)>,
+        val_scratch: &mut Vec<(&'p str, &'p serde_json::Value)>,
+        str_scratch: &mut Vec<(&'p str, &'p str)>,
+    ) {
+        pkg_scratch.clear();
+        collect_pkg_fields(pkg, pkg_scratch);
+
+        if !pkg.extra.is_empty() {
+            let mut has_emittable_extra = false;
+            for (ek, ev) in &pkg.extra {
+                if is_stripped_extra_entry(ek, ev) {
+                    continue;
+                }
+                has_emittable_extra = true;
+                let entry = (ek.as_str(), ev.is_object(), PkgFieldVal::JsonVal(ev));
+                if let Some(pos) = pkg_scratch.iter().position(|(k, _, _)| *k == ek.as_str()) {
+                    pkg_scratch[pos] = entry;
+                } else {
+                    pkg_scratch.push(entry);
+                }
+            }
+            if has_emittable_extra && pkg_scratch.len() > 1 {
+                pkg_scratch.sort_unstable_by(|(ak, a_obj, _), (bk, b_obj, _)| {
+                    a_obj
+                        .cmp(b_obj)
+                        .then_with(|| sw_key_rank(ak).cmp(&sw_key_rank(bk)))
+                        .then_with(|| npm_key_compare(ak, bk))
+                });
+            }
+        }
+
+        let len = pkg_scratch.len();
+        if len == 0 {
+            out.push_str("{}");
+            return;
+        }
+
+        if self.compact {
+            out.push('{');
+            for (i, &(k, _, v)) in pkg_scratch.iter().enumerate() {
+                write_json_str(k, out);
+                out.push(':');
+                self.write_pkg_field_val(v, 0, out, val_scratch, str_scratch);
+                if i + 1 < len {
+                    out.push(',');
+                }
+            }
+            out.push('}');
+        } else {
+            out.push('{');
+            out.push_str(self.newline);
+            for (i, &(k, _, v)) in pkg_scratch.iter().enumerate() {
+                self.write_indent(out, level + 1);
+                write_json_str(k, out);
+                out.push_str(": ");
+                self.write_pkg_field_val(v, level + 1, out, val_scratch, str_scratch);
+                if i + 1 < len {
+                    out.push(',');
+                }
+                out.push_str(self.newline);
+            }
+            self.write_indent(out, level);
+            out.push('}');
         }
     }
 
@@ -3085,10 +4539,14 @@ impl<'a> LockfileWriter<'a> {
         target_version: u32,
         out: &mut String,
     ) -> Result<(), LockfileError> {
+        let per_pkg = if self.compact { 384 } else { 512 };
+        out.reserve(lockfile.packages.len().saturating_mul(per_pkg) + 128);
+
         out.push('{');
         self.write_newline(out);
 
         let mut first_field = true;
+        let mut val_scratch: Vec<(&str, &serde_json::Value)> = Vec::with_capacity(32);
 
         // 1. name (if root_metadata)
         if self.root_metadata {
@@ -3122,7 +4580,10 @@ impl<'a> LockfileWriter<'a> {
         self.write_indent(out, 1);
         write_json_str("lockfileVersion", out);
         out.push_str(self.colon_sep());
-        out.push_str(&target_version.to_string());
+        {
+            use std::fmt::Write;
+            let _ = write!(out, "{target_version}");
+        }
 
         // 4. requires
         match target_version {
@@ -3162,18 +4623,14 @@ impl<'a> LockfileWriter<'a> {
                 self.write_newline(out);
 
                 let mut pkg_entries: Vec<(std::borrow::Cow<'_, str>, &LockfilePackage)> =
-                    lockfile
-                        .packages
-                        .iter()
-                        .map(|(k, v)| {
-                            if k.contains('\\') {
-                                (std::borrow::Cow::Owned(to_posix_path(k)), v)
-                            } else {
-                                (std::borrow::Cow::Borrowed(k.as_str()), v)
-                            }
-                        })
-                        .collect();
-                pkg_entries.sort_by(|(k1, _), (k2, _)| npm_key_compare(k1, k2));
+                    Vec::with_capacity(lockfile.packages.len());
+                for (k, v) in &lockfile.packages {
+                    pkg_entries.push((to_posix_path_cow(k), v));
+                }
+                pkg_entries.sort_unstable_by(|(k1, _), (k2, _)| npm_key_compare(k1, k2));
+
+                let mut pkg_scratch: Vec<(&str, bool, PkgFieldVal<'_>)> = Vec::with_capacity(24);
+                let mut str_scratch: Vec<(&str, &str)> = Vec::with_capacity(16);
 
                 for (i, (k, pkg)) in pkg_entries.iter().enumerate() {
                     self.write_indent(out, 2);
@@ -3181,12 +4638,16 @@ impl<'a> LockfileWriter<'a> {
                     out.push_str(self.colon_sep());
 
                     if let Some(ref raw) = pkg.raw_value {
-                        self.write_value(raw, 2, out);
+                        self.write_value_inner(raw, 2, out, &mut val_scratch);
                     } else {
-                        let mut p = (*pkg).clone();
-                        p.normalize_flags();
-                        let pkg_val = serde_json::to_value(&p)?;
-                        self.write_value(&pkg_val, 2, out);
+                        self.write_package(
+                            pkg,
+                            2,
+                            out,
+                            &mut pkg_scratch,
+                            &mut val_scratch,
+                            &mut str_scratch,
+                        );
                     }
 
                     if i + 1 < pkg_entries.len() {
@@ -3208,7 +4669,7 @@ impl<'a> LockfileWriter<'a> {
             write_json_str("dependencies", out);
             out.push_str(self.colon_sep());
             let legacy = lockfile.to_legacy_dependencies();
-            self.write_value(&legacy, 1, out);
+            self.write_value_inner(&legacy, 1, out, &mut val_scratch);
         }
 
         // Close root
@@ -3238,6 +4699,16 @@ const NPM_CHAR_RANK: [u8; 256] = [
     255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
     255, 255, 255, 255, 255, 255, 255,
 ];
+
+const NPM_CHAR_RANK_FOLDED: [u8; 256] = {
+    let mut table = NPM_CHAR_RANK;
+    let mut i = b'A' as usize;
+    while i <= b'Z' as usize {
+        table[i] = NPM_CHAR_RANK[i + 32];
+        i += 1;
+    }
+    table
+};
 
 static OMIT_REGISTRY_RESOLVED: std::sync::RwLock<Option<Vec<String>>> =
     std::sync::RwLock::new(None);
@@ -3318,27 +4789,35 @@ fn is_format_package_lock_enabled(project_dir: &Path) -> bool {
     true
 }
 
+#[inline]
 pub fn npm_key_compare(a: &str, b: &str) -> std::cmp::Ordering {
     let a_bytes = a.as_bytes();
     let b_bytes = b.as_bytes();
+    if a_bytes == b_bytes {
+        return std::cmp::Ordering::Equal;
+    }
     let n = a_bytes.len().min(b_bytes.len());
     for i in 0..n {
-        let ra = NPM_CHAR_RANK[a_bytes[i].to_ascii_lowercase() as usize];
-        let rb = NPM_CHAR_RANK[b_bytes[i].to_ascii_lowercase() as usize];
+        let ra = NPM_CHAR_RANK_FOLDED[a_bytes[i] as usize];
+        let rb = NPM_CHAR_RANK_FOLDED[b_bytes[i] as usize];
         if ra != rb {
             return ra.cmp(&rb);
         }
     }
-    a_bytes.len().cmp(&b_bytes.len()).then_with(|| {
-        for i in 0..n {
-            let ra = NPM_CHAR_RANK[a_bytes[i] as usize];
-            let rb = NPM_CHAR_RANK[b_bytes[i] as usize];
-            if ra != rb {
-                return ra.cmp(&rb);
+    a_bytes
+        .len()
+        .cmp(&b_bytes.len())
+        .then_with(|| {
+            for i in 0..n {
+                let ra = NPM_CHAR_RANK[a_bytes[i] as usize];
+                let rb = NPM_CHAR_RANK[b_bytes[i] as usize];
+                if ra != rb {
+                    return ra.cmp(&rb);
+                }
             }
-        }
-        std::cmp::Ordering::Equal
-    }).then_with(|| a.cmp(b))
+            std::cmp::Ordering::Equal
+        })
+        .then_with(|| a.cmp(b))
 }
 
 #[allow(dead_code)]

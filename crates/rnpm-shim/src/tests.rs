@@ -1642,6 +1642,20 @@ fn test_header_only_shebang_scanning_multi_mb_binary_untouched() {
 }
 
 #[test]
+fn normalize_long_shebang_preserves_the_whole_file() {
+    let temp = tempfile::tempdir().unwrap();
+    let script = temp.path().join("long-shebang");
+    let line = format!("#!/usr/bin/env node #{}", "a".repeat(600));
+    std::fs::write(&script, format!("{line}\r\nbody\r\n")).unwrap();
+
+    assert!(shebang::normalize_shebang_file(&script).unwrap());
+    assert_eq!(
+        std::fs::read_to_string(&script).unwrap(),
+        format!("{line}\nbody\r\n")
+    );
+}
+
+#[test]
 fn test_header_only_shebang_crlf_normalized_and_readonly_preserved() {
     let dir = tempdir().unwrap();
     let script = dir.path().join("crlf_readonly.js");

@@ -124,35 +124,38 @@ impl PackageTarget {
             ));
         }
 
-        // Fast path for the ~95% most common semver range and exact version specs:
-        // - Ranges starting with '^', '~' (excluding "~/"), '>', '<', '='
-        // - Versions and ranges starting with a digit (e.g. "1.2.3", "0.1.0", "1.x")
-        //   or 'v' + digit (e.g. "v1.2.3") that contain no protocol/path separators (':', '/', '@')
+        // Fast path for the ~95% most common semver range, exact version, and dist-tag specs:
+        // - Ranges starting with '^', '~' (excluding "~/"), '>', '<' -> Range directly (skip Version::parse error alloc!)
+        // - '=' -> Version or Range
+        // - Digits or 'v' + digit without ':', '/', '@' -> Version or Range
+        // - ASCII alphabetic tag (not 'v'/'V'/'x'/'X') without ':', '/', '@', whitespace -> Tag directly
         let bytes = trimmed_spec.as_bytes();
         let first = bytes[0];
-        let is_fast_semver = match first {
-            b'^' | b'>' | b'<' | b'=' => true,
-            b'~' => !trimmed_spec.starts_with("~/"),
-            b'0'..=b'9' => {
-                !trimmed_spec.contains(':')
-                    && !trimmed_spec.contains('/')
-                    && !trimmed_spec.contains('@')
+        if matches!(first, b'^' | b'>' | b'<') || (first == b'~' && !trimmed_spec.starts_with("~/"))
+        {
+            if let Ok(range) = Range::parse(trimmed_spec) {
+                return Ok(PackageTarget::Range(range));
             }
-            b'v' if bytes.len() > 1 && bytes[1].is_ascii_digit() => {
-                !trimmed_spec.contains(':')
-                    && !trimmed_spec.contains('/')
-                    && !trimmed_spec.contains('@')
-            }
-            _ => false,
-        };
-
-        if is_fast_semver {
+        } else if first == b'='
+            || ((first.is_ascii_digit()
+                || ((first == b'v' || first == b'V')
+                    && bytes.len() > 1
+                    && bytes[1].is_ascii_digit()))
+                && !trimmed_spec.contains(':')
+                && !trimmed_spec.contains('/')
+                && !trimmed_spec.contains('@'))
+        {
             if let Ok(ver) = Version::parse(trimmed_spec) {
                 return Ok(PackageTarget::Version(ver));
             }
             if let Ok(range) = Range::parse(trimmed_spec) {
                 return Ok(PackageTarget::Range(range));
             }
+        } else if first.is_ascii_alphabetic()
+            && !matches!(first, b'v' | b'V' | b'x' | b'X')
+            && is_valid_tag(trimmed_spec)
+        {
+            return Ok(PackageTarget::Tag(trimmed_spec.to_string()));
         }
 
         let expanded = expand_github_shorthand(trimmed_spec);
@@ -204,18 +207,20 @@ impl PackageTarget {
         }
 
         // Unsupported protocols (e.g. svn://, ftp://, sftp://, hg+https://, cvs://, etc.)
-        if let Some((scheme, _)) = s.split_once("://") {
-            return Err(SpecError::UnsupportedProtocol {
-                protocol: format!("{scheme}:"),
-                spec: s.to_string(),
-            });
-        }
-        for proto in &["cvs:", "svn:", "ftp:", "hg:"] {
-            if s.starts_with(proto) {
+        if s.contains(':') {
+            if let Some((scheme, _)) = s.split_once("://") {
                 return Err(SpecError::UnsupportedProtocol {
-                    protocol: proto.to_string(),
+                    protocol: format!("{scheme}:"),
                     spec: s.to_string(),
                 });
+            }
+            for proto in &["cvs:", "svn:", "ftp:", "hg:"] {
+                if s.starts_with(proto) {
+                    return Err(SpecError::UnsupportedProtocol {
+                        protocol: proto.to_string(),
+                        spec: s.to_string(),
+                    });
+                }
             }
         }
 
@@ -434,6 +439,22 @@ impl PackageSpec {
             return Err(SpecError::Empty);
         }
 
+        // Fast path: scoped package (`@scope/pkg[@spec]`) or unscoped registry spec without `:` / `/`
+        if trimmed_input.starts_with('@')
+            || (!trimmed_input.contains(':') && !trimmed_input.contains('/'))
+        {
+            let (name, spec_opt) = split_name_and_spec(trimmed_input)?;
+            let target = if let Some(spec) = spec_opt {
+                PackageTarget::parse(spec)?
+            } else {
+                PackageTarget::Tag("latest".to_string())
+            };
+            return Ok(Self {
+                name: name.to_string(),
+                target,
+            });
+        }
+
         let expanded = expand_github_shorthand(trimmed_input);
         let trimmed = expanded.as_ref();
 
@@ -625,17 +646,26 @@ fn extract_url_package_name(url_str: &str) -> String {
             }
         }
         if let Some(segments) = u.path_segments() {
-            let segs: Vec<&str> = segments.collect();
-            // npm registry tarball format: .../[@scope/]pkg/-/pkg-version.tgz
-            if let Some(dash_pos) = segs.iter().position(|&s| s == "-") {
-                if dash_pos > 0 {
-                    if dash_pos >= 2 && segs[dash_pos - 2].starts_with('@') {
-                        return format!("{}/{}", segs[dash_pos - 2], segs[dash_pos - 1]);
+            let mut prev2: Option<&str> = None;
+            let mut prev1: Option<&str> = None;
+            let mut last: Option<&str> = None;
+            for seg in segments {
+                // npm registry tarball format: .../[@scope/]pkg/-/pkg-version.tgz
+                if seg == "-" {
+                    if let Some(p1) = prev1 {
+                        if let Some(p2) = prev2 {
+                            if p2.starts_with('@') {
+                                return format!("{p2}/{p1}");
+                            }
+                        }
+                        return p1.to_string();
                     }
-                    return segs[dash_pos - 1].to_string();
                 }
+                prev2 = prev1;
+                prev1 = last;
+                last = Some(seg);
             }
-            if let Some(mut last_seg) = segs.last().copied() {
+            if let Some(mut last_seg) = last {
                 if last_seg.ends_with(".tgz") {
                     last_seg = &last_seg[..last_seg.len() - 4];
                 } else if last_seg.ends_with(".tar.gz") {

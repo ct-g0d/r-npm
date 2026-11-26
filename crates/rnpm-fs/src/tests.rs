@@ -3677,3 +3677,127 @@ fn test_parallel_safe_removal_large_tree_with_junctions_and_readonly() {
         b"MUST_NEVER_BE_DELETED"
     );
 }
+
+#[cfg(windows)]
+#[test]
+fn test_failed_replacement_leaves_linked_file_intact() {
+    use std::os::windows::ffi::OsStrExt;
+
+    extern "system" {
+        fn CreateFileW(
+            lpFileName: *const u16,
+            dwDesiredAccess: u32,
+            dwShareMode: u32,
+            lpSecurityAttributes: *mut std::ffi::c_void,
+            dwCreationDisposition: u32,
+            dwFlagsAndAttributes: u32,
+            hTemplateFile: *mut std::ffi::c_void,
+        ) -> *mut std::ffi::c_void;
+        fn CloseHandle(hObject: *mut std::ffi::c_void) -> i32;
+    }
+
+    struct HandleGuard(*mut std::ffi::c_void);
+    impl Drop for HandleGuard {
+        fn drop(&mut self) {
+            unsafe {
+                CloseHandle(self.0);
+            }
+        }
+    }
+
+    const GENERIC_READ: u32 = 0x80000000;
+    const FILE_SHARE_READ: u32 = 1;
+    const FILE_SHARE_WRITE: u32 = 2;
+    const OPEN_EXISTING: u32 = 3;
+    const INVALID_HANDLE_VALUE: *mut std::ffi::c_void = -1isize as *mut std::ffi::c_void;
+
+    let dir = tempdir().unwrap();
+    let original = dir.path().join("cas_original.js");
+    let linked = dir.path().join("linked_dest.js");
+    let source = dir.path().join("new_source.js");
+    let expected = b"CAS_IMMUTABLE_CONTENT";
+
+    fs::write(&original, expected).unwrap();
+    fs::write(&source, b"OVERWRITTEN_BAD_CONTENT").unwrap();
+    fs::hard_link(&original, &linked).unwrap();
+
+    // Lock the hardlink handle without FILE_SHARE_DELETE so unlink fails,
+    // while keeping FILE_SHARE_READ | FILE_SHARE_WRITE which CREATE_ALWAYS
+    // would otherwise open and truncate.
+    let wide: Vec<u16> = crate::path::to_verbatim_path(&linked)
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect();
+    let handle = unsafe {
+        CreateFileW(
+            wide.as_ptr(),
+            GENERIC_READ,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            std::ptr::null_mut(),
+            OPEN_EXISTING,
+            0,
+            std::ptr::null_mut(),
+        )
+    };
+    assert_ne!(handle, INVALID_HANDLE_VALUE);
+    let _guard = HandleGuard(handle);
+
+    let write_res = crate::writer::write_file_fast(&linked, b"CORRUPT", 0o644, 64 * 1024);
+    assert!(
+        write_res.is_err(),
+        "Exclusive replacement must fail when existing link cannot be unlinked"
+    );
+    assert_eq!(
+        fs::read(&original).unwrap(),
+        expected,
+        "Failed write_file_fast replacement must leave linked original intact"
+    );
+
+    let copy_res = crate::writer::copy_file_fast(&source, &linked);
+    assert!(
+        copy_res.is_err(),
+        "Exclusive copy replacement must fail when existing link cannot be unlinked"
+    );
+    assert_eq!(
+        fs::read(&original).unwrap(),
+        expected,
+        "Failed copy_file_fast replacement must leave linked original intact"
+    );
+
+    // Also verify symlinked targets cannot be overwritten through a failed unlink when symlinks are permitted
+    let sym = dir.path().join("sym_dest.js");
+    if std::os::windows::fs::symlink_file(&original, &sym).is_ok() {
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x00200000;
+        let sym_wide: Vec<u16> = crate::path::to_verbatim_path(&sym)
+            .as_os_str()
+            .encode_wide()
+            .chain(Some(0))
+            .collect();
+        let sym_handle = unsafe {
+            CreateFileW(
+                sym_wide.as_ptr(),
+                GENERIC_READ,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                std::ptr::null_mut(),
+                OPEN_EXISTING,
+                FILE_FLAG_OPEN_REPARSE_POINT,
+                std::ptr::null_mut(),
+            )
+        };
+        if sym_handle != INVALID_HANDLE_VALUE {
+            let _sym_guard = HandleGuard(sym_handle);
+            let sym_write_res =
+                crate::writer::write_file_fast(&sym, b"CORRUPT_SYM", 0o644, 64 * 1024);
+            assert!(
+                sym_write_res.is_err(),
+                "Exclusive replacement must fail when existing symlink cannot be unlinked"
+            );
+            assert_eq!(
+                fs::read(&original).unwrap(),
+                expected,
+                "Failed symlink replacement must leave symlink target intact"
+            );
+        }
+    }
+}

@@ -1740,3 +1740,23 @@ fn test_find_workspace_root_dynamic_stateless() {
     );
 }
 
+#[test]
+fn test_find_workspace_root_escaped_workspaces_key() {
+    let tmp = tempdir().unwrap();
+    let root = tmp.path().join("escaped-ws");
+    let member = root.join("packages").join("app");
+    fs::create_dir_all(&member).unwrap();
+    fs::write(
+        root.join("package.json"),
+        r#"{"name":"root","worksp\u0061ces":["packages/*"]}"#,
+    )
+    .unwrap();
+    fs::write(member.join("package.json"), r#"{"name":"app"}"#).unwrap();
+
+    let found = crate::find_workspace_root(&member);
+    assert_eq!(
+        found.as_deref().and_then(|p| p.canonicalize().ok()),
+        root.canonicalize().ok()
+    );
+}
+

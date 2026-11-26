@@ -18,7 +18,7 @@ use rnpm_fs::junction::{is_junction, remove_junction};
 use rnpm_fs::{determine_writer_config, extract_tarball_direct, precreate_directories};
 use rnpm_lifecycle::{LifecycleOptions, LifecyclePackageNode, PackageSource};
 use rnpm_lockfile::{LockfilePackage, LockfileV3};
-use rnpm_registry::client::{RegistryClient, RegistryClientConfig};
+use rnpm_registry::client::{PackumentFetchOptions, RegistryClient, RegistryClientConfig};
 use rnpm_registry::metadata::AbbreviatedPackageMetadata;
 const INSTALL_PACKUMENT_ACCEPT: &str = "application/json";
 use rnpm_shim::{create_shims_with_force, normalize_shebang};
@@ -89,16 +89,23 @@ async fn finish_pack_tasks(tasks: Vec<tokio::task::JoinHandle<Result<()>>>) -> R
     first_error.map_or(Ok(()), Err)
 }
 
-/// Writes warm-store files. Files with a verified CAS blob are copied; the
-/// rest go to the async writer (the node helper on Windows, where node's
-/// writes run several times faster than ours), falling back to our writer.
-/// Paths that are not valid UTF-8 stay on our writer: the helper takes text.
+/// Writes warm-store files. Files with a verified CAS blob are copied; small and
+/// large installs materialize slice references zero-copy in parallel without
+/// paying external `node.exe` process startup or per-file `.to_vec()` clones.
 fn materialize_warm_files(
     files: Vec<rnpm_fs::MaterializeFileRef<'_>>,
     config: &rnpm_fs::ParallelWriterConfig,
-    estimated_packages: usize,
 ) -> Result<(), rnpm_fs::FsError> {
-    let Ok(writer) = rnpm_fs::AsyncFileWriter::spawn_for_hint(estimated_packages) else {
+    let writer_pref = std::env::var("RNPM_WRITER").unwrap_or_default();
+    let force_node = writer_pref.eq_ignore_ascii_case("node");
+    if !force_node {
+        let mut warm_cfg = config.clone();
+        if !warm_cfg.is_hdd && warm_cfg.worker_threads < 16 {
+            warm_cfg.worker_threads = 16;
+        }
+        return rnpm_fs::materialize_files_parallel_refs(files, &warm_cfg);
+    }
+    let Ok(writer) = rnpm_fs::AsyncFileWriter::spawn() else {
         return rnpm_fs::materialize_files_parallel_refs(files, config);
     };
     let sender = writer.sender();
@@ -135,13 +142,15 @@ fn queue_pack_files(
         return false;
     }
     // The Rust writer does not create parent directories.
-    let dirs: std::collections::BTreeSet<PathBuf> = pack
-        .index
-        .files
-        .iter()
-        .filter_map(|entry| dest.join(&entry.path).parent().map(Path::to_path_buf))
-        .chain(std::iter::once(dest.to_path_buf()))
-        .collect();
+    let mut dirs = HashSet::with_capacity(pack.index.files.len() / 2 + 1);
+    dirs.insert(dest.to_path_buf());
+    for entry in &pack.index.files {
+        if entry.path.contains('/') {
+            if let Some(parent) = dest.join(&entry.path).parent() {
+                dirs.insert(parent.to_path_buf());
+            }
+        }
+    }
     if rnpm_fs::precreate_directories(dirs.iter().map(PathBuf::as_path)).is_err() {
         return false;
     }
@@ -149,13 +158,13 @@ fn queue_pack_files(
         let Some(data) = pack.get_entry_slice(entry) else {
             return false;
         };
-        let rel = if cfg!(windows) {
-            entry.path.replace('/', "\\")
+        let rel: std::borrow::Cow<'_, str> = if cfg!(windows) && entry.path.contains('/') {
+            std::borrow::Cow::Owned(entry.path.replace('/', "\\"))
         } else {
-            entry.path.clone()
+            std::borrow::Cow::Borrowed(entry.path.as_str())
         };
         if sender
-            .send(dest.join(rel), data.to_vec(), entry.mode)
+            .send(dest.join(rel.as_ref()), data.to_vec(), entry.mode)
             .is_err()
         {
             return false;
@@ -2711,7 +2720,8 @@ pub struct Installer {
     pack_store: Arc<PackStore>,
     registry_client: RegistryClient,
     metadata_cache: HashMap<String, AbbreviatedPackageMetadata>,
-    writer_cfg: Arc<rnpm_fs::ParallelWriterConfig>,
+    writer_concurrency: Option<usize>,
+    writer_cfg: std::sync::OnceLock<Arc<rnpm_fs::ParallelWriterConfig>>,
     io_semaphore: Arc<tokio::sync::Semaphore>,
     source_policy: policy::SourcePolicy,
     script_policy: policy::ScriptPolicy,
@@ -2728,7 +2738,6 @@ impl Installer {
     pub fn new(options: InstallOptions) -> Result<Self> {
         let mut options = options;
         let root_dir = &options.project_dir;
-        crate::trash::cleanup_leftover_trash(root_dir);
         if options.is_global && !root_dir.join("package.json").exists() {
             let _ = std::fs::create_dir_all(root_dir);
             let global_nm = rnpm_config::find_global_node_modules(root_dir);
@@ -2814,8 +2823,6 @@ impl Installer {
             }
         });
 
-        let cache = Cache::new(&cache_path).context("Failed to initialize cache")?;
-
         let pack_store_path = if let Some(ref s) = options.store_dir {
             s.clone()
         } else if let Ok(store_env) = std::env::var("RNPM_STORE_DIR") {
@@ -2835,9 +2842,6 @@ impl Installer {
         } else {
             cache_path.join("store-v1")
         };
-
-        let pack_store =
-            Arc::new(PackStore::new(&pack_store_path).context("Failed to initialize pack store")?);
 
         let mut trusted_hosts = HashSet::new();
         if let Some(host) = registry_url.host_str() {
@@ -2890,10 +2894,12 @@ impl Installer {
 
         apply_config_to_client_config(&mut client_config, &config);
 
+        let cache = Cache::new(&cache_path).context("Failed to initialize cache")?;
+        let pack_store =
+            Arc::new(PackStore::new(&pack_store_path).context("Failed to initialize pack store")?);
         let registry_client = RegistryClient::with_config(client_config)
             .context("Failed to initialize registry client")?;
 
-        let writer_cfg = Arc::new(determine_writer_config(&options.project_dir, concurrency));
         let io_concurrency = 64;
         let io_semaphore = Arc::new(tokio::sync::Semaphore::new(io_concurrency));
 
@@ -2931,7 +2937,8 @@ impl Installer {
             pack_store,
             registry_client,
             metadata_cache: HashMap::new(),
-            writer_cfg,
+            writer_concurrency: concurrency,
+            writer_cfg: std::sync::OnceLock::new(),
             io_semaphore,
             source_policy,
             script_policy,
@@ -2939,6 +2946,23 @@ impl Installer {
             dry_run_ideal: None,
             manifest_rollback: Vec::new(),
         })
+    }
+
+    pub(crate) fn cache(&self) -> &Cache {
+        &self.cache
+    }
+
+    fn has_cached_tarball_blob(&self, integrity: &str) -> bool {
+        integrity
+            .parse()
+            .is_ok_and(|expected| matches!(self.cache.get_by_integrity(&expected), Ok(Some(_))))
+    }
+
+    fn read_cached_project_fingerprint(&self) -> Option<String> {
+        self.cache
+            .get_project_fingerprint(&self.options.project_dir)
+            .ok()
+            .flatten()
     }
 
     fn collect_root_declared(
@@ -3177,7 +3201,7 @@ impl Installer {
         if self.options.offline {
             return HashSet::new();
         }
-        legacy_lock::hydrate_old_lockfile(&self.registry_client, lockfile, skip_names).await
+        legacy_lock::hydrate_old_lockfile(self.registry_client(), lockfile, skip_names).await
     }
 
     /// npm's post-reify advisory about install scripts the allowScripts
@@ -3204,6 +3228,15 @@ impl Installer {
         }
     }
 
+    fn writer_cfg_arc_ref(&self) -> &Arc<rnpm_fs::ParallelWriterConfig> {
+        self.writer_cfg.get_or_init(|| {
+            Arc::new(determine_writer_config(
+                &self.options.project_dir,
+                self.writer_concurrency,
+            ))
+        })
+    }
+
     /// Access the underlying PackStore.
     pub fn pack_store(&self) -> &PackStore {
         &self.pack_store
@@ -3220,10 +3253,8 @@ impl Installer {
         cfg.max_concurrent_requests = concurrency;
         self.registry_client = RegistryClient::with_config(cfg)
             .context("Failed to reconfigure registry client with concurrency")?;
-        self.writer_cfg = Arc::new(determine_writer_config(
-            &self.options.project_dir,
-            Some(concurrency),
-        ));
+        self.writer_concurrency = Some(concurrency);
+        self.writer_cfg = std::sync::OnceLock::new();
         let io_concurrency = concurrency.clamp(32, 128);
         self.io_semaphore = Arc::new(tokio::sync::Semaphore::new(io_concurrency));
         Ok(self)
@@ -3231,12 +3262,12 @@ impl Installer {
 
     /// Access the shared ParallelWriterConfig.
     pub fn writer_config(&self) -> &rnpm_fs::ParallelWriterConfig {
-        &self.writer_cfg
+        self.writer_cfg_arc_ref()
     }
 
     /// Access the shared ParallelWriterConfig Arc.
     pub fn writer_config_arc(&self) -> Arc<rnpm_fs::ParallelWriterConfig> {
-        Arc::clone(&self.writer_cfg)
+        Arc::clone(self.writer_cfg_arc_ref())
     }
 
     /// Access the shared I/O semaphore.
@@ -3306,9 +3337,9 @@ impl Installer {
                 // Diagnostics must never turn an allowed conflict into a fetch failure.
                 let cached = (self.options.offline || self.options.prefer_offline)
                     .then(|| {
-                        self.cache
+                        self.cache()
                             .get_packument_with_accept(
-                                self.registry_client
+                                self.registry_client()
                                     .registry_for_package(&spec.package_name)
                                     .as_str(),
                                 &spec.package_name,
@@ -3323,14 +3354,16 @@ impl Installer {
                     .flatten();
                 let metadata = if cached.is_some() || self.options.offline {
                     cached
-                } else if before_cutoff().is_some() {
-                    self.registry_client
-                        .get_package_metadata_full(&spec.package_name)
-                        .await
-                        .ok()
                 } else {
-                    self.registry_client
-                        .get_package_metadata_install(&spec.package_name)
+                    // Diagnostics only select a version. Arborist's ideal-tree
+                    // fetch still needs the full manifest for lockfile parity.
+                    let fetch = if before_cutoff().is_some() {
+                        PackumentFetchOptions::full()
+                    } else {
+                        PackumentFetchOptions::abbreviated()
+                    };
+                    self.registry_client()
+                        .get_package_metadata_negotiated(&spec.package_name, fetch)
                         .await
                         .ok()
                 };
@@ -3411,7 +3444,9 @@ impl Installer {
     }
 
     async fn install_internal(&mut self) -> Result<InstallSummary> {
-        crate::trash::cleanup_leftover_trash(&self.options.project_dir);
+        if !self.options.dry_run {
+            crate::trash::cleanup_leftover_trash(&self.options.project_dir);
+        }
         let collector = TimingCollector::new();
         let plan_start = std::time::Instant::now();
         let _plan_span = tracing::info_span!("plan").entered();
@@ -3431,85 +3466,86 @@ impl Installer {
             && !self.options.package_lock_only
             && self.options.unlocked_packages.is_empty()
             && self.options.vulnerability_constraints.is_empty()
+            && self
+                .options
+                .project_dir
+                .join(LockfileV3::HIDDEN_LOCKFILE_PATH)
+                .is_file()
         {
-            if let Ok(current_fingerprint) =
-                compute_project_fingerprint(&self.options.project_dir, &self.options)
-            {
-                if let Ok(Some(stored_fingerprint)) = self
-                    .cache
-                    .get_project_fingerprint(&self.options.project_dir)
+            if let Some(stored_fingerprint) = self.read_cached_project_fingerprint() {
+                if let Ok(current_fingerprint) =
+                    compute_project_fingerprint(&self.options.project_dir, &self.options)
                 {
-                    if current_fingerprint == stored_fingerprint
-                        && validate_hidden_lockfile(&self.options.project_dir, Some(&self.options))
-                    {
-                        info!("Fast path hit: inputs unchanged and hidden lockfile valid");
-                        let lockfile_path = project_lockfile_path(&self.options.project_dir);
-                        drop(_plan_span);
-                        collector.record_phase(Phase::Plan, plan_start.elapsed());
-                        if !self.options.ignore_scripts && !self.options.is_global {
-                            let hidden = self
-                                .options
-                                .project_dir
-                                .join("node_modules")
-                                .join(".package-lock.json");
-                            if let Ok(actual) = LockfileV3::load_from_file_readonly(&hidden) {
+                    if current_fingerprint == stored_fingerprint {
+                        if let Some((actual, root_manifest)) = crate::fast_path::validate_hidden_lockfile_loaded(
+                            &self.options.project_dir,
+                            Some(&self.options),
+                        ) {
+                            info!("Fast path hit: inputs unchanged and hidden lockfile valid");
+                            let lockfile_path = project_lockfile_path(&self.options.project_dir);
+                            drop(_plan_span);
+                            collector.record_phase(Phase::Plan, plan_start.elapsed());
+                            if !self.options.ignore_scripts && !self.options.is_global {
                                 self.warn_unreviewed_scripts(&actual, &self.options.project_dir);
+                                let parsed_root = match root_manifest {
+                                    Some(ref m) => m,
+                                    None => {
+                                        return Err(anyhow!(
+                                            "Failed to parse project package.json"
+                                        ));
+                                    }
+                                };
+                                let opts = self.lifecycle_options();
+                                let _life_guard = collector.enter_phase(Phase::Lifecycle);
+                                self.run_lifecycle_hooks(rnpm_lifecycle::execute_root_hooks(
+                                    parsed_root,
+                                    &opts,
+                                ))
+                                .await?;
                             }
-                            let root_manifest = Manifest::from_file_readonly(&manifest_path)
-                                .context("Failed to parse project package.json")?;
-                            let opts = self.lifecycle_options();
-                            let _life_guard = collector.enter_phase(Phase::Lifecycle);
-                            self.run_lifecycle_hooks(rnpm_lifecycle::execute_root_hooks(&root_manifest, &opts)).await?;
-                        }
-                        let actual = LockfileV3::load_from_file_readonly(
-                            &self
-                                .options
-                                .project_dir
-                                .join("node_modules")
-                                .join(".package-lock.json"),
-                        )
-                        .ok();
-                        let inventory = actual
-                            .as_ref()
-                            .map(|l| l.packages.len() + usize::from(!l.packages.contains_key("")))
-                            .unwrap_or(1);
-                        let mut peer_warnings = Vec::new();
-                        if actual.as_ref().is_some_and(|lock| {
-                            lock.packages.values().any(|p| {
-                                p.peer_dependencies
-                                    .as_ref()
-                                    .is_some_and(|peers| !peers.is_empty())
-                            })
-                        }) {
-                            let project_lock = LockfileV3::load_from_file_readonly(&lockfile_path).ok();
-                            let peer_lock = if self.options.package_lock_enabled() {
-                                project_lock.as_ref().or(actual.as_ref())
-                            } else {
-                                actual.as_ref()
-                            };
-                            if let (Some(lock), Ok(root)) =
-                                (peer_lock, Manifest::from_file_readonly(&manifest_path))
+                            let inventory =
+                                actual.packages.len() + usize::from(!actual.packages.contains_key(""));
+                            let mut peer_warnings = Vec::new();
+                            if !self.options.legacy_peer_deps
+                                && actual.packages.values().any(|p| {
+                                    p.peer_dependencies
+                                        .as_ref()
+                                        .is_some_and(|peers| !peers.is_empty())
+                                })
                             {
-                                peer_warnings = self
-                                    .peer_conflict_warnings(
-                                        &peer_graph_from_lockfile(lock, &root),
-                                        project_lock.as_ref().or(actual.as_ref()),
-                                    )
-                                    .await;
+                                let project_lock =
+                                    LockfileV3::load_from_file_readonly(&lockfile_path).ok();
+                                let peer_lock = if self.options.package_lock_enabled() {
+                                    project_lock.as_ref().unwrap_or(&actual)
+                                } else {
+                                    &actual
+                                };
+                                let loaded_root = match root_manifest {
+                                    Some(m) => Ok(m),
+                                    None => Manifest::from_file_readonly(&manifest_path),
+                                };
+                                if let Ok(root) = loaded_root {
+                                    peer_warnings = self
+                                        .peer_conflict_warnings(
+                                            &peer_graph_from_lockfile(peer_lock, &root),
+                                            project_lock.as_ref().or(Some(&actual)),
+                                        )
+                                        .await;
+                                }
                             }
+                            return Ok(InstallSummary {
+                                reify: Some(ReifyReport {
+                                    changes: Vec::new(),
+                                    inventory,
+                                    peer_warnings,
+                                }),
+                                packages_installed: 0,
+                                cache_hits: 0,
+                                cache_misses: 0,
+                                lockfile_path,
+                                timing: Some(collector.finish_with_client(&self.registry_client)),
+                            });
                         }
-                        return Ok(InstallSummary {
-                            reify: Some(ReifyReport {
-                                changes: Vec::new(),
-                                inventory,
-                                peer_warnings,
-                            }),
-                            packages_installed: 0,
-                            cache_hits: 0,
-                            cache_misses: 0,
-                            lockfile_path,
-                            timing: Some(collector.finish_with_client(&self.registry_client)),
-                        });
                     }
                 }
             }
@@ -3543,18 +3579,25 @@ impl Installer {
             ));
         };
 
-        let workspace_members = if !self.options.is_global {
-            discover_workspaces_from_manifest(&self.options.project_dir, &manifest)
-                .unwrap_or_default()
+        let workspace_discovery = if !self.options.is_global {
+            Some(discover_workspaces_from_manifest(
+                &self.options.project_dir,
+                &manifest,
+            ))
         } else {
-            Vec::new()
+            None
         };
+        let discovered_members = workspace_discovery
+            .as_ref()
+            .and_then(|res| res.as_ref().ok())
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
 
         // npm-package-arg rejects unknown spec protocols (yarn/pnpm's
         // `workspace:`, `patch:`, `link:`...) while loading the root and
         // workspace edges, before anything is resolved.
         if !self.options.is_global {
-            let manifests = std::iter::once(&manifest).chain(workspace_members.iter().map(|m| &m.manifest));
+            let manifests = std::iter::once(&manifest).chain(discovered_members.iter().map(|m| &m.manifest));
             for m in manifests {
                 // Node#loadDeps: one edge per name, later types replacing
                 // earlier ones (peer, unless legacy, then prod, optional, dev).
@@ -3600,7 +3643,7 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                             &manifest,
                             !self.options.omit_dev,
                             false,
-                            Some(&workspace_members),
+                            Some(discovered_members),
                         ) {
                             info!(
                                 "Lockfile matches manifest: taking lockfile reification fast path"
@@ -3623,9 +3666,10 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
         }
 
         // 0. Discover workspace members (if any)
-        let mut workspace_members =
-            discover_workspaces_from_manifest(&self.options.project_dir, &manifest)
-                .map_err(|e| anyhow!("Failed to discover workspaces: {e}"))?;
+        let mut workspace_members = match workspace_discovery {
+            Some(res) => res.map_err(|e| anyhow!("Failed to discover workspaces: {e}"))?,
+            None => Vec::new(),
+        };
 
         for filter in &self.options.workspace {
             if !workspace_members.iter().any(|member| {
@@ -3750,7 +3794,7 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
 
                     let u_str = u.as_str();
                     let bytes = if self.options.offline {
-                        if let Ok(Some((_entry, data))) = self.cache.get(u_str) {
+                        if let Ok(Some((_entry, data))) = self.cache().get(u_str) {
                             Some(data)
                         } else {
                             return Err(anyhow!(
@@ -3758,16 +3802,16 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                             ));
                         }
                     } else if self.options.prefer_offline {
-                        if let Ok(Some((_entry, data))) = self.cache.get(u_str) {
+                        if let Ok(Some((_entry, data))) = self.cache().get(u_str) {
                             Some(data)
                         } else {
-                            self.registry_client
+                            self.registry_client()
                                 .download_tarball_bytes(u_str)
                                 .await
                                 .ok()
                         }
                     } else {
-                        self.registry_client
+                        self.registry_client()
                             .download_tarball_bytes(u_str)
                             .await
                             .ok()
@@ -3783,7 +3827,7 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                 }
                 PackageTarget::Git { .. } => {
                     policy::check_source_gate(&self.source_policy, policy::SourceKind::Git, true)?;
-                    let git_fetcher = crate::git::GitFetcher::new(self.cache.root());
+                    let git_fetcher = crate::git::GitFetcher::new(self.cache().root());
                     if let Ok(resolved) = git_fetcher
                         .resolve_git_dependency(inner_target, self.options.offline)
                         .await
@@ -4082,17 +4126,17 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
             )
             .collect();
         let provider = RegistryPackageProvider {
-            client: self.registry_client.clone(),
+            client: self.registry_client().clone(),
             handle,
             metadata_cache,
             custom_metadata_cache,
             global_disk_metadata_cache,
-            cache: self.cache.clone(),
+            cache: self.cache().clone(),
             offline: self.options.offline,
             prefer_offline,
             prefer_online: self.options.prefer_online,
             named_packages: added_pkgs.iter().map(|a| a.name.clone()).collect(),
-            git_fetcher: crate::git::GitFetcher::new(self.cache.root()),
+            git_fetcher: crate::git::GitFetcher::new(self.cache().root()),
             lockfile: existing_lockfile.clone(),
             unlocked_packages: unlocked_packages.clone(),
             source_policy: self.source_policy.clone(),
@@ -4334,8 +4378,8 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
 
         bundled::inflate(
             &mut lockfile,
-            &self.cache,
-            &self.registry_client,
+            self.cache(),
+            self.registry_client(),
             self.options.offline,
             &self.options.project_dir,
         )
@@ -4880,7 +4924,7 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                         .unwrap_or(false);
 
                 if is_git {
-                    let git_fetcher = crate::git::GitFetcher::new(self.cache.root());
+                    let git_fetcher = crate::git::GitFetcher::new(self.cache().root());
                     let target = PackageTarget::parse(res)
                         .map_err(|e| anyhow!("Failed to parse git target: {e}"))?;
                     let is_opt = node.flags.optional || node.flags.dev_optional;
@@ -4966,11 +5010,11 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                             format!("sha512-{}", data_encoding::BASE64.encode(&hash))
                         };
 
+                        let pack_store = self.pack_store();
                         if !computed_integrity.is_empty()
-                            && !self.pack_store.has_package_pack(&computed_integrity)
+                            && !pack_store.has_package_pack(&computed_integrity)
                         {
-                            let _ = self
-                                .pack_store
+                            let _ = pack_store
                                 .put_package_from_tarball(&computed_integrity, &archive_bytes);
                         }
 
@@ -4978,25 +5022,26 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                             let _ = rnpm_fs::remove_junction(&dest_dir);
                         }
 
+                        let writer_cfg = self.writer_cfg_arc_ref();
                         let extracted = if !computed_integrity.is_empty()
-                            && self.pack_store.has_package_pack(&computed_integrity)
+                            && pack_store.has_package_pack(&computed_integrity)
                         {
-                            match self.pack_store.materialize_pack(
+                            match pack_store.materialize_pack(
                                 &computed_integrity,
                                 &dest_dir,
-                                Some(&self.writer_cfg),
+                                Some(writer_cfg),
                             ) {
                                 Ok(_) => Ok(()),
                                 Err(e) => {
                                     if e.is_pack_corruption() {
                                         warn!("materialize_pack failed for {computed_integrity}: {e}, purging pack and falling back to tarball extraction");
-                                        let _ = self.pack_store.purge(&computed_integrity);
+                                        let _ = pack_store.purge(&computed_integrity);
                                         let _ = std::fs::remove_dir_all(&dest_dir);
                                         extract_tarball_direct(
                                             Cursor::new(&archive_bytes),
                                             &dest_dir,
                                             None,
-                                            Some(&self.writer_cfg),
+                                            Some(writer_cfg),
                                         )
                                         .map(|_| ())
                                         .map_err(|e| {
@@ -5012,7 +5057,7 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                                 Cursor::new(&archive_bytes),
                                 &dest_dir,
                                 None,
-                                Some(&self.writer_cfg),
+                                Some(writer_cfg),
                             )
                             .map(|_| ())
                             .map_err(|e| anyhow!("Failed to extract local archive {}: {e}", loc))
@@ -5176,7 +5221,7 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
             }
         }
 
-        let mut active_writer_cfg = (*self.writer_cfg).clone();
+        let mut active_writer_cfg = (**self.writer_cfg_arc_ref()).clone();
         if loc_base_dir.join("node_modules").is_dir() {
             active_writer_cfg.skip_existing_matching = true;
         }
@@ -5212,11 +5257,12 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                 if node.flags.optional || !url.starts_with("http") {
                     continue;
                 }
-                let packed = node
-                    .integrity
-                    .as_deref()
-                    .is_some_and(|i| !i.is_empty() && self.pack_store.has_package_pack(i));
-                if !packed && !matches!(self.cache.get(url), Ok(Some(_))) {
+                let cached = node.integrity.as_deref().is_some_and(|i| {
+                    !i.is_empty()
+                        && (self.pack_store().has_package_pack(i)
+                            || self.has_cached_tarball_blob(i))
+                });
+                if !cached && !matches!(self.cache().get(url), Ok(Some(_))) {
                     return Err(anyhow!(
                         "npm error code ENOTCACHED\nnpm error request to {url} failed: cache mode is 'only-if-cached' but no cached response is available."
                     ));
@@ -5230,7 +5276,7 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
             let tarballs = packages_to_download
                 .iter()
                 .filter(|(loc, node)| {
-                    let installed = Manifest::from_file(loc_base_dir.join(loc).join("package.json"))
+                    let installed = Manifest::from_file_readonly(loc_base_dir.join(loc).join("package.json"))
                         .ok()
                         .and_then(|m| m.version);
                     installed.as_deref() != Some(node.version.as_str())
@@ -5239,14 +5285,14 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                     Some((node.resolved.clone()?, node.integrity.clone().unwrap_or_default()))
                 })
                 .collect();
-            refetch_tarballs_online(&self.registry_client, tarballs).await?;
+            refetch_tarballs_online(self.registry_client(), tarballs).await?;
         }
 
         let all_packs_available = !packages_to_download.is_empty()
             && packages_to_download.iter().all(|(_, node)| {
                 node.integrity
                     .as_ref()
-                    .is_some_and(|i| !i.is_empty() && self.pack_store.has_package_pack(i))
+                    .is_some_and(|i| !i.is_empty() && self.pack_store().has_package_pack(i))
             });
 
         let mut used_fast_materialize = false;
@@ -5272,7 +5318,7 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
             let num_workers = 16.min(total_pkgs);
             let next_idx = std::sync::atomic::AtomicUsize::new(0);
             let load_failed = std::sync::atomic::AtomicBool::new(false);
-            let pack_store = Arc::clone(&self.pack_store);
+            let pack_store = self.pack_store_arc();
 
             let mut loaded_packs = Vec::with_capacity(total_pkgs);
             let load_success = std::thread::scope(|scope| {
@@ -5329,22 +5375,36 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                 let mut all_file_refs = Vec::with_capacity(16384);
                 let mut all_symlinks = Vec::new();
 
+                let block_cloning = self.pack_store().is_block_cloning_eligible(&loc_base_dir);
                 let mut files_valid = true;
                 for (loc, pkg_target, pack) in &loaded_packs {
                     for entry in &pack.index.files {
-                        let full_path = pkg_target.join(&entry.path);
-                        if let Some(parent) = full_path.parent() {
-                            all_dirs.insert(parent.to_path_buf());
+                        let clean_entry: std::borrow::Cow<'_, str> =
+                            if cfg!(windows) && entry.path.contains('/') {
+                                std::borrow::Cow::Owned(entry.path.replace('/', "\\"))
+                            } else {
+                                std::borrow::Cow::Borrowed(entry.path.as_str())
+                            };
+                        let full_path = pkg_target.join(clean_entry.as_ref());
+                        if entry.path.contains('/') {
+                            if let Some(parent) = full_path.parent() {
+                                all_dirs.insert(parent.to_path_buf());
+                            }
                         }
                         if let Some(slice) = pack.get_entry_slice(entry) {
+                            let source_path = if block_cloning && entry.cas_verified {
+                                entry.cas_path.as_deref()
+                            } else {
+                                None
+                            };
                             all_file_refs.push(rnpm_fs::MaterializeFileRef {
                                 path: full_path,
                                 data: slice,
                                 mode: entry.mode,
                                 package_id: Some(loc.as_str()),
-                                source_path: entry.cas_path.as_deref(),
+                                source_path,
                                 expected_sha256: entry.sha256.as_deref(),
-                                source_verified: entry.cas_verified,
+                                source_verified: block_cloning && entry.cas_verified,
                             });
                         } else {
                             files_valid = false;
@@ -5359,7 +5419,7 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                 if files_valid {
                     let dir_refs: Vec<&Path> = all_dirs.iter().map(|p| p.as_path()).collect();
                     if precreate_directories(dir_refs).is_ok()
-                        && materialize_warm_files(all_file_refs, &writer_cfg, loaded_packs.len()).is_ok()
+                        && materialize_warm_files(all_file_refs, &writer_cfg).is_ok()
                     {
                         for (link_path, target_path) in all_symlinks {
                             let _ = rnpm_fs::create_link_or_copy(&link_path, &target_path);
@@ -5369,8 +5429,13 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                         for (idx, (loc, pkg_target, pack)) in loaded_packs.iter().enumerate() {
                             let node = &packages_to_download[idx].1;
                             if let Some(slice) = pack.get_file_slice("package.json") {
-                                if let Ok(pkg_manifest) = Manifest::from_slice(slice) {
-                                    in_memory_manifests.insert(loc.clone(), pkg_manifest.clone());
+                                if let Ok(pkg_manifest) = Manifest::from_slice_readonly(slice) {
+                                    if !pkg_manifest.engines.is_empty()
+                                        || !slice.windows(9).any(|w| w == b"\"engines\"")
+                                    {
+                                        in_memory_manifests
+                                            .insert(loc.clone(), pkg_manifest.clone());
+                                    }
                                     let has_install_script =
                                         pkg_manifest.scripts.contains_key("preinstall")
                                             || pkg_manifest.scripts.contains_key("install")
@@ -5403,13 +5468,46 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
         }
 
         if !used_fast_materialize {
+            let loc_base_dir_v = rnpm_fs::to_verbatim_path(&loc_base_dir);
+            let mut dirs_to_precreate = Vec::with_capacity(packages_to_download.len() * 2 + 2);
+            dirs_to_precreate.push(rnpm_fs::to_verbatim_path(&node_modules_dir));
+            dirs_to_precreate.push(rnpm_fs::to_verbatim_path(&root_bin_dir));
+            for (loc, node) in &packages_to_download {
+                if node.flags.optional {
+                    continue;
+                }
+                let loc_clean = if cfg!(windows) && loc.contains('/') {
+                    loc.replace('/', "\\")
+                } else {
+                    loc.clone()
+                };
+                let target = loc_base_dir_v.join(loc_clean);
+                if let Some(parent) = target.parent() {
+                    dirs_to_precreate.push(parent.to_path_buf());
+                }
+                dirs_to_precreate.push(target);
+            }
+            let dir_refs: Vec<&Path> = dirs_to_precreate.iter().map(PathBuf::as_path).collect();
+            let _ = precreate_directories(dir_refs);
+
+            let mut init_dirs = HashSet::with_capacity(dirs_to_precreate.len());
+            init_dirs.extend(dirs_to_precreate);
+            let seen_dirs = Arc::new(std::sync::RwLock::new(init_dirs));
+
             let mut join_set = tokio::task::JoinSet::new();
             let unlocked_packages = self.options.unlocked_packages.clone();
-            // Stored packages are written through the async writer (the node
-            // helper on Windows, where its writes are several times faster).
-            let pack_writer =
-                rnpm_fs::AsyncFileWriter::spawn_for_hint(packages_to_download.len()).ok();
+            let active_semaphore = Arc::new(tokio::sync::Semaphore::new(48));
+            let cpu_semaphore = Arc::new(tokio::sync::Semaphore::new(16));
+            let pack_persist_semaphore = Arc::new(tokio::sync::Semaphore::new(32));
+
+            let mut pack_writer = rnpm_fs::AsyncFileWriter::spawn().ok();
             let pack_sender = pack_writer.as_ref().map(|w| w.sender());
+            let warm_pack_sender = matches!(
+                pack_writer,
+                Some(rnpm_fs::AsyncFileWriter::Node(_))
+            )
+            .then(|| pack_sender.as_ref().cloned())
+            .flatten();
 
             for (loc, node) in &packages_to_download {
                 // Optional packages write directly so a write failure stays
@@ -5419,11 +5517,21 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                 } else {
                     pack_sender.clone()
                 };
+                let warm_file_sender = if node.flags.optional {
+                    None
+                } else {
+                    warm_pack_sender.clone()
+                };
                 let sem = Arc::clone(&semaphore);
-                let cache = self.cache.clone();
-                let pack_store = Arc::clone(&self.pack_store);
-                let registry_client = self.registry_client.clone();
+                let active_sem = Arc::clone(&active_semaphore);
+                let cpu_sem = Arc::clone(&cpu_semaphore);
+                let pack_persist_sem = Arc::clone(&pack_persist_semaphore);
+                let seen_dirs = Arc::clone(&seen_dirs);
+                let cache = self.cache().clone();
+                let pack_store = self.pack_store_arc();
+                let registry_client = self.registry_client().clone();
                 let project_dir = loc_base_dir.clone();
+                let project_dir_v = loc_base_dir_v.clone();
                 let worker_unlocked_packages = unlocked_packages.clone();
                 let offline = self.options.offline;
                 let worker_collector = collector.clone();
@@ -5432,156 +5540,255 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                 let node = node.clone();
 
                 join_set.spawn(async move {
-                let _permit = sem.acquire().await.map_err(|e| anyhow!("{e}"))?;
+                    let _active_permit = Arc::clone(&active_sem)
+                        .acquire_owned()
+                        .await
+                        .map_err(|e| anyhow!("{e}"))?;
 
-                // Early path containment defense: validate loc before warm pack check or junction removal
-                if loc.contains("..") || loc.contains(':') || loc.contains('\\') || loc.contains('\0') {
-                    return Err(anyhow!("Package path '{loc}' contains illegal path characters"));
-                }
-                rnpm_fs::validate_entry_path(Path::new(&loc))
-                    .map_err(|e| anyhow!("Invalid package path '{loc}': {e}"))?;
+                    let dest_dir = project_dir.join(&loc);
+                    if rnpm_fs::is_junction(&dest_dir).unwrap_or(false) {
+                        let _ = rnpm_fs::remove_junction(&dest_dir);
+                    }
 
-                let dest_dir = project_dir.join(&loc);
-                let cleaned_dest = path_clean::clean(&dest_dir);
-                let cleaned_project = path_clean::clean(&project_dir);
-                if !cleaned_dest.starts_with(&cleaned_project) {
-                    return Err(anyhow!("Package installation path '{cleaned_dest:?}' escapes project root"));
-                }
-
-                if rnpm_fs::is_junction(&dest_dir).unwrap_or(false) {
-                    let _ = rnpm_fs::remove_junction(&dest_dir);
-                }
-
-                // Warm Pack Store fast path: if package pack already exists, materialize directly without downloading/parsing!
-                if let Some(ref integ_str) = node.integrity {
-                    if !integ_str.is_empty() && pack_store.has_package_pack(integ_str) {
-                        let t_mat = std::time::Instant::now();
-                        let dest_dir_clone = dest_dir.clone();
-                        let ps_clone = Arc::clone(&pack_store);
-                        let integ_clone = integ_str.clone();
-                        let cfg_clone = Arc::clone(&pkg_writer_cfg);
-                        let loc_clone = loc.clone();
-                        let warm_sender = file_sender.clone();
-                        let mat_res = tokio::task::spawn_blocking(move || {
-                            let _mat_span = tracing::info_span!("materialize-pack", package = %loc_clone).entered();
-                            if let (Some(sender), Ok(Some(pack))) = (warm_sender.as_ref(), ps_clone.get_package_pack(&integ_clone)) {
-                                if queue_pack_files(&pack, &dest_dir_clone, sender) {
-                                    return Ok(rnpm_fs::ExtractionSummary::default());
+                    // Warm Pack Store fast path: if package pack already exists, materialize without downloading/parsing.
+                    if let Some(ref integ_str) = node.integrity {
+                        if !integ_str.is_empty() && pack_store.has_package_pack(integ_str) {
+                            let t_mat = std::time::Instant::now();
+                            let dest_dir_clone = dest_dir.clone();
+                            let ps_clone = Arc::clone(&pack_store);
+                            let integ_clone = integ_str.clone();
+                            let cfg_clone = Arc::clone(&pkg_writer_cfg);
+                            let loc_clone = loc.clone();
+                            let warm_sender = warm_file_sender.clone();
+                            let mat_res: std::result::Result<_, CacheError> = tokio::task::spawn_blocking(move || {
+                                let _mat_span =
+                                    tracing::info_span!("materialize-pack", package = %loc_clone)
+                                        .entered();
+                                if let Ok(Some(pack)) = ps_clone.get_package_pack(&integ_clone) {
+                                    let in_mem = pack.get_file_slice("package.json").and_then(|s| {
+                                        Manifest::from_slice_readonly(s)
+                                            .ok()
+                                            .map(|m| {
+                                                let cacheable = !m.engines.is_empty()
+                                                    || !s.windows(9).any(|w| w == b"\"engines\"");
+                                                (m, cacheable)
+                                            })
+                                    });
+                                    if let Some(sender) = warm_sender.as_ref() {
+                                        if queue_pack_files(&pack, &dest_dir_clone, sender) {
+                                            return Ok((rnpm_fs::ExtractionSummary::default(), in_mem));
+                                        }
+                                    }
+                                    let res = ps_clone.materialize_pack(
+                                        &integ_clone,
+                                        &dest_dir_clone,
+                                        Some(&cfg_clone),
+                                    )?;
+                                    return Ok((res, in_mem));
                                 }
-                            }
-                            let res = ps_clone.materialize_pack(&integ_clone, &dest_dir_clone, Some(&cfg_clone));
-                            drop(_mat_span);
-                            res
-                        }).await?;
-                        worker_collector.record_phase(Phase::Materialize, t_mat.elapsed());
+                                let res = ps_clone.materialize_pack(
+                                    &integ_clone,
+                                    &dest_dir_clone,
+                                    Some(&cfg_clone),
+                                )?;
+                                Ok((res, None))
+                            })
+                            .await?;
+                            worker_collector.record_phase(Phase::Materialize, t_mat.elapsed());
 
-                        match mat_res {
-                            Ok(_) => {
-                                let mut lifecycle_node = None;
-                                {
-                                    if let Some(pkg_manifest) = installed_manifest(&pack_store, Some(integ_str), &dest_dir) {
+                            match mat_res {
+                                Ok((_, mem_pair)) => {
+                                    let mut lifecycle_node = None;
+                                    let mut cacheable_manifest = None;
+                                    let manifest_opt = if let Some((m, cacheable)) = mem_pair {
+                                        if cacheable {
+                                            cacheable_manifest = Some(m.clone());
+                                        }
+                                        Some(m)
+                                    } else {
+                                        installed_manifest(&pack_store, Some(integ_str), &dest_dir)
+                                    };
+                                    if let Some(pkg_manifest) = manifest_opt {
                                         let has_scripts = pkg_manifest.scripts.contains_key("preinstall")
                                             || pkg_manifest.scripts.contains_key("install")
                                             || pkg_manifest.scripts.contains_key("postinstall");
-
                                         if has_scripts {
-                                            let lifecycle_deps = node.dependencies.clone().into_keys().collect();
                                             lifecycle_node = Some(LifecyclePackageNode {
                                                 package_path: loc.clone(),
                                                 disk_path: dest_dir.clone(),
                                                 manifest: pkg_manifest,
                                                 source: PackageSource::Registry,
-                                                dependencies: lifecycle_deps,
+                                                dependencies: node
+                                                    .dependencies
+                                                    .keys()
+                                                    .cloned()
+                                                    .collect(),
                                                 optional: node.flags.optional,
                                             });
                                         }
                                     }
+                                    return Ok(Some((
+                                        loc,
+                                        true,
+                                        lifecycle_node,
+                                        cacheable_manifest,
+                                        Vec::new(),
+                                        None,
+                                    )));
                                 }
-                                return Ok(Some((true, lifecycle_node)));
-                            }
-                            Err(e) => {
-                                if e.is_pack_corruption() {
-                                    warn!("Failed to materialize package {loc} from pack: {e}. Purging pack and falling back to tarball fetch.");
-                                    let _ = pack_store.purge(integ_str);
-                                    let _ = std::fs::remove_dir_all(&dest_dir);
-                                } else {
-                                    return Err(anyhow!("Failed to materialize package {loc} from pack: {e}"));
+                                Err(e) => {
+                                    if e.is_pack_corruption() {
+                                        warn!(
+                                            "Failed to materialize package {loc} from pack: {e}. Purging pack and falling back to tarball fetch."
+                                        );
+                                        let _ = pack_store.purge(integ_str);
+                                        let _ = std::fs::remove_dir_all(&dest_dir);
+                                    } else {
+                                        return Err(anyhow!(
+                                            "Failed to materialize package {loc} from pack: {e}"
+                                        ));
+                                    }
                                 }
                             }
                         }
                     }
-                }
 
-                let resolved_url = node.resolved.as_ref().ok_or_else(|| {
-                    anyhow!("Missing resolved URL for package at {loc}")
-                })?;
+                    let resolved_url = node
+                        .resolved
+                        .as_ref()
+                        .ok_or_else(|| anyhow!("Missing resolved URL for package at {loc}"))?
+                        .clone();
 
-                let expected_integrity: Option<Integrity> = if let Some(ref integ_str) = node.integrity {
-                    if !integ_str.is_empty() {
-                        match integ_str.parse::<Integrity>() {
-                            Ok(i) => Some(i),
-                            Err(e) => {
-                                // Targeted updates retain satisfying, already-installed
-                                // transitive packages. Older lockfiles may contain placeholder
-                                // integrity values for those entries; do not refetch or reject a
-                                // package that was not unlocked and is present on disk.
-                                let location_name = loc
-                                    .strip_prefix("node_modules/")
-                                    .unwrap_or(&loc)
-                                    .rsplit("/node_modules/")
-                                    .next()
-                                    .unwrap_or(&loc);
-                                if !worker_unlocked_packages.is_empty()
-                                    && !worker_unlocked_packages.contains(location_name)
-                                    && dest_dir.join("package.json").exists()
-                                {
-                                    return Ok(Some((true, None)));
-                                }
-                                if node.flags.optional {
-                                    warn!(
-                                        "npm warn optional SKIPPING OPTIONAL DEPENDENCY: Invalid integrity for {}: {}",
-                                        loc, e
-                                    );
-                                    return Ok(None);
-                                } else {
-                                    return Err(anyhow!("Invalid integrity string for {loc}: {e}"));
+                    let expected_integrity: Option<Integrity> = if let Some(ref integ_str) =
+                        node.integrity
+                    {
+                        if !integ_str.is_empty() {
+                            match integ_str.parse::<Integrity>() {
+                                Ok(i) => Some(i),
+                                Err(e) => {
+                                    let location_name = loc
+                                        .strip_prefix("node_modules/")
+                                        .unwrap_or(&loc)
+                                        .rsplit("/node_modules/")
+                                        .next()
+                                        .unwrap_or(&loc);
+                                    if !worker_unlocked_packages.is_empty()
+                                        && !worker_unlocked_packages.contains(location_name)
+                                        && dest_dir.join("package.json").exists()
+                                    {
+                                        return Ok(Some((loc, true, None, None, Vec::new(), None)));
+                                    }
+                                    if node.flags.optional {
+                                        warn!(
+                                            "npm warn optional SKIPPING OPTIONAL DEPENDENCY: Invalid integrity for {}: {}",
+                                            loc, e
+                                        );
+                                        return Ok(None);
+                                    } else {
+                                        return Err(anyhow!(
+                                            "Invalid integrity string for {loc}: {e}"
+                                        ));
+                                    }
                                 }
                             }
+                        } else {
+                            None
                         }
                     } else {
                         None
-                    }
-                } else {
-                    None
-                };
-
-                let t_fetch = std::time::Instant::now();
-                let _fetch_span = tracing::info_span!("fetch", package = %loc);
-                let fetch_res = if let Ok(Some((_entry, data))) = cache.get(resolved_url) {
-                    let is_valid = if let Some(ref exp) = expected_integrity {
-                        exp.verify(&data).is_ok()
-                    } else {
-                        true
                     };
 
-                    if is_valid {
-                        debug!("Cache hit for {}", resolved_url);
-                        Ok((data, true))
-                    } else {
-                        debug!("Cached blob for {} failed integrity, purging and re-fetching", resolved_url);
-                        let _ = cache.purge_key(resolved_url);
-                        if offline {
-                            if node.flags.optional {
-                                return Ok(None);
+                    let t_fetch = std::time::Instant::now();
+                    let _fetch_span = tracing::info_span!("fetch", package = %loc);
+                    let cached_blob = expected_integrity
+                        .as_ref()
+                        .and_then(|integrity| cache.get_by_integrity(integrity).ok().flatten());
+                    let (bytes, was_hit) = if let Some(data) = cached_blob {
+                        (data, true)
+                    } else if let Ok(Some((_entry, data))) = cache.get(&resolved_url) {
+                        let t_v = std::time::Instant::now();
+                        let is_valid = expected_integrity
+                            .as_ref()
+                            .is_none_or(|exp| exp.verify(&data).is_ok());
+                        worker_collector.record_phase(Phase::Verify, t_v.elapsed());
+                        if is_valid {
+                            debug!("Cache hit for {}", resolved_url);
+                            (data, true)
+                        } else {
+                            debug!(
+                                "Cached blob for {} failed integrity, purging and re-fetching",
+                                resolved_url
+                            );
+                            let _ = cache.purge_key(&resolved_url);
+                            if offline {
+                                if node.flags.optional {
+                                    return Ok(None);
+                                }
+                                return Err(anyhow!(
+                                    "npm error code EINTEGRITY\nnpm error Integrity verification failed for cached package {loc}"
+                                ));
                             }
-                            return Err(anyhow!(
-                                "npm error code EINTEGRITY\nnpm error Integrity verification failed for cached package {loc}"
-                            ));
+                            let _io_permit =
+                                sem.acquire().await.map_err(|e| anyhow!("{e}"))?;
+                            let dl_res =
+                                registry_client.download_tarball_bytes(&resolved_url).await;
+                            drop(_io_permit);
+                            match dl_res {
+                                Ok(dl_bytes) => {
+                                    let t_v2 = std::time::Instant::now();
+                                    if let Some(ref exp) = expected_integrity {
+                                        if let Err(e) = exp.verify(&dl_bytes) {
+                                            if node.flags.optional {
+                                                warn!(
+                                                    "npm warn optional SKIPPING OPTIONAL DEPENDENCY: Integrity verification failed for {}: {}",
+                                                    loc, e
+                                                );
+                                                return Ok(None);
+                                            } else {
+                                                return Err(anyhow!(
+                                                    "Integrity verification failed for {loc}: {e}"
+                                                ));
+                                            }
+                                        }
+                                    }
+                                    worker_collector.record_phase(Phase::Verify, t_v2.elapsed());
+                                    (dl_bytes, false)
+                                }
+                                Err(e) => {
+                                    if node.flags.optional {
+                                        warn!(
+                                            "npm warn optional SKIPPING OPTIONAL DEPENDENCY: Failed to download tarball from {}: {}",
+                                            resolved_url, e
+                                        );
+                                        return Ok(None);
+                                    }
+                                    return Err(anyhow!(
+                                        "Failed to download tarball from {resolved_url}: {e}"
+                                    ));
+                                }
+                            }
                         }
-                        match registry_client.download_tarball_bytes(resolved_url).await {
-                            Ok(bytes) => {
+                    } else if offline {
+                        if node.flags.optional {
+                            warn!(
+                                "npm warn optional SKIPPING OPTIONAL DEPENDENCY: Package {} not found in local cache (--offline)",
+                                loc
+                            );
+                            return Ok(None);
+                        }
+                        return Err(anyhow!(
+                            "npm error code ENOTCACHED\nnpm error request to {resolved_url} failed: cache mode is 'only-if-cached' but no cached response is available."
+                        ));
+                    } else {
+                        info!("Downloading {}", resolved_url);
+                        let _io_permit = sem.acquire().await.map_err(|e| anyhow!("{e}"))?;
+                        let dl_res = registry_client.download_tarball_bytes(&resolved_url).await;
+                        drop(_io_permit);
+                        match dl_res {
+                            Ok(dl_bytes) => {
+                                let t_v = std::time::Instant::now();
                                 if let Some(ref exp) = expected_integrity {
-                                    if let Err(e) = exp.verify(&bytes) {
+                                    if let Err(e) = exp.verify(&dl_bytes) {
                                         if node.flags.optional {
                                             warn!(
                                                 "npm warn optional SKIPPING OPTIONAL DEPENDENCY: Integrity verification failed for {}: {}",
@@ -5589,189 +5796,200 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                                             );
                                             return Ok(None);
                                         } else {
-                                            return Err(anyhow!("Integrity verification failed for {loc}: {e}"));
+                                            return Err(anyhow!(
+                                                "Integrity verification failed for {loc}: {e}"
+                                            ));
                                         }
                                     }
                                 }
+                                worker_collector.record_phase(Phase::Verify, t_v.elapsed());
+                                (dl_bytes, false)
+                            }
+                            Err(e) => {
+                                if node.flags.optional {
+                                    warn!(
+                                        "npm warn optional SKIPPING OPTIONAL DEPENDENCY: Failed to download tarball from {}: {}",
+                                        resolved_url, e
+                                    );
+                                    return Ok(None);
+                                }
+                                return Err(anyhow!(
+                                    "Failed to download tarball from {resolved_url}: {e}"
+                                ));
+                            }
+                        }
+                    };
+                    worker_collector.record_phase(Phase::Fetch, t_fetch.elapsed());
+
+                    const MAX_COMPRESSED_TARBALL_BYTES: usize = 256 * 1024 * 1024;
+                    if bytes.len() > MAX_COMPRESSED_TARBALL_BYTES {
+                        return Err(anyhow!(
+                            "Tarball for {} exceeds maximum allowed compressed size of {} bytes",
+                            loc,
+                            MAX_COMPRESSED_TARBALL_BYTES
+                        ));
+                    }
+
+                    let bytes_arc = Arc::new(bytes);
+                    let cache_task = (!was_hit).then(|| {
+                        let blob_arc = Arc::clone(&bytes_arc);
+                        let cache_bg = cache.clone();
+                        let url_bg = resolved_url.clone();
+                        let exp_bg = expected_integrity.clone();
+                        let sem_bg = Arc::clone(&pack_persist_sem);
+                        let col_bg = worker_collector.clone();
+                        tokio::task::spawn(async move {
+                            let _permit = sem_bg.acquire_owned().await.map_err(|e| anyhow!("{e}"))?;
+                            tokio::task::spawn_blocking(move || {
+                                let _hold = _permit;
                                 let t_sw = std::time::Instant::now();
-                                let _sw_span = tracing::info_span!("store-write", package = %loc).entered();
-                                let _ = cache.put_with_integrity(resolved_url, &bytes, expected_integrity.as_ref(), None);
-                                drop(_sw_span);
-                                worker_collector.record_phase(Phase::StoreWrite, t_sw.elapsed());
-                                Ok((bytes, false))
-                            }
-                            Err(e) => Err(anyhow!("Failed to download tarball from {}: {e}", resolved_url)),
-                        }
-                    }
-                } else if offline {
-                    if node.flags.optional {
-                        warn!("npm warn optional SKIPPING OPTIONAL DEPENDENCY: Package {} not found in local cache (--offline)", loc);
-                        return Ok(None);
-                    }
-                    return Err(anyhow!(
-                        "npm error code ENOTCACHED\nnpm error request to {resolved_url} failed: cache mode is 'only-if-cached' but no cached response is available."
-                    ));
-                } else {
-                    info!("Downloading {}", resolved_url);
-                    match registry_client.download_tarball_bytes(resolved_url).await {
-                        Ok(bytes) => {
-                            if let Some(ref exp) = expected_integrity {
-                                if let Err(e) = exp.verify(&bytes) {
-                                    if node.flags.optional {
-                                        warn!(
-                                            "npm warn optional SKIPPING OPTIONAL DEPENDENCY: Integrity verification failed for {}: {}",
-                                            loc, e
-                                        );
-                                        return Ok(None);
-                                    } else {
-                                        return Err(anyhow!("Integrity verification failed for {loc}: {e}"));
+                                let _ = cache_bg.put_with_integrity(
+                                    &url_bg,
+                                    &blob_arc,
+                                    exp_bg.as_ref(),
+                                    None,
+                                );
+                                col_bg.record_phase(Phase::StoreWrite, t_sw.elapsed());
+                                Ok::<(), anyhow::Error>(())
+                            })
+                            .await
+                            .map_err(|e| anyhow!("cache worker panicked: {e}"))?
+                        })
+                    });
+
+                    let decoded_res = {
+                        let _cpu_permit = Arc::clone(&cpu_sem)
+                            .acquire_owned()
+                            .await
+                            .map_err(|e| anyhow!("{e}"))?;
+                        let loc_clean = if cfg!(windows) && loc.contains('/') {
+                            loc.replace('/', "\\")
+                        } else {
+                            loc.clone()
+                        };
+                        let pkg_target = project_dir_v.join(&loc_clean);
+                        let loc_for_decode = loc.clone();
+                        let bytes_for_decode = Arc::clone(&bytes_arc);
+                        let sender_for_decode = file_sender.clone();
+                        let seen_for_decode = Arc::clone(&seen_dirs);
+                        let decode_collector = worker_collector.clone();
+                        let root_v = project_dir_v.clone();
+
+                        tokio::task::spawn_blocking(move || {
+                            let _hold_cpu = _cpu_permit;
+                            let t_inf = std::time::Instant::now();
+                            let decoded = rnpm_cache::PackStore::decode_package_tarball(
+                                &bytes_for_decode,
+                                &pkg_target,
+                                &loc_for_decode,
+                            )
+                            .map_err(|e| anyhow!("{e}"))?;
+                            decode_collector.record_phase(Phase::Inflate, t_inf.elapsed());
+
+                            for d in &decoded.dirs {
+                                let already_created = {
+                                    let guard = seen_for_decode.read().unwrap();
+                                    guard.contains(d)
+                                };
+                                if !already_created {
+                                    std::fs::create_dir_all(d).map_err(|e| {
+                                        anyhow!("Failed to create directory '{}': {e}", d.display())
+                                    })?;
+                                    let mut guard = seen_for_decode.write().unwrap();
+                                    guard.insert(d.clone());
+                                    let mut curr = d.as_path();
+                                    while let Some(parent) = curr.parent() {
+                                        if parent == root_v || parent.as_os_str().is_empty() {
+                                            break;
+                                        }
+                                        if !guard.insert(parent.to_path_buf()) {
+                                            break;
+                                        }
+                                        curr = parent;
                                     }
                                 }
                             }
-                            let t_sw = std::time::Instant::now();
-                            let _sw_span = tracing::info_span!("store-write", package = %loc).entered();
-                            let _ = cache.put_with_integrity(resolved_url, &bytes, expected_integrity.as_ref(), None);
-                            drop(_sw_span);
-                            worker_collector.record_phase(Phase::StoreWrite, t_sw.elapsed());
-                            Ok((bytes, false))
-                        }
-                        Err(e) => Err(anyhow!("Failed to download tarball from {}: {e}", resolved_url)),
-                    }
-                };
-                worker_collector.record_phase(Phase::Fetch, t_fetch.elapsed());
 
-                let (bytes, was_hit) = match fetch_res {
-                    Ok(res) => res,
-                    Err(err) => {
-                        if node.flags.optional {
-                            warn!(
-                                "npm warn optional SKIPPING OPTIONAL DEPENDENCY: Failed to fetch {}: {:#}",
-                                loc, err
-                            );
-                            return Ok(None);
-                        } else {
-                            return Err(err);
-                        }
-                    }
-                };
+                            let pkg_json_target = pkg_target.join("package.json");
+                            let in_mem = decoded
+                                .files
+                                .iter()
+                                .find(|f| f.path == pkg_json_target)
+                                .and_then(|f| {
+                                    Manifest::from_slice_readonly(&f.data).ok().map(|m| {
+                                        let cacheable = !m.engines.is_empty()
+                                            || !f.data.windows(9).any(|w| w == b"\"engines\"");
+                                        (m, cacheable)
+                                    })
+                                });
 
-                // Verify integrity in memory (defense in depth)
-                let t_verify = std::time::Instant::now();
-                let _v_span = tracing::info_span!("verify", package = %loc).entered();
-                if let Some(ref exp) = expected_integrity {
-                    if let Err(e) = exp.verify(&bytes) {
-                        if node.flags.optional {
-                            warn!(
-                                "npm warn optional SKIPPING OPTIONAL DEPENDENCY: Integrity verification failed for {}: {}",
-                                loc, e
-                            );
-                            return Ok(None);
-                        } else {
-                            return Err(anyhow!("Integrity verification failed for {}: {e}", loc));
-                        }
-                    }
-                }
-                drop(_v_span);
-                worker_collector.record_phase(Phase::Verify, t_verify.elapsed());
-
-                // Streaming memory bound: enforce maximum compressed tarball size (256 MB)
-                const MAX_COMPRESSED_TARBALL_BYTES: usize = 256 * 1024 * 1024;
-                if bytes.len() > MAX_COMPRESSED_TARBALL_BYTES {
-                    return Err(anyhow!(
-                        "Tarball for {} exceeds maximum allowed compressed size of {} bytes",
-                        loc, MAX_COMPRESSED_TARBALL_BYTES
-                    ));
-                }
-
-                // Path containment defense: ensure loc has no traversal or device escaping
-                if loc.contains("..") || loc.contains(':') || loc.contains('\\') || loc.contains('\0') {
-                    return Err(anyhow!("Package path '{loc}' contains illegal path characters"));
-                }
-
-                let cleaned_dest = path_clean::clean(&dest_dir);
-                let cleaned_project = path_clean::clean(&project_dir);
-                if !cleaned_dest.starts_with(&cleaned_project) {
-                    return Err(anyhow!("Package installation path '{cleaned_dest:?}' escapes project root"));
-                }
-
-                // Parallel native materialization straight into place without staging dirs or renames
-                let dest_dir_clone = dest_dir.clone();
-                let cfg_clone = Arc::clone(&pkg_writer_cfg);
-                let ps_clone = Arc::clone(&pack_store);
-                let integ_opt = node.integrity.clone();
-                let cold_sender = file_sender.clone();
-                let extract_res = tokio::task::spawn_blocking(move || {
-                    if rnpm_fs::is_junction(&dest_dir_clone).unwrap_or(false) {
-                        let _ = rnpm_fs::remove_junction(&dest_dir_clone);
-                    }
-                    // Store the pack (bytes were verified above). Per-file CAS
-                    // copies are skipped: they double the writes for no gain here.
-                    if let Some(ref integ) = integ_opt {
-                        if !integ.is_empty() && !ps_clone.has_package_pack(integ) {
-                            let _ = ps_clone.put_package_from_verified_tarball_deferred(integ, &bytes);
-                        }
-                    }
-                    if let Some(ref integ) = integ_opt {
-                        if let (Some(sender), false) = (cold_sender.as_ref(), integ.is_empty()) {
-                            if let Ok(Some(pack)) = ps_clone.get_package_pack(integ) {
-                                if queue_pack_files(&pack, &dest_dir_clone, sender) {
-                                    return Ok(rnpm_fs::ExtractionSummary::default());
+                            if let Some(ref sender) = sender_for_decode {
+                                for file in &decoded.files {
+                                    rnpm_fs::record_file_created(file.data.len() as u64);
+                                    sender
+                                        .send_arc(
+                                            file.path.clone(),
+                                            Arc::clone(&file.data),
+                                            file.mode,
+                                        )
+                                        .map_err(|e| anyhow!("{e}"))?;
                                 }
+                            } else {
+                                let t_mat = std::time::Instant::now();
+                                for file in &decoded.files {
+                                    rnpm_fs::record_file_created(file.data.len() as u64);
+                                    rnpm_fs::writer::write_file_fast(
+                                        &file.path,
+                                        &file.data,
+                                        file.mode,
+                                        65536,
+                                    )
+                                    .map_err(|e| {
+                                        anyhow!("Failed to write file '{}': {e}", file.path.display())
+                                    })?;
+                                }
+                                decode_collector.record_phase(Phase::Materialize, t_mat.elapsed());
+                            }
+
+                            Ok::<
+                                (
+                                    rnpm_cache::DecodedPackage,
+                                    PathBuf,
+                                    Option<(Manifest, bool)>,
+                                ),
+                                anyhow::Error,
+                            >((decoded, pkg_target, in_mem))
+                        })
+                        .await
+                        .map_err(|e| anyhow!("decode worker panicked: {e}"))?
+                    };
+
+                    let (decoded, pkg_target, mem_pair) = match decoded_res {
+                        Ok(res) => res,
+                        Err(e) => {
+                            if node.flags.optional {
+                                warn!(
+                                    "npm warn optional SKIPPING OPTIONAL DEPENDENCY: Failed to extract package {}: {}",
+                                    loc, e
+                                );
+                                let _ = rnpm_fs::remove_dir_all_safe(&dest_dir);
+                                return Ok(None);
+                            } else {
+                                return Err(anyhow!("Failed to extract package {loc}: {e}"));
                             }
                         }
-                        if !integ.is_empty() && ps_clone.has_package_pack(integ) {
-                            match ps_clone.materialize_pack(integ, &dest_dir_clone, Some(&cfg_clone)) {
-                                Ok(sum) => return Ok(sum),
-                                Err(e) => {
-                                    if e.is_pack_corruption() {
-                                        warn!("materialize_pack failed: {e}, purging pack and falling back to tarball extraction");
-                                        let _ = ps_clone.purge(integ);
-                                        let _ = rnpm_fs::remove_dir_all_safe(&dest_dir_clone);
-                                    } else {
-                                        return Err(rnpm_fs::FsError::Io(match e {
-                                            CacheError::Io(io_err) => io_err,
-                                            other => std::io::Error::other(other.to_string()),
-                                        }));
-                                    }
-                                }
-                            }
+                    };
+
+                    let symlinks = decoded.symlinks.clone();
+                    let mut lifecycle_node = None;
+                    let mut cacheable_manifest = None;
+                    if let Some((pkg_manifest, cacheable)) = mem_pair {
+                        if cacheable {
+                            cacheable_manifest = Some(pkg_manifest.clone());
                         }
-                    }
-                    extract_tarball_direct(Cursor::new(bytes), &dest_dir_clone, None, Some(&cfg_clone))
-                }).await?;
-
-                match extract_res {
-                    Ok(sum) => {
-                        let _inf = tracing::info_span!("inflate", package = %loc).entered();
-                        worker_collector.record_phase(Phase::Inflate, sum.inflate_duration);
-                        drop(_inf);
-                        let _mat = tracing::info_span!("materialize", package = %loc).entered();
-                        worker_collector.record_phase(Phase::Materialize, sum.materialize_duration);
-                        drop(_mat);
-                    }
-                    Err(e) => {
-                        if node.flags.optional {
-                            warn!(
-                                "npm warn optional SKIPPING OPTIONAL DEPENDENCY: Failed to extract package {}: {}",
-                                loc, e
-                            );
-                            let _ = rnpm_fs::remove_dir_all_safe(&dest_dir);
-                            return Ok(None);
-                        } else {
-                            return Err(anyhow!("Failed to extract package {}: {e}", loc));
-                        }
-                    }
-                }
-
-                // Generate shims if package declares bin and collect lifecycle node
-                let mut lifecycle_node = None;
-
-                {
-                    if let Some(pkg_manifest) = installed_manifest(&pack_store, node.integrity.as_deref(), &dest_dir) {
                         let has_install_script = pkg_manifest.scripts.contains_key("preinstall")
                             || pkg_manifest.scripts.contains_key("install")
                             || pkg_manifest.scripts.contains_key("postinstall");
-
                         if has_install_script {
                             lifecycle_node = Some(LifecyclePackageNode {
                                 package_path: loc.clone(),
@@ -5783,51 +6001,157 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                             });
                         }
                     }
-                }
 
-                Ok(Some((
-                    was_hit,
-                    lifecycle_node,
-                )))
-            });
+                    drop(_active_permit);
+
+                    let integ_for_pack = node.integrity.clone();
+                    let collector_for_pack = worker_collector.clone();
+                    let need_pack = integ_for_pack
+                        .as_deref()
+                        .is_some_and(|i| !i.is_empty());
+                    let pack_task = if need_pack || cache_task.is_some() {
+                        Some(tokio::task::spawn(async move {
+                            let pack_bg = need_pack.then(|| {
+                                let sem_bg = Arc::clone(&pack_persist_sem);
+                                let ps_bg = Arc::clone(&pack_store);
+                                let col_bg = collector_for_pack.clone();
+                                tokio::task::spawn(async move {
+                                    let _permit =
+                                        sem_bg.acquire_owned().await.map_err(|e| anyhow!("{e}"))?;
+                                    tokio::task::spawn_blocking(move || {
+                                        let _hold_permit = _permit;
+                                        let t_sw = std::time::Instant::now();
+                                        if let Some(ref integ_str) = integ_for_pack {
+                                            if !integ_str.is_empty()
+                                                && !ps_bg.has_package_pack(integ_str)
+                                            {
+                                                let _ = ps_bg.put_decoded_package(
+                                                    integ_str,
+                                                    &pkg_target,
+                                                    &decoded,
+                                                    false,
+                                                );
+                                            }
+                                        }
+                                        col_bg.record_phase(Phase::StoreWrite, t_sw.elapsed());
+                                        Ok::<(), anyhow::Error>(())
+                                    })
+                                    .await
+                                    .map_err(|e| anyhow!("pack worker panicked: {e}"))?
+                                })
+                            });
+                            if let Some(t) = pack_bg {
+                                t.await.map_err(|e| anyhow!("pack join error: {e}"))??;
+                            }
+                            if let Some(t) = cache_task {
+                                t.await.map_err(|e| anyhow!("cache join error: {e}"))??;
+                            }
+                            Ok::<(), anyhow::Error>(())
+                        }))
+                    } else {
+                        None
+                    };
+
+                    let pending_links: Vec<(PathBuf, PathBuf)> = symlinks
+                        .into_iter()
+                        .map(|(link_rel, target_rel)| {
+                            (dest_dir.join(link_rel), dest_dir.join(target_rel))
+                        })
+                        .collect();
+
+                    Ok(Some((
+                        loc,
+                        was_hit,
+                        lifecycle_node,
+                        cacheable_manifest,
+                        pending_links,
+                        pack_task,
+                    )))
+                });
             }
+
+            let mut all_pack_tasks = Vec::new();
+            let mut all_pending_symlinks = Vec::new();
+            let mut first_err: Option<anyhow::Error> = None;
 
             while let Some(join_res) = join_set.join_next().await {
-                let item_opt =
-                    join_res.map_err(|e| anyhow!("Reification worker panicked: {e}"))??;
-                if let Some((was_hit, lifecycle_node)) = item_opt {
-                    if was_hit {
-                        cache_hits += 1;
-                        collector.record_cache_hit();
-                    } else {
-                        cache_misses += 1;
-                        collector.record_cache_miss();
+                match join_res {
+                    Ok(Ok(Some((
+                        loc,
+                        was_hit,
+                        lifecycle_node,
+                        cacheable_manifest,
+                        links,
+                        pack_task,
+                    )))) => {
+                        if was_hit {
+                            cache_hits += 1;
+                            collector.record_cache_hit();
+                        } else {
+                            cache_misses += 1;
+                            collector.record_cache_miss();
+                        }
+                        packages_installed += 1;
+                        if let Some(l_node) = lifecycle_node {
+                            lifecycle_nodes.push(l_node);
+                        }
+                        if let Some(m) = cacheable_manifest {
+                            in_memory_manifests.insert(loc, m);
+                        }
+                        all_pending_symlinks.extend(links);
+                        if let Some(t) = pack_task {
+                            all_pack_tasks.push(t);
+                        }
                     }
-                    packages_installed += 1;
-                    if let Some(l_node) = lifecycle_node {
-                        lifecycle_nodes.push(l_node);
+                    Ok(Ok(None)) => {}
+                    Ok(Err(e)) => {
+                        if first_err.is_none() {
+                            first_err = Some(e);
+                        }
+                    }
+                    Err(e) => {
+                        if first_err.is_none() {
+                            first_err = Some(anyhow!("Reification worker panicked: {e}"));
+                        }
                     }
                 }
             }
-            // Every queued file must be on disk before bins and scripts run.
+
             drop(pack_sender);
-            if let Some(writer) = pack_writer {
-                let t_writer = std::time::Instant::now();
-                tokio::task::spawn_blocking(move || writer.finish())
-                    .await
-                    .map_err(|e| anyhow!("File writer panicked: {e}"))?
-                    .map_err(|e| anyhow!("Failed to write package files: {e}"))?;
-                collector.record_phase(Phase::Materialize, t_writer.elapsed());
+            if let Some(ref mut w) = pack_writer {
+                w.close_input();
+            }
+
+            let (pack_res, writer_res) = tokio::join!(finish_pack_tasks(all_pack_tasks), async {
+                if let Some(writer) = pack_writer {
+                    let t_writer = std::time::Instant::now();
+                    tokio::task::spawn_blocking(move || writer.wait())
+                        .await
+                        .map_err(|e| anyhow!("File writer panicked: {e}"))?
+                        .map_err(|e| anyhow!("Failed to write package files: {e}"))?;
+                    collector.record_phase(Phase::Materialize, t_writer.elapsed());
+                }
+                Ok::<(), anyhow::Error>(())
+            });
+
+            if let Some(e) = first_err {
+                return Err(e);
+            }
+            writer_res?;
+            pack_res?;
+
+            for (link_path, target_path) in all_pending_symlinks {
+                let _ = rnpm_fs::create_link_or_copy(&link_path, &target_path);
             }
         }
 
         // Fill CAS by copying from node_modules on 16 threads for cold installs (offloaded if eligible)
-        if !used_fast_materialize && self.pack_store.is_block_cloning_eligible(&loc_base_dir) {
+        if !used_fast_materialize && self.pack_store().is_block_cloning_eligible(&loc_base_dir) {
             let mut cas_copy_list = Vec::new();
             for (loc, node) in &packages_to_download {
                 if let Some(ref integrity_str) = node.integrity {
                     if !integrity_str.is_empty() {
-                        if let Ok(Some(pack)) = self.pack_store.get_package_pack(integrity_str) {
+                        if let Ok(Some(pack)) = self.pack_store().get_package_pack(integrity_str) {
                             for entry in &pack.index.files {
                                 if let Some(ref cas_path) = entry.cas_path {
                                     if !cas_path.metadata().is_ok_and(|m| m.len() == entry.size) {
@@ -5841,7 +6165,7 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                 }
             }
             if !cas_copy_list.is_empty() {
-                let ps = self.pack_store.clone();
+                let ps = self.pack_store_arc();
                 std::thread::spawn(move || {
                     ps.populate_cas_from_installed(&cas_copy_list);
                 });
@@ -6061,7 +6385,7 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                 compute_project_fingerprint(&self.options.project_dir, &self.options)
             {
                 let _ = self
-                    .cache
+                    .cache()
                     .set_project_fingerprint(&self.options.project_dir, &fingerprint);
             }
         }
@@ -6108,7 +6432,9 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
     /// `from_scratch` is true for `npm ci`, which removes node_modules first;
     /// the install fast path reifies against the existing tree instead.
     async fn run_ci_internal(&mut self, from_scratch: bool) -> Result<InstallSummary> {
-        crate::trash::cleanup_leftover_trash(&self.options.project_dir);
+        if from_scratch && !self.options.dry_run {
+            crate::trash::cleanup_leftover_trash(&self.options.project_dir);
+        }
         let collector = TimingCollector::new();
         let plan_start = std::time::Instant::now();
         let _plan_span = tracing::info_span!("plan").entered();
@@ -6809,7 +7135,7 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                     });
                     let unscoped = name.rsplit('/').next().unwrap_or(&name).to_string();
                     let base = self
-                        .registry_client
+                        .registry_client()
                         .registry_for_package(&name)
                         .as_str()
                         .trim_end_matches('/')
@@ -6858,7 +7184,7 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                     .unwrap_or(false);
 
             if is_git {
-                let git_fetcher = crate::git::GitFetcher::new(self.cache.root());
+                let git_fetcher = crate::git::GitFetcher::new(self.cache().root());
                 let target = PackageTarget::parse(resolved_url)
                     .map_err(|e| anyhow!("Failed to parse git target in lockfile: {e}"))?;
                 let is_opt = pkg_info.is_effective_optional() || pkg_info.is_peer_optional();
@@ -6994,10 +7320,13 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                 if resolved_url.starts_with("file:") {
                     continue;
                 }
-                if !integrity_str.is_empty() && self.pack_store.has_package_pack(integrity_str) {
+                if !integrity_str.is_empty()
+                    && (self.pack_store().has_package_pack(integrity_str)
+                        || self.has_cached_tarball_blob(integrity_str))
+                {
                     continue;
                 }
-                match self.cache.get(resolved_url) {
+                match self.cache().get(resolved_url) {
                     Ok(Some((_entry, data))) => {
                         if let Ok(expected) = integrity_str.parse::<Integrity>() {
                             if let Err(e) = expected.verify(&data) {
@@ -7034,10 +7363,10 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                 .iter()
                 .map(|(_, url, integrity, _, _, _)| (url.clone(), integrity.clone()))
                 .collect();
-            refetch_tarballs_online(&self.registry_client, tarballs).await?;
+            refetch_tarballs_online(self.registry_client(), tarballs).await?;
         }
 
-        let mut custom_cfg = (*self.writer_cfg).clone();
+        let mut custom_cfg = (**self.writer_cfg_arc_ref()).clone();
         if !custom_cfg.is_hdd {
             custom_cfg.worker_threads = 16;
         }
@@ -7048,7 +7377,7 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
             .iter()
             .enumerate()
             .filter(|(_, (_, _, integrity_str, _, _, _))| {
-                !integrity_str.is_empty() && !self.pack_store.has_package_pack(integrity_str)
+                !integrity_str.is_empty() && !self.pack_store().has_package_pack(integrity_str)
             })
             .map(
                 |(i, (pkg_key, resolved_url, integrity_str, is_optional, _, _))| {
@@ -7074,7 +7403,10 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
             dirs_to_precreate.push(node_modules_dir_v.clone());
             dirs_to_precreate.push(bin_dir_v.clone());
             let loc_base_dir_v = rnpm_fs::to_verbatim_path(&loc_base_dir);
-            for (_, pkg_key, _, _, _) in &missing_packs {
+            for (_, pkg_key, _, _, is_optional) in &missing_packs {
+                if *is_optional {
+                    continue;
+                }
                 let pkg_key_clean = if cfg!(windows) && pkg_key.contains('/') {
                     pkg_key.replace('/', "\\")
                 } else {
@@ -7098,14 +7430,13 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
             let semaphore = Arc::clone(&self.io_semaphore);
             let active_semaphore = Arc::new(tokio::sync::Semaphore::new(48));
             let cpu_semaphore = Arc::new(tokio::sync::Semaphore::new(16));
-            let pack_persist_semaphore = Arc::new(tokio::sync::Semaphore::new(16));
+            let pack_persist_semaphore = Arc::new(tokio::sync::Semaphore::new(32));
             let mut init_dirs = std::collections::HashSet::with_capacity(dirs_to_precreate.len());
             init_dirs.extend(dirs_to_precreate);
             let seen_dirs = Arc::new(std::sync::RwLock::new(init_dirs));
             let mut join_set = tokio::task::JoinSet::new();
 
-            let mut async_writer =
-                rnpm_fs::AsyncFileWriter::spawn_for_hint(missing_packs.len()).ok();
+            let mut async_writer = rnpm_fs::AsyncFileWriter::spawn().ok();
             let writer_sender = async_writer.as_ref().map(|w| w.sender());
 
             for (idx, pkg_key, resolved_url, integrity_str, is_optional) in &missing_packs {
@@ -7114,12 +7445,12 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                 let cpu_sem = Arc::clone(&cpu_semaphore);
                 let pack_persist_sem = Arc::clone(&pack_persist_semaphore);
                 let seen_dirs = Arc::clone(&seen_dirs);
-                let cache = self.cache.clone();
-                let registry_client = self.registry_client.clone();
+                let cache = self.cache().clone();
+                let registry_client = self.registry_client().clone();
                 let project_dir = loc_base_dir.clone();
                 let offline = self.options.offline;
                 let worker_collector = collector.clone();
-                let pack_store = Arc::clone(&self.pack_store);
+                let pack_store = self.pack_store_arc();
                 let idx = *idx;
                 let pkg_key = pkg_key.clone();
                 let resolved_url = resolved_url.clone();
@@ -7247,7 +7578,13 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                                             .map(|e| data_encoding::HEXLOWER.encode(&e.digest));
                                         (fresh_bytes, false, sha_hex)
                                     }
-                                    Err(e) => return Err(anyhow!("Failed to download tarball from {resolved_url}: {e}")),
+                                    Err(e) => {
+                                        if is_optional {
+                                            warn!("npm warn optional SKIPPING OPTIONAL DEPENDENCY: Failed to download tarball from {resolved_url}: {e}");
+                                            return Ok(None);
+                                        }
+                                        return Err(anyhow!("Failed to download tarball from {resolved_url}: {e}"));
+                                    }
                                 }
                             }
                         } else if offline {
@@ -7279,7 +7616,13 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                                         .map(|e| data_encoding::HEXLOWER.encode(&e.digest));
                                     (fresh_bytes, false, sha_hex)
                                 }
-                                Err(e) => return Err(anyhow!("Failed to download tarball from {resolved_url}: {e}")),
+                                Err(e) => {
+                                    if is_optional {
+                                        warn!("npm warn optional SKIPPING OPTIONAL DEPENDENCY: Failed to download tarball from {resolved_url}: {e}");
+                                        return Ok(None);
+                                    }
+                                    return Err(anyhow!("Failed to download tarball from {resolved_url}: {e}"));
+                                }
                             }
                         };
                         worker_collector.record_phase(Phase::Fetch, t_fetch.elapsed());
@@ -7338,7 +7681,6 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                                     tm_nm_bytes.fetch_add(b_sum, std::sync::atomic::Ordering::Relaxed);
                                 }
                                 for file in &decoded.files {
-                                    rnpm_fs::record_file_created(file.data.len() as u64);
                                     sender
                                         .send_arc(file.path.clone(), Arc::clone(&file.data), file.mode)
                                         .map_err(|e| anyhow!("{e}"))?;
@@ -7558,7 +7900,7 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
             && packages_to_process
                 .iter()
                 .all(|(_, _, integrity_str, _, _, _)| {
-                    !integrity_str.is_empty() && self.pack_store.has_package_pack(integrity_str)
+                    !integrity_str.is_empty() && self.pack_store().has_package_pack(integrity_str)
                 });
 
         let mut used_fast_path = false;
@@ -7623,23 +7965,27 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
             );
 
             if load_success {
+                let block_cloning = self.pack_store().is_block_cloning_eligible(&loc_base_dir);
                 let t_refs = std::time::Instant::now();
                 let mut all_file_refs = Vec::with_capacity(16384);
                 let mut all_symlinks = Vec::new();
 
                 'load_files: for (pkg_key, pkg_target, pack) in &loaded_packs {
                     for entry in &pack.index.files {
-                        let clean_entry_path = if cfg!(windows) && entry.path.contains('/') {
-                            entry.path.replace('/', "\\")
-                        } else {
-                            entry.path.clone()
-                        };
-                        let full_path = pkg_target.join(clean_entry_path);
-                        if let Some(parent) = full_path.parent() {
-                            all_dirs.insert(parent.to_path_buf());
+                        let clean_entry_path: std::borrow::Cow<'_, str> =
+                            if cfg!(windows) && entry.path.contains('/') {
+                                std::borrow::Cow::Owned(entry.path.replace('/', "\\"))
+                            } else {
+                                std::borrow::Cow::Borrowed(entry.path.as_str())
+                            };
+                        let full_path = pkg_target.join(clean_entry_path.as_ref());
+                        if entry.path.contains('/') {
+                            if let Some(parent) = full_path.parent() {
+                                all_dirs.insert(parent.to_path_buf());
+                            }
                         }
                         if let Some(slice) = pack.get_entry_slice(entry) {
-                            let source_path = if entry.cas_verified {
+                            let source_path = if block_cloning && entry.cas_verified {
                                 entry.cas_path.as_deref()
                             } else {
                                 None
@@ -7651,7 +7997,7 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                                 package_id: Some(pkg_key.as_str()),
                                 source_path,
                                 expected_sha256: entry.sha256.as_deref(),
-                                source_verified: entry.cas_verified,
+                                source_verified: block_cloning && entry.cas_verified,
                             });
                         } else {
                             warn!(
@@ -7663,18 +8009,22 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                         }
                     }
                     for (link_rel, target_rel) in &pack.index.symlinks {
-                        let clean_link = if cfg!(windows) && link_rel.contains('/') {
-                            link_rel.replace('/', "\\")
-                        } else {
-                            link_rel.clone()
-                        };
-                        let clean_target = if cfg!(windows) && target_rel.contains('/') {
-                            target_rel.replace('/', "\\")
-                        } else {
-                            target_rel.clone()
-                        };
-                        all_symlinks
-                            .push((pkg_target.join(clean_link), pkg_target.join(clean_target)));
+                        let clean_link: std::borrow::Cow<'_, str> =
+                            if cfg!(windows) && link_rel.contains('/') {
+                                std::borrow::Cow::Owned(link_rel.replace('/', "\\"))
+                            } else {
+                                std::borrow::Cow::Borrowed(link_rel.as_str())
+                            };
+                        let clean_target: std::borrow::Cow<'_, str> =
+                            if cfg!(windows) && target_rel.contains('/') {
+                                std::borrow::Cow::Owned(target_rel.replace('/', "\\"))
+                            } else {
+                                std::borrow::Cow::Borrowed(target_rel.as_str())
+                            };
+                        all_symlinks.push((
+                            pkg_target.join(clean_link.as_ref()),
+                            pkg_target.join(clean_target.as_ref()),
+                        ));
                     }
                 }
                 if std::env::var_os("RNPM_TIMING_DEBUG").is_some() {
@@ -7737,7 +8087,7 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
 
                         // Bin shims read script headers, so complete the files
                         // and symlinks before selecting their interpreter.
-                        materialize_warm_files(all_file_refs, &ci_writer_cfg, packages_to_process.len())
+                        materialize_warm_files(all_file_refs, &ci_writer_cfg)
                             .map_err(|e| anyhow!("{e}"))?;
                         collector.record_phase(Phase::Materialize, t_mat.elapsed());
 
@@ -7773,6 +8123,7 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                                 remove_all_bin_dirs(&ws_nm);
                             }
                         }
+                        clean_empty_bin_dirs(nm_dir_ref);
                         if save_hidden_needed {
                             let t_lock = std::time::Instant::now();
                             if self.options.omit_dev || self.options.omit_optional || self.options.omit_peer {
@@ -7855,9 +8206,9 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
             ) in &packages_to_process
             {
                 let sem = Arc::clone(&semaphore);
-                let cache = self.cache.clone();
-                let pack_store = Arc::clone(&self.pack_store);
-                let registry_client = self.registry_client.clone();
+                let cache = self.cache().clone();
+                let pack_store = self.pack_store_arc();
+                let registry_client = self.registry_client().clone();
                 let project_dir = loc_base_dir.clone();
                 let offline = self.options.offline;
                 let worker_collector = collector.clone();
@@ -8160,11 +8511,11 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
             }
 
             // Fill CAS by copying from node_modules on 16 threads for cold installs (offloaded if eligible)
-            if self.pack_store.is_block_cloning_eligible(&loc_base_dir) {
+            if self.pack_store().is_block_cloning_eligible(&loc_base_dir) {
                 let mut cas_copy_list = Vec::new();
                 for (pkg_key, _, integrity_str, _, _, _) in &packages_to_process {
                     if !integrity_str.is_empty() {
-                        if let Ok(Some(pack)) = self.pack_store.get_package_pack(integrity_str) {
+                        if let Ok(Some(pack)) = self.pack_store().get_package_pack(integrity_str) {
                             for entry in &pack.index.files {
                                 if let Some(ref cas_path) = entry.cas_path {
                                     if !cas_path.metadata().is_ok_and(|m| m.len() == entry.size) {
@@ -8177,7 +8528,7 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                     }
                 }
                 if !cas_copy_list.is_empty() {
-                    let ps = self.pack_store.clone();
+                    let ps = self.pack_store_arc();
                     std::thread::spawn(move || {
                         ps.populate_cas_from_installed(&cas_copy_list);
                     });
@@ -8258,6 +8609,14 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
             None
         };
 
+        let root_bin = node_modules_dir.join(".bin");
+        if let Ok(mut bin_entries) = std::fs::read_dir(&root_bin) {
+            if bin_entries.next().is_none() {
+                let _ = std::fs::remove_dir(&root_bin);
+            }
+        }
+        clean_empty_bin_dirs(&node_modules_dir);
+
         // Persist hidden lockfile to node_modules/.package-lock.json unless package-lock is disabled
         let has_packages = lockfile.packages.keys().any(|k| !k.is_empty());
         if !used_fast_path
@@ -8284,18 +8643,11 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                 compute_project_fingerprint(&self.options.project_dir, &self.options)
             {
                 let _ = self
-                    .cache
+                    .cache()
                     .set_project_fingerprint(&self.options.project_dir, &fingerprint);
             }
         }
 
-        let root_bin = node_modules_dir.join(".bin");
-        if let Ok(mut bin_entries) = std::fs::read_dir(&root_bin) {
-            if bin_entries.next().is_none() {
-                let _ = std::fs::remove_dir(&root_bin);
-            }
-        }
-        clean_empty_bin_dirs(&node_modules_dir);
         remove_node_modules_if_empty(&node_modules_dir);
 
         Ok(InstallSummary {
@@ -8347,6 +8699,10 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
             }
         }
 
+        if names.is_empty() {
+            return Ok(());
+        }
+
         let mut full_packument_cache: std::collections::HashMap<String, serde_json::Value> =
             std::collections::HashMap::new();
 
@@ -8361,7 +8717,7 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
             .and_then(|p| rnpm_cache::Cache::new(p).ok());
 
         for name in &names {
-            let registry_url = self.registry_client.registry_for_package(name).as_str();
+            let registry_url = self.registry_client().registry_for_package(name).as_str();
             let encoded_name = rnpm_registry::encode_package_name(name);
             let full_url_enc = format!("{}/{}", registry_url.trim_end_matches('/'), encoded_name);
             let cacache_key_enc = format!("make-fetch-happen:request-cache:{full_url_enc}");
@@ -8369,13 +8725,13 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
             let cacache_key_raw = format!("make-fetch-happen:request-cache:{full_url_raw}");
 
             let cached_bytes = self
-                .cache
+                .cache()
                 .get(&cacache_key_enc)
                 .ok()
                 .flatten()
-                .or_else(|| self.cache.get(&cacache_key_raw).ok().flatten())
-                .or_else(|| self.cache.get(&full_url_enc).ok().flatten())
-                .or_else(|| self.cache.get(&full_url_raw).ok().flatten())
+                .or_else(|| self.cache().get(&cacache_key_raw).ok().flatten())
+                .or_else(|| self.cache().get(&full_url_enc).ok().flatten())
+                .or_else(|| self.cache().get(&full_url_raw).ok().flatten())
                 .or_else(|| {
                     npm_cacache.as_ref().and_then(|c| {
                         c.get(&cacache_key_enc)
@@ -8387,7 +8743,7 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                     })
                 })
                 .or_else(|| {
-                    self.cache
+                    self.cache()
                         .get_packument_with_accept(
                             registry_url,
                             name,
@@ -8395,7 +8751,7 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                         )
                         .ok()
                         .flatten()
-                        .or_else(|| self.cache.get_packument(registry_url, name).ok().flatten())
+                        .or_else(|| self.cache().get_packument(registry_url, name).ok().flatten())
                 })
                 .map(|(_entry, bytes)| bytes);
 
@@ -8594,7 +8950,7 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                     }
                     return Err(e);
                 }
-                let git_fetcher = crate::git::GitFetcher::new(self.cache.root());
+                let git_fetcher = crate::git::GitFetcher::new(self.cache().root());
                 let resolved = match git_fetcher
                     .resolve_git_dependency(&git_target, self.options.offline)
                     .await
@@ -8851,7 +9207,7 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
 
                     let url_str = url.as_str();
                     let archive_bytes_res = if self.options.offline {
-                        if let Ok(Some((_entry, data))) = self.cache.get(url_str) {
+                        if let Ok(Some((_entry, data))) = self.cache().get(url_str) {
                             Ok(data)
                         } else {
                             return Err(anyhow!(
@@ -8859,16 +9215,16 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                             ));
                         }
                     } else if self.options.prefer_offline {
-                        if let Ok(Some((_entry, data))) = self.cache.get(url_str) {
+                        if let Ok(Some((_entry, data))) = self.cache().get(url_str) {
                             Ok(data)
                         } else {
-                            self.registry_client
+                            self.registry_client()
                                 .download_tarball_bytes(url_str)
                                 .await
                                 .map_err(|e| anyhow!("{e}"))
                         }
                     } else {
-                        self.registry_client
+                        self.registry_client()
                             .download_tarball_bytes(url_str)
                             .await
                             .map_err(|e| anyhow!("{e}"))
@@ -9121,11 +9477,11 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
             cached.clone()
         } else {
             let meta = if before_cutoff().is_some() {
-                self.registry_client
+                self.registry_client()
                     .get_package_metadata_full(lookup_name)
                     .await
             } else {
-                self.registry_client
+                self.registry_client()
                     .get_package_metadata_install(lookup_name)
                     .await
             }
@@ -9269,7 +9625,7 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
         let results = if before_cutoff().is_some() {
             let reqs: Vec<(String, Option<String>)> =
                 missing.iter().map(|s| (s.clone(), None)).collect();
-            self.registry_client
+            self.registry_client()
                 .get_package_metadata_full_conditional_concurrent(&reqs)
                 .await
                 .into_iter()
@@ -9286,7 +9642,7 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                 })
                 .collect()
         } else {
-            self.registry_client
+            self.registry_client()
                 .get_package_metadata_install_concurrent(&missing)
                 .await
         };
@@ -9309,8 +9665,8 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
 
         let sem = Arc::clone(&self.io_semaphore);
         for (idx, url) in urls.iter().enumerate() {
-            let cache = self.cache.clone();
-            let registry_client = self.registry_client.clone();
+            let cache = self.cache().clone();
+            let registry_client = self.registry_client().clone();
             let url_str = url.to_string();
             let task_sem = Arc::clone(&sem);
 
@@ -9358,14 +9714,14 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
 
     #[allow(dead_code)]
     async fn fetch_tarball(&self, tarball_url: &str) -> Result<(Vec<u8>, bool)> {
-        if let Ok(Some((_entry, data))) = self.cache.get(tarball_url) {
+        if let Ok(Some((_entry, data))) = self.cache().get(tarball_url) {
             debug!("Cache hit for {}", tarball_url);
             return Ok((data, true));
         }
 
         info!("Downloading {}", tarball_url);
         let bytes = self
-            .registry_client
+            .registry_client()
             .download_tarball_bytes(tarball_url)
             .await
             .map_err(|e| anyhow!("Failed to download tarball from {tarball_url}: {e}"))?;
@@ -9396,7 +9752,7 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
             .map_err(|e| anyhow!("Integrity verification failed for {}: {e}", node.name))?;
 
         if !was_hit {
-            let _ = self.cache.put_with_integrity(
+            let _ = self.cache().put_with_integrity(
                 &node.resolved_url,
                 bytes,
                 Some(&expected_integrity),
@@ -9431,22 +9787,18 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
         if dest_dir.is_dir() {
             clean_stale_package_dir(&dest_dir, &format!("node_modules/{}", node.name), None);
         }
-        let writer_cfg = Arc::clone(&self.writer_cfg);
-        if !self.pack_store.has_package_pack(&node.integrity) {
-            let _ = self
-                .pack_store
-                .put_package_from_tarball(&node.integrity, bytes);
+        let writer_cfg = self.writer_config_arc();
+        let pack_store = self.pack_store();
+        if !pack_store.has_package_pack(&node.integrity) {
+            let _ = pack_store.put_package_from_tarball(&node.integrity, bytes);
         }
-        let extract_res = if self.pack_store.has_package_pack(&node.integrity) {
-            match self
-                .pack_store
-                .materialize_pack(&node.integrity, &dest_dir, Some(&writer_cfg))
-            {
+        let extract_res = if pack_store.has_package_pack(&node.integrity) {
+            match pack_store.materialize_pack(&node.integrity, &dest_dir, Some(&writer_cfg)) {
                 Ok(_) => Ok(()),
                 Err(e) => {
                     if e.is_pack_corruption() {
                         warn!("materialize_pack failed: {e}, purging pack and falling back to tarball extraction");
-                        let _ = self.pack_store.purge(&node.integrity);
+                        let _ = pack_store.purge(&node.integrity);
                         let _ = std::fs::remove_dir_all(&dest_dir);
                         extract_tarball_direct(
                             Cursor::new(bytes),

@@ -3062,7 +3062,7 @@ async fn test_offline_mode_tarball_cache_miss_enotcached() {
 }
 
 #[tokio::test]
-async fn test_offline_mode_cache_hit_success() {
+async fn test_offline_install_and_ci_accept_tarball_without_url_index() {
     use flate2::write::GzEncoder;
     use flate2::Compression;
     use sha2::{Digest, Sha512};
@@ -3092,7 +3092,6 @@ async fn test_offline_mode_cache_hit_success() {
     hasher.update(&tarball_bytes);
     let hash = hasher.finalize();
     let integrity_str = format!("sha512-{}", data_encoding::BASE64.encode(&hash));
-    let integrity: rnpm_core::integrity::Integrity = integrity_str.parse().unwrap();
 
     let tarball_url = "https://registry.npmjs.org/offline-pkg/-/offline-pkg-1.0.0.tgz";
 
@@ -3122,8 +3121,9 @@ async fn test_offline_mode_cache_hit_success() {
         )
         .unwrap();
     cache
-        .put_with_integrity(tarball_url, &tarball_bytes, Some(&integrity), None)
+        .put_blob_direct(&tarball_bytes, &data_encoding::HEXLOWER.encode(&hash))
         .unwrap();
+    assert!(cache.get(tarball_url).unwrap().is_none());
 
     // 3. Project package.json
     let pkg_json = r#"{"name": "test-app", "dependencies": {"offline-pkg": "^1.0.0"}}"#;
@@ -3138,7 +3138,7 @@ async fn test_offline_mode_cache_hit_success() {
         ..Default::default()
     };
 
-    let mut installer = crate::Installer::new(options).unwrap();
+    let mut installer = crate::Installer::new(options.clone()).unwrap();
     let summary = installer.run().await.unwrap();
 
     assert_eq!(summary.packages_installed, 1);
@@ -3149,6 +3149,16 @@ async fn test_offline_mode_cache_hit_success() {
         .join("offline-pkg")
         .join("package.json")
         .exists());
+
+    let mut ci_installer = crate::Installer::new(InstallOptions {
+        store_dir: Some(tmp.path().join("empty-store")),
+        ..options
+    })
+    .unwrap();
+    let summary = ci_installer.run_ci().await.unwrap();
+    assert_eq!(summary.packages_installed, 1);
+    assert_eq!(summary.cache_hits, 1);
+    assert_eq!(summary.cache_misses, 0);
 }
 
 #[tokio::test]
@@ -4644,12 +4654,12 @@ async fn test_enrich_lockfile_never_makes_network_requests() {
     };
     let mut installer = Installer::new(options).unwrap();
 
-    let before_requests = installer.registry_client.http_requests();
+    let before_requests = installer.registry_client().http_requests();
     installer
         .enrich_lockfile_from_registry(&mut lockfile)
         .await
         .unwrap();
-    let after_requests = installer.registry_client.http_requests();
+    let after_requests = installer.registry_client().http_requests();
 
     assert_eq!(
         before_requests, after_requests,
@@ -6233,4 +6243,58 @@ fn test_fast_path_validate_hidden_lockfile_ignores_non_directory_files() {
         crate::fast_path::validate_hidden_lockfile(root, Some(&opts)),
         "hidden lockfile must ignore non-directory files like README.txt and @scope/.DS_Store"
     );
+}
+
+#[test]
+fn test_read_cached_project_fingerprint_matches_cache_without_writing() {
+    let tmp = tempdir().unwrap();
+    let proj = tmp.path().join("proj");
+    let cache_dir = tmp.path().join("cache");
+    fs::create_dir_all(&proj).unwrap();
+
+    let installer = Installer::new(InstallOptions {
+        project_dir: proj.clone(),
+        cache_dir: Some(cache_dir.clone()),
+        ..Default::default()
+    })
+    .unwrap();
+    assert!(installer.read_cached_project_fingerprint().is_none());
+    assert!(
+        !cache_dir.join("_fingerprints").exists(),
+        "reading a missing fingerprint must not write fingerprint data"
+    );
+
+    let cache = rnpm_cache::Cache::new(&cache_dir).unwrap();
+    cache.set_project_fingerprint(&proj, "abc123").unwrap();
+    assert_eq!(
+        installer.read_cached_project_fingerprint().as_deref(),
+        Some("abc123")
+    );
+}
+
+#[test]
+fn test_installer_returns_storage_setup_errors() {
+    let tmp = tempdir().unwrap();
+    let file_path = tmp.path().join("file");
+    fs::write(&file_path, []).unwrap();
+
+    for (cache_dir, store_dir, expected) in [
+        (file_path.clone(), None, "Failed to initialize cache"),
+        (
+            tmp.path().join("cache"),
+            Some(file_path.clone()),
+            "Failed to initialize pack store",
+        ),
+    ] {
+        let result = Installer::new(InstallOptions {
+            project_dir: tmp.path().to_path_buf(),
+            cache_dir: Some(cache_dir),
+            store_dir,
+            ..Default::default()
+        });
+        let Err(error) = result else {
+            panic!("expected an error for a file in place of a storage directory");
+        };
+        assert_eq!(error.to_string(), expected);
+    }
 }

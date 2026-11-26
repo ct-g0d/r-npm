@@ -39,8 +39,8 @@ pub fn compute_project_fingerprint(project_dir: &Path, options: &InstallOptions)
             return Err(e).with_context(|| format!("Failed to read {}", manifest_path.display()));
         }
     };
-    let manifest =
-        Manifest::from_slice(&pkg_json_bytes).context("Failed to parse project package.json")?;
+    let manifest = Manifest::from_slice_readonly(&pkg_json_bytes)
+        .context("Failed to parse project package.json")?;
 
     let mut hasher = Sha256::new();
 
@@ -130,14 +130,26 @@ pub fn compute_project_fingerprint(project_dir: &Path, options: &InstallOptions)
         hasher.update(format!("npmrc:setting:{k}={v}\n").as_bytes());
     }
 
-    // Hash raw configuration file sources from loaded layers (project, workspace, user, global, builtin)
+    // Hash raw configuration file sources from loaded layers (project, workspace, user, global, builtin),
+    // deduplicating file reads when process configs or project/workspace .npmrc match layer paths.
+    let mut rc_file_cache: HashMap<PathBuf, Option<Vec<u8>>> = HashMap::with_capacity(8);
+    fn read_rc_cached<'a>(
+        cache: &'a mut HashMap<PathBuf, Option<Vec<u8>>>,
+        path: &Path,
+    ) -> Option<&'a [u8]> {
+        if !cache.contains_key(path) {
+            cache.insert(path.to_path_buf(), std::fs::read(path).ok());
+        }
+        cache.get(path).and_then(|o| o.as_deref())
+    }
+
     for layer in &config.layers {
         if let Some(ref src) = layer.source {
-            if let Ok(bytes) = std::fs::read(src) {
+            if let Some(bytes) = read_rc_cached(&mut rc_file_cache, src) {
                 hasher.update(
                     format!("\nconfig_layer:{}:{}:\n", layer.name, src.display()).as_bytes(),
                 );
-                hasher.update(&bytes);
+                hasher.update(bytes);
             }
         }
     }
@@ -145,16 +157,16 @@ pub fn compute_project_fingerprint(project_dir: &Path, options: &InstallOptions)
     // Process-level userconfig, globalconfig, and CLI overrides
     if let Some(user_cfg) = rnpm_config::get_process_userconfig() {
         hasher.update(format!("\nprocess_userconfig:{:?}:\n", user_cfg).as_bytes());
-        if let Ok(bytes) = std::fs::read(&user_cfg) {
+        if let Some(bytes) = read_rc_cached(&mut rc_file_cache, &user_cfg) {
             hasher.update(b"userconfig_bytes:\n");
-            hasher.update(&bytes);
+            hasher.update(bytes);
         }
     }
     if let Some(global_cfg) = rnpm_config::get_process_globalconfig() {
         hasher.update(format!("\nprocess_globalconfig:{:?}:\n", global_cfg).as_bytes());
-        if let Ok(bytes) = std::fs::read(&global_cfg) {
+        if let Some(bytes) = read_rc_cached(&mut rc_file_cache, &global_cfg) {
             hasher.update(b"globalconfig_bytes:\n");
-            hasher.update(&bytes);
+            hasher.update(bytes);
         }
     }
     if let Some(cli_map) = rnpm_config::get_process_cli_overrides() {
@@ -164,16 +176,16 @@ pub fn compute_project_fingerprint(project_dir: &Path, options: &InstallOptions)
     }
 
     let project_npmrc = project_dir.join(".npmrc");
-    if let Ok(bytes) = std::fs::read(&project_npmrc) {
+    if let Some(bytes) = read_rc_cached(&mut rc_file_cache, &project_npmrc) {
         hasher.update(b"\nproject_npmrc_bytes:\n");
-        hasher.update(&bytes);
+        hasher.update(bytes);
     }
 
     if let Some(ws_root) = rnpm_config::find_workspace_root(project_dir) {
         let ws_npmrc = ws_root.join(".npmrc");
-        if let Ok(bytes) = std::fs::read(&ws_npmrc) {
+        if let Some(bytes) = read_rc_cached(&mut rc_file_cache, &ws_npmrc) {
             hasher.update(b"\nworkspace_root_npmrc_bytes:\n");
-            hasher.update(&bytes);
+            hasher.update(bytes);
         }
     }
 
@@ -252,10 +264,17 @@ pub fn compute_project_fingerprint(project_dir: &Path, options: &InstallOptions)
 /// global store, so only top-level direct packages exist in `project_dir/node_modules`
 /// as directory junctions.
 pub fn validate_hidden_lockfile(project_dir: &Path, options: Option<&InstallOptions>) -> bool {
+    validate_hidden_lockfile_loaded(project_dir, options).is_some()
+}
+
+pub(crate) fn validate_hidden_lockfile_loaded(
+    project_dir: &Path,
+    options: Option<&InstallOptions>,
+) -> Option<(LockfileV3, Option<Manifest>)> {
     let node_modules = project_dir.join("node_modules");
     if !node_modules.is_dir() {
         debug!("Hidden lockfile invalid: node_modules directory does not exist");
-        return false;
+        return None;
     }
 
     let hidden_path = project_dir.join(LockfileV3::HIDDEN_LOCKFILE_PATH);
@@ -266,12 +285,12 @@ pub fn validate_hidden_lockfile(project_dir: &Path, options: Option<&InstallOpti
                 "Hidden lockfile does not exist at {}",
                 hidden_path.display()
             );
-            return false;
+            return None;
         }
     };
     let hidden_mtime = match hidden_meta.modified() {
         Ok(t) => t,
-        Err(_) => return false,
+        Err(_) => return None,
     };
 
     // Check modification time of root node_modules directory:
@@ -284,7 +303,7 @@ pub fn validate_hidden_lockfile(project_dir: &Path, options: Option<&InstallOpti
                     "Hidden lockfile invalid: node_modules directory mtime ({:?}) is newer than hidden lockfile ({:?})",
                     nm_mtime, hidden_mtime
                 );
-                return false;
+                return None;
             }
         }
     }
@@ -298,7 +317,7 @@ pub fn validate_hidden_lockfile(project_dir: &Path, options: Option<&InstallOpti
                     "Hidden lockfile invalid: package-lock.json mtime ({:?}) is newer than hidden lockfile ({:?})",
                     mtime, hidden_mtime
                 );
-                return false;
+                return None;
             }
         }
     }
@@ -310,7 +329,7 @@ pub fn validate_hidden_lockfile(project_dir: &Path, options: Option<&InstallOpti
                     "Hidden lockfile invalid: npm-shrinkwrap.json mtime ({:?}) is newer than hidden lockfile ({:?})",
                     mtime, hidden_mtime
                 );
-                return false;
+                return None;
             }
         }
     }
@@ -320,7 +339,7 @@ pub fn validate_hidden_lockfile(project_dir: &Path, options: Option<&InstallOpti
         Ok(l) => l,
         Err(_) => {
             debug!("Hidden lockfile is not valid JSON / LockfileV3");
-            return false;
+            return None;
         }
     };
 
@@ -338,7 +357,7 @@ pub fn validate_hidden_lockfile(project_dir: &Path, options: Option<&InstallOpti
 
     // Verify root package.json if present on disk
     let pkg_json_path = project_dir.join("package.json");
-    let root_manifest = match std::fs::read(&pkg_json_path) {
+    let (root_manifest, root_may_have_overrides) = match std::fs::read(&pkg_json_path) {
         Ok(bytes) => {
             if let Ok(meta) = std::fs::symlink_metadata(&pkg_json_path) {
                 if let Ok(mtime) = meta.modified() {
@@ -347,13 +366,14 @@ pub fn validate_hidden_lockfile(project_dir: &Path, options: Option<&InstallOpti
                             "Hidden lockfile invalid: package.json mtime ({:?}) is newer than hidden lockfile ({:?})",
                             mtime, hidden_mtime
                         );
-                        return false;
+                        return None;
                     }
                 }
             }
-            Manifest::from_slice(&bytes).ok()
+            let has_overrides = bytes.windows(9).any(|w| w == b"overrides");
+            (Manifest::from_slice_readonly(&bytes).ok(), has_overrides)
         }
-        Err(_) => None,
+        Err(_) => (None, false),
     };
 
     if let (Some(manifest), Some(root_pkg)) = (&root_manifest, lockfile.packages.get("")) {
@@ -367,7 +387,7 @@ pub fn validate_hidden_lockfile(project_dir: &Path, options: Option<&InstallOpti
                         "Hidden lockfile invalid: dependency '{}' spec mismatch between package.json ({:?}) and hidden lockfile ({:?})",
                         name, Some(spec), lock_deps.get(name)
                     );
-                    return false;
+                    return None;
                 }
             }
             for name in lock_deps.keys() {
@@ -378,12 +398,12 @@ pub fn validate_hidden_lockfile(project_dir: &Path, options: Option<&InstallOpti
                         "Hidden lockfile invalid: dependency '{}' in hidden lockfile removed from package.json",
                         name
                     );
-                    return false;
+                    return None;
                 }
             }
         } else if !manifest.dependencies.is_empty() {
             debug!("Hidden lockfile invalid: package.json has dependencies but hidden lockfile has none");
-            return false;
+            return None;
         }
 
         if !omit_dev {
@@ -394,7 +414,7 @@ pub fn validate_hidden_lockfile(project_dir: &Path, options: Option<&InstallOpti
                             "Hidden lockfile invalid: devDependency '{}' spec mismatch between package.json ({:?}) and hidden lockfile ({:?})",
                             name, Some(spec), lock_dev.get(name)
                         );
-                        return false;
+                        return None;
                     }
                 }
                 for name in lock_dev.keys() {
@@ -403,12 +423,12 @@ pub fn validate_hidden_lockfile(project_dir: &Path, options: Option<&InstallOpti
                             "Hidden lockfile invalid: devDependency '{}' in hidden lockfile removed from package.json",
                             name
                         );
-                        return false;
+                        return None;
                     }
                 }
             } else if !manifest.dev_dependencies.is_empty() {
                 debug!("Hidden lockfile invalid: package.json has devDependencies but hidden lockfile has none");
-                return false;
+                return None;
             }
         }
 
@@ -420,7 +440,7 @@ pub fn validate_hidden_lockfile(project_dir: &Path, options: Option<&InstallOpti
                             "Hidden lockfile invalid: optionalDependency '{}' spec mismatch between package.json ({:?}) and hidden lockfile ({:?})",
                             name, Some(spec), lock_opt.get(name)
                         );
-                        return false;
+                        return None;
                     }
                 }
                 for name in lock_opt.keys() {
@@ -429,12 +449,12 @@ pub fn validate_hidden_lockfile(project_dir: &Path, options: Option<&InstallOpti
                             "Hidden lockfile invalid: optionalDependency '{}' in hidden lockfile removed from package.json",
                             name
                         );
-                        return false;
+                        return None;
                     }
                 }
             } else if !manifest.optional_dependencies.is_empty() {
                 debug!("Hidden lockfile invalid: package.json has optionalDependencies but hidden lockfile has none");
-                return false;
+                return None;
             }
         }
     }
@@ -492,20 +512,59 @@ pub fn validate_hidden_lockfile(project_dir: &Path, options: Option<&InstallOpti
             }
         }
     } else if let Some(manifest) = &root_manifest {
-        for name in manifest.dependencies.keys() {
+        let check_direct_spec = |key: &str, name: &str, spec: &str| -> bool {
+            if root_may_have_overrides || platform_skipped.contains(key) {
+                return true;
+            }
+            let Some(pkg) = lockfile.packages.get(key) else {
+                return true;
+            };
+            if pkg.link == Some(true) || pkg.name.as_deref().is_some_and(|n| n != name) {
+                return true;
+            }
+            let Some(ver_str) = pkg.version.as_deref() else {
+                return true;
+            };
+            if let (Ok(range), Ok(ver)) = (
+                rnpm_core::semver::Range::parse(spec),
+                rnpm_core::semver::Version::parse(ver_str),
+            ) {
+                if !range.satisfies(&ver) {
+                    debug!(
+                        "Hidden lockfile invalid: installed {}@{} does not satisfy package.json spec '{}'",
+                        name, ver_str, spec
+                    );
+                    return false;
+                }
+            }
+            true
+        };
+
+        for (name, spec) in &manifest.dependencies {
             if manifest.optional_dependencies.contains_key(name) {
                 continue;
             }
-            direct_top_level_deps.insert(format!("node_modules/{name}"));
+            let key = format!("node_modules/{name}");
+            if !check_direct_spec(&key, name, spec) {
+                return None;
+            }
+            direct_top_level_deps.insert(key);
         }
         if !omit_dev {
-            for name in manifest.dev_dependencies.keys() {
-                direct_top_level_deps.insert(format!("node_modules/{name}"));
+            for (name, spec) in &manifest.dev_dependencies {
+                let key = format!("node_modules/{name}");
+                if !check_direct_spec(&key, name, spec) {
+                    return None;
+                }
+                direct_top_level_deps.insert(key);
             }
         }
         if !omit_optional {
-            for name in manifest.optional_dependencies.keys() {
+            for (name, spec) in &manifest.optional_dependencies {
                 let key = format!("node_modules/{name}");
+                if !check_direct_spec(&key, name, spec) {
+                    return None;
+                }
                 direct_top_level_deps.insert(key.clone());
                 optional_or_opt_peer_direct_deps.insert(key);
             }
@@ -539,7 +598,7 @@ pub fn validate_hidden_lockfile(project_dir: &Path, options: Option<&InstallOpti
     // and verify scope directory modification times. Non-directory files are ignored.
     let nm_entries = match std::fs::read_dir(&node_modules) {
         Ok(e) => e,
-        Err(_) => return false,
+        Err(_) => return None,
     };
 
     for entry in nm_entries.flatten() {
@@ -566,7 +625,7 @@ pub fn validate_hidden_lockfile(project_dir: &Path, options: Option<&InstallOpti
                             "Hidden lockfile invalid: scope directory '{}' mtime ({:?}) is newer than hidden lockfile ({:?})",
                             name_str, mtime, hidden_mtime
                         );
-                        return false;
+                        return None;
                     }
                 }
             }
@@ -597,7 +656,7 @@ pub fn validate_hidden_lockfile(project_dir: &Path, options: Option<&InstallOpti
                                 "Hidden lockfile invalid: package folder 'node_modules/{}/{}' mtime ({:?}) is newer than hidden lockfile ({:?})",
                                 name_str, sub_str, m, hidden_mtime
                             );
-                            return false;
+                            return None;
                         }
                     }
 
@@ -624,7 +683,7 @@ pub fn validate_hidden_lockfile(project_dir: &Path, options: Option<&InstallOpti
                         "Hidden lockfile invalid: package folder 'node_modules/{}' mtime ({:?}) is newer than hidden lockfile ({:?})",
                         name_str, m, hidden_mtime
                     );
-                    return false;
+                    return None;
                 }
             }
 
@@ -644,20 +703,37 @@ pub fn validate_hidden_lockfile(project_dir: &Path, options: Option<&InstallOpti
         .unwrap_or(detected_junction);
 
     // Verify there are no extraneous package directories in node_modules
-    let normalized_lockfile_keys: HashSet<String> = lockfile
-        .packages
-        .keys()
-        .map(|k| k.replace('\\', "/"))
-        .collect();
+    let has_backslash_keys = lockfile.packages.keys().any(|k| k.contains('\\'));
+    let normalized_lockfile_keys_owned: HashSet<String> = if has_backslash_keys {
+        lockfile
+            .packages
+            .keys()
+            .map(|k| k.replace('\\', "/"))
+            .collect()
+    } else {
+        HashSet::new()
+    };
 
     #[cfg(windows)]
-    let normalized_lockfile_keys_lower: HashSet<String> = normalized_lockfile_keys
-        .iter()
-        .map(|k| k.to_ascii_lowercase())
-        .collect();
+    let normalized_lockfile_keys_lower: HashSet<String> = if has_backslash_keys {
+        normalized_lockfile_keys_owned
+            .iter()
+            .map(|k| k.to_ascii_lowercase())
+            .collect()
+    } else {
+        lockfile
+            .packages
+            .keys()
+            .map(|k| k.to_ascii_lowercase())
+            .collect()
+    };
 
     for key in disk_packages.keys() {
-        let is_known = normalized_lockfile_keys.contains(key);
+        let is_known = if has_backslash_keys {
+            normalized_lockfile_keys_owned.contains(key)
+        } else {
+            lockfile.packages.contains_key(key)
+        };
         #[cfg(windows)]
         let is_known = is_known || normalized_lockfile_keys_lower.contains(&key.to_ascii_lowercase());
 
@@ -666,7 +742,7 @@ pub fn validate_hidden_lockfile(project_dir: &Path, options: Option<&InstallOpti
                 "Hidden lockfile invalid: extraneous directory '{}' found on disk",
                 key
             );
-            return false;
+            return None;
         }
     }
 
@@ -689,7 +765,7 @@ pub fn validate_hidden_lockfile(project_dir: &Path, options: Option<&InstallOpti
                 "Hidden lockfile invalid: declared direct dependency '{}' missing from hidden lockfile",
                 dep_key
             );
-            return false;
+            return None;
         };
 
         let is_platform_skipped = platform_skipped.contains(dep_key)
@@ -718,7 +794,7 @@ pub fn validate_hidden_lockfile(project_dir: &Path, options: Option<&InstallOpti
                 "Hidden lockfile invalid: declared direct dependency '{}' missing on disk",
                 dep_key
             );
-            return false;
+            return None;
         }
     }
 
@@ -800,7 +876,7 @@ pub fn validate_hidden_lockfile(project_dir: &Path, options: Option<&InstallOpti
                         "Hidden lockfile invalid: package folder '{}' exists on disk but is omitted by options",
                         normalized_key
                     );
-                    return false;
+                    return None;
                 }
 
                 // In linked mode, top-level non-link packages MUST be junctions to the store
@@ -809,7 +885,7 @@ pub fn validate_hidden_lockfile(project_dir: &Path, options: Option<&InstallOpti
                         "Hidden lockfile invalid: top-level package '{}' is a directory instead of a junction in linked mode",
                         normalized_key
                     );
-                    return false;
+                    return None;
                 }
 
                 present_packages.insert(normalized_key.to_string());
@@ -830,7 +906,7 @@ pub fn validate_hidden_lockfile(project_dir: &Path, options: Option<&InstallOpti
                     "Hidden lockfile invalid: package folder '{}' missing from disk",
                     normalized_key
                 );
-                return false;
+                return None;
             }
         } else {
             // Nested package
@@ -844,12 +920,12 @@ pub fn validate_hidden_lockfile(project_dir: &Path, options: Option<&InstallOpti
                         "Hidden lockfile invalid: nested package folder '{}' exists on disk but is omitted by options",
                         normalized_key
                     );
-                    return false;
+                    return None;
                 }
 
                 let folder_mtime = match std::fs::symlink_metadata(&folder_path) {
                     Ok(meta) => meta.modified().ok(),
-                    Err(_) => return false,
+                    Err(_) => return None,
                 };
 
                 present_packages.insert(normalized_key.to_string());
@@ -869,7 +945,7 @@ pub fn validate_hidden_lockfile(project_dir: &Path, options: Option<&InstallOpti
                     "Hidden lockfile invalid: nested package folder '{}' missing from disk",
                     normalized_key
                 );
-                return false;
+                return None;
             }
         }
     }
@@ -888,7 +964,7 @@ pub fn validate_hidden_lockfile(project_dir: &Path, options: Option<&InstallOpti
                     "Hidden lockfile invalid: junction or link target for '{:?}' is missing on disk",
                     check.folder_path
                 );
-                return false;
+                return None;
             }
             if let Some(mtime) = check.check_mtime {
                 if mtime > hidden_mtime {
@@ -896,7 +972,7 @@ pub fn validate_hidden_lockfile(project_dir: &Path, options: Option<&InstallOpti
                         "Hidden lockfile invalid: package folder '{:?}' mtime ({:?}) is newer than hidden lockfile ({:?})",
                         check.folder_path, mtime, hidden_mtime
                     );
-                    return false;
+                    return None;
                 }
             }
             let pkg_json = check.folder_path.join("package.json");
@@ -909,7 +985,7 @@ pub fn validate_hidden_lockfile(project_dir: &Path, options: Option<&InstallOpti
                     "Hidden lockfile invalid: package.json missing or 0 bytes in package folder '{:?}'",
                     check.folder_path
                 );
-                return false;
+                return None;
             }
         }
     } else {
@@ -949,7 +1025,7 @@ pub fn validate_hidden_lockfile(project_dir: &Path, options: Option<&InstallOpti
         });
 
         if failed.load(std::sync::atomic::Ordering::Relaxed) {
-            return false;
+            return None;
         }
     }
 
@@ -1037,7 +1113,7 @@ pub fn validate_hidden_lockfile(project_dir: &Path, options: Option<&InstallOpti
                             normalized,
                             bin_dir.display()
                         );
-                        return false;
+                        return None;
                     }
                 }
             }
@@ -1045,11 +1121,11 @@ pub fn validate_hidden_lockfile(project_dir: &Path, options: Option<&InstallOpti
 
         if has_expected_bins && !bin_dir_is_dir {
             debug!("Hidden lockfile invalid: node_modules/.bin directory missing");
-            return false;
+            return None;
         }
     }
 
-    true
+    Some((lockfile, root_manifest))
 }
 
 /// Convenience helper for validating hidden lockfile with default or no explicit options.
@@ -1159,6 +1235,17 @@ pub(crate) fn build_known_bins_map(
     known_bins
 }
 
+fn parse_engines_fallback_from_bytes(bytes: &[u8]) -> Option<rnpm_lockfile::PackageEngines> {
+    if !bytes.windows(9).any(|w| w == b"\"engines\"") && !bytes.windows(2).any(|w| w == b"\\u") {
+        return None;
+    }
+    let clean = bytes.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(bytes);
+    let json: serde_json::Value = serde_json::from_slice(clean).ok()?;
+    let engines_val = json.get("engines")?;
+    let engines: rnpm_lockfile::PackageEngines = serde_json::from_value(engines_val.clone()).ok()?;
+    (!engines.is_empty()).then_some(engines)
+}
+
 /// Enrich lockfile entries with author/funding/license/engines from installed manifests
 pub fn enrich_lockfile_from_installed_manifests(
     lockfile: &mut LockfileV3,
@@ -1166,6 +1253,7 @@ pub fn enrich_lockfile_from_installed_manifests(
     manifest_cache: Option<&HashMap<String, Manifest>>,
 ) {
     let mut manifests_by_loc: HashMap<String, Manifest> = HashMap::new();
+    let mut raw_engines_by_loc: HashMap<String, rnpm_lockfile::PackageEngines> = HashMap::new();
     let mut missing_locations = Vec::new();
 
     for (location, package) in &lockfile.packages {
@@ -1188,33 +1276,44 @@ pub fn enrich_lockfile_from_installed_manifests(
     if !missing_locations.is_empty() {
         let num_threads = 16.min(missing_locations.len());
         let chunk_size = missing_locations.len().div_ceil(num_threads);
-        let disk_manifests = std::thread::scope(|scope| {
+        let (disk_manifests, disk_engines) = std::thread::scope(|scope| {
             let mut handles = Vec::with_capacity(num_threads);
             for chunk in missing_locations.chunks(chunk_size) {
                 handles.push(scope.spawn(move || {
                     let mut local = Vec::with_capacity(chunk.len());
+                    let mut local_engines = Vec::new();
                     for loc in chunk {
                         let manifest_path = if loc.is_empty() {
                             project_dir.join("package.json")
                         } else {
                             project_dir.join(loc).join("package.json")
                         };
-                        if let Ok(m) = Manifest::from_file(&manifest_path) {
-                            local.push((loc.clone(), m));
+                        if let Ok(bytes) = std::fs::read(&manifest_path) {
+                            if let Ok(m) = Manifest::from_slice_readonly(&bytes) {
+                                if m.engines.is_empty() && !m.extra.contains_key("engines") {
+                                    if let Some(engines) = parse_engines_fallback_from_bytes(&bytes) {
+                                        local_engines.push((loc.clone(), engines));
+                                    }
+                                }
+                                local.push((loc.clone(), m));
+                            }
                         }
                     }
-                    local
+                    (local, local_engines)
                 }));
             }
             let mut results = HashMap::with_capacity(missing_locations.len());
+            let mut engines_results = HashMap::new();
             for handle in handles {
-                if let Ok(items) = handle.join() {
+                if let Ok((items, eng_items)) = handle.join() {
                     results.extend(items);
+                    engines_results.extend(eng_items);
                 }
             }
-            results
+            (results, engines_results)
         });
         manifests_by_loc.extend(disk_manifests);
+        raw_engines_by_loc.extend(disk_engines);
     }
 
     for (location, manifest) in manifests_by_loc {
@@ -1270,25 +1369,14 @@ pub fn enrich_lockfile_from_installed_manifests(
             } else if !manifest.engines.is_empty() {
                 package.engines =
                     Some(rnpm_lockfile::PackageEngines::Map(manifest.engines.clone()));
-            } else {
-                let manifest_path = if location.is_empty() {
-                    project_dir.join("package.json")
-                } else {
-                    project_dir.join(&location).join("package.json")
-                };
-                if let Ok(raw_str) = std::fs::read_to_string(&manifest_path) {
-                    if let Ok(json) = serde_json::from_str::<serde_json::Value>(&raw_str) {
-                        if let Some(engines_val) = json.get("engines") {
-                            if let Ok(engines) = serde_json::from_value::<rnpm_lockfile::PackageEngines>(
-                                engines_val.clone(),
-                            ) {
-                                if !engines.is_empty() {
-                                    package.engines = Some(engines);
-                                }
-                            }
-                        }
-                    }
-                }
+            } else if let Some(engines) = raw_engines_by_loc.remove(&location) {
+                package.engines = Some(engines);
+            } else if let Some(engines) = manifest
+                .raw_text
+                .as_deref()
+                .and_then(|raw| parse_engines_fallback_from_bytes(raw.as_bytes()))
+            {
+                package.engines = Some(engines);
             }
         }
         if package.bin.is_none() {

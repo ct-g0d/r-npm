@@ -2675,10 +2675,8 @@ fn test_lowercase_v_is_normalized_to_version_flag() {
 
 #[test]
 fn test_should_cleanup_trash_gating() {
-    // Mutating commands must trigger trash cleanup
+    // These commands need cleanup during CLI preparation.
     let mutating = [
-        ["rnpm", "install"].as_slice(),
-        ["rnpm", "ci"].as_slice(),
         ["rnpm", "update"].as_slice(),
         ["rnpm", "uninstall", "pkg"].as_slice(),
         ["rnpm", "prune"].as_slice(),
@@ -2692,6 +2690,12 @@ fn test_should_cleanup_trash_gating() {
             "Command '{:?}' must be classified as mutating and trigger trash cleanup",
             args
         );
+    }
+
+    // The installer owns cleanup for install and ci, including library calls.
+    for args in [["rnpm", "install"], ["rnpm", "ci"]] {
+        let parsed = Cli::try_parse_from(args).unwrap();
+        assert!(!should_cleanup_trash(&parsed.command));
     }
 
     // Dry-run commands must NOT trigger trash cleanup

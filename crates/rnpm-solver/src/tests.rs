@@ -7142,3 +7142,299 @@ fn test_remove_root_dependency_and_prune_unreferenced_indices_consistency() {
     cloned.rebuild_indices();
     assert_eq!(graph, cloned);
 }
+
+#[test]
+fn test_dedupe_multi_candidate_preserves_incoming_edge_order_and_eresolve() {
+    use crate::error::SolverError;
+    use crate::graph::{DependencyEdge, Node};
+    use crate::overrides::Overrides;
+    use crate::solver::Solver;
+    use rnpm_core::spec::PackageTarget;
+
+    // 1. Direct multi-candidate dedupe edge-order test:
+    // Create two nested compatible copies of `shared@1.0.0` whose incoming edges appear in
+    // reverse candidate discovery order, then dedupe into `node_modules/shared`.
+    let provider = InMemoryPackageProvider::new();
+    let mut solver = Solver::new(&provider, ResolverOptions::default(), Overrides::default());
+    {
+        let g = solver.graph_mut();
+        for (loc, name, ver) in [
+            ("", "root", "1.0.0"),
+            ("node_modules/b-parent", "b-parent", "1.0.0"),
+            ("node_modules/a-parent", "a-parent", "1.0.0"),
+            ("node_modules/b-parent/node_modules/shared", "shared", "1.0.0"),
+            ("node_modules/a-parent/node_modules/shared", "shared", "1.0.0"),
+            ("node_modules/shared", "shared", "1.0.0"),
+        ] {
+            g.add_node(
+                loc.to_string(),
+                Node {
+                    location: loc.to_string(),
+                    install_name: name.to_string(),
+                    name: name.to_string(),
+                    version: ver.to_string(),
+                    parsed_version: Some(rnpm_core::semver::Version::parse(ver).unwrap()),
+                    ..Default::default()
+                },
+            );
+        }
+        // Edge 0 points to a-parent/node_modules/shared, Edge 1 points to b-parent/node_modules/shared
+        // (while b-parent's copy was registered earlier in nodes_by_install_name).
+        g.add_edge(DependencyEdge {
+            from_location: "node_modules/a-parent".to_string(),
+            to_location: "node_modules/a-parent/node_modules/shared".to_string(),
+            install_name: "shared".to_string(),
+            package_name: "shared".to_string(),
+            spec: "^1.0.0".to_string(),
+            dep_type: DependencyType::Prod,
+        });
+        g.add_edge(DependencyEdge {
+            from_location: "node_modules/b-parent".to_string(),
+            to_location: "node_modules/b-parent/node_modules/shared".to_string(),
+            install_name: "shared".to_string(),
+            package_name: "shared".to_string(),
+            spec: "^1.0.0".to_string(),
+            dep_type: DependencyType::Prod,
+        });
+    }
+
+    let target = PackageTarget::Range(rnpm_core::semver::Range::parse("^1.0.0").unwrap());
+    solver.dedupe_nested_compatible_nodes("node_modules/shared", "shared", "shared", &target);
+    let graph = solver.graph();
+    assert_eq!(graph.incoming_edges_by_location["node_modules/shared"], vec![0, 1]);
+    let mut rebuilt = graph.clone();
+    rebuilt.rebuild_indices();
+    assert_eq!(
+        graph.incoming_edges_by_location["node_modules/shared"],
+        rebuilt.incoming_edges_by_location["node_modules/shared"]
+    );
+
+    // 2. End-to-end ERESOLVE explanation parity after multi-candidate retargeting:
+    // `a-first` (placed first alphabetically) pulls `shared` (nested copy at b-later? No:
+    // `a-wrap` nests `shared@1.0.0` (under root conflict) BEFORE `b-wrap` also nests `shared@1.0.0`;
+    // `b-root-enabler` or `shared@^1.0.0` at root then retargets BOTH nested copies to `node_modules/shared`,
+    // which holds peer `core@^2.0.0` while root holds `core@1.0.0` or wait: conflict on `shared`'s peer!).
+    let mut conflict_provider = InMemoryPackageProvider::new();
+    conflict_provider.add_version("core", "1.0.0", |_| {});
+    conflict_provider.add_version("a-first", "1.0.0", |v| {
+        v.dependencies.insert("shared".into(), "^1.0.0".into());
+    });
+    conflict_provider.add_version("b-second", "1.0.0", |v| {
+        v.dependencies.insert("shared".into(), "^1.0.0".into());
+    });
+    conflict_provider.add_version("shared", "1.0.0", |v| {
+        v.peer_dependencies.insert("core".into(), "^2.0.0".into());
+    });
+    let mut manifest = Manifest {
+        name: Some("multi-dedupe-app".into()),
+        version: Some("1.0.0".into()),
+        ..Default::default()
+    };
+    manifest.dependencies.insert("core".into(), "1.0.0".into());
+    manifest.dependencies.insert("a-first".into(), "1.0.0".into());
+    manifest.dependencies.insert("b-second".into(), "1.0.0".into());
+    let err = resolve_dependency_graph(&manifest, &conflict_provider, &ResolverOptions::default())
+        .unwrap_err();
+    match err {
+        SolverError::PeerConflict { .. } => {
+            let msg = err.to_string();
+            assert!(msg.contains("a-first") || msg.contains("core"), "unexpected peer error: {msg}");
+        }
+        other => panic!("expected PeerConflict, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_link_late_optional_peers_unindexed_graph_and_x_wildcard_specs() {
+    use crate::graph::{DependencyEdge, DependencyGraph, Node};
+    let mut graph = DependencyGraph::new();
+    let mut root = Node {
+        location: String::new(),
+        name: "app".to_string(),
+        install_name: "app".to_string(),
+        version: "1.0.0".to_string(),
+        ..Default::default()
+    };
+    root.dependencies.insert("owner".into(), "1.0.0".into());
+    root.dependencies.insert("prov".into(), "1.2.3".into());
+    graph.nodes.insert(String::new(), root);
+
+    let mut owner = Node {
+        location: "node_modules/owner".to_string(),
+        name: "owner".to_string(),
+        install_name: "owner".to_string(),
+        version: "1.0.0".to_string(),
+        ..Default::default()
+    };
+    owner.peer_dependencies.insert("prov".into(), "x.x".into());
+    owner
+        .peer_dependencies_meta
+        .insert("prov".into(), rnpm_core::manifest::PeerDependencyMeta { optional: true });
+    graph.nodes.insert(owner.location.clone(), owner);
+
+    let prov = Node {
+        location: "node_modules/prov".to_string(),
+        name: "prov".to_string(),
+        install_name: "prov".to_string(),
+        version: "1.2.3".to_string(),
+        parsed_version: Some(rnpm_core::semver::Version::parse("1.2.3").unwrap()),
+        ..Default::default()
+    };
+    graph.nodes.insert(prov.location.clone(), prov);
+
+    // Push edges directly WITHOUT building secondary indices first.
+    graph.edges.push(DependencyEdge {
+        from_location: String::new(),
+        to_location: "node_modules/owner".to_string(),
+        install_name: "owner".to_string(),
+        package_name: "owner".to_string(),
+        spec: "1.0.0".to_string(),
+        dep_type: DependencyType::Prod,
+    });
+    graph.edges.push(DependencyEdge {
+        from_location: String::new(),
+        to_location: "node_modules/prov".to_string(),
+        install_name: "prov".to_string(),
+        package_name: "prov".to_string(),
+        spec: "1.2.3".to_string(),
+        dep_type: DependencyType::Prod,
+    });
+
+    graph.normalize_dependency_flags();
+
+    // "x.x" optional peer must be linked AND pre-existing root edges must be indexed too.
+    assert_eq!(graph.edges.len(), 3);
+    assert_eq!(graph.get_outgoing_edges("").len(), 2);
+    assert_eq!(graph.get_outgoing_edges("node_modules/owner").len(), 1);
+    assert_eq!(graph.edges[2].dep_type, DependencyType::PeerOptional);
+}
+
+#[test]
+fn test_bundle_dependencies_object_map_parity() {
+    use crate::graph::Node;
+    let mut node = Node {
+        location: "node_modules/host".to_string(),
+        name: "host".to_string(),
+        install_name: "host".to_string(),
+        version: "1.0.0".to_string(),
+        ..Default::default()
+    };
+    node.extra.insert(
+        "bundleDependencies".to_string(),
+        serde_json::json!({ "bundled-a": "*", "bundled-b": "^1.0.0" }),
+    );
+    let parsed = node.bundle_dependencies();
+    assert_eq!(
+        parsed,
+        Some(rnpm_core::manifest::BundledDependencies::List(vec![
+            "bundled-a".to_string(),
+            "bundled-b".to_string(),
+        ]))
+    );
+    assert!(node.is_bundled_dependency("bundled-a"));
+    assert!(node.is_bundled_dependency("bundled-b"));
+    assert!(!node.is_bundled_dependency("other"));
+}
+
+#[test]
+fn test_pkg_cache_partial_equal_len_and_latest_tag_bypass() {
+    use crate::error::SolverError;
+    use crate::types::{PackageMetadata, PackageMetadataProvider};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct PartialDiskMock {
+        calls: AtomicUsize,
+    }
+
+    impl PackageMetadataProvider for PartialDiskMock {
+        fn get_package(&self, name: &str) -> Result<Option<PackageMetadata>, SolverError> {
+            self.get_package_for_edge(name, "*", false)
+        }
+
+        fn get_package_for_edge(
+            &self,
+            name: &str,
+            raw_spec: &str,
+            _is_root: bool,
+        ) -> Result<Option<PackageMetadata>, SolverError> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            if name != "pkg-x" {
+                let mut versions = BTreeMap::new();
+                if name == "holder-latest" {
+                    let mut v = PackageVersionMetadata {
+                        version: "1.0.0".into(),
+                        ..Default::default()
+                    };
+                    v.dependencies
+                        .insert("pkg-x-latest".into(), "npm:pkg-x@latest".into());
+                    versions.insert("1.0.0".into(), v);
+                } else if name == "holder-range" {
+                    let mut v = PackageVersionMetadata {
+                        version: "1.0.0".into(),
+                        ..Default::default()
+                    };
+                    v.dependencies.insert("pkg-x".into(), "^2.0.0".into());
+                    versions.insert("1.0.0".into(), v);
+                }
+                return Ok(Some(PackageMetadata {
+                    name: name.into(),
+                    versions,
+                    dist_tags: BTreeMap::new(),
+                }));
+            }
+            let mut versions = BTreeMap::new();
+            let mut dist_tags = BTreeMap::new();
+            if raw_spec == "^1.0.0" {
+                // Partial 1-version cached entry with stale dist-tag
+                versions.insert(
+                    "1.0.0".into(),
+                    PackageVersionMetadata {
+                        version: "1.0.0".into(),
+                        ..Default::default()
+                    },
+                );
+                dist_tags.insert("latest".into(), "1.0.0".into());
+            } else {
+                // Fresh 1-version response (SAME entries.len() == 1!) for 2.0.0
+                versions.insert(
+                    "2.0.0".into(),
+                    PackageVersionMetadata {
+                        version: "2.0.0".into(),
+                        ..Default::default()
+                    },
+                );
+                dist_tags.insert("latest".into(), "2.0.0".into());
+            }
+            Ok(Some(PackageMetadata {
+                name: name.into(),
+                versions,
+                dist_tags,
+            }))
+        }
+    }
+
+    let provider = PartialDiskMock {
+        calls: AtomicUsize::new(0),
+    };
+    let mut manifest = Manifest {
+        name: Some("partial-app".into()),
+        version: Some("1.0.0".into()),
+        ..Default::default()
+    };
+    manifest.dependencies.insert("pkg-x".into(), "^1.0.0".into());
+    manifest
+        .dependencies
+        .insert("holder-latest".into(), "1.0.0".into());
+    manifest
+        .dependencies
+        .insert("holder-range".into(), "1.0.0".into());
+
+    let graph =
+        resolve_dependency_graph(&manifest, &provider, &ResolverOptions::default()).unwrap();
+    assert_eq!(graph.nodes["node_modules/pkg-x"].version, "1.0.0");
+    assert_eq!(graph.nodes["node_modules/pkg-x-latest"].version, "2.0.0");
+    assert_eq!(
+        graph.nodes["node_modules/holder-range/node_modules/pkg-x"].version,
+        "2.0.0"
+    );
+}

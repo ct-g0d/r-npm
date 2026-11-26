@@ -2,11 +2,82 @@ use anyhow::Result;
 use rnpm_core::ordered_json::{OrderedJsonMap as Map, OrderedJsonValue as Value};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 struct Layer {
     name: String,
     source: String,
     data: Map,
+}
+
+fn base_defaults() -> Result<Map> {
+    static DEFAULTS: OnceLock<Map> = OnceLock::new();
+    if let Some(cached) = DEFAULTS.get() {
+        return Ok(cached.clone());
+    }
+    let parsed = serde_json::from_str::<Value>(include_str!("config_defaults.json"))?
+        .as_object()
+        .cloned()
+        .unwrap_or_default();
+    Ok(DEFAULTS.get_or_init(|| parsed).clone())
+}
+
+struct EnvSnapshot {
+    npm_env_order: Vec<String>,
+    proxy_vars: Vec<(String, String)>,
+}
+
+fn collect_env_snapshot(collect_npm_order: bool, collect_proxies: bool) -> EnvSnapshot {
+    let mut npm_env_order = Vec::new();
+    let mut proxy_vars = Vec::new();
+    if !collect_npm_order && !collect_proxies {
+        return EnvSnapshot {
+            npm_env_order,
+            proxy_vars,
+        };
+    }
+    let mut seen_proxies = std::collections::HashSet::new();
+    for (k, v) in std::env::vars() {
+        if collect_npm_order
+            && k.get(..11)
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case("npm_config_"))
+        {
+            if let Some(raw) = k.get(11..) {
+                if !raw.is_empty() {
+                    let norm = if raw.starts_with("//") {
+                        raw.to_string()
+                    } else {
+                        let mut chars = raw.chars();
+                        let first = chars.next().map(|c| c.to_ascii_lowercase());
+                        let rest: String = chars
+                            .map(|c| if c == '_' { '-' } else { c.to_ascii_lowercase() })
+                            .collect();
+                        match first {
+                            Some(f) => format!("{f}{rest}"),
+                            None => String::new(),
+                        }
+                    };
+                    npm_env_order.push(norm);
+                }
+            }
+        }
+        if collect_proxies {
+            let lower = k.to_ascii_lowercase();
+            if ["http_proxy", "https_proxy", "proxy", "no_proxy"].contains(&lower.as_str())
+                && seen_proxies.insert(lower)
+            {
+                proxy_vars.push((k, v));
+            }
+        }
+    }
+    if collect_proxies && cfg!(windows) {
+        // Windows keeps its environment block sorted by uppercased name.
+        proxy_vars.sort_by_key(|(k, _)| k.to_ascii_uppercase());
+    }
+    EnvSnapshot {
+        npm_env_order,
+        proxy_vars,
+    }
 }
 
 fn typed(key: &str, text: &str, defaults: &Map) -> Value {
@@ -59,7 +130,12 @@ fn private(key: &str) -> bool {
             && (key.contains(":_") || PROTECTED.iter().any(|p| key.ends_with(&format!(":{p}")))))
 }
 
-pub(super) fn run(json: bool, long: bool, dir: &Path) -> Result<()> {
+pub(super) fn run(
+    json: bool,
+    long: bool,
+    dir: &Path,
+    config: Option<&rnpm_config::Config>,
+) -> Result<()> {
     let node = rnpm_lifecycle::node_executable().unwrap_or_else(|| PathBuf::from("node"));
     let node_dir = node.parent().unwrap_or(Path::new("."));
     let node_prefix = if cfg!(windows) {
@@ -74,12 +150,15 @@ pub(super) fn run(json: bool, long: bool, dir: &Path) -> Result<()> {
     };
     let home =
         std::env::var(if cfg!(windows) { "USERPROFILE" } else { "HOME" }).unwrap_or_default();
-    let detailed =
-        rnpm_config::Config::load_detailed(rnpm_config::ConfigOptions::new().project_dir(dir))?;
-    let mut defaults: Map = serde_json::from_str::<Value>(include_str!("config_defaults.json"))?
-        .as_object()
-        .cloned()
-        .unwrap_or_default();
+    let loaded_config;
+    let config_ref = match config {
+        Some(cfg) => cfg,
+        None => {
+            loaded_config = rnpm_config::Config::load(Some(dir))?;
+            &loaded_config
+        }
+    };
+    let mut defaults = base_defaults()?;
     for (key, value) in &mut defaults {
         if value.get("dynamic").is_none() {
             continue;
@@ -131,6 +210,8 @@ pub(super) fn run(json: bool, long: bool, dir: &Path) -> Result<()> {
         };
         *value = Value::String(dynamic);
     }
+    let has_env_layer = config_ref.layers.iter().any(|l| l.name == "env");
+    let env_snapshot = collect_env_snapshot(has_env_layer, !json && !long);
     let mut layers = vec![Layer {
         name: "default".into(),
         source: "default values".into(),
@@ -152,9 +233,10 @@ pub(super) fn run(json: bool, long: bool, dir: &Path) -> Result<()> {
             data,
         });
     }
-    for layer in detailed.layers {
+    for layer in &config_ref.layers {
         let source = layer
             .source
+            .as_ref()
             .map(|p| p.display().to_string())
             .unwrap_or_else(|| {
                 if layer.name == "env" {
@@ -167,36 +249,12 @@ pub(super) fn run(json: bool, long: bool, dir: &Path) -> Result<()> {
             // Preserve OS environment insertion order (matching Node's Object.entries(process.env))
             // so `npm config list --json` key order matches on Linux, macOS, and Windows.
             let mut ordered = Map::new();
-            let mut remaining = layer.settings;
+            let mut remaining = layer.settings.clone();
             remaining.remove("globalconfig");
-            for (env_k, _) in std::env::vars() {
-                if env_k
-                    .get(..11)
-                    .is_some_and(|prefix| prefix.eq_ignore_ascii_case("npm_config_"))
-                {
-                    let Some(raw) = env_k.get(11..) else {
-                        continue;
-                    };
-                    if raw.is_empty() {
-                        continue;
-                    }
-                    let norm = if raw.starts_with("//") {
-                        raw.to_string()
-                    } else {
-                        let mut chars = raw.chars();
-                        let first = chars.next().map(|c| c.to_ascii_lowercase());
-                        let rest: String = chars
-                            .map(|c| if c == '_' { '-' } else { c.to_ascii_lowercase() })
-                            .collect();
-                        match first {
-                            Some(f) => format!("{f}{rest}"),
-                            None => String::new(),
-                        }
-                    };
-                    if let Some(v) = remaining.remove(&norm) {
-                        let value = typed(&norm, &v, &defaults);
-                        ordered.insert(norm, value);
-                    }
+            for norm in &env_snapshot.npm_env_order {
+                if let Some(v) = remaining.remove(norm) {
+                    let value = typed(norm, &v, &defaults);
+                    ordered.insert(norm.clone(), value);
                 }
             }
             for (k, v) in remaining {
@@ -207,16 +265,16 @@ pub(super) fn run(json: bool, long: bool, dir: &Path) -> Result<()> {
         } else {
             layer
                 .settings
-                .into_iter()
-                .filter(|(k, _)| k != "globalconfig")
+                .iter()
+                .filter(|(k, _)| k.as_str() != "globalconfig")
                 .map(|(k, v)| {
-                    let value = typed(&k, &v, &defaults);
-                    (k, value)
+                    let value = typed(k, v, &defaults);
+                    (k.clone(), value)
                 })
                 .collect()
         };
         layers.push(Layer {
-            name: layer.name,
+            name: layer.name.clone(),
             source,
             data,
         });
@@ -287,38 +345,20 @@ pub(super) fn run(json: bool, long: bool, dir: &Path) -> Result<()> {
         text.push(String::new());
     }
     if !long {
-        let version = std::process::Command::new(&node)
-            .arg("--version")
-            .output()
-            .ok()
-            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-            .unwrap_or_default();
-        // npm lists the proxy variables it reads from the environment, the
-        // first spelling of each name in environment order.
-        let mut seen = std::collections::HashSet::new();
-        let mut env_vars: Vec<(String, String)> = std::env::vars()
-            .filter(|(k, _)| {
-                let lower = k.to_ascii_lowercase();
-                ["http_proxy", "https_proxy", "proxy", "no_proxy"].contains(&lower.as_str())
-                    && seen.insert(lower)
-            })
-            .collect();
-        if cfg!(windows) {
-            // Windows keeps its environment block sorted by uppercased name.
-            env_vars.sort_by_key(|(k, _)| k.to_ascii_uppercase());
-        }
-        if !env_vars.is_empty() {
+        let version = crate::node_info::node_version_for(&node);
+        let local_prefix = rnpm_config::find_local_prefix(dir);
+        if !env_snapshot.proxy_vars.is_empty() {
             text.push("; environment-related config".into());
             text.push(String::new());
-            for (k, v) in env_vars {
-                text.push(format!("; {k} = {}", serde_json::to_string(&v).unwrap_or_default()));
+            for (k, v) in &env_snapshot.proxy_vars {
+                text.push(format!("; {k} = {}", serde_json::to_string(v).unwrap_or_default()));
             }
             text.push(String::new());
         }
         text.extend([
             format!("; node bin location = {}", node.display()),
             format!("; node version = {version}"),
-            format!("; npm local prefix = {}", detailed.local_prefix.display()),
+            format!("; npm local prefix = {}", local_prefix.display()),
             "; npm version = 11.20.0".into(),
             format!("; cwd = {}", dir.display()),
             format!("; HOME = {home}"),
