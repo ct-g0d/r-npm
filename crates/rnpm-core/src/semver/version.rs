@@ -48,77 +48,244 @@ pub struct Version {
     pub build: Vec<String>,
 }
 
+/// Single-pass prefix parser for strict `MAJOR.MINOR.PATCH` segments.
+/// Returns `(major, minor, patch, bytes_consumed)`.
 #[inline]
-pub(crate) fn parse_u64_segment(bytes: &[u8]) -> Option<u64> {
-    if bytes.is_empty() {
+pub(crate) fn parse_strict_triplet_prefix(bytes: &[u8]) -> Option<(u64, u64, u64, usize)> {
+    let len = bytes.len();
+    if len < 5 {
         return None;
     }
-    // SemVer 2.0.0 §2: Numeric segments MUST NOT contain leading zeroes
-    if bytes.len() > 1 && bytes[0] == b'0' {
-        return None;
-    }
-    let mut val: u64 = 0;
-    for &b in bytes {
-        if !b.is_ascii_digit() {
+
+    let mut i = 0usize;
+    let mut vals = [0u64; 3];
+
+    let mut seg = 0usize;
+    while seg < 3 {
+        if i >= len {
             return None;
         }
-        val = val.checked_mul(10)?.checked_add((b - b'0') as u64)?;
-    }
-    Some(val)
-}
-
-#[inline]
-pub(crate) fn parse_loose_u64_segment(bytes: &[u8]) -> Option<u64> {
-    if bytes.is_empty() {
-        return None;
-    }
-    let mut val: u64 = 0;
-    for &b in bytes {
-        if !b.is_ascii_digit() {
+        let b0 = bytes[i];
+        if !b0.is_ascii_digit() {
             return None;
         }
-        val = val.checked_mul(10)?.checked_add((b - b'0') as u64)?;
-    }
-    Some(val)
-}
+        i += 1;
 
-/// Zero-allocation parser for pure `MAJOR.MINOR.PATCH` with no prerelease/build metadata.
-#[inline]
-pub(crate) fn parse_fast_u64_triplet(s: &str) -> Option<(u64, u64, u64)> {
-    let bytes = s.as_bytes();
-    if bytes.is_empty() {
-        return None;
-    }
-
-    let mut dot1 = None;
-    let mut dot2 = None;
-
-    for (i, &b) in bytes.iter().enumerate() {
-        if b == b'.' {
-            if dot1.is_none() {
-                dot1 = Some(i);
-            } else if dot2.is_none() {
-                dot2 = Some(i);
-            } else {
-                return None; // More than 2 dots
+        if b0 == b'0' {
+            // SemVer 2.0.0 §2: numeric identifiers MUST NOT contain leading zeroes
+            if i < len && bytes[i].is_ascii_digit() {
+                return None;
             }
-        } else if !b.is_ascii_digit() {
-            return None; // Any non-digit (including -, +, whitespace)
+            vals[seg] = 0;
+        } else {
+            let mut val = (b0 - b'0') as u64;
+            while i < len {
+                let b = bytes[i];
+                if !b.is_ascii_digit() {
+                    break;
+                }
+                val = val.checked_mul(10)?.checked_add((b - b'0') as u64)?;
+                i += 1;
+            }
+            vals[seg] = val;
         }
+
+        if seg < 2 {
+            if i >= len || bytes[i] != b'.' {
+                return None;
+            }
+            i += 1;
+        }
+        seg += 1;
     }
 
-    let d1 = dot1?;
-    let d2 = dot2?;
+    Some((vals[0], vals[1], vals[2], i))
+}
 
-    let s0 = &bytes[..d1];
-    let s1 = &bytes[d1 + 1..d2];
-    let s2 = &bytes[d2 + 1..];
+/// Single-pass prefix parser for loose `MAJOR[.MINOR[.PATCH]]` (allows leading zeroes).
+#[inline]
+fn parse_loose_prefix(bytes: &[u8]) -> Option<(u64, u64, u64, usize)> {
+    let len = bytes.len();
+    if len == 0 {
+        return None;
+    }
 
-    let major = parse_u64_segment(s0)?;
-    let minor = parse_u64_segment(s1)?;
-    let patch = parse_u64_segment(s2)?;
+    let mut i = 0usize;
+    let mut vals = [0u64; 3];
+    let mut seg = 0usize;
 
-    Some((major, minor, patch))
+    loop {
+        if i >= len || !bytes[i].is_ascii_digit() {
+            return None;
+        }
+        let mut val = (bytes[i] - b'0') as u64;
+        i += 1;
+        while i < len {
+            let b = bytes[i];
+            if !b.is_ascii_digit() {
+                break;
+            }
+            val = val.checked_mul(10)?.checked_add((b - b'0') as u64)?;
+            i += 1;
+        }
+        vals[seg] = val;
+        seg += 1;
+
+        if seg < 3 && i < len && bytes[i] == b'.' {
+            i += 1;
+            continue;
+        }
+        break;
+    }
+
+    Some((vals[0], vals[1], vals[2], i))
+}
+
+#[inline]
+fn parse_prerelease_list(
+    pre_str: &str,
+    full_tail: &str,
+    orig_input: &str,
+    loose: bool,
+) -> Result<Vec<PrereleaseId>, SemverError> {
+    if pre_str.is_empty() {
+        return Err(SemverError::InvalidVersion(orig_input.to_string()));
+    }
+    let bytes = pre_str.as_bytes();
+    let len = bytes.len();
+    let mut pres = Vec::new();
+    let mut start = 0usize;
+
+    loop {
+        let mut end = start;
+        let mut all_digits = true;
+        let mut num_val: u64 = 0;
+        let mut num_ok = true;
+
+        while end < len {
+            let b = bytes[end];
+            if b == b'.' {
+                break;
+            }
+            if !(b.is_ascii_alphanumeric() || b == b'-') {
+                if full_tail.chars().any(char::is_whitespace) {
+                    return Err(SemverError::InvalidVersion(orig_input.to_string()));
+                }
+                return Err(SemverError::InvalidPrerelease(pre_str.to_string()));
+            }
+            if all_digits {
+                if b.is_ascii_digit() {
+                    if num_ok {
+                        match num_val
+                            .checked_mul(10)
+                            .and_then(|v| v.checked_add((b - b'0') as u64))
+                        {
+                            Some(v) => num_val = v,
+                            None => num_ok = false,
+                        }
+                    }
+                } else {
+                    all_digits = false;
+                }
+            }
+            end += 1;
+        }
+
+        let seg_len = end - start;
+        if seg_len == 0 {
+            if full_tail.chars().any(char::is_whitespace) {
+                return Err(SemverError::InvalidVersion(orig_input.to_string()));
+            }
+            return Err(SemverError::InvalidPrerelease(pre_str.to_string()));
+        }
+
+        if all_digits {
+            if !loose {
+                if !num_ok || (seg_len > 1 && bytes[start] == b'0') {
+                    if full_tail.chars().any(char::is_whitespace) {
+                        return Err(SemverError::InvalidVersion(orig_input.to_string()));
+                    }
+                    return Err(SemverError::InvalidPrerelease(pre_str.to_string()));
+                }
+                pres.push(PrereleaseId::Numeric(num_val));
+            } else if num_ok {
+                pres.push(PrereleaseId::Numeric(num_val));
+            } else {
+                pres.push(PrereleaseId::Alpha(pre_str[start..end].to_string()));
+            }
+        } else {
+            pres.push(PrereleaseId::Alpha(pre_str[start..end].to_string()));
+        }
+
+        if end == len {
+            break;
+        }
+        start = end + 1;
+    }
+
+    Ok(pres)
+}
+
+#[inline]
+fn parse_strict_build_list(b_str: &str, orig_input: &str) -> Result<Vec<String>, SemverError> {
+    if b_str.is_empty() {
+        return Err(SemverError::InvalidVersion(orig_input.to_string()));
+    }
+    let bytes = b_str.as_bytes();
+    let len = bytes.len();
+    let mut builds = Vec::new();
+    let mut start = 0usize;
+
+    loop {
+        let mut end = start;
+        while end < len && bytes[end] != b'.' {
+            let b = bytes[end];
+            if !(b.is_ascii_alphanumeric() || b == b'-') {
+                return Err(SemverError::InvalidVersion(orig_input.to_string()));
+            }
+            end += 1;
+        }
+        if end == start {
+            return Err(SemverError::InvalidVersion(orig_input.to_string()));
+        }
+        builds.push(b_str[start..end].to_string());
+        if end == len {
+            break;
+        }
+        start = end + 1;
+    }
+
+    Ok(builds)
+}
+
+#[inline]
+fn write_u64_rev(mut n: u64, buf: &mut [u8; 64], mut pos: usize) -> usize {
+    loop {
+        pos -= 1;
+        buf[pos] = b'0' + (n % 10) as u8;
+        n /= 10;
+        if n == 0 {
+            return pos;
+        }
+    }
+}
+
+#[inline]
+pub(crate) fn format_simple_version(
+    major: u64,
+    minor: u64,
+    patch: u64,
+    buf: &mut [u8; 64],
+) -> &str {
+    let mut pos = 64usize;
+    pos = write_u64_rev(patch, buf, pos);
+    pos -= 1;
+    buf[pos] = b'.';
+    pos = write_u64_rev(minor, buf, pos);
+    pos -= 1;
+    buf[pos] = b'.';
+    pos = write_u64_rev(major, buf, pos);
+    std::str::from_utf8(&buf[pos..]).unwrap_or("")
 }
 
 impl Version {
@@ -134,21 +301,31 @@ impl Version {
     }
 
     pub fn parse(input: &str) -> Result<Self, SemverError> {
-        let trimmed = input.trim();
-        // Support leading '=' and/or 'v'/'V' prefix (e.g. '=1.2.3', 'v1.2.3', '=v1.2.3')
-        let s = trimmed.strip_prefix('=').unwrap_or(trimmed);
-        let s = s
-            .strip_prefix('v')
-            .or_else(|| s.strip_prefix('V'))
-            .unwrap_or(s);
-        let s = s.trim();
-        // node-semver never accepts inner whitespace: "2.5.0 - 3" is a range.
-        if s.is_empty() || s.chars().any(char::is_whitespace) {
-            return Err(SemverError::InvalidVersion(input.to_string()));
-        }
+        let raw_bytes = input.as_bytes();
+        let s = if !raw_bytes.is_empty()
+            && raw_bytes[0].is_ascii_digit()
+            && raw_bytes[raw_bytes.len() - 1] > b' '
+            && raw_bytes[raw_bytes.len() - 1] < 0x80
+        {
+            input
+        } else {
+            let trimmed = input.trim();
+            // Support leading '=' and/or 'v'/'V' prefix (e.g. '=1.2.3', 'v1.2.3', '=v1.2.3')
+            let s = trimmed.strip_prefix('=').unwrap_or(trimmed);
+            let s = s
+                .strip_prefix('v')
+                .or_else(|| s.strip_prefix('V'))
+                .unwrap_or(s);
+            s.trim()
+        };
 
-        // Fast path: pure major.minor.patch with zero heap allocations (95% common case)
-        if let Some((major, minor, patch)) = parse_fast_u64_triplet(s) {
+        let bytes = s.as_bytes();
+        let Some((major, minor, patch, pos)) = parse_strict_triplet_prefix(bytes) else {
+            return Err(SemverError::InvalidVersion(input.to_string()));
+        };
+
+        // Fast path: pure major.minor.patch with zero heap allocations (~95% common case)
+        if pos == bytes.len() {
             return Ok(Self {
                 major,
                 minor,
@@ -158,128 +335,63 @@ impl Version {
             });
         }
 
-        // If string contains only digits and dots, but failed parse_fast_u64_triplet,
-        // it means it had leading zeroes ("01.2.3"), too many/few dots ("1.2" or "1.2.3.4"),
-        // or numeric overflow. Without '-' or '+', it is definitively an invalid version.
-        if s.bytes().all(|b| b.is_ascii_digit() || b == b'.') {
-            return Err(SemverError::InvalidVersion(input.to_string()));
-        }
-
-        // Split off build metadata first '+'
-        let (ver_pre, build) = if let Some(idx) = s.find('+') {
-            let b_str = &s[idx + 1..];
-            if b_str.is_empty() {
-                return Err(SemverError::InvalidVersion(input.to_string()));
+        let tail = &s[pos..];
+        match bytes[pos] {
+            b'+' => {
+                let build = parse_strict_build_list(&s[pos + 1..], input)?;
+                Ok(Self {
+                    major,
+                    minor,
+                    patch,
+                    prerelease: Vec::new(),
+                    build,
+                })
             }
-            let mut builds = Vec::new();
-            for part in b_str.split('.') {
-                let part = part.trim();
-                if part.is_empty() || !part.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
-                    return Err(SemverError::InvalidVersion(input.to_string()));
-                }
-                builds.push(part.to_string());
-            }
-            (&s[..idx], builds)
-        } else {
-            (s, Vec::new())
-        };
-
-        // Split off prerelease '-'
-        let (ver_part, prerelease) = if let Some(idx) = ver_pre.find('-') {
-            let p_str = &ver_pre[idx + 1..];
-            if p_str.is_empty() {
-                return Err(SemverError::InvalidVersion(input.to_string()));
-            }
-            let mut pres = Vec::new();
-            for part in p_str.split('.') {
-                let part = part.trim();
-                if part.is_empty() || !part.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
-                    return Err(SemverError::InvalidPrerelease(p_str.to_string()));
-                }
-                // Check if part is purely numeric
-                if part.chars().all(|c| c.is_ascii_digit()) {
-                    // SemVer 2.0.0 §9: Numeric identifiers MUST NOT include leading zeroes
-                    if part.len() > 1 && part.starts_with('0') {
-                        return Err(SemverError::InvalidPrerelease(p_str.to_string()));
-                    }
-                    let n = part
-                        .parse::<u64>()
-                        .map_err(|_| SemverError::InvalidPrerelease(p_str.to_string()))?;
-                    pres.push(PrereleaseId::Numeric(n));
+            b'-' => {
+                let after_dash = &s[pos + 1..];
+                let (pre_str, build) = if let Some(plus_rel) = after_dash.find('+') {
+                    let b_str = &after_dash[plus_rel + 1..];
+                    let build = parse_strict_build_list(b_str, input)?;
+                    (&after_dash[..plus_rel], build)
                 } else {
-                    pres.push(PrereleaseId::Alpha(part.to_string()));
-                }
+                    (after_dash, Vec::new())
+                };
+                let prerelease = parse_prerelease_list(pre_str, tail, input, false)?;
+                Ok(Self {
+                    major,
+                    minor,
+                    patch,
+                    prerelease,
+                    build,
+                })
             }
-            (&ver_pre[..idx], pres)
-        } else {
-            (ver_pre, Vec::new())
-        };
-
-        // Parse major.minor.patch without allocating a Vec
-        let mut split = ver_part.split('.');
-        let p0 = split.next();
-        let p1 = split.next();
-        let p2 = split.next();
-        if split.next().is_some() {
-            return Err(SemverError::InvalidVersion(input.to_string()));
+            _ => Err(SemverError::InvalidVersion(input.to_string())),
         }
-        let (p0, p1, p2) = match (p0, p1, p2) {
-            (Some(a), Some(b), Some(c)) => (a, b, c),
-            _ => return Err(SemverError::InvalidVersion(input.to_string())),
-        };
-
-        let major = parse_u64_segment(p0.trim().as_bytes())
-            .ok_or_else(|| SemverError::InvalidVersion(input.to_string()))?;
-        let minor = parse_u64_segment(p1.trim().as_bytes())
-            .ok_or_else(|| SemverError::InvalidVersion(input.to_string()))?;
-        let patch = parse_u64_segment(p2.trim().as_bytes())
-            .ok_or_else(|| SemverError::InvalidVersion(input.to_string()))?;
-
-        Ok(Self {
-            major,
-            minor,
-            patch,
-            prerelease,
-            build,
-        })
     }
 
     /// Loose version parsing supporting "v", "=", leading/trailing spaces,
     /// and partial versions like "1", "1.2" which default missing minor/patch to 0.
     pub fn parse_loose(input: &str) -> Result<Self, SemverError> {
-        let trimmed = input.trim();
-        // node-semver loose mode strips leading 'v', 'V', '=', and whitespace
-        let s = trimmed.trim_start_matches(['v', 'V', '=', ' ']);
-        let s = s.trim();
-        // node-semver never accepts inner whitespace: "2.5.0 - 3" is a range.
-        if s.is_empty() || s.chars().any(char::is_whitespace) {
-            return Err(SemverError::InvalidVersion(input.to_string()));
-        }
+        let raw_bytes = input.as_bytes();
+        let s = if !raw_bytes.is_empty()
+            && raw_bytes[0].is_ascii_digit()
+            && raw_bytes[raw_bytes.len() - 1] > b' '
+            && raw_bytes[raw_bytes.len() - 1] < 0x80
+        {
+            input
+        } else {
+            let trimmed = input.trim();
+            // node-semver loose mode strips leading 'v', 'V', '=', and whitespace
+            let s = trimmed.trim_start_matches(['v', 'V', '=', ' ']);
+            s.trim()
+        };
 
-        // Fast path: if s contains only digits and dots, parse 1..=3 segments directly
-        if s.bytes().all(|b| b.is_ascii_digit() || b == b'.') {
-            let mut split = s.split('.');
-            let p0 = split.next();
-            let p1 = split.next();
-            let p2 = split.next();
-            if split.next().is_some() {
-                return Err(SemverError::InvalidVersion(input.to_string()));
-            }
-            let p0 = p0.ok_or_else(|| SemverError::InvalidVersion(input.to_string()))?;
-            let major = parse_loose_u64_segment(p0.as_bytes())
-                .ok_or_else(|| SemverError::InvalidVersion(input.to_string()))?;
-            let minor = if let Some(p1) = p1 {
-                parse_loose_u64_segment(p1.as_bytes())
-                    .ok_or_else(|| SemverError::InvalidVersion(input.to_string()))?
-            } else {
-                0
-            };
-            let patch = if let Some(p2) = p2 {
-                parse_loose_u64_segment(p2.as_bytes())
-                    .ok_or_else(|| SemverError::InvalidVersion(input.to_string()))?
-            } else {
-                0
-            };
+        let bytes = s.as_bytes();
+        let Some((major, minor, patch, pos)) = parse_loose_prefix(bytes) else {
+            return Err(SemverError::InvalidVersion(input.to_string()));
+        };
+
+        if pos == bytes.len() {
             return Ok(Self {
                 major,
                 minor,
@@ -289,78 +401,46 @@ impl Version {
             });
         }
 
-        // Split off build metadata first '+'
-        let (ver_pre, build) = if let Some(idx) = s.find('+') {
-            let b_str = &s[idx + 1..];
-            let builds: Vec<String> = b_str.split('.').map(|p| p.trim().to_string()).collect();
-            (&s[..idx], builds)
-        } else {
-            (s, Vec::new())
-        };
-
-        // Split off prerelease '-'
-        let (ver_part, prerelease) = if let Some(idx) = ver_pre.find('-') {
-            let p_str = &ver_pre[idx + 1..];
-            if p_str.is_empty() {
-                return Err(SemverError::InvalidVersion(input.to_string()));
-            }
-            let mut pres = Vec::new();
-            for part in p_str.split('.') {
-                let part = part.trim();
-                if part.is_empty() {
-                    return Err(SemverError::InvalidPrerelease(p_str.to_string()));
+        let tail = &s[pos..];
+        match bytes[pos] {
+            b'+' => {
+                if tail.chars().any(char::is_whitespace) {
+                    return Err(SemverError::InvalidVersion(input.to_string()));
                 }
-                // In loose mode, parse all-digit segments as numeric (e.g. 01 -> 1)
-                if part.chars().all(|c| c.is_ascii_digit()) {
-                    if let Ok(n) = part.parse::<u64>() {
-                        pres.push(PrereleaseId::Numeric(n));
-                        continue;
+                let build: Vec<String> = s[pos + 1..].split('.').map(str::to_string).collect();
+                Ok(Self {
+                    major,
+                    minor,
+                    patch,
+                    prerelease: Vec::new(),
+                    build,
+                })
+            }
+            b'-' => {
+                let after_dash = &s[pos + 1..];
+                let (pre_str, build) = if let Some(plus_rel) = after_dash.find('+') {
+                    if tail.chars().any(char::is_whitespace) {
+                        return Err(SemverError::InvalidVersion(input.to_string()));
                     }
-                }
-                pres.push(PrereleaseId::Alpha(part.to_string()));
+                    let build: Vec<String> = after_dash[plus_rel + 1..]
+                        .split('.')
+                        .map(str::to_string)
+                        .collect();
+                    (&after_dash[..plus_rel], build)
+                } else {
+                    (after_dash, Vec::new())
+                };
+                let prerelease = parse_prerelease_list(pre_str, tail, input, true)?;
+                Ok(Self {
+                    major,
+                    minor,
+                    patch,
+                    prerelease,
+                    build,
+                })
             }
-            (&ver_pre[..idx], pres)
-        } else {
-            (ver_pre, Vec::new())
-        };
-
-        // Parse major[.minor[.patch]] without allocating a Vec
-        let mut split = ver_part.split('.');
-        let p0 = split.next();
-        let p1 = split.next();
-        let p2 = split.next();
-        if split.next().is_some() {
-            return Err(SemverError::InvalidVersion(input.to_string()));
+            _ => Err(SemverError::InvalidVersion(input.to_string())),
         }
-        let p0 = p0.ok_or_else(|| SemverError::InvalidVersion(input.to_string()))?;
-        let major = p0
-            .trim()
-            .parse::<u64>()
-            .map_err(|_| SemverError::InvalidVersion(input.to_string()))?;
-
-        let minor = if let Some(p1) = p1 {
-            p1.trim()
-                .parse::<u64>()
-                .map_err(|_| SemverError::InvalidVersion(input.to_string()))?
-        } else {
-            0
-        };
-
-        let patch = if let Some(p2) = p2 {
-            p2.trim()
-                .parse::<u64>()
-                .map_err(|_| SemverError::InvalidVersion(input.to_string()))?
-        } else {
-            0
-        };
-
-        Ok(Self {
-            major,
-            minor,
-            patch,
-            prerelease,
-            build,
-        })
     }
 
     #[inline]
@@ -531,13 +611,7 @@ impl Ord for Version {
             ord => return ord,
         }
 
-        // Fast path: if neither has prerelease, versions are equal
-        if self.prerelease.is_empty() && other.prerelease.is_empty() {
-            return Ordering::Equal;
-        }
-
-        // Compare prereleases
-        // 1. Version without prerelease has higher precedence than with prerelease
+        // Compare prereleases: version without prerelease has higher precedence
         match (self.prerelease.is_empty(), other.prerelease.is_empty()) {
             (true, true) => Ordering::Equal,
             (true, false) => Ordering::Greater,
@@ -615,7 +689,13 @@ impl Serialize for Version {
     where
         S: Serializer,
     {
-        serializer.serialize_str(&self.to_string())
+        if self.prerelease.is_empty() && self.build.is_empty() {
+            let mut buf = [0u8; 64];
+            let s = format_simple_version(self.major, self.minor, self.patch, &mut buf);
+            serializer.serialize_str(s)
+        } else {
+            serializer.serialize_str(&self.to_string())
+        }
     }
 }
 

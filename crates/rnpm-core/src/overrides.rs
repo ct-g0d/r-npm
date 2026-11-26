@@ -2,10 +2,11 @@ use crate::error::OverrideError;
 use crate::manifest::Manifest;
 use crate::semver::{
     comparator::{Comparator, Op},
-    range::ComparatorSet,
+    range::{try_parse_fast_set_stack, ComparatorSet, StackComparator},
     Range, Version,
 };
 use serde::{Deserialize, Serialize};
+use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 /// Value in an override definition: either an exact spec string or a nested map of overrides.
@@ -76,7 +77,11 @@ impl PrecompiledPattern {
             }
         }
 
-        let r_extracted = extract_semver_range_from_spec(r);
+        let r_extracted = if r.contains('#') {
+            extract_semver_range_from_spec(r)
+        } else {
+            None
+        };
         let r_str = r_extracted.as_deref().unwrap_or(r).trim();
         if r_str == "*" || r_str.eq_ignore_ascii_case("x") {
             return true;
@@ -85,17 +90,20 @@ impl PrecompiledPattern {
         match self {
             PrecompiledPattern::Any => true,
             PrecompiledPattern::ExactVersion(p_ver) => {
-                if let Ok(r_ver) = Version::parse(r_str) {
-                    return p_ver == &r_ver;
-                }
-                if let Ok(r_range) = Range::parse(r_str) {
-                    return r_range.satisfies(p_ver);
-                }
-                false
+                Range::satisfies_str(r_str, p_ver).unwrap_or(false)
             }
             PrecompiledPattern::SemverRange(p_range) => {
-                if let Ok(r_ver) = Version::parse(r_str) {
-                    return p_range.satisfies(&r_ver);
+                if let Some(res) = ranges_intersect_simple_str(p_range, r_str) {
+                    return res;
+                }
+                if !r_str
+                    .as_bytes()
+                    .first()
+                    .is_some_and(|&b| matches!(b, b'^' | b'~' | b'>' | b'<'))
+                {
+                    if let Ok(r_ver) = Version::parse(r_str) {
+                        return p_range.satisfies(&r_ver);
+                    }
                 }
                 if let Ok(r_range) = Range::parse(r_str) {
                     return ranges_intersect(p_range, &r_range);
@@ -208,6 +216,12 @@ impl PrecompiledNode {
         let rule_list = self.rules_by_pkg.get(parent_name)?;
 
         for rule in rule_list {
+            let (Some(ref nested_node), Some(OverrideValue::Nested(ref nested_map))) =
+                (&rule.nested, rules.get(&rule.raw_key))
+            else {
+                continue;
+            };
+
             let matches_parent = if rule.has_spec && !parent_ver.is_empty() {
                 rule.pattern.matches(parent_ver)
             } else {
@@ -215,24 +229,20 @@ impl PrecompiledNode {
             };
 
             if matches_parent {
-                if let (Some(ref nested_node), Some(OverrideValue::Nested(ref nested_map))) =
-                    (&rule.nested, rules.get(&rule.raw_key))
-                {
-                    if ancestors.len() > 1 {
-                        for next_idx in 1..ancestors.len() {
-                            if let Some(res) = nested_node.find_in_nested(
-                                nested_map,
-                                &ancestors[next_idx..],
-                                dep_name,
-                                requested_spec,
-                            ) {
-                                return Some(res);
-                            }
+                if ancestors.len() > 1 {
+                    for next_idx in 1..ancestors.len() {
+                        if let Some(res) = nested_node.find_in_nested(
+                            nested_map,
+                            &ancestors[next_idx..],
+                            dep_name,
+                            requested_spec,
+                        ) {
+                            return Some(res);
                         }
                     }
-                    if let Some(res) = nested_node.find_direct(nested_map, dep_name, requested_spec) {
-                        return Some(res);
-                    }
+                }
+                if let Some(res) = nested_node.find_direct(nested_map, dep_name, requested_spec) {
+                    return Some(res);
                 }
             }
         }
@@ -332,10 +342,15 @@ impl Overrides {
     pub fn from_manifest(
         manifest: &Manifest,
     ) -> Result<Self, OverrideError> {
-        Ok(Self::from_json_value(
-            manifest.extra.get("overrides"),
-            Self::reference_specs(manifest),
-        ))
+        let Some(overrides_val) = manifest.extra.get("overrides") else {
+            return Ok(Self::default());
+        };
+        let mut rules = BTreeMap::new();
+        parse_overrides_into_map(overrides_val, &mut rules);
+        if rules.is_empty() {
+            return Ok(Self::default());
+        }
+        Ok(Self::new(rules, Self::reference_specs(manifest)))
     }
 
     /// Specs that `$name` override references resolve to. arborist's
@@ -516,28 +531,23 @@ fn split_arrow_key(key: &str) -> Vec<String> {
         return vec![key.trim().to_string()];
     }
 
-    let mut parts = Vec::new();
-    let chars: Vec<char> = key.chars().collect();
-    let mut last_idx = 0;
-    let mut i = 0;
+    let mut parts = Vec::with_capacity(2);
+    let bytes = key.as_bytes();
+    let mut last_idx = 0usize;
+    let mut i = 0usize;
 
-    while i < chars.len() {
-        if chars[i] == '>' {
-            let is_comparator = is_comparator_gt(&chars, i, last_idx);
-            if !is_comparator {
-                let part: String = chars[last_idx..i].iter().collect();
-                let trimmed = part.trim();
-                if !trimmed.is_empty() {
-                    parts.push(trimmed.to_string());
-                }
-                last_idx = i + 1;
+    while i < bytes.len() {
+        if bytes[i] == b'>' && !is_comparator_gt(key, i, last_idx) {
+            let trimmed = key[last_idx..i].trim();
+            if !trimmed.is_empty() {
+                parts.push(trimmed.to_string());
             }
+            last_idx = i + 1;
         }
         i += 1;
     }
 
-    let last_part: String = chars[last_idx..].iter().collect();
-    let trimmed = last_part.trim();
+    let trimmed = key[last_idx..].trim();
     if !trimmed.is_empty() {
         parts.push(trimmed.to_string());
     }
@@ -549,50 +559,50 @@ fn split_arrow_key(key: &str) -> Vec<String> {
     }
 }
 
-/// Checks whether a `>` character at index `i` is a semver comparator (e.g. `>=1.0.0`, `>1.0.0`, `@ > 1.0.0`)
+/// Checks whether a `>` character at byte index `i` is a semver comparator (e.g. `>=1.0.0`, `>1.0.0`, `@ > 1.0.0`)
 /// rather than an override arrow separator `>`.
-fn is_comparator_gt(chars: &[char], i: usize, segment_start: usize) -> bool {
+fn is_comparator_gt(key: &str, i: usize, segment_start: usize) -> bool {
+    let bytes = key.as_bytes();
     // 1. Always treat `>=` as a comparator
-    if i + 1 < chars.len() && chars[i + 1] == '=' {
+    if i + 1 < bytes.len() && bytes[i + 1] == b'=' {
         return true;
     }
 
     // 2. Must be in a version context (after a version '@')
-    if !has_version_context(chars, segment_start, i) {
+    if !has_version_context(&bytes[segment_start..i]) {
         return false;
     }
 
     // 3. In a version context, '>' followed by a digit or 'v' + digit is a comparator (e.g. `>1.0.0`, `> 1.0.0`)
-    let next_non_ws = (i + 1..chars.len()).find(|&k| !chars[k].is_whitespace());
-    if let Some(next) = next_non_ws {
-        if chars[next].is_ascii_digit() {
-            return true;
-        }
-        if (chars[next] == 'v' || chars[next] == 'V')
-            && next + 1 < chars.len()
-            && chars[next + 1].is_ascii_digit()
-        {
-            return true;
-        }
+    let mut rem = key[i + 1..].trim_start().as_bytes();
+    if rem.is_empty() {
+        return false;
+    }
+    if rem[0].is_ascii_digit() {
+        return true;
+    }
+    if (rem[0] == b'v' || rem[0] == b'V') && rem.len() > 1 {
+        rem = &rem[1..];
+        return rem[0].is_ascii_digit();
     }
     false
 }
 
-/// Checks whether there is a version specifier '@' within `chars[start..end]`.
+/// Checks whether there is a version specifier '@' within `segment`.
 /// A leading '@' (e.g. `@scope/pkg`) is a package scope prefix, not a version specifier.
-fn has_version_context(chars: &[char], start: usize, end: usize) -> bool {
-    let mut at_count = 0;
+fn has_version_context(segment: &[u8]) -> bool {
+    let mut at_count = 0usize;
     let mut first_non_ws_is_at = false;
     let mut found_first_non_ws = false;
 
-    for &ch in &chars[start..end] {
-        if !found_first_non_ws && !ch.is_whitespace() {
+    for &b in segment {
+        if !found_first_non_ws && !b.is_ascii_whitespace() && b < 0x80 {
             found_first_non_ws = true;
-            if ch == '@' {
+            if b == b'@' {
                 first_non_ws_is_at = true;
             }
         }
-        if ch == '@' {
+        if b == b'@' {
             at_count += 1;
         }
     }
@@ -790,6 +800,188 @@ fn comparator_sets_intersect(cs1: &ComparatorSet, cs2: &ComparatorSet) -> bool {
         }
     }
     true
+}
+
+/// Compares a full `Version` against a stack-allocated `StackComparator` tuple.
+#[inline]
+fn cmp_version_to_stack(v: &Version, s: &StackComparator) -> Ordering {
+    match (v.major, v.minor, v.patch).cmp(&(s.major, s.minor, s.patch)) {
+        Ordering::Equal => match (v.prerelease.is_empty(), s.is_upper_pre0) {
+            (true, false) => Ordering::Equal,
+            (true, true) => Ordering::Greater,
+            (false, false) => Ordering::Less,
+            (false, true) => {
+                // Compare v.prerelease against [Numeric(0)]
+                let p0 = match v.prerelease.first() {
+                    Some(crate::semver::version::PrereleaseId::Numeric(0)) => Ordering::Equal,
+                    Some(crate::semver::version::PrereleaseId::Numeric(_)) => Ordering::Greater,
+                    Some(crate::semver::version::PrereleaseId::Alpha(_)) => Ordering::Greater,
+                    None => Ordering::Greater,
+                };
+                match p0 {
+                    Ordering::Equal => v.prerelease.len().cmp(&1),
+                    ord => ord,
+                }
+            }
+        },
+        ord => ord,
+    }
+}
+
+#[inline]
+fn eval_op_ord(op: Op, ord: Ordering) -> bool {
+    match op {
+        Op::Eq => ord == Ordering::Equal,
+        Op::Gt => ord == Ordering::Greater,
+        Op::Gte => ord != Ordering::Less,
+        Op::Lt => ord == Ordering::Less,
+        Op::Lte => ord != Ordering::Greater,
+    }
+}
+
+#[inline]
+fn single_comp_matches_stack(c: &Comparator, s: &StackComparator) -> bool {
+    let rev = cmp_version_to_stack(&c.version, s).reverse();
+    if !eval_op_ord(c.op, rev) {
+        return false;
+    }
+    !s.is_upper_pre0
+        || (c.version.is_prerelease()
+            && c.version.major == s.major
+            && c.version.minor == s.minor
+            && c.version.patch == s.patch)
+}
+
+#[inline]
+fn stack_comp_matches_version(s: &StackComparator, v: &Version) -> bool {
+    let ord = cmp_version_to_stack(v, s);
+    if !eval_op_ord(s.op, ord) {
+        return false;
+    }
+    !v.is_prerelease()
+        || (s.is_upper_pre0 && s.major == v.major && s.minor == v.minor && s.patch == v.patch)
+}
+
+#[inline]
+fn cmp_stack_pair(a: &StackComparator, b: &StackComparator) -> Ordering {
+    match (a.major, a.minor, a.patch).cmp(&(b.major, b.minor, b.patch)) {
+        Ordering::Equal => match (a.is_upper_pre0, b.is_upper_pre0) {
+            (true, true) | (false, false) => Ordering::Equal,
+            (true, false) => Ordering::Less,
+            (false, true) => Ordering::Greater,
+        },
+        ord => ord,
+    }
+}
+
+#[inline]
+fn bounds_intersect(op1: Op, is_lt0_1: bool, op2: Op, is_lt0_2: bool, ord: Ordering) -> bool {
+    if is_lt0_1 || is_lt0_2 {
+        return false;
+    }
+    let inc1 = matches!(op1, Op::Gt | Op::Gte);
+    let inc2 = matches!(op2, Op::Gt | Op::Gte);
+    let dec1 = matches!(op1, Op::Lt | Op::Lte);
+    let dec2 = matches!(op2, Op::Lt | Op::Lte);
+    (inc1 && inc2)
+        || (dec1 && dec2)
+        || (ord == Ordering::Equal && matches!(op1, Op::Gte | Op::Lte) && matches!(op2, Op::Gte | Op::Lte))
+        || (inc1 && dec2 && ord == Ordering::Less)
+        || (dec1 && inc2 && ord == Ordering::Greater)
+}
+
+#[inline]
+fn stack_comparator_intersects(s1: &StackComparator, s2: &StackComparator) -> bool {
+    if s1.op == Op::Eq {
+        return eval_op_ord(s2.op, cmp_stack_pair(s1, s2))
+            && (!s1.is_upper_pre0
+                || (s2.is_upper_pre0
+                    && s2.major == s1.major
+                    && s2.minor == s1.minor
+                    && s2.patch == s1.patch));
+    }
+    if s2.op == Op::Eq {
+        return eval_op_ord(s1.op, cmp_stack_pair(s2, s1))
+            && (!s2.is_upper_pre0
+                || (s1.is_upper_pre0
+                    && s1.major == s2.major
+                    && s1.minor == s2.minor
+                    && s1.patch == s2.patch));
+    }
+    bounds_intersect(
+        s1.op,
+        s1.op == Op::Lt && s1.major == 0 && s1.minor == 0 && s1.patch == 0,
+        s2.op,
+        s2.op == Op::Lt && s2.major == 0 && s2.minor == 0 && s2.patch == 0,
+        cmp_stack_pair(s1, s2),
+    )
+}
+
+#[inline]
+fn comparator_stack_intersects(c: &Comparator, s: &StackComparator) -> bool {
+    if c.op == Op::Eq {
+        return stack_comp_matches_version(s, &c.version);
+    }
+    if s.op == Op::Eq {
+        return single_comp_matches_stack(c, s);
+    }
+    bounds_intersect(
+        c.op,
+        c.op == Op::Lt && c.version.major == 0 && c.version.minor == 0 && c.version.patch == 0,
+        s.op,
+        s.op == Op::Lt && s.major == 0 && s.minor == 0 && s.patch == 0,
+        cmp_version_to_stack(&c.version, s),
+    )
+}
+
+/// Zero-allocation fast path checking if `r1` intersects a simple single-set semver string `r2_str`.
+#[inline]
+fn ranges_intersect_simple_str(r1: &Range, r2_str: &str) -> Option<bool> {
+    if r1.sets.is_empty() {
+        return Some(false);
+    }
+    let mut s2_buf = [StackComparator::new(Op::Eq, 0, 0, 0, false); 4];
+    let s2_len = try_parse_fast_set_stack(r2_str, &mut s2_buf)?;
+    let s2 = &s2_buf[..s2_len];
+
+    // Check internal satisfiability of s2
+    for i in 0..s2.len() {
+        for j in i + 1..s2.len() {
+            if !stack_comparator_intersects(&s2[i], &s2[j]) {
+                return Some(false);
+            }
+        }
+    }
+
+    if r1.is_wildcard() {
+        return Some(true);
+    }
+
+    if s2.len() == 1 && s2[0].is_wildcard() {
+        return Some(r1.sets.iter().any(|s| {
+            is_set_satisfiable(s)
+                && !s.comparators.iter().any(|c| c.op == Op::Eq && c.version.is_prerelease())
+        }));
+    }
+
+    for set1 in &r1.sets {
+        if !is_set_satisfiable(set1) {
+            continue;
+        }
+        let mut all_ok = true;
+        'pair: for c1 in &set1.comparators {
+            for c2 in s2 {
+                if !comparator_stack_intersects(c1, c2) {
+                    all_ok = false;
+                    break 'pair;
+                }
+            }
+        }
+        if all_ok {
+            return Some(true);
+        }
+    }
+    Some(false)
 }
 
 /// Checks if two semver Ranges intersect, matching node-semver `semver.intersects(r1, r2)`.

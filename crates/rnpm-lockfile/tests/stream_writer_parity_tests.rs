@@ -526,3 +526,285 @@ fn test_lockfile_writer_direct_api() {
     assert!(out.contains("\"name\": \"sample-app\""));
 }
 
+/// Reference formatter replicating the pre-optimization `serde_json::to_value` + `write_value` path.
+fn format_lockfile_via_reference(lockfile: &LockfileV3, indent: &str, newline: &str, compact: bool) -> String {
+    let writer = LockfileWriter::new(indent, newline, compact, true);
+    let mut root_map = serde_json::Map::new();
+    root_map.insert("name".to_string(), serde_json::Value::String(lockfile.name.clone()));
+    if let Some(ref v) = lockfile.version {
+        root_map.insert("version".to_string(), serde_json::Value::String(v.clone()));
+    }
+    root_map.insert(
+        "lockfileVersion".to_string(),
+        serde_json::Value::Number(serde_json::Number::from(lockfile.lockfile_version)),
+    );
+    if let Some(r) = lockfile.requires {
+        root_map.insert("requires".to_string(), serde_json::Value::Bool(r));
+    }
+    let mut pkgs_map = serde_json::Map::new();
+    for (k, v) in &lockfile.packages {
+        let pkg_val = if let Some(ref raw) = v.raw_value {
+            raw.clone()
+        } else {
+            let mut cloned = v.clone();
+            cloned.normalize_flags();
+            serde_json::to_value(&cloned).unwrap()
+        };
+        pkgs_map.insert(rnpm_core::to_posix_path(k), pkg_val);
+    }
+    root_map.insert("packages".to_string(), serde_json::Value::Object(pkgs_map));
+    let mut out = String::new();
+    writer.write_value(&serde_json::Value::Object(root_map), 0, &mut out);
+    if !compact {
+        out.push_str(newline);
+    }
+    out
+}
+
+#[test]
+fn test_direct_write_package_matches_serde_to_value_all_variants() {
+    use rnpm_core::manifest::BundledDependencies;
+    use rnpm_core::PlatformList;
+
+    let mut lockfile = LockfileV3::new("parity\"app\\line\n\t\x08\x0c\x01", Some("1.0.0".to_string()));
+    lockfile.requires = Some(true);
+
+    // Package 1: devOptional splitting, scalar/array PlatformList, Bin Single, Bundled bool, String engines, escapes
+    let mut deps_sw = BTreeMap::new();
+    deps_sw.insert("zlib".to_string(), "^1.0.0".to_string());
+    deps_sw.insert("version".to_string(), "^2.0.0".to_string());
+    deps_sw.insert("name".to_string(), "^3.0.0".to_string());
+    deps_sw.insert("dependencies".to_string(), "^4.0.0".to_string());
+
+    let mut peer_meta = BTreeMap::new();
+    peer_meta.insert("react".to_string(), serde_json::json!({ "optional": true }));
+
+    lockfile.insert_package(
+        "node_modules/pkg-all-scalars",
+        LockfilePackage {
+            name: Some("pkg\"one\\name".to_string()),
+            version: Some("1.2.3".to_string()),
+            resolved: Some("https://registry.npmjs.org/a/-/a-1.2.3.tgz".to_string()),
+            integrity: Some("sha512-abc==".to_string()),
+            link: Some(false),
+            dev: Some(true),
+            optional: Some(true),
+            dev_optional: Some(true), // must clear dev & optional!
+            peer: Some(true),
+            peer_optional: Some(true),
+            in_bundle: Some(true),
+            has_install_script: Some(true),
+            has_shrinkwrap: Some(true),
+            extraneous: Some(true),
+            license: Some("MIT\nOR\tApache-2.0".to_string()),
+            os: Some(PlatformList::from("linux".to_string())),
+            cpu: Some(PlatformList::from(Vec::new())), // empty -> omitted
+            libc: Some(PlatformList::from(vec!["glibc".to_string(), "musl".to_string()])),
+            bin: Some(PackageBin::Single("./cli.js".to_string())),
+            engines: Some(PackageEngines::String("node>=18".to_string())),
+            bundle_dependencies: Some(BundledDependencies::Boolean(true)),
+            workspaces: Some(Vec::new()), // Some([]) -> emitted
+            dependencies: Some(deps_sw),
+            dev_dependencies: Some(BTreeMap::from([("vitest".to_string(), "^1.0.0".to_string())])),
+            optional_dependencies: Some(BTreeMap::from([("fsevents".to_string(), "^2.3.0".to_string())])),
+            peer_dependencies: Some(BTreeMap::from([("react".to_string(), ">=18".to_string())])),
+            peer_dependencies_meta: Some(peer_meta),
+            ..Default::default()
+        },
+    );
+
+    // Package 2: Map bin, List engines, Bundled list, workspaces non-empty
+    let mut bin_map = BTreeMap::new();
+    bin_map.insert("version".to_string(), "bin/ver.js".to_string());
+    bin_map.insert("alpha".to_string(), "bin/alpha.js".to_string());
+    lockfile.insert_package(
+        "node_modules/pkg-maps-and-lists",
+        LockfilePackage {
+            version: Some("2.0.0".to_string()),
+            bin: Some(PackageBin::Map(bin_map)),
+            engines: Some(PackageEngines::List(vec![serde_json::json!("node >= 16")])),
+            bundle_dependencies: Some(BundledDependencies::List(vec!["sub-a".to_string(), "sub-b".to_string()])),
+            workspaces: Some(vec!["packages/*".to_string()]),
+            ..Default::default()
+        },
+    );
+
+    // Package 3: Empty bin map, empty engines string, Boolean(false) bundled -> omitted; Other engines Object & extra with directories/deprecated + field shadow
+    let mut extra = BTreeMap::new();
+    extra.insert("directories".to_string(), serde_json::json!({ "lib": "src" }));
+    extra.insert("deprecated".to_string(), serde_json::Value::Bool(false));
+    extra.insert("funding".to_string(), serde_json::json!({ "type": "github", "url": "https://example.com" }));
+    extra.insert("customNote".to_string(), serde_json::json!("hello\u{0007}"));
+    extra.insert("version".to_string(), serde_json::json!("9.9.9-override"));
+
+    lockfile.insert_package(
+        "node_modules/pkg-extra-and-other",
+        LockfilePackage {
+            version: Some("0.1.0".to_string()),
+            bin: Some(PackageBin::Map(BTreeMap::new())),
+            engines: Some(PackageEngines::Other(serde_json::json!({ "node": ">=20", "strict": true }))),
+            bundle_dependencies: Some(BundledDependencies::Boolean(false)),
+            extra,
+            ..Default::default()
+        },
+    );
+
+    // Package 4: Totally empty package `{}` and engines Other(Bool(true))
+    lockfile.insert_package("node_modules/pkg-empty", LockfilePackage::default());
+    lockfile.insert_package(
+        "node_modules/pkg-engines-bool",
+        LockfilePackage {
+            engines: Some(PackageEngines::Other(serde_json::Value::Bool(true))),
+            bundle_dependencies: Some(BundledDependencies::List(Vec::new())),
+            ..Default::default()
+        },
+    );
+
+    for fmt in [
+        ManifestFormat { indent: "  ".to_string(), newline: "\n".to_string(), ..Default::default() },
+        ManifestFormat { indent: "    ".to_string(), newline: "\r\n".to_string(), ..Default::default() },
+        ManifestFormat { indent: "\t".to_string(), newline: "\n".to_string(), ..Default::default() },
+    ] {
+        let actual = lockfile.to_json_string_version_formatted(3, &fmt).unwrap();
+        let expected = format_lockfile_via_reference(&lockfile, &fmt.indent, &fmt.newline, false);
+        assert_eq!(actual, expected, "pretty parity failed for indent={:?} newline={:?}", fmt.indent, fmt.newline);
+    }
+
+    let actual_compact = lockfile.to_json_string_version_compact(3).unwrap();
+    let expected_compact = format_lockfile_via_reference(&lockfile, "", "", true);
+    assert_eq!(actual_compact, expected_compact, "compact parity failed");
+}
+
+#[test]
+fn test_single_pass_deserialization_and_migration_edge_cases() {
+    let raw_json = r#"{
+  "name": "single-pass-edge",
+  "version": "1.0.0",
+  "lockfileVersion": 3,
+  "packages": {
+    "": {
+      "name": "single-pass-edge",
+      "version": "1.0.0"
+    },
+    "node_modules\\win-pkg": {
+      "version": "1.0.0",
+      "_integrity": "sha512-alias==",
+      "_hasShrinkwrap": true,
+      "bundled": true,
+      "dev": false,
+      "directories": { "bin": "bin" },
+      "deprecated": false,
+      "license": { "type": "ISC", "name": "MIT" },
+      "engines": { "node": ">=18", "mixed": 42 },
+      "os": "darwin",
+      "bin": { "cli": "bin/cli.js" }
+    },
+    "node_modules/arr-license": {
+      "version": "2.0.0",
+      "license": ["MIT", "Apache-2.0"],
+      "dependencies": { "win-pkg": "^1.0.0" }
+    }
+  }
+}"#;
+
+    let normal = LockfileV3::from_json_str(raw_json).expect("from_json_str");
+    let readonly = LockfileV3::from_json_str_readonly(raw_json).expect("from_json_str_readonly");
+    let migrated = parse_and_migrate(raw_json).expect("parse_and_migrate");
+
+    let win_norm = &normal.packages["node_modules/win-pkg"];
+    let win_ro = &readonly.packages["node_modules/win-pkg"];
+    assert_eq!(win_norm.integrity.as_deref(), Some("sha512-alias=="));
+    assert_eq!(win_norm.has_shrinkwrap, Some(true));
+    assert_eq!(win_norm.in_bundle, Some(true));
+    assert_eq!(win_norm.dev, None); // normalized out of struct
+    assert!(!win_norm.extra.contains_key("directories"));
+    assert!(!win_norm.extra.contains_key("deprecated"));
+    assert_eq!(win_norm.license.as_deref(), Some("ISC"));
+    assert!(matches!(win_norm.engines, Some(PackageEngines::Other(_))));
+    assert!(win_norm.os.as_ref().is_some_and(|p| p.is_scalar() && p.as_slice() == ["darwin"]));
+    assert!(matches!(win_norm.bin, Some(PackageBin::Map(_))));
+
+    // Untouched raw_value preserved on normal/migrated, None on readonly
+    let raw_obj = win_norm.raw_value.as_ref().expect("raw_value cached").as_object().unwrap();
+    assert_eq!(raw_obj.get("_integrity").and_then(|v| v.as_str()), Some("sha512-alias=="));
+    assert_eq!(raw_obj.get("dev").and_then(|v| v.as_bool()), Some(false));
+    assert!(raw_obj.contains_key("directories"));
+    assert_eq!(win_ro.raw_value, None);
+
+    let mut stripped_norm = normal.clone();
+    for pkg in stripped_norm.packages.values_mut() {
+        pkg.raw_value = None;
+    }
+    assert_eq!(stripped_norm, readonly);
+    assert_eq!(normal, migrated);
+    assert_eq!(normal.packages["node_modules/arr-license"].license.as_deref(), Some("MIT OR Apache-2.0"));
+
+    // v3 with null packages must fail like serde BTreeMap
+    let null_pkgs = r#"{ "name": "bad", "lockfileVersion": 3, "packages": null }"#;
+    assert!(parse_and_migrate(null_pkgs).is_err());
+
+    // packages appearing BEFORE lockfileVersion: 2 and 4
+    let v2_reordered = r#"{
+  "packages": {
+    "node_modules\\a": { "version": "1.0.0", "dev": false }
+  },
+  "lockfileVersion": 2,
+  "dependencies": {
+    "a": { "version": "1.0.0" }
+  }
+}"#;
+    let m2 = parse_and_migrate(v2_reordered).expect("v2 reordered");
+    assert_eq!(m2.lockfile_version, 3);
+    assert!(m2.packages.contains_key("node_modules/a"));
+
+    let v4_reordered = r#"{ "packages": {}, "lockfileVersion": 4 }"#;
+    assert!(matches!(parse_and_migrate(v4_reordered), Err(rnpm_lockfile::LockfileError::UnsupportedVersion(4))));
+}
+
+#[test]
+fn test_package_satisfies_spec_fast_vs_general_parity() {
+    let pkg = LockfilePackage {
+        name: Some("foo".to_string()),
+        version: Some("1.2.3".to_string()),
+        ..Default::default()
+    };
+
+    for (spec, expected) in [
+        ("", true),
+        ("*", true),
+        ("^1.2.0", true),
+        ("^2.0.0", false),
+        ("~1.2.0", true),
+        (">=1.0.0 <2.0.0", true),
+        ("1.2.3", true),
+        ("1.2.4", false),
+        ("v1.2.3", true),
+        ("=1.2.3", true),
+        ("1.x", true),
+        ("1.2.3 - 2.0.0", true),
+        ("^2.0.0 || ^1.2.0", true),
+        ("latest", true),
+        ("next-1", true),
+        ("npm:foo@^1.0.0", true),
+        ("npm:bar@^1.0.0", false),
+        ("??invalid-spec??", false),
+    ] {
+        assert_eq!(
+            LockfileV3::package_satisfies_spec("foo", &pkg, spec),
+            expected,
+            "spec={spec:?}"
+        );
+    }
+
+    assert!(!LockfileV3::package_satisfies_spec("wrong-name", &pkg, "^1.2.0"));
+
+    let bad_ver_pkg = LockfilePackage {
+        name: Some("foo".to_string()),
+        version: Some("not-a-semver".to_string()),
+        ..Default::default()
+    };
+    assert!(!LockfileV3::package_satisfies_spec("foo", &bad_ver_pkg, "1.2.3"));
+    assert!(!LockfileV3::package_satisfies_spec("foo", &bad_ver_pkg, "^1.0.0"));
+    assert!(LockfileV3::package_satisfies_spec("foo", &bad_ver_pkg, "latest"));
+}
+

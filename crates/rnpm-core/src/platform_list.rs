@@ -15,6 +15,9 @@ impl PlatformList {
     pub fn as_slice(&self) -> &[String] {
         &self.values
     }
+    pub fn is_scalar(&self) -> bool {
+        self.scalar
+    }
     pub fn is_empty(&self) -> bool {
         self.values.is_empty()
     }
