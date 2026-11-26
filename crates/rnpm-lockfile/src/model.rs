@@ -909,7 +909,10 @@ fn bundle_deps_from_json_value<E: serde::de::Error>(
             }
             Ok(Some(BundledDependencies::List(out)))
         }
-        _ => Err(E::custom("expected a boolean or array of strings for bundleDependencies")),
+        serde_json::Value::Object(map) => Ok(Some(BundledDependencies::List(
+            map.keys().cloned().collect(),
+        ))),
+        _ => Err(E::custom("expected a boolean, array of strings, or object for bundleDependencies")),
     }
 }
 

@@ -1833,3 +1833,17 @@ fn test_manifest_from_str_array_bin_parity() {
     assert_eq!(m_ro.bin, expected);
     assert_eq!(m_serde.bin, expected);
 }
+
+#[test]
+fn test_manifest_engines_float_formatting_parity() {
+    let json = r#"{
+  "name": "engines-float-pkg",
+  "version": "1.0.0",
+  "engines": { "node": 18.0, "npm": 10 }
+}"#;
+    let m_raw = Manifest::from_str(json).expect("Manifest::from_str");
+    let m_ro = Manifest::from_str_readonly(json).expect("Manifest::from_str_readonly");
+    assert_eq!(m_raw.engines, m_ro.engines);
+    assert_eq!(m_ro.engines.get("node").map(String::as_str), Some("18.0"));
+    assert_eq!(m_ro.engines.get("npm").map(String::as_str), Some("10"));
+}

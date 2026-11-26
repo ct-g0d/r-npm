@@ -82,7 +82,10 @@ impl<'de> Deserialize<'de> for EngineValue {
                 Ok(EngineValue(Some(v.to_string())))
             }
             fn visit_f64<E: de::Error>(self, v: f64) -> Result<Self::Value, E> {
-                Ok(EngineValue(Some(v.to_string())))
+                let s = serde_json::Number::from_f64(v)
+                    .map(|n| n.to_string())
+                    .unwrap_or_else(|| v.to_string());
+                Ok(EngineValue(Some(s)))
             }
             fn visit_none<E: de::Error>(self) -> Result<Self::Value, E> {
                 Ok(EngineValue(None))

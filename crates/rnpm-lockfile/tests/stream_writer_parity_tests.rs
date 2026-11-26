@@ -808,3 +808,40 @@ fn test_package_satisfies_spec_fast_vs_general_parity() {
     assert!(LockfileV3::package_satisfies_spec("foo", &bad_ver_pkg, "latest"));
 }
 
+#[test]
+fn test_bundle_dependencies_object_form_capture_raw_parity() {
+    use rnpm_core::manifest::BundledDependencies;
+
+    let json = r#"{
+  "name": "bundled-obj-test",
+  "version": "1.0.0",
+  "lockfileVersion": 3,
+  "packages": {
+    "": {
+      "name": "bundled-obj-test",
+      "version": "1.0.0"
+    },
+    "node_modules/a": {
+      "version": "1.0.0",
+      "bundleDependencies": { "foo": true, "bar": "^1.0.0" }
+    }
+  }
+}"#;
+
+    let full = LockfileV3::from_json_str(json).expect("from_json_str object bundleDependencies");
+    let ro = LockfileV3::from_json_str_readonly(json)
+        .expect("from_json_str_readonly object bundleDependencies");
+    let migrated = parse_and_migrate(json).expect("parse_and_migrate object bundleDependencies");
+
+    let expected = Some(BundledDependencies::List(vec![
+        "foo".to_string(),
+        "bar".to_string(),
+    ]));
+    assert_eq!(full.packages["node_modules/a"].bundle_dependencies, expected);
+    assert_eq!(ro.packages["node_modules/a"].bundle_dependencies, expected);
+    assert_eq!(
+        migrated.packages["node_modules/a"].bundle_dependencies,
+        expected
+    );
+}
+
