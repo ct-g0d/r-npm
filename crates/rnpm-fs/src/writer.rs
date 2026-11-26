@@ -7,7 +7,7 @@ use data_encoding::HEXLOWER;
 use flate2::read::GzDecoder;
 use path_clean::clean;
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
@@ -250,6 +250,41 @@ fn select_default_concurrency(seek_penalty: Option<bool>) -> (usize, bool) {
     }
 }
 
+#[cfg(windows)]
+#[inline]
+fn dir_exists_wide(wide_null_term: &[u16]) -> bool {
+    extern "system" {
+        fn GetFileAttributesW(lpFileName: *const u16) -> u32;
+    }
+    const INVALID_FILE_ATTRIBUTES: u32 = u32::MAX;
+    const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x10;
+    let attrs = unsafe { GetFileAttributesW(wide_null_term.as_ptr()) };
+    attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_DIRECTORY) != 0
+}
+
+#[cfg(windows)]
+#[inline]
+fn create_dir_wide_or_fallback(wide: &[u16]) {
+    use std::os::windows::ffi::OsStringExt;
+    extern "system" {
+        fn CreateDirectoryW(
+            lpPathName: *const u16,
+            lpSecurityAttributes: *mut std::ffi::c_void,
+        ) -> i32;
+        fn GetLastError() -> u32;
+    }
+    const ERROR_ALREADY_EXISTS: u32 = 183;
+
+    let ret = unsafe { CreateDirectoryW(wide.as_ptr(), std::ptr::null_mut()) };
+    if ret == 0 {
+        let err = unsafe { GetLastError() };
+        if err != ERROR_ALREADY_EXISTS && !dir_exists_wide(wide) {
+            let dir_path = std::ffi::OsString::from_wide(&wide[..wide.len().saturating_sub(1)]);
+            let _ = std::fs::create_dir_all(&dir_path);
+        }
+    }
+}
+
 /// Pre-creates a collection of directories in breadth-first order (by path depth),
 /// eliminating redundant `exists()` calls in the subsequent file write loop.
 ///
@@ -260,79 +295,291 @@ where
 {
     #[cfg(windows)]
     {
-        use std::os::windows::ffi::{OsStrExt, OsStringExt};
+        use std::os::windows::ffi::OsStrExt;
 
-        extern "system" {
-            fn CreateDirectoryW(
-                lpPathName: *const u16,
-                lpSecurityAttributes: *mut std::ffi::c_void,
-            ) -> i32;
-            fn GetLastError() -> u32;
-        }
-        const ERROR_ALREADY_EXISTS: u32 = 183;
+        let iter = dirs.into_iter();
+        let (lower, _) = iter.size_hint();
+        let mut raw_seen: HashSet<&std::ffi::OsStr> = HashSet::with_capacity(lower);
+        let mut unique_paths: Vec<PathBuf> = Vec::with_capacity(lower);
+        let mut verb_seen: HashSet<PathBuf> = HashSet::with_capacity(lower);
 
-        let mut all_dirs = BTreeSet::new();
-        for d in dirs {
-            let verbatim = crate::path::to_verbatim_path(d);
-            let mut curr = verbatim.as_path();
-            while let Some(parent) = curr.parent() {
-                if parent.as_os_str().is_empty() || parent == curr {
-                    break;
-                }
-                if !all_dirs.insert(parent.to_path_buf()) {
-                    // Ancestors already inserted by another child
-                    break;
-                }
-                curr = parent;
+        for d in iter {
+            let os = d.as_os_str();
+            if os.is_empty() || !raw_seen.insert(os) {
+                continue;
             }
-            all_dirs.insert(verbatim);
+            let verbatim = crate::path::to_verbatim_path(d);
+            if verb_seen.insert(verbatim.clone()) {
+                unique_paths.push(verbatim);
+            }
         }
 
-        // Group directories by depth (component count)
-        let mut dirs_by_depth: BTreeMap<usize, Vec<Vec<u16>>> = BTreeMap::new();
-        for dir in all_dirs {
-            let depth = dir.components().count();
-            let wide: Vec<u16> = dir.as_os_str().encode_wide().chain(Some(0)).collect();
-            dirs_by_depth.entry(depth).or_default().push(wide);
+        if unique_paths.is_empty() {
+            return Ok(());
         }
 
-        // Create directories breadth-first level by level, parallelizing large levels across 16 threads
-        for (_depth, level_dirs) in dirs_by_depth {
-            let total = level_dirs.len();
-            if total <= 16 {
-                for wide in &level_dirs {
-                    let ret = unsafe { CreateDirectoryW(wide.as_ptr(), std::ptr::null_mut()) };
-                    if ret == 0 {
-                        let err = unsafe { GetLastError() };
-                        if err != ERROR_ALREADY_EXISTS {
-                            let dir_path = std::ffi::OsString::from_wide(&wide[..wide.len() - 1]);
-                            let _ = std::fs::create_dir_all(&dir_path);
-                        }
+        // Compute longest common directory prefix on clean verbatim paths so we
+        // ensure the shared root exists once and never touch drive roots (C:\).
+        let common_prefix: Option<PathBuf> = {
+            let mut prefix = unique_paths[0].as_os_str().as_encoded_bytes();
+            for p in &unique_paths[1..] {
+                let b = p.as_os_str().as_encoded_bytes();
+                let min_len = prefix.len().min(b.len());
+                let mut i = 0;
+                while i < min_len && prefix[i] == b[i] {
+                    i += 1;
+                }
+                let boundary_ok = (i == prefix.len() && (i == b.len() || b[i] == b'\\'))
+                    || (i == b.len() && prefix[i] == b'\\')
+                    || (i < prefix.len() && i < b.len() && prefix[i] == b'\\' && b[i] == b'\\');
+                if !boundary_ok {
+                    while i > 0 && prefix[i - 1] != b'\\' {
+                        i -= 1;
                     }
+                    i = i.saturating_sub(1);
+                }
+                prefix = &prefix[..i];
+                if prefix.len() <= 6 {
+                    break;
+                }
+            }
+            // Must include at least one subdirectory below drive root (\\?\X:\sub) or UNC share (\\?\UNC\server\share\sub)
+            if prefix.len() > 7 && prefix.starts_with(br"\\?\") {
+                let valid = if prefix.starts_with(br"\\?\UNC\") {
+                    prefix[8..].iter().filter(|&&b| b == b'\\').count() >= 2
+                } else {
+                    prefix[5] == b':' && prefix[6] == b'\\'
+                };
+                if valid {
+                    // Safety: sliced at ASCII '\\' boundary on valid WTF-8 bytes.
+                    let os_prefix =
+                        unsafe { std::ffi::OsStr::from_encoded_bytes_unchecked(prefix) };
+                    Some(PathBuf::from(os_prefix))
+                } else {
+                    None
                 }
             } else {
-                let num_threads = 16.min(total);
-                let chunk_size = total.div_ceil(num_threads);
-                std::thread::scope(|scope| {
-                    for chunk in level_dirs.chunks(chunk_size) {
-                        scope.spawn(move || {
-                            for wide in chunk {
-                                let ret = unsafe {
-                                    CreateDirectoryW(wide.as_ptr(), std::ptr::null_mut())
-                                };
-                                if ret == 0 {
-                                    let err = unsafe { GetLastError() };
-                                    if err != ERROR_ALREADY_EXISTS {
-                                        let dir_path =
-                                            std::ffi::OsString::from_wide(&wide[..wide.len() - 1]);
-                                        let _ = std::fs::create_dir_all(&dir_path);
-                                    }
-                                }
-                            }
-                        });
-                    }
-                });
+                None
             }
+        };
+
+        let mut known_existing_bytes: HashSet<&[u8]> = HashSet::new();
+        if let Some(ref prefix) = common_prefix {
+            let mut prefix_wide = Vec::with_capacity(prefix.as_os_str().len() + 1);
+            prefix_wide.extend(prefix.as_os_str().encode_wide());
+            prefix_wide.push(0);
+            if !dir_exists_wide(&prefix_wide) {
+                let _ = std::fs::create_dir_all(prefix);
+            }
+            known_existing_bytes.insert(prefix.as_os_str().as_encoded_bytes());
+        }
+
+        let mut pending_seen: HashSet<&[u8]> = HashSet::with_capacity(unique_paths.len() * 2);
+        let mut by_depth: Vec<(usize, Vec<u16>)> = Vec::with_capacity(unique_paths.len() * 2);
+        let mut min_depth = usize::MAX;
+        let mut max_depth = 0usize;
+
+        for dir in &unique_paths {
+            let full_bytes = dir.as_os_str().as_encoded_bytes();
+            let mut end = full_bytes.len();
+            let mut depth = full_bytes.iter().filter(|&&b| b == b'\\').count();
+            let min_root = if full_bytes.starts_with(br"\\?\UNC\") {
+                let mut slashes = 0;
+                let mut idx = 8;
+                while idx < full_bytes.len() {
+                    if full_bytes[idx] == b'\\' {
+                        slashes += 1;
+                        if slashes == 2 {
+                            break;
+                        }
+                    }
+                    idx += 1;
+                }
+                if slashes >= 2 {
+                    idx + 1
+                } else {
+                    full_bytes.len()
+                }
+            } else if full_bytes.starts_with(br"\\?\")
+                && full_bytes.len() >= 7
+                && full_bytes[5] == b':'
+            {
+                7
+            } else {
+                4
+            };
+            while end > min_root {
+                let slice = &full_bytes[..end];
+                if known_existing_bytes.contains(slice) || !pending_seen.insert(slice) {
+                    break;
+                }
+                // Safety: sliced at ASCII '\\' boundary on valid WTF-8 bytes.
+                let slice_os = unsafe { std::ffi::OsStr::from_encoded_bytes_unchecked(slice) };
+                let mut wide = Vec::with_capacity(slice.len() + 1);
+                wide.extend(slice_os.encode_wide());
+                wide.push(0);
+
+                if common_prefix.is_none() && dir_exists_wide(&wide) {
+                    known_existing_bytes.insert(slice);
+                    break;
+                }
+
+                min_depth = min_depth.min(depth);
+                max_depth = max_depth.max(depth);
+                by_depth.push((depth, wide));
+
+                // Step back to parent component boundary
+                let mut p_end = end;
+                while p_end > min_root && full_bytes[p_end - 1] != b'\\' {
+                    p_end -= 1;
+                }
+                if p_end <= min_root {
+                    break;
+                }
+                end = p_end - 1;
+                depth -= 1;
+            }
+        }
+
+        let total_to_create = by_depth.len();
+        if total_to_create == 0 {
+            return Ok(());
+        }
+
+        let num_levels = max_depth - min_depth + 1;
+        let mut levels: Vec<Vec<Vec<u16>>> = (0..num_levels).map(|_| Vec::new()).collect();
+        for (depth, wide) in by_depth {
+            levels[depth - min_depth].push(wide);
+        }
+        levels.retain(|l| !l.is_empty());
+
+        if total_to_create <= 32 {
+            for level in &levels {
+                for wide in level {
+                    create_dir_wide_or_fallback(wide);
+                }
+            }
+            return Ok(());
+        }
+
+        // Peel shallow low-fanout levels sequentially so workers can create independent
+        // package subtrees top-down with zero barrier synchronization.
+        let mut split_idx = 0usize;
+        while split_idx + 1 < levels.len() && levels[split_idx].len() < 24 {
+            for wide in &levels[split_idx] {
+                create_dir_wide_or_fallback(wide);
+            }
+            split_idx += 1;
+        }
+
+        if split_idx + 1 >= levels.len() {
+            let level = &levels[split_idx];
+            let num_threads = 16.min(level.len());
+            let cursor = std::sync::atomic::AtomicUsize::new(0);
+            let chunk = (level.len() / (num_threads * 2)).clamp(1, 8);
+            std::thread::scope(|scope| {
+                for _ in 0..num_threads {
+                    scope.spawn(|| loop {
+                        let start = cursor.fetch_add(chunk, Ordering::Relaxed);
+                        if start >= level.len() {
+                            break;
+                        }
+                        let end = (start + chunk).min(level.len());
+                        for wide in &level[start..end] {
+                            create_dir_wide_or_fallback(wide);
+                        }
+                    });
+                }
+            });
+            return Ok(());
+        }
+
+        // Promote a small number of high-fanout scope roots (e.g. `@scope`) so every
+        // package gets its own balanced bucket without per-level barriers.
+        let mut promoted: HashSet<&[u16]> = HashSet::new();
+        {
+            let mut child_counts: HashMap<&[u16], usize> =
+                HashMap::with_capacity(levels[split_idx].len());
+            for w in &levels[split_idx] {
+                child_counts.insert(&w[..w.len().saturating_sub(1)], 0);
+            }
+            for child in &levels[split_idx + 1] {
+                let no_null = &child[..child.len().saturating_sub(1)];
+                if let Some(pos) = no_null.iter().rposition(|&c| c == b'\\' as u16) {
+                    if let Some(cnt) = child_counts.get_mut(&no_null[..pos]) {
+                        *cnt += 1;
+                    }
+                }
+            }
+            let high_fanout_count = child_counts.values().filter(|&&c| c >= 16).count();
+            if high_fanout_count > 0 && high_fanout_count < 16 {
+                for w in &levels[split_idx] {
+                    let key = &w[..w.len().saturating_sub(1)];
+                    if child_counts.get(key).copied().unwrap_or(0) >= 16 {
+                        create_dir_wide_or_fallback(w);
+                        promoted.insert(key);
+                    }
+                }
+            }
+        }
+
+        let mut bucket_map: HashMap<&[u16], usize> = HashMap::with_capacity(total_to_create);
+        let mut buckets: Vec<Vec<&[u16]>> = Vec::with_capacity(levels[split_idx].len() * 2);
+
+        for w in &levels[split_idx] {
+            let key = &w[..w.len().saturating_sub(1)];
+            if promoted.contains(key) {
+                continue;
+            }
+            let id = buckets.len();
+            bucket_map.insert(key, id);
+            buckets.push(vec![w.as_slice()]);
+        }
+
+        for lvl in &levels[split_idx + 1..] {
+            for w in lvl {
+                let no_null = &w[..w.len().saturating_sub(1)];
+                let mut cur = no_null;
+                let mut found = None;
+                while let Some(pos) = cur.iter().rposition(|&c| c == b'\\' as u16) {
+                    let parent = &cur[..pos];
+                    if let Some(&id) = bucket_map.get(parent) {
+                        found = Some(id);
+                        break;
+                    }
+                    cur = parent;
+                }
+                if let Some(id) = found {
+                    bucket_map.insert(no_null, id);
+                    buckets[id].push(w.as_slice());
+                } else {
+                    let id = buckets.len();
+                    bucket_map.insert(no_null, id);
+                    buckets.push(vec![w.as_slice()]);
+                }
+            }
+        }
+
+        if !buckets.is_empty() {
+            let num_threads = 16.min(buckets.len());
+            let cursor = std::sync::atomic::AtomicUsize::new(0);
+            let chunk = (buckets.len() / (num_threads * 4)).clamp(1, 8);
+            std::thread::scope(|scope| {
+                for _ in 0..num_threads {
+                    scope.spawn(|| loop {
+                        let start = cursor.fetch_add(chunk, Ordering::Relaxed);
+                        if start >= buckets.len() {
+                            break;
+                        }
+                        let end = (start + chunk).min(buckets.len());
+                        for bucket in &buckets[start..end] {
+                            for wide in bucket {
+                                create_dir_wide_or_fallback(wide);
+                            }
+                        }
+                    });
+                }
+            });
         }
 
         Ok(())
@@ -340,45 +587,365 @@ where
 
     #[cfg(not(windows))]
     {
-        let mut all_dirs = BTreeSet::new();
-        for d in dirs {
-            let mut curr = d;
-            while let Some(parent) = curr.parent() {
-                if parent.as_os_str().is_empty() || parent == curr {
-                    break;
-                }
-                all_dirs.insert(parent.to_path_buf());
-                curr = parent;
+        let iter = dirs.into_iter();
+        let (lower, _) = iter.size_hint();
+        let mut raw_seen: HashSet<&std::ffi::OsStr> = HashSet::with_capacity(lower);
+        let mut unique_paths: Vec<PathBuf> = Vec::with_capacity(lower);
+
+        for d in iter {
+            if !d.as_os_str().is_empty() && raw_seen.insert(d.as_os_str()) {
+                unique_paths.push(d.to_path_buf());
             }
-            all_dirs.insert(d.to_path_buf());
+        }
+        if unique_paths.is_empty() {
+            return Ok(());
         }
 
-        let mut created_dirs: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
-        let mut sorted_dirs: Vec<PathBuf> = all_dirs.into_iter().collect();
-        sorted_dirs.sort_by_key(|a| std::cmp::Reverse(a.components().count()));
-
-        for dir in &sorted_dirs {
-            if created_dirs.contains(dir) {
-                continue;
+        let mut common = unique_paths[0].clone();
+        for p in &unique_paths[1..] {
+            while !p.starts_with(&common) {
+                if !common.pop() {
+                    break;
+                }
             }
-            let _ = std::fs::create_dir_all(dir);
+            if common.as_os_str().is_empty() {
+                break;
+            }
+        }
+
+        let mut known_existing: HashSet<PathBuf> = HashSet::new();
+        if !common.as_os_str().is_empty() {
+            let _ = std::fs::create_dir_all(&common);
+            known_existing.insert(common);
+        }
+
+        let mut pending_seen: HashSet<PathBuf> = HashSet::with_capacity(unique_paths.len() * 2);
+        let mut by_depth: Vec<(usize, PathBuf)> = Vec::with_capacity(unique_paths.len() * 2);
+        let mut min_depth = usize::MAX;
+        let mut max_depth = 0usize;
+
+        for dir in &unique_paths {
             let mut curr = dir.as_path();
-            while let Some(parent) = curr.parent() {
-                if !created_dirs.insert(parent.to_path_buf()) {
+            loop {
+                if known_existing.contains(curr) || !pending_seen.insert(curr.to_path_buf()) {
                     break;
                 }
-                curr = parent;
+                if curr.is_dir() {
+                    known_existing.insert(curr.to_path_buf());
+                    break;
+                }
+                let depth = curr.components().count();
+                min_depth = min_depth.min(depth);
+                max_depth = max_depth.max(depth);
+                by_depth.push((depth, curr.to_path_buf()));
+                match curr.parent() {
+                    Some(parent) if !parent.as_os_str().is_empty() && parent != curr => {
+                        curr = parent;
+                    }
+                    _ => break,
+                }
             }
-            created_dirs.insert(dir.clone());
         }
+
+        let total = by_depth.len();
+        if total == 0 {
+            return Ok(());
+        }
+
+        let num_levels = max_depth - min_depth + 1;
+        let mut levels: Vec<Vec<PathBuf>> = (0..num_levels).map(|_| Vec::new()).collect();
+        for (depth, path) in by_depth {
+            levels[depth - min_depth].push(path);
+        }
+        levels.retain(|l| !l.is_empty());
+
+        if total <= 32 {
+            for level in &levels {
+                for p in level {
+                    if let Err(e) = std::fs::create_dir(p) {
+                        if e.kind() != std::io::ErrorKind::AlreadyExists {
+                            let _ = std::fs::create_dir_all(p);
+                        }
+                    }
+                }
+            }
+            return Ok(());
+        }
+
+        let max_level_len = levels.iter().map(|l| l.len()).max().unwrap_or(1);
+        let num_threads = 16.min(max_level_len.max(2)).min(total);
+        let cursors: Vec<std::sync::atomic::AtomicUsize> = levels
+            .iter()
+            .map(|_| std::sync::atomic::AtomicUsize::new(0))
+            .collect();
+        let barrier = LevelBarrier::new();
+
+        std::thread::scope(|scope| {
+            for _ in 0..num_threads {
+                scope.spawn(|| {
+                    for (idx, level) in levels.iter().enumerate() {
+                        let len = level.len();
+                        let cursor = &cursors[idx];
+                        let chunk = (len / (num_threads * 2)).clamp(1, 8);
+                        loop {
+                            let start = cursor.fetch_add(chunk, Ordering::Relaxed);
+                            if start >= len {
+                                break;
+                            }
+                            let end = (start + chunk).min(len);
+                            for p in &level[start..end] {
+                                if let Err(e) = std::fs::create_dir(p) {
+                                    if e.kind() != std::io::ErrorKind::AlreadyExists {
+                                        let _ = std::fs::create_dir_all(p);
+                                    }
+                                }
+                            }
+                        }
+                        if idx + 1 < levels.len() {
+                            barrier.wait(num_threads);
+                        }
+                    }
+                });
+            }
+        });
 
         Ok(())
     }
 }
 
+#[cfg(windows)]
+pub(crate) fn write_file_fast_wide(
+    path_wide: &[u16],
+    path_hint: &Path,
+    data: &[u8],
+    _mode: u32,
+    _prealloc_threshold: usize,
+    record_stats: bool,
+) -> std::io::Result<()> {
+    extern "system" {
+        fn CreateFileW(
+            lpFileName: *const u16,
+            dwDesiredAccess: u32,
+            dwShareMode: u32,
+            lpSecurityAttributes: *mut std::ffi::c_void,
+            dwCreationDisposition: u32,
+            dwFlagsAndAttributes: u32,
+            hTemplateFile: *mut std::ffi::c_void,
+        ) -> *mut std::ffi::c_void;
+
+        fn WriteFile(
+            hFile: *mut std::ffi::c_void,
+            lpBuffer: *const std::ffi::c_void,
+            nNumberOfBytesToWrite: u32,
+            lpNumberOfBytesWritten: *mut u32,
+            lpOverlapped: *mut std::ffi::c_void,
+        ) -> i32;
+
+        fn CloseHandle(hObject: *mut std::ffi::c_void) -> i32;
+        fn GetLastError() -> u32;
+    }
+
+    const GENERIC_WRITE: u32 = 0x40000000;
+    const CREATE_NEW: u32 = 1;
+    const FILE_ATTRIBUTE_NORMAL: u32 = 0x80;
+    const INVALID_HANDLE_VALUE: *mut std::ffi::c_void = -1isize as *mut std::ffi::c_void;
+    const ERROR_PATH_NOT_FOUND: u32 = 3;
+    const ERROR_ACCESS_DENIED: u32 = 5;
+    const ERROR_FILE_EXISTS: u32 = 80;
+    const ERROR_ALREADY_EXISTS: u32 = 183;
+
+    const FILE_SHARE_READ: u32 = 1;
+    const FILE_SHARE_WRITE: u32 = 2;
+    const FILE_SHARE_DELETE: u32 = 4;
+    const FILE_SHARE_ALL: u32 = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
+
+    // Fast path: exclusive creation avoids truncating an existing hardlink or
+    // following a symlink without paying a pre-stat syscall on fresh installs.
+    let mut handle = unsafe {
+        CreateFileW(
+            path_wide.as_ptr(),
+            GENERIC_WRITE,
+            FILE_SHARE_ALL,
+            std::ptr::null_mut(),
+            CREATE_NEW,
+            FILE_ATTRIBUTE_NORMAL,
+            std::ptr::null_mut(),
+        )
+    };
+
+    if handle == INVALID_HANDLE_VALUE {
+        let err = unsafe { GetLastError() };
+        if err == ERROR_FILE_EXISTS || err == ERROR_ALREADY_EXISTS || err == ERROR_ACCESS_DENIED {
+            crate::tarball::unlink_target_path_wide(path_wide, path_hint);
+            handle = unsafe {
+                CreateFileW(
+                    path_wide.as_ptr(),
+                    GENERIC_WRITE,
+                    FILE_SHARE_ALL,
+                    std::ptr::null_mut(),
+                    CREATE_NEW,
+                    FILE_ATTRIBUTE_NORMAL,
+                    std::ptr::null_mut(),
+                )
+            };
+        } else if err == ERROR_PATH_NOT_FOUND {
+            if let Some(parent) = path_hint.parent() {
+                let parent_v = crate::path::to_verbatim_path(parent);
+                let _ = std::fs::create_dir_all(&parent_v);
+            }
+            handle = unsafe {
+                CreateFileW(
+                    path_wide.as_ptr(),
+                    GENERIC_WRITE,
+                    FILE_SHARE_ALL,
+                    std::ptr::null_mut(),
+                    CREATE_NEW,
+                    FILE_ATTRIBUTE_NORMAL,
+                    std::ptr::null_mut(),
+                )
+            };
+        }
+        if handle == INVALID_HANDLE_VALUE {
+            let final_err = unsafe { GetLastError() };
+            return Err(std::io::Error::from_raw_os_error(final_err as i32));
+        }
+    }
+
+    let data_len = data.len();
+
+    if data_len > 0 {
+        let mut offset = 0usize;
+        while offset < data_len {
+            let chunk_len = ((data_len - offset).min(u32::MAX as usize)) as u32;
+            let mut written = 0u32;
+            let ok = unsafe {
+                WriteFile(
+                    handle,
+                    data[offset..].as_ptr() as *const std::ffi::c_void,
+                    chunk_len,
+                    &mut written,
+                    std::ptr::null_mut(),
+                )
+            };
+            if ok == 0 {
+                let err = unsafe { GetLastError() };
+                unsafe {
+                    CloseHandle(handle);
+                }
+                return Err(std::io::Error::from_raw_os_error(err as i32));
+            }
+            if written == 0 {
+                unsafe {
+                    CloseHandle(handle);
+                }
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WriteZero,
+                    "WriteFile returned 0 bytes written",
+                ));
+            }
+            offset += written as usize;
+        }
+    }
+
+    unsafe {
+        CloseHandle(handle);
+    }
+
+    if record_stats {
+        crate::tarball::record_file_created(data_len as u64);
+    }
+    Ok(())
+}
+
+/// Writes a file reusing a caller-provided wide-string buffer on Windows.
+#[inline]
+pub(crate) fn write_file_fast_buf(
+    path: &Path,
+    data: &[u8],
+    mode: u32,
+    prealloc_threshold: usize,
+    wide_buf: &mut Vec<u16>,
+    record_stats: bool,
+) -> std::io::Result<()> {
+    #[cfg(windows)]
+    {
+        crate::path::encode_verbatim_wide(path, wide_buf);
+        write_file_fast_wide(
+            wide_buf,
+            path,
+            data,
+            mode,
+            prealloc_threshold,
+            record_stats,
+        )
+    }
+
+    #[cfg(not(windows))]
+    {
+        let _ = wide_buf;
+        write_file_fast_impl(path, data, mode, prealloc_threshold, record_stats)
+    }
+}
+
+#[cfg(not(windows))]
+fn write_file_fast_impl(
+    path: &Path,
+    data: &[u8],
+    mode: u32,
+    prealloc_threshold: usize,
+    record_stats: bool,
+) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut file = match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+    {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            unlink_target_path(path);
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(path)?
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            if let Some(parent) = path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(path)?
+        }
+        Err(e) => return Err(e),
+    };
+
+    if data.len() >= prealloc_threshold {
+        let _ = file.set_len(data.len() as u64);
+    }
+
+    if !data.is_empty() {
+        file.write_all(data)?;
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if mode & 0o111 != 0 {
+            let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode));
+        }
+    }
+
+    if record_stats {
+        crate::tarball::record_file_created(data.len() as u64);
+    }
+    Ok(())
+}
+
 /// Writes a single file using native OS primitives:
 /// - Verbatim `\\?\` path formatting to bypass MAX_PATH limit
-/// - Direct handle creation with `CREATE_ALWAYS`
+/// - Direct handle creation with `CREATE_NEW` fast path
 /// - Preallocation for files >= 64 KiB using `FileAllocationInfo`
 /// - Single cheap write straight from memory
 /// - `CloseHandle` without per-file `fsync`
@@ -386,199 +953,24 @@ pub fn write_file_fast(
     path: &Path,
     data: &[u8],
     mode: u32,
-    _prealloc_threshold: usize,
+    prealloc_threshold: usize,
 ) -> std::io::Result<()> {
     #[cfg(windows)]
     {
-        use std::os::windows::ffi::OsStrExt;
-
-        extern "system" {
-            fn CreateFileW(
-                lpFileName: *const u16,
-                dwDesiredAccess: u32,
-                dwShareMode: u32,
-                lpSecurityAttributes: *mut std::ffi::c_void,
-                dwCreationDisposition: u32,
-                dwFlagsAndAttributes: u32,
-                hTemplateFile: *mut std::ffi::c_void,
-            ) -> *mut std::ffi::c_void;
-
-            fn WriteFile(
-                hFile: *mut std::ffi::c_void,
-                lpBuffer: *const std::ffi::c_void,
-                nNumberOfBytesToWrite: u32,
-                lpNumberOfBytesWritten: *mut u32,
-                lpOverlapped: *mut std::ffi::c_void,
-            ) -> i32;
-
-            fn SetFileAttributesW(lpFileName: *const u16, dwFileAttributes: u32) -> i32;
-
-            fn CloseHandle(hObject: *mut std::ffi::c_void) -> i32;
-            fn GetLastError() -> u32;
-        }
-
-        const GENERIC_WRITE: u32 = 0x40000000;
-        const CREATE_ALWAYS: u32 = 2;
-        const FILE_ATTRIBUTE_NORMAL: u32 = 0x80;
-        const INVALID_HANDLE_VALUE: *mut std::ffi::c_void = -1isize as *mut std::ffi::c_void;
-        const ERROR_ACCESS_DENIED: u32 = 5;
-
-        const FILE_SHARE_READ: u32 = 1;
-        const FILE_SHARE_WRITE: u32 = 2;
-        const FILE_SHARE_DELETE: u32 = 4;
-        const FILE_SHARE_ALL: u32 = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
-
-        let path_wide: Vec<u16> = {
-            let s = path.as_os_str();
-            let bytes = s.as_encoded_bytes();
-            if bytes.starts_with(br"\\?\") || bytes.starts_with(br"\??\") {
-                s.encode_wide().chain(Some(0)).collect()
-            } else {
-                let verb = crate::path::to_verbatim_path(path);
-                verb.as_os_str().encode_wide().chain(Some(0)).collect()
-            }
-        };
-
-        let mut handle = unsafe {
-            CreateFileW(
-                path_wide.as_ptr(),
-                GENERIC_WRITE,
-                FILE_SHARE_ALL,
-                std::ptr::null_mut(),
-                CREATE_ALWAYS,
-                FILE_ATTRIBUTE_NORMAL,
-                std::ptr::null_mut(),
-            )
-        };
-
-        const ERROR_PATH_NOT_FOUND: u32 = 3;
-
-        if handle == INVALID_HANDLE_VALUE {
-            let err = unsafe { GetLastError() };
-            if err == ERROR_PATH_NOT_FOUND {
-                if let Some(parent) = path.parent() {
-                    let _ = std::fs::create_dir_all(parent);
-                }
-                handle = unsafe {
-                    CreateFileW(
-                        path_wide.as_ptr(),
-                        GENERIC_WRITE,
-                        FILE_SHARE_ALL,
-                        std::ptr::null_mut(),
-                        CREATE_ALWAYS,
-                        FILE_ATTRIBUTE_NORMAL,
-                        std::ptr::null_mut(),
-                    )
-                };
-            } else if err == ERROR_ACCESS_DENIED {
-                unlink_target_path(path);
-                unsafe {
-                    SetFileAttributesW(path_wide.as_ptr(), FILE_ATTRIBUTE_NORMAL);
-                }
-                handle = unsafe {
-                    CreateFileW(
-                        path_wide.as_ptr(),
-                        GENERIC_WRITE,
-                        FILE_SHARE_ALL,
-                        std::ptr::null_mut(),
-                        CREATE_ALWAYS,
-                        FILE_ATTRIBUTE_NORMAL,
-                        std::ptr::null_mut(),
-                    )
-                };
-            }
-            if handle == INVALID_HANDLE_VALUE {
-                let final_err = unsafe { GetLastError() };
-                return Err(std::io::Error::from_raw_os_error(final_err as i32));
-            }
-        }
-
-        let data_len = data.len();
-
-        if data_len > 0 {
-            let mut offset = 0usize;
-            while offset < data_len {
-                let chunk_len = ((data_len - offset).min(u32::MAX as usize)) as u32;
-                let mut written = 0u32;
-                let ok = unsafe {
-                    WriteFile(
-                        handle,
-                        data[offset..].as_ptr() as *const std::ffi::c_void,
-                        chunk_len,
-                        &mut written,
-                        std::ptr::null_mut(),
-                    )
-                };
-                if ok == 0 {
-                    let err = unsafe { GetLastError() };
-                    unsafe {
-                        CloseHandle(handle);
-                    }
-                    return Err(std::io::Error::from_raw_os_error(err as i32));
-                }
-                if written == 0 {
-                    unsafe {
-                        CloseHandle(handle);
-                    }
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::WriteZero,
-                        "WriteFile returned 0 bytes written",
-                    ));
-                }
-                offset += written as usize;
-            }
-        }
-
-        unsafe {
-            CloseHandle(handle);
-        }
-
-        let _ = mode;
-        crate::tarball::record_file_created(data_len as u64);
-        Ok(())
+        crate::path::with_verbatim_wide(path, |path_wide| {
+            write_file_fast_wide(path_wide, path, data, mode, prealloc_threshold, true)
+        })
     }
 
     #[cfg(not(windows))]
     {
-        use std::io::Write;
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(path)?;
-
-        if data.len() >= _prealloc_threshold {
-            let _ = file.set_len(data.len() as u64);
-        }
-
-        const WRITE_CHUNK_SIZE: usize = 128 * 1024;
-        let mut offset = 0;
-        while offset < data.len() {
-            let end = (offset + WRITE_CHUNK_SIZE).min(data.len());
-            file.write_all(&data[offset..end])?;
-            offset = end;
-        }
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            if mode & 0o111 != 0 {
-                let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode));
-            }
-        }
-
-        crate::tarball::record_file_created(data.len() as u64);
-        Ok(())
+        write_file_fast_impl(path, data, mode, prealloc_threshold, true)
     }
 }
 
 #[cfg(windows)]
 fn path_to_wide_buf(path: &Path, buf: &mut Vec<u16>) {
-    use std::os::windows::ffi::OsStrExt;
-    buf.clear();
-    let verbatim = crate::path::to_verbatim_path(path);
-    buf.extend(verbatim.as_os_str().encode_wide());
-    buf.push(0);
+    crate::path::encode_verbatim_wide(path, buf);
 }
 
 #[cfg(windows)]
@@ -589,7 +981,7 @@ fn path_to_wide(path: &Path) -> Vec<u16> {
     wide
 }
 
-/// Copies or hardlinks a file using native OS primitives (CreateHardLinkW / CopyFileExW on Windows) reusing caller wide-string buffers.
+/// Copies a file using native OS primitives reusing caller wide-string buffers.
 #[cfg(windows)]
 pub fn copy_file_fast_buf(
     source: &Path,
@@ -609,29 +1001,73 @@ pub fn copy_file_fast_buf(
         fn GetLastError() -> u32;
     }
 
+    const COPY_FILE_FAIL_IF_EXISTS: u32 = 0x00000001;
+    const ERROR_PATH_NOT_FOUND: u32 = 3;
+    const ERROR_ACCESS_DENIED: u32 = 5;
+    const ERROR_FILE_EXISTS: u32 = 80;
+    const ERROR_ALREADY_EXISTS: u32 = 183;
+
     path_to_wide_buf(source, src_buf);
     path_to_wide_buf(destination, dst_buf);
 
-    let ret = unsafe {
+    let mut ret = unsafe {
         CopyFileExW(
             src_buf.as_ptr(),
             dst_buf.as_ptr(),
             std::ptr::null_mut(),
             std::ptr::null_mut(),
             std::ptr::null_mut(),
-            0,
+            COPY_FILE_FAIL_IF_EXISTS,
         )
     };
 
     if ret == 0 {
-        let err = unsafe { GetLastError() };
-        Err(std::io::Error::from_raw_os_error(err as i32))
-    } else {
-        Ok(())
+        let mut err = unsafe { GetLastError() };
+        if err == ERROR_PATH_NOT_FOUND {
+            if let Some(parent) = destination.parent() {
+                let parent_v = crate::path::to_verbatim_path(parent);
+                let _ = std::fs::create_dir_all(&parent_v);
+            }
+            ret = unsafe {
+                CopyFileExW(
+                    src_buf.as_ptr(),
+                    dst_buf.as_ptr(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    COPY_FILE_FAIL_IF_EXISTS,
+                )
+            };
+            if ret == 0 {
+                err = unsafe { GetLastError() };
+            }
+        }
+        if ret == 0
+            && (err == ERROR_FILE_EXISTS
+                || err == ERROR_ALREADY_EXISTS
+                || err == ERROR_ACCESS_DENIED)
+        {
+            crate::tarball::unlink_target_path_wide(dst_buf, destination);
+            ret = unsafe {
+                CopyFileExW(
+                    src_buf.as_ptr(),
+                    dst_buf.as_ptr(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    COPY_FILE_FAIL_IF_EXISTS,
+                )
+            };
+        }
+        if ret == 0 {
+            let final_err = unsafe { GetLastError() };
+            return Err(std::io::Error::from_raw_os_error(final_err as i32));
+        }
     }
+    Ok(())
 }
 
-/// Copies a file using native OS primitives (CopyFileExW on Windows).
+/// Copies a file using native OS primitives (`CopyFileExW` on Windows).
 pub fn copy_file_fast(source: &Path, destination: &Path) -> std::io::Result<()> {
     #[cfg(windows)]
     {
@@ -748,56 +1184,260 @@ pub fn repair_cas_file(path: &Path, data: &[u8], mode: u32, prealloc_threshold: 
     }
 }
 
-fn file_ref_lpt_priority(file: &MaterializeFileRef<'_>) -> u64 {
-    let size = file.data.len() as u64;
-    let path_str = file.path.to_string_lossy();
-    let is_heavy = size >= 64 * 1024
-        || path_str.ends_with(".node")
-        || path_str.ends_with(".wasm")
-        || path_str.ends_with(".exe")
-        || path_str.ends_with(".dll");
+trait MatItem: Sync {
+    fn item_path(&self) -> &Path;
+    fn item_data(&self) -> &[u8];
+    fn item_mode(&self) -> u32;
+    fn item_package_id(&self) -> Option<&str>;
+    fn item_source_path(&self) -> Option<&Path>;
+    fn item_expected_sha256(&self) -> Option<&str>;
+    fn item_source_verified(&self) -> bool;
+}
 
-    if is_heavy {
+impl MatItem for MaterializeFile {
+    #[inline]
+    fn item_path(&self) -> &Path {
+        &self.path
+    }
+    #[inline]
+    fn item_data(&self) -> &[u8] {
+        &self.data
+    }
+    #[inline]
+    fn item_mode(&self) -> u32 {
+        self.mode
+    }
+    #[inline]
+    fn item_package_id(&self) -> Option<&str> {
+        self.package_id.as_deref()
+    }
+    #[inline]
+    fn item_source_path(&self) -> Option<&Path> {
+        None
+    }
+    #[inline]
+    fn item_expected_sha256(&self) -> Option<&str> {
+        None
+    }
+    #[inline]
+    fn item_source_verified(&self) -> bool {
+        false
+    }
+}
+
+impl MatItem for MaterializeFileRef<'_> {
+    #[inline]
+    fn item_path(&self) -> &Path {
+        &self.path
+    }
+    #[inline]
+    fn item_data(&self) -> &[u8] {
+        self.data
+    }
+    #[inline]
+    fn item_mode(&self) -> u32 {
+        self.mode
+    }
+    #[inline]
+    fn item_package_id(&self) -> Option<&str> {
+        self.package_id
+    }
+    #[inline]
+    fn item_source_path(&self) -> Option<&Path> {
+        self.source_path
+    }
+    #[inline]
+    fn item_expected_sha256(&self) -> Option<&str> {
+        self.expected_sha256
+    }
+    #[inline]
+    fn item_source_verified(&self) -> bool {
+        self.source_verified
+    }
+}
+
+#[inline]
+fn is_heavy_item<T: MatItem>(item: &T) -> bool {
+    let data = item.item_data();
+    if data.len() >= 64 * 1024 {
+        return true;
+    }
+    let bytes = item.item_path().as_os_str().as_encoded_bytes();
+    bytes.ends_with(b".node")
+        || bytes.ends_with(b".wasm")
+        || bytes.ends_with(b".exe")
+        || bytes.ends_with(b".dll")
+}
+
+#[inline]
+fn item_lpt_priority<T: MatItem>(item: &T) -> u64 {
+    let size = item.item_data().len() as u64;
+    if is_heavy_item(item) {
         (1u64 << 62) | size
     } else {
         size
     }
 }
 
-/// Writes a batch of borrowed file references in parallel according to the optimal disk policy:
-/// - SSD: 24-48 threads, global LPT scheduling across all packages with lock-free atomic chunking.
-/// - HDD: 4 threads, writes grouped by package to minimize mechanical seek head movement.
-pub fn materialize_files_parallel_refs<'a>(
-    files: Vec<MaterializeFileRef<'a>>,
+#[cfg(windows)]
+#[inline]
+fn file_size_if_exists_wide(wide: &[u16]) -> Option<u64> {
+    #[repr(C)]
+    #[allow(non_snake_case, clippy::upper_case_acronyms)]
+    struct FILETIME {
+        dwLowDateTime: u32,
+        dwHighDateTime: u32,
+    }
+    #[repr(C)]
+    #[allow(non_snake_case)]
+    struct WIN32_FILE_ATTRIBUTE_DATA {
+        dwFileAttributes: u32,
+        ftCreationTime: FILETIME,
+        ftLastAccessTime: FILETIME,
+        ftLastWriteTime: FILETIME,
+        nFileSizeHigh: u32,
+        nFileSizeLow: u32,
+    }
+    extern "system" {
+        fn GetFileAttributesExW(
+            lpFileName: *const u16,
+            fInfoLevelId: u32,
+            lpFileInformation: *mut WIN32_FILE_ATTRIBUTE_DATA,
+        ) -> i32;
+    }
+    let mut info: WIN32_FILE_ATTRIBUTE_DATA = unsafe { std::mem::zeroed() };
+    let ok = unsafe { GetFileAttributesExW(wide.as_ptr(), 0, &mut info) };
+    if ok != 0 && (info.dwFileAttributes & 0x10) == 0 {
+        Some(((info.nFileSizeHigh as u64) << 32) | (info.nFileSizeLow as u64))
+    } else {
+        None
+    }
+}
+
+#[inline]
+fn materialize_one_item<T: MatItem>(
+    item: &T,
+    skip_existing_matching: bool,
+    prealloc_thresh: usize,
+    _src_buf: &mut Vec<u16>,
+    dst_buf: &mut Vec<u16>,
+) -> Result<(), FsError> {
+    let path = item.item_path();
+    let data = item.item_data();
+    let mode = item.item_mode();
+
+    if skip_existing_matching {
+        #[cfg(windows)]
+        {
+            crate::path::encode_verbatim_wide(path, dst_buf);
+            if file_size_if_exists_wide(dst_buf) == Some(data.len() as u64) {
+                return Ok(());
+            }
+        }
+        #[cfg(not(windows))]
+        if let Ok(meta) = std::fs::metadata(path) {
+            if meta.len() == data.len() as u64 {
+                return Ok(());
+            }
+        }
+    }
+
+    if let Some(src) = item.item_source_path() {
+        let verified = item.item_source_verified();
+        let mut cas_valid = cas_file_is_valid(src, data.len(), item.item_expected_sha256(), verified);
+        if !cas_valid {
+            repair_cas_file(src, data, mode, prealloc_thresh);
+            cas_valid = cas_file_is_valid(src, data.len(), item.item_expected_sha256(), true);
+        }
+        if cas_valid {
+            // When the file payload is already mapped in memory, writing directly
+            // avoids opening and reading a separate CAS file on disk.
+            if !data.is_empty() {
+                return write_file_fast_buf(path, data, mode, prealloc_thresh, dst_buf, true)
+                    .map_err(FsError::Io);
+            }
+            #[cfg(windows)]
+            let copy_ok = copy_file_fast_buf(src, path, _src_buf, dst_buf).is_ok();
+            #[cfg(not(windows))]
+            let copy_ok = copy_file_fast(src, path).is_ok();
+            if copy_ok {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    if mode & 0o111 != 0 {
+                        let _ = std::fs::set_permissions(
+                            path,
+                            std::fs::Permissions::from_mode(mode),
+                        );
+                    }
+                }
+                crate::tarball::record_file_created(data.len() as u64);
+                return Ok(());
+            }
+        }
+    }
+
+    write_file_fast_buf(path, data, mode, prealloc_thresh, dst_buf, true).map_err(FsError::Io)
+}
+
+fn materialize_items_slice<T: MatItem>(
+    mut items: Vec<T>,
     config: &ParallelWriterConfig,
 ) -> Result<(), FsError> {
-    if files.is_empty() {
+    if items.is_empty() {
         return Ok(());
     }
 
     let prealloc_thresh = config.preallocate_threshold;
-
     let num_threads = if config.is_hdd {
         config.worker_threads.clamp(1, 4)
     } else {
-        config.worker_threads.clamp(1, 16)
-    };
+        config.worker_threads.clamp(1, 32)
+    }
+    .min(items.len());
 
     if !config.is_hdd {
-        // On SSD: chunk-level lock-free atomic scheduling across all files to eliminate thread starvation
-        let total_files = files.len();
-        let chunk_size = 64;
+        let total_files = items.len();
+        if total_files == 1 || num_threads <= 1 {
+            let mut src_buf = Vec::with_capacity(260);
+            let mut dst_buf = Vec::with_capacity(260);
+            for item in &items {
+                materialize_one_item(
+                    item,
+                    config.skip_existing_matching,
+                    prealloc_thresh,
+                    &mut src_buf,
+                    &mut dst_buf,
+                )?;
+            }
+            return Ok(());
+        }
+
+        // Partition heavy binaries / >= 64 KiB payloads to the front in O(N) so
+        // large writes and AV scans start immediately without sorting small files.
+        if total_files >= 32 {
+            let mut heavy_end = 0usize;
+            for i in 0..total_files {
+                if is_heavy_item(&items[i]) {
+                    items.swap(i, heavy_end);
+                    heavy_end += 1;
+                }
+            }
+            if heavy_end > 1 {
+                items[..heavy_end].sort_unstable_by_key(|a| std::cmp::Reverse(a.item_data().len()));
+            }
+        }
+
+        let chunk_size = (total_files / (num_threads * 4)).clamp(1, 16);
         let next_file = std::sync::atomic::AtomicUsize::new(0);
-        let files_slice = &files[..];
+        let items_slice = &items[..];
 
         std::thread::scope(|scope| {
             let mut handles = Vec::with_capacity(num_threads);
 
             for _ in 0..num_threads {
                 handles.push(scope.spawn(|| -> Result<(), FsError> {
-                    #[cfg(windows)]
                     let mut src_buf = Vec::with_capacity(260);
-                    #[cfg(windows)]
                     let mut dst_buf = Vec::with_capacity(260);
 
                     loop {
@@ -807,63 +1447,14 @@ pub fn materialize_files_parallel_refs<'a>(
                             break;
                         }
                         let end = (start + chunk_size).min(total_files);
-                        for file in &files_slice[start..end] {
-                            if config.skip_existing_matching {
-                                if let Ok(meta) = std::fs::metadata(&file.path) {
-                                    if meta.len() == file.data.len() as u64 {
-                                        continue;
-                                    }
-                                }
-                            }
-
-                            let mut copied = false;
-                            if let Some(src) = file.source_path {
-                                let mut cas_valid = cas_file_is_valid(
-                                    src,
-                                    file.data.len(),
-                                    file.expected_sha256,
-                                    file.source_verified,
-                                );
-                                if !cas_valid {
-                                    repair_cas_file(src, file.data, file.mode, prealloc_thresh);
-                                    cas_valid = cas_file_is_valid(
-                                        src,
-                                        file.data.len(),
-                                        file.expected_sha256,
-                                        true,
-                                    );
-                                }
-                                #[cfg(windows)]
-                                let copy_ok = cas_valid
-                                    && copy_file_fast_buf(
-                                        src,
-                                        &file.path,
-                                        &mut src_buf,
-                                        &mut dst_buf,
-                                    )
-                                    .is_ok();
-                                #[cfg(not(windows))]
-                                let copy_ok = cas_valid && copy_file_fast(src, &file.path).is_ok();
-
-                                if copy_ok {
-                                    copied = true;
-                                    #[cfg(unix)]
-                                    {
-                                        use std::os::unix::fs::PermissionsExt;
-                                        if file.mode & 0o111 != 0 {
-                                            let _ = std::fs::set_permissions(
-                                                &file.path,
-                                                std::fs::Permissions::from_mode(file.mode),
-                                            );
-                                        }
-                                    }
-                                    crate::tarball::record_file_created(file.data.len() as u64);
-                                }
-                            }
-                            if !copied {
-                                write_file_fast(&file.path, file.data, file.mode, prealloc_thresh)
-                                    .map_err(FsError::Io)?;
-                            }
+                        for item in &items_slice[start..end] {
+                            materialize_one_item(
+                                item,
+                                config.skip_existing_matching,
+                                prealloc_thresh,
+                                &mut src_buf,
+                                &mut dst_buf,
+                            )?;
                         }
                     }
                     Ok(())
@@ -880,30 +1471,31 @@ pub fn materialize_files_parallel_refs<'a>(
         })
     } else {
         // Group files by package to maintain directory locality on HDD
-        let mut package_groups: BTreeMap<String, Vec<MaterializeFileRef<'a>>> = BTreeMap::new();
-        let mut ungrouped: Vec<MaterializeFileRef<'a>> = Vec::new();
+        let mut package_groups: BTreeMap<String, Vec<T>> = BTreeMap::new();
+        let mut ungrouped: Vec<T> = Vec::new();
 
-        for file in files {
-            if let Some(pkg) = file.package_id {
+        for item in items {
+            if let Some(pkg) = item.item_package_id() {
                 package_groups
                     .entry(pkg.to_string())
                     .or_default()
-                    .push(file);
+                    .push(item);
             } else {
-                ungrouped.push(file);
+                ungrouped.push(item);
             }
         }
 
         for group in package_groups.values_mut() {
-            group.sort_by_key(|a| std::cmp::Reverse(file_ref_lpt_priority(a)));
+            group.sort_by_key(|a| std::cmp::Reverse(item_lpt_priority(a)));
         }
 
-        let mut batches: Vec<Vec<MaterializeFileRef<'a>>> = package_groups.into_values().collect();
-        batches
-            .sort_by_key(|b| std::cmp::Reverse(b.iter().map(|f| f.data.len() as u64).sum::<u64>()));
+        let mut batches: Vec<Vec<T>> = package_groups.into_values().collect();
+        batches.sort_by_key(|b| {
+            std::cmp::Reverse(b.iter().map(|f| f.item_data().len() as u64).sum::<u64>())
+        });
 
         if !ungrouped.is_empty() {
-            ungrouped.sort_by_key(|a| std::cmp::Reverse(file_ref_lpt_priority(a)));
+            ungrouped.sort_by_key(|a| std::cmp::Reverse(item_lpt_priority(a)));
             batches.push(ungrouped);
         }
 
@@ -916,48 +1508,21 @@ pub fn materialize_files_parallel_refs<'a>(
 
             for _ in 0..num_threads {
                 handles.push(scope.spawn(|| -> Result<(), FsError> {
+                    let mut src_buf = Vec::with_capacity(260);
+                    let mut dst_buf = Vec::with_capacity(260);
                     loop {
                         let idx = next_pkg.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         if idx >= total_batches {
                             break;
                         }
-                        for file in &batches_slice[idx] {
-                            let mut copied = false;
-                            if let Some(src) = file.source_path {
-                                let mut cas_valid = cas_file_is_valid(
-                                    src,
-                                    file.data.len(),
-                                    file.expected_sha256,
-                                    file.source_verified,
-                                );
-                                if !cas_valid {
-                                    repair_cas_file(src, file.data, file.mode, prealloc_thresh);
-                                    cas_valid = cas_file_is_valid(
-                                        src,
-                                        file.data.len(),
-                                        file.expected_sha256,
-                                        true,
-                                    );
-                                }
-                                if cas_valid && copy_file_fast(src, &file.path).is_ok() {
-                                    copied = true;
-                                    #[cfg(unix)]
-                                    {
-                                        use std::os::unix::fs::PermissionsExt;
-                                        if file.mode & 0o111 != 0 {
-                                            let _ = std::fs::set_permissions(
-                                                &file.path,
-                                                std::fs::Permissions::from_mode(file.mode),
-                                            );
-                                        }
-                                    }
-                                    crate::tarball::record_file_created(file.data.len() as u64);
-                                }
-                            }
-                            if !copied {
-                                write_file_fast(&file.path, file.data, file.mode, prealloc_thresh)
-                                    .map_err(FsError::Io)?;
-                            }
+                        for item in &batches_slice[idx] {
+                            materialize_one_item(
+                                item,
+                                config.skip_existing_matching,
+                                prealloc_thresh,
+                                &mut src_buf,
+                                &mut dst_buf,
+                            )?;
                         }
                     }
                     Ok(())
@@ -975,6 +1540,16 @@ pub fn materialize_files_parallel_refs<'a>(
     }
 }
 
+/// Writes a batch of borrowed file references in parallel according to the optimal disk policy:
+/// - SSD: 24-48 threads, global LPT scheduling across all packages with lock-free atomic chunking.
+/// - HDD: 4 threads, writes grouped by package to minimize mechanical seek head movement.
+pub fn materialize_files_parallel_refs<'a>(
+    files: Vec<MaterializeFileRef<'a>>,
+    config: &ParallelWriterConfig,
+) -> Result<(), FsError> {
+    materialize_items_slice(files, config)
+}
+
 /// Writes a batch of files in parallel according to the optimal disk policy:
 /// - SSD: 24-32 threads, global LPT scheduling across all packages.
 /// - HDD: 4 threads, writes grouped by package to minimize mechanical seek head movement.
@@ -982,19 +1557,7 @@ pub fn materialize_files_parallel(
     files: Vec<MaterializeFile>,
     config: &ParallelWriterConfig,
 ) -> Result<(), FsError> {
-    let refs: Vec<MaterializeFileRef<'_>> = files
-        .iter()
-        .map(|f| MaterializeFileRef {
-            path: f.path.clone(),
-            data: &f.data,
-            mode: f.mode,
-            package_id: f.package_id.as_deref(),
-            source_path: None,
-            expected_sha256: None,
-            source_verified: false,
-        })
-        .collect();
-    materialize_files_parallel_refs(refs, config)
+    materialize_items_slice(files, config)
 }
 
 /// A package tarball decoded in memory, ready for parallel materialization.
@@ -1020,10 +1583,11 @@ pub fn decode_tar_entries<R: Read>(
 ) -> Result<DecodedTarball, FsError> {
     let limits = limits.unwrap_or_default();
     let verbatim_dest = crate::path::to_verbatim_path(destination);
+    let clean_dest = clean(&verbatim_dest);
 
     let counting_reader = CountingReader::new(reader);
     let compressed_counter = counting_reader.counter();
-    let mut buffered = std::io::BufReader::new(counting_reader);
+    let mut buffered = std::io::BufReader::with_capacity(64 * 1024, counting_reader);
     let gzipped = std::io::BufRead::fill_buf(&mut buffered)
         .map_err(FsError::Io)?
         .starts_with(&[0x1f, 0x8b]);
@@ -1153,10 +1717,23 @@ pub fn decode_tar_entries<R: Read>(
 
         validate_entry_path(&relative_path)?;
 
-        let path_depth = relative_path
-            .components()
-            .filter(|c| matches!(c, std::path::Component::Normal(_)))
-            .count();
+        let mut path_depth = 0usize;
+        let mut target_path = PathBuf::with_capacity(
+            clean_dest.as_os_str().len() + relative_path.as_os_str().len() + 2,
+        );
+        target_path.push(&clean_dest);
+        let mut norm_exact = String::with_capacity(relative_path.as_os_str().len());
+        for c in relative_path.components() {
+            if let std::path::Component::Normal(s) = c {
+                path_depth += 1;
+                target_path.push(s);
+                if !norm_exact.is_empty() {
+                    norm_exact.push('/');
+                }
+                norm_exact.push_str(&s.to_string_lossy());
+            }
+        }
+
         if path_depth > limits.max_path_depth {
             return Err(FsError::TarBombLimitExceeded {
                 limit_type: "path depth".to_string(),
@@ -1189,20 +1766,16 @@ pub fn decode_tar_entries<R: Read>(
             return Err(FsError::ForbiddenSpecialEntry { path: raw_path });
         }
 
-        let target_path = verbatim_dest.join(&relative_path);
-        let clean_dest = clean(&verbatim_dest);
-        let clean_target = clean(&target_path);
-        if !clean_target.starts_with(&clean_dest) {
+        if !target_path.starts_with(&clean_dest) {
             return Err(FsError::PathTraversal {
                 path: relative_path.clone(),
             });
         }
-        if clean_target == clean_dest && !entry_type.is_dir() {
+        if target_path == clean_dest && !entry_type.is_dir() {
             return Err(FsError::PathTraversal {
                 path: relative_path.clone(),
             });
         }
-        let target_path = clean_target;
 
         crate::tarball::ensure_no_symlink_ancestors_with_cache(
             &target_path,
@@ -1212,14 +1785,6 @@ pub fn decode_tar_entries<R: Read>(
             Some(&mut safe_ancestors),
         )?;
 
-        let norm_exact = relative_path
-            .components()
-            .filter_map(|c| match c {
-                std::path::Component::Normal(s) => Some(s.to_string_lossy().to_string()),
-                _ => None,
-            })
-            .collect::<Vec<_>>()
-            .join("/");
         if norm_exact.is_empty() {
             continue;
         }
@@ -1233,26 +1798,26 @@ pub fn decode_tar_entries<R: Read>(
             }
         }
 
-        let path_segments: Vec<&str> = norm_lower.split('/').collect();
         if entry_type.is_dir() {
             if seen_files_lower.contains(&norm_lower) {
                 return Err(FsError::CaseCollision {
                     path: relative_path.clone(),
                 });
             }
-            seen_dirs_lower.insert(norm_lower.clone());
-            let mut prefix = String::new();
-            for seg in &path_segments {
-                if !prefix.is_empty() {
-                    prefix.push('/');
+            if seen_dirs_lower.insert(norm_lower.clone()) {
+                let mut end = norm_lower.len();
+                while let Some(pos) = norm_lower[..end].rfind('/') {
+                    let prefix = &norm_lower[..pos];
+                    if seen_files_lower.contains(prefix) {
+                        return Err(FsError::CaseCollision {
+                            path: relative_path.clone(),
+                        });
+                    }
+                    if !seen_dirs_lower.insert(prefix.to_string()) {
+                        break;
+                    }
+                    end = pos;
                 }
-                prefix.push_str(seg);
-                if seen_files_lower.contains(&prefix) {
-                    return Err(FsError::CaseCollision {
-                        path: relative_path.clone(),
-                    });
-                }
-                seen_dirs_lower.insert(prefix.clone());
             }
         } else {
             if seen_dirs_lower.contains(&norm_lower) {
@@ -1261,22 +1826,22 @@ pub fn decode_tar_entries<R: Read>(
                 });
             }
             seen_files_lower.insert(norm_lower.clone());
-            let mut prefix = String::new();
-            for seg in &path_segments[..path_segments.len().saturating_sub(1)] {
-                if !prefix.is_empty() {
-                    prefix.push('/');
-                }
-                prefix.push_str(seg);
-                if seen_files_lower.contains(&prefix) {
+            let mut end = norm_lower.len();
+            while let Some(pos) = norm_lower[..end].rfind('/') {
+                let prefix = &norm_lower[..pos];
+                if seen_files_lower.contains(prefix) {
                     return Err(FsError::CaseCollision {
                         path: relative_path.clone(),
                     });
                 }
-                seen_dirs_lower.insert(prefix.clone());
+                if !seen_dirs_lower.insert(prefix.to_string()) {
+                    break;
+                }
+                end = pos;
             }
         }
 
-        seen_paths.insert(norm_lower, norm_exact.clone());
+        let was_seen = seen_paths.insert(norm_lower, norm_exact.clone()).is_some();
 
         if entry_type.is_symlink() || entry_type.is_hard_link() {
             symlink_count += 1;
@@ -1320,8 +1885,12 @@ pub fn decode_tar_entries<R: Read>(
                     symlink_paths.insert(relative_path.clone());
                     symlink_paths.insert(normalize_rel_path(&relative_path));
                     files_by_path.remove(&norm_exact);
-                    symlinks.retain(|(p, _)| p != &target_path);
-                    hardlinks.retain(|(p, _)| p != &target_path);
+                    if !symlinks.is_empty() {
+                        symlinks.retain(|(p, _)| p != &target_path);
+                    }
+                    if !hardlinks.is_empty() {
+                        hardlinks.retain(|(p, _)| p != &target_path);
+                    }
                     symlinks.push((target_path, cleaned_rel));
                 } else if entry_type.is_hard_link() {
                     if normalized_target.is_absolute() || normalized_target.has_root() {
@@ -1383,8 +1952,12 @@ pub fn decode_tar_entries<R: Read>(
                     extracted_regular_files.insert(relative_path.clone());
                     extracted_regular_files.insert(normalize_rel_path(&relative_path));
                     files_by_path.remove(&norm_exact);
-                    symlinks.retain(|(p, _)| p != &target_path);
-                    hardlinks.retain(|(p, _)| p != &target_path);
+                    if !symlinks.is_empty() {
+                        symlinks.retain(|(p, _)| p != &target_path);
+                    }
+                    if !hardlinks.is_empty() {
+                        hardlinks.retain(|(p, _)| p != &target_path);
+                    }
                     hardlinks.push((target_path, source_full));
                 }
             }
@@ -1394,7 +1967,8 @@ pub fn decode_tar_entries<R: Read>(
         if entry_type.is_dir() {
             directories.push(target_path);
         } else if entry_type.is_file() {
-            if let Ok(entry_size) = entry.header().size() {
+            let header_size = entry.header().size().ok();
+            if let Some(entry_size) = header_size {
                 if entry_size > limits.max_single_entry_size {
                     return Err(FsError::TarBombLimitExceeded {
                         limit_type: "entry size".to_string(),
@@ -1420,7 +1994,8 @@ pub fn decode_tar_entries<R: Read>(
                 .mode()
                 .unwrap_or(crate::tarball::NPM_DEFAULT_FILE_MODE);
             let t_read = std::time::Instant::now();
-            let mut file_buf = Vec::new();
+            let initial_cap = header_size.unwrap_or(0).min(4 * 1024 * 1024) as usize;
+            let mut file_buf = Vec::with_capacity(initial_cap);
             entry.read_to_end(&mut file_buf).map_err(FsError::Io)?;
             inflate_nanos += t_read.elapsed().as_nanos() as u64;
 
@@ -1453,13 +2028,20 @@ pub fn decode_tar_entries<R: Read>(
                 }
             }
 
-            symlink_paths.remove(&relative_path);
-            symlink_paths.remove(&normalize_rel_path(&relative_path));
+            if was_seen {
+                if !symlink_paths.is_empty() {
+                    symlink_paths.remove(&relative_path);
+                    symlink_paths.remove(&normalize_rel_path(&relative_path));
+                }
+                if !symlinks.is_empty() {
+                    symlinks.retain(|(p, _)| p != &target_path);
+                }
+                if !hardlinks.is_empty() {
+                    hardlinks.retain(|(p, _)| p != &target_path);
+                }
+            }
             extracted_regular_files.insert(relative_path.clone());
             extracted_regular_files.insert(normalize_rel_path(&relative_path));
-
-            symlinks.retain(|(p, _)| p != &target_path);
-            hardlinks.retain(|(p, _)| p != &target_path);
 
             let mat_file = MaterializeFile {
                 path: target_path,
@@ -1622,31 +2204,80 @@ pub fn extract_packages_direct_parallel<R: Read + Send>(
         }
     };
 
-    let mut decoded_results: Vec<Result<DecodedTarball, FsError>> = Vec::with_capacity(num_items);
-    for item in items {
-        let res = decode_tar_entries(
-            item.reader,
-            &item.destination,
-            item.limits,
-            Some(item.package_id),
-        );
-        decoded_results.push(res);
+    let mut decoded_results: Vec<Result<DecodedTarball, FsError>> = if num_items == 1 {
+        items
+            .into_iter()
+            .map(|item| {
+                decode_tar_entries(
+                    item.reader,
+                    &item.destination,
+                    item.limits,
+                    Some(item.package_id),
+                )
+            })
+            .collect()
+    } else {
+        let decode_threads = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4)
+            .clamp(2, 16)
+            .min(num_items);
+        let queue = std::sync::Mutex::new(items.into_iter().enumerate().collect::<Vec<_>>());
+        let results: Vec<std::sync::Mutex<Option<Result<DecodedTarball, FsError>>>> =
+            (0..num_items).map(|_| std::sync::Mutex::new(None)).collect();
+
+        std::thread::scope(|scope| {
+            for _ in 0..decode_threads {
+                let q = &queue;
+                let res_slots = &results;
+                scope.spawn(move || loop {
+                    let task = {
+                        let mut guard = q.lock().unwrap();
+                        guard.pop()
+                    };
+                    let Some((idx, item)) = task else {
+                        break;
+                    };
+                    let decoded = decode_tar_entries(
+                        item.reader,
+                        &item.destination,
+                        item.limits,
+                        Some(item.package_id),
+                    );
+                    *res_slots[idx].lock().unwrap() = Some(decoded);
+                });
+            }
+        });
+
+        results
+            .into_iter()
+            .map(|slot| {
+                slot.into_inner().unwrap().unwrap_or_else(|| {
+                    Err(FsError::Io(std::io::Error::other(
+                        "Tarball decode worker terminated unexpectedly",
+                    )))
+                })
+            })
+            .collect()
+    };
+
+    // Collect all unique directories and move decoded files without cloning payloads/paths
+    let mut all_files = Vec::new();
+    for decoded in decoded_results.iter_mut().flatten() {
+        all_files.append(&mut decoded.files);
     }
 
-    // Collect all unique directories across all successfully decoded packages with pre-deduplication
     let mut unique_dirs: std::collections::HashSet<&Path> = std::collections::HashSet::new();
     unique_dirs.insert(root_destination);
-    let mut all_files = Vec::new();
     for decoded in decoded_results.iter().flatten() {
         for d in &decoded.directories {
             unique_dirs.insert(d.as_path());
         }
-        for f in &decoded.files {
-            if let Some(p) = f.path.parent() {
-                unique_dirs.insert(p);
-            }
+    }
+    for f in &all_files {
+        if let Some(p) = f.path.parent() {
+            unique_dirs.insert(p);
         }
-        all_files.extend(decoded.files.clone());
     }
 
     // Pre-create all directories in one pass

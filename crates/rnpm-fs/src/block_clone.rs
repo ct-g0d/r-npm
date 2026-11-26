@@ -929,7 +929,7 @@ pub fn materialize_pack_entries(
     }
 
     // 1. Precreate directories breadth-first
-    let mut dirs = std::collections::BTreeSet::new();
+    let mut dirs = std::collections::HashSet::with_capacity(entries.len() / 2 + 1);
     dirs.insert(dest_dir.to_path_buf());
     for entry in entries {
         let full_path = dest_dir.join(entry.path);
@@ -972,38 +972,50 @@ pub fn materialize_pack_entries(
 
     let num_threads = cfg.worker_threads.clamp(1, 32).min(entries.len());
     if num_threads > 1 && entries.len() > 1 {
-        let queue = std::sync::Mutex::new(entries.to_vec());
+        let cursor = std::sync::atomic::AtomicUsize::new(0);
+        let chunk = (entries.len() / (num_threads * 4)).clamp(1, 16);
         std::thread::scope(|scope| {
             let mut handles = Vec::with_capacity(num_threads);
             for _ in 0..num_threads {
-                let q = &queue;
-                handles.push(scope.spawn(move || -> Result<(), crate::error::FsError> {
+                handles.push(scope.spawn(|| -> Result<(), crate::error::FsError> {
+                    let mut wide_buf = Vec::with_capacity(260);
                     loop {
-                        let entry = {
-                            let mut guard = q.lock().unwrap();
-                            guard.pop()
-                        };
-                        let entry = match entry {
-                            Some(e) => e,
-                            None => break,
-                        };
-                        let full_path = dest_dir.join(entry.path);
+                        let start = cursor.fetch_add(chunk, Ordering::Relaxed);
+                        if start >= entries.len() {
+                            break;
+                        }
+                        let end = (start + chunk).min(entries.len());
+                        for entry in &entries[start..end] {
+                            let full_path = dest_dir.join(entry.path);
 
-                        #[cfg(windows)]
-                        let src_h = raw_handle.map(|h| h as RawFileHandle);
-                        #[cfg(not(windows))]
-                        let src_h = None;
+                            #[cfg(windows)]
+                            let src_h = raw_handle.map(|h| h as RawFileHandle);
+                            #[cfg(not(windows))]
+                            let src_h = None;
 
-                        clone_or_write_pack_file(
-                            src_h,
-                            &full_path,
-                            entry.data,
-                            entry.offset,
-                            entry.size,
-                            entry.mode,
-                            prealloc_thresh,
-                        )
-                        .map_err(crate::error::FsError::Io)?;
+                            if src_h.is_none() {
+                                crate::writer::write_file_fast_buf(
+                                    &full_path,
+                                    entry.data,
+                                    entry.mode,
+                                    prealloc_thresh,
+                                    &mut wide_buf,
+                                    true,
+                                )
+                                .map_err(crate::error::FsError::Io)?;
+                            } else {
+                                clone_or_write_pack_file(
+                                    src_h,
+                                    &full_path,
+                                    entry.data,
+                                    entry.offset,
+                                    entry.size,
+                                    entry.mode,
+                                    prealloc_thresh,
+                                )
+                                .map_err(crate::error::FsError::Io)?;
+                            }
+                        }
                     }
                     Ok(())
                 }));
@@ -1018,6 +1030,7 @@ pub fn materialize_pack_entries(
             Ok::<(), crate::error::FsError>(())
         })?;
     } else {
+        let mut wide_buf = Vec::with_capacity(260);
         for entry in entries {
             let full_path = dest_dir.join(entry.path);
 
@@ -1026,16 +1039,28 @@ pub fn materialize_pack_entries(
             #[cfg(not(windows))]
             let src_h = None;
 
-            clone_or_write_pack_file(
-                src_h,
-                &full_path,
-                entry.data,
-                entry.offset,
-                entry.size,
-                entry.mode,
-                prealloc_thresh,
-            )
-            .map_err(crate::error::FsError::Io)?;
+            if src_h.is_none() {
+                crate::writer::write_file_fast_buf(
+                    &full_path,
+                    entry.data,
+                    entry.mode,
+                    prealloc_thresh,
+                    &mut wide_buf,
+                    true,
+                )
+                .map_err(crate::error::FsError::Io)?;
+            } else {
+                clone_or_write_pack_file(
+                    src_h,
+                    &full_path,
+                    entry.data,
+                    entry.offset,
+                    entry.size,
+                    entry.mode,
+                    prealloc_thresh,
+                )
+                .map_err(crate::error::FsError::Io)?;
+            }
         }
     }
 

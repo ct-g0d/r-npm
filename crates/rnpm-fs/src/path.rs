@@ -1,4 +1,134 @@
+#[cfg(windows)]
+use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
+
+#[cfg(windows)]
+#[inline]
+fn is_clean_windows_tail(bytes: &[u8]) -> bool {
+    let len = bytes.len();
+    if len == 0 {
+        return true;
+    }
+    if bytes == b"."
+        || bytes.starts_with(br".\")
+        || bytes.starts_with(b"\\")
+        || bytes.ends_with(br"\.")
+        || bytes.ends_with(b"\\")
+    {
+        return false;
+    }
+    let mut i = 0;
+    while i < len {
+        let b = bytes[i];
+        if b == b'/' {
+            return false;
+        }
+        if b == b'\\' && i + 1 < len {
+            let next = bytes[i + 1];
+            if next == b'\\' {
+                return false;
+            }
+            if next == b'.' && i + 2 < len && bytes[i + 2] == b'\\' {
+                return false;
+            }
+        }
+        if b == b'.' && i + 1 < len && bytes[i + 1] == b'.' {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
+#[cfg(windows)]
+#[inline]
+fn is_clean_already_verbatim(bytes: &[u8]) -> bool {
+    if !(bytes.starts_with(br"\\?\") || bytes.starts_with(br"\??\")) {
+        return false;
+    }
+    // Check for UNC/normal cleanliness after the 4-byte prefix
+    is_clean_windows_tail(&bytes[4..])
+}
+
+#[cfg(windows)]
+#[inline]
+fn is_clean_drive_abs(bytes: &[u8]) -> bool {
+    bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && bytes[2] == b'\\'
+        && is_clean_windows_tail(&bytes[3..])
+}
+
+/// Encodes `path` as a null-terminated Windows verbatim UTF-16 path into `buf`,
+/// avoiding intermediate `String`/`PathBuf` allocations on clean paths.
+#[cfg(windows)]
+pub(crate) fn encode_verbatim_wide(path: &Path, buf: &mut Vec<u16>) {
+    use std::os::windows::ffi::OsStrExt;
+    buf.clear();
+    let os = path.as_os_str();
+    let bytes = os.as_encoded_bytes();
+    if bytes.is_empty() {
+        buf.push(0);
+        return;
+    }
+    if is_clean_already_verbatim(bytes) {
+        buf.extend(os.encode_wide());
+        buf.push(0);
+        return;
+    }
+    if is_clean_drive_abs(bytes) {
+        buf.extend_from_slice(&[b'\\' as u16, b'\\' as u16, b'?' as u16, b'\\' as u16]);
+        buf.extend(os.encode_wide());
+        buf.push(0);
+        return;
+    }
+    let verb = to_verbatim_path(path);
+    buf.extend(verb.as_os_str().encode_wide());
+    buf.push(0);
+}
+
+/// Invokes `f` with a null-terminated Windows verbatim UTF-16 slice for `path`.
+/// Uses a stack buffer for short clean paths so common operations allocate zero heap memory.
+#[cfg(windows)]
+#[inline]
+pub(crate) fn with_verbatim_wide<R>(path: &Path, f: impl FnOnce(&[u16]) -> R) -> R {
+    use std::os::windows::ffi::OsStrExt;
+    let os = path.as_os_str();
+    let bytes = os.as_encoded_bytes();
+    const STACK_CAP: usize = 384;
+
+    if !bytes.is_empty() && bytes.len() + 6 <= STACK_CAP {
+        if is_clean_already_verbatim(bytes) {
+            let mut stack = [0u16; STACK_CAP];
+            let mut n = 0;
+            for ch in os.encode_wide() {
+                stack[n] = ch;
+                n += 1;
+            }
+            stack[n] = 0;
+            return f(&stack[..=n]);
+        }
+        if is_clean_drive_abs(bytes) {
+            let mut stack = [0u16; STACK_CAP];
+            stack[0] = b'\\' as u16;
+            stack[1] = b'\\' as u16;
+            stack[2] = b'?' as u16;
+            stack[3] = b'\\' as u16;
+            let mut n = 4;
+            for ch in os.encode_wide() {
+                stack[n] = ch;
+                n += 1;
+            }
+            stack[n] = 0;
+            return f(&stack[..=n]);
+        }
+    }
+
+    let mut vec = Vec::with_capacity(bytes.len() + 8);
+    encode_verbatim_wide(path, &mut vec);
+    f(&vec)
+}
 
 /// Normalizes path separators to Windows backslashes, strips redundant `.` and `..`
 /// components lexically, and converts the path to a Windows verbatim path (`\\?\` or `\\?\UNC\`)
@@ -14,21 +144,27 @@ pub fn to_verbatim_path(path: &Path) -> PathBuf {
 
     #[cfg(windows)]
     {
-        let path_str = path.to_string_lossy();
-        if path_str.is_empty() {
+        let os = path.as_os_str();
+        let bytes = os.as_encoded_bytes();
+        if bytes.is_empty() {
             return PathBuf::new();
         }
 
-        // If it already has verbatim prefix, check if already clean
+        // Fast path: already verbatim and clean
+        if is_clean_already_verbatim(bytes) {
+            return path.to_path_buf();
+        }
+
+        // Fast path: clean absolute drive path (e.g. C:\foo\bar)
+        if is_clean_drive_abs(bytes) {
+            let mut out = OsString::with_capacity(4 + bytes.len());
+            out.push(OsStr::new(r"\\?\"));
+            out.push(os);
+            return PathBuf::from(out);
+        }
+
+        let path_str = path.to_string_lossy();
         if path_str.starts_with(r"\\?\") || path_str.starts_with(r"\??\") {
-            if !path_str.contains('/')
-                && !path_str.contains("..")
-                && !path_str.contains(r"\.\")
-                && !path_str.ends_with(r"\.")
-                && (path_str.len() <= 4 || !path_str[4..].contains(r"\\"))
-            {
-                return path.to_path_buf();
-            }
             let normalized = path_str.replace('/', "\\");
             if normalized.starts_with(r"\\?\UNC\") || normalized.starts_with(r"\??\UNC\") {
                 let unc_tail = &normalized[8..];
@@ -39,20 +175,6 @@ pub fn to_verbatim_path(path: &Path) -> PathBuf {
                 let cleaned = clean_windows_components(tail);
                 return PathBuf::from(format!(r"\\?\{cleaned}"));
             }
-        }
-
-        // Fast path for clean absolute drive paths (e.g. C:\foo\bar)
-        let bytes = path_str.as_bytes();
-        if bytes.len() >= 3
-            && bytes[1] == b':'
-            && bytes[2] == b'\\'
-            && !path_str.contains('/')
-            && !path_str.contains("..")
-            && !path_str.contains(r"\.\")
-            && !path_str.ends_with(r"\.")
-            && !path_str[3..].contains(r"\\")
-        {
-            return PathBuf::from(format!(r"\\?\{path_str}"));
         }
 
         // Make path absolute if relative so verbatim path has a valid root
