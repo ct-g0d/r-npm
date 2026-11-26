@@ -45,23 +45,25 @@ impl CacheLock {
         }
 
         let start = Instant::now();
-        let mut attempt = 0;
-        let mut delay = Duration::from_millis(5);
+        let mut attempt = 0u64;
+        let mut delay = Duration::from_micros(300);
 
         loop {
             attempt += 1;
-            match Self::try_acquire_exclusive(path)? {
+            match Self::try_acquire_exclusive_inner(path, false)? {
                 Some(lock) => return Ok(lock),
                 None => {
                     // Check if current lock owner process has died; if so, break and reclaim stale lock immediately
-                    if let Some(pid) = Self::read_lock_pid(path) {
-                        if !is_process_alive(pid) {
-                            warn!(
-                                "Lock owner process PID {pid} for {} no longer exists. Breaking and reclaiming stale lock.",
-                                path.display()
-                            );
-                            if let Ok(Some(recovered)) = Self::force_recover_stale_lock(path) {
-                                return Ok(recovered);
+                    if attempt == 1 || attempt.is_multiple_of(8) {
+                        if let Some(pid) = Self::read_lock_pid(path) {
+                            if !is_process_alive(pid) {
+                                warn!(
+                                    "Lock owner process PID {pid} for {} no longer exists. Breaking and reclaiming stale lock.",
+                                    path.display()
+                                );
+                                if let Ok(Some(recovered)) = Self::force_recover_stale_lock(path) {
+                                    return Ok(recovered);
+                                }
                             }
                         }
                     }
@@ -90,11 +92,15 @@ impl CacheLock {
                         ));
                     }
 
-                    let jitter_ms = (attempt as u64 * 3) % 11;
-                    let remaining = timeout.saturating_sub(elapsed);
-                    let sleep_dur = (delay + Duration::from_millis(jitter_ms)).min(remaining);
-                    sleep(sleep_dur);
-                    delay = delay.saturating_mul(2).min(Duration::from_millis(250));
+                    if attempt <= 2 {
+                        std::thread::yield_now();
+                    } else {
+                        let jitter_us = (attempt * 97) % 400;
+                        let remaining = timeout.saturating_sub(elapsed);
+                        let sleep_dur = (delay + Duration::from_micros(jitter_us)).min(remaining);
+                        sleep(sleep_dur);
+                        delay = delay.saturating_mul(2).min(Duration::from_millis(50));
+                    }
                 }
             }
         }
@@ -103,26 +109,40 @@ impl CacheLock {
     /// Try to acquire an exclusive cross-process lock without blocking.
     /// Returns `Ok(Some(lock))` if acquired, or `Ok(None)` if another process holds the lock.
     pub fn try_acquire_exclusive(path: &Path) -> Result<Option<Self>, std::io::Error> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
+        Self::try_acquire_exclusive_inner(path, true)
+    }
 
-        // On Windows, if readonly attribute was set, clear it before opening
-        #[cfg(windows)]
-        if let Ok(meta) = std::fs::metadata(path) {
-            let mut perms = meta.permissions();
-            if perms.readonly() {
-                perms.set_readonly(false);
-                let _ = std::fs::set_permissions(path, perms);
+    fn try_acquire_exclusive_inner(
+        path: &Path,
+        ensure_parent: bool,
+    ) -> Result<Option<Self>, std::io::Error> {
+        let mut opts = OpenOptions::new();
+        opts.read(true).write(true).create(true).truncate(false);
+
+        let mut file_res = opts.open(path);
+        if let Err(ref e) = file_res {
+            if ensure_parent && e.kind() == std::io::ErrorKind::NotFound {
+                if let Some(parent) = path.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                file_res = opts.open(path);
+            }
+            #[cfg(windows)]
+            if let Err(ref e2) = file_res {
+                if e2.kind() == std::io::ErrorKind::PermissionDenied
+                    || e2.raw_os_error() == Some(5)
+                {
+                    if let Ok(meta) = std::fs::metadata(path) {
+                        let mut perms = meta.permissions();
+                        if perms.readonly() {
+                            perms.set_readonly(false);
+                            let _ = std::fs::set_permissions(path, perms);
+                            file_res = opts.open(path);
+                        }
+                    }
+                }
             }
         }
-
-        let file_res = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(path);
 
         let mut file = match file_res {
             Ok(f) => f,
@@ -144,10 +164,14 @@ impl CacheLock {
                     .duration_since(UNIX_EPOCH)
                     .map(|d| d.as_secs())
                     .unwrap_or(0);
-                let _ = file.set_len(0);
-                let _ = file.seek(SeekFrom::Start(0));
-                let _ = writeln!(file, "pid={pid} time={now}");
-                let _ = file.flush();
+                let mut buf = [0u8; 64];
+                let mut cur = std::io::Cursor::new(&mut buf[..]);
+                if writeln!(cur, "pid={pid} time={now}").is_ok() {
+                    let len = cur.position() as usize;
+                    let _ = file.seek(SeekFrom::Start(0));
+                    let _ = file.write_all(&buf[..len]);
+                    let _ = file.set_len(len as u64);
+                }
 
                 Ok(Some(Self {
                     path: path.to_path_buf(),

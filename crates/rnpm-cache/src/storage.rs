@@ -1,20 +1,98 @@
 use crate::error::CacheError;
-use crate::index::IndexEntry;
+use crate::index::{
+    encode_hex_lower, legacy_index_path_from_npm, npm_index_path_from_hash, sha256_hex_stack,
+    IndexEntry,
+};
 use crate::lock::CacheLock;
-use data_encoding::HEXLOWER;
+use data_encoding::{BASE64, HEXLOWER};
 use rnpm_core::{Algorithm, Integrity, IntegrityError};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256, Sha512};
+use sha2::{Digest, Sha512};
 use std::collections::HashSet;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::thread::sleep;
+use std::thread::{sleep, yield_now};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::{debug, warn};
 
 static TMP_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+#[inline]
+fn is_path_not_found(err: &std::io::Error) -> bool {
+    #[cfg(windows)]
+    {
+        // ERROR_PATH_NOT_FOUND (3): parent directory does not exist, so sibling files cannot exist either.
+        err.raw_os_error() == Some(3)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = err;
+        false
+    }
+}
+
+#[inline]
+fn hex_nibble(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
+#[inline]
+fn decode_sha512_hex_stack(hex: &str) -> Option<[u8; 64]> {
+    let bytes = hex.as_bytes();
+    if bytes.len() != 128 {
+        return None;
+    }
+    let mut out = [0u8; 64];
+    for i in 0..64 {
+        let hi = hex_nibble(bytes[i * 2])?;
+        let lo = hex_nibble(bytes[i * 2 + 1])?;
+        out[i] = (hi << 4) | lo;
+    }
+    Some(out)
+}
+
+#[inline]
+fn constant_time_eq_64(a: &[u8; 64], b: &[u8]) -> bool {
+    if b.len() != 64 {
+        return false;
+    }
+    let mut diff = 0u8;
+    for i in 0..64 {
+        diff |= a[i] ^ b[i];
+    }
+    diff == 0
+}
+
+#[inline]
+fn sha512_matches_integrity(digest: &[u8; 64], expected: &Integrity) -> Option<bool> {
+    if expected.strongest_algorithm() != Some(Algorithm::Sha512) {
+        return None;
+    }
+    for entry in &expected.entries {
+        if entry.algorithm == Algorithm::Sha512 && constant_time_eq_64(digest, &entry.digest) {
+            return Some(true);
+        }
+    }
+    Some(false)
+}
+
+#[inline]
+fn retry_backoff(attempt: u32, delay: &mut Duration, max_delay: Duration) {
+    if attempt <= 2 {
+        yield_now();
+    } else {
+        let jitter = (attempt as u64 * 73) % 300;
+        sleep(*delay + Duration::from_micros(jitter));
+        *delay = delay.saturating_mul(2).min(max_delay);
+    }
+}
 
 /// Clear readonly attribute on Windows or Unix.
 fn make_writable(path: &Path) {
@@ -56,14 +134,16 @@ fn clear_readonly_recursive(path: &Path) {
 
 /// Helper to reliably remove a file, clearing Windows readonly attributes and retrying on transient locks.
 fn remove_file_with_retries(path: &Path) -> std::io::Result<()> {
-    if !path.exists() {
-        return Ok(());
+    match fs::remove_file(path) {
+        Ok(()) => return Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(_) => {}
     }
 
     make_writable(path);
 
-    let mut attempts = 0;
-    let mut delay = Duration::from_millis(5);
+    let mut attempts = 0u32;
+    let mut delay = Duration::from_micros(500);
     loop {
         attempts += 1;
         match fs::remove_file(path) {
@@ -74,9 +154,7 @@ fn remove_file_with_retries(path: &Path) -> std::io::Result<()> {
                     return Err(e);
                 }
                 make_writable(path);
-                let jitter = (attempts as u64 * 3) % 7;
-                sleep(delay + Duration::from_millis(jitter));
-                delay = delay.saturating_mul(2).min(Duration::from_millis(200));
+                retry_backoff(attempts, &mut delay, Duration::from_millis(100));
             }
         }
     }
@@ -109,15 +187,17 @@ fn remove_dir_all_with_retries(dir: &Path) -> std::io::Result<()> {
     }
 }
 
-/// Recursively collect all files under a directory.
+/// Recursively collect all files under a directory without extra stat syscalls.
 pub(crate) fn collect_files_recursive(dir: &Path, out: &mut Vec<PathBuf>) {
     if let Ok(entries) = fs::read_dir(dir) {
         for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                collect_files_recursive(&path, out);
-            } else if path.is_file() {
-                out.push(path);
+            let Ok(ft) = entry.file_type() else {
+                continue;
+            };
+            if ft.is_dir() {
+                collect_files_recursive(&entry.path(), out);
+            } else if ft.is_file() {
+                out.push(entry.path());
             }
         }
     }
@@ -183,26 +263,43 @@ impl std::fmt::Display for VerifyReport {
 
 /// Helper to reliably rename a temporary file to its target path with retries on Windows transient locks.
 fn rename_with_retries(from: &Path, to: &Path) -> std::io::Result<()> {
-    let mut attempts = 0;
-    let mut delay = Duration::from_millis(5);
+    match fs::rename(from, to) {
+        Ok(()) => return Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            if let Some(parent) = to.parent() {
+                let _ = fs::create_dir_all(parent);
+            }
+            if fs::rename(from, to).is_ok() {
+                return Ok(());
+            }
+        }
+        Err(_) => {}
+    }
+
+    let mut attempts = 0u32;
+    let mut delay = Duration::from_micros(500);
     loop {
         attempts += 1;
-        if let Some(parent) = to.parent() {
-            let _ = fs::create_dir_all(parent);
-        }
         match fs::rename(from, to) {
             Ok(()) => return Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                if let Some(parent) = to.parent() {
+                    let _ = fs::create_dir_all(parent);
+                }
+                if attempts >= 10 {
+                    return Err(e);
+                }
+                retry_backoff(attempts, &mut delay, Duration::from_millis(100));
+            }
             Err(e) => {
                 if attempts >= 10 {
                     return Err(e);
                 }
-                // If destination exists, try removing it first before retrying rename
-                if attempts > 1 && to.exists() {
+                // If destination exists as a file, clear readonly and remove before retrying rename
+                if to.is_file() {
                     let _ = remove_file_with_retries(to);
                 }
-                let jitter = (attempts as u64 * 3) % 7;
-                sleep(delay + Duration::from_millis(jitter));
-                delay = delay.saturating_mul(2).min(Duration::from_millis(250));
+                retry_backoff(attempts, &mut delay, Duration::from_millis(100));
             }
         }
     }
@@ -210,8 +307,8 @@ fn rename_with_retries(from: &Path, to: &Path) -> std::io::Result<()> {
 
 /// Helper to reliably read a file with retries on Windows transient file sharing locks.
 fn read_file_with_retries(path: &Path) -> std::io::Result<Vec<u8>> {
-    let mut attempts = 0;
-    let mut delay = Duration::from_millis(5);
+    let mut attempts = 0u32;
+    let mut delay = Duration::from_micros(500);
     loop {
         attempts += 1;
         match fs::read(path) {
@@ -221,18 +318,116 @@ fn read_file_with_retries(path: &Path) -> std::io::Result<Vec<u8>> {
                 if attempts >= 10 {
                     return Err(e);
                 }
-                let jitter = (attempts as u64 * 3) % 7;
-                sleep(delay + Duration::from_millis(jitter));
-                delay = delay.saturating_mul(2).min(Duration::from_millis(150));
+                retry_backoff(attempts, &mut delay, Duration::from_millis(100));
             }
         }
     }
 }
 
-/// Helper to reliably read a UTF-8 file with retries on Windows transient file sharing locks.
-fn read_to_string_with_retries(path: &Path) -> std::io::Result<String> {
-    let bytes = read_file_with_retries(path)?;
-    String::from_utf8(bytes).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+fn parse_metadata_bytes(metadata: Option<&[u8]>) -> Option<serde_json::Value> {
+    metadata.map(|m| match serde_json::from_slice::<serde_json::Value>(m) {
+        Ok(val) => val,
+        Err(_) => match std::str::from_utf8(m) {
+            Ok(s) => serde_json::Value::String(s.to_string()),
+            Err(_) => serde_json::Value::String(HEXLOWER.encode(m)),
+        },
+    })
+}
+
+fn parse_index_line(trimmed: &str, expected_key: Option<&str>) -> Option<(IndexEntry, Integrity)> {
+    let json_str = match trimmed.find('\t') {
+        Some(tab_pos) => &trimmed[tab_pos + 1..],
+        None => trimmed,
+    };
+    let mut entry = serde_json::from_str::<IndexEntry>(json_str).ok()?;
+    if let Some(k) = expected_key {
+        if entry.key != k {
+            return None;
+        }
+    }
+    let parsed = Integrity::parse(&entry.integrity).ok()?;
+    if entry.sha512_hex.is_empty() {
+        if let Some(sha512) = parsed
+            .entries
+            .iter()
+            .find(|e| e.algorithm == Algorithm::Sha512)
+        {
+            let mut hex_buf = [0u8; 128];
+            if sha512.digest.len() == 64 {
+                entry.sha512_hex = encode_hex_lower(&sha512.digest, &mut hex_buf).to_string();
+            } else {
+                entry.sha512_hex = HEXLOWER.encode(&sha512.digest);
+            }
+        }
+    }
+    Some((entry, parsed))
+}
+
+fn parse_index_entry_slice(
+    content: &str,
+    expected_key: Option<&str>,
+    strict_all_lines: bool,
+) -> Option<(IndexEntry, Integrity)> {
+    if strict_all_lines {
+        let mut last: Option<(IndexEntry, Integrity)> = None;
+        for line in content.lines() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            last = Some(parse_index_line(trimmed, expected_key)?);
+        }
+        if last.is_some() {
+            return last;
+        }
+    } else {
+        for line in content.lines().rev() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            return parse_index_line(trimmed, expected_key);
+        }
+    }
+
+    None
+}
+
+#[inline]
+fn verify_sha512_and_integrity(
+    data: &[u8],
+    expected_integrity: &Integrity,
+    key_for_err: &str,
+) -> Result<[u8; 64], CacheError> {
+    if expected_integrity.strongest_algorithm() == Some(Algorithm::Sha512) {
+        let actual_digest: [u8; 64] = Sha512::digest(data).into();
+        if sha512_matches_integrity(&actual_digest, expected_integrity) == Some(true) {
+            return Ok(actual_digest);
+        }
+        let expected_b64 = expected_integrity
+            .entries
+            .iter()
+            .find(|e| e.algorithm == Algorithm::Sha512)
+            .map(|e| e.digest_base64.as_str())
+            .unwrap_or_default();
+        return Err(CacheError::IntegrityMismatch {
+            key: key_for_err.to_string(),
+            expected: format!("sha512-{expected_b64}"),
+            actual: format!("sha512-{}", BASE64.encode(&actual_digest)),
+        });
+    }
+
+    expected_integrity.verify(data).map_err(|e| match e {
+        IntegrityError::Mismatch {
+            expected, actual, ..
+        } => CacheError::IntegrityMismatch {
+            key: key_for_err.to_string(),
+            expected,
+            actual,
+        },
+        other => CacheError::Core(rnpm_core::CoreError::Integrity(other)),
+    })?;
+    Ok(Sha512::digest(data).into())
 }
 
 /// Content-addressable cache manager.
@@ -285,28 +480,49 @@ impl Cache {
         self.blob_path_for_algo(Algorithm::Sha512, sha512_hex)
     }
 
-    /// Compute storage path for a digest hex string under a specific algorithm (cacache content-v2/<algo> layout).
-    pub fn blob_path_for_algo(&self, algo: Algorithm, hex_str: &str) -> PathBuf {
-        let hex = hex_str.to_ascii_lowercase();
+    fn npm_blob_path_for_algo(&self, algo: Algorithm, hex_str: &str) -> PathBuf {
+        let mut stack_buf = [0u8; 128];
+        let owned_hex;
+        let hex: &str = if hex_str.is_ascii() && hex_str.len() <= 128 {
+            for (i, &b) in hex_str.as_bytes().iter().enumerate() {
+                stack_buf[i] = b.to_ascii_lowercase();
+            }
+            std::str::from_utf8(&stack_buf[..hex_str.len()]).unwrap_or(hex_str)
+        } else {
+            owned_hex = hex_str.to_ascii_lowercase();
+            &owned_hex
+        };
+
         let p1 = if hex.len() >= 2 { &hex[0..2] } else { "xx" };
         let p2 = if hex.len() >= 4 { &hex[2..4] } else { "yy" };
-        let npm_style = self
-            .root
-            .join("content-v2")
-            .join(algo.as_str())
-            .join(p1)
-            .join(p2)
-            .join(if hex.len() >= 4 { &hex[4..] } else { &hex });
-        let legacy_style = self
-            .root
-            .join("content-v2")
-            .join(algo.as_str())
-            .join(p1)
-            .join(p2)
-            .join(&hex);
+        let mut npm_style = PathBuf::with_capacity(self.root.as_os_str().len() + hex.len() + 32);
+        npm_style.push(&self.root);
+        npm_style.push("content-v2");
+        npm_style.push(algo.as_str());
+        npm_style.push(p1);
+        npm_style.push(p2);
+        npm_style.push(if hex.len() >= 4 { &hex[4..] } else { hex });
+        npm_style
+    }
+
+    fn legacy_blob_path_from_npm(npm_path: &Path, hex_str: &str) -> PathBuf {
+        let mut legacy = npm_path.to_path_buf();
+        if hex_str.bytes().any(|b| b.is_ascii_uppercase()) {
+            legacy.set_file_name(hex_str.to_ascii_lowercase());
+        } else {
+            legacy.set_file_name(hex_str);
+        }
+        legacy
+    }
+
+    /// Compute storage path for a digest hex string under a specific algorithm (cacache content-v2/<algo> layout).
+    pub fn blob_path_for_algo(&self, algo: Algorithm, hex_str: &str) -> PathBuf {
+        let npm_style = self.npm_blob_path_for_algo(algo, hex_str);
         if npm_style.exists() {
-            npm_style
-        } else if legacy_style.exists() {
+            return npm_style;
+        }
+        let legacy_style = Self::legacy_blob_path_from_npm(&npm_style, hex_str);
+        if legacy_style.exists() {
             legacy_style
         } else {
             npm_style
@@ -315,30 +531,42 @@ impl Cache {
 
     /// Compute lock file path for a given resource name.
     pub fn lock_path(&self, name: &str) -> PathBuf {
-        let safe_name = name
-            .chars()
-            .map(|c| {
-                if c.is_alphanumeric() || c == '-' || c == '_' {
-                    c
-                } else {
-                    '_'
-                }
-            })
-            .collect::<String>();
-        self.root.join("locks").join(format!("{safe_name}.lock"))
+        let mut path = PathBuf::with_capacity(self.root.as_os_str().len() + name.len() + 16);
+        path.push(&self.root);
+        path.push("locks");
+        if name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        {
+            let mut file = String::with_capacity(name.len() + 5);
+            file.push_str(name);
+            file.push_str(".lock");
+            path.push(file);
+            return path;
+        }
+        let mut file = String::with_capacity(name.len() + 5);
+        for c in name.chars() {
+            if c.is_alphanumeric() || c == '-' || c == '_' {
+                file.push(c);
+            } else {
+                file.push('_');
+            }
+        }
+        file.push_str(".lock");
+        path.push(file);
+        path
     }
 
-    /// Acquire an exclusive cross-process lock for a key with custom options.
-    pub fn lock_key_with_options(
+    fn lock_key_by_hash_with_options(
         &self,
-        key: &str,
+        hash: &str,
         timeout: Duration,
         stale_threshold: Duration,
     ) -> Result<CacheLock, CacheError> {
-        let mut hasher = sha2::Sha256::new();
-        hasher.update(key.as_bytes());
-        let hash = HEXLOWER.encode(&hasher.finalize());
-        let lock_path = self.lock_path(&format!("idx_{hash}"));
+        let mut name = String::with_capacity(4 + hash.len());
+        name.push_str("idx_");
+        name.push_str(hash);
+        let lock_path = self.lock_path(&name);
         CacheLock::acquire_exclusive_with_options(&lock_path, timeout, stale_threshold).map_err(
             |e| {
                 if e.kind() == std::io::ErrorKind::TimedOut {
@@ -348,6 +576,18 @@ impl Cache {
                 }
             },
         )
+    }
+
+    /// Acquire an exclusive cross-process lock for a key with custom options.
+    pub fn lock_key_with_options(
+        &self,
+        key: &str,
+        timeout: Duration,
+        stale_threshold: Duration,
+    ) -> Result<CacheLock, CacheError> {
+        let mut hex_buf = [0u8; 64];
+        let hash = sha256_hex_stack(key.as_bytes(), &mut hex_buf);
+        self.lock_key_by_hash_with_options(hash, timeout, stale_threshold)
     }
 
     /// Acquire an exclusive cross-process lock for a key.
@@ -381,16 +621,36 @@ impl Cache {
 
     /// Create a unique temporary file path within `<cache_root>/tmp` (guaranteed on same volume).
     fn create_temp_path(&self, prefix: &str) -> PathBuf {
-        let count = TMP_COUNTER.fetch_add(1, Ordering::SeqCst);
+        let count = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
         let pid = std::process::id();
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_nanos())
             .unwrap_or(0);
-        let filename = format!("{prefix}_{pid}_{now}_{count}.tmp");
-        let tmp = self.tmp_dir();
-        let _ = fs::create_dir_all(&tmp);
-        tmp.join(filename)
+        let mut path = self.tmp_dir();
+        path.push(format!("{prefix}_{pid}_{now}_{count}.tmp"));
+        path
+    }
+
+    fn write_temp_file(&self, prefix: &str, data: &[u8]) -> Result<PathBuf, CacheError> {
+        let temp_path = self.create_temp_path(prefix);
+        let mut file = match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp_path)
+        {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                fs::create_dir_all(self.tmp_dir())?;
+                OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&temp_path)?
+            }
+            Err(e) => return Err(CacheError::Io(e)),
+        };
+        file.write_all(data)?;
+        Ok(temp_path)
     }
 
     /// Atomically store raw bytes into content-addressable storage.
@@ -402,75 +662,120 @@ impl Cache {
         data: &[u8],
         expected_integrity: Option<&Integrity>,
     ) -> Result<String, CacheError> {
-        // Calculate SHA-512
-        let mut hasher = Sha512::new();
-        hasher.update(data);
-        let digest_bytes = hasher.finalize();
-        let sha512_hex = HEXLOWER.encode(&digest_bytes);
+        let sha512_bytes: [u8; 64] = if let Some(expected) = expected_integrity {
+            verify_sha512_and_integrity(data, expected, "blob")?
+        } else {
+            Sha512::digest(data).into()
+        };
+        let mut hex_buf = [0u8; 128];
+        let sha512_hex = encode_hex_lower(&sha512_bytes, &mut hex_buf).to_string();
 
-        // Verify against expected integrity if provided
-        if let Some(expected) = expected_integrity {
-            expected.verify(data).map_err(|e| match e {
-                IntegrityError::Mismatch {
-                    algorithm: _,
-                    expected,
-                    actual,
-                } => CacheError::IntegrityMismatch {
-                    key: sha512_hex.clone(),
-                    expected,
-                    actual,
-                },
-                other => CacheError::Core(rnpm_core::CoreError::Integrity(other)),
-            })?;
+        if let Err(e) = self.put_blob_direct(data, &sha512_hex) {
+            return Err(e);
         }
-
-        self.put_blob_direct(data, &sha512_hex)?;
         Ok(sha512_hex)
     }
 
     /// Store a pre-verified blob atomically by its known SHA-512 hex digest.
     pub fn put_blob_direct(&self, data: &[u8], sha512_hex: &str) -> Result<(), CacheError> {
-        let target_path = self.blob_path(sha512_hex);
-        if target_path.exists() {
-            // Check if existing file has valid content
-            if let Ok(existing_bytes) = fs::read(&target_path) {
-                let mut h = Sha512::new();
-                h.update(&existing_bytes);
-                if HEXLOWER.encode(&h.finalize()) == sha512_hex {
-                    // Blob already exists and is uncorrupted
+        let npm_path = self.npm_blob_path_for_algo(Algorithm::Sha512, sha512_hex);
+        let target_path = match fs::metadata(&npm_path) {
+            Ok(meta) => {
+                if meta.is_dir() {
+                    return Err(CacheError::Io(std::io::Error::new(
+                        std::io::ErrorKind::AlreadyExists,
+                        format!("Blob path is a directory: {}", npm_path.display()),
+                    )));
+                }
+                if meta.len() == data.len() as u64 {
+                    if let Ok(existing) = read_file_with_retries(&npm_path) {
+                        if existing.as_slice() == data {
+                            return Ok(());
+                        }
+                    }
+                }
+                let _ = remove_file_with_retries(&npm_path);
+                npm_path
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                if !is_path_not_found(&e) {
+                    let legacy_path = Self::legacy_blob_path_from_npm(&npm_path, sha512_hex);
+                    if let Ok(meta) = fs::metadata(&legacy_path) {
+                        if meta.is_dir() {
+                            return Err(CacheError::Io(std::io::Error::new(
+                                std::io::ErrorKind::AlreadyExists,
+                                format!("Blob path is a directory: {}", legacy_path.display()),
+                            )));
+                        }
+                        if meta.len() == data.len() as u64 {
+                            if let Ok(existing) = read_file_with_retries(&legacy_path) {
+                                if existing.as_slice() == data {
+                                    return Ok(());
+                                }
+                            }
+                        }
+                        let _ = remove_file_with_retries(&legacy_path);
+                    }
+                }
+                npm_path
+            }
+            Err(_) => npm_path,
+        };
+
+        // Staging step: Write to temporary file on the SAME filesystem/volume
+        let temp_path = self.write_temp_file("blob", data)?;
+
+        // Fast lock-free atomic rename for immutable content-addressed blobs
+        match fs::rename(&temp_path, &target_path) {
+            Ok(()) => {
+                debug!("Atomically stored blob {}", target_path.display());
+                return Ok(());
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                if let Some(parent) = target_path.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                if fs::rename(&temp_path, &target_path).is_ok() {
+                    debug!("Atomically stored blob {}", target_path.display());
                     return Ok(());
                 }
             }
-            // If existing file is corrupted, remove it first
-            let _ = remove_file_with_retries(&target_path);
-        }
-
-        // Staging step: Write to temporary file on the SAME filesystem/volume
-        let temp_path = self.create_temp_path("blob");
-        {
-            let mut file = OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&temp_path)?;
-            file.write_all(data)?;
-            file.flush()?;
-        }
-
-        // Ensure target directory exists
-        if let Some(parent) = target_path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-
-        // Acquire lock and rename atomically
-        let _blob_lock = self.lock_blob(sha512_hex)?;
-        if target_path.exists() {
-            if let Ok(existing_bytes) = fs::read(&target_path) {
-                let mut h = Sha512::new();
-                h.update(&existing_bytes);
-                if HEXLOWER.encode(&h.finalize()) == sha512_hex {
-                    // Another worker already populated target_path; clean up temp and succeed
+            Err(e) => {
+                if target_path.is_dir() {
                     let _ = remove_file_with_retries(&temp_path);
-                    return Ok(());
+                    return Err(CacheError::Io(e));
+                }
+            }
+        }
+
+        // Check if another concurrent worker already populated the valid blob
+        if let Ok(meta) = fs::metadata(&target_path) {
+            if meta.is_dir() {
+                let _ = remove_file_with_retries(&temp_path);
+                return Err(CacheError::Io(std::io::Error::new(
+                    std::io::ErrorKind::AlreadyExists,
+                    format!("Blob path is a directory: {}", target_path.display()),
+                )));
+            }
+            if meta.len() == data.len() as u64 {
+                if let Ok(existing) = read_file_with_retries(&target_path) {
+                    if existing.as_slice() == data {
+                        let _ = remove_file_with_retries(&temp_path);
+                        return Ok(());
+                    }
+                }
+            }
+        }
+
+        // Fallback to cross-process lock if rename collided on corrupted/readonly file
+        let _blob_lock = self.lock_blob(sha512_hex)?;
+        if let Ok(meta) = fs::metadata(&target_path) {
+            if meta.len() == data.len() as u64 {
+                if let Ok(existing) = read_file_with_retries(&target_path) {
+                    if existing.as_slice() == data {
+                        let _ = remove_file_with_retries(&temp_path);
+                        return Ok(());
+                    }
                 }
             }
             let _ = remove_file_with_retries(&target_path);
@@ -485,43 +790,72 @@ impl Cache {
         Ok(())
     }
 
+    fn read_and_verify_sha512(
+        &self,
+        sha512_hex: &str,
+    ) -> Result<Option<(Vec<u8>, [u8; 64])>, CacheError> {
+        let npm_path = self.npm_blob_path_for_algo(Algorithm::Sha512, sha512_hex);
+        let (bytes, used_path) = match read_file_with_retries(&npm_path) {
+            Ok(b) => (b, npm_path),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                if is_path_not_found(&e) {
+                    return Ok(None);
+                }
+                let legacy_path = Self::legacy_blob_path_from_npm(&npm_path, sha512_hex);
+                match read_file_with_retries(&legacy_path) {
+                    Ok(b) => (b, legacy_path),
+                    Err(e2) if e2.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                    Err(e2) => {
+                        warn!(
+                            "Unreadable or corrupt blob at {} ({e2}). Purging corrupted entry.",
+                            legacy_path.display()
+                        );
+                        let _ = remove_file_with_retries(&legacy_path);
+                        return Ok(None);
+                    }
+                }
+            }
+            Err(e) => {
+                warn!(
+                    "Unreadable or corrupt blob at {} ({e}). Purging corrupted entry.",
+                    npm_path.display()
+                );
+                let _ = remove_file_with_retries(&npm_path);
+                return Ok(None);
+            }
+        };
+
+        let actual_digest: [u8; 64] = Sha512::digest(&bytes).into();
+        let matches = match decode_sha512_hex_stack(sha512_hex) {
+            Some(expected) => actual_digest == expected,
+            None => {
+                let mut hex_buf = [0u8; 128];
+                encode_hex_lower(&actual_digest, &mut hex_buf).eq_ignore_ascii_case(sha512_hex)
+            }
+        };
+
+        if !matches {
+            let mut hex_buf = [0u8; 128];
+            let actual_hex = encode_hex_lower(&actual_digest, &mut hex_buf);
+            warn!(
+                "Cached blob {} is corrupted (expected {}, got {})! Purging corrupt entry and signaling cache miss.",
+                used_path.display(),
+                sha512_hex,
+                actual_hex
+            );
+            let _ = remove_file_with_retries(&used_path);
+            return Ok(None);
+        }
+
+        Ok(Some((bytes, actual_digest)))
+    }
+
     /// Retrieve a blob by its SHA-512 hex digest.
     ///
     /// If the file on disk is corrupted (checksum mismatch or unreadable), it is automatically
     /// PURGED and `Ok(None)` is returned (signaling a cache miss for re-fetch).
     pub fn get_by_sha512(&self, sha512_hex: &str) -> Result<Option<Vec<u8>>, CacheError> {
-        let blob_path = self.blob_path(sha512_hex);
-        let bytes = match read_file_with_retries(&blob_path) {
-            Ok(b) => b,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(e) => {
-                warn!(
-                    "Unreadable or corrupt blob at {} ({e}). Purging corrupted entry.",
-                    blob_path.display()
-                );
-                let _ = remove_file_with_retries(&blob_path);
-                return Ok(None);
-            }
-        };
-
-        // Verify SHA-512 checksum of cached data
-        let mut hasher = Sha512::new();
-        hasher.update(&bytes);
-        let actual_hex = HEXLOWER.encode(&hasher.finalize());
-
-        if !actual_hex.eq_ignore_ascii_case(sha512_hex) {
-            warn!(
-                "Cached blob {} is corrupted (expected {}, got {})! Purging corrupt entry and signaling cache miss.",
-                blob_path.display(),
-                sha512_hex,
-                actual_hex
-            );
-            // Purge corrupt file
-            let _ = remove_file_with_retries(&blob_path);
-            return Ok(None);
-        }
-
-        Ok(Some(bytes))
+        Ok(self.read_and_verify_sha512(sha512_hex)?.map(|(b, _)| b))
     }
 
     /// Retrieve an index entry by key.
@@ -529,29 +863,36 @@ impl Cache {
     /// If the index file is corrupted (invalid JSON, non-UTF-8, or mismatched key),
     /// it is automatically PURGED and `Ok(None)` is returned.
     pub fn get_index_entry(&self, key: &str) -> Result<Option<IndexEntry>, CacheError> {
+        Ok(self.get_index_entry_with_parsed(key)?.map(|(e, _)| e))
+    }
+
+    fn get_index_entry_with_parsed(
+        &self,
+        key: &str,
+    ) -> Result<Option<(IndexEntry, Integrity)>, CacheError> {
         // First try exact key
-        if let Some(entry) = self.get_index_entry_internal(key)? {
-            return Ok(Some(entry));
+        if let Some(pair) = self.get_index_entry_internal(key)? {
+            return Ok(Some(pair));
         }
 
         // Try npm cacache / pacote key aliases
         if key.starts_with("http://") || key.starts_with("https://") {
             let alias = format!("make-fetch-happen:request-cache:{key}");
-            if let Some(entry) = self.get_index_entry_internal(&alias)? {
-                return Ok(Some(entry));
+            if let Some(pair) = self.get_index_entry_internal(&alias)? {
+                return Ok(Some(pair));
             }
         } else if let Some(stripped) = key.strip_prefix("make-fetch-happen:request-cache:") {
-            if let Some(entry) = self.get_index_entry_internal(stripped)? {
-                return Ok(Some(entry));
+            if let Some(pair) = self.get_index_entry_internal(stripped)? {
+                return Ok(Some(pair));
             }
         } else if !key.contains(':') {
             let alias = format!("pacote:packument:{key}");
-            if let Some(entry) = self.get_index_entry_internal(&alias)? {
-                return Ok(Some(entry));
+            if let Some(pair) = self.get_index_entry_internal(&alias)? {
+                return Ok(Some(pair));
             }
         } else if let Some(stripped) = key.strip_prefix("pacote:packument:") {
-            if let Some(entry) = self.get_index_entry_internal(stripped)? {
-                return Ok(Some(entry));
+            if let Some(pair) = self.get_index_entry_internal(stripped)? {
+                return Ok(Some(pair));
             }
             if stripped.contains("://") {
                 if let Some((protocol, rest)) = stripped.split_once("://") {
@@ -560,14 +901,14 @@ impl Cache {
                             let trimmed_host = host_part.trim_end_matches('/');
                             let alt_key =
                                 format!("pacote:packument:{protocol}://{trimmed_host}:{name_part}");
-                            if let Some(entry) = self.get_index_entry_internal(&alt_key)? {
-                                return Ok(Some(entry));
+                            if let Some(pair) = self.get_index_entry_internal(&alt_key)? {
+                                return Ok(Some(pair));
                             }
                         } else {
                             let alt_key =
                                 format!("pacote:packument:{protocol}://{host_part}/:{name_part}");
-                            if let Some(entry) = self.get_index_entry_internal(&alt_key)? {
-                                return Ok(Some(entry));
+                            if let Some(pair) = self.get_index_entry_internal(&alt_key)? {
+                                return Ok(Some(pair));
                             }
                         }
                     }
@@ -578,14 +919,48 @@ impl Cache {
         Ok(None)
     }
 
-    fn get_index_entry_internal(&self, key: &str) -> Result<Option<IndexEntry>, CacheError> {
-        let index_path = IndexEntry::path_for_key(&self.root, key);
-        let content = match read_to_string_with_retries(&index_path) {
-            Ok(c) => c,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+    fn get_index_entry_internal(
+        &self,
+        key: &str,
+    ) -> Result<Option<(IndexEntry, Integrity)>, CacheError> {
+        let mut hex_buf = [0u8; 64];
+        let hash = sha256_hex_stack(key.as_bytes(), &mut hex_buf);
+        let npm_path = npm_index_path_from_hash(&self.root, hash);
+        let (bytes, index_path) = match read_file_with_retries(&npm_path) {
+            Ok(b) => (b, npm_path),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                if is_path_not_found(&e) {
+                    return Ok(None);
+                }
+                let legacy_path = legacy_index_path_from_npm(&npm_path, hash);
+                match read_file_with_retries(&legacy_path) {
+                    Ok(b) => (b, legacy_path),
+                    Err(e2) if e2.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                    Err(e2) => {
+                        warn!(
+                            "Unreadable index entry at {} ({e2}). Purging corrupt index.",
+                            legacy_path.display()
+                        );
+                        let _ = remove_file_with_retries(&legacy_path);
+                        return Ok(None);
+                    }
+                }
+            }
             Err(e) => {
                 warn!(
-                    "Non-UTF8 or unreadable index entry at {} ({e}). Purging corrupt index.",
+                    "Unreadable index entry at {} ({e}). Purging corrupt index.",
+                    npm_path.display()
+                );
+                let _ = remove_file_with_retries(&npm_path);
+                return Ok(None);
+            }
+        };
+
+        let content = match std::str::from_utf8(&bytes) {
+            Ok(s) => s,
+            Err(e) => {
+                warn!(
+                    "Non-UTF8 index entry at {} ({e}). Purging corrupt index.",
                     index_path.display()
                 );
                 let _ = remove_file_with_retries(&index_path);
@@ -593,105 +968,82 @@ impl Cache {
             }
         };
 
-        for line in content.lines().rev() {
-            let trimmed = line.trim();
-            if trimmed.is_empty() {
-                continue;
-            }
-
-            let json_str = if let Some(tab_pos) = trimmed.find('\t') {
-                &trimmed[tab_pos + 1..]
-            } else {
-                trimmed
-            };
-
-            match serde_json::from_str::<IndexEntry>(json_str) {
-                Ok(mut entry) => {
-                    if entry.key == key {
-                        if let Err(err) = Integrity::parse(&entry.integrity) {
-                            warn!(
-                                "Index entry at {} has unparseable SSRI integrity '{}' ({err}). Purging corrupt index.",
-                                index_path.display(),
-                                entry.integrity
-                            );
-                            let _ = remove_file_with_retries(&index_path);
-                            return Ok(None);
-                        }
-
-                        if entry.sha512_hex.is_empty() {
-                            if let Ok(parsed) = Integrity::parse(&entry.integrity) {
-                                if let Some(sha512) = parsed
-                                    .entries
-                                    .iter()
-                                    .find(|e| e.algorithm == Algorithm::Sha512)
-                                {
-                                    entry.sha512_hex = HEXLOWER.encode(&sha512.digest);
-                                }
-                            }
-                        }
-
-                        return Ok(Some(entry));
-                    } else {
-                        warn!(
-                            "Index entry at {} has key mismatch (expected '{}', got '{}'). Purging corrupt index.",
-                            index_path.display(),
-                            key,
-                            entry.key
-                        );
-                        let _ = remove_file_with_retries(&index_path);
-                        return Ok(None);
-                    }
-                }
-                Err(err) => {
-                    warn!(
-                        "Corrupt index entry at {}: {err}. Purging corrupt index.",
-                        index_path.display()
-                    );
-                    let _ = remove_file_with_retries(&index_path);
-                    return Ok(None);
-                }
-            }
+        if let Some(pair) = parse_index_entry_slice(content, Some(key), false) {
+            return Ok(Some(pair));
         }
 
         // Fallback for multi-line pretty-printed single JSON
-        match serde_json::from_str::<IndexEntry>(&content) {
-            Ok(mut entry) => {
+        if content.trim_start().starts_with('{') {
+            if let Ok(mut entry) = serde_json::from_str::<IndexEntry>(content) {
                 if entry.key == key {
-                    if let Err(err) = Integrity::parse(&entry.integrity) {
-                        warn!(
-                            "Index entry at {} has unparseable SSRI integrity '{}' ({err}). Purging corrupt index.",
-                            index_path.display(),
-                            entry.integrity
-                        );
-                        let _ = remove_file_with_retries(&index_path);
-                        return Ok(None);
-                    }
-                    if entry.sha512_hex.is_empty() {
-                        if let Ok(parsed) = Integrity::parse(&entry.integrity) {
+                    if let Ok(parsed) = Integrity::parse(&entry.integrity) {
+                        if entry.sha512_hex.is_empty() {
                             if let Some(sha512) = parsed
                                 .entries
                                 .iter()
                                 .find(|e| e.algorithm == Algorithm::Sha512)
                             {
-                                entry.sha512_hex = HEXLOWER.encode(&sha512.digest);
+                                let mut h = [0u8; 128];
+                                if sha512.digest.len() == 64 {
+                                    entry.sha512_hex =
+                                        encode_hex_lower(&sha512.digest, &mut h).to_string();
+                                } else {
+                                    entry.sha512_hex = HEXLOWER.encode(&sha512.digest);
+                                }
                             }
                         }
+                        return Ok(Some((entry, parsed)));
                     }
-                    Ok(Some(entry))
-                } else {
-                    let _ = remove_file_with_retries(&index_path);
-                    Ok(None)
                 }
             }
-            Err(_) => {
-                warn!(
-                    "Corrupt index entry at {}. Purging corrupt index.",
-                    index_path.display()
-                );
-                let _ = remove_file_with_retries(&index_path);
-                Ok(None)
-            }
         }
+
+        warn!(
+            "Corrupt or mismatched index entry at {}. Purging corrupt index.",
+            index_path.display()
+        );
+        let _ = remove_file_with_retries(&index_path);
+        Ok(None)
+    }
+
+    fn write_index_entry(&self, key: &str, entry: &IndexEntry) -> Result<(), CacheError> {
+        let mut hex_buf = [0u8; 64];
+        let hash = sha256_hex_stack(key.as_bytes(), &mut hex_buf);
+        let npm_path = npm_index_path_from_hash(&self.root, hash);
+
+        let mut buf = Vec::with_capacity(256 + key.len());
+        buf.resize(41, 0u8);
+        serde_json::to_writer(&mut buf, entry)?;
+        let sha1_digest = sha1::Sha1::digest(&buf[41..]);
+        encode_hex_lower(&sha1_digest, &mut buf[..40]);
+        buf[40] = b'\t';
+        buf.push(b'\n');
+
+        let temp_path = self.write_temp_file("index", &buf)?;
+
+        match fs::rename(&temp_path, &npm_path) {
+            Ok(()) => return Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                if let Some(parent) = npm_path.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                if fs::rename(&temp_path, &npm_path).is_ok() {
+                    return Ok(());
+                }
+            }
+            Err(_) => {}
+        }
+
+        let _key_lock = self.lock_key_by_hash_with_options(
+            hash,
+            self.lock_timeout,
+            self.stale_threshold,
+        )?;
+        if let Err(err) = rename_with_retries(&temp_path, &npm_path) {
+            let _ = remove_file_with_retries(&temp_path);
+            return Err(CacheError::Io(err));
+        }
+        Ok(())
     }
 
     /// Store an entry into the cache with key mapping and strict integrity verification.
@@ -705,92 +1057,27 @@ impl Cache {
         expected_integrity: Option<&Integrity>,
         metadata: Option<&[u8]>,
     ) -> Result<IndexEntry, CacheError> {
-        // If expected_integrity is provided, verify it BEFORE writing blob or index entry
-        if let Some(expected) = expected_integrity {
-            expected.verify(data).map_err(|e| match e {
-                IntegrityError::Mismatch {
-                    expected, actual, ..
-                } => CacheError::IntegrityMismatch {
-                    key: key.to_string(),
-                    expected,
-                    actual,
-                },
-                other => CacheError::Core(rnpm_core::CoreError::Integrity(other)),
-            })?;
-        }
-
-        // Put blob in content-addressable storage
-        let sha512_hex = if let Some(expected) = expected_integrity {
-            if let Some(sha_entry) = expected
-                .entries
-                .iter()
-                .find(|e| e.algorithm == Algorithm::Sha512)
-            {
-                let hex = HEXLOWER.encode(&sha_entry.digest);
-                self.put_blob_direct(data, &hex)?;
-                hex
-            } else {
-                self.put_blob(data, None)?
-            }
+        let (sha512_bytes, integrity) = if let Some(expected) = expected_integrity {
+            let bytes = verify_sha512_and_integrity(data, expected, key)?;
+            (bytes, expected.to_string())
         } else {
-            self.put_blob(data, None)?
-        };
-        let integrity = if let Some(expected) = expected_integrity {
-            expected.to_string()
-        } else {
-            Integrity::from_bytes(data, Algorithm::Sha512).to_string()
+            let bytes: [u8; 64] = Sha512::digest(data).into();
+            let integ = format!("sha512-{}", BASE64.encode(&bytes));
+            (bytes, integ)
         };
 
-        let metadata_val = match metadata {
-            Some(m) => match serde_json::from_slice::<serde_json::Value>(m) {
-                Ok(val) => Some(val),
-                Err(_) => match std::str::from_utf8(m) {
-                    Ok(s) => Some(serde_json::Value::String(s.to_string())),
-                    Err(_) => Some(serde_json::Value::String(HEXLOWER.encode(m))),
-                },
-            },
-            None => None,
-        };
+        let mut hex_buf = [0u8; 128];
+        let sha512_hex = encode_hex_lower(&sha512_bytes, &mut hex_buf).to_string();
+        self.put_blob_direct(data, &sha512_hex)?;
 
         let entry = IndexEntry::new(
             key.to_string(),
             integrity,
             sha512_hex,
             data.len() as u64,
-            metadata_val,
+            parse_metadata_bytes(metadata),
         );
-
-        // Put index entry with atomic write and cross-process lock
-        let index_path = IndexEntry::path_for_key(&self.root, key);
-        if let Some(parent) = index_path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-
-        let temp_path = self.create_temp_path("index");
-        {
-            let json_str = serde_json::to_string(&entry)?;
-            let mut hasher = sha1::Sha1::new();
-            hasher.update(json_str.as_bytes());
-            let hash = HEXLOWER.encode(&hasher.finalize());
-            let line = format!("{hash}\t{json_str}\n");
-
-            let mut file = OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&temp_path)?;
-            file.write_all(line.as_bytes())?;
-            file.flush()?;
-        }
-
-        let _key_lock = self.lock_key(key)?;
-        if index_path.exists() {
-            let _ = remove_file_with_retries(&index_path);
-        }
-        if let Err(err) = rename_with_retries(&temp_path, &index_path) {
-            let _ = remove_file_with_retries(&temp_path);
-            return Err(CacheError::Io(err));
-        }
-
+        self.write_index_entry(key, &entry)?;
         Ok(entry)
     }
 
@@ -803,9 +1090,12 @@ impl Cache {
         data: &[u8],
         metadata: Option<serde_json::Value>,
     ) -> Result<IndexEntry, CacheError> {
-        // First, put blob in content-addressable storage
-        let sha512_hex = self.put_blob(data, None)?;
-        let integrity = Integrity::from_bytes(data, Algorithm::Sha512).to_string();
+        let sha512_bytes: [u8; 64] = Sha512::digest(data).into();
+        let mut hex_buf = [0u8; 128];
+        let sha512_hex = encode_hex_lower(&sha512_bytes, &mut hex_buf).to_string();
+        let integrity = format!("sha512-{}", BASE64.encode(&sha512_bytes));
+
+        self.put_blob_direct(data, &sha512_hex)?;
 
         let entry = IndexEntry::new(
             key.to_string(),
@@ -814,36 +1104,47 @@ impl Cache {
             data.len() as u64,
             metadata,
         );
-
-        // Put index entry with atomic write and cross-process lock
-        let index_path = IndexEntry::path_for_key(&self.root, key);
-        if let Some(parent) = index_path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-
-        let temp_path = self.create_temp_path("index");
-        {
-            let json_str = serde_json::to_string(&entry)?;
-            let mut hasher = sha1::Sha1::new();
-            hasher.update(json_str.as_bytes());
-            let hash = HEXLOWER.encode(&hasher.finalize());
-            let line = format!("{hash}\t{json_str}\n");
-
-            let mut file = OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&temp_path)?;
-            file.write_all(line.as_bytes())?;
-            file.flush()?;
-        }
-
-        let _key_lock = self.lock_key(key)?;
-        if let Err(err) = rename_with_retries(&temp_path, &index_path) {
-            let _ = remove_file_with_retries(&temp_path);
-            return Err(CacheError::Io(err));
-        }
-
+        self.write_index_entry(key, &entry)?;
         Ok(entry)
+    }
+
+    fn get_with_entry_and_parsed(
+        &self,
+        entry: IndexEntry,
+        parsed_integrity: Integrity,
+    ) -> Result<Option<(IndexEntry, Vec<u8>)>, CacheError> {
+        if !entry.sha512_hex.is_empty() {
+            if let Some((bytes, actual_digest)) = self.read_and_verify_sha512(&entry.sha512_hex)? {
+                let valid = match sha512_matches_integrity(&actual_digest, &parsed_integrity) {
+                    Some(ok) => ok,
+                    None => parsed_integrity.verify(&bytes).is_ok(),
+                };
+                if !valid {
+                    warn!(
+                        "SSRI integrity mismatch for key '{}'. Auto-purging corrupt entry and treating as cache miss.",
+                        entry.key
+                    );
+                    let index_path = IndexEntry::path_for_key(&self.root, &entry.key);
+                    let _ = remove_file_with_retries(&index_path);
+                    let blob_path = self.blob_path(&entry.sha512_hex);
+                    let _ = remove_file_with_retries(&blob_path);
+                    return Ok(None);
+                }
+                return Ok(Some((entry, bytes)));
+            }
+        }
+
+        if let Some(bytes) = self.get_by_integrity(&parsed_integrity)? {
+            return Ok(Some((entry, bytes)));
+        }
+
+        let index_path = IndexEntry::path_for_key(&self.root, &entry.key);
+        let _ = remove_file_with_retries(&index_path);
+        warn!(
+            "Blob for index key '{}' was corrupted or missing. Stale index purged.",
+            entry.key
+        );
+        Ok(None)
     }
 
     /// Retrieve cached data and index metadata by key.
@@ -851,66 +1152,52 @@ impl Cache {
     /// If the blob is missing or corrupted, both the blob and index entry are purged,
     /// and `Ok(None)` is returned to signal a cache miss for re-fetching.
     pub fn get(&self, key: &str) -> Result<Option<(IndexEntry, Vec<u8>)>, CacheError> {
-        let entry = match self.get_index_entry(key)? {
-            Some(e) => e,
-            None => return Ok(None),
+        let Some((entry, parsed_integrity)) = self.get_index_entry_with_parsed(key)? else {
+            return Ok(None);
         };
+        self.get_with_entry_and_parsed(entry, parsed_integrity)
+    }
 
-        if !entry.sha512_hex.is_empty() {
-            if let Some(bytes) = self.get_by_sha512(&entry.sha512_hex)? {
-                if let Ok(expected_integrity) = Integrity::parse(&entry.integrity) {
-                    if let Err(err) = expected_integrity.verify(&bytes) {
-                        warn!(
-                            "SSRI SHA-512 integrity mismatch for key '{key}': {err}. Auto-purging corrupt entry and treating as cache miss."
-                        );
-                        let index_path = IndexEntry::path_for_key(&self.root, &entry.key);
-                        let _ = remove_file_with_retries(&index_path);
-                        let blob_path = self.blob_path(&entry.sha512_hex);
-                        let _ = remove_file_with_retries(&blob_path);
-                        return Ok(None);
-                    }
-                }
-                return Ok(Some((entry, bytes)));
-            }
-        }
-
-        if let Ok(parsed_integrity) = Integrity::parse(&entry.integrity) {
-            if let Some(bytes) = self.get_by_integrity(&parsed_integrity)? {
-                return Ok(Some((entry, bytes)));
-            }
-        }
-
-        let index_path = IndexEntry::path_for_key(&self.root, &entry.key);
-        let _ = remove_file_with_retries(&index_path);
-        warn!("Blob for index key '{key}' was corrupted or missing. Stale index purged.");
-        Ok(None)
+    fn get_exact(&self, key: &str) -> Result<Option<(IndexEntry, Vec<u8>)>, CacheError> {
+        let Some((entry, parsed_integrity)) = self.get_index_entry_internal(key)? else {
+            return Ok(None);
+        };
+        self.get_with_entry_and_parsed(entry, parsed_integrity)
     }
 
     /// Retrieve the local filesystem path to a cached blob without reading the contents into memory.
     /// This enables zero-copy streaming extraction and inspection.
     pub fn get_blob_path(&self, key: &str) -> Result<Option<(IndexEntry, PathBuf)>, CacheError> {
-        let entry = match self.get_index_entry(key)? {
-            Some(e) => e,
+        let (entry, parsed_integrity) = match self.get_index_entry_with_parsed(key)? {
+            Some(pair) => pair,
             None => return Ok(None),
         };
 
         if !entry.sha512_hex.is_empty() {
-            let blob_path = self.blob_path(&entry.sha512_hex);
-            if blob_path.exists() {
-                return Ok(Some((entry, blob_path)));
+            let npm_path = self.npm_blob_path_for_algo(Algorithm::Sha512, &entry.sha512_hex);
+            if npm_path.exists() {
+                return Ok(Some((entry, npm_path)));
+            }
+            let legacy_path = Self::legacy_blob_path_from_npm(&npm_path, &entry.sha512_hex);
+            if legacy_path.exists() {
+                return Ok(Some((entry, legacy_path)));
             }
         }
 
-        if let Ok(parsed_integrity) = Integrity::parse(&entry.integrity) {
-            let mut sorted_entries = parsed_integrity.entries.clone();
+        let mut sorted_entries = parsed_integrity.entries;
+        if sorted_entries.len() > 1 {
             sorted_entries.sort_by_key(|a| std::cmp::Reverse(a.algorithm));
+        }
 
-            for ssri in sorted_entries {
-                let hex = HEXLOWER.encode(&ssri.digest);
-                let blob_path = self.blob_path_for_algo(ssri.algorithm, &hex);
-                if blob_path.exists() {
-                    return Ok(Some((entry, blob_path)));
-                }
+        for ssri in sorted_entries {
+            let hex = HEXLOWER.encode(&ssri.digest);
+            let npm_path = self.npm_blob_path_for_algo(ssri.algorithm, &hex);
+            if npm_path.exists() {
+                return Ok(Some((entry, npm_path)));
+            }
+            let legacy_path = Self::legacy_blob_path_from_npm(&npm_path, &hex);
+            if legacy_path.exists() {
+                return Ok(Some((entry, legacy_path)));
             }
         }
 
@@ -928,22 +1215,50 @@ impl Cache {
     ) -> Result<IndexEntry, CacheError> {
         use std::io::Read;
 
-        let mut file = fs::File::open(source_path).map_err(CacheError::Io)?;
+        let mut src_file = fs::File::open(source_path).map_err(CacheError::Io)?;
+        let temp_blob = self.create_temp_path("blob");
+        let mut dst_file = match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp_blob)
+        {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                fs::create_dir_all(self.tmp_dir())?;
+                OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&temp_blob)?
+            }
+            Err(e) => return Err(CacheError::Io(e)),
+        };
+
         let mut hasher = Sha512::new();
         let mut buffer = [0u8; 65536];
         let mut total_size = 0u64;
 
-        loop {
-            let bytes_read = file.read(&mut buffer).map_err(CacheError::Io)?;
-            if bytes_read == 0 {
-                break;
+        let read_res: Result<(), CacheError> = (|| {
+            loop {
+                let bytes_read = src_file.read(&mut buffer).map_err(CacheError::Io)?;
+                if bytes_read == 0 {
+                    break;
+                }
+                hasher.update(&buffer[..bytes_read]);
+                dst_file.write_all(&buffer[..bytes_read])?;
+                total_size += bytes_read as u64;
             }
-            hasher.update(&buffer[..bytes_read]);
-            total_size += bytes_read as u64;
+            Ok(())
+        })();
+        drop(dst_file);
+
+        if let Err(err) = read_res {
+            let _ = remove_file_with_retries(&temp_blob);
+            return Err(err);
         }
 
-        let sha512_bytes = hasher.finalize();
-        let sha512_hex = HEXLOWER.encode(&sha512_bytes);
+        let sha512_bytes: [u8; 64] = hasher.finalize().into();
+        let mut hex_buf = [0u8; 128];
+        let sha512_hex = encode_hex_lower(&sha512_bytes, &mut hex_buf).to_string();
 
         if let Some(expected) = expected_integrity {
             if let Some(sha512_entry) = expected
@@ -952,40 +1267,44 @@ impl Cache {
                 .find(|e| e.algorithm == Algorithm::Sha512)
             {
                 if sha512_entry.digest.as_slice() != sha512_bytes.as_slice() {
+                    let _ = remove_file_with_retries(&temp_blob);
                     return Err(CacheError::IntegrityMismatch {
                         key: key.to_string(),
                         expected: sha512_entry.to_string(),
-                        actual: format!("sha512-{}", data_encoding::BASE64.encode(&sha512_bytes)),
+                        actual: format!("sha512-{}", BASE64.encode(&sha512_bytes)),
                     });
                 }
             }
         }
 
-        let target_path = self.blob_path(&sha512_hex);
-        if !target_path.exists() {
-            if let Some(parent) = target_path.parent() {
-                fs::create_dir_all(parent)?;
+        let npm_path = self.npm_blob_path_for_algo(Algorithm::Sha512, &sha512_hex);
+        match fs::rename(&temp_blob, &npm_path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                if let Some(parent) = npm_path.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                if rename_with_retries(&temp_blob, &npm_path).is_err() {
+                    let _ = remove_file_with_retries(&temp_blob);
+                }
             }
-            let temp_path = self.create_temp_path("blob");
-            fs::copy(source_path, &temp_path)?;
-            let _ = rename_with_retries(&temp_path, &target_path);
+            Err(_) => {
+                if let Ok(meta) = fs::metadata(&npm_path) {
+                    if meta.len() == total_size {
+                        let _ = remove_file_with_retries(&temp_blob);
+                    } else if rename_with_retries(&temp_blob, &npm_path).is_err() {
+                        let _ = remove_file_with_retries(&temp_blob);
+                    }
+                } else if rename_with_retries(&temp_blob, &npm_path).is_err() {
+                    let _ = remove_file_with_retries(&temp_blob);
+                }
+            }
         }
 
         let integrity = if let Some(expected) = expected_integrity {
             expected.to_string()
         } else {
-            format!("sha512-{}", data_encoding::BASE64.encode(&sha512_bytes))
-        };
-
-        let metadata_val = match metadata {
-            Some(m) => match serde_json::from_slice::<serde_json::Value>(m) {
-                Ok(val) => Some(val),
-                Err(_) => match std::str::from_utf8(m) {
-                    Ok(s) => Some(serde_json::Value::String(s.to_string())),
-                    Err(_) => Some(serde_json::Value::String(HEXLOWER.encode(m))),
-                },
-            },
-            None => None,
+            format!("sha512-{}", BASE64.encode(&sha512_bytes))
         };
 
         let entry = IndexEntry::new(
@@ -993,68 +1312,103 @@ impl Cache {
             integrity,
             sha512_hex,
             total_size,
-            metadata_val,
+            parse_metadata_bytes(metadata),
         );
-
-        let index_path = IndexEntry::path_for_key(&self.root, key);
-        if let Some(parent) = index_path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-
-        let temp_path = self.create_temp_path("index");
-        {
-            let json_str = serde_json::to_string(&entry)?;
-            let mut h = sha1::Sha1::new();
-            h.update(json_str.as_bytes());
-            let hash = HEXLOWER.encode(&h.finalize());
-            let line = format!("{hash}\t{json_str}\n");
-
-            let mut f = OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&temp_path)?;
-            f.write_all(line.as_bytes())?;
-            f.flush()?;
-        }
-
-        let _key_lock = self.lock_key(key)?;
-        if index_path.exists() {
-            let _ = remove_file_with_retries(&index_path);
-        }
-        if let Err(err) = rename_with_retries(&temp_path, &index_path) {
-            let _ = remove_file_with_retries(&temp_path);
-            return Err(CacheError::Io(err));
-        }
-
+        self.write_index_entry(key, &entry)?;
         Ok(entry)
     }
 
     /// Retrieve a blob by its SSRI Integrity descriptor.
     /// If corrupted, auto-purges the corrupt blob, logs a diagnostic, and returns `Ok(None)` for clean re-fetching.
     pub fn get_by_integrity(&self, integrity: &Integrity) -> Result<Option<Vec<u8>>, CacheError> {
+        if integrity.entries.len() == 1 {
+            let entry = &integrity.entries[0];
+            if entry.algorithm == Algorithm::Sha512 {
+                let mut hex_buf = [0u8; 128];
+                if entry.digest.len() == 64 {
+                    let hex = encode_hex_lower(&entry.digest, &mut hex_buf);
+                    return self.get_by_sha512(hex);
+                }
+            }
+            let hex = HEXLOWER.encode(&entry.digest);
+            let npm_path = self.npm_blob_path_for_algo(entry.algorithm, &hex);
+            let (bytes, used_path) = match read_file_with_retries(&npm_path) {
+                Ok(b) => (b, npm_path),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    if is_path_not_found(&e) {
+                        return Ok(None);
+                    }
+                    let legacy_path = Self::legacy_blob_path_from_npm(&npm_path, &hex);
+                    match read_file_with_retries(&legacy_path) {
+                        Ok(b) => (b, legacy_path),
+                        Err(e2) if e2.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                        Err(e2) => {
+                            warn!(
+                                "Unreadable or corrupt blob at {} ({e2}). Purging corrupted entry.",
+                                legacy_path.display()
+                            );
+                            let _ = remove_file_with_retries(&legacy_path);
+                            return Ok(None);
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!(
+                        "Unreadable or corrupt blob at {} ({e}). Purging corrupted entry.",
+                        npm_path.display()
+                    );
+                    let _ = remove_file_with_retries(&npm_path);
+                    return Ok(None);
+                }
+            };
+            if let Err(err) = integrity.verify(&bytes) {
+                warn!("SSRI verification failed for blob {hex}: {err}. Auto-purging.");
+                let _ = remove_file_with_retries(&used_path);
+                return Ok(None);
+            }
+            return Ok(Some(bytes));
+        }
+
         let mut sorted_entries = integrity.entries.clone();
         sorted_entries.sort_by_key(|a| std::cmp::Reverse(a.algorithm));
 
         for entry in sorted_entries {
             let hex = HEXLOWER.encode(&entry.digest);
-            let blob_path = self.blob_path_for_algo(entry.algorithm, &hex);
-            match read_file_with_retries(&blob_path) {
-                Ok(bytes) => {
-                    if let Err(err) = integrity.verify(&bytes) {
-                        warn!("SSRI verification failed for blob {hex}: {err}. Auto-purging.");
-                        let _ = remove_file_with_retries(&blob_path);
-                    } else {
-                        return Ok(Some(bytes));
+            let npm_path = self.npm_blob_path_for_algo(entry.algorithm, &hex);
+            let (bytes, used_path) = match read_file_with_retries(&npm_path) {
+                Ok(b) => (b, npm_path),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    if is_path_not_found(&e) {
+                        continue;
+                    }
+                    let legacy_path = Self::legacy_blob_path_from_npm(&npm_path, &hex);
+                    match read_file_with_retries(&legacy_path) {
+                        Ok(b) => (b, legacy_path),
+                        Err(e2) if e2.kind() == std::io::ErrorKind::NotFound => continue,
+                        Err(e2) => {
+                            warn!(
+                                "Unreadable or corrupt blob at {} ({e2}). Purging corrupted entry.",
+                                legacy_path.display()
+                            );
+                            let _ = remove_file_with_retries(&legacy_path);
+                            continue;
+                        }
                     }
                 }
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
                 Err(e) => {
                     warn!(
                         "Unreadable or corrupt blob at {} ({e}). Purging corrupted entry.",
-                        blob_path.display()
+                        npm_path.display()
                     );
-                    let _ = remove_file_with_retries(&blob_path);
+                    let _ = remove_file_with_retries(&npm_path);
+                    continue;
                 }
+            };
+            if let Err(err) = integrity.verify(&bytes) {
+                warn!("SSRI verification failed for blob {hex}: {err}. Auto-purging.");
+                let _ = remove_file_with_retries(&used_path);
+            } else {
+                return Ok(Some(bytes));
             }
         }
         Ok(None)
@@ -1097,7 +1451,7 @@ impl Cache {
         accept: Option<&str>,
     ) -> Result<Option<(IndexEntry, Vec<u8>)>, CacheError> {
         let key = Self::packument_key(registry, name, accept);
-        if let Some(res) = self.get(&key)? {
+        if let Some(res) = self.get_exact(&key)? {
             return Ok(Some(res));
         }
 
@@ -1108,7 +1462,7 @@ impl Cache {
             _ => format!("pacote:packument:{reg_with_slash}:{name}"),
         };
         if alt_key != key {
-            if let Some(res) = self.get(&alt_key)? {
+            if let Some(res) = self.get_exact(&alt_key)? {
                 return Ok(Some(res));
             }
         }
@@ -1116,14 +1470,28 @@ impl Cache {
         // If an accept header was provided, also fallback to the key without accept header
         if accept.is_some() {
             let key_no_accept = Self::packument_key(registry, name, None);
-            if let Some(res) = self.get(&key_no_accept)? {
+            if let Some(res) = self.get_exact(&key_no_accept)? {
                 return Ok(Some(res));
+            }
+            let alt_no_accept = format!("pacote:packument:{reg_with_slash}:{name}");
+            if alt_no_accept != key_no_accept {
+                if let Some(res) = self.get_exact(&alt_no_accept)? {
+                    return Ok(Some(res));
+                }
             }
         } else {
             let key_abbrev =
                 Self::packument_key(registry, name, Some("application/vnd.npm.install-v1+json"));
-            if let Some(res) = self.get(&key_abbrev)? {
+            if let Some(res) = self.get_exact(&key_abbrev)? {
                 return Ok(Some(res));
+            }
+            let alt_abbrev = format!(
+                "pacote:packument:{reg_with_slash}:{name}:application/vnd.npm.install-v1+json"
+            );
+            if alt_abbrev != key_abbrev {
+                if let Some(res) = self.get_exact(&alt_abbrev)? {
+                    return Ok(Some(res));
+                }
             }
         }
 
@@ -1294,83 +1662,200 @@ impl Cache {
         Ok(())
     }
 
+    fn expected_blob_digest(path: &Path) -> Option<[u8; 64]> {
+        let file_name = path.file_name()?.to_str()?;
+        if file_name.len() == 128 {
+            return decode_sha512_hex_stack(file_name);
+        }
+        if file_name.len() == 124 {
+            let p2 = path.parent()?.file_name()?.to_str()?;
+            let p1 = path.parent()?.parent()?.file_name()?.to_str()?;
+            if p1.len() == 2 && p2.len() == 2 {
+                let mut combined = [0u8; 128];
+                combined[0..2].copy_from_slice(p1.as_bytes());
+                combined[2..4].copy_from_slice(p2.as_bytes());
+                combined[4..128].copy_from_slice(file_name.as_bytes());
+                let s = std::str::from_utf8(&combined).ok()?;
+                return decode_sha512_hex_stack(s);
+            }
+        }
+        None
+    }
+
+    fn verify_single_blob(path: &Path) -> (usize, usize, u64, Option<[u8; 64]>) {
+        let Some(expected) = Self::expected_blob_digest(path) else {
+            warn!(
+                "Invalid blob file name '{}' in content-v2. Purging.",
+                path.display()
+            );
+            let _ = remove_file_with_retries(path);
+            return (0, 1, 0, None);
+        };
+
+        match read_file_with_retries(path) {
+            Ok(bytes) => {
+                let actual: [u8; 64] = Sha512::digest(&bytes).into();
+                if actual == expected {
+                    (1, 0, bytes.len() as u64, Some(actual))
+                } else {
+                    let mut exp_buf = [0u8; 128];
+                    let mut act_buf = [0u8; 128];
+                    warn!(
+                        "Corrupted blob detected at {} (expected {}, got {}). Purging.",
+                        path.display(),
+                        encode_hex_lower(&expected, &mut exp_buf),
+                        encode_hex_lower(&actual, &mut act_buf)
+                    );
+                    let _ = remove_file_with_retries(path);
+                    (0, 1, 0, None)
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => (0, 0, 0, None),
+            Err(e) => {
+                warn!("Unreadable blob at {} ({}). Purging.", path.display(), e);
+                let _ = remove_file_with_retries(path);
+                (0, 1, 0, None)
+            }
+        }
+    }
+
+    fn verify_single_index(
+        &self,
+        path: &Path,
+        valid_blobs: &HashSet<[u8; 64]>,
+    ) -> (usize, usize, usize, Option<[u8; 64]>) {
+        let bytes = match read_file_with_retries(path) {
+            Ok(b) => b,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return (0, 0, 0, None),
+            Err(e) => {
+                warn!(
+                    "Unreadable index file at {} ({}). Purging.",
+                    path.display(),
+                    e
+                );
+                let _ = remove_file_with_retries(path);
+                return (0, 1, 0, None);
+            }
+        };
+
+        let Ok(content) = std::str::from_utf8(&bytes) else {
+            warn!(
+                "Non-UTF8 index file at {}. Purging.",
+                path.display()
+            );
+            let _ = remove_file_with_retries(path);
+            return (0, 1, 0, None);
+        };
+
+        let parsed_entry = parse_index_entry_slice(content, None, true);
+        let entry = match parsed_entry {
+            Some((e, _)) if !e.key.is_empty() && !e.sha512_hex.is_empty() => e,
+            _ => {
+                warn!(
+                    "Corrupted or malformed index entry at {}. Purging.",
+                    path.display()
+                );
+                let _ = remove_file_with_retries(path);
+                return (0, 1, 0, None);
+            }
+        };
+
+        if let Some(digest) = decode_sha512_hex_stack(&entry.sha512_hex) {
+            if valid_blobs.contains(&digest) {
+                return (1, 0, 0, None);
+            }
+            let npm_path = self.npm_blob_path_for_algo(Algorithm::Sha512, &entry.sha512_hex);
+            let bytes_res = match read_file_with_retries(&npm_path) {
+                Ok(b) => Ok(b),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound && !is_path_not_found(&e) => {
+                    let legacy_path =
+                        Self::legacy_blob_path_from_npm(&npm_path, &entry.sha512_hex);
+                    read_file_with_retries(&legacy_path)
+                }
+                Err(e) => Err(e),
+            };
+            if let Ok(blob_bytes) = bytes_res {
+                let actual: [u8; 64] = Sha512::digest(&blob_bytes).into();
+                if actual == digest {
+                    return (1, 0, 0, Some(digest));
+                }
+            }
+        }
+
+        warn!(
+            "Orphaned index entry at {} points to missing blob {}. Purging.",
+            path.display(),
+            entry.sha512_hex
+        );
+        let _ = remove_file_with_retries(path);
+        (0, 0, 1, None)
+    }
+
     /// Verify all `content-v2` SHA-512 blobs against their digests, purge corrupted blobs,
     /// scan `index-v5` entries, purge corrupted indices or orphaned indices pointing to missing blobs,
     /// clean stale temporary files in `tmp`, and return a detailed `VerifyReport`.
     pub fn verify(&self) -> Result<VerifyReport, CacheError> {
         let mut report = VerifyReport::default();
-        let mut valid_blobs = HashSet::new();
+        let mut valid_blobs: HashSet<[u8; 64]> = HashSet::new();
 
         // 1. Verify content-v2 blobs against their digests and purge corrupted ones
         let content_dir = self.root.join("content-v2").join("sha512");
         if content_dir.exists() {
             let mut blob_paths = Vec::new();
             collect_files_recursive(&content_dir, &mut blob_paths);
+            valid_blobs.reserve(blob_paths.len());
 
-            for path in blob_paths {
-                let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                let is_hex_128 =
-                    file_name.len() == 128 && file_name.chars().all(|c| c.is_ascii_hexdigit());
-                let p2 = path
-                    .parent()
-                    .and_then(|p| p.file_name())
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("");
-                let p1 = path
-                    .parent()
-                    .and_then(|p| p.parent())
-                    .and_then(|p| p.file_name())
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("");
-                let is_hex_124 = file_name.len() == 124
-                    && file_name.chars().all(|c| c.is_ascii_hexdigit())
-                    && p1.len() == 2
-                    && p1.chars().all(|c| c.is_ascii_hexdigit())
-                    && p2.len() == 2
-                    && p2.chars().all(|c| c.is_ascii_hexdigit());
-
-                let expected_hex = if is_hex_128 {
-                    file_name.to_string()
-                } else if is_hex_124 {
-                    format!("{p1}{p2}{file_name}")
-                } else {
-                    warn!(
-                        "Invalid blob file name '{}' in content-v2. Purging.",
-                        path.display()
-                    );
-                    let _ = remove_file_with_retries(&path);
-                    report.corrupted_blobs += 1;
-                    continue;
-                };
-
-                match read_file_with_retries(&path) {
-                    Ok(bytes) => {
-                        let mut hasher = Sha512::new();
-                        hasher.update(&bytes);
-                        let actual = HEXLOWER.encode(&hasher.finalize());
-                        if actual.eq_ignore_ascii_case(&expected_hex) {
-                            report.verified_blobs += 1;
-                            report.total_blob_bytes += bytes.len() as u64;
-                            valid_blobs.insert(actual.to_ascii_lowercase());
-                        } else {
-                            warn!(
-                                "Corrupted blob detected at {} (expected {}, got {}). Purging.",
-                                path.display(),
-                                expected_hex,
-                                actual
-                            );
-                            let _ = remove_file_with_retries(&path);
-                            report.corrupted_blobs += 1;
-                        }
+            if blob_paths.len() >= 4 {
+                let workers = std::thread::available_parallelism()
+                    .map(|n| n.get().clamp(2, 8))
+                    .unwrap_or(4)
+                    .min(blob_paths.len());
+                let next_idx = std::sync::atomic::AtomicUsize::new(0);
+                let paths_ref = &blob_paths;
+                let next_ref = &next_idx;
+                let results = std::thread::scope(|scope| {
+                    let mut handles = Vec::with_capacity(workers);
+                    for _ in 0..workers {
+                        handles.push(scope.spawn(move || {
+                            let mut v = 0usize;
+                            let mut c = 0usize;
+                            let mut b = 0u64;
+                            let mut digests = Vec::new();
+                            loop {
+                                let idx = next_ref.fetch_add(1, Ordering::Relaxed);
+                                if idx >= paths_ref.len() {
+                                    break;
+                                }
+                                let (vi, ci, bi, dg) = Self::verify_single_blob(&paths_ref[idx]);
+                                v += vi;
+                                c += ci;
+                                b += bi;
+                                if let Some(d) = dg {
+                                    digests.push(d);
+                                }
+                            }
+                            (v, c, b, digests)
+                        }));
                     }
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                        // Concurrent rename or cleanup; safely skip
-                        continue;
-                    }
-                    Err(e) => {
-                        warn!("Unreadable blob at {} ({}). Purging.", path.display(), e);
-                        let _ = remove_file_with_retries(&path);
-                        report.corrupted_blobs += 1;
+                    handles
+                        .into_iter()
+                        .map(|h| h.join().unwrap_or((0, 0, 0, Vec::new())))
+                        .collect::<Vec<_>>()
+                });
+                for (v, c, b, digests) in results {
+                    report.verified_blobs += v;
+                    report.corrupted_blobs += c;
+                    report.total_blob_bytes += b;
+                    valid_blobs.extend(digests);
+                }
+            } else {
+                for path in &blob_paths {
+                    let (v, c, b, dg) = Self::verify_single_blob(path);
+                    report.verified_blobs += v;
+                    report.corrupted_blobs += c;
+                    report.total_blob_bytes += b;
+                    if let Some(d) = dg {
+                        valid_blobs.insert(d);
                     }
                 }
             }
@@ -1382,138 +1867,55 @@ impl Cache {
             let mut index_paths = Vec::new();
             collect_files_recursive(&index_dir, &mut index_paths);
 
-            for path in index_paths {
-                let content = match read_to_string_with_retries(&path) {
-                    Ok(c) => c,
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                        // Concurrent rename or cleanup; safely skip
-                        continue;
-                    }
-                    Err(e) => {
-                        warn!(
-                            "Unreadable index file at {} ({}). Purging.",
-                            path.display(),
-                            e
-                        );
-                        let _ = remove_file_with_retries(&path);
-                        report.corrupted_indices += 1;
-                        continue;
-                    }
-                };
-
-                let parsed_entry = {
-                    let mut last = None;
-                    let mut all_valid = true;
-                    let mut has_lines = false;
-                    for line in content.lines() {
-                        let trimmed = line.trim();
-                        if trimmed.is_empty() {
-                            continue;
-                        }
-                        has_lines = true;
-                        let json_str = if let Some(tab_pos) = trimmed.find('\t') {
-                            &trimmed[tab_pos + 1..]
-                        } else {
-                            trimmed
-                        };
-                        if let Ok(mut entry) = serde_json::from_str::<IndexEntry>(json_str) {
-                            if entry.sha512_hex.is_empty() {
-                                if let Ok(parsed) = Integrity::parse(&entry.integrity) {
-                                    if let Some(sha512) = parsed
-                                        .entries
-                                        .iter()
-                                        .find(|e| e.algorithm == Algorithm::Sha512)
-                                    {
-                                        entry.sha512_hex = HEXLOWER.encode(&sha512.digest);
-                                    }
+            if index_paths.len() >= 4 {
+                let workers = std::thread::available_parallelism()
+                    .map(|n| n.get().clamp(2, 8))
+                    .unwrap_or(4)
+                    .min(index_paths.len());
+                let next_idx = std::sync::atomic::AtomicUsize::new(0);
+                let paths_ref = &index_paths;
+                let next_ref = &next_idx;
+                let valid_ref = &valid_blobs;
+                let results = std::thread::scope(|scope| {
+                    let mut handles = Vec::with_capacity(workers);
+                    for _ in 0..workers {
+                        handles.push(scope.spawn(move || {
+                            let mut v = 0usize;
+                            let mut c = 0usize;
+                            let mut o = 0usize;
+                            loop {
+                                let idx = next_ref.fetch_add(1, Ordering::Relaxed);
+                                if idx >= paths_ref.len() {
+                                    break;
                                 }
+                                let (vi, ci, oi, _) =
+                                    self.verify_single_index(&paths_ref[idx], valid_ref);
+                                v += vi;
+                                c += ci;
+                                o += oi;
                             }
-                            if Integrity::parse(&entry.integrity).is_ok() {
-                                last = Some(entry);
-                            } else {
-                                all_valid = false;
-                                break;
-                            }
-                        } else {
-                            all_valid = false;
-                            break;
-                        }
+                            (v, c, o)
+                        }));
                     }
-                    if all_valid && last.is_some() {
-                        last
-                    } else if !has_lines {
-                        if let Ok(mut entry) = serde_json::from_str::<IndexEntry>(&content) {
-                            if entry.sha512_hex.is_empty() {
-                                if let Ok(parsed) = Integrity::parse(&entry.integrity) {
-                                    if let Some(sha512) = parsed
-                                        .entries
-                                        .iter()
-                                        .find(|e| e.algorithm == Algorithm::Sha512)
-                                    {
-                                        entry.sha512_hex = HEXLOWER.encode(&sha512.digest);
-                                    }
-                                }
-                            }
-                            if Integrity::parse(&entry.integrity).is_ok() {
-                                Some(entry)
-                            } else {
-                                None
-                            }
-                        } else {
-                            None
-                        }
-                    } else {
-                        None
+                    handles
+                        .into_iter()
+                        .map(|h| h.join().unwrap_or((0, 0, 0)))
+                        .collect::<Vec<_>>()
+                });
+                for (v, c, o) in results {
+                    report.verified_indices += v;
+                    report.corrupted_indices += c;
+                    report.orphaned_indices += o;
+                }
+            } else {
+                for path in &index_paths {
+                    let (v, c, o, new_digest) = self.verify_single_index(path, &valid_blobs);
+                    report.verified_indices += v;
+                    report.corrupted_indices += c;
+                    report.orphaned_indices += o;
+                    if let Some(d) = new_digest {
+                        valid_blobs.insert(d);
                     }
-                };
-
-                let entry = match parsed_entry {
-                    Some(e) if !e.key.is_empty() && !e.sha512_hex.is_empty() => e,
-                    _ => {
-                        warn!(
-                            "Corrupted or malformed index entry at {}. Purging.",
-                            path.display()
-                        );
-                        let _ = remove_file_with_retries(&path);
-                        report.corrupted_indices += 1;
-                        continue;
-                    }
-                };
-
-                let digest = entry.sha512_hex.to_ascii_lowercase();
-                let is_valid = if valid_blobs.contains(&digest) {
-                    true
-                } else {
-                    let bpath = self.blob_path(&digest);
-                    if bpath.exists() {
-                        if let Ok(bytes) = fs::read(&bpath) {
-                            let mut hasher = Sha512::new();
-                            hasher.update(&bytes);
-                            let actual = HEXLOWER.encode(&hasher.finalize());
-                            if actual.eq_ignore_ascii_case(&digest) {
-                                valid_blobs.insert(digest.clone());
-                                true
-                            } else {
-                                false
-                            }
-                        } else {
-                            false
-                        }
-                    } else {
-                        false
-                    }
-                };
-
-                if is_valid {
-                    report.verified_indices += 1;
-                } else {
-                    warn!(
-                        "Orphaned index entry at {} points to missing blob {}. Purging.",
-                        path.display(),
-                        entry.sha512_hex
-                    );
-                    let _ = remove_file_with_retries(&path);
-                    report.orphaned_indices += 1;
                 }
             }
         }
@@ -1548,36 +1950,37 @@ impl Cache {
         let mut count = 0;
         if let Ok(entries) = fs::read_dir(dir) {
             for entry in entries.flatten() {
+                let Ok(ft) = entry.file_type() else {
+                    continue;
+                };
                 let path = entry.path();
-                if path.is_dir() {
+                if ft.is_dir() {
                     count += self.audit_and_purge_dir(&path, is_blob)?;
-                } else if path.is_file() {
-                    let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                } else if ft.is_file() {
                     if is_blob {
-                        // For blob: filename is expected sha512 hex
-                        if let Ok(bytes) = fs::read(&path) {
-                            let mut hasher = Sha512::new();
-                            hasher.update(&bytes);
-                            let actual = HEXLOWER.encode(&hasher.finalize());
-                            if !actual.eq_ignore_ascii_case(file_name) {
+                        if let Some(expected) = Self::expected_blob_digest(&path) {
+                            if let Ok(bytes) = fs::read(&path) {
+                                let actual: [u8; 64] = Sha512::digest(&bytes).into();
+                                if actual != expected {
+                                    let _ = remove_file_with_retries(&path);
+                                    count += 1;
+                                }
+                            } else {
                                 let _ = remove_file_with_retries(&path);
                                 count += 1;
                             }
                         } else {
+                            let _ = remove_file_with_retries(&path);
+                            count += 1;
+                        }
+                    } else if let Ok(content) = fs::read_to_string(&path) {
+                        if parse_index_entry_slice(&content, None, true).is_none() {
                             let _ = remove_file_with_retries(&path);
                             count += 1;
                         }
                     } else {
-                        // For index: parse JSON
-                        if let Ok(content) = fs::read_to_string(&path) {
-                            if serde_json::from_str::<IndexEntry>(&content).is_err() {
-                                let _ = remove_file_with_retries(&path);
-                                count += 1;
-                            }
-                        } else {
-                            let _ = remove_file_with_retries(&path);
-                            count += 1;
-                        }
+                        let _ = remove_file_with_retries(&path);
+                        count += 1;
                     }
                 }
             }
@@ -1597,12 +2000,11 @@ impl Cache {
         #[cfg(not(windows))]
         let normalized_str = normalized.to_string();
 
-        let mut hasher = Sha256::new();
-        hasher.update(normalized_str.as_bytes());
-        let key = HEXLOWER.encode(&hasher.finalize());
+        let mut hex_buf = [0u8; 64];
+        let key = sha256_hex_stack(normalized_str.as_bytes(), &mut hex_buf);
         self.root
             .join("_fingerprints")
-            .join(format!("{}.json", key))
+            .join(format!("{key}.json"))
     }
 
     /// Retrieve the cached project fingerprint for a project directory.
@@ -1611,10 +2013,7 @@ impl Cache {
         project_dir: &Path,
     ) -> Result<Option<String>, CacheError> {
         let path = self.fingerprint_path(project_dir);
-        if !path.exists() {
-            return Ok(None);
-        }
-        let data = match fs::read_to_string(&path) {
+        let data = match fs::read(&path) {
             Ok(d) => d,
             Err(_) => return Ok(None),
         };
@@ -1622,7 +2021,7 @@ impl Cache {
         struct FingerprintRecord {
             fingerprint: String,
         }
-        if let Ok(record) = serde_json::from_str::<FingerprintRecord>(&data) {
+        if let Ok(record) = serde_json::from_slice::<FingerprintRecord>(&data) {
             Ok(Some(record.fingerprint))
         } else {
             Ok(None)
@@ -1636,10 +2035,6 @@ impl Cache {
         fingerprint: &str,
     ) -> Result<(), CacheError> {
         let target_path = self.fingerprint_path(project_dir);
-        if let Some(parent) = target_path.parent() {
-            let _ = fs::create_dir_all(parent);
-        }
-
         let canonical = project_dir
             .canonicalize()
             .unwrap_or_else(|_| project_dir.to_path_buf());
@@ -1652,20 +2047,8 @@ impl Cache {
                 .unwrap_or(0),
         });
         let serialized = serde_json::to_vec_pretty(&record)?;
+        let temp_path = self.write_temp_file("fingerprint", &serialized)?;
 
-        let temp_path = self.create_temp_path("fingerprint");
-        {
-            let mut file = OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&temp_path)?;
-            file.write_all(&serialized)?;
-            file.flush()?;
-        }
-
-        if target_path.exists() {
-            let _ = remove_file_with_retries(&target_path);
-        }
         if let Err(err) = rename_with_retries(&temp_path, &target_path) {
             let _ = remove_file_with_retries(&temp_path);
             return Err(CacheError::Io(err));
