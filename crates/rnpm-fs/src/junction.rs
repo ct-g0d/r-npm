@@ -698,6 +698,7 @@ mod win_rm {
     struct QueueState {
         pending: VecDeque<DirItem>,
         active: usize,
+        waiters: usize,
         error: Option<FsError>,
     }
 
@@ -714,7 +715,7 @@ mod win_rm {
         let mut local_subdirs = Vec::with_capacity(16);
 
         // Traverse sequentially until queue fans out (>= 2 subdirs), avoiding thread
-        // spawning overhead on tiny trees while scaling cleanly for nested node_modules.
+        // dispatch overhead on tiny trees while scaling cleanly for nested node_modules.
         while stack.len() == 1 {
             let dir = stack.pop().unwrap();
             local_subdirs.clear();
@@ -750,75 +751,118 @@ mod win_rm {
             let state = Mutex::new(QueueState {
                 pending: stack.into_iter().collect(),
                 active: 0,
+                waiters: 0,
                 error: None,
             });
             let cvar = Condvar::new();
+            let stop_flag = std::sync::atomic::AtomicBool::new(false);
 
-            std::thread::scope(|scope| {
-                for _ in 0..num_threads {
-                    let state_ref = &state;
-                    let cvar_ref = &cvar;
-                    scope.spawn(move || {
-                        let mut p_buf = Vec::with_capacity(300);
-                        let mut c_buf = Vec::with_capacity(300);
-                        let mut local_subs = Vec::with_capacity(16);
+            crate::pool::run_parallel(num_threads, &|| {
+                let mut p_buf = Vec::with_capacity(300);
+                let mut c_buf = Vec::with_capacity(300);
+                let mut local_subs = Vec::with_capacity(16);
 
-                        loop {
-                            let dir = {
-                                let mut guard = state_ref.lock().unwrap_or_else(|e| e.into_inner());
-                                loop {
-                                    if guard.error.is_some() {
-                                        break None;
-                                    }
-                                    if let Some(d) = guard.pending.pop_back() {
-                                        guard.active += 1;
-                                        break Some(d);
-                                    }
-                                    if guard.active == 0 {
-                                        cvar_ref.notify_all();
-                                        break None;
-                                    }
-                                    guard = cvar_ref.wait(guard).unwrap_or_else(|e| e.into_inner());
-                                }
-                            };
-                            let Some(dir) = dir else {
-                                break;
-                            };
-
-                            let mut active_guard = ActiveGuard {
-                                state: state_ref,
-                                cvar: cvar_ref,
-                                armed: true,
-                            };
-
-                            local_subs.clear();
-                            let res =
-                                scan_and_unlink_dir(dir, &mut p_buf, &mut c_buf, &mut local_subs);
-
-                            let mut guard = state_ref.lock().unwrap_or_else(|e| e.into_inner());
-                            guard.active = guard.active.saturating_sub(1);
-                            active_guard.armed = false;
-                            match res {
-                                Ok(()) => {
-                                    if !local_subs.is_empty() {
-                                        for sub in local_subs.drain(..) {
-                                            guard.pending.push_back(sub);
-                                        }
-                                        cvar_ref.notify_all();
-                                    } else if guard.pending.is_empty() && guard.active == 0 {
-                                        cvar_ref.notify_all();
-                                    }
-                                }
-                                Err(e) => {
-                                    if guard.error.is_none() {
-                                        guard.error = Some(e);
-                                    }
-                                    cvar_ref.notify_all();
-                                    break;
-                                }
-                            }
+                let mut current_dir = {
+                    let mut guard = state.lock().unwrap_or_else(|e| e.into_inner());
+                    loop {
+                        if guard.error.is_some() {
+                            break None;
                         }
-                    });
+                        if let Some(d) = guard.pending.pop_back() {
+                            guard.active += 1;
+                            break Some(d);
+                        }
+                        if guard.active == 0 {
+                            cvar.notify_all();
+                            break None;
+                        }
+                        guard.waiters += 1;
+                        guard = cvar.wait(guard).unwrap_or_else(|e| e.into_inner());
+                        guard.waiters = guard.waiters.saturating_sub(1);
+                    }
+                };
+
+                while let Some(dir) = current_dir {
+                    if stop_flag.load(std::sync::atomic::Ordering::Relaxed) {
+                        let mut guard = state.lock().unwrap_or_else(|e| e.into_inner());
+                        guard.active = guard.active.saturating_sub(1);
+                        if guard.active == 0 {
+                            cvar.notify_all();
+                        }
+                        break;
+                    }
+
+                    let mut active_guard = ActiveGuard {
+                        state: &state,
+                        cvar: &cvar,
+                        armed: true,
+                    };
+
+                    local_subs.clear();
+                    let res = scan_and_unlink_dir(dir, &mut p_buf, &mut c_buf, &mut local_subs);
+                    active_guard.armed = false;
+
+                    match res {
+                        Ok(()) => {
+                            if let Some(next_local) = local_subs.pop() {
+                                if !local_subs.is_empty() {
+                                    let mut guard = state.lock().unwrap_or_else(|e| e.into_inner());
+                                    if guard.error.is_some() {
+                                        guard.active = guard.active.saturating_sub(1);
+                                        if guard.active == 0 {
+                                            cvar.notify_all();
+                                        }
+                                        break;
+                                    }
+                                    let pushed = local_subs.len();
+                                    for sub in local_subs.drain(..) {
+                                        guard.pending.push_back(sub);
+                                    }
+                                    if guard.waiters > 0 {
+                                        if pushed >= guard.waiters || guard.waiters <= 1 {
+                                            cvar.notify_all();
+                                        } else {
+                                            for _ in 0..pushed {
+                                                cvar.notify_one();
+                                            }
+                                        }
+                                    }
+                                }
+                                // Keep one subdir locally to avoid lock/notify roundtrips.
+                                current_dir = Some(next_local);
+                                continue;
+                            }
+
+                            let mut guard = state.lock().unwrap_or_else(|e| e.into_inner());
+                            guard.active = guard.active.saturating_sub(1);
+                            current_dir = loop {
+                                if guard.error.is_some() {
+                                    break None;
+                                }
+                                if let Some(d) = guard.pending.pop_back() {
+                                    guard.active += 1;
+                                    break Some(d);
+                                }
+                                if guard.active == 0 {
+                                    cvar.notify_all();
+                                    break None;
+                                }
+                                guard.waiters += 1;
+                                guard = cvar.wait(guard).unwrap_or_else(|e| e.into_inner());
+                                guard.waiters = guard.waiters.saturating_sub(1);
+                            };
+                        }
+                        Err(e) => {
+                            stop_flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                            let mut guard = state.lock().unwrap_or_else(|e| e.into_inner());
+                            guard.active = guard.active.saturating_sub(1);
+                            if guard.error.is_none() {
+                                guard.error = Some(e);
+                            }
+                            cvar.notify_all();
+                            break;
+                        }
+                    }
                 }
             });
 

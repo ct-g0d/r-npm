@@ -1,7 +1,8 @@
 use crate::error::FsError;
 use crate::tarball::{
-    normalize_rel_path, strip_package_prefix, unlink_target_path, validate_entry_path,
-    validate_link_target, CountingReader, ExtractionSummary, TarLimits,
+    fast_validate_and_strip_ascii, join_clean_rel, normalize_rel_path, strip_package_prefix,
+    unlink_target_path, validate_entry_path, validate_link_target, CountingReader,
+    ExtractionSummary, TarLimits,
 };
 use data_encoding::HEXLOWER;
 use flate2::read::GzDecoder;
@@ -10,9 +11,12 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::Ordering;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use tar::Archive;
+
+#[cfg(windows)]
+static DRIVE_SEEK_CACHE: [AtomicU8; 26] = [const { AtomicU8::new(0) }; 26];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DriveType {
@@ -61,6 +65,20 @@ pub fn detect_seek_penalty(path: &Path) -> Option<bool> {
             }
             found?
         };
+
+        let drive_idx = if drive_char.is_ascii_uppercase() {
+            Some((drive_char as u8 - b'A') as usize)
+        } else {
+            None
+        };
+        if let Some(idx) = drive_idx {
+            match DRIVE_SEEK_CACHE[idx].load(Ordering::Relaxed) {
+                1 => return Some(false),
+                2 => return Some(true),
+                3 => return None,
+                _ => {}
+            }
+        }
 
         let device_name = format!(r"\\.\{drive_char}:");
         let device_wide: Vec<u16> = std::ffi::OsStr::new(&device_name)
@@ -130,6 +148,9 @@ pub fn detect_seek_penalty(path: &Path) -> Option<bool> {
         };
 
         if handle == INVALID_HANDLE_VALUE {
+            if let Some(idx) = drive_idx {
+                DRIVE_SEEK_CACHE[idx].store(3, Ordering::Relaxed);
+            }
             return None;
         }
 
@@ -164,8 +185,15 @@ pub fn detect_seek_penalty(path: &Path) -> Option<bool> {
         }
 
         if res != 0 {
-            Some(desc.IncursSeekPenalty != 0)
+            let has_penalty = desc.IncursSeekPenalty != 0;
+            if let Some(idx) = drive_idx {
+                DRIVE_SEEK_CACHE[idx].store(if has_penalty { 2 } else { 1 }, Ordering::Relaxed);
+            }
+            Some(has_penalty)
         } else {
+            if let Some(idx) = drive_idx {
+                DRIVE_SEEK_CACHE[idx].store(3, Ordering::Relaxed);
+            }
             None
         }
     }
@@ -285,6 +313,18 @@ fn create_dir_wide_or_fallback(wide: &[u16]) {
     }
 }
 
+#[cfg(windows)]
+#[inline]
+fn create_dir_bytes_wide_buf(dir_bytes: &[u8], wide_buf: &mut Vec<u16>) {
+    use std::os::windows::ffi::OsStrExt;
+    wide_buf.clear();
+    // Safety: sliced at ASCII '\\' boundary on valid WTF-8 bytes.
+    let os = unsafe { std::ffi::OsStr::from_encoded_bytes_unchecked(dir_bytes) };
+    wide_buf.extend(os.encode_wide());
+    wide_buf.push(0);
+    create_dir_wide_or_fallback(wide_buf);
+}
+
 /// Pre-creates a collection of directories in breadth-first order (by path depth),
 /// eliminating redundant `exists()` calls in the subsequent file write loop.
 ///
@@ -364,18 +404,18 @@ where
         };
 
         let mut known_existing_bytes: HashSet<&[u8]> = HashSet::new();
+        let mut scratch_wide = Vec::with_capacity(260);
         if let Some(ref prefix) = common_prefix {
-            let mut prefix_wide = Vec::with_capacity(prefix.as_os_str().len() + 1);
-            prefix_wide.extend(prefix.as_os_str().encode_wide());
-            prefix_wide.push(0);
-            if !dir_exists_wide(&prefix_wide) {
+            scratch_wide.extend(prefix.as_os_str().encode_wide());
+            scratch_wide.push(0);
+            if !dir_exists_wide(&scratch_wide) {
                 let _ = std::fs::create_dir_all(prefix);
             }
             known_existing_bytes.insert(prefix.as_os_str().as_encoded_bytes());
         }
 
         let mut pending_seen: HashSet<&[u8]> = HashSet::with_capacity(unique_paths.len() * 2);
-        let mut by_depth: Vec<(usize, Vec<u16>)> = Vec::with_capacity(unique_paths.len() * 2);
+        let mut by_depth: Vec<(usize, &[u8])> = Vec::with_capacity(unique_paths.len() * 2);
         let mut min_depth = usize::MAX;
         let mut max_depth = 0usize;
 
@@ -413,20 +453,21 @@ where
                 if known_existing_bytes.contains(slice) || !pending_seen.insert(slice) {
                     break;
                 }
-                // Safety: sliced at ASCII '\\' boundary on valid WTF-8 bytes.
-                let slice_os = unsafe { std::ffi::OsStr::from_encoded_bytes_unchecked(slice) };
-                let mut wide = Vec::with_capacity(slice.len() + 1);
-                wide.extend(slice_os.encode_wide());
-                wide.push(0);
-
-                if common_prefix.is_none() && dir_exists_wide(&wide) {
-                    known_existing_bytes.insert(slice);
-                    break;
+                if common_prefix.is_none() {
+                    scratch_wide.clear();
+                    let slice_os =
+                        unsafe { std::ffi::OsStr::from_encoded_bytes_unchecked(slice) };
+                    scratch_wide.extend(slice_os.encode_wide());
+                    scratch_wide.push(0);
+                    if dir_exists_wide(&scratch_wide) {
+                        known_existing_bytes.insert(slice);
+                        break;
+                    }
                 }
 
                 min_depth = min_depth.min(depth);
                 max_depth = max_depth.max(depth);
-                by_depth.push((depth, wide));
+                by_depth.push((depth, slice));
 
                 // Step back to parent component boundary
                 let mut p_end = end;
@@ -447,16 +488,16 @@ where
         }
 
         let num_levels = max_depth - min_depth + 1;
-        let mut levels: Vec<Vec<Vec<u16>>> = (0..num_levels).map(|_| Vec::new()).collect();
-        for (depth, wide) in by_depth {
-            levels[depth - min_depth].push(wide);
+        let mut levels: Vec<Vec<&[u8]>> = (0..num_levels).map(|_| Vec::new()).collect();
+        for (depth, slice) in by_depth {
+            levels[depth - min_depth].push(slice);
         }
         levels.retain(|l| !l.is_empty());
 
         if total_to_create <= 32 {
             for level in &levels {
-                for wide in level {
-                    create_dir_wide_or_fallback(wide);
+                for &slice in level {
+                    create_dir_bytes_wide_buf(slice, &mut scratch_wide);
                 }
             }
             return Ok(());
@@ -466,8 +507,8 @@ where
         // package subtrees top-down with zero barrier synchronization.
         let mut split_idx = 0usize;
         while split_idx + 1 < levels.len() && levels[split_idx].len() < 24 {
-            for wide in &levels[split_idx] {
-                create_dir_wide_or_fallback(wide);
+            for &slice in &levels[split_idx] {
+                create_dir_bytes_wide_buf(slice, &mut scratch_wide);
             }
             split_idx += 1;
         }
@@ -475,20 +516,19 @@ where
         if split_idx + 1 >= levels.len() {
             let level = &levels[split_idx];
             let num_threads = 16.min(level.len());
-            let cursor = std::sync::atomic::AtomicUsize::new(0);
+            let cursor = AtomicUsize::new(0);
             let chunk = (level.len() / (num_threads * 2)).clamp(1, 8);
-            std::thread::scope(|scope| {
-                for _ in 0..num_threads {
-                    scope.spawn(|| loop {
-                        let start = cursor.fetch_add(chunk, Ordering::Relaxed);
-                        if start >= level.len() {
-                            break;
-                        }
-                        let end = (start + chunk).min(level.len());
-                        for wide in &level[start..end] {
-                            create_dir_wide_or_fallback(wide);
-                        }
-                    });
+            crate::pool::run_parallel(num_threads, &|| {
+                let mut wide_buf = Vec::with_capacity(260);
+                loop {
+                    let start = cursor.fetch_add(chunk, Ordering::Relaxed);
+                    if start >= level.len() {
+                        break;
+                    }
+                    let end = (start + chunk).min(level.len());
+                    for &slice in &level[start..end] {
+                        create_dir_bytes_wide_buf(slice, &mut wide_buf);
+                    }
                 }
             });
             return Ok(());
@@ -496,52 +536,48 @@ where
 
         // Promote a small number of high-fanout scope roots (e.g. `@scope`) so every
         // package gets its own balanced bucket without per-level barriers.
-        let mut promoted: HashSet<&[u16]> = HashSet::new();
+        let mut promoted: HashSet<&[u8]> = HashSet::new();
         {
-            let mut child_counts: HashMap<&[u16], usize> =
+            let mut child_counts: HashMap<&[u8], usize> =
                 HashMap::with_capacity(levels[split_idx].len());
-            for w in &levels[split_idx] {
-                child_counts.insert(&w[..w.len().saturating_sub(1)], 0);
+            for &s in &levels[split_idx] {
+                child_counts.insert(s, 0);
             }
-            for child in &levels[split_idx + 1] {
-                let no_null = &child[..child.len().saturating_sub(1)];
-                if let Some(pos) = no_null.iter().rposition(|&c| c == b'\\' as u16) {
-                    if let Some(cnt) = child_counts.get_mut(&no_null[..pos]) {
+            for &child in &levels[split_idx + 1] {
+                if let Some(pos) = child.iter().rposition(|&c| c == b'\\') {
+                    if let Some(cnt) = child_counts.get_mut(&child[..pos]) {
                         *cnt += 1;
                     }
                 }
             }
             let high_fanout_count = child_counts.values().filter(|&&c| c >= 16).count();
             if high_fanout_count > 0 && high_fanout_count < 16 {
-                for w in &levels[split_idx] {
-                    let key = &w[..w.len().saturating_sub(1)];
-                    if child_counts.get(key).copied().unwrap_or(0) >= 16 {
-                        create_dir_wide_or_fallback(w);
-                        promoted.insert(key);
+                for &s in &levels[split_idx] {
+                    if child_counts.get(s).copied().unwrap_or(0) >= 16 {
+                        create_dir_bytes_wide_buf(s, &mut scratch_wide);
+                        promoted.insert(s);
                     }
                 }
             }
         }
 
-        let mut bucket_map: HashMap<&[u16], usize> = HashMap::with_capacity(total_to_create);
-        let mut buckets: Vec<Vec<&[u16]>> = Vec::with_capacity(levels[split_idx].len() * 2);
+        let mut bucket_map: HashMap<&[u8], usize> = HashMap::with_capacity(total_to_create);
+        let mut buckets: Vec<Vec<&[u8]>> = Vec::with_capacity(levels[split_idx].len() * 2);
 
-        for w in &levels[split_idx] {
-            let key = &w[..w.len().saturating_sub(1)];
-            if promoted.contains(key) {
+        for &s in &levels[split_idx] {
+            if promoted.contains(s) {
                 continue;
             }
             let id = buckets.len();
-            bucket_map.insert(key, id);
-            buckets.push(vec![w.as_slice()]);
+            bucket_map.insert(s, id);
+            buckets.push(vec![s]);
         }
 
         for lvl in &levels[split_idx + 1..] {
-            for w in lvl {
-                let no_null = &w[..w.len().saturating_sub(1)];
-                let mut cur = no_null;
+            for &s in lvl {
+                let mut cur = s;
                 let mut found = None;
-                while let Some(pos) = cur.iter().rposition(|&c| c == b'\\' as u16) {
+                while let Some(pos) = cur.iter().rposition(|&c| c == b'\\') {
                     let parent = &cur[..pos];
                     if let Some(&id) = bucket_map.get(parent) {
                         found = Some(id);
@@ -550,34 +586,33 @@ where
                     cur = parent;
                 }
                 if let Some(id) = found {
-                    bucket_map.insert(no_null, id);
-                    buckets[id].push(w.as_slice());
+                    bucket_map.insert(s, id);
+                    buckets[id].push(s);
                 } else {
                     let id = buckets.len();
-                    bucket_map.insert(no_null, id);
-                    buckets.push(vec![w.as_slice()]);
+                    bucket_map.insert(s, id);
+                    buckets.push(vec![s]);
                 }
             }
         }
 
         if !buckets.is_empty() {
             let num_threads = 16.min(buckets.len());
-            let cursor = std::sync::atomic::AtomicUsize::new(0);
+            let cursor = AtomicUsize::new(0);
             let chunk = (buckets.len() / (num_threads * 4)).clamp(1, 8);
-            std::thread::scope(|scope| {
-                for _ in 0..num_threads {
-                    scope.spawn(|| loop {
-                        let start = cursor.fetch_add(chunk, Ordering::Relaxed);
-                        if start >= buckets.len() {
-                            break;
+            crate::pool::run_parallel(num_threads, &|| {
+                let mut wide_buf = Vec::with_capacity(260);
+                loop {
+                    let start = cursor.fetch_add(chunk, Ordering::Relaxed);
+                    if start >= buckets.len() {
+                        break;
+                    }
+                    let end = (start + chunk).min(buckets.len());
+                    for bucket in &buckets[start..end] {
+                        for &slice in bucket {
+                            create_dir_bytes_wide_buf(slice, &mut wide_buf);
                         }
-                        let end = (start + chunk).min(buckets.len());
-                        for bucket in &buckets[start..end] {
-                            for wide in bucket {
-                                create_dir_wide_or_fallback(wide);
-                            }
-                        }
-                    });
+                    }
                 }
             });
         }
@@ -711,6 +746,20 @@ where
 
         Ok(())
     }
+}
+
+/// Writes a file directly using a caller-supplied null-terminated Windows verbatim UTF-16 path.
+#[cfg(windows)]
+#[inline]
+pub fn write_file_fast_wide_raw(
+    path_wide: &[u16],
+    path_hint: &Path,
+    data: &[u8],
+    mode: u32,
+    prealloc_threshold: usize,
+    record_stats: bool,
+) -> std::io::Result<()> {
+    write_file_fast_wide(path_wide, path_hint, data, mode, prealloc_threshold, record_stats)
 }
 
 #[cfg(windows)]
@@ -1453,46 +1502,47 @@ fn materialize_items_slice<T: MatItem>(
         }
 
         let chunk_size = (total_files / (num_threads * 4)).clamp(1, 16);
-        let next_file = std::sync::atomic::AtomicUsize::new(0);
+        let next_file = AtomicUsize::new(0);
+        let has_err = AtomicBool::new(false);
+        let first_err: Mutex<Option<FsError>> = Mutex::new(None);
         let items_slice = &items[..];
 
-        std::thread::scope(|scope| {
-            let mut handles = Vec::with_capacity(num_threads);
+        crate::pool::run_parallel(num_threads, &|| {
+            let mut src_buf = Vec::with_capacity(260);
+            let mut dst_buf = Vec::with_capacity(260);
 
-            for _ in 0..num_threads {
-                handles.push(scope.spawn(|| -> Result<(), FsError> {
-                    let mut src_buf = Vec::with_capacity(260);
-                    let mut dst_buf = Vec::with_capacity(260);
-
-                    loop {
-                        let start =
-                            next_file.fetch_add(chunk_size, std::sync::atomic::Ordering::Relaxed);
-                        if start >= total_files {
-                            break;
+            loop {
+                if has_err.load(Ordering::Relaxed) {
+                    break;
+                }
+                let start = next_file.fetch_add(chunk_size, Ordering::Relaxed);
+                if start >= total_files {
+                    break;
+                }
+                let end = (start + chunk_size).min(total_files);
+                for item in &items_slice[start..end] {
+                    if let Err(e) = materialize_one_item(
+                        item,
+                        config.skip_existing_matching,
+                        prealloc_thresh,
+                        &mut src_buf,
+                        &mut dst_buf,
+                    ) {
+                        has_err.store(true, Ordering::Relaxed);
+                        let mut guard = first_err.lock().unwrap_or_else(|p| p.into_inner());
+                        if guard.is_none() {
+                            *guard = Some(e);
                         }
-                        let end = (start + chunk_size).min(total_files);
-                        for item in &items_slice[start..end] {
-                            materialize_one_item(
-                                item,
-                                config.skip_existing_matching,
-                                prealloc_thresh,
-                                &mut src_buf,
-                                &mut dst_buf,
-                            )?;
-                        }
+                        return;
                     }
-                    Ok(())
-                }));
+                }
             }
+        });
 
-            for handle in handles {
-                handle.join().map_err(|_| {
-                    FsError::Io(std::io::Error::other("Materialization worker panicked"))
-                })??;
-            }
-
-            Ok(())
-        })
+        if let Some(e) = first_err.into_inner().unwrap_or_else(|p| p.into_inner()) {
+            return Err(e);
+        }
+        Ok(())
     } else {
         // Group files by package to maintain directory locality on HDD
         let mut package_groups: BTreeMap<String, Vec<T>> = BTreeMap::new();
@@ -1524,43 +1574,45 @@ fn materialize_items_slice<T: MatItem>(
         }
 
         let total_batches = batches.len();
-        let next_pkg = std::sync::atomic::AtomicUsize::new(0);
+        let next_pkg = AtomicUsize::new(0);
+        let has_err = AtomicBool::new(false);
+        let first_err: Mutex<Option<FsError>> = Mutex::new(None);
         let batches_slice = &batches[..];
 
-        std::thread::scope(|scope| {
-            let mut handles = Vec::with_capacity(num_threads);
-
-            for _ in 0..num_threads {
-                handles.push(scope.spawn(|| -> Result<(), FsError> {
-                    let mut src_buf = Vec::with_capacity(260);
-                    let mut dst_buf = Vec::with_capacity(260);
-                    loop {
-                        let idx = next_pkg.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        if idx >= total_batches {
-                            break;
+        crate::pool::run_parallel(num_threads, &|| {
+            let mut src_buf = Vec::with_capacity(260);
+            let mut dst_buf = Vec::with_capacity(260);
+            loop {
+                if has_err.load(Ordering::Relaxed) {
+                    break;
+                }
+                let idx = next_pkg.fetch_add(1, Ordering::Relaxed);
+                if idx >= total_batches {
+                    break;
+                }
+                for item in &batches_slice[idx] {
+                    if let Err(e) = materialize_one_item(
+                        item,
+                        config.skip_existing_matching,
+                        prealloc_thresh,
+                        &mut src_buf,
+                        &mut dst_buf,
+                    ) {
+                        has_err.store(true, Ordering::Relaxed);
+                        let mut guard = first_err.lock().unwrap_or_else(|p| p.into_inner());
+                        if guard.is_none() {
+                            *guard = Some(e);
                         }
-                        for item in &batches_slice[idx] {
-                            materialize_one_item(
-                                item,
-                                config.skip_existing_matching,
-                                prealloc_thresh,
-                                &mut src_buf,
-                                &mut dst_buf,
-                            )?;
-                        }
+                        return;
                     }
-                    Ok(())
-                }));
+                }
             }
+        });
 
-            for handle in handles {
-                handle.join().map_err(|_| {
-                    FsError::Io(std::io::Error::other("Materialization worker panicked"))
-                })??;
-            }
-
-            Ok(())
-        })
+        if let Some(e) = first_err.into_inner().unwrap_or_else(|p| p.into_inner()) {
+            return Err(e);
+        }
+        Ok(())
     }
 }
 
@@ -1637,8 +1689,8 @@ pub fn decode_tar_entries<R: Read>(
     let mut safe_ancestors = HashSet::new();
 
     let mut directories = Vec::new();
-    let mut files_by_path: HashMap<String, MaterializeFile> = HashMap::new();
-    let mut file_order: Vec<String> = Vec::new();
+    let mut files: Vec<Option<MaterializeFile>> = Vec::new();
+    let mut file_indices: HashMap<String, usize> = HashMap::new();
     let mut symlinks = Vec::new();
     let mut hardlinks = Vec::new();
     let mut saw_npmignores: HashSet<PathBuf> = HashSet::new();
@@ -1672,26 +1724,42 @@ pub fn decode_tar_entries<R: Read>(
             });
         }
 
-        let path_bytes = entry.path_bytes();
-        if path_bytes.contains(&0) {
-            return Err(FsError::PathTraversal {
-                path: PathBuf::from(String::from_utf8_lossy(&path_bytes).into_owned()),
-            });
-        }
-        if std::str::from_utf8(&path_bytes).is_err() {
-            return Err(FsError::InvalidUtf8Path {
-                path: PathBuf::from(String::from_utf8_lossy(&path_bytes).into_owned()),
-            });
-        }
-
-        let raw_path = match entry.path() {
-            Ok(p) => p.to_path_buf(),
-            Err(_) if std::str::from_utf8(&path_bytes).is_err() => {
-                return Err(FsError::InvalidUtf8Path {
+        let fast_ascii: Option<(String, usize)> = {
+            let path_bytes = entry.path_bytes();
+            if path_bytes.contains(&0) {
+                return Err(FsError::PathTraversal {
                     path: PathBuf::from(String::from_utf8_lossy(&path_bytes).into_owned()),
                 });
             }
-            Err(e) => return Err(FsError::Io(e)),
+            let s = std::str::from_utf8(&path_bytes).map_err(|_| FsError::InvalidUtf8Path {
+                path: PathBuf::from(String::from_utf8_lossy(&path_bytes).into_owned()),
+            })?;
+            match fast_validate_and_strip_ascii(s) {
+                Ok(None) => continue,
+                Ok(Some((rel, depth))) => {
+                    if entry_type.is_file() {
+                        if rel == ".npmignore" || rel.ends_with("/.npmignore") {
+                            saw_npmignores.insert(PathBuf::from(rel));
+                            Some((rel.to_string(), depth))
+                        } else if rel == ".gitignore" || rel.ends_with("/.gitignore") {
+                            let rewritten = if rel.len() == ".gitignore".len() {
+                                ".npmignore".to_string()
+                            } else {
+                                format!("{}/.npmignore", &rel[..rel.len() - "/.gitignore".len()])
+                            };
+                            if saw_npmignores.contains(Path::new(&rewritten)) {
+                                continue;
+                            }
+                            Some((rewritten, depth))
+                        } else {
+                            Some((rel.to_string(), depth))
+                        }
+                    } else {
+                        Some((rel.to_string(), depth))
+                    }
+                }
+                Err(()) => None,
+            }
         };
 
         let is_sparse = entry_type.as_byte() == b'S' || entry_type.is_gnu_sparse();
@@ -1706,57 +1774,81 @@ pub fn decode_tar_entries<R: Read>(
             false
         };
         if is_sparse || has_pax_sparse {
-            return Err(FsError::ForbiddenSparseFile { path: raw_path });
+            let err_path = match fast_ascii {
+                Some((s, _)) => PathBuf::from(s),
+                None => entry.path().unwrap_or_default().to_path_buf(),
+            };
+            return Err(FsError::ForbiddenSparseFile { path: err_path });
         }
 
-        validate_entry_path(&raw_path)?;
+        let (relative_path, target_path, norm_exact, path_depth, _is_ascii_clean) =
+            if let Some((rel_str, depth)) = fast_ascii {
+                let target_path = join_clean_rel(&clean_dest, &rel_str);
+                let relative_path = PathBuf::from(&rel_str);
+                (relative_path, target_path, rel_str, depth, true)
+            } else {
+                let path_bytes = entry.path_bytes();
+                let raw_path = match entry.path() {
+                    Ok(p) => p.to_path_buf(),
+                    Err(_) if std::str::from_utf8(&path_bytes).is_err() => {
+                        return Err(FsError::InvalidUtf8Path {
+                            path: PathBuf::from(String::from_utf8_lossy(&path_bytes).into_owned()),
+                        });
+                    }
+                    Err(e) => return Err(FsError::Io(e)),
+                };
 
-        let mut relative_path = match strip_package_prefix(&raw_path) {
-            Some(p) => {
-                let cleaned: PathBuf = p
-                    .components()
-                    .filter(|c| !matches!(c, std::path::Component::CurDir))
-                    .collect();
-                if cleaned.as_os_str().is_empty() {
-                    continue;
+                validate_entry_path(&raw_path)?;
+
+                let mut relative_path = match strip_package_prefix(&raw_path) {
+                    Some(p) => {
+                        let cleaned: PathBuf = p
+                            .components()
+                            .filter(|c| !matches!(c, std::path::Component::CurDir))
+                            .collect();
+                        if cleaned.as_os_str().is_empty() {
+                            continue;
+                        }
+                        cleaned
+                    }
+                    None => continue,
+                };
+
+                // Replicate pacote / npm pack behavior: treat .gitignore files like .npmignore
+                // unless a .npmignore file is already present.
+                if entry_type.is_file() {
+                    if relative_path.file_name() == Some(std::ffi::OsStr::new(".npmignore")) {
+                        saw_npmignores.insert(relative_path.clone());
+                    } else if relative_path.file_name() == Some(std::ffi::OsStr::new(".gitignore"))
+                    {
+                        let ni = relative_path.with_file_name(".npmignore");
+                        if saw_npmignores.contains(&ni) {
+                            continue;
+                        }
+                        relative_path = ni;
+                    }
                 }
-                cleaned
-            }
-            None => continue,
-        };
 
-        // Replicate pacote / npm pack behavior: treat .gitignore files like .npmignore
-        // unless a .npmignore file is already present.
-        if entry_type.is_file() {
-            if relative_path.file_name() == Some(std::ffi::OsStr::new(".npmignore")) {
-                saw_npmignores.insert(relative_path.clone());
-            } else if relative_path.file_name() == Some(std::ffi::OsStr::new(".gitignore")) {
-                let ni = relative_path.with_file_name(".npmignore");
-                if saw_npmignores.contains(&ni) {
-                    continue;
+                validate_entry_path(&relative_path)?;
+
+                let mut path_depth = 0usize;
+                let mut target_path = PathBuf::with_capacity(
+                    clean_dest.as_os_str().len() + relative_path.as_os_str().len() + 2,
+                );
+                target_path.push(&clean_dest);
+                let mut norm_exact = String::with_capacity(relative_path.as_os_str().len());
+                for c in relative_path.components() {
+                    if let std::path::Component::Normal(s) = c {
+                        path_depth += 1;
+                        target_path.push(s);
+                        if !norm_exact.is_empty() {
+                            norm_exact.push('/');
+                        }
+                        norm_exact.push_str(&s.to_string_lossy());
+                    }
                 }
-                relative_path = ni;
-            }
-        }
-
-        validate_entry_path(&relative_path)?;
-
-        let mut path_depth = 0usize;
-        let mut target_path = PathBuf::with_capacity(
-            clean_dest.as_os_str().len() + relative_path.as_os_str().len() + 2,
-        );
-        target_path.push(&clean_dest);
-        let mut norm_exact = String::with_capacity(relative_path.as_os_str().len());
-        for c in relative_path.components() {
-            if let std::path::Component::Normal(s) = c {
-                path_depth += 1;
-                target_path.push(s);
-                if !norm_exact.is_empty() {
-                    norm_exact.push('/');
-                }
-                norm_exact.push_str(&s.to_string_lossy());
-            }
-        }
+                (relative_path, target_path, norm_exact, path_depth, false)
+            };
 
         if path_depth > limits.max_path_depth {
             return Err(FsError::TarBombLimitExceeded {
@@ -1787,7 +1879,7 @@ pub fn decode_tar_entries<R: Read>(
             || entry_type.is_character_special()
             || entry_type.is_fifo()
         {
-            return Err(FsError::ForbiddenSpecialEntry { path: raw_path });
+            return Err(FsError::ForbiddenSpecialEntry { path: relative_path });
         }
 
         if !target_path.starts_with(&clean_dest) {
@@ -1812,7 +1904,11 @@ pub fn decode_tar_entries<R: Read>(
         if norm_exact.is_empty() {
             continue;
         }
-        let norm_lower = norm_exact.to_ascii_lowercase();
+        let norm_lower = if norm_exact.bytes().any(|b| b.is_ascii_uppercase()) {
+            norm_exact.to_ascii_lowercase()
+        } else {
+            norm_exact.clone()
+        };
 
         if let Some(existing_exact) = seen_paths.get(&norm_lower) {
             if existing_exact != &norm_exact {
@@ -1908,7 +2004,9 @@ pub fn decode_tar_entries<R: Read>(
                     extracted_regular_files.remove(&normalize_rel_path(&relative_path));
                     symlink_paths.insert(relative_path.clone());
                     symlink_paths.insert(normalize_rel_path(&relative_path));
-                    files_by_path.remove(&norm_exact);
+                    if let Some(prev_idx) = file_indices.remove(&norm_exact) {
+                        files[prev_idx] = None;
+                    }
                     if !symlinks.is_empty() {
                         symlinks.retain(|(p, _)| p != &target_path);
                     }
@@ -1975,7 +2073,9 @@ pub fn decode_tar_entries<R: Read>(
                     hardlink_targets.insert(relative_path.clone(), cleaned_target);
                     extracted_regular_files.insert(relative_path.clone());
                     extracted_regular_files.insert(normalize_rel_path(&relative_path));
-                    files_by_path.remove(&norm_exact);
+                    if let Some(prev_idx) = file_indices.remove(&norm_exact) {
+                        files[prev_idx] = None;
+                    }
                     if !symlinks.is_empty() {
                         symlinks.retain(|(p, _)| p != &target_path);
                     }
@@ -2064,8 +2164,19 @@ pub fn decode_tar_entries<R: Read>(
                     hardlinks.retain(|(p, _)| p != &target_path);
                 }
             }
-            extracted_regular_files.insert(relative_path.clone());
-            extracted_regular_files.insert(normalize_rel_path(&relative_path));
+            if !was_seen {
+                if _is_ascii_clean || !cfg!(windows) {
+                    extracted_regular_files.insert(relative_path);
+                } else {
+                    extracted_regular_files.insert(relative_path.clone());
+                    extracted_regular_files.insert(normalize_rel_path(&relative_path));
+                }
+            } else {
+                extracted_regular_files.insert(relative_path.clone());
+                if cfg!(windows) && !_is_ascii_clean {
+                    extracted_regular_files.insert(normalize_rel_path(&relative_path));
+                }
+            }
 
             let mat_file = MaterializeFile {
                 path: target_path,
@@ -2075,8 +2186,14 @@ pub fn decode_tar_entries<R: Read>(
             };
 
             // Deduplicate: later entry in tarball wins (keyed on case-preserved normalized path)
-            if files_by_path.insert(norm_exact.clone(), mat_file).is_none() {
-                file_order.push(norm_exact);
+            match file_indices.entry(norm_exact) {
+                std::collections::hash_map::Entry::Occupied(occ) => {
+                    files[*occ.get()] = Some(mat_file);
+                }
+                std::collections::hash_map::Entry::Vacant(vac) => {
+                    vac.insert(files.len());
+                    files.push(Some(mat_file));
+                }
             }
         }
     }
@@ -2099,10 +2216,7 @@ pub fn decode_tar_entries<R: Read>(
         }
     }
 
-    let files: Vec<MaterializeFile> = file_order
-        .into_iter()
-        .filter_map(|key| files_by_path.remove(&key))
-        .collect();
+    let files: Vec<MaterializeFile> = files.into_iter().flatten().collect();
 
     Ok(DecodedTarball {
         directories,
@@ -2241,42 +2355,48 @@ pub fn extract_packages_direct_parallel<R: Read + Send>(
             })
             .collect()
     } else {
+        struct DisjointSlot<T>(std::cell::UnsafeCell<Option<T>>);
+        unsafe impl<T: Send> Sync for DisjointSlot<T> {}
+
         let decode_threads = std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(4)
             .clamp(2, 16)
             .min(num_items);
-        let queue = std::sync::Mutex::new(items.into_iter().enumerate().collect::<Vec<_>>());
-        let results: Vec<std::sync::Mutex<Option<Result<DecodedTarball, FsError>>>> =
-            (0..num_items).map(|_| std::sync::Mutex::new(None)).collect();
+        let inputs: Vec<DisjointSlot<BatchDirectItem<R>>> = items
+            .into_iter()
+            .map(|item| DisjointSlot(std::cell::UnsafeCell::new(Some(item))))
+            .collect();
+        let results: Vec<DisjointSlot<Result<DecodedTarball, FsError>>> = (0..num_items)
+            .map(|_| DisjointSlot(std::cell::UnsafeCell::new(None)))
+            .collect();
+        let next_idx = AtomicUsize::new(0);
 
-        std::thread::scope(|scope| {
-            for _ in 0..decode_threads {
-                let q = &queue;
-                let res_slots = &results;
-                scope.spawn(move || loop {
-                    let task = {
-                        let mut guard = q.lock().unwrap();
-                        guard.pop()
-                    };
-                    let Some((idx, item)) = task else {
-                        break;
-                    };
-                    let decoded = decode_tar_entries(
-                        item.reader,
-                        &item.destination,
-                        item.limits,
-                        Some(item.package_id),
-                    );
-                    *res_slots[idx].lock().unwrap() = Some(decoded);
-                });
+        crate::pool::run_parallel(decode_threads, &|| {
+            loop {
+                let idx = next_idx.fetch_add(1, Ordering::Relaxed);
+                if idx >= num_items {
+                    break;
+                }
+                // SAFETY: `fetch_add` assigns each `idx < num_items` to at most one worker.
+                let item = unsafe { (*inputs[idx].0.get()).take() };
+                let Some(item) = item else { continue };
+                let decoded = decode_tar_entries(
+                    item.reader,
+                    &item.destination,
+                    item.limits,
+                    Some(item.package_id),
+                );
+                unsafe {
+                    *results[idx].0.get() = Some(decoded);
+                }
             }
         });
 
         results
             .into_iter()
             .map(|slot| {
-                slot.into_inner().unwrap().unwrap_or_else(|| {
+                slot.0.into_inner().unwrap_or_else(|| {
                     Err(FsError::Io(std::io::Error::other(
                         "Tarball decode worker terminated unexpectedly",
                     )))
@@ -2285,13 +2405,21 @@ pub fn extract_packages_direct_parallel<R: Read + Send>(
             .collect()
     };
 
+    let mut total_files_count = 0usize;
+    let mut total_dirs_count = 1usize;
+    for decoded in decoded_results.iter().flatten() {
+        total_files_count += decoded.files.len();
+        total_dirs_count += decoded.directories.len() + decoded.files.len() / 2;
+    }
+
     // Collect all unique directories and move decoded files without cloning payloads/paths
-    let mut all_files = Vec::new();
+    let mut all_files = Vec::with_capacity(total_files_count);
     for decoded in decoded_results.iter_mut().flatten() {
         all_files.append(&mut decoded.files);
     }
 
-    let mut unique_dirs: std::collections::HashSet<&Path> = std::collections::HashSet::new();
+    let mut unique_dirs: std::collections::HashSet<&Path> =
+        std::collections::HashSet::with_capacity(total_dirs_count);
     unique_dirs.insert(root_destination);
     for decoded in decoded_results.iter().flatten() {
         for d in &decoded.directories {

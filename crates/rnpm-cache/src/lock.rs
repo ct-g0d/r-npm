@@ -40,25 +40,22 @@ impl CacheLock {
         timeout: Duration,
         stale_threshold: Duration,
     ) -> Result<Self, std::io::Error> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-
         let start = Instant::now();
         let mut attempt = 0u64;
         let mut delay = Duration::from_micros(300);
-        let pid_mix = (std::process::id() as u64).wrapping_mul(2654435761);
+        let self_pid = std::process::id();
+        let pid_mix = (self_pid as u64).wrapping_mul(2654435761);
 
         loop {
             attempt += 1;
             match Self::try_acquire_exclusive_inner(path, true)? {
                 Some(lock) => return Ok(lock),
                 None => {
-                    // Check if current lock owner process has died; delay past initial yield
-                    // attempts so a new holder finishing its PID write is not preempted.
-                    if attempt == 3 || attempt.is_multiple_of(8) {
+                    // Defer stale-PID inspection past the first few fast yields so active
+                    // short-lived holders don't trigger extra open+read+OpenProcess calls.
+                    if attempt >= 8 && attempt.is_multiple_of(8) {
                         if let Some(pid) = Self::read_lock_pid(path) {
-                            if !is_process_alive(pid) {
+                            if pid != self_pid && !is_process_alive(pid) {
                                 warn!(
                                     "Lock owner process PID {pid} for {} no longer exists. Breaking and reclaiming stale lock.",
                                     path.display()

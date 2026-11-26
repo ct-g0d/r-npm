@@ -121,6 +121,115 @@ impl<R: Read> Read for CountingReader<R> {
     }
 }
 
+/// Fast zero-allocation validation and first-component stripping for clean ASCII tar paths.
+/// Returns:
+/// - `Ok(None)` if the entry is just the root component (e.g. `"package/"` or `"."`)
+/// - `Ok(Some((rel_str, depth)))` if valid and clean ASCII without escapes/traversal
+/// - `Err(())` if caller should fall back to full `Path`-based validation/normalization
+#[inline]
+pub(crate) fn fast_validate_and_strip_ascii(s: &str) -> Result<Option<(&str, usize)>, ()> {
+    if !s.is_ascii()
+        || s.contains('\\')
+        || s.contains("..")
+        || s.contains(':')
+        || s.starts_with('/')
+        || s.contains("/./")
+        || s.contains("//")
+        || s.ends_with("/.")
+    {
+        return Err(());
+    }
+
+    let mut trimmed = s;
+    while let Some(rest) = trimmed.strip_prefix("./") {
+        trimmed = rest;
+    }
+    if trimmed.is_empty() || trimmed == "." {
+        return Ok(None);
+    }
+
+    let Some(slash) = trimmed.find('/') else {
+        // Validate single root component in case it contains reserved/invalid chars
+        let root_seg = trimmed;
+        if !is_clean_ascii_segment(root_seg) {
+            return Err(());
+        }
+        return Ok(None);
+    };
+
+    let root_seg = &trimmed[..slash];
+    if !is_clean_ascii_segment(root_seg) {
+        return Err(());
+    }
+
+    let mut rel = &trimmed[slash + 1..];
+    while let Some(r) = rel.strip_prefix("./") {
+        rel = r;
+    }
+    rel = rel.trim_end_matches('/');
+    if rel.is_empty() || rel == "." {
+        return Ok(None);
+    }
+
+    let mut depth = 0usize;
+    for seg in rel.split('/') {
+        if seg.is_empty() || !is_clean_ascii_segment(seg) {
+            return Err(());
+        }
+        depth += 1;
+    }
+
+    Ok(Some((rel, depth)))
+}
+
+#[inline]
+fn is_clean_ascii_segment(seg: &str) -> bool {
+    if seg.ends_with('.') || seg.ends_with(' ') {
+        return false;
+    }
+    for &b in seg.as_bytes() {
+        if b < 0x20 || matches!(b, b':' | b'\\' | b'*' | b'?' | b'"' | b'<' | b'>' | b'|') {
+            return false;
+        }
+    }
+    !is_windows_reserved_name(seg)
+}
+
+/// Joins `base` (already a clean verbatim path) with a clean slash-separated relative path `rel`
+/// using native separators in a single `PathBuf` allocation.
+#[inline]
+pub(crate) fn join_clean_rel(base: &Path, rel: &str) -> PathBuf {
+    #[cfg(windows)]
+    {
+        let mut out = std::ffi::OsString::with_capacity(base.as_os_str().len() + 1 + rel.len());
+        out.push(base.as_os_str());
+        if !base.as_os_str().as_encoded_bytes().ends_with(b"\\") {
+            out.push("\\");
+        }
+        if !rel.contains('/') {
+            out.push(rel);
+        } else {
+            let mut buf = [0u8; 256];
+            let bytes = rel.as_bytes();
+            if bytes.len() <= buf.len() {
+                for (i, &b) in bytes.iter().enumerate() {
+                    buf[i] = if b == b'/' { b'\\' } else { b };
+                }
+                // Safety: `rel` is valid ASCII/UTF-8 and `/` -> `\` preserves UTF-8.
+                let s = unsafe { std::str::from_utf8_unchecked(&buf[..bytes.len()]) };
+                out.push(s);
+            } else {
+                out.push(rel.replace('/', "\\"));
+            }
+        }
+        PathBuf::from(out)
+    }
+    #[cfg(not(windows))]
+    {
+        base.join(rel)
+    }
+}
+
 /// Helper that creates `dir` and registers it and all intermediate ancestors down to `root`
 /// in both `created_dirs` and `safe_cache` so that directory creation and ancestor symlink
 /// checks are performed at most once per unique directory hierarchy.
@@ -272,6 +381,76 @@ pub fn extract_tar_gz<R: Read>(
     let mut copy_buf = vec![0u8; 128 * 1024];
     let mut scratch_buf: Vec<u8> = Vec::with_capacity(64 * 1024);
     let mut wide_buf: Vec<u16> = Vec::with_capacity(260);
+    let mut pending_files: Vec<crate::writer::MaterializeFile> = Vec::with_capacity(64);
+    let mut pending_bytes: u64 = 0;
+    let mut recorded_files: u64 = 0;
+    let mut recorded_bytes: u64 = 0;
+    const PENDING_FLUSH_BYTES: u64 = 4 * 1024 * 1024;
+    let cached_cfg = crate::writer::determine_writer_config(&verbatim_dest, None);
+
+    let flush_pending = |pending_files: &mut Vec<crate::writer::MaterializeFile>,
+                         pending_bytes: &mut u64,
+                         created_dirs: &mut HashSet<PathBuf>,
+                         verified_safe_ancestors: &mut HashSet<PathBuf>,
+                         recorded_files: &mut u64,
+                         recorded_bytes: &mut u64,
+                         wide_buf: &mut Vec<u16>|
+     -> Result<(), FsError> {
+        if pending_files.is_empty() {
+            return Ok(());
+        }
+        let batch = std::mem::take(pending_files);
+        let batch_len = batch.len() as u64;
+        let batch_bytes = *pending_bytes;
+        *pending_bytes = 0;
+
+        let mut unique_dirs: HashSet<&Path> = HashSet::with_capacity(batch.len() / 2 + 1);
+        for f in &batch {
+            if let Some(p) = f.path.parent() {
+                if !created_dirs.contains(p) {
+                    unique_dirs.insert(p);
+                }
+            }
+        }
+        if !unique_dirs.is_empty() {
+            let dir_refs: Vec<&Path> = unique_dirs.iter().copied().collect();
+            crate::writer::precreate_directories(dir_refs).map_err(FsError::Io)?;
+            for dir in unique_dirs {
+                let mut curr = Some(dir);
+                while let Some(p) = curr {
+                    if !p.starts_with(&verbatim_dest) {
+                        break;
+                    }
+                    let inserted = created_dirs.insert(p.to_path_buf());
+                    verified_safe_ancestors.insert(p.to_path_buf());
+                    if !inserted {
+                        break;
+                    }
+                    curr = p.parent();
+                }
+            }
+        }
+
+        if batch.len() < 4 {
+            for item in &batch {
+                crate::writer::write_file_fast_buf(
+                    &item.path,
+                    &item.data,
+                    item.mode,
+                    cached_cfg.preallocate_threshold,
+                    wide_buf,
+                    true,
+                )?;
+            }
+        } else {
+            crate::writer::materialize_files_parallel(batch, &cached_cfg)?;
+        }
+        // `write_file_fast_buf(..., true)` / `materialize_files_parallel` already recorded these.
+        *recorded_files += batch_len;
+        *recorded_bytes += batch_bytes;
+        Ok(())
+    };
+    let _ = &flush_pending;
 
     let entries = archive.entries().map_err(FsError::Io)?;
 
@@ -306,27 +485,21 @@ pub fn extract_tar_gz<R: Read>(
         }
 
         // Check non-UTF-8 path bytes or embedded null bytes before entry.path()
-        let path_bytes = entry.path_bytes();
-        if path_bytes.contains(&0) {
-            return Err(FsError::PathTraversal {
-                path: PathBuf::from(String::from_utf8_lossy(&path_bytes).into_owned()),
-            });
-        }
-        if std::str::from_utf8(&path_bytes).is_err() {
-            return Err(FsError::InvalidUtf8Path {
-                path: PathBuf::from(String::from_utf8_lossy(&path_bytes).into_owned()),
-            });
-        }
-
-        // Get raw entry path
-        let raw_path = match entry.path() {
-            Ok(p) => p.to_path_buf(),
-            Err(_) if std::str::from_utf8(&path_bytes).is_err() => {
-                return Err(FsError::InvalidUtf8Path {
+        let fast_ascii: Option<(String, usize)> = {
+            let path_bytes = entry.path_bytes();
+            if path_bytes.contains(&0) {
+                return Err(FsError::PathTraversal {
                     path: PathBuf::from(String::from_utf8_lossy(&path_bytes).into_owned()),
                 });
             }
-            Err(e) => return Err(FsError::Io(e)),
+            let s = std::str::from_utf8(&path_bytes).map_err(|_| FsError::InvalidUtf8Path {
+                path: PathBuf::from(String::from_utf8_lossy(&path_bytes).into_owned()),
+            })?;
+            match fast_validate_and_strip_ascii(s) {
+                Ok(None) => continue,
+                Ok(Some((rel, depth))) => Some((rel.to_string(), depth)),
+                Err(()) => None,
+            }
         };
 
         // Reject sparse entries: entry_type.as_byte() == b'S' or PAX sparse attributes
@@ -342,49 +515,66 @@ pub fn extract_tar_gz<R: Read>(
             false
         };
         if is_sparse || has_pax_sparse {
-            return Err(FsError::ForbiddenSparseFile { path: raw_path });
+            let err_path = match fast_ascii {
+                Some((s, _)) => PathBuf::from(s),
+                None => entry.path().unwrap_or_default().to_path_buf(),
+            };
+            return Err(FsError::ForbiddenSparseFile { path: err_path });
         }
 
-        // Security check raw path before stripping prefix
-        validate_entry_path(&raw_path)?;
+        let (relative_path, target_path, norm_exact, path_depth, _is_ascii_clean) =
+            if let Some((rel_str, depth)) = fast_ascii {
+                let target_path = join_clean_rel(&clean_dest, &rel_str);
+                let relative_path = PathBuf::from(&rel_str);
+                (relative_path, target_path, rel_str, depth, true)
+            } else {
+                let path_bytes = entry.path_bytes();
+                let raw_path = match entry.path() {
+                    Ok(p) => p.to_path_buf(),
+                    Err(_) if std::str::from_utf8(&path_bytes).is_err() => {
+                        return Err(FsError::InvalidUtf8Path {
+                            path: PathBuf::from(String::from_utf8_lossy(&path_bytes).into_owned()),
+                        });
+                    }
+                    Err(e) => return Err(FsError::Io(e)),
+                };
 
-        // Strip the archive root component (usually "package/").
-        let relative_path = match strip_package_prefix(&raw_path) {
-            Some(p) => {
-                let cleaned: PathBuf = p
-                    .components()
-                    .filter(|c| !matches!(c, Component::CurDir))
-                    .collect();
-                if cleaned.as_os_str().is_empty() {
-                    continue;
+                validate_entry_path(&raw_path)?;
+
+                let relative_path = match strip_package_prefix(&raw_path) {
+                    Some(p) => {
+                        let cleaned: PathBuf = p
+                            .components()
+                            .filter(|c| !matches!(c, Component::CurDir))
+                            .collect();
+                        if cleaned.as_os_str().is_empty() {
+                            continue;
+                        }
+                        cleaned
+                    }
+                    None => continue,
+                };
+
+                validate_entry_path(&relative_path)?;
+
+                let mut path_depth = 0usize;
+                let mut target_path = PathBuf::with_capacity(
+                    clean_dest.as_os_str().len() + relative_path.as_os_str().len() + 2,
+                );
+                target_path.push(&clean_dest);
+                let mut norm_exact = String::with_capacity(relative_path.as_os_str().len());
+                for c in relative_path.components() {
+                    if let Component::Normal(s) = c {
+                        path_depth += 1;
+                        target_path.push(s);
+                        if !norm_exact.is_empty() {
+                            norm_exact.push('/');
+                        }
+                        norm_exact.push_str(&s.to_string_lossy());
+                    }
                 }
-                cleaned
-            }
-            None => {
-                // If this is the directory entry for "package" itself, skip it
-                continue;
-            }
-        };
-
-        // Security check relative path: path traversal, absolute paths, device names, trailing dots/spaces
-        validate_entry_path(&relative_path)?;
-
-        let mut path_depth = 0usize;
-        let mut target_path = PathBuf::with_capacity(
-            clean_dest.as_os_str().len() + relative_path.as_os_str().len() + 2,
-        );
-        target_path.push(&clean_dest);
-        let mut norm_exact = String::with_capacity(relative_path.as_os_str().len());
-        for c in relative_path.components() {
-            if let Component::Normal(s) = c {
-                path_depth += 1;
-                target_path.push(s);
-                if !norm_exact.is_empty() {
-                    norm_exact.push('/');
-                }
-                norm_exact.push_str(&s.to_string_lossy());
-            }
-        }
+                (relative_path, target_path, norm_exact, path_depth, false)
+            };
 
         // Check path depth: count components; if deeper than limits.max_path_depth
         if path_depth > limits.max_path_depth {
@@ -418,7 +608,9 @@ pub fn extract_tar_gz<R: Read>(
             || entry_type.is_character_special()
             || entry_type.is_fifo()
         {
-            return Err(FsError::ForbiddenSpecialEntry { path: raw_path });
+            return Err(FsError::ForbiddenSpecialEntry {
+                path: entry.path().unwrap_or_default().to_path_buf(),
+            });
         }
 
         // Verify strict canonical path containment
@@ -433,25 +625,24 @@ pub fn extract_tar_gz<R: Read>(
             });
         }
 
-        // Security check against Symlink Slip:
-        // Ensure neither target_path nor any intermediate ancestor directory is a symlink or junction
-        // pointing outside destination or created by an earlier tarball entry.
-        ensure_no_symlink_ancestors_with_cache(
-            &target_path,
-            &verbatim_dest,
-            &symlink_paths,
-            &relative_path,
-            Some(&mut verified_safe_ancestors),
-        )?;
+        if !symlink_paths.is_empty() || !is_fresh_dest {
+            ensure_no_symlink_ancestors_with_cache(
+                &target_path,
+                &verbatim_dest,
+                &symlink_paths,
+                &relative_path,
+                Some(&mut verified_safe_ancestors),
+            )?;
+        }
 
-        // Track case-preserved normalized paths: maintain seen_paths: HashMap<String, String>
-        // mapping lowercase normalized path -> exact case-preserved normalized path.
-        // Node-tar and npm rule: same path (case preserved) = later entry wins.
-        // Only raise FsError::CaseCollision when two extracted paths differ only by case (e.g. foo.js vs FOO.JS).
         if norm_exact.is_empty() {
             continue;
         }
-        let norm_lower = norm_exact.to_ascii_lowercase();
+        let norm_lower = if norm_exact.bytes().any(|b| b.is_ascii_uppercase()) {
+            norm_exact.to_ascii_lowercase()
+        } else {
+            norm_exact.clone()
+        };
 
         if let Some(existing_exact) = seen_paths.get(&norm_lower) {
             if existing_exact != &norm_exact {
@@ -505,10 +696,21 @@ pub fn extract_tar_gz<R: Read>(
             }
         }
 
-        let _was_seen = seen_paths.insert(norm_lower, norm_exact.clone()).is_some();
+        let was_seen = seen_paths.insert(norm_lower, norm_exact.clone()).is_some();
 
         // Security check: escaping symlinks/hardlinks
         if entry_type.is_symlink() || entry_type.is_hard_link() {
+            if !pending_files.is_empty() {
+                flush_pending(
+                    &mut pending_files,
+                    &mut pending_bytes,
+                    &mut created_dirs,
+                    &mut verified_safe_ancestors,
+                    &mut recorded_files,
+                    &mut recorded_bytes,
+                    &mut wide_buf,
+                )?;
+            }
             let norm_rel = PathBuf::from(&norm_exact);
             symlink_count += 1;
             if symlink_count > limits.max_symlinks {
@@ -746,6 +948,17 @@ pub fn extract_tar_gz<R: Read>(
 
         // Unpack entry with size and ratio checks
         if entry_type.is_dir() {
+            if was_seen && !pending_files.is_empty() {
+                flush_pending(
+                    &mut pending_files,
+                    &mut pending_bytes,
+                    &mut created_dirs,
+                    &mut verified_safe_ancestors,
+                    &mut recorded_files,
+                    &mut recorded_bytes,
+                    &mut wide_buf,
+                )?;
+            }
             if !created_dirs.contains(&target_path) {
                 let norm_rel = PathBuf::from(&norm_exact);
                 let should_unlink = if is_fresh_dest {
@@ -789,6 +1002,87 @@ pub fn extract_tar_gz<R: Read>(
                         ),
                     });
                 }
+            }
+
+            // Fast parallel batching path for <=256KB files on a fresh destination without
+            // duplicate paths or prior symlinks.
+            if header_size.is_some_and(|sz| sz <= 256 * 1024)
+                && is_fresh_dest
+                && !was_seen
+                && symlink_paths.is_empty()
+                && !created_dirs.contains(&target_path)
+            {
+                let sz = header_size.unwrap() as usize;
+                let mut file_data = Vec::with_capacity(sz);
+                let t_read = std::time::Instant::now();
+                entry.read_to_end(&mut file_data).map_err(FsError::Io)?;
+                inflate_nanos += t_read.elapsed().as_nanos() as u64;
+
+                total_uncompressed += file_data.len() as u64;
+                if total_uncompressed > limits.max_uncompressed_size {
+                    return Err(FsError::TarBombLimitExceeded {
+                        limit_type: "uncompressed size".to_string(),
+                        detail: format!(
+                            "Uncompressed size {} exceeded limit of {} bytes",
+                            total_uncompressed, limits.max_uncompressed_size
+                        ),
+                    });
+                }
+                if total_uncompressed > 50_000 {
+                    let compressed_so_far = compressed_counter.load(Ordering::Relaxed);
+                    let ratio = if compressed_so_far == 0 {
+                        f64::INFINITY
+                    } else {
+                        total_uncompressed as f64 / compressed_so_far as f64
+                    };
+                    if ratio > limits.max_compression_ratio {
+                        return Err(FsError::TarBombLimitExceeded {
+                            limit_type: "compression ratio".to_string(),
+                            detail: format!(
+                                "Compression ratio {:.1}:1 exceeded limit of {:.1}:1",
+                                ratio, limits.max_compression_ratio
+                            ),
+                        });
+                    }
+                }
+
+                pending_bytes += file_data.len() as u64;
+                pending_files.push(crate::writer::MaterializeFile {
+                    path: target_path,
+                    data: Arc::new(file_data),
+                    mode,
+                    package_id: None,
+                });
+
+                if cfg!(windows) && !_is_ascii_clean {
+                    extracted_regular_files.insert(PathBuf::from(&norm_exact));
+                }
+                extracted_regular_files.insert(relative_path);
+
+                if pending_bytes >= PENDING_FLUSH_BYTES {
+                    flush_pending(
+                        &mut pending_files,
+                        &mut pending_bytes,
+                        &mut created_dirs,
+                        &mut verified_safe_ancestors,
+                        &mut recorded_files,
+                        &mut recorded_bytes,
+                        &mut wide_buf,
+                    )?;
+                }
+                continue;
+            }
+
+            if !pending_files.is_empty() {
+                flush_pending(
+                    &mut pending_files,
+                    &mut pending_bytes,
+                    &mut created_dirs,
+                    &mut verified_safe_ancestors,
+                    &mut recorded_files,
+                    &mut recorded_bytes,
+                    &mut wide_buf,
+                )?;
             }
 
             // Ensure parent directory exists using deduplicated directory cache
@@ -1038,6 +1332,18 @@ pub fn extract_tar_gz<R: Read>(
         }
     }
 
+    if !pending_files.is_empty() {
+        flush_pending(
+            &mut pending_files,
+            &mut pending_bytes,
+            &mut created_dirs,
+            &mut verified_safe_ancestors,
+            &mut recorded_files,
+            &mut recorded_bytes,
+            &mut wide_buf,
+        )?;
+    }
+
     // Final check for compression ratio after extraction
     let compressed_bytes = compressed_counter.load(Ordering::Relaxed);
     if total_uncompressed > 50_000 {
@@ -1057,7 +1363,11 @@ pub fn extract_tar_gz<R: Read>(
         }
     }
 
-    record_files_created_batch(entry_count as u64, total_uncompressed);
+    let rem_files = (entry_count as u64).saturating_sub(recorded_files);
+    let rem_bytes = total_uncompressed.saturating_sub(recorded_bytes);
+    if rem_files > 0 || rem_bytes > 0 {
+        record_files_created_batch(rem_files, rem_bytes);
+    }
     let total_elapsed = start_extract.elapsed();
     let inflate_duration = std::time::Duration::from_nanos(inflate_nanos);
     let materialize_duration = total_elapsed.saturating_sub(inflate_duration);

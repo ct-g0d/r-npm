@@ -24,14 +24,42 @@ use tokio::sync::{Notify, OwnedSemaphorePermit, SemaphorePermit};
 use tracing::debug;
 use url::Url;
 
+static DEFAULT_USER_AGENT_STR: OnceLock<String> = OnceLock::new();
+static DEFAULT_UA_HEADER: OnceLock<HeaderValue> = OnceLock::new();
+static DEFAULT_REGISTRY_URL: OnceLock<Url> = OnceLock::new();
+
+#[inline]
+fn default_user_agent_str() -> &'static str {
+    DEFAULT_USER_AGENT_STR.get_or_init(|| {
+        format!(
+            "rnpm/{} ({}; {})",
+            env!("CARGO_PKG_VERSION"),
+            std::env::consts::OS,
+            std::env::consts::ARCH
+        )
+    })
+}
+
+#[inline]
+fn default_ua_header() -> HeaderValue {
+    DEFAULT_UA_HEADER
+        .get_or_init(|| {
+            HeaderValue::from_str(default_user_agent_str())
+                .expect("default user-agent is valid HTTP header value")
+        })
+        .clone()
+}
+
+#[inline]
+fn default_registry_url() -> Url {
+    DEFAULT_REGISTRY_URL
+        .get_or_init(|| Url::parse("https://registry.npmjs.org/").unwrap())
+        .clone()
+}
+
 /// Returns the default User-Agent header string.
 pub fn default_user_agent() -> String {
-    format!(
-        "rnpm/{} ({}; {})",
-        env!("CARGO_PKG_VERSION"),
-        std::env::consts::OS,
-        std::env::consts::ARCH
-    )
+    default_user_agent_str().to_owned()
 }
 
 /// Abbreviated metadata MIME type for npm registry.
@@ -50,13 +78,22 @@ pub fn set_cli_request_context(command: String, user_agent: String) {
 }
 
 fn packument_cache_metadata(headers: &HeaderMap) -> serde_json::Value {
-    let mut map = serde_json::Map::new();
-    for key in ["cache-control", "date", "age", "content-type", "vary"] {
+    const KEYS: [&str; 5] = ["cache-control", "date", "age", "content-type", "vary"];
+    let mut map: Option<serde_json::Map<String, serde_json::Value>> = None;
+    for key in KEYS {
         if let Some(val) = headers.get(key).and_then(|v| v.to_str().ok()) {
-            map.insert(key.into(), serde_json::Value::String(val.to_owned()));
+            let m = map.get_or_insert_with(serde_json::Map::new);
+            m.insert(key.into(), serde_json::Value::String(val.to_owned()));
         }
     }
-    serde_json::json!({ "response": { "headers": map } })
+    let mut outer = serde_json::Map::new();
+    let mut resp_map = serde_json::Map::new();
+    resp_map.insert(
+        "headers".into(),
+        serde_json::Value::Object(map.unwrap_or_default()),
+    );
+    outer.insert("response".into(), serde_json::Value::Object(resp_map));
+    serde_json::Value::Object(outer)
 }
 
 /// Negotiated HTTP representation of an npm packument.
@@ -871,13 +908,13 @@ pub struct RegistryClientConfig {
 
 impl Default for RegistryClientConfig {
     fn default() -> Self {
-        let registry_url = Url::parse("https://registry.npmjs.org/").unwrap();
-        let mut trusted_hosts = HashSet::new();
+        let registry_url = default_registry_url();
+        let mut trusted_hosts = HashSet::with_capacity(2);
         if let Some(h) = registry_url.host_str() {
             trusted_hosts.insert(h.to_ascii_lowercase());
         }
 
-        let mut retry_on_status = HashSet::new();
+        let mut retry_on_status = HashSet::with_capacity(4);
         retry_on_status.insert(429);
         retry_on_status.insert(502);
         retry_on_status.insert(503);
@@ -1685,21 +1722,32 @@ impl RegistryClient {
     /// Create a new RegistryClient with custom configuration.
     /// Defers heavy `reqwest` / `rustls` / root CA initialization until the first network request.
     pub fn with_config(config: RegistryClientConfig) -> Result<Self, RegistryError> {
-        let mut headers = HeaderMap::new();
+        let mut headers = HeaderMap::with_capacity(4);
         let cli_context = CLI_REQUEST_CONTEXT.get();
-        let agent = cli_context
-            .filter(|_| config.user_agent == default_user_agent())
-            .map(|(_, agent)| agent.as_str())
-            .unwrap_or(&config.user_agent);
-        let user_agent =
-            HeaderValue::from_str(agent).map_err(|e| RegistryError::Other(e.to_string()))?;
-        headers.insert(USER_AGENT, user_agent);
-        if let Some((command, _)) = cli_context {
+        let user_agent = if let Some((command, cli_ua)) =
+            cli_context.filter(|_| config.user_agent == default_user_agent_str())
+        {
             headers.insert(
                 "npm-command",
                 HeaderValue::from_str(command).map_err(|e| RegistryError::Other(e.to_string()))?,
             );
-        }
+            HeaderValue::from_str(cli_ua).map_err(|e| RegistryError::Other(e.to_string()))?
+        } else {
+            if let Some((command, _)) = cli_context {
+                headers.insert(
+                    "npm-command",
+                    HeaderValue::from_str(command)
+                        .map_err(|e| RegistryError::Other(e.to_string()))?,
+                );
+            }
+            if config.user_agent == default_user_agent_str() {
+                default_ua_header()
+            } else {
+                HeaderValue::from_str(&config.user_agent)
+                    .map_err(|e| RegistryError::Other(e.to_string()))?
+            }
+        };
+        headers.insert(USER_AGENT, user_agent);
         headers.insert(CONNECTION, HeaderValue::from_static("keep-alive"));
 
         // Only validate proxy / CA / TLS files eagerly when configured;
@@ -1974,7 +2022,17 @@ impl RegistryClient {
         };
 
         if let Some(port) = port_or_default {
-            if self
+            use std::io::Write as _;
+            let mut stack_buf = [0u8; 272];
+            let mut cursor = std::io::Cursor::new(&mut stack_buf[..]);
+            if write!(&mut cursor, "{host}:{port}").is_ok() {
+                let len = cursor.position() as usize;
+                if let Ok(key) = std::str::from_utf8(&stack_buf[..len]) {
+                    if self.config.trusted_hosts.contains(key) {
+                        return true;
+                    }
+                }
+            } else if self
                 .config
                 .trusted_hosts
                 .contains(&format!("{host}:{port}"))
@@ -4446,9 +4504,9 @@ impl RegistryClient {
                 }
             }
 
-            use sha2::Digest as _;
             let mut bytes = Vec::new();
-            let mut hasher = compute_sha512.then(sha2::Sha512::new);
+            let mut hasher =
+                compute_sha512.then(|| ring::digest::Context::new(&ring::digest::SHA512));
             let mut stream_err = None;
 
             loop {
@@ -4528,8 +4586,8 @@ impl RegistryClient {
             }
 
             let integrity = hasher.map(|ctx| {
-                let digest = sha2::Digest::finalize(ctx);
-                format!("sha512-{}", data_encoding::BASE64.encode(&digest))
+                let digest = ctx.finish();
+                format!("sha512-{}", data_encoding::BASE64.encode(digest.as_ref()))
             });
 
             return Ok((BytesFetchResult::Fresh { bytes, etag }, integrity));
@@ -4610,6 +4668,16 @@ impl RegistryClient {
         tarball_url: &str,
         dest_path: &Path,
     ) -> Result<u64, RegistryError> {
+        self.download_tarball_to_file_inner(tarball_url, dest_path, false)
+            .await
+    }
+
+    async fn download_tarball_to_file_inner(
+        &self,
+        tarball_url: &str,
+        dest_path: &Path,
+        parent_verified: bool,
+    ) -> Result<u64, RegistryError> {
         const DISK_BUFFER_THRESHOLD: usize = 4 * 1024 * 1024;
 
         let url = Url::parse(tarball_url)?;
@@ -4627,7 +4695,7 @@ impl RegistryClient {
             .then(|| url_host_key(&url));
 
         let parent = dest_path.parent().unwrap_or_else(|| Path::new("."));
-        if !parent.as_os_str().is_empty() && !parent.is_dir() {
+        if !parent_verified && !parent.as_os_str().is_empty() && !parent.is_dir() {
             tokio::fs::create_dir_all(parent).await.map_err(|e| {
                 RegistryError::Other(format!(
                     "Failed to create directories for {}: {e}",
@@ -4925,13 +4993,32 @@ impl RegistryClient {
         &self,
         downloads: &[(&str, &Path)],
     ) -> Vec<Result<u64, RegistryError>> {
+        if downloads.is_empty() {
+            return Vec::new();
+        }
+        let mut unique_parents: HashSet<&Path> = HashSet::with_capacity(8);
+        for &(_, dest) in downloads {
+            if let Some(p) = dest.parent() {
+                if !p.as_os_str().is_empty() && unique_parents.insert(p) && !p.is_dir() {
+                    if let Err(e) = std::fs::create_dir_all(p) {
+                        let msg = format!("Failed to create directories for {}: {e}", p.display());
+                        return (0..downloads.len())
+                            .map(|_| Err(RegistryError::Other(msg.clone())))
+                            .collect();
+                    }
+                }
+            }
+        }
+
         let mut join_set = tokio::task::JoinSet::new();
         for (idx, (url, dest)) in downloads.iter().enumerate() {
             let client = self.clone();
             let url_str = url.to_string();
             let dest_buf = dest.to_path_buf();
             join_set.spawn(async move {
-                let res = client.download_tarball_to_file(&url_str, &dest_buf).await;
+                let res = client
+                    .download_tarball_to_file_inner(&url_str, &dest_buf, true)
+                    .await;
                 (idx, res)
             });
         }
