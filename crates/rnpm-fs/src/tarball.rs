@@ -215,7 +215,8 @@ pub(crate) fn join_clean_rel(base: &Path, rel: &str) -> PathBuf {
                 for (i, &b) in bytes.iter().enumerate() {
                     buf[i] = if b == b'/' { b'\\' } else { b };
                 }
-                // Safety: `rel` is valid ASCII/UTF-8 and `/` -> `\` preserves UTF-8.
+                debug_assert!(std::str::from_utf8(&buf[..bytes.len()]).is_ok());
+                // SAFETY: `rel` is valid UTF-8 and replacing single-byte ASCII `/` with `\` preserves UTF-8.
                 let s = unsafe { std::str::from_utf8_unchecked(&buf[..bytes.len()]) };
                 out.push(s);
             } else {

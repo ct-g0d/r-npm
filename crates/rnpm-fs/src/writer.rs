@@ -286,6 +286,8 @@ fn dir_exists_wide(wide_null_term: &[u16]) -> bool {
     }
     const INVALID_FILE_ATTRIBUTES: u32 = u32::MAX;
     const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x10;
+    debug_assert_eq!(wide_null_term.last().copied(), Some(0));
+    // SAFETY: `wide_null_term` is NUL-terminated UTF-16 passed read-only to Win32 `GetFileAttributesW`.
     let attrs = unsafe { GetFileAttributesW(wide_null_term.as_ptr()) };
     attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_DIRECTORY) != 0
 }
@@ -303,6 +305,8 @@ fn create_dir_wide_or_fallback(wide: &[u16]) -> std::io::Result<()> {
     }
     const ERROR_ALREADY_EXISTS: u32 = 183;
 
+    debug_assert_eq!(wide.last().copied(), Some(0));
+    // SAFETY: `wide` is NUL-terminated UTF-16 passed read-only with a null security descriptor pointer.
     let ret = unsafe { CreateDirectoryW(wide.as_ptr(), std::ptr::null_mut()) };
     if ret == 0 {
         let err = unsafe { GetLastError() };
@@ -319,7 +323,11 @@ fn create_dir_wide_or_fallback(wide: &[u16]) -> std::io::Result<()> {
 fn create_dir_bytes_wide_buf(dir_bytes: &[u8], wide_buf: &mut Vec<u16>) -> std::io::Result<()> {
     use std::os::windows::ffi::OsStrExt;
     wide_buf.clear();
-    // Safety: sliced at ASCII '\\' boundary on valid WTF-8 bytes.
+    debug_assert!(!dir_bytes.is_empty());
+    // SAFETY: `dir_bytes` comes exclusively from `Path::as_os_str().as_encoded_bytes()` sliced
+    // immediately before an ASCII `b'\\'` (`0x5C`) separator (or at full slice length). Because `0x5C`
+    // is ASCII `< 0x80`, it can never fall inside a multi-byte UTF-8/WTF-8 code unit sequence nor split
+    // a surrogate pair across both halves, so every prefix cut before `b'\\'` preserves valid WTF-8.
     let os = unsafe { std::ffi::OsStr::from_encoded_bytes_unchecked(dir_bytes) };
     wide_buf.extend(os.encode_wide());
     wide_buf.push(0);
@@ -392,7 +400,9 @@ where
                     prefix[5] == b':' && prefix[6] == b'\\'
                 };
                 if valid {
-                    // Safety: sliced at ASCII '\\' boundary on valid WTF-8 bytes.
+                    // SAFETY: `prefix` is a non-empty prefix of `unique_paths[0]`'s valid WTF-8 bytes,
+                    // guaranteed by `boundary_ok` / the rewind loop to match either the full path or end
+                    // immediately before an ASCII `b'\\'` (`0x5C`), preserving valid WTF-8 encoding.
                     let os_prefix =
                         unsafe { std::ffi::OsStr::from_encoded_bytes_unchecked(prefix) };
                     Some(PathBuf::from(os_prefix))
@@ -450,12 +460,14 @@ where
                 4
             };
             while end > min_root {
+                debug_assert!(end == full_bytes.len() || full_bytes[end] == b'\\');
                 let slice = &full_bytes[..end];
                 if known_existing_bytes.contains(slice) || !pending_seen.insert(slice) {
                     break;
                 }
                 if common_prefix.is_none() {
                     scratch_wide.clear();
+                    // SAFETY: `slice` is either the full valid WTF-8 path or cut right before ASCII `b'\\'`.
                     let slice_os =
                         unsafe { std::ffi::OsStr::from_encoded_bytes_unchecked(slice) };
                     scratch_wide.extend(slice_os.encode_wide());
@@ -2392,6 +2404,7 @@ pub fn extract_packages_direct_parallel<R: Read + Send>(
             .collect()
     } else {
         struct DisjointSlot<T>(std::cell::UnsafeCell<Option<T>>);
+        // SAFETY: `T: Send`, and workers only access distinct indices claimed once via `next_idx.fetch_add(1)`.
         unsafe impl<T: Send> Sync for DisjointSlot<T> {}
 
         let decode_threads = std::thread::available_parallelism()
@@ -2423,6 +2436,8 @@ pub fn extract_packages_direct_parallel<R: Read + Send>(
                     item.limits,
                     Some(item.package_id),
                 );
+                // SAFETY: Each `idx < num_items` is claimed by at most one worker via `next_idx.fetch_add(1)`,
+                // and `run_parallel` synchronizes all helpers before `results` is consumed.
                 unsafe {
                     *results[idx].0.get() = Some(decoded);
                 }

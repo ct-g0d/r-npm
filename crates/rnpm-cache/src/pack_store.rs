@@ -2007,6 +2007,7 @@ impl PackStore {
 
             if index.files.len() >= 12 {
                 struct EntrySlot(std::cell::UnsafeCell<PackFileEntry>);
+                // SAFETY: Each slot index is claimed once by `next_idx.fetch_add(1)` and joined before unwrapping.
                 unsafe impl Sync for EntrySlot {}
 
                 let slots: Vec<EntrySlot> = std::mem::take(&mut index.files)

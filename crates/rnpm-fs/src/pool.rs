@@ -48,6 +48,9 @@ impl Batch {
     }
 
     fn execute_as_helper(&self) {
+        // SAFETY: `self.call` is `call_closure::<F>` and `self.ctx` points to the caller's `&F`
+        // (`F: Fn() + Sync`), which remains live and immutable until `BatchFinishGuard::drop`
+        // closes the batch and waits for `ACTIVE_MASK == 0`.
         let res = catch_unwind(AssertUnwindSafe(|| unsafe { (self.call)(self.ctx) }));
         if let Err(payload) = res {
             let mut guard = self.panic.lock().unwrap_or_else(|e| e.into_inner());
@@ -168,6 +171,7 @@ impl IoPool {
     }
 }
 
+/// SAFETY: Caller must guarantee `ctx` points to a valid, initialized `F` that outlives the call.
 unsafe fn call_closure<F: Fn() + Sync>(ctx: *const ()) {
     let f = &*(ctx as *const F);
     f();
@@ -191,6 +195,7 @@ pub fn run_parallel<F: Fn() + Sync>(requested_threads: usize, f: &F) {
     }
 
     let helper_slots = total_threads - 1;
+    debug_assert!(helper_slots < (1usize << 31));
     let batch = Arc::new(Batch {
         call: call_closure::<F>,
         ctx: (f as *const F).cast(),
