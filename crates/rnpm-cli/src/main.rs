@@ -5599,14 +5599,10 @@ async fn run_audit_fix(
 
 fn should_cleanup_trash(cmd: &Commands) -> bool {
     match cmd {
-        Commands::Install { dry_run, .. } if *dry_run => false,
-        Commands::Ci { dry_run, .. } if *dry_run => false,
         Commands::Prune { dry_run, .. } if *dry_run => false,
         Commands::Dedupe { dry_run, .. } if *dry_run => false,
         Commands::Fix { dry_run, .. } if *dry_run => false,
-        Commands::Install { .. }
-        | Commands::Ci { .. }
-        | Commands::Update { .. }
+        Commands::Update { .. }
         | Commands::Uninstall { .. }
         | Commands::Prune { .. }
         | Commands::Dedupe { .. }

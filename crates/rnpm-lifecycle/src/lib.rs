@@ -1575,11 +1575,18 @@ fn flatten_pkg_script_fields_from_bytes(bytes: &[u8], env: &mut HashMap<String, 
     let maybe_has_fields = bytes_contain_subslice(bytes, b"\"config\"")
         || bytes_contain_subslice(bytes, b"\"engines\"")
         || bytes_contain_subslice(bytes, b"\"bin\"")
+        || bytes_contain_subslice(bytes, b"\"name\"")
+        || bytes_contain_subslice(bytes, b"\"version\"")
         || bytes_contain_subslice(bytes, b"\\u");
     if !maybe_has_fields {
         return;
     }
     if let Ok(package) = serde_json::from_slice::<serde_json::Value>(bytes) {
+        for key in ["name", "version"] {
+            if let Some(value) = package.get(key).filter(|value| value.is_string()) {
+                flatten_pkg_script_env(&format!("npm_package_{key}"), value, env);
+            }
+        }
         for key in ["config", "engines", "bin"] {
             if let Some(value) = package.get(key) {
                 flatten_pkg_script_env(&format!("npm_package_{key}"), value, env);
@@ -1630,8 +1637,7 @@ impl ScriptBaseEnv {
 
         // Single pass over config layers instead of walking config twice.
         if !config.layers.is_empty() {
-            let mut winning: HashMap<&str, (&str, &String)> =
-                HashMap::with_capacity(config.layers.iter().map(|l| l.settings.len()).sum::<usize>().min(64));
+            let mut winning = std::collections::BTreeMap::new();
             for layer in &config.layers {
                 let source = if layer.name == "env" { "env" } else { "other" };
                 for (key, value) in &layer.settings {
@@ -1808,7 +1814,9 @@ impl ScriptBaseEnv {
             gyp_bin,
             inherited_tail_no_gyp,
             inherited_tail_with_gyp,
-            init_cwd_fallback: project_root.to_path_buf(),
+            init_cwd_fallback: extra_env
+                .and_then(|extra| extra.get("INIT_CWD"))
+                .map_or_else(|| project_root.to_path_buf(), PathBuf::from),
         }
     }
 
@@ -1837,8 +1845,10 @@ impl ScriptBaseEnv {
         if let Some(val) = extra_env.and_then(|e| e.get("INIT_CWD")) {
             env.insert("INIT_CWD".to_string(), val.clone());
         } else {
-            env.entry("INIT_CWD".to_string())
-                .or_insert_with(|| self.init_cwd_fallback.to_string_lossy().into_owned());
+            env.insert(
+                "INIT_CWD".to_string(),
+                self.init_cwd_fallback.to_string_lossy().into_owned(),
+            );
         }
 
         let cmd = match event {
@@ -1855,6 +1865,7 @@ impl ScriptBaseEnv {
             .or_insert_with(|| cmd.to_string());
         env.insert("npm_lifecycle_event".to_string(), event.to_string());
         env.insert("npm_lifecycle_script".to_string(), script_cmd.to_string());
+        env.retain(|key, _| !key.starts_with("npm_package_") || key == "npm_package_version");
         env.insert("npm_package_name".to_string(), package_name.to_string());
         if let Some(ver) = package_version {
             env.insert("npm_package_version".to_string(), ver.to_string());
@@ -1971,7 +1982,7 @@ pub fn build_script_env_with_config(
         ctx.npm_execpath.as_deref(),
         Some(&ctx.extra_env),
     );
-    base.build_package_env(
+    let mut env = base.build_package_env(
         &ctx.package_dir,
         &ctx.package_name,
         ctx.package_version.as_deref(),
@@ -1979,7 +1990,11 @@ pub fn build_script_env_with_config(
         &ctx.script_cmd,
         None,
         ctx.node_gyp.as_deref(),
-    )
+    );
+    if let Some(script) = ctx.extra_env.get("npm_lifecycle_script") {
+        env.insert("npm_lifecycle_script".into(), script.clone());
+    }
+    env
 }
 
 fn apply_context_overrides_to_precomputed_env(
@@ -3404,10 +3419,14 @@ async fn execute_dependency_hooks_with_abort(
     };
     drain_ready(&mut zero_queue, &mut ready_hooks, &mut indegree);
 
-    let max_workers = std::thread::available_parallelism()
-        .map(|p| p.get())
-        .unwrap_or(4)
-        .clamp(4, 16);
+    let max_workers = if opts.foreground_scripts {
+        1
+    } else {
+        std::thread::available_parallelism()
+            .map(|p| p.get())
+            .unwrap_or(4)
+            .clamp(4, 16)
+    };
 
     let (fail_abort_tx, fail_abort_rx) = tokio::sync::watch::channel(false);
     let mut join_set: tokio::task::JoinSet<Result<usize>> = tokio::task::JoinSet::new();
@@ -4094,6 +4113,9 @@ pub async fn execute_workspace_scripts_topological_with_abort(
                 cfg_ref.clone(),
             );
             ctx.package_version = member.manifest.version.clone();
+            if let Ok(command) = std::env::var("npm_command") {
+                ctx.extra_env.insert("npm_command".to_string(), command);
+            }
             ctx.precomputed_env = match precomputed.as_mut() {
                 Some(p) if hook_i == last_hook_idx => Some(std::mem::take(p)),
                 Some(p) => Some(p.clone()),

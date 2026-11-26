@@ -77,8 +77,12 @@ pub fn normalize_shebang_str(content: &str) -> (String, bool) {
 /// ONLY reads/rewrites the full file when line 1 actually contains `\r\n`.
 /// Returns `Ok(true)` if the file was modified, `Ok(false)` otherwise.
 pub fn normalize_shebang_file(file_path: &Path) -> Result<bool, ShimError> {
-    use std::io::Read;
+    use std::io::{Read, Seek, SeekFrom};
 
+    #[cfg(unix)]
+    if std::fs::metadata(file_path).is_ok_and(|m| !m.is_file()) {
+        return Ok(false);
+    }
     let mut file = match std::fs::File::open(file_path) {
         Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
@@ -130,6 +134,13 @@ pub fn normalize_shebang_file(file_path: &Path) -> Result<bool, ShimError> {
         return Ok(false);
     }
 
+    if n == header.len() && !header_slice.contains(&b'\n') {
+        file.seek(SeekFrom::Start(n as u64))
+            .map_err(|source| ShimError::Io {
+                path: file_path.to_path_buf(),
+                source,
+            })?;
+    }
     normalize_crlf_from_open_file(file_path, file, header_slice, n < 512)
 }
 
@@ -299,6 +310,10 @@ pub enum ShebangRead {
 /// file open, distinguishing missing/non-files from direct (non-shebang) scripts.
 pub fn normalize_and_read_shebang_line(file_path: &Path) -> Result<ShebangRead, ShimError> {
     use std::io::Read;
+    #[cfg(unix)]
+    if std::fs::metadata(file_path).is_ok_and(|m| !m.is_file()) {
+        return Ok(ShebangRead::NotFile);
+    }
 
     let mut file = match std::fs::File::open(file_path) {
         Ok(f) => f,

@@ -2729,12 +2729,9 @@ pub fn inspect_manifest_from_tarball(bytes: &[u8]) -> Result<Manifest> {
 
 pub struct Installer {
     options: InstallOptions,
-    cache_path: PathBuf,
-    cache: std::sync::OnceLock<Cache>,
-    pack_store_path: PathBuf,
-    pack_store: std::sync::OnceLock<Arc<PackStore>>,
-    registry_client_config: RegistryClientConfig,
-    registry_client: std::sync::OnceLock<RegistryClient>,
+    cache: Cache,
+    pack_store: Arc<PackStore>,
+    registry_client: RegistryClient,
     metadata_cache: HashMap<String, AbbreviatedPackageMetadata>,
     writer_concurrency: Option<usize>,
     writer_cfg: std::sync::OnceLock<Arc<rnpm_fs::ParallelWriterConfig>>,
@@ -2910,6 +2907,12 @@ impl Installer {
 
         apply_config_to_client_config(&mut client_config, &config);
 
+        let cache = Cache::new(&cache_path).context("Failed to initialize cache")?;
+        let pack_store =
+            Arc::new(PackStore::new(&pack_store_path).context("Failed to initialize pack store")?);
+        let registry_client = RegistryClient::with_config(client_config)
+            .context("Failed to initialize registry client")?;
+
         let io_concurrency = 64;
         let io_semaphore = Arc::new(tokio::sync::Semaphore::new(io_concurrency));
 
@@ -2943,12 +2946,9 @@ impl Installer {
 
         Ok(Self {
             options,
-            cache_path,
-            cache: std::sync::OnceLock::new(),
-            pack_store_path,
-            pack_store: std::sync::OnceLock::new(),
-            registry_client_config: client_config,
-            registry_client: std::sync::OnceLock::new(),
+            cache,
+            pack_store,
+            registry_client,
             metadata_cache: HashMap::new(),
             writer_concurrency: concurrency,
             writer_cfg: std::sync::OnceLock::new(),
@@ -2962,54 +2962,14 @@ impl Installer {
     }
 
     pub(crate) fn cache(&self) -> &Cache {
-        self.cache.get_or_init(|| {
-            Cache::new(&self.cache_path).expect("Failed to initialize cache")
-        })
+        &self.cache
     }
 
     fn read_cached_project_fingerprint(&self) -> Option<String> {
-        if let Some(cache) = self.cache.get() {
-            return cache
-                .get_project_fingerprint(&self.options.project_dir)
-                .ok()
-                .flatten();
-        }
-        let fp_dir = self.cache_path.join("_fingerprints");
-        if !fp_dir.is_dir() {
-            return None;
-        }
-        let canonical = self
-            .options
-            .project_dir
-            .canonicalize()
-            .unwrap_or_else(|_| self.options.project_dir.clone());
-        let path_str = canonical.to_string_lossy();
-        let normalized = path_str.strip_prefix(r"\\?\").unwrap_or(&path_str);
-        #[cfg(windows)]
-        let normalized_str = normalized.to_ascii_lowercase().replace('\\', "/");
-        #[cfg(not(windows))]
-        let normalized_str = normalized.to_string();
-        use sha2::{Digest, Sha256};
-        let mut hasher = Sha256::new();
-        hasher.update(normalized_str.as_bytes());
-        let key = data_encoding::HEXLOWER.encode(&hasher.finalize());
-        let path = fp_dir.join(format!("{key}.json"));
-        let data = std::fs::read_to_string(path).ok()?;
-        #[derive(serde::Deserialize)]
-        struct FingerprintRecord {
-            fingerprint: String,
-        }
-        serde_json::from_str::<FingerprintRecord>(&data)
+        self.cache
+            .get_project_fingerprint(&self.options.project_dir)
             .ok()
-            .map(|r| r.fingerprint)
-    }
-
-    fn finish_timing(&self, collector: &TimingCollector) -> TimingMetrics {
-        if let Some(client) = self.registry_client.get() {
-            collector.finish_with_client(client)
-        } else {
-            collector.finish()
-        }
+            .flatten()
     }
 
     fn collect_root_declared(
@@ -3275,15 +3235,6 @@ impl Installer {
         }
     }
 
-    fn pack_store_arc_ref(&self) -> &Arc<PackStore> {
-        self.pack_store.get_or_init(|| {
-            Arc::new(
-                PackStore::new(&self.pack_store_path)
-                    .expect("Failed to initialize pack store"),
-            )
-        })
-    }
-
     fn writer_cfg_arc_ref(&self) -> &Arc<rnpm_fs::ParallelWriterConfig> {
         self.writer_cfg.get_or_init(|| {
             Arc::new(determine_writer_config(
@@ -3295,18 +3246,20 @@ impl Installer {
 
     /// Access the underlying PackStore.
     pub fn pack_store(&self) -> &PackStore {
-        self.pack_store_arc_ref()
+        &self.pack_store
     }
 
     /// Access the underlying PackStore Arc.
     pub fn pack_store_arc(&self) -> Arc<PackStore> {
-        Arc::clone(self.pack_store_arc_ref())
+        Arc::clone(&self.pack_store)
     }
 
     /// Reconfigure maximum network worker concurrency (bounded semaphore).
     pub fn with_concurrency(mut self, concurrency: usize) -> Result<Self> {
-        self.registry_client_config.max_concurrent_requests = concurrency;
-        self.registry_client = std::sync::OnceLock::new();
+        let mut cfg = self.registry_client.config().clone();
+        cfg.max_concurrent_requests = concurrency;
+        self.registry_client = RegistryClient::with_config(cfg)
+            .context("Failed to reconfigure registry client with concurrency")?;
         self.writer_concurrency = Some(concurrency);
         self.writer_cfg = std::sync::OnceLock::new();
         let io_concurrency = concurrency.clamp(32, 128);
@@ -3461,10 +3414,7 @@ impl Installer {
     }
 
     pub fn registry_client(&self) -> &RegistryClient {
-        self.registry_client.get_or_init(|| {
-            RegistryClient::with_config(self.registry_client_config.clone())
-                .expect("Failed to initialize registry client")
-        })
+        &self.registry_client
     }
 
     /// Alias for `run()`.
@@ -3499,6 +3449,9 @@ impl Installer {
     }
 
     async fn install_internal(&mut self) -> Result<InstallSummary> {
+        if !self.options.dry_run {
+            crate::trash::cleanup_leftover_trash(&self.options.project_dir);
+        }
         let collector = TimingCollector::new();
         let plan_start = std::time::Instant::now();
         let _plan_span = tracing::info_span!("plan").entered();
@@ -3595,16 +3548,12 @@ impl Installer {
                                 cache_hits: 0,
                                 cache_misses: 0,
                                 lockfile_path,
-                                timing: Some(self.finish_timing(&collector)),
+                                timing: Some(collector.finish_with_client(&self.registry_client)),
                             });
                         }
                     }
                 }
             }
-        }
-
-        if !self.options.dry_run {
-            crate::trash::cleanup_leftover_trash(&self.options.project_dir);
         }
 
         let mut manifest = if manifest_path.exists() && !self.options.is_global {
@@ -4510,7 +4459,7 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                 cache_hits: 0,
                 cache_misses: 0,
                 lockfile_path,
-                timing: Some(self.finish_timing(&collector)),
+                timing: Some(collector.finish_with_client(&self.registry_client)),
             });
         }
 
@@ -4629,7 +4578,7 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                 cache_hits: 0,
                 cache_misses: 0,
                 lockfile_path,
-                timing: Some(self.finish_timing(&collector)),
+                timing: Some(collector.finish_with_client(&self.registry_client)),
             });
         }
 
@@ -6449,7 +6398,7 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
             cache_hits,
             cache_misses,
             lockfile_path,
-            timing: Some(self.finish_timing(&collector)),
+            timing: Some(collector.finish_with_client(&self.registry_client)),
         })
     }
 
@@ -6829,7 +6778,7 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                 cache_hits: 0,
                 cache_misses: 0,
                 lockfile_path,
-                timing: Some(self.finish_timing(&collector)),
+                timing: Some(collector.finish_with_client(&self.registry_client)),
             });
         }
 
@@ -8008,7 +7957,7 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
             }
 
             let (loaded_packs, mut load_success) = crate::fast_path::parallel_load_packs(
-                self.pack_store_arc_ref(),
+                &self.pack_store,
                 &loc_base_dir,
                 &packages_to_process,
             );
@@ -8705,7 +8654,7 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
             cache_hits,
             cache_misses,
             lockfile_path,
-            timing: Some(self.finish_timing(&collector)),
+            timing: Some(collector.finish_with_client(&self.registry_client)),
         })
     }
 
