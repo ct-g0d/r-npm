@@ -7803,10 +7803,6 @@ fn execute_run_sync_with_config(
         ));
     }
     let mut manifest = Manifest::from_file(&manifest_path)?;
-    if config.get("script-shell") == Some("true") {
-        eprintln!("npm error code ENOENT\nnpm error syscall spawn true");
-        std::process::exit(1);
-    }
     let ignore_scripts = ignore_scripts || config.get_bool("ignore-scripts").unwrap_or(false);
     let foreground_scripts =
         foreground_scripts || config.get_bool("foreground-scripts").unwrap_or(false);
@@ -7882,24 +7878,18 @@ fn execute_run_sync_with_config(
     let pre = format!("pre{script}");
     let post = format!("post{script}");
 
-    // Precompute lifecycle environment once across all hooks of this package!
-    let cfg_env = lifecycle_config_env_from_config(&current_dir, config);
-    let base_env = rnpm_lifecycle::precompute_lifecycle_env(
-        &current_dir,
-        &current_dir,
-        manifest.name.as_deref().unwrap_or(""),
-        manifest.version.as_deref(),
-        config,
-        Some(&cfg_env),
-    );
-
+    let mut base_env = None;
     for hook in [&pre, &script, &post] {
         if ignore_scripts && hook != &script {
             continue;
         }
-        let Some(cmd) = manifest.scripts.get(hook) else {
+        let Some(cmd) = manifest.scripts.get(hook).filter(|cmd| !cmd.is_empty()) else {
             continue;
         };
+        if config.get("script-shell") == Some("true") {
+            eprintln!("npm error code ENOENT\nnpm error syscall spawn true");
+            std::process::exit(1);
+        }
         let full_cmd = if hook == &script && !args.is_empty() {
             let formatted: Vec<String> = args
                 .iter()
@@ -7937,7 +7927,19 @@ fn execute_run_sync_with_config(
         ctx.package_version = manifest.version.clone();
         ctx.foreground_scripts = foreground_scripts;
 
-        let mut hook_env = base_env.clone();
+        let mut hook_env = base_env
+            .get_or_insert_with(|| {
+                let cfg_env = lifecycle_config_env_from_config(&current_dir, config);
+                rnpm_lifecycle::precompute_lifecycle_env(
+                    &current_dir,
+                    &current_dir,
+                    manifest.name.as_deref().unwrap_or(""),
+                    manifest.version.as_deref(),
+                    config,
+                    Some(&cfg_env),
+                )
+            })
+            .clone();
         hook_env.insert("npm_lifecycle_event".into(), hook.to_string());
         hook_env.insert("npm_lifecycle_script".into(), cmd.clone());
         ctx.precomputed_env = Some(hook_env);

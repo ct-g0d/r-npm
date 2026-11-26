@@ -3375,7 +3375,7 @@ async fn execute_dependency_hooks_with_abort(
             let hooks = node.source.lifecycle_hooks();
             hooks
                 .iter()
-                .any(|h| node.manifest.scripts.contains_key(*h))
+                .any(|h| node.manifest.scripts.get(*h).is_some_and(|cmd| !cmd.is_empty()))
         })
         .collect();
 
@@ -3450,7 +3450,13 @@ async fn execute_dependency_hooks_with_abort(
             let hooks = node.source.lifecycle_hooks();
             let matching_hooks: Vec<(&str, &str)> = hooks
                 .iter()
-                .filter_map(|&h| node.manifest.scripts.get(h).map(|cmd| (h, cmd.as_str())))
+                .filter_map(|&h| {
+                    node.manifest
+                        .scripts
+                        .get(h)
+                        .filter(|cmd| !cmd.is_empty())
+                        .map(|cmd| (h, cmd.as_str()))
+                })
                 .collect();
 
             let mut base_extra = HashMap::new();
@@ -3684,7 +3690,9 @@ async fn execute_root_hooks_with_abort(
         rnpm_config::Config::load(Some(&opts.root_dir)).unwrap_or_default()
     });
 
-    let root_has_hooks = root_hooks.iter().any(|h| root_manifest.scripts.contains_key(*h));
+    let root_has_hooks = root_hooks
+        .iter()
+        .any(|h| root_manifest.scripts.get(*h).is_some_and(|cmd| !cmd.is_empty()));
     let root_precomputed = if root_has_hooks {
         let mut base_extra = HashMap::new();
         if !opts.init_cwd.as_os_str().is_empty() {
@@ -3708,7 +3716,7 @@ async fn execute_root_hooks_with_abort(
     let is_silent = root_config.get("loglevel") == Some("silent");
 
     for hook in root_hooks {
-        if let Some(script_cmd) = root_manifest.scripts.get(hook) {
+        if let Some(script_cmd) = root_manifest.scripts.get(hook).filter(|cmd| !cmd.is_empty()) {
             if let Some(ref rx) = abort_rx {
                 if *rx.borrow() {
                     return Err(anyhow::anyhow!(
@@ -4048,13 +4056,13 @@ pub async fn execute_workspace_scripts_topological_with_abort(
         }
 
         let mut hooks_to_run = Vec::new();
-        if let Some(cmd) = pre_cmd {
+        if let Some(cmd) = pre_cmd.filter(|cmd| !cmd.is_empty()) {
             hooks_to_run.push((pre_hook_name.as_str(), cmd, false));
         }
-        if let Some(cmd) = main_cmd {
+        if let Some(cmd) = main_cmd.filter(|cmd| !cmd.is_empty()) {
             hooks_to_run.push((opts.script.as_str(), cmd, true));
         }
-        if let Some(cmd) = post_cmd {
+        if let Some(cmd) = post_cmd.filter(|cmd| !cmd.is_empty()) {
             hooks_to_run.push((post_hook_name.as_str(), cmd, false));
         }
 
