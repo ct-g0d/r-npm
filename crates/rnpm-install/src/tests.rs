@@ -6236,7 +6236,7 @@ fn test_fast_path_validate_hidden_lockfile_ignores_non_directory_files() {
 }
 
 #[test]
-fn test_read_cached_project_fingerprint_matches_cache_and_stays_lazy() {
+fn test_read_cached_project_fingerprint_matches_cache_without_writing() {
     let tmp = tempdir().unwrap();
     let proj = tmp.path().join("proj");
     let cache_dir = tmp.path().join("cache");
@@ -6250,8 +6250,8 @@ fn test_read_cached_project_fingerprint_matches_cache_and_stays_lazy() {
     .unwrap();
     assert!(installer.read_cached_project_fingerprint().is_none());
     assert!(
-        !cache_dir.exists(),
-        "reading missing fingerprint must not initialize Cache directories"
+        !cache_dir.join("_fingerprints").exists(),
+        "reading a missing fingerprint must not write fingerprint data"
     );
 
     let cache = rnpm_cache::Cache::new(&cache_dir).unwrap();
@@ -6260,4 +6260,31 @@ fn test_read_cached_project_fingerprint_matches_cache_and_stays_lazy() {
         installer.read_cached_project_fingerprint().as_deref(),
         Some("abc123")
     );
+}
+
+#[test]
+fn test_installer_returns_storage_setup_errors() {
+    let tmp = tempdir().unwrap();
+    let file_path = tmp.path().join("file");
+    fs::write(&file_path, []).unwrap();
+
+    for (cache_dir, store_dir, expected) in [
+        (file_path.clone(), None, "Failed to initialize cache"),
+        (
+            tmp.path().join("cache"),
+            Some(file_path.clone()),
+            "Failed to initialize pack store",
+        ),
+    ] {
+        let result = Installer::new(InstallOptions {
+            project_dir: tmp.path().to_path_buf(),
+            cache_dir: Some(cache_dir),
+            store_dir,
+            ..Default::default()
+        });
+        let Err(error) = result else {
+            panic!("expected an error for a file in place of a storage directory");
+        };
+        assert_eq!(error.to_string(), expected);
+    }
 }
