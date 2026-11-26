@@ -2680,13 +2680,19 @@ fn resolve_executable_in_env(
         None
     };
 
+    let base_dir: std::borrow::Cow<'_, Path> = if package_dir.is_absolute() {
+        std::borrow::Cow::Borrowed(package_dir)
+    } else {
+        std::borrow::Cow::Owned(std::env::current_dir().ok()?.join(package_dir))
+    };
+
     if prog.contains('/') || prog.contains('\\') {
         let norm = prog.replace('/', "\\");
         let p = Path::new(&norm);
         let full = if p.is_absolute() {
             p.to_path_buf()
         } else {
-            package_dir.join(p)
+            base_dir.join(p)
         };
         if has_known_ext {
             return full.is_file().then_some(full);
@@ -2700,7 +2706,7 @@ fn resolve_executable_in_env(
         return None;
     }
 
-    if let Some(found) = probe_dir(package_dir, prog) {
+    if let Some(found) = probe_dir(&base_dir, prog) {
         return Some(found);
     }
     let path_str = find_env_case_insensitive(env, "PATH")?;
@@ -2708,7 +2714,12 @@ fn resolve_executable_in_env(
         if dir.as_os_str().is_empty() {
             continue;
         }
-        if let Some(found) = probe_dir(&dir, prog) {
+        let search_dir = if dir.is_absolute() {
+            dir
+        } else {
+            base_dir.join(dir)
+        };
+        if let Some(found) = probe_dir(&search_dir, prog) {
             return Some(found);
         }
     }
