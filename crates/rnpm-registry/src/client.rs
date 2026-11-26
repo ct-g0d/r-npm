@@ -123,13 +123,6 @@ impl PackumentRepresentation {
             Self::Full
         }
     }
-
-    fn from_cache_metadata(requested_accept: &str, cache_metadata: &serde_json::Value) -> Self {
-        let ct = cache_metadata
-            .pointer("/response/headers/content-type")
-            .and_then(|v| v.as_str());
-        Self::from_response_headers(requested_accept, ct)
-    }
 }
 
 /// Options governing negotiated packument fetches and full-packument fallback behavior.
@@ -481,8 +474,10 @@ struct InFlightSlot<T> {
 
 const IN_FLIGHT_SHARDS: usize = 16;
 
+type InFlightShardMap<K, T> = Mutex<HashMap<Arc<K>, Arc<InFlightSlot<T>>>>;
+
 struct InFlightGroup<K, T> {
-    shards: [Mutex<HashMap<Arc<K>, Arc<InFlightSlot<T>>>>; IN_FLIGHT_SHARDS],
+    shards: [InFlightShardMap<K, T>; IN_FLIGHT_SHARDS],
 }
 
 #[inline]
@@ -1611,9 +1606,19 @@ fn validate_proxy_and_ca_config(config: &RegistryClientConfig) -> Result<(), Reg
         })?;
     }
     if let Some(general_proxy) = &config.proxy {
-        reqwest::Proxy::all(general_proxy).map_err(|err| {
-            RegistryError::Other(format!("Invalid proxy '{general_proxy}': {err}"))
-        })?;
+        if config.https_proxy.is_none() && config.http_proxy.is_none() {
+            reqwest::Proxy::all(general_proxy).map_err(|err| {
+                RegistryError::Other(format!("Invalid proxy '{general_proxy}': {err}"))
+            })?;
+        } else if config.http_proxy.is_none() {
+            reqwest::Proxy::http(general_proxy).map_err(|err| {
+                RegistryError::Other(format!("Invalid proxy '{general_proxy}': {err}"))
+            })?;
+        } else if config.https_proxy.is_none() {
+            reqwest::Proxy::https(general_proxy).map_err(|err| {
+                RegistryError::Other(format!("Invalid proxy '{general_proxy}': {err}"))
+            })?;
+        }
     }
     if let Some(cafile_path) = &config.cafile {
         let pem_bytes = std::fs::read(cafile_path).map_err(|err| {
@@ -3232,6 +3237,7 @@ impl RegistryClient {
         metadata: &AbbreviatedPackageMetadata,
         cache_metadata: &serde_json::Value,
     ) {
+        const MAX_PACKUMENT_CACHE_ENTRIES: usize = 1024;
         let no_store = cache_metadata
             .pointer("/response/headers/cache-control")
             .and_then(|v| v.as_str())
@@ -3250,6 +3256,11 @@ impl RegistryClient {
             .packument_cache
             .write()
             .unwrap_or_else(|e| e.into_inner());
+        if guard.len() >= MAX_PACKUMENT_CACHE_ENTRIES && !guard.contains_key(&key) {
+            if let Some(evict_key) = guard.keys().next().cloned() {
+                guard.remove(&evict_key);
+            }
+        }
         guard.insert(
             key,
             CachedPackumentEntry {
@@ -3258,6 +3269,14 @@ impl RegistryClient {
                 cache_metadata: cache_metadata.clone(),
             },
         );
+    }
+
+    /// Clear all cached packument representations held in memory.
+    pub fn clear_packument_cache(&self) {
+        self.packument_cache
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
     }
 
     /// Negotiate packument metadata using representation-specific ETags and automatic fallback.
@@ -3373,12 +3392,14 @@ impl RegistryClient {
             )
             .await;
 
+        let mut stored_repr = target_repr;
         let final_res = match res {
             // Never reuse an abbreviated ETag when falling back to Full!
             Err(RegistryError::PackageNotFound { .. })
             | Err(RegistryError::ServerError {
                 status: 406 | 415, ..
             }) if target_repr == PackumentRepresentation::Abbreviated => {
+                stored_repr = PackumentRepresentation::Full;
                 let full_etag = {
                     let key = PackumentCacheKey {
                         url: url.as_str().to_owned(),
@@ -3407,10 +3428,12 @@ impl RegistryClient {
             ref cache_metadata,
         } = final_res
         {
-            let actual_repr = PackumentRepresentation::from_cache_metadata(accept, cache_metadata);
+            // Store under `stored_repr` (the representation/parse_mode actually produced),
+            // so Install-parsed responses never poison the Full slot even if the server replied
+            // with `Content-Type: application/json`.
             self.store_cached_packument(
                 url,
-                actual_repr,
+                stored_repr,
                 etag.as_deref(),
                 metadata,
                 cache_metadata,
@@ -3454,14 +3477,53 @@ impl RegistryClient {
                         .get(&key)
                         .and_then(|c| c.etag.clone())
                 };
-                return self
+                let fb_res = self
                     .get_package_metadata_negotiated_conditional_at_url(
                         package_name,
                         &url,
                         full_etag.as_deref(),
                         PackumentFetchOptions::full(),
                     )
-                    .await;
+                    .await?;
+                if let MetadataFetchResult::NotModified {
+                    etag,
+                    cache_metadata,
+                } = fb_res
+                {
+                    let key = PackumentCacheKey {
+                        url: url.as_str().to_owned(),
+                        representation: PackumentRepresentation::Full,
+                    };
+                    let cached_full = {
+                        let mut guard = self
+                            .packument_cache
+                            .write()
+                            .unwrap_or_else(|e| e.into_inner());
+                        guard.get_mut(&key).map(|entry| {
+                            if etag.is_some() {
+                                entry.etag = etag.clone();
+                            }
+                            entry.cache_metadata = cache_metadata.clone();
+                            (entry.etag.clone(), entry.metadata.clone())
+                        })
+                    };
+                    if let Some((cached_etag, cached_meta)) = cached_full {
+                        return Ok(MetadataFetchResult::Fresh {
+                            metadata: cached_meta,
+                            etag: cached_etag,
+                            cache_metadata,
+                        });
+                    }
+                    return self
+                        .get_package_metadata_negotiated_conditional_at_url(
+                            package_name,
+                            &url,
+                            None,
+                            PackumentFetchOptions::full(),
+                        )
+                        .await;
+                }
+                return Ok(fb_res);
             }
         }
         Ok(res)
@@ -3473,11 +3535,84 @@ impl RegistryClient {
         packages: &[(S, Option<String>)],
         options: PackumentFetchOptions,
     ) -> Vec<Result<MetadataFetchResult, RegistryError>> {
-        self.get_package_metadata_conditional_concurrent_with_accept(
-            packages,
-            options.effective_representation().accept_header(),
-        )
-        .await
+        let mut key_to_group: HashMap<(&str, Option<&str>), usize> =
+            HashMap::with_capacity(packages.len());
+        let mut groups: Vec<(usize, Vec<usize>)> = Vec::with_capacity(packages.len());
+        for (idx, (pkg, if_none_match)) in packages.iter().enumerate() {
+            let key = (pkg.as_ref(), if_none_match.as_deref());
+            if let Some(&grp) = key_to_group.get(&key) {
+                groups[grp].1.push(idx);
+            } else {
+                let grp = groups.len();
+                key_to_group.insert(key, grp);
+                groups.push((idx, Vec::new()));
+            }
+        }
+
+        let mut join_set = tokio::task::JoinSet::new();
+        for (first_idx, dup_indices) in groups {
+            let client = self.clone();
+            let (pkg, if_none_match) = &packages[first_idx];
+            let name = pkg.as_ref().to_string();
+            let etag = if_none_match.clone();
+            join_set.spawn(async move {
+                let res = client
+                    .get_package_metadata_negotiated_conditional(&name, etag.as_deref(), options)
+                    .await;
+                if dup_indices.is_empty() {
+                    return vec![(first_idx, res)];
+                }
+                let mut out = Vec::with_capacity(1 + dup_indices.len());
+                match res {
+                    Ok(val) => {
+                        for dup_idx in dup_indices {
+                            out.push((dup_idx, Ok(val.clone())));
+                        }
+                        out.push((first_idx, Ok(val)));
+                    }
+                    Err(err) => {
+                        if clone_clonable_registry_error(&err).is_some() {
+                            for dup_idx in dup_indices {
+                                let c = clone_clonable_registry_error(&err).unwrap();
+                                out.push((dup_idx, Err(c)));
+                            }
+                            out.push((first_idx, Err(err)));
+                        } else {
+                            for dup_idx in dup_indices {
+                                out.push((
+                                    dup_idx,
+                                    client
+                                        .get_package_metadata_negotiated_conditional(
+                                            &name,
+                                            etag.as_deref(),
+                                            options,
+                                        )
+                                        .await,
+                                ));
+                            }
+                            out.push((first_idx, Err(err)));
+                        }
+                    }
+                }
+                out
+            });
+        }
+
+        let mut results: Vec<Option<Result<MetadataFetchResult, RegistryError>>> =
+            (0..packages.len()).map(|_| None).collect();
+
+        while let Some(res) = join_set.join_next().await {
+            if let Ok(items) = res {
+                for (idx, result) in items {
+                    results[idx] = Some(result);
+                }
+            }
+        }
+
+        results
+            .into_iter()
+            .map(|r| r.unwrap_or_else(|| Err(RegistryError::Other("Task cancelled".into()))))
+            .collect()
     }
 
     /// Arborist resolves manifests from full packuments, including lockfile
@@ -3744,7 +3879,7 @@ impl RegistryClient {
                     PackumentParseMode::Full
                 };
 
-            let metadata = if bytes.len() > 256 * 1024 {
+            let metadata = if bytes.len() > 512 * 1024 {
                 tokio::task::spawn_blocking(move || parse_packument_with_mode(&bytes, parse_mode))
                     .await
                     .map_err(|e| {
@@ -4320,9 +4455,9 @@ impl RegistryClient {
                 }
             }
 
+            use sha2::Digest as _;
             let mut bytes = Vec::new();
-            let mut hasher =
-                compute_sha512.then(|| ring::digest::Context::new(&ring::digest::SHA512));
+            let mut hasher = compute_sha512.then(sha2::Sha512::new);
             let mut stream_err = None;
 
             loop {
@@ -4402,8 +4537,8 @@ impl RegistryClient {
             }
 
             let integrity = hasher.map(|ctx| {
-                let digest = ctx.finish();
-                format!("sha512-{}", data_encoding::BASE64.encode(digest.as_ref()))
+                let digest = sha2::Digest::finalize(ctx);
+                format!("sha512-{}", data_encoding::BASE64.encode(&digest))
             });
 
             return Ok((BytesFetchResult::Fresh { bytes, etag }, integrity));
@@ -4770,20 +4905,24 @@ impl RegistryClient {
                     RegistryError::Other(format!("Failed to join tarball write task: {e}"))
                 })??;
             } else if let Some(mut bw) = file {
-                bw.flush().await.map_err(|e| {
-                    RegistryError::Other(format!("Failed to flush {}: {e}", temp_path.display()))
-                })?;
+                if let Err(e) = bw.flush().await {
+                    drop(bw);
+                    let _ = tokio::fs::remove_file(&temp_path).await;
+                    return Err(RegistryError::Other(format!(
+                        "Failed to flush {}: {e}",
+                        temp_path.display()
+                    )));
+                }
                 drop(bw);
 
-                tokio::fs::rename(&temp_path, dest_path)
-                    .await
-                    .map_err(|e| {
-                        RegistryError::Other(format!(
-                            "Failed to rename {} to {}: {e}",
-                            temp_path.display(),
-                            dest_path.display()
-                        ))
-                    })?;
+                if let Err(e) = tokio::fs::rename(&temp_path, dest_path).await {
+                    let _ = tokio::fs::remove_file(&temp_path).await;
+                    return Err(RegistryError::Other(format!(
+                        "Failed to rename {} to {}: {e}",
+                        temp_path.display(),
+                        dest_path.display()
+                    )));
+                }
             }
 
             return Ok(written);
@@ -7192,53 +7331,50 @@ nB99xJBcpcklOhB/x8L3Vb9kw8ZPzUvYKI7lj0+yjYJannulkI7H7LB4hxKnVKp5\n\
                 let bad_etag = Arc::clone(&bad_etag_c);
                 tokio::spawn(async move {
                     let mut buf = vec![0u8; 8192];
-                    loop {
-                        let n = stream.read(&mut buf).await.unwrap_or(0);
-                        if n == 0 {
-                            break;
-                        }
-                        let req_str = String::from_utf8_lossy(&buf[..n]);
-                        let mut accept = "";
-                        let mut inm = None;
-                        for line in req_str.split("\r\n").skip(1) {
-                            if let Some((k, v)) = line.split_once(':') {
-                                if k.eq_ignore_ascii_case("accept") {
-                                    accept = v.trim();
-                                } else if k.eq_ignore_ascii_case("if-none-match") {
-                                    inm = Some(v.trim());
-                                }
-                            }
-                        }
-                        let is_abbrev = accept.contains("vnd.npm.install-v1+json");
-                        let resp = if is_abbrev {
-                            abbrev_calls.fetch_add(1, Ordering::SeqCst);
-                            if inm == Some("\"etag-abbrev-1\"") {
-                                "HTTP/1.1 304 Not Modified\r\nETag: \"etag-abbrev-1\"\r\nContent-Type: application/vnd.npm.install-v1+json\r\nVary: Accept\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string()
-                            } else {
-                                format!(
-                                    "HTTP/1.1 200 OK\r\nETag: \"etag-abbrev-1\"\r\nContent-Type: application/vnd.npm.install-v1+json\r\nVary: Accept\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                                    abbrev_body.len(),
-                                    abbrev_body
-                                )
-                            }
-                        } else {
-                            full_calls.fetch_add(1, Ordering::SeqCst);
-                            if inm == Some("\"etag-abbrev-1\"") || inm == Some("\"stale-abbrev\"") {
-                                bad_etag.store(true, Ordering::SeqCst);
-                            }
-                            if inm == Some("\"etag-full-1\"") {
-                                "HTTP/1.1 304 Not Modified\r\nETag: \"etag-full-1\"\r\nContent-Type: application/json\r\nVary: Accept\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string()
-                            } else {
-                                format!(
-                                    "HTTP/1.1 200 OK\r\nETag: \"etag-full-1\"\r\nContent-Type: application/json\r\nVary: Accept\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                                    full_body.len(),
-                                    full_body
-                                )
-                            }
-                        };
-                        let _ = stream.write_all(resp.as_bytes()).await;
-                        break;
+                    let n = stream.read(&mut buf).await.unwrap_or(0);
+                    if n == 0 {
+                        return;
                     }
+                    let req_str = String::from_utf8_lossy(&buf[..n]);
+                    let mut accept = "";
+                    let mut inm = None;
+                    for line in req_str.split("\r\n").skip(1) {
+                        if let Some((k, v)) = line.split_once(':') {
+                            if k.eq_ignore_ascii_case("accept") {
+                                accept = v.trim();
+                            } else if k.eq_ignore_ascii_case("if-none-match") {
+                                inm = Some(v.trim());
+                            }
+                        }
+                    }
+                    let is_abbrev = accept.contains("vnd.npm.install-v1+json");
+                    let resp = if is_abbrev {
+                        abbrev_calls.fetch_add(1, Ordering::SeqCst);
+                        if inm == Some("\"etag-abbrev-1\"") {
+                            "HTTP/1.1 304 Not Modified\r\nETag: \"etag-abbrev-1\"\r\nContent-Type: application/vnd.npm.install-v1+json\r\nVary: Accept\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string()
+                        } else {
+                            format!(
+                                "HTTP/1.1 200 OK\r\nETag: \"etag-abbrev-1\"\r\nContent-Type: application/vnd.npm.install-v1+json\r\nVary: Accept\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                                abbrev_body.len(),
+                                abbrev_body
+                            )
+                        }
+                    } else {
+                        full_calls.fetch_add(1, Ordering::SeqCst);
+                        if inm == Some("\"etag-abbrev-1\"") || inm == Some("\"stale-abbrev\"") {
+                            bad_etag.store(true, Ordering::SeqCst);
+                        }
+                        if inm == Some("\"etag-full-1\"") {
+                            "HTTP/1.1 304 Not Modified\r\nETag: \"etag-full-1\"\r\nContent-Type: application/json\r\nVary: Accept\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string()
+                        } else {
+                            format!(
+                                "HTTP/1.1 200 OK\r\nETag: \"etag-full-1\"\r\nContent-Type: application/json\r\nVary: Accept\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                                full_body.len(),
+                                full_body
+                            )
+                        }
+                    };
+                    let _ = stream.write_all(resp.as_bytes()).await;
                 });
             }
         });
@@ -7322,7 +7458,132 @@ nB99xJBcpcklOhB/x8L3Vb9kw8ZPzUvYKI7lj0+yjYJannulkI7H7LB4hxKnVKp5\n\
             .await
             .unwrap();
         assert!(!saw_abbrev_etag_on_full.load(Ordering::SeqCst));
-        assert!(fb.is_not_modified() || fb.metadata().is_some_and(|m| !m.time.is_empty()));
+        assert!(fb.is_fresh());
+        assert!(!fb.metadata().unwrap().time.is_empty());
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn test_negotiated_application_json_response_does_not_poison_full_cache() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let body = serde_json::json!({
+            "name": "plain-json-pkg",
+            "dist-tags": { "latest": "1.0.0" },
+            "time": { "1.0.0": "2025-06-01T00:00:00.000Z" },
+            "versions": {
+                "1.0.0": {
+                    "name": "plain-json-pkg",
+                    "version": "1.0.0",
+                    "license": "MIT",
+                    "repository": "git+https://github.com/example/plain-json-pkg.git",
+                    "dist": {
+                        "tarball": format!("http://{addr}/plain-json-pkg/-/plain-json-pkg-1.0.0.tgz")
+                    },
+                    "dependencies": {}
+                }
+            }
+        })
+        .to_string();
+
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let body = body.clone();
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 8192];
+                    let n = stream.read(&mut buf).await.unwrap_or(0);
+                    if n == 0 {
+                        return;
+                    }
+                    let req_str = String::from_utf8_lossy(&buf[..n]);
+                    let mut inm = None;
+                    for line in req_str.split("\r\n").skip(1) {
+                        if let Some((k, v)) = line.split_once(':') {
+                            if k.eq_ignore_ascii_case("if-none-match") {
+                                inm = Some(v.trim());
+                            }
+                        }
+                    }
+                    let resp = if inm == Some("\"plain-etag\"") {
+                        "HTTP/1.1 304 Not Modified\r\nETag: \"plain-etag\"\r\nContent-Type: application/json\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string()
+                    } else {
+                        format!(
+                            "HTTP/1.1 200 OK\r\nETag: \"plain-etag\"\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            body.len(),
+                            body
+                        )
+                    };
+                    let _ = stream.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+
+        let cfg = RegistryClientConfig {
+            default_registry: Url::parse(&format!("http://{addr}/")).unwrap(),
+            ..Default::default()
+        };
+        let client = RegistryClient::with_config(cfg).unwrap();
+
+        // Abbreviated fetch receives Content-Type: application/json from a server that ignores Accept
+        let m1 = client
+            .get_package_metadata_negotiated("plain-json-pkg", PackumentFetchOptions::abbreviated())
+            .await
+            .unwrap();
+        assert!(!m1.versions["1.0.0"].extra.contains_key("repository"));
+        assert_eq!(
+            client
+                .cached_packument_etag("plain-json-pkg", PackumentRepresentation::Abbreviated)
+                .as_deref(),
+            Some("\"plain-etag\"")
+        );
+        assert!(client
+            .cached_packument_etag("plain-json-pkg", PackumentRepresentation::Full)
+            .is_none());
+
+        // Second abbreviated fetch hits 304 Not Modified against Abbreviated cache
+        let url = Url::parse(&format!("http://{addr}/plain-json-pkg")).unwrap();
+        let abbrev_etag = client
+            .cached_packument_etag("plain-json-pkg", PackumentRepresentation::Abbreviated);
+        let res2 = client
+            .get_package_metadata_negotiated_conditional_at_url(
+                "plain-json-pkg",
+                &url,
+                abbrev_etag.as_deref(),
+                PackumentFetchOptions::abbreviated(),
+            )
+            .await
+            .unwrap();
+        assert!(res2.is_not_modified());
+
+        // Full fetch is NOT poisoned by the Install-parsed Abbreviated cache entry
+        let m_full = client
+            .get_package_metadata_negotiated(
+                "plain-json-pkg",
+                PackumentFetchOptions {
+                    representation: PackumentRepresentation::Full,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            m_full.versions["1.0.0"]
+                .extra
+                .get("repository")
+                .and_then(|v| v.as_str()),
+            Some("git+https://github.com/example/plain-json-pkg.git")
+        );
+        assert_eq!(
+            m_full.versions["1.0.0"].license.as_deref(),
+            Some("MIT")
+        );
 
         server.abort();
     }

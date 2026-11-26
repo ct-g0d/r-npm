@@ -497,7 +497,13 @@ fn is_fast_valid_http_tarball_url(s: &str) -> bool {
         None => authority,
     };
 
-    if host.is_empty() || host.len() > 253 || host.contains("xn--") {
+    if host.is_empty()
+        || host.len() > 253
+        || host
+            .as_bytes()
+            .windows(4)
+            .any(|w| w.eq_ignore_ascii_case(b"xn--"))
+    {
         return false;
     }
 

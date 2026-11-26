@@ -289,18 +289,26 @@ async fn handle_keepalive_conn(mut stream: TcpStream, state: Arc<MockRegistrySta
                 let pkg = path.trim_start_matches('/');
                 if let Some(etag) = state.etags.get(pkg) {
                     if if_none_match == Some(etag.as_str()) {
+                        let content_type = if accept_abbrev {
+                            "application/vnd.npm.install-v1+json"
+                        } else {
+                            "application/json"
+                        };
                         let hdr = format!(
-                            "HTTP/1.1 304 Not Modified\r\nETag: {etag}\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n"
+                            "HTTP/1.1 304 Not Modified\r\nContent-Type: {content_type}\r\nETag: {etag}\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n"
                         );
                         (hdr, None, close_conn)
                     } else {
-                        let body = if accept_abbrev {
-                            state.abbreviated.get(pkg).unwrap()
+                        let (content_type, body) = if accept_abbrev {
+                            (
+                                "application/vnd.npm.install-v1+json",
+                                state.abbreviated.get(pkg).unwrap(),
+                            )
                         } else {
-                            state.full.get(pkg).unwrap()
+                            ("application/json", state.full.get(pkg).unwrap())
                         };
                         let hdr = format!(
-                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nETag: {etag}\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n",
+                            "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nETag: {etag}\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n",
                             body.len()
                         );
                         (hdr, Some(body), close_conn)
@@ -341,14 +349,9 @@ async fn start_mock_registry(state: Arc<MockRegistryState>) -> (SocketAddr, toki
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let handle = tokio::spawn(async move {
-        loop {
-            match listener.accept().await {
-                Ok((stream, _)) => {
-                    let st = Arc::clone(&state);
-                    tokio::spawn(handle_keepalive_conn(stream, st));
-                }
-                Err(_) => break,
-            }
+        while let Ok((stream, _)) = listener.accept().await {
+            let st = Arc::clone(&state);
+            tokio::spawn(handle_keepalive_conn(stream, st));
         }
     });
     (addr, handle)
@@ -478,10 +481,9 @@ async fn bench_registry_http_and_tarballs() {
 
     // 2. Burst 160 overlapping requests (16 packages * 10 concurrent callers each)
     let mut overlap_reqs = Vec::with_capacity(160);
-    for round in 0..10 {
-        for i in 0..16 {
-            let _ = round;
-            overlap_reqs.push((pkg_names[i].clone(), None));
+    for _round in 0..10 {
+        for pkg in pkg_names.iter().take(16) {
+            overlap_reqs.push((pkg.clone(), None));
         }
     }
     for _ in 0..2 {
@@ -740,7 +742,7 @@ async fn bench_registry_http_and_tarballs() {
         tb_stream_hash_dur.as_secs_f64() * 1000.0 / 8.0
     );
     println!(
-        "tarball_ring_sha512_32x256k (8x):     {:.2} ms ({:.2} ms/burst)",
+        "tarball_singlepass_sha512_32x256k (8x): {:.2} ms ({:.2} ms/burst)",
         tb_ring_sha512_dur.as_secs_f64() * 1000.0,
         tb_ring_sha512_dur.as_secs_f64() * 1000.0 / 8.0
     );
