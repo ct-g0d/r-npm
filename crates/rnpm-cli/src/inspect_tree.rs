@@ -365,10 +365,10 @@ pub(crate) fn scan_disk_packages_with_raw(
                 continue;
             };
             let is_link = is_dir_entry_reparse_or_symlink(&entry, &file_type);
-            if !file_type.is_dir() && !is_link {
+            let entry_path = entry.path();
+            if !file_type.is_dir() && !(is_link && entry_path.is_dir()) {
                 continue;
             }
-            let entry_path = entry.path();
 
             if name_str.starts_with('@') {
                 // Scoped packages
@@ -383,10 +383,10 @@ pub(crate) fn scan_disk_packages_with_raw(
                             continue;
                         };
                         let sub_is_link = is_dir_entry_reparse_or_symlink(&scoped_entry, &sub_ft);
-                        if !sub_ft.is_dir() && !sub_is_link {
+                        let sub_path = scoped_entry.path();
+                        if !sub_ft.is_dir() && !(sub_is_link && sub_path.is_dir()) {
                             continue;
                         }
-                        let sub_path = scoped_entry.path();
 
                         let loc = format!("{nm_rel}/{name_str}/{sub_name_str}");
                         let pkg_name = format!("{name_str}/{sub_name_str}");

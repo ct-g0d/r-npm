@@ -792,6 +792,9 @@ pub fn is_sensitive_credential_key(key: &str) -> bool {
     {
         return true;
     }
+    if has_underscore && (mask & M_AUTH) == M_AUTH && bytes_contain_lc(lower, b"ssh_auth_sock") {
+        return true;
+    }
     if has_colon
         && (bytes_contain_lc(lower, b"/:_") || bytes_contain_lc(lower, b":_auth"))
     {
@@ -2564,12 +2567,14 @@ fn try_split_simple_args(cmd: &str) -> Option<Vec<String>> {
     let mut current = String::new();
     let mut in_arg = false;
     let mut in_quotes = false;
+    let mut just_closed_quote = false;
 
     for ch in trimmed.chars() {
         if in_quotes {
             match ch {
                 '"' => {
                     in_quotes = false;
+                    just_closed_quote = true;
                 }
                 '%' | '!' | '$' | '`' | '\\' | '\n' | '\r' | '\0' => return None,
                 c => current.push(c),
@@ -2578,12 +2583,18 @@ fn try_split_simple_args(cmd: &str) -> Option<Vec<String>> {
         }
         match ch {
             ' ' | '\t' => {
+                just_closed_quote = false;
                 if in_arg {
                     args.push(std::mem::take(&mut current));
                     in_arg = false;
                 }
             }
             '"' => {
+                // Reject adjacent `""` (MSVCRT treats `""` inside quotes as a literal quote)
+                // and `\"` on Windows (MSVCRT treats `\"` as an escaped literal quote).
+                if just_closed_quote || (cfg!(windows) && current.ends_with('\\')) {
+                    return None;
+                }
                 in_quotes = true;
                 in_arg = true;
             }
@@ -2593,10 +2604,12 @@ fn try_split_simple_args(cmd: &str) -> Option<Vec<String>> {
                 if cfg!(not(windows)) {
                     return None;
                 }
+                just_closed_quote = false;
                 in_arg = true;
                 current.push(ch);
             }
             c => {
+                just_closed_quote = false;
                 in_arg = true;
                 current.push(c);
             }

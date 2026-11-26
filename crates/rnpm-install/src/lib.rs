@@ -5319,7 +5319,9 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                 && !rnpm_fs::is_junction(&node_modules_dir).unwrap_or(false);
             for (loc, _) in &packages_to_download {
                 let pkg_target = loc_base_dir.join(loc);
-                if !nm_clean_slate && rnpm_fs::is_junction(&pkg_target).unwrap_or(false) {
+                if !(nm_clean_slate && loc.starts_with("node_modules/"))
+                    && rnpm_fs::is_junction(&pkg_target).unwrap_or(false)
+                {
                     let _ = rnpm_fs::remove_junction(&pkg_target);
                 }
                 all_dirs.insert(pkg_target.clone());
@@ -7978,7 +7980,9 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
 
             for (pkg_key, _, _, _, _, _) in &packages_to_process {
                 let pkg_target = loc_base_dir.join(pkg_key);
-                if !from_scratch && rnpm_fs::is_junction(&pkg_target).unwrap_or(false) {
+                if !(from_scratch && pkg_key.starts_with("node_modules/"))
+                    && rnpm_fs::is_junction(&pkg_target).unwrap_or(false)
+                {
                     let _ = rnpm_fs::remove_junction(&pkg_target);
                 }
                 all_dirs.insert(pkg_target.clone());

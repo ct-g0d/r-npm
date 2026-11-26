@@ -157,7 +157,7 @@ pub fn resolve_dependency_path(
     dep_name: &str,
     lockfile: Option<&LockfileV3>,
 ) -> String {
-    resolve_dependency_path_cached(project_dir, current_pkg_path, dep_name, lockfile, None)
+    resolve_dependency_path_cached(project_dir, current_pkg_path, dep_name, lockfile, None, &[])
 }
 
 fn resolve_dependency_path_cached(
@@ -166,6 +166,7 @@ fn resolve_dependency_path_cached(
     dep_name: &str,
     lockfile: Option<&LockfileV3>,
     discovered_idx: Option<&HashMap<&str, usize>>,
+    junction_prefixes: &[String],
 ) -> String {
     let candidates = get_candidate_paths(current_pkg_path, dep_name);
 
@@ -181,6 +182,18 @@ fn resolve_dependency_path_cached(
         for cand in &candidates {
             if idx_map.contains_key(cand.as_str()) {
                 return cand.clone();
+            }
+            if !junction_prefixes.is_empty()
+                && junction_prefixes.iter().any(|j| {
+                    cand.len() > j.len() + 14
+                        && cand.starts_with(j.as_str())
+                        && cand.as_bytes()[j.len()..].starts_with(b"/node_modules/")
+                })
+            {
+                let full_path = project_dir.join(cand);
+                if full_path.is_dir() || is_junction(&full_path).unwrap_or(false) {
+                    return cand.clone();
+                }
             }
         }
     } else {
@@ -242,6 +255,11 @@ fn collect_transitive_dependencies(
             if let Some(m) = &manifests[idx] {
                 push_manifest_deps(m, omit_optional, omit_peer, &mut deps);
             }
+        } else {
+            let disk_manifest_path = project_dir.join(pkg_path).join("package.json");
+            if let Ok(m) = Manifest::from_file_readonly(&disk_manifest_path) {
+                push_manifest_deps(&m, omit_optional, omit_peer, &mut deps);
+            }
         }
     } else {
         let disk_manifest_path = project_dir.join(pkg_path).join("package.json");
@@ -297,7 +315,7 @@ pub fn analyze_reachability(
     options: &PruneOptions,
     lockfile: Option<&LockfileV3>,
 ) -> Result<HashSet<String>> {
-    analyze_reachability_internal(project_dir, manifest, options, lockfile, None, None)
+    analyze_reachability_internal(project_dir, manifest, options, lockfile, None, None, &[])
 }
 
 fn analyze_reachability_internal(
@@ -307,6 +325,7 @@ fn analyze_reachability_internal(
     lockfile: Option<&LockfileV3>,
     discovered_idx: Option<&HashMap<&str, usize>>,
     discovered_manifests: Option<&[Option<Manifest>]>,
+    junction_prefixes: &[String],
 ) -> Result<HashSet<String>> {
     let omit_dev = options.should_omit_dev();
     let omit_optional = options.should_omit_optional();
@@ -354,8 +373,14 @@ fn analyze_reachability_internal(
 
     // Direct dependencies resolve to "node_modules/<name>"
     for dep_name in &root_dep_names {
-        let expected_key =
-            resolve_dependency_path_cached(project_dir, "", dep_name, lockfile, discovered_idx);
+        let expected_key = resolve_dependency_path_cached(
+            project_dir,
+            "",
+            dep_name,
+            lockfile,
+            discovered_idx,
+            junction_prefixes,
+        );
         if reachable_packages.insert(expected_key.clone()) {
             queue.push_back(expected_key);
         }
@@ -379,6 +404,7 @@ fn analyze_reachability_internal(
                 &child_dep,
                 lockfile,
                 discovered_idx,
+                junction_prefixes,
             );
             if reachable_packages.insert(child_pkg_path.clone()) {
                 queue.push_back(child_pkg_path);
@@ -393,20 +419,31 @@ fn analyze_reachability_internal(
 /// Handles standard packages, `@scope/*` namespaces, and nested `node_modules`.
 /// Skips dot-entries (such as `.bin`, `.cache`, `.package-lock.json`).
 pub fn scan_node_modules(project_dir: &Path) -> Result<Vec<String>> {
+    Ok(scan_node_modules_with_junctions(project_dir)?.0)
+}
+
+fn scan_node_modules_with_junctions(project_dir: &Path) -> Result<(Vec<String>, Vec<String>)> {
     let mut discovered = Vec::new();
+    let mut junction_prefixes = Vec::new();
     let root_nm = project_dir.join("node_modules");
     if !root_nm.is_dir() {
-        return Ok(discovered);
+        return Ok((discovered, junction_prefixes));
     }
 
-    scan_nm_directory(project_dir, "node_modules", &mut discovered)?;
-    Ok(discovered)
+    scan_nm_directory(
+        project_dir,
+        "node_modules",
+        &mut discovered,
+        &mut junction_prefixes,
+    )?;
+    Ok((discovered, junction_prefixes))
 }
 
 fn scan_nm_directory(
     project_dir: &Path,
     nm_rel_posix: &str,
     discovered: &mut Vec<String>,
+    junction_prefixes: &mut Vec<String>,
 ) -> Result<()> {
     let full_nm_path = project_dir.join(nm_rel_posix);
     let entries = match std::fs::read_dir(&full_nm_path) {
@@ -461,11 +498,18 @@ fn scan_nm_directory(
                 discovered.push(pkg_rel.clone());
 
                 // Check for nested node_modules inside this scoped package
-                if !sub_junc {
+                if sub_junc {
+                    junction_prefixes.push(pkg_rel);
+                } else {
                     let nested_nm = sub_path.join("node_modules");
                     if nested_nm.is_dir() {
                         let nested_rel = format!("{pkg_rel}/node_modules");
-                        scan_nm_directory(project_dir, &nested_rel, discovered)?;
+                        scan_nm_directory(
+                            project_dir,
+                            &nested_rel,
+                            discovered,
+                            junction_prefixes,
+                        )?;
                     }
                 }
             }
@@ -475,11 +519,18 @@ fn scan_nm_directory(
             discovered.push(pkg_rel.clone());
 
             // Check for nested node_modules inside this package
-            if !is_junc {
+            if is_junc {
+                junction_prefixes.push(pkg_rel);
+            } else {
                 let nested_nm = entry_path.join("node_modules");
                 if nested_nm.is_dir() {
                     let nested_rel = format!("{pkg_rel}/node_modules");
-                    scan_nm_directory(project_dir, &nested_rel, discovered)?;
+                    scan_nm_directory(
+                        project_dir,
+                        &nested_rel,
+                        discovered,
+                        junction_prefixes,
+                    )?;
                 }
             }
         }
@@ -515,7 +566,7 @@ pub fn discover_extraneous_packages(
     let lockfile = load_lockfile_if_exists(project_dir);
 
     // 1. Scan node_modules on disk once
-    let discovered_packages = scan_node_modules(project_dir)?;
+    let (discovered_packages, junction_prefixes) = scan_node_modules_with_junctions(project_dir)?;
     debug!("Discovered {} packages on disk", discovered_packages.len());
 
     let discovered_normalized: Vec<String> = discovered_packages
@@ -567,6 +618,7 @@ pub fn discover_extraneous_packages(
         lockfile.as_ref(),
         Some(&discovered_idx),
         Some(&discovered_manifests),
+        &junction_prefixes,
     )?;
 
     // 4. Find extraneous packages

@@ -8885,7 +8885,7 @@ fn try_parse_fast_command(args: &[String]) -> Option<Cli> {
             let mut global = false;
             for tok in rest {
                 match tok.as_str() {
-                    "-g" | "--global" => global = true,
+                    "-g" | "--global" if !global => global = true,
                     _ => return None,
                 }
             }
@@ -8937,8 +8937,8 @@ fn try_parse_fast_command(args: &[String]) -> Option<Cli> {
                     let mut long = false;
                     for tok in tail {
                         match tok.as_str() {
-                            "--json" => json = true,
-                            "-l" | "--long" => long = true,
+                            "--json" if !json => json = true,
+                            "-l" | "--long" if !long => long = true,
                             _ => return None,
                         }
                     }
@@ -8956,7 +8956,7 @@ fn try_parse_fast_command(args: &[String]) -> Option<Cli> {
             let mut depth = None;
             let mut all = false;
             let mut json = false;
-            let mut long = cmd_name == "la" || cmd_name == "ll";
+            let mut long_flag = false;
             let mut parseable = false;
             let mut package_lock_only = false;
             let mut global = false;
@@ -8964,18 +8964,24 @@ fn try_parse_fast_command(args: &[String]) -> Option<Cli> {
             while i < rest.len() {
                 let tok = rest[i].as_str();
                 if let Some(d_str) = tok.strip_prefix("--depth=") {
+                    if depth.is_some() {
+                        return None;
+                    }
                     depth = Some(d_str.parse::<usize>().ok()?);
                 } else if tok == "--depth" {
+                    if depth.is_some() {
+                        return None;
+                    }
                     i += 1;
                     depth = Some(rest.get(i)?.parse::<usize>().ok()?);
                 } else {
                     match tok {
-                        "-a" | "--all" => all = true,
-                        "--json" => json = true,
-                        "-l" | "--long" => long = true,
-                        "-p" | "--parseable" => parseable = true,
-                        "--package-lock-only" => package_lock_only = true,
-                        "-g" | "--global" => global = true,
+                        "-a" | "--all" if !all => all = true,
+                        "--json" if !json => json = true,
+                        "-l" | "--long" if !long_flag => long_flag = true,
+                        "-p" | "--parseable" if !parseable => parseable = true,
+                        "--package-lock-only" if !package_lock_only => package_lock_only = true,
+                        "-g" | "--global" if !global => global = true,
                         t if !t.starts_with('-') => packages.push(t.to_string()),
                         _ => return None,
                     }
@@ -8988,7 +8994,7 @@ fn try_parse_fast_command(args: &[String]) -> Option<Cli> {
                     depth,
                     all,
                     json,
-                    long,
+                    long: long_flag || cmd_name == "la" || cmd_name == "ll",
                     parseable,
                     package_lock_only,
                     omit: Vec::new(),
