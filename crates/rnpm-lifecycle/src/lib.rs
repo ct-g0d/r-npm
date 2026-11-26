@@ -2635,6 +2635,7 @@ fn try_split_simple_args(cmd: &str) -> Option<Vec<String>> {
     Some(args)
 }
 
+#[cfg(windows)]
 fn find_env_case_insensitive<'a>(env: &'a HashMap<String, String>, key: &str) -> Option<&'a str> {
     env.get(key).map(String::as_str).or_else(|| {
         env.iter()
