@@ -94,20 +94,21 @@ pub fn replace_dir_with_retries(
 }
 
 fn try_replace_dir(staging: &Path, destination: &Path, parent: &Path) -> std::io::Result<()> {
-    let dest_is_reparse = crate::junction::is_junction(destination).unwrap_or(false);
-    if !destination.exists() && !dest_is_reparse {
-        // Fast-path: Direct atomic rename when destination does not exist
-        match fs::rename(staging, destination) {
-            Ok(()) => return Ok(()),
-            Err(e)
-                if e.kind() == std::io::ErrorKind::DirectoryNotEmpty
-                    || e.raw_os_error() == Some(39)
-                    || e.raw_os_error() == Some(66)
-                    || e.raw_os_error() == Some(145) =>
-            {
-                // Another concurrent worker just placed destination; fall through to trash rename
+    if let Err(err) = fs::symlink_metadata(destination) {
+        if err.kind() == std::io::ErrorKind::NotFound {
+            // Fast-path: Direct atomic rename when destination does not exist
+            match fs::rename(staging, destination) {
+                Ok(()) => return Ok(()),
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::DirectoryNotEmpty
+                        || e.raw_os_error() == Some(39)
+                        || e.raw_os_error() == Some(66)
+                        || e.raw_os_error() == Some(145) =>
+                {
+                    // Another concurrent worker just placed destination; fall through to trash rename
+                }
+                Err(e) => return Err(e),
             }
-            Err(e) => return Err(e),
         }
     }
 

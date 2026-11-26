@@ -259,6 +259,37 @@ pub fn wildcard_match(pattern: &str, text: &str) -> bool {
     if pattern == "*" {
         return true;
     }
+    if pattern.is_ascii() && text.is_ascii() {
+        let p = pattern.as_bytes();
+        let t = text.as_bytes();
+        let mut p_idx = 0;
+        let mut t_idx = 0;
+        let mut star_idx = None;
+        let mut match_idx = 0;
+
+        while t_idx < t.len() {
+            if p_idx < p.len() && (p[p_idx] == b'?' || p[p_idx] == t[t_idx]) {
+                p_idx += 1;
+                t_idx += 1;
+            } else if p_idx < p.len() && p[p_idx] == b'*' {
+                star_idx = Some(p_idx);
+                match_idx = t_idx;
+                p_idx += 1;
+            } else if let Some(star) = star_idx {
+                p_idx = star + 1;
+                match_idx += 1;
+                t_idx = match_idx;
+            } else {
+                return false;
+            }
+        }
+
+        while p_idx < p.len() && p[p_idx] == b'*' {
+            p_idx += 1;
+        }
+        return p_idx == p.len();
+    }
+
     let p_chars: Vec<char> = pattern.chars().collect();
     let t_chars: Vec<char> = text.chars().collect();
     let mut p_idx = 0;
@@ -395,8 +426,8 @@ pub fn path_matches_workspace_patterns(path: &str, patterns: &[String]) -> bool 
     } else if let Some(stripped) = clean_path.strip_prefix(".\\") {
         clean_path = stripped;
     }
-    let clean_path = clean_path.replace('\\', "/");
-    let clean_path = clean_path.trim_end_matches('/');
+    let clean_path_cow = crate::to_posix_path_cow(clean_path);
+    let clean_path = clean_path_cow.trim_end_matches('/');
     if clean_path.is_empty() {
         return false;
     }
@@ -415,8 +446,8 @@ pub fn path_matches_workspace_patterns(path: &str, patterns: &[String]) -> bool 
         let clean_pattern = pattern.trim();
         let clean_pattern = clean_pattern.strip_prefix("./").unwrap_or(clean_pattern);
         let clean_pattern = clean_pattern.strip_prefix(".\\").unwrap_or(clean_pattern);
-        let posix_pattern = clean_pattern.replace('\\', "/");
-        let posix_pattern = posix_pattern.trim_end_matches('/');
+        let posix_pattern_cow = crate::to_posix_path_cow(clean_pattern);
+        let posix_pattern = posix_pattern_cow.trim_end_matches('/');
 
         let pat_segs: Vec<&str> = posix_pattern.split('/').filter(|s| !s.is_empty()).collect();
         if pat_segs.is_empty() {
@@ -438,8 +469,8 @@ pub fn path_matches_workspace_patterns(path: &str, patterns: &[String]) -> bool 
         let neg_clean = neg.trim().strip_prefix('!').unwrap_or(neg).trim();
         let neg_clean = neg_clean.strip_prefix("./").unwrap_or(neg_clean);
         let neg_clean = neg_clean.strip_prefix(".\\").unwrap_or(neg_clean);
-        let posix_neg = neg_clean.replace('\\', "/");
-        let posix_neg = posix_neg.trim_end_matches('/');
+        let posix_neg_cow = crate::to_posix_path_cow(neg_clean);
+        let posix_neg = posix_neg_cow.trim_end_matches('/');
 
         if matches_neg_pattern(posix_neg, clean_path) {
             return false;

@@ -192,7 +192,7 @@ impl<'de> Visitor<'de> for OrderedJsonVisitor {
     where
         A: SeqAccess<'de>,
     {
-        let mut vec = Vec::new();
+        let mut vec = seq.size_hint().map_or_else(Vec::new, Vec::with_capacity);
         while let Some(elem) = seq.next_element()? {
             vec.push(elem);
         }
@@ -203,7 +203,9 @@ impl<'de> Visitor<'de> for OrderedJsonVisitor {
     where
         M: MapAccess<'de>,
     {
-        let mut index_map = IndexMap::new();
+        let mut index_map = map
+            .size_hint()
+            .map_or_else(IndexMap::new, IndexMap::with_capacity);
         while let Some((k, v)) = map.next_entry()? {
             index_map.insert(k, v);
         }
@@ -220,6 +222,142 @@ impl<'de> Deserialize<'de> for OrderedJsonValue {
     }
 }
 
+impl OrderedJsonValue {
+    /// Converts a borrowed `OrderedJsonValue` into a `serde_json::Value` without consuming `self`.
+    pub fn to_serde_value(&self) -> serde_json::Value {
+        match self {
+            OrderedJsonValue::Null => serde_json::Value::Null,
+            OrderedJsonValue::Bool(b) => serde_json::Value::Bool(*b),
+            OrderedJsonValue::Number(n) => serde_json::Value::Number(n.clone()),
+            OrderedJsonValue::String(s) => serde_json::Value::String(s.clone()),
+            OrderedJsonValue::Array(arr) => {
+                serde_json::Value::Array(arr.iter().map(Self::to_serde_value).collect())
+            }
+            OrderedJsonValue::Object(map) => {
+                let mut m = serde_json::Map::with_capacity(map.len());
+                for (k, v) in map {
+                    m.insert(k.clone(), v.to_serde_value());
+                }
+                serde_json::Value::Object(m)
+            }
+        }
+    }
+}
+
+/// Writes a JSON-escaped quoted string directly into `out`, matching `serde_json` escaping byte-for-byte.
+#[inline]
+pub(crate) fn write_json_str(s: &str, out: &mut String) {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    out.push('"');
+    let bytes = s.as_bytes();
+    let mut start = 0usize;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b < 0x20 || b == b'"' || b == b'\\' {
+            if start < i {
+                out.push_str(&s[start..i]);
+            }
+            match b {
+                b'"' => out.push_str("\\\""),
+                b'\\' => out.push_str("\\\\"),
+                0x08 => out.push_str("\\b"),
+                0x0c => out.push_str("\\f"),
+                b'\n' => out.push_str("\\n"),
+                b'\r' => out.push_str("\\r"),
+                b'\t' => out.push_str("\\t"),
+                _ => {
+                    out.push_str("\\u00");
+                    out.push(HEX[(b >> 4) as usize] as char);
+                    out.push(HEX[(b & 0x0f) as usize] as char);
+                }
+            }
+            start = i + 1;
+        }
+        i += 1;
+    }
+    if start < bytes.len() {
+        out.push_str(&s[start..]);
+    }
+    out.push('"');
+}
+
+#[inline]
+pub(crate) fn push_indent(out: &mut String, indent: &str, depth: usize) {
+    for _ in 0..depth {
+        out.push_str(indent);
+    }
+}
+
+#[inline]
+pub(crate) fn write_json_number(n: &serde_json::Number, out: &mut String) {
+    use std::fmt::Write;
+    let _ = write!(out, "{n}");
+}
+
+pub(crate) fn write_ordered_json_value(
+    val: &OrderedJsonValue,
+    indent: &str,
+    newline: &str,
+    depth: usize,
+    out: &mut String,
+) {
+    match val {
+        OrderedJsonValue::Null => out.push_str("null"),
+        OrderedJsonValue::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
+        OrderedJsonValue::Number(n) => write_json_number(n, out),
+        OrderedJsonValue::String(s) => write_json_str(s, out),
+        OrderedJsonValue::Array(arr) => {
+            if arr.is_empty() {
+                out.push_str("[]");
+                return;
+            }
+            let pretty = !indent.is_empty();
+            out.push('[');
+            for (idx, item) in arr.iter().enumerate() {
+                if idx > 0 {
+                    out.push(',');
+                }
+                if pretty {
+                    out.push_str(newline);
+                    push_indent(out, indent, depth + 1);
+                }
+                write_ordered_json_value(item, indent, newline, depth + 1, out);
+            }
+            if pretty {
+                out.push_str(newline);
+                push_indent(out, indent, depth);
+            }
+            out.push(']');
+        }
+        OrderedJsonValue::Object(map) => {
+            if map.is_empty() {
+                out.push_str("{}");
+                return;
+            }
+            let pretty = !indent.is_empty();
+            out.push('{');
+            for (idx, (k, v)) in map.iter().enumerate() {
+                if idx > 0 {
+                    out.push(',');
+                }
+                if pretty {
+                    out.push_str(newline);
+                    push_indent(out, indent, depth + 1);
+                }
+                write_json_str(k, out);
+                out.push_str(if pretty { ": " } else { ":" });
+                write_ordered_json_value(v, indent, newline, depth + 1, out);
+            }
+            if pretty {
+                out.push_str(newline);
+                push_indent(out, indent, depth);
+            }
+            out.push('}');
+        }
+    }
+}
+
 impl From<serde_json::Value> for OrderedJsonValue {
     fn from(val: serde_json::Value) -> Self {
         match val {
@@ -231,7 +369,7 @@ impl From<serde_json::Value> for OrderedJsonValue {
                 OrderedJsonValue::Array(arr.into_iter().map(Into::into).collect())
             }
             serde_json::Value::Object(map) => {
-                let mut m = IndexMap::new();
+                let mut m = IndexMap::with_capacity(map.len());
                 for (k, v) in map {
                     m.insert(k, v.into());
                 }
@@ -252,7 +390,7 @@ impl From<OrderedJsonValue> for serde_json::Value {
                 serde_json::Value::Array(arr.into_iter().map(Into::into).collect())
             }
             OrderedJsonValue::Object(map) => {
-                let mut m = serde_json::Map::new();
+                let mut m = serde_json::Map::with_capacity(map.len());
                 for (k, v) in map {
                     m.insert(k, v.into());
                 }

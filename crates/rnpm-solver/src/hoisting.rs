@@ -1,25 +1,30 @@
+use crate::fast_util::{fast_map_with_capacity, FastMap};
 use crate::graph::DependencyGraph;
 use rnpm_core::semver::Version;
 use rnpm_core::spec::PackageTarget;
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::rc::Rc;
 
-const MAX_CACHE_ENTRIES: usize = 8192;
+const MAX_CACHE_ENTRIES: usize = 65536;
 
 thread_local! {
-    static TARGET_CACHE: RefCell<HashMap<String, Option<PackageTarget>>> = RefCell::new(HashMap::with_capacity(1024));
-    static VERSION_CACHE: RefCell<HashMap<String, Option<Version>>> = RefCell::new(HashMap::with_capacity(2048));
+    static TARGET_CACHE: RefCell<FastMap<String, Option<Rc<PackageTarget>>>> =
+        RefCell::new(fast_map_with_capacity(1024));
+    static VERSION_CACHE: RefCell<FastMap<String, Option<Rc<Version>>>> =
+        RefCell::new(fast_map_with_capacity(2048));
 }
 
-/// Cached parser for PackageTarget, avoiding repeated parse calls on identical specs like "^1.0.0".
 #[inline]
-pub fn cached_parse_package_target(spec: &str) -> Option<PackageTarget> {
+pub(crate) fn cached_target_rc(spec: &str) -> Option<Rc<PackageTarget>> {
     TARGET_CACHE.with(|cache| {
-        let mut map = cache.borrow_mut();
-        if let Some(target) = map.get(spec) {
-            return target.clone();
+        {
+            let map = cache.borrow();
+            if let Some(target) = map.get(spec) {
+                return target.clone();
+            }
         }
-        let parsed = PackageTarget::parse(spec).ok();
+        let parsed = PackageTarget::parse(spec).ok().map(Rc::new);
+        let mut map = cache.borrow_mut();
         if map.len() >= MAX_CACHE_ENTRIES {
             map.clear();
         }
@@ -28,21 +33,35 @@ pub fn cached_parse_package_target(spec: &str) -> Option<PackageTarget> {
     })
 }
 
-/// Cached parser for SemVer Version, avoiding repeated parses of package version strings.
 #[inline]
-pub fn cached_parse_version(version_str: &str) -> Option<Version> {
+pub(crate) fn cached_version_rc(version_str: &str) -> Option<Rc<Version>> {
     VERSION_CACHE.with(|cache| {
-        let mut map = cache.borrow_mut();
-        if let Some(v) = map.get(version_str) {
-            return v.clone();
+        {
+            let map = cache.borrow();
+            if let Some(v) = map.get(version_str) {
+                return v.clone();
+            }
         }
-        let parsed = Version::parse(version_str).ok();
+        let parsed = Version::parse(version_str).ok().map(Rc::new);
+        let mut map = cache.borrow_mut();
         if map.len() >= MAX_CACHE_ENTRIES {
             map.clear();
         }
         map.insert(version_str.to_string(), parsed.clone());
         parsed
     })
+}
+
+/// Cached parser for PackageTarget, avoiding repeated parse calls on identical specs like "^1.0.0".
+#[inline]
+pub fn cached_parse_package_target(spec: &str) -> Option<PackageTarget> {
+    cached_target_rc(spec).map(|rc| (*rc).clone())
+}
+
+/// Cached parser for SemVer Version, avoiding repeated parses of package version strings.
+#[inline]
+pub fn cached_parse_version(version_str: &str) -> Option<Version> {
+    cached_version_rc(version_str).map(|rc| (*rc).clone())
 }
 
 /// Placement decision made by the deduplication and hoisting engine.
@@ -90,52 +109,80 @@ pub(crate) fn file_target_matches_resolved(target: &std::path::Path, resolved: &
     )
 }
 
-/// Checks if an exact version string satisfies a package target specification.
-pub fn version_satisfies_target(version_str: &str, target: &PackageTarget) -> bool {
-    let Some(v) = cached_parse_version(version_str) else {
-        return false;
-    };
+/// Checks if a pre-parsed `Version` satisfies a `PackageTarget`, avoiding string conversions and re-parses.
+#[inline]
+pub(crate) fn parsed_version_satisfies_target(
+    v: &Version,
+    version_str: Option<&str>,
+    target: &PackageTarget,
+) -> bool {
     match target {
-        PackageTarget::Version(expected) => &v == expected,
-        PackageTarget::Range(range) => range.satisfies(&v),
+        PackageTarget::Version(expected) => v == expected,
+        PackageTarget::Range(range) => range.satisfies(v),
         PackageTarget::Tag(_) => true,
-        PackageTarget::Alias { target, .. } => version_satisfies_target(version_str, target),
-        PackageTarget::File(p) => {
-            let expected = format!("file:{}", rnpm_core::to_posix_path(&p.to_string_lossy()));
-            version_str == expected
+        PackageTarget::Alias { target, .. } => {
+            parsed_version_satisfies_target(v, version_str, target)
         }
+        PackageTarget::File(p) => version_str.is_some_and(|vs| {
+            let expected = format!("file:{}", rnpm_core::to_posix_path(&p.to_string_lossy()));
+            vs == expected
+        }),
         PackageTarget::Git {
             url,
             committish,
             subdir,
-        } => {
+        } => version_str.is_some_and(|vs| {
             let expected = match (committish, subdir) {
                 (Some(c), Some(s)) => format!("{url}#{c}::path:{s}"),
                 (Some(c), None) => format!("{url}#{c}"),
                 (None, Some(s)) => format!("{url}#path:{s}"),
                 (None, None) => url.clone(),
             };
-            version_str == expected
-                || git_target_matches_resolved(url, committish.as_deref(), version_str)
+            vs == expected
+                || git_target_matches_resolved(url, committish.as_deref(), vs)
                 || committish
                     .as_ref()
-                    .map(|c| c.trim_start_matches('v') == version_str)
+                    .map(|c| c.trim_start_matches('v') == vs)
                     .unwrap_or(false)
-        }
-        PackageTarget::Url(u) => version_str == u.as_str(),
+        }),
+        PackageTarget::Url(u) => version_str.is_some_and(|vs| vs == u.as_str()),
         PackageTarget::Workspace(ws_spec) => {
             let s = ws_spec.trim();
             if s == "*" || s == "^" || s == "~" || s.is_empty() {
                 true
-            } else if let Ok(range) = rnpm_core::semver::Range::parse(s) {
-                range.satisfies(&v)
-            } else if let Some(expected) = cached_parse_version(s) {
-                v == expected
+            } else if let Some(cached) = cached_target_rc(s) {
+                match cached.as_ref() {
+                    PackageTarget::Range(range) => range.satisfies(v),
+                    PackageTarget::Version(expected) => v == expected,
+                    _ => true,
+                }
             } else {
                 true
             }
         }
     }
+}
+
+/// Checks if a version entry (with optional pre-parsed SemVer) satisfies a target constraint.
+#[inline]
+pub(crate) fn version_entry_satisfies_target(
+    version_str: &str,
+    parsed: Option<&Version>,
+    target: &PackageTarget,
+) -> bool {
+    if let Some(v) = parsed {
+        parsed_version_satisfies_target(v, Some(version_str), target)
+    } else {
+        version_satisfies_target(version_str, target)
+    }
+}
+
+/// Checks if an exact version string satisfies a package target specification.
+pub fn version_satisfies_target(version_str: &str, target: &PackageTarget) -> bool {
+    let Some(v) = cached_version_rc(version_str) else {
+        return false;
+    };
+    parsed_version_satisfies_target(&v, Some(version_str), target)
 }
 
 /// Extracts (host, normalized_path) from a git URL.
@@ -249,29 +296,21 @@ pub fn node_satisfies_target(node: &crate::graph::Node, target: &PackageTarget) 
         _ => {}
     }
 
-    if let Some(parsed) = cached_parse_version(&node.version) {
-        match target {
-            PackageTarget::Version(expected) => &parsed == expected,
-            PackageTarget::Range(range) => range.satisfies(&parsed),
-            PackageTarget::Tag(_) => true,
+    if let Some(ref parsed) = node.parsed_version {
+        return match target {
             PackageTarget::Alias { name, target } => {
                 node.name == *name && node_satisfies_target(node, target)
             }
-            PackageTarget::File(_) => true,
-            PackageTarget::Git { .. } => true,
-            PackageTarget::Url(_) => true,
-            PackageTarget::Workspace(ws_spec) => {
-                let s = ws_spec.trim();
-                if s == "*" || s == "^" || s == "~" || s.is_empty() {
-                    true
-                } else if let Ok(range) = rnpm_core::semver::Range::parse(s) {
-                    range.satisfies(&parsed)
-                } else if let Some(expected) = cached_parse_version(s) {
-                    parsed == expected
-                } else {
-                    true
-                }
+            _ => parsed_version_satisfies_target(parsed, Some(&node.version), target),
+        };
+    }
+
+    if let Some(parsed) = cached_version_rc(&node.version) {
+        match target {
+            PackageTarget::Alias { name, target } => {
+                node.name == *name && node_satisfies_target(node, target)
             }
+            _ => parsed_version_satisfies_target(&parsed, Some(&node.version), target),
         }
     } else {
         version_satisfies_target(&node.version, target)
@@ -362,9 +401,9 @@ pub fn determine_placement_with_peers(
     placing_peer: bool,
     strategy: PlacementStrategy,
 ) -> PlacementDecision {
-    let mut root_target = String::with_capacity(14 + install_name.len());
-    root_target.push_str("node_modules/");
-    root_target.push_str(install_name);
+    let mut path_buf = String::with_capacity(parent_location.len() + 14 + install_name.len());
+    path_buf.push_str("node_modules/");
+    path_buf.push_str(install_name);
 
     let reuse_peer_set = |existing: &crate::graph::Node, location: &str| {
         // CanPlaceDep checks dep.matches(current) before checking candidate
@@ -378,34 +417,28 @@ pub fn determine_placement_with_peers(
             resolved_version == Some(existing.version.as_str())
         };
         same_package
-            || ((placing_peer
-                || !target_peer_conflicts(
-                    graph,
-                    location,
-                    peer_dependencies,
-                    peer_dependencies_meta,
-                ))
-                && !candidate_has_incompatible_peer(
-                    graph,
-                    location,
-                    parent_location,
-                    dependencies,
-                    peer_dependencies,
-                    peer_dependencies_meta,
-                ))
+            || !candidate_peer_conflict(
+                graph,
+                location,
+                parent_location,
+                dependencies,
+                peer_dependencies,
+                peer_dependencies_meta,
+                placing_peer,
+            )
     };
 
     // If parent is root (""), location is directly under root
     if parent_location.is_empty() {
-        if let Some(existing) = graph.nodes.get(&root_target) {
+        if let Some(existing) = graph.nodes.get(&path_buf) {
             if existing.name == package_name
                 && node_satisfies_target(existing, target)
-                && reuse_peer_set(existing, &root_target)
+                && reuse_peer_set(existing, &path_buf)
             {
-                return PlacementDecision::Reuse(root_target);
+                return PlacementDecision::Reuse(path_buf);
             }
         }
-        return PlacementDecision::PlaceNew(root_target);
+        return PlacementDecision::PlaceNew(path_buf);
     }
 
     // PlaceDep leaves an edge alone when its nearest visible node already
@@ -419,14 +452,18 @@ pub fn determine_placement_with_peers(
                 return PlacementDecision::Reuse(existing.location.clone());
             }
         }
-        return PlacementDecision::PlaceNew(format!("{parent_location}/node_modules/{install_name}"));
+        path_buf.clear();
+        path_buf.push_str(parent_location);
+        path_buf.push_str("/node_modules/");
+        path_buf.push_str(install_name);
+        return PlacementDecision::PlaceNew(path_buf);
     }
 
     // Attempt 1: Check root node_modules
-    if let Some(existing) = graph.nodes.get(&root_target) {
+    if let Some(existing) = graph.nodes.get(&path_buf) {
         if existing.name == package_name
             && node_satisfies_target(existing, target)
-            && reuse_peer_set(existing, &root_target)
+            && reuse_peer_set(existing, &path_buf)
         {
             // Check if there is an intermediate shadowing conflict between parent and root
             if !is_shadowed_by_incompatible_between(
@@ -436,7 +473,7 @@ pub fn determine_placement_with_peers(
                 install_name,
                 target,
             ) {
-                return PlacementDecision::Reuse(root_target);
+                return PlacementDecision::Reuse(path_buf);
             }
         }
         // Root is occupied and either incompatible or shadowed -> conflict!
@@ -444,105 +481,107 @@ pub fn determine_placement_with_peers(
         // Shallow placement never hoists a transitive dependency to the root.
         // Root is vacant. Check if vacant root is shadowed by an incompatible intermediate node
         if !is_shadowed_by_incompatible_between(graph, parent_location, "", install_name, target)
-            && (placing_peer
-                || !target_peer_conflicts(
-                    graph,
-                    &root_target,
-                    peer_dependencies,
-                    peer_dependencies_meta,
-                ))
-            && !candidate_has_incompatible_peer(
+            && !candidate_peer_conflict(
                 graph,
-                &root_target,
+                &path_buf,
                 parent_location,
                 dependencies,
                 peer_dependencies,
                 peer_dependencies_meta,
+                placing_peer,
             )
         {
-            return PlacementDecision::PlaceNew(root_target);
+            return PlacementDecision::PlaceNew(path_buf);
         }
     }
 
     // Attempt 2: Check intermediate ancestor scopes from root towards parent
-    let mut ancestors = Vec::new();
-    let mut curr = parent_location;
-    while let Some(next) = parent_scope(curr) {
-        if next.is_empty() {
-            break;
-        }
-        if next.contains("/node_modules/")
-            || next.starts_with("node_modules/")
-            || graph.nodes.contains_key(next)
-        {
-            ancestors.push(next);
-        }
-        curr = next;
-    }
+    if let Some(first_parent) = parent_scope(parent_location) {
+        if !first_parent.is_empty() {
+            let mut ancestors = Vec::new();
+            let mut curr = parent_location;
+            while let Some(next) = parent_scope(curr) {
+                if next.is_empty() {
+                    break;
+                }
+                if next.contains("/node_modules/")
+                    || next.starts_with("node_modules/")
+                    || graph.nodes.contains_key(next)
+                {
+                    ancestors.push(next);
+                }
+                curr = next;
+            }
 
-    for ancestor in ancestors.into_iter().rev() {
-        let mut candidate = String::with_capacity(ancestor.len() + 14 + install_name.len());
-        candidate.push_str(ancestor);
-        candidate.push_str("/node_modules/");
-        candidate.push_str(install_name);
+            let resolved_parsed = resolved_version.and_then(cached_version_rc);
+            for ancestor in ancestors.into_iter().rev() {
+                path_buf.clear();
+                path_buf.push_str(ancestor);
+                path_buf.push_str("/node_modules/");
+                path_buf.push_str(install_name);
 
-        if let Some(existing) = graph.nodes.get(&candidate) {
-            if existing.name == package_name
-                && node_satisfies_target(existing, target)
-                && reuse_peer_set(existing, &candidate)
-                && !is_shadowed_by_incompatible_between(
+                if let Some(existing) = graph.nodes.get(&path_buf) {
+                    if existing.name == package_name
+                        && node_satisfies_target(existing, target)
+                        && reuse_peer_set(existing, &path_buf)
+                        && !is_shadowed_by_incompatible_between(
+                            graph,
+                            parent_location,
+                            ancestor,
+                            install_name,
+                            target,
+                        )
+                    {
+                        return PlacementDecision::Reuse(path_buf);
+                    }
+                } else if !is_shadowed_by_incompatible_between(
                     graph,
                     parent_location,
                     ancestor,
                     install_name,
                     target,
-                )
-            {
-                return PlacementDecision::Reuse(candidate);
+                ) && !candidate_peer_conflict(
+                    graph,
+                    &path_buf,
+                    parent_location,
+                    dependencies,
+                    peer_dependencies,
+                    peer_dependencies_meta,
+                    placing_peer,
+                ) && !candidate_shadows_ancestor_dep(
+                    graph,
+                    ancestor,
+                    install_name,
+                    package_name,
+                    target,
+                    resolved_version,
+                    resolved_parsed.as_deref(),
+                ) && !candidate_shadows_descendant_dep_parsed(
+                    graph,
+                    ancestor,
+                    install_name,
+                    resolved_version,
+                    resolved_parsed.as_deref(),
+                ) {
+                    return PlacementDecision::PlaceNew(path_buf);
+                }
             }
-        } else if !is_shadowed_by_incompatible_between(
-            graph,
-            parent_location,
-            ancestor,
-            install_name,
-            target,
-        ) && (placing_peer
-            || !target_peer_conflicts(graph, &candidate, peer_dependencies, peer_dependencies_meta))
-            && !candidate_has_incompatible_peer(
-                graph,
-                &candidate,
-                parent_location,
-                dependencies,
-                peer_dependencies,
-                peer_dependencies_meta,
-            )
-            && !candidate_shadows_ancestor_dep(
-                graph,
-                ancestor,
-                install_name,
-                package_name,
-                target,
-                resolved_version,
-            )
-            && !candidate_shadows_descendant_dep(graph, ancestor, install_name, resolved_version)
-        {
-            return PlacementDecision::PlaceNew(candidate);
         }
     }
 
     // Attempt 3: Conflict nesting under parent
-    let mut nested_target = String::with_capacity(parent_location.len() + 14 + install_name.len());
-    nested_target.push_str(parent_location);
-    nested_target.push_str("/node_modules/");
-    nested_target.push_str(install_name);
+    path_buf.clear();
+    path_buf.push_str(parent_location);
+    path_buf.push_str("/node_modules/");
+    path_buf.push_str(install_name);
 
-    if let Some(existing) = graph.nodes.get(&nested_target) {
+    if let Some(existing) = graph.nodes.get(&path_buf) {
         if existing.name == package_name && node_satisfies_target(existing, target) {
-            return PlacementDecision::Reuse(nested_target);
+            return PlacementDecision::Reuse(path_buf);
         }
     }
 
-    PlacementDecision::PlaceNew(nested_target)
+    PlacementDecision::PlaceNew(path_buf)
 }
 
 fn candidate_shadows_ancestor_dep(
@@ -552,6 +591,7 @@ fn candidate_shadows_ancestor_dep(
     package_name: &str,
     target: &PackageTarget,
     resolved_version: Option<&str>,
+    resolved_parsed: Option<&Version>,
 ) -> bool {
     let Some(ancestor_node) = graph.nodes.get(ancestor) else {
         return false;
@@ -583,9 +623,9 @@ fn candidate_shadows_ancestor_dep(
         return false;
     };
 
-    if let Some(req_target) = cached_parse_package_target(spec) {
+    if let Some(req_target) = cached_target_rc(spec) {
         if let Some(version) = resolved_version {
-            return !version_satisfies_target(version, &req_target);
+            return !version_entry_satisfies_target(version, resolved_parsed, &req_target);
         }
         if let Some(visible) = find_visible_peer_node(graph, ancestor, install_name, package_name) {
             if node_satisfies_target(visible, &req_target)
@@ -596,13 +636,13 @@ fn candidate_shadows_ancestor_dep(
         }
         match target {
             PackageTarget::Version(v) => {
-                if !version_satisfies_target(&v.to_string(), &req_target) {
+                if !parsed_version_satisfies_target(v, None, &req_target) {
                     return true;
                 }
             }
             PackageTarget::Range(range) => {
-                if let Some(v) = cached_parse_version(&range.raw) {
-                    if !version_satisfies_target(&v.to_string(), &req_target) {
+                if let Some(v) = cached_version_rc(&range.raw) {
+                    if !parsed_version_satisfies_target(&v, Some(&range.raw), &req_target) {
                         return true;
                     }
                 }
@@ -624,21 +664,43 @@ fn is_in_scope_subtree(loc: &str, scope: &str) -> bool {
         if !loc.starts_with(scope) {
             return false;
         }
-        if loc.as_bytes().get(scope.len()) != Some(&b'/') {
+        let rest = &loc.as_bytes()[scope.len()..];
+        if rest.first() != Some(&b'/') {
             return false;
+        }
+        if rest.starts_with(b"/node_modules/") {
+            return true;
         }
         iter_ancestor_scopes(loc).any(|s| s == scope)
     }
 }
 
-// CanPlaceDep.checkCanPlaceNoCurrent: introducing a node in an empty slot
-// must not intercept a valid descendant edge that currently resolves above
-// this scope. Otherwise a later sibling silently breaks an earlier branch.
+#[cfg(test)]
 fn candidate_shadows_descendant_dep(
     graph: &DependencyGraph,
     scope: &str,
     install_name: &str,
     resolved_version: Option<&str>,
+) -> bool {
+    let parsed = resolved_version.and_then(cached_version_rc);
+    candidate_shadows_descendant_dep_parsed(
+        graph,
+        scope,
+        install_name,
+        resolved_version,
+        parsed.as_deref(),
+    )
+}
+
+// CanPlaceDep.checkCanPlaceNoCurrent: introducing a node in an empty slot
+// must not intercept a valid descendant edge that currently resolves above
+// this scope. Otherwise a later sibling silently breaks an earlier branch.
+fn candidate_shadows_descendant_dep_parsed(
+    graph: &DependencyGraph,
+    scope: &str,
+    install_name: &str,
+    resolved_version: Option<&str>,
+    resolved_parsed: Option<&Version>,
 ) -> bool {
     let Some(version) = resolved_version else {
         return false;
@@ -661,13 +723,16 @@ fn candidate_shadows_descendant_dep(
         else {
             return false;
         };
-        let Some(target) = cached_parse_package_target(spec) else {
+        let Some(target) = cached_target_rc(spec) else {
             return false;
         };
+        // Fast exit: if the candidate satisfies this descendant's constraint, it cannot shadow incompatibly.
+        if version_entry_satisfies_target(version, resolved_parsed, &target) {
+            return false;
+        }
         find_visible_node(graph, &node.location, install_name).is_some_and(|current| {
             !is_in_scope_subtree(&current.location, scope)
                 && node_satisfies_target(current, &target)
-                && !version_satisfies_target(version, &target)
         })
     };
 
@@ -688,14 +753,16 @@ fn candidate_shadows_descendant_dep(
         {
             return false;
         }
-        let Some(target) = cached_parse_package_target(&edge.spec) else {
+        let Some(target) = cached_target_rc(&edge.spec) else {
             return false;
         };
+        if version_entry_satisfies_target(version, resolved_parsed, &target) {
+            return false;
+        }
         graph
             .nodes
             .get(&edge.to_location)
             .is_some_and(|current| node_satisfies_target(current, &target))
-            && !version_satisfies_target(version, &target)
     };
 
     if !graph.edges_by_install_name.is_empty() {
@@ -709,7 +776,7 @@ fn candidate_shadows_descendant_dep(
     }
 }
 
-fn candidate_has_incompatible_peer(
+fn candidate_peer_conflict(
     graph: &DependencyGraph,
     candidate_location: &str,
     parent_location: &str,
@@ -719,9 +786,18 @@ fn candidate_has_incompatible_peer(
         String,
         rnpm_core::manifest::PeerDependencyMeta,
     >,
+    placing_peer: bool,
 ) -> bool {
+    if peer_dependencies.is_empty() {
+        return false;
+    }
     peer_dependencies.iter().any(|(peer_name, peer_spec)| {
-        if dependencies.contains_key(peer_name) {
+        let is_dep = !dependencies.is_empty() && dependencies.contains_key(peer_name);
+        let optional = !peer_dependencies_meta.is_empty()
+            && peer_dependencies_meta
+                .get(peer_name)
+                .is_some_and(|meta| meta.optional);
+        if is_dep && (placing_peer || optional) {
             return false;
         }
         let Some(existing) =
@@ -729,20 +805,22 @@ fn candidate_has_incompatible_peer(
         else {
             return false;
         };
-        let Some(target) = cached_parse_package_target(peer_spec) else {
+        let Some(target) = cached_target_rc(peer_spec) else {
             return false;
         };
         if node_satisfies_target(existing, &target) {
             return false;
         }
 
+        if !placing_peer && !optional {
+            return true;
+        }
+        if is_dep {
+            return false;
+        }
         // Optional peers constrain placement when an incompatible visible
         // version exists. Required peers retain the existing conflict
         // diagnostics and resolution path.
-        let optional = peer_dependencies_meta
-            .get(peer_name)
-            .map(|meta| meta.optional)
-            .unwrap_or(false);
         if optional {
             return !root_provider_replaceable(graph, existing, peer_name, peer_spec);
         }
@@ -769,6 +847,29 @@ fn candidate_has_incompatible_peer(
     })
 }
 
+#[cfg(test)]
+fn candidate_has_incompatible_peer(
+    graph: &DependencyGraph,
+    candidate_location: &str,
+    parent_location: &str,
+    dependencies: &std::collections::BTreeMap<String, String>,
+    peer_dependencies: &std::collections::BTreeMap<String, String>,
+    peer_dependencies_meta: &std::collections::BTreeMap<
+        String,
+        rnpm_core::manifest::PeerDependencyMeta,
+    >,
+) -> bool {
+    candidate_peer_conflict(
+        graph,
+        candidate_location,
+        parent_location,
+        dependencies,
+        peer_dependencies,
+        peer_dependencies_meta,
+        true,
+    )
+}
+
 /// can-place-dep: a top-level provider can be REPLACEd by a pinned version when
 /// every edge into it accepts that version (Node#canReplace). The replacement
 /// happens when the optional peer edge is resolved.
@@ -778,23 +879,37 @@ pub fn root_provider_replaceable(
     peer_name: &str,
     peer_spec: &str,
 ) -> bool {
-    if existing.location != format!("node_modules/{peer_name}") {
+    if existing.location.len() != 13 + peer_name.len()
+        || !existing.location.starts_with("node_modules/")
+        || &existing.location[13..] != peer_name
+    {
         return false;
     }
-    let Some(version) = cached_parse_version(peer_spec) else {
+    let Some(version) = cached_version_rc(peer_spec) else {
         return false;
     };
-    provider_accepts_version(graph, &existing.location, &version.to_string())
+    provider_accepts_parsed_version(graph, &existing.location, &version.to_string(), Some((*version).clone()))
 }
 
 /// Every edge into `location` accepts `version` in place of the current node,
 /// and there is at least one.
 pub fn provider_accepts_version(graph: &DependencyGraph, location: &str, version: &str) -> bool {
+    let parsed = cached_parse_version(version);
+    provider_accepts_parsed_version(graph, location, version, parsed)
+}
+
+fn provider_accepts_parsed_version(
+    graph: &DependencyGraph,
+    location: &str,
+    version: &str,
+    parsed_version: Option<Version>,
+) -> bool {
     let Some(existing) = graph.nodes.get(location) else {
         return false;
     };
     let replacement = crate::graph::Node {
         version: version.to_string(),
+        parsed_version,
         resolved: None,
         integrity: None,
         ..existing.clone()
@@ -808,7 +923,7 @@ pub fn provider_accepts_version(graph: &DependencyGraph, location: &str, version
             }
             incoming.iter().all(|&idx| {
                 let edge = &graph.edges[idx];
-                cached_parse_package_target(&edge.spec)
+                cached_target_rc(&edge.spec)
                     .is_some_and(|target| node_satisfies_target(&replacement, &target))
             })
         } else {
@@ -822,37 +937,10 @@ pub fn provider_accepts_version(graph: &DependencyGraph, location: &str, version
             .peekable();
         incoming.peek().is_some()
             && incoming.all(|edge| {
-                cached_parse_package_target(&edge.spec)
+                cached_target_rc(&edge.spec)
                     .is_some_and(|target| node_satisfies_target(&replacement, &target))
             })
     }
-}
-
-/// can-place-dep: a required peer that is visible but incompatible at the
-/// target location's scope is a CONFLICT there, so a regular dependency nests deeper,
-/// where npm overrides the peer with a warning instead of ERESOLVE.
-fn target_peer_conflicts(
-    graph: &DependencyGraph,
-    candidate_location: &str,
-    peer_dependencies: &std::collections::BTreeMap<String, String>,
-    peer_dependencies_meta: &std::collections::BTreeMap<
-        String,
-        rnpm_core::manifest::PeerDependencyMeta,
-    >,
-) -> bool {
-    peer_dependencies.iter().any(|(peer_name, peer_spec)| {
-        if peer_dependencies_meta
-            .get(peer_name)
-            .is_some_and(|meta| meta.optional)
-        {
-            return false;
-        }
-        let Some(target) = cached_parse_package_target(peer_spec) else {
-            return false;
-        };
-        find_visible_peer_node(graph, candidate_location, peer_name, peer_name)
-            .is_some_and(|existing| !node_satisfies_target(existing, &target))
-    })
 }
 
 /// Checks if any intermediate scope between `from_scope` and `to_ancestor` has a node for `install_name`
@@ -864,10 +952,31 @@ fn is_shadowed_by_incompatible_between(
     install_name: &str,
     target: &PackageTarget,
 ) -> bool {
-    if !graph.nodes_by_install_name.is_empty()
-        && !graph.nodes_by_install_name.contains_key(install_name)
-    {
-        return false;
+    if !graph.nodes_by_install_name.is_empty() {
+        let Some(locs) = graph.nodes_by_install_name.get(install_name) else {
+            return false;
+        };
+        // Fast exit: if every copy of `install_name` is at root (`node_modules/<pkg>`)
+        // or not nested along an ancestor scope of `from_scope`, no intermediate node can shadow.
+        let suffix_len = 14 + install_name.len();
+        let any_potential_intermediate = locs.iter().any(|loc| {
+            if loc.len() <= suffix_len {
+                return false;
+            }
+            let Some((scope, leaf)) = loc.rsplit_once("/node_modules/") else {
+                return false;
+            };
+            leaf == install_name
+                && !scope.is_empty()
+                && scope != to_ancestor
+                && (from_scope == scope
+                    || (from_scope.len() > scope.len()
+                        && from_scope.starts_with(scope)
+                        && from_scope.as_bytes()[scope.len()] == b'/'))
+        });
+        if !any_potential_intermediate {
+            return false;
+        }
     }
     let mut current = from_scope;
     let mut candidate_buf = String::with_capacity(from_scope.len() + 14 + install_name.len());
@@ -908,6 +1017,41 @@ pub fn find_visible_peer_node<'a>(
     install_name: &str,
     package_name: &str,
 ) -> Option<&'a crate::graph::Node> {
+    if !graph.nodes_by_install_name.is_empty() {
+        let by_install = graph.nodes_by_install_name.get(install_name);
+        if package_name == install_name {
+            let locs = by_install?;
+            if locs.is_empty() {
+                return None;
+            }
+            if locs.len() == 1 {
+                let only_loc = &locs[0];
+                if let Some(leaf) = only_loc.strip_prefix("node_modules/") {
+                    if !leaf.contains("/node_modules/") && leaf == install_name {
+                        let node = graph.nodes.get(only_loc)?;
+                        return node_matches_peer_name(node, install_name, package_name)
+                            .then_some(node);
+                    }
+                }
+                if let Some((scope, leaf)) = only_loc.rsplit_once("/node_modules/") {
+                    if leaf == install_name {
+                        if from_location == scope || is_in_scope_subtree(from_location, scope) {
+                            let node = graph.nodes.get(only_loc)?;
+                            return node_matches_peer_name(node, install_name, package_name)
+                                .then_some(node);
+                        }
+                        return None;
+                    }
+                }
+            }
+        } else {
+            let by_pkg = graph.nodes_by_install_name.get(package_name);
+            if by_install.is_none_or(Vec::is_empty) && by_pkg.is_none_or(Vec::is_empty) {
+                return None;
+            }
+        }
+    }
+
     let mut current = from_location;
     let max_len = install_name.len().max(package_name.len());
     let mut candidate_buf = String::with_capacity(from_location.len() + 14 + max_len);
@@ -1271,6 +1415,7 @@ mod tests {
             "dev-dep",
             &target_v2,
             Some("2.0.0"),
+            None,
         ));
         assert!(!candidate_shadows_ancestor_dep(
             &graph,
@@ -1279,6 +1424,7 @@ mod tests {
             "dev-dep",
             &target_v1,
             Some("1.1.0"),
+            None,
         ));
 
         // devDependencies on installed packages in node_modules are ignored and never shadow
@@ -1289,6 +1435,7 @@ mod tests {
             "dev-dep",
             &target_v2,
             Some("2.0.0"),
+            None,
         ));
 
         // peerDependencies shadowing guard on installed packages
@@ -1299,6 +1446,7 @@ mod tests {
             "peer-dep",
             &target_v2,
             Some("2.0.0"),
+            None,
         ));
         assert!(!candidate_shadows_ancestor_dep(
             &graph,
@@ -1307,6 +1455,7 @@ mod tests {
             "peer-dep",
             &target_v1,
             Some("1.5.0"),
+            None,
         ));
     }
 

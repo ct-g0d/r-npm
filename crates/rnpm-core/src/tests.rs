@@ -1811,3 +1811,39 @@ fn test_workspace_deep_glob_no_backtracking_and_order_preservation() {
     assert_eq!(matched[0], tools_dir);
     assert_eq!(matched[1], deep_dir);
 }
+
+#[test]
+fn test_manifest_from_str_array_bin_parity() {
+    use crate::manifest::PackageBin;
+    let json = r#"{
+  "name": "arr-bin-pkg",
+  "version": "1.0.0",
+  "bin": ["./bin/a.js", "./bin/b.js"]
+}"#;
+    let m_raw = Manifest::from_str(json).expect("Manifest::from_str array bin");
+    let m_ro = Manifest::from_str_readonly(json).expect("Manifest::from_str_readonly array bin");
+    let m_serde: Manifest = serde_json::from_str(json).expect("serde_json array bin");
+
+    let mut expected_map = std::collections::BTreeMap::new();
+    expected_map.insert("a.js".to_string(), "./bin/a.js".to_string());
+    expected_map.insert("b.js".to_string(), "./bin/b.js".to_string());
+    let expected = Some(PackageBin::Map(expected_map));
+
+    assert_eq!(m_raw.bin, expected);
+    assert_eq!(m_ro.bin, expected);
+    assert_eq!(m_serde.bin, expected);
+}
+
+#[test]
+fn test_manifest_engines_float_formatting_parity() {
+    let json = r#"{
+  "name": "engines-float-pkg",
+  "version": "1.0.0",
+  "engines": { "node": 18.0, "npm": 10 }
+}"#;
+    let m_raw = Manifest::from_str(json).expect("Manifest::from_str");
+    let m_ro = Manifest::from_str_readonly(json).expect("Manifest::from_str_readonly");
+    assert_eq!(m_raw.engines, m_ro.engines);
+    assert_eq!(m_ro.engines.get("node").map(String::as_str), Some("18.0"));
+    assert_eq!(m_ro.engines.get("npm").map(String::as_str), Some("10"));
+}

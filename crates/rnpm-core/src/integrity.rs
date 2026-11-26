@@ -57,7 +57,7 @@ impl Algorithm {
 
     pub fn compute_digest_reader<R: Read>(&self, mut reader: R) -> std::io::Result<Vec<u8>> {
         let mut hasher = self.hasher();
-        let mut buf = [0u8; 16384];
+        let mut buf = [0u8; 65536];
         loop {
             let n = reader.read(&mut buf)?;
             if n == 0 {
@@ -75,21 +75,27 @@ impl fmt::Display for Algorithm {
     }
 }
 
+#[inline]
+fn parse_algorithm(s: &str) -> Option<Algorithm> {
+    match s {
+        "sha512" => Some(Algorithm::Sha512),
+        "sha256" => Some(Algorithm::Sha256),
+        "sha384" => Some(Algorithm::Sha384),
+        "sha1" => Some(Algorithm::Sha1),
+        _ if s.eq_ignore_ascii_case("sha512") => Some(Algorithm::Sha512),
+        _ if s.eq_ignore_ascii_case("sha256") => Some(Algorithm::Sha256),
+        _ if s.eq_ignore_ascii_case("sha384") => Some(Algorithm::Sha384),
+        _ if s.eq_ignore_ascii_case("sha1") => Some(Algorithm::Sha1),
+        _ => None,
+    }
+}
+
 impl FromStr for Algorithm {
     type Err = IntegrityError;
 
+    #[inline]
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        if s.eq_ignore_ascii_case("sha512") {
-            Ok(Algorithm::Sha512)
-        } else if s.eq_ignore_ascii_case("sha1") {
-            Ok(Algorithm::Sha1)
-        } else if s.eq_ignore_ascii_case("sha256") {
-            Ok(Algorithm::Sha256)
-        } else if s.eq_ignore_ascii_case("sha384") {
-            Ok(Algorithm::Sha384)
-        } else {
-            Err(IntegrityError::UnsupportedAlgorithm(s.to_string()))
-        }
+        parse_algorithm(s).ok_or_else(|| IntegrityError::UnsupportedAlgorithm(s.to_string()))
     }
 }
 
@@ -143,6 +149,20 @@ pub struct IntegrityEntry {
     pub digest_base64: String,
 }
 
+#[inline]
+fn decode_base64_digest(b64_bytes: &[u8]) -> Option<Vec<u8>> {
+    let decode_len = BASE64.decode_len(b64_bytes.len()).ok()?;
+    if decode_len <= 64 {
+        let mut stack_buf = [0u8; 64];
+        let written = BASE64.decode_mut(b64_bytes, &mut stack_buf[..decode_len]).ok()?;
+        let mut out = Vec::with_capacity(written);
+        out.extend_from_slice(&stack_buf[..written]);
+        Some(out)
+    } else {
+        BASE64.decode(b64_bytes).ok()
+    }
+}
+
 impl IntegrityEntry {
     pub fn new(algorithm: Algorithm, digest: Vec<u8>) -> Self {
         let digest_base64 = BASE64.encode(&digest);
@@ -154,9 +174,8 @@ impl IntegrityEntry {
     }
 
     pub fn from_base64(algorithm: Algorithm, base64_str: &str) -> Result<Self, IntegrityError> {
-        let digest = BASE64
-            .decode(base64_str.as_bytes())
-            .map_err(|_| IntegrityError::InvalidBase64(base64_str.to_string()))?;
+        let digest = decode_base64_digest(base64_str.as_bytes())
+            .ok_or_else(|| IntegrityError::InvalidBase64(base64_str.to_string()))?;
         Ok(Self {
             algorithm,
             digest,
@@ -196,12 +215,29 @@ impl Integrity {
     }
 
     pub fn parse(input: &str) -> Result<Self, IntegrityError> {
+        // Fast path for single clean SRI token (e.g. "sha512-...==") with zero whitespace scanning
+        if let Some((algo_str, base64_str)) = input.split_once('-') {
+            if !algo_str.is_empty() && !base64_str.is_empty() {
+                if let Some(algo) = parse_algorithm(algo_str) {
+                    if let Some(digest) = decode_base64_digest(base64_str.as_bytes()) {
+                        return Ok(Self {
+                            entries: vec![IntegrityEntry {
+                                algorithm: algo,
+                                digest,
+                                digest_base64: base64_str.to_string(),
+                            }],
+                        });
+                    }
+                }
+            }
+        }
+
         let trimmed = input.trim();
         if trimmed.is_empty() {
             return Err(IntegrityError::Empty);
         }
 
-        let mut entries = Vec::new();
+        let mut entries = Vec::with_capacity(2);
         for token in trimmed.split_whitespace() {
             let Some((algo_str, base64_str)) = token.split_once('-') else {
                 return Err(IntegrityError::InvalidFormat(token.to_string()));
@@ -220,6 +256,48 @@ impl Integrity {
         }
 
         Ok(Self { entries })
+    }
+
+    /// Zero-allocation validation and strongest algorithm extraction from an integrity string.
+    pub fn strongest_algorithm_str(input: &str) -> Result<Option<Algorithm>, IntegrityError> {
+        let trimmed = input.trim();
+        if trimmed.is_empty() {
+            return Err(IntegrityError::Empty);
+        }
+
+        let mut strongest: Option<Algorithm> = None;
+        let mut decode_buf = [0u8; 128];
+        for token in trimmed.split_whitespace() {
+            let Some((algo_str, base64_str)) = token.split_once('-') else {
+                return Err(IntegrityError::InvalidFormat(token.to_string()));
+            };
+            if algo_str.is_empty() || base64_str.is_empty() {
+                return Err(IntegrityError::InvalidFormat(token.to_string()));
+            }
+
+            let algo = Algorithm::from_str(algo_str)?;
+            let b64_bytes = base64_str.as_bytes();
+            match BASE64.decode_len(b64_bytes.len()) {
+                Ok(out_len) if out_len <= decode_buf.len() => {
+                    BASE64
+                        .decode_mut(b64_bytes, &mut decode_buf[..out_len])
+                        .map_err(|_| IntegrityError::InvalidBase64(base64_str.to_string()))?;
+                }
+                Ok(_) => {
+                    BASE64
+                        .decode(b64_bytes)
+                        .map_err(|_| IntegrityError::InvalidBase64(base64_str.to_string()))?;
+                }
+                Err(_) => return Err(IntegrityError::InvalidBase64(base64_str.to_string())),
+            }
+
+            strongest = Some(strongest.map_or(algo, |curr| curr.max(algo)));
+        }
+
+        match strongest {
+            Some(algo) => Ok(Some(algo)),
+            None => Err(IntegrityError::Empty),
+        }
     }
 
     pub fn from_bytes(bytes: &[u8], algorithm: Algorithm) -> Self {
@@ -265,8 +343,34 @@ impl Integrity {
 
     pub fn verify(&self, bytes: &[u8]) -> Result<(), IntegrityError> {
         let strongest = self.strongest_algorithm().ok_or(IntegrityError::Empty)?;
-        let actual_digest = strongest.compute_digest(bytes);
-        self.verify_digest(strongest, &actual_digest)
+        let mut buf = [0u8; 64];
+        let digest_len = match strongest {
+            Algorithm::Sha1 => {
+                let mut hasher = Sha1::new();
+                hasher.update(bytes);
+                buf[..20].copy_from_slice(&hasher.finalize());
+                20
+            }
+            Algorithm::Sha256 => {
+                let mut hasher = Sha256::new();
+                hasher.update(bytes);
+                buf[..32].copy_from_slice(&hasher.finalize());
+                32
+            }
+            Algorithm::Sha384 => {
+                let mut hasher = Sha384::new();
+                hasher.update(bytes);
+                buf[..48].copy_from_slice(&hasher.finalize());
+                48
+            }
+            Algorithm::Sha512 => {
+                let mut hasher = Sha512::new();
+                hasher.update(bytes);
+                buf[..64].copy_from_slice(&hasher.finalize());
+                64
+            }
+        };
+        self.verify_digest(strongest, &buf[..digest_len])
     }
 
     pub fn verify_reader<R: Read>(&self, reader: R) -> Result<(), IntegrityError> {

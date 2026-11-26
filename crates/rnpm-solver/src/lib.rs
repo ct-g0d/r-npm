@@ -10,6 +10,7 @@
 pub mod aliases;
 pub mod error;
 pub mod explain;
+mod fast_util;
 pub mod graph;
 pub mod hoisting;
 pub mod overrides;

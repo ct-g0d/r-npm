@@ -8,11 +8,19 @@ use reqwest::header::{
     IF_NONE_MATCH, LOCATION, RETRY_AFTER, USER_AGENT,
 };
 use reqwest::{Client, Method, Response, StatusCode};
-use std::collections::HashSet;
+use std::borrow::Cow;
+use std::collections::{HashMap, HashSet};
+use std::future::Future;
+use std::hash::{Hash, Hasher};
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::task::Poll;
 use std::time::Duration;
-use tokio::io::AsyncWriteExt;
-use tokio::sync::OwnedSemaphorePermit;
+use tokio::io::{AsyncWriteExt, BufWriter};
+use tokio::sync::{Notify, OwnedSemaphorePermit, SemaphorePermit};
 use tracing::debug;
 use url::Url;
 
@@ -42,17 +50,170 @@ pub fn set_cli_request_context(command: String, user_agent: String) {
 }
 
 fn packument_cache_metadata(headers: &HeaderMap) -> serde_json::Value {
-    let headers: serde_json::Map<String, serde_json::Value> = ["cache-control", "date", "age"]
-        .into_iter()
-        .filter_map(|key| {
-            headers
-                .get(key)?
-                .to_str()
-                .ok()
-                .map(|value| (key.into(), value.into()))
+    let mut map = serde_json::Map::new();
+    for key in ["cache-control", "date", "age", "content-type", "vary"] {
+        if let Some(val) = headers.get(key).and_then(|v| v.to_str().ok()) {
+            map.insert(key.into(), serde_json::Value::String(val.to_owned()));
+        }
+    }
+    serde_json::json!({ "response": { "headers": map } })
+}
+
+/// Negotiated HTTP representation of an npm packument.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum PackumentRepresentation {
+    /// Abbreviated install representation (`application/vnd.npm.install-v1+json`).
+    #[default]
+    Abbreviated,
+    /// Full npm packument (`application/json`) containing `time`, `license`, `scripts`, etc.
+    Full,
+}
+
+impl PackumentRepresentation {
+    /// HTTP `Accept` header value for negotiating this representation with fallback support.
+    #[inline]
+    pub const fn accept_header(self) -> &'static str {
+        match self {
+            Self::Abbreviated => NPM_INSTALL_ACCEPT,
+            Self::Full => "application/json",
+        }
+    }
+
+    /// Strict HTTP `Accept` header (`application/vnd.npm.install-v1+json` or `application/json`).
+    #[inline]
+    pub const fn strict_accept_header(self) -> &'static str {
+        match self {
+            Self::Abbreviated => NPM_INSTALL_V1_JSON,
+            Self::Full => "application/json",
+        }
+    }
+
+    /// Representation-specific cache key suffix ensuring abbreviated and full entries never collide.
+    #[inline]
+    pub const fn cache_key_suffix(self) -> &'static str {
+        match self {
+            Self::Abbreviated => "abbrev",
+            Self::Full => "full",
+        }
+    }
+
+    /// Corresponding parser mode for this representation.
+    #[inline]
+    pub const fn parse_mode(self) -> PackumentParseMode {
+        match self {
+            Self::Abbreviated => PackumentParseMode::Install,
+            Self::Full => PackumentParseMode::Full,
+        }
+    }
+
+    /// Determine actual returned representation from response `Content-Type` header (or requested `Accept`).
+    pub fn from_response_headers(requested_accept: &str, content_type: Option<&str>) -> Self {
+        if let Some(ct) = content_type {
+            let ct_lower = ct.to_ascii_lowercase();
+            if ct_lower.contains("vnd.npm.install-v1") {
+                return Self::Abbreviated;
+            }
+            if ct_lower.contains("application/json") {
+                return Self::Full;
+            }
+        }
+        if requested_accept.contains("install-v1") {
+            Self::Abbreviated
+        } else {
+            Self::Full
+        }
+    }
+}
+
+/// Options governing negotiated packument fetches and full-packument fallback behavior.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct PackumentFetchOptions {
+    /// Preferred representation to request (`Abbreviated` by default).
+    pub representation: PackumentRepresentation,
+    /// Require `time` publish timestamps (e.g., `--before` / release-age checks).
+    /// Negotiates `Full` directly when set.
+    pub require_publish_times: bool,
+    /// Require full manifest fields that minimal abbreviated registries (such as
+    /// `benchmarks/mock-registry/mock-server.js`) omit from `install-v1` responses.
+    pub require_full_fields: bool,
+}
+
+impl PackumentFetchOptions {
+    /// Options for abbreviated install resolution.
+    #[inline]
+    pub const fn abbreviated() -> Self {
+        Self {
+            representation: PackumentRepresentation::Abbreviated,
+            require_publish_times: false,
+            require_full_fields: false,
+        }
+    }
+
+    /// Options for full packument resolution (e.g., `--before`, `license`, `time`, CLI inspection).
+    #[inline]
+    pub const fn full() -> Self {
+        Self {
+            representation: PackumentRepresentation::Full,
+            require_publish_times: false,
+            require_full_fields: true,
+        }
+    }
+
+    #[inline]
+    const fn effective_representation(self) -> PackumentRepresentation {
+        if self.require_publish_times || self.require_full_fields {
+            PackumentRepresentation::Full
+        } else {
+            self.representation
+        }
+    }
+}
+
+#[derive(Hash, PartialEq, Eq, Clone)]
+struct PackumentCacheKey {
+    url: String,
+    representation: PackumentRepresentation,
+}
+
+#[derive(Clone)]
+struct CachedPackumentEntry {
+    etag: Option<String>,
+    metadata: AbbreviatedPackageMetadata,
+    cache_metadata: serde_json::Value,
+}
+
+struct LazyHttpClient {
+    identity: Mutex<Option<reqwest::Identity>>,
+    cell: OnceLock<Result<Client, String>>,
+}
+
+impl LazyHttpClient {
+    fn new(identity: Option<reqwest::Identity>) -> Arc<Self> {
+        Arc::new(Self {
+            identity: Mutex::new(identity),
+            cell: OnceLock::new(),
         })
-        .collect();
-    serde_json::json!({ "response": { "headers": headers } })
+    }
+
+    #[inline]
+    fn get_or_init(
+        &self,
+        config: &RegistryClientConfig,
+        headers: &HeaderMap,
+    ) -> Result<&Client, RegistryError> {
+        let res = self.cell.get_or_init(|| {
+            let id = self
+                .identity
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take();
+            build_http_client(config, headers, id).map_err(|e| e.to_string())
+        });
+        match res {
+            Ok(client) => Ok(client),
+            Err(err) => Err(RegistryError::Other(err.clone())),
+        }
+    }
 }
 
 /// Maximum number of HTTP redirects to follow before failing.
@@ -109,10 +270,332 @@ pub fn reset_http_request_count() {
     HTTP_REQUEST_COUNT.store(0, std::sync::atomic::Ordering::SeqCst);
 }
 
+static LOG_HTTP_REQUESTS: OnceLock<bool> = OnceLock::new();
+
+#[inline]
+fn should_log_http_requests() -> bool {
+    *LOG_HTTP_REQUESTS.get_or_init(|| {
+        std::env::var_os("RNPM_COUNT_HTTP").is_some()
+            || std::env::var_os("RNPM_TIMING_DEBUG").is_some()
+    })
+}
+
 fn track_http_request(method: &Method, url: &Url) {
-    let count = HTTP_REQUEST_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
-    if std::env::var("RNPM_COUNT_HTTP").is_ok() || std::env::var("RNPM_TIMING_DEBUG").is_ok() {
+    let count = HTTP_REQUEST_COUNT.fetch_add(1, Ordering::SeqCst) + 1;
+    if should_log_http_requests() {
         eprintln!("[http-request #{count}] {method} {url}");
+    }
+}
+
+/// Returns a lowercase `host[:port]` key, borrowing zero-copy when the URL has no explicit port
+/// and its host is already lowercase ASCII (true for canonical `url::Url` DNS hosts).
+#[inline]
+fn url_host_key(url: &Url) -> Cow<'_, str> {
+    let host = url.host_str().unwrap_or_default();
+    match url.port() {
+        Some(port) => Cow::Owned(format!("{host}:{port}").to_ascii_lowercase()),
+        None if host.bytes().any(|b| b.is_ascii_uppercase()) => {
+            Cow::Owned(host.to_ascii_lowercase())
+        }
+        None => Cow::Borrowed(host),
+    }
+}
+
+/// Appends the npm-encoded package name (`@scope%2fpkg` or `pkg`) directly into `out`.
+#[inline]
+fn append_encoded_package_name(out: &mut String, name: &str) {
+    if let Some(rest) = name.strip_prefix('@') {
+        if let Some((scope, pkg)) = rest.split_once('/') {
+            out.push('@');
+            out.push_str(scope);
+            out.push_str("%2f");
+            out.push_str(pkg);
+            return;
+        }
+    }
+    out.push_str(name);
+}
+
+/// Polls the next body chunk while enforcing `idle_timeout` without allocating or resetting a Tokio
+/// timer unless `resp.chunk()` actually returns `Poll::Pending`.
+#[inline]
+async fn next_chunk_with_idle_timeout(
+    resp: &mut Response,
+    idle_timeout: Duration,
+    idle_sleep: &mut Pin<&mut tokio::time::Sleep>,
+) -> Result<Option<bytes::Bytes>, RegistryError> {
+    let mut deadline_set = false;
+    let mut fut = std::pin::pin!(resp.chunk());
+    std::future::poll_fn(|cx| match fut.as_mut().poll(cx) {
+        Poll::Ready(Ok(opt)) => Poll::Ready(Ok(opt)),
+        Poll::Ready(Err(err)) => Poll::Ready(Err(RegistryError::Http(err))),
+        Poll::Pending => {
+            if !deadline_set {
+                idle_sleep
+                    .as_mut()
+                    .reset(tokio::time::Instant::now() + idle_timeout);
+                deadline_set = true;
+            }
+            match idle_sleep.as_mut().poll(cx) {
+                Poll::Ready(()) => Poll::Ready(Err(RegistryError::SlowlorisTimeout(idle_timeout))),
+                Poll::Pending => Poll::Pending,
+            }
+        }
+    })
+    .await
+}
+
+fn clone_clonable_registry_error(err: &RegistryError) -> Option<RegistryError> {
+    Some(match err {
+        RegistryError::Http(_) | RegistryError::Json(_) => return None,
+        RegistryError::UrlParse(e) => RegistryError::UrlParse(*e),
+        RegistryError::PackageNotFound { package, status } => RegistryError::PackageNotFound {
+            package: package.clone(),
+            status: *status,
+        },
+        RegistryError::VersionNotFound { package, version } => RegistryError::VersionNotFound {
+            package: package.clone(),
+            version: version.clone(),
+        },
+        RegistryError::Unauthorized {
+            url,
+            status,
+            message,
+        } => RegistryError::Unauthorized {
+            url: url.clone(),
+            status: *status,
+            message: message.clone(),
+        },
+        RegistryError::AuthChallenge {
+            url,
+            www_authenticate,
+            body,
+        } => RegistryError::AuthChallenge {
+            url: url.clone(),
+            www_authenticate: www_authenticate.clone(),
+            body: body.clone(),
+        },
+        RegistryError::Forbidden {
+            url,
+            status,
+            message,
+        } => RegistryError::Forbidden {
+            url: url.clone(),
+            status: *status,
+            message: message.clone(),
+        },
+        RegistryError::PublishConflict {
+            url,
+            status,
+            message,
+        } => RegistryError::PublishConflict {
+            url: url.clone(),
+            status: *status,
+            message: message.clone(),
+        },
+        RegistryError::RateLimited { retry_after } => RegistryError::RateLimited {
+            retry_after: *retry_after,
+        },
+        RegistryError::TooManyRedirects(n) => RegistryError::TooManyRedirects(*n),
+        RegistryError::SecurityViolation(s) => RegistryError::SecurityViolation(s.clone()),
+        RegistryError::ServerError { status, body } => RegistryError::ServerError {
+            status: *status,
+            body: body.clone(),
+        },
+        RegistryError::CircuitBreakerOpen { host } => {
+            RegistryError::CircuitBreakerOpen { host: host.clone() }
+        }
+        RegistryError::MalformedMetadata(s) => RegistryError::MalformedMetadata(s.clone()),
+        RegistryError::SizeLimitExceeded {
+            limit,
+            actual,
+            message,
+        } => RegistryError::SizeLimitExceeded {
+            limit: *limit,
+            actual: *actual,
+            message: message.clone(),
+        },
+        RegistryError::SlowlorisTimeout(d) => RegistryError::SlowlorisTimeout(*d),
+        RegistryError::ContentLengthMismatch { expected, actual } => {
+            RegistryError::ContentLengthMismatch {
+                expected: *expected,
+                actual: *actual,
+            }
+        }
+        RegistryError::ProvenanceVerificationFailed(s) => {
+            RegistryError::ProvenanceVerificationFailed(s.clone())
+        }
+        RegistryError::AttestationDigestMismatch {
+            algorithm,
+            expected,
+            actual,
+        } => RegistryError::AttestationDigestMismatch {
+            algorithm: algorithm.clone(),
+            expected: expected.clone(),
+            actual: actual.clone(),
+        },
+        RegistryError::UntrustedSourceRepository { expected, actual } => {
+            RegistryError::UntrustedSourceRepository {
+                expected: expected.clone(),
+                actual: actual.clone(),
+            }
+        }
+        RegistryError::InvalidSigstoreBundle(s) => RegistryError::InvalidSigstoreBundle(s.clone()),
+        RegistryError::InvalidSignature(s) => RegistryError::InvalidSignature(s.clone()),
+        RegistryError::Other(s) => RegistryError::Other(s.clone()),
+    })
+}
+
+#[derive(Hash, PartialEq, Eq)]
+struct MetadataInFlightKey {
+    url: Url,
+    accept: Cow<'static, str>,
+    if_none_match: Option<String>,
+    package_name: String,
+}
+
+#[derive(Hash, PartialEq, Eq)]
+struct TarballInFlightKey {
+    url: Url,
+    if_none_match: Option<String>,
+}
+
+enum CoalescedResult<T> {
+    Ok(T),
+    Err(RegistryError),
+    Fallback,
+}
+
+struct InFlightSlot<T> {
+    has_waiters: AtomicBool,
+    outcome: OnceLock<CoalescedResult<T>>,
+    notify: Notify,
+}
+
+const IN_FLIGHT_SHARDS: usize = 16;
+
+type InFlightShardMap<K, T> = Mutex<HashMap<Arc<K>, Arc<InFlightSlot<T>>>>;
+
+struct InFlightGroup<K, T> {
+    shards: [InFlightShardMap<K, T>; IN_FLIGHT_SHARDS],
+}
+
+#[inline]
+fn shard_index<K: Hash>(key: &K) -> usize {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    key.hash(&mut hasher);
+    (hasher.finish() as usize) & (IN_FLIGHT_SHARDS - 1)
+}
+
+impl<K, T> InFlightGroup<K, T>
+where
+    K: Eq + Hash,
+{
+    fn new() -> Self {
+        Self {
+            shards: std::array::from_fn(|_| Mutex::new(HashMap::new())),
+        }
+    }
+
+    fn join_or_lead(
+        self: &Arc<Self>,
+        key: Arc<K>,
+    ) -> Result<LeaderGuard<K, T>, Arc<InFlightSlot<T>>> {
+        let idx = shard_index(&*key);
+        let mut guard = self.shards[idx].lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(existing) = guard.get(&key) {
+            existing.has_waiters.store(true, Ordering::Release);
+            return Err(Arc::clone(existing));
+        }
+        let slot = Arc::new(InFlightSlot {
+            has_waiters: AtomicBool::new(false),
+            outcome: OnceLock::new(),
+            notify: Notify::new(),
+        });
+        guard.insert(Arc::clone(&key), Arc::clone(&slot));
+        Ok(LeaderGuard {
+            group: Arc::clone(self),
+            shard_idx: idx,
+            key: Some(key),
+            slot,
+        })
+    }
+}
+
+async fn wait_for_coalesced<T>(
+    slot: &InFlightSlot<T>,
+    clone_ok: impl Fn(&T) -> T,
+) -> Option<Result<T, RegistryError>> {
+    loop {
+        let notified = slot.notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        if let Some(outcome) = slot.outcome.get() {
+            return match outcome {
+                CoalescedResult::Ok(val) => Some(Ok(clone_ok(val))),
+                CoalescedResult::Err(err) => clone_clonable_registry_error(err).map(Err),
+                CoalescedResult::Fallback => None,
+            };
+        }
+        notified.await;
+    }
+}
+
+struct LeaderGuard<K: Eq + Hash, T> {
+    group: Arc<InFlightGroup<K, T>>,
+    shard_idx: usize,
+    key: Option<Arc<K>>,
+    slot: Arc<InFlightSlot<T>>,
+}
+
+impl<K: Eq + Hash, T> LeaderGuard<K, T> {
+    fn finish(mut self, res: &Result<T, RegistryError>, clone_ok: impl FnOnce(&T) -> T) {
+        if let Some(key) = self.key.take() {
+            {
+                let mut guard = self.group.shards[self.shard_idx]
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                if let Some(cur) = guard.get(&key) {
+                    if Arc::ptr_eq(cur, &self.slot) {
+                        guard.remove(&key);
+                    }
+                }
+            }
+
+            // Fast-path: if no concurrent caller joined while in flight, avoid cloning payload.
+            if self.slot.has_waiters.load(Ordering::Acquire) {
+                let outcome = match res {
+                    Ok(val) => CoalescedResult::Ok(clone_ok(val)),
+                    Err(err) => match clone_clonable_registry_error(err) {
+                        Some(cloned) => CoalescedResult::Err(cloned),
+                        None => CoalescedResult::Fallback,
+                    },
+                };
+                let _ = self.slot.outcome.set(outcome);
+                self.slot.notify.notify_waiters();
+            }
+        }
+    }
+}
+
+impl<K: Eq + Hash, T> Drop for LeaderGuard<K, T> {
+    fn drop(&mut self) {
+        if let Some(key) = self.key.take() {
+            {
+                let mut guard = self.group.shards[self.shard_idx]
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                if let Some(cur) = guard.get(&key) {
+                    if Arc::ptr_eq(cur, &self.slot) {
+                        guard.remove(&key);
+                    }
+                }
+            }
+            if self.slot.has_waiters.load(Ordering::Acquire) {
+                let _ = self.slot.outcome.set(CoalescedResult::Fallback);
+                self.slot.notify.notify_waiters();
+            }
+        }
     }
 }
 
@@ -924,7 +1407,10 @@ pub fn build_http_client(
         .tcp_nodelay(true)
         .tcp_keepalive(Some(config.tcp_keepalive))
         .pool_idle_timeout(Some(config.pool_idle_timeout))
-        .pool_max_idle_per_host(max_idle);
+        .pool_max_idle_per_host(max_idle)
+        .http2_adaptive_window(true)
+        .http2_initial_stream_window_size(Some(2 * 1024 * 1024))
+        .http2_initial_connection_window_size(Some(8 * 1024 * 1024));
 
     if !config.strict_ssl {
         builder = builder.danger_accept_invalid_certs(true);
@@ -1108,18 +1594,86 @@ pub fn build_http_client(
     builder.build().map_err(RegistryError::from)
 }
 
+fn validate_proxy_and_ca_config(config: &RegistryClientConfig) -> Result<(), RegistryError> {
+    if let Some(https_proxy) = &config.https_proxy {
+        reqwest::Proxy::https(https_proxy).map_err(|err| {
+            RegistryError::Other(format!("Invalid https_proxy '{https_proxy}': {err}"))
+        })?;
+    }
+    if let Some(http_proxy) = &config.http_proxy {
+        reqwest::Proxy::http(http_proxy).map_err(|err| {
+            RegistryError::Other(format!("Invalid http_proxy '{http_proxy}': {err}"))
+        })?;
+    }
+    if let Some(general_proxy) = &config.proxy {
+        if config.https_proxy.is_none() && config.http_proxy.is_none() {
+            reqwest::Proxy::all(general_proxy).map_err(|err| {
+                RegistryError::Other(format!("Invalid proxy '{general_proxy}': {err}"))
+            })?;
+        } else if config.http_proxy.is_none() {
+            reqwest::Proxy::http(general_proxy).map_err(|err| {
+                RegistryError::Other(format!("Invalid proxy '{general_proxy}': {err}"))
+            })?;
+        } else if config.https_proxy.is_none() {
+            reqwest::Proxy::https(general_proxy).map_err(|err| {
+                RegistryError::Other(format!("Invalid proxy '{general_proxy}': {err}"))
+            })?;
+        }
+    }
+    if let Some(cafile_path) = &config.cafile {
+        let pem_bytes = std::fs::read(cafile_path).map_err(|err| {
+            RegistryError::Other(format!(
+                "Failed to read cafile at '{}': {err}",
+                cafile_path.display()
+            ))
+        })?;
+        let certs = reqwest::Certificate::from_pem_bundle(&pem_bytes).unwrap_or_default();
+        if certs.is_empty() {
+            return Err(RegistryError::Other(format!(
+                "No PEM certificates found in cafile '{}'",
+                cafile_path.display()
+            )));
+        }
+    }
+    if let Some(ca_content_or_path) = &config.ca {
+        let pem_bytes = if Path::new(ca_content_or_path).exists() {
+            std::fs::read(ca_content_or_path).map_err(|err| {
+                RegistryError::Other(format!(
+                    "Failed to read CA path '{ca_content_or_path}': {err}"
+                ))
+            })?
+        } else {
+            ca_content_or_path.as_bytes().to_vec()
+        };
+        let certs = reqwest::Certificate::from_pem_bundle(&pem_bytes).unwrap_or_default();
+        if certs.is_empty() {
+            return Err(RegistryError::Other(
+                "No PEM certificates found in ca configuration".to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Client for interacting with npm package registries.
 #[derive(Clone)]
 pub struct RegistryClient {
-    client: Client,
+    base_client: Arc<LazyHttpClient>,
+    default_headers: Arc<HeaderMap>,
     config: RegistryClientConfig,
-    user_agent: HeaderValue,
     semaphore: std::sync::Arc<tokio::sync::Semaphore>,
     circuit_breaker: CircuitBreaker,
     http_requests: std::sync::Arc<std::sync::atomic::AtomicU64>,
     http_304s: std::sync::Arc<std::sync::atomic::AtomicU64>,
-    scoped_clients: std::collections::BTreeMap<String, Client>,
-    global_client: Option<Client>,
+    scoped_clients: std::collections::BTreeMap<String, Arc<LazyHttpClient>>,
+    global_client: Option<Arc<LazyHttpClient>>,
+    has_scoped_auth: bool,
+    has_any_auth: bool,
+    has_non_error_retry_status: bool,
+    bearer_auth_header: Option<HeaderValue>,
+    in_flight_metadata: Arc<InFlightGroup<MetadataInFlightKey, MetadataFetchResult>>,
+    in_flight_tarballs: Arc<InFlightGroup<TarballInFlightKey, BytesFetchResult>>,
+    packument_cache: Arc<std::sync::RwLock<HashMap<PackumentCacheKey, CachedPackumentEntry>>>,
 }
 
 impl RegistryClient {
@@ -1129,6 +1683,7 @@ impl RegistryClient {
     }
 
     /// Create a new RegistryClient with custom configuration.
+    /// Defers heavy `reqwest` / `rustls` / root CA initialization until the first network request.
     pub fn with_config(config: RegistryClientConfig) -> Result<Self, RegistryError> {
         let mut headers = HeaderMap::new();
         let cli_context = CLI_REQUEST_CONTEXT.get();
@@ -1138,6 +1693,7 @@ impl RegistryClient {
             .unwrap_or(&config.user_agent);
         let user_agent =
             HeaderValue::from_str(agent).map_err(|e| RegistryError::Other(e.to_string()))?;
+        headers.insert(USER_AGENT, user_agent);
         if let Some((command, _)) = cli_context {
             headers.insert(
                 "npm-command",
@@ -1146,116 +1702,120 @@ impl RegistryClient {
         }
         headers.insert(CONNECTION, HeaderValue::from_static("keep-alive"));
 
-        // Load and validate global identity upfront
-        let global_identity = load_tls_identity(
-            config.certfile.as_deref(),
-            config.cert.as_deref(),
-            config.keyfile.as_deref(),
-            config.key.as_deref(),
-        )?;
+        // Only validate proxy / CA / TLS files eagerly when configured;
+        // defer reqwest/rustls ClientBuilder construction until the first actual request.
+        validate_proxy_and_ca_config(&config)?;
 
-        // Build base unauthenticated client
-        let client = build_http_client(&config, &headers, None)?;
-
-        // Build global client if global identity configured
-        let global_client = if let Some(id) = global_identity {
-            Some(build_http_client(&config, &headers, Some(id))?)
+        let global_client = if config.certfile.is_some()
+            || config.cert.is_some()
+            || config.keyfile.is_some()
+            || config.key.is_some()
+        {
+            load_tls_identity(
+                config.certfile.as_deref(),
+                config.cert.as_deref(),
+                config.keyfile.as_deref(),
+                config.key.as_deref(),
+            )?
+            .map(|id| LazyHttpClient::new(Some(id)))
         } else {
             None
         };
 
-        // Pre-normalize and clean scoped configs to enable parent-prefix inheritance on the same host
-        let mut normalized_scoped: std::collections::BTreeMap<String, ScopedTlsConfig> =
-            std::collections::BTreeMap::new();
-        for (prefix, scoped_cfg) in &config.scoped_tls {
-            let norm = normalize_uri_prefix(prefix);
-            let cleaned = ScopedTlsConfig {
-                certfile: clean_pathbuf(scoped_cfg.certfile.as_ref()),
-                cert: clean_string(scoped_cfg.cert.as_ref()),
-                keyfile: clean_pathbuf(scoped_cfg.keyfile.as_ref()),
-                key: clean_string(scoped_cfg.key.as_ref()),
-            };
-            normalized_scoped.insert(norm, cleaned);
-        }
-
-        // Load and build scoped clients with parent-prefix inheritance within the same host
         let mut scoped_clients = std::collections::BTreeMap::new();
-        for (prefix, scoped_cfg) in &config.scoped_tls {
-            let norm = normalize_uri_prefix(prefix);
-            let mut certfile = clean_pathbuf(scoped_cfg.certfile.as_ref());
-            let mut cert = clean_string(scoped_cfg.cert.as_ref());
-            let mut keyfile = clean_pathbuf(scoped_cfg.keyfile.as_ref());
-            let mut key = clean_string(scoped_cfg.key.as_ref());
-
-            // If cert or key is missing, check parent prefixes of the SAME host in config.scoped_tls
-            let rest = norm.strip_prefix("//").unwrap_or(&norm);
-            let (host_part, path_part) = match rest.find('/') {
-                Some(i) => (&rest[..i], &rest[i..]),
-                None => (rest, "/"),
-            };
-
-            let parent_paths = get_parent_path_prefixes(path_part);
-            for parent_path in &parent_paths {
-                if (certfile.is_some() || cert.is_some()) && (keyfile.is_some() || key.is_some()) {
-                    break;
-                }
-                let cand_parent = format!("//{host_part}{parent_path}");
-                if let Some(parent_cfg) = normalized_scoped.get(&cand_parent) {
-                    if certfile.is_none() && cert.is_none() {
-                        certfile = parent_cfg.certfile.clone();
-                        cert = parent_cfg.cert.clone();
-                    }
-                    if keyfile.is_none() && key.is_none() {
-                        keyfile = parent_cfg.keyfile.clone();
-                        key = parent_cfg.key.clone();
-                    }
-                }
+        if !config.scoped_tls.is_empty() {
+            // Pre-normalize and clean scoped configs to enable parent-prefix inheritance on the same host
+            let mut normalized_scoped: std::collections::BTreeMap<String, ScopedTlsConfig> =
+                std::collections::BTreeMap::new();
+            for (prefix, scoped_cfg) in &config.scoped_tls {
+                let norm = normalize_uri_prefix(prefix);
+                let cleaned = ScopedTlsConfig {
+                    certfile: clean_pathbuf(scoped_cfg.certfile.as_ref()),
+                    cert: clean_string(scoped_cfg.cert.as_ref()),
+                    keyfile: clean_pathbuf(scoped_cfg.keyfile.as_ref()),
+                    key: clean_string(scoped_cfg.key.as_ref()),
+                };
+                normalized_scoped.insert(norm, cleaned);
             }
 
-            // If a scoped entry has neither cert nor key after filtering empty/"null", skip it cleanly
-            if certfile.is_none() && cert.is_none() && keyfile.is_none() && key.is_none() {
-                continue;
-            }
+            // Load and register scoped TLS clients lazily with parent-prefix inheritance within the same host
+            for (prefix, scoped_cfg) in &config.scoped_tls {
+                let norm = normalize_uri_prefix(prefix);
+                let mut certfile = clean_pathbuf(scoped_cfg.certfile.as_ref());
+                let mut cert = clean_string(scoped_cfg.cert.as_ref());
+                let mut keyfile = clean_pathbuf(scoped_cfg.keyfile.as_ref());
+                let mut key = clean_string(scoped_cfg.key.as_ref());
 
-            // Check if this entry has descendants in scoped_tls that could inherit its partial credentials
-            let has_scoped_descendant = normalized_scoped.keys().any(|other_norm| {
-                other_norm != &norm && other_norm.starts_with(&norm)
-            });
+                let rest = norm.strip_prefix("//").unwrap_or(&norm);
+                let (host_part, path_part) = match rest.find('/') {
+                    Some(i) => (&rest[..i], &rest[i..]),
+                    None => (rest, "/"),
+                };
 
-            // Do NOT fall back to global config.cert/config.key for scoped entries!
-            match load_tls_identity(
-                certfile.as_deref(),
-                cert.as_deref(),
-                keyfile.as_deref(),
-                key.as_deref(),
-            ) {
-                Ok(Some(id)) => {
-                    let scoped_client = build_http_client(&config, &headers, Some(id))?;
-                    scoped_clients.insert(norm.clone(), scoped_client.clone());
-                    if norm.ends_with('/') {
-                        let no_slash = norm.trim_end_matches('/').to_string();
-                        scoped_clients.insert(no_slash, scoped_client.clone());
+                let parent_paths = get_parent_path_prefixes(path_part);
+                for parent_path in &parent_paths {
+                    if (certfile.is_some() || cert.is_some())
+                        && (keyfile.is_some() || key.is_some())
+                    {
+                        break;
                     }
-                    scoped_clients.insert(prefix.clone(), scoped_client);
+                    let cand_parent = format!("//{host_part}{parent_path}");
+                    if let Some(parent_cfg) = normalized_scoped.get(&cand_parent) {
+                        if certfile.is_none() && cert.is_none() {
+                            certfile = parent_cfg.certfile.clone();
+                            cert = parent_cfg.cert.clone();
+                        }
+                        if keyfile.is_none() && key.is_none() {
+                            keyfile = parent_cfg.keyfile.clone();
+                            key = parent_cfg.key.clone();
+                        }
+                    }
                 }
-                Ok(None) => {}
-                Err(err) => {
-                    // If this is a parent prefix providing partial config to descendants, don't fail if only key/cert is missing
-                    if has_scoped_descendant {
-                        let has_cert = certfile.is_some() || cert.is_some();
-                        let has_key = keyfile.is_some() || key.is_some();
-                        if has_cert != has_key {
-                            if let RegistryError::Other(ref msg) = err {
-                                if msg.contains("both cert and key are required") {
-                                    continue;
+
+                if certfile.is_none() && cert.is_none() && keyfile.is_none() && key.is_none() {
+                    continue;
+                }
+
+                let has_scoped_descendant = normalized_scoped
+                    .keys()
+                    .any(|other_norm| other_norm != &norm && other_norm.starts_with(&norm));
+
+                match load_tls_identity(
+                    certfile.as_deref(),
+                    cert.as_deref(),
+                    keyfile.as_deref(),
+                    key.as_deref(),
+                ) {
+                    Ok(Some(id)) => {
+                        let lazy_client = LazyHttpClient::new(Some(id));
+                        scoped_clients.insert(norm.clone(), Arc::clone(&lazy_client));
+                        if norm.ends_with('/') {
+                            let no_slash = norm.trim_end_matches('/').to_string();
+                            scoped_clients.insert(no_slash, Arc::clone(&lazy_client));
+                        }
+                        scoped_clients.insert(prefix.clone(), lazy_client);
+                    }
+                    Ok(None) => {}
+                    Err(err) => {
+                        if has_scoped_descendant {
+                            let has_cert = certfile.is_some() || cert.is_some();
+                            let has_key = keyfile.is_some() || key.is_some();
+                            if has_cert != has_key {
+                                if let RegistryError::Other(ref msg) = err {
+                                    if msg.contains("both cert and key are required") {
+                                        continue;
+                                    }
                                 }
                             }
                         }
+                        return Err(err);
                     }
-                    return Err(err);
                 }
             }
         }
+
+        let base_client = LazyHttpClient::new(None);
+        let default_headers = Arc::new(headers);
 
         let max_concurrency = if let Some(sockets) = config.maxsockets {
             if sockets == 0 {
@@ -1278,16 +1838,31 @@ impl RegistryClient {
         let circuit_breaker =
             CircuitBreaker::new(failure_threshold, config.circuit_breaker_reset_timeout);
 
+        let has_scoped_auth = !config.auth_tokens.is_empty() || !config.basic_auths.is_empty();
+        let has_any_auth = config.auth_token.is_some() || has_scoped_auth;
+        let has_non_error_retry_status = config.retry_on_status.iter().any(|&s| s < 400);
+        let bearer_auth_header = config
+            .auth_token
+            .as_deref()
+            .and_then(|token| HeaderValue::from_str(&format!("Bearer {token}")).ok());
+
         Ok(Self {
-            client,
+            base_client,
+            default_headers,
             config,
-            user_agent,
             semaphore,
             circuit_breaker,
             http_requests: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             http_304s: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             scoped_clients,
             global_client,
+            has_scoped_auth,
+            has_any_auth,
+            has_non_error_retry_status,
+            bearer_auth_header,
+            in_flight_metadata: Arc::new(InFlightGroup::new()),
+            in_flight_tarballs: Arc::new(InFlightGroup::new()),
+            packument_cache: Arc::new(std::sync::RwLock::new(HashMap::new())),
         })
     }
 
@@ -1365,21 +1940,40 @@ impl RegistryClient {
     /// A host is trusted if it matches the default registry, is listed in `trusted_hosts`,
     /// or matches one of the `scoped_registries`.
     pub fn is_trusted_host(&self, url: &Url) -> bool {
-        let host = match url.host_str() {
-            Some(h) => h.to_ascii_lowercase(),
-            None => return false,
+        let Some(raw_host) = url.host_str() else {
+            return false;
         };
+        let port_or_default = url.port_or_known_default();
 
         if let Some(reg_host) = self.config.default_registry.host_str() {
-            if reg_host.eq_ignore_ascii_case(&host)
-                && self.config.default_registry.port_or_known_default()
-                    == url.port_or_known_default()
+            if reg_host.eq_ignore_ascii_case(raw_host)
+                && self.config.default_registry.port_or_known_default() == port_or_default
             {
                 return true;
             }
         }
 
-        if let Some(port) = url.port_or_known_default() {
+        for scoped_reg in self.config.scoped_registries.values() {
+            if let Some(shost) = scoped_reg.host_str() {
+                if shost.eq_ignore_ascii_case(raw_host)
+                    && scoped_reg.port_or_known_default() == port_or_default
+                {
+                    return true;
+                }
+            }
+        }
+
+        if self.config.trusted_hosts.is_empty() {
+            return false;
+        }
+
+        let host: Cow<'_, str> = if raw_host.bytes().any(|b| b.is_ascii_uppercase()) {
+            Cow::Owned(raw_host.to_ascii_lowercase())
+        } else {
+            Cow::Borrowed(raw_host)
+        };
+
+        if let Some(port) = port_or_default {
             if self
                 .config
                 .trusted_hosts
@@ -1388,21 +1982,7 @@ impl RegistryClient {
                 return true;
             }
         }
-        if self.config.trusted_hosts.contains(&host) {
-            return true;
-        }
-
-        for scoped_reg in self.config.scoped_registries.values() {
-            if let Some(shost) = scoped_reg.host_str() {
-                if shost.eq_ignore_ascii_case(&host)
-                    && scoped_reg.port_or_known_default() == url.port_or_known_default()
-                {
-                    return true;
-                }
-            }
-        }
-
-        false
+        self.config.trusted_hosts.contains(host.as_ref())
     }
 
     /// The `Authorization` value npm would send: a Bearer token when one is
@@ -1410,6 +1990,9 @@ impl RegistryClient {
     pub fn auth_header_for_url(&self, url: &Url) -> Option<String> {
         if let Some(token) = self.auth_token_for_url(url) {
             return Some(format!("Bearer {token}"));
+        }
+        if self.config.basic_auths.is_empty() {
+            return None;
         }
         let host = url.host_str()?.to_ascii_lowercase();
         let port = url.port().map(|p| format!(":{p}")).unwrap_or_default();
@@ -1441,41 +2024,48 @@ impl RegistryClient {
     /// Never returns the fallback registry auth token to untrusted hosts.
     pub fn auth_token_for_url(&self, url: &Url) -> Option<&str> {
         let host = url.host_str()?;
-        let host_lower = host.to_ascii_lowercase();
-        let port_part = if let Some(port) = url.port() {
-            format!(":{port}")
-        } else {
-            String::new()
-        };
-        let path = url.path();
-        let normalized_path = if path.ends_with('/') {
-            path.to_string()
-        } else {
-            format!("{path}/")
-        };
+        if !self.config.auth_tokens.is_empty() {
+            let host_lower: Cow<'_, str> = if host.bytes().any(|b| b.is_ascii_uppercase()) {
+                Cow::Owned(host.to_ascii_lowercase())
+            } else {
+                Cow::Borrowed(host)
+            };
+            let port_part = if let Some(port) = url.port() {
+                format!(":{port}")
+            } else {
+                String::new()
+            };
+            let path = url.path();
+            let normalized_path: Cow<'_, str> = if path.ends_with('/') {
+                Cow::Borrowed(path)
+            } else {
+                Cow::Owned(format!("{path}/"))
+            };
 
-        let candidate1 = format!("//{host_lower}{port_part}{normalized_path}");
-        if let Some(token) = self.config.auth_tokens.get(&candidate1) {
-            return Some(token.as_str());
-        }
-        let candidate2 = format!("//{host_lower}{port_part}{path}");
-        if let Some(token) = self.config.auth_tokens.get(&candidate2) {
-            return Some(token.as_str());
-        }
-        let candidate3 = format!("//{host_lower}{port_part}/");
-        if let Some(token) = self.config.auth_tokens.get(&candidate3) {
-            return Some(token.as_str());
-        }
-        if !port_part.is_empty() {
-            let candidate4 = format!("//{host_lower}/");
-            if let Some(token) = self.config.auth_tokens.get(&candidate4) {
+            let candidate1 = format!("//{host_lower}{port_part}{normalized_path}");
+            if let Some(token) = self.config.auth_tokens.get(&candidate1) {
                 return Some(token.as_str());
+            }
+            let candidate2 = format!("//{host_lower}{port_part}{path}");
+            if let Some(token) = self.config.auth_tokens.get(&candidate2) {
+                return Some(token.as_str());
+            }
+            let candidate3 = format!("//{host_lower}{port_part}/");
+            if let Some(token) = self.config.auth_tokens.get(&candidate3) {
+                return Some(token.as_str());
+            }
+            if !port_part.is_empty() {
+                let candidate4 = format!("//{host_lower}/");
+                if let Some(token) = self.config.auth_tokens.get(&candidate4) {
+                    return Some(token.as_str());
+                }
             }
         }
 
         // Hardening: Fallback to self.config.auth_token ONLY if the host is trusted
+        let token = self.config.auth_token.as_deref()?;
         if self.is_trusted_host(url) {
-            self.config.auth_token.as_deref()
+            Some(token)
         } else {
             None
         }
@@ -1504,33 +2094,37 @@ impl RegistryClient {
         registry: &Url,
         package_name: &str,
     ) -> Result<Url, RegistryError> {
-        if package_name.contains('\r') || package_name.contains('\n') {
+        if package_name.as_bytes().iter().any(|&b| b == b'\r' || b == b'\n') {
             return Err(RegistryError::SecurityViolation(
                 "Package name contains forbidden CR/LF characters".into(),
             ));
         }
-        let encoded = encode_package_name(package_name);
         let base_str = registry.as_str().trim_end_matches('/');
-        let url_str = format!("{base_str}/{encoded}");
+        let mut url_str = String::with_capacity(base_str.len() + package_name.len() + 4);
+        url_str.push_str(base_str);
+        url_str.push('/');
+        append_encoded_package_name(&mut url_str, package_name);
         Url::parse(&url_str).map_err(RegistryError::UrlParse)
     }
 
     /// Check whether two URLs share the exact same origin (scheme, host, and port).
+    #[inline]
     pub fn is_same_origin(&self, a: &Url, b: &Url) -> bool {
-        a.scheme() == b.scheme()
-            && a.host_str().is_some()
-            && a.host_str().map(|s| s.to_ascii_lowercase())
-                == b.host_str().map(|s| s.to_ascii_lowercase())
-            && a.port_or_known_default() == b.port_or_known_default()
+        if a.scheme() != b.scheme() || a.port_or_known_default() != b.port_or_known_default() {
+            return false;
+        }
+        match (a.host_str(), b.host_str()) {
+            (Some(ha), Some(hb)) => ha.eq_ignore_ascii_case(hb),
+            _ => false,
+        }
     }
 
     /// Check if target URL is trusted to receive authorization headers.
     /// When following redirects or downloading tarballs, never forward registry auth token
     /// to untrusted cross-origin hosts.
     pub fn is_trusted_target(&self, initial_url: &Url, current_url: &Url) -> bool {
-        let host = match current_url.host_str() {
-            Some(h) => h.to_ascii_lowercase(),
-            None => return false,
+        let Some(raw_host) = current_url.host_str() else {
+            return false;
         };
 
         // Never forward authorization headers across an HTTPS -> HTTP downgrade!
@@ -1539,7 +2133,12 @@ impl RegistryClient {
         }
 
         // If explicitly defined in auth_tokens or basic_auths map for this URL, that specific host token is allowed
-        let has_explicit_token = {
+        if self.has_scoped_auth {
+            let host: Cow<'_, str> = if raw_host.bytes().any(|b| b.is_ascii_uppercase()) {
+                Cow::Owned(raw_host.to_ascii_lowercase())
+            } else {
+                Cow::Borrowed(raw_host)
+            };
             let port_part = if let Some(port) = current_url.port() {
                 format!(":{port}")
             } else {
@@ -1555,12 +2154,13 @@ impl RegistryClient {
                 String::new()
             };
             let path = current_url.path();
-            let normalized_path = if path.ends_with('/') {
-                path.to_string()
+            let normalized_path: Cow<'_, str> = if path.ends_with('/') {
+                Cow::Borrowed(path)
             } else {
-                format!("{path}/")
+                Cow::Owned(format!("{path}/"))
             };
-            self.config
+            let has_explicit_token = self
+                .config
                 .auth_tokens
                 .contains_key(&format!("//{host}{port_part}{normalized_path}"))
                 || self
@@ -1574,8 +2174,12 @@ impl RegistryClient {
                 || (!port_part.is_empty()
                     && self.config.auth_tokens.contains_key(&format!("//{host}/")))
                 || (!default_port_part.is_empty()
-                    && (self.config.auth_tokens.contains_key(&format!("//{host}{default_port_part}{normalized_path}"))
-                        || self.config.auth_tokens.contains_key(&format!("//{host}{default_port_part}/"))))
+                    && (self.config.auth_tokens.contains_key(&format!(
+                        "//{host}{default_port_part}{normalized_path}"
+                    )) || self
+                        .config
+                        .auth_tokens
+                        .contains_key(&format!("//{host}{default_port_part}/"))))
                 || self
                     .config
                     .basic_auths
@@ -1585,11 +2189,14 @@ impl RegistryClient {
                     .basic_auths
                     .contains_key(&format!("//{host}{port_part}/"))
                 || (!default_port_part.is_empty()
-                    && self.config.basic_auths.contains_key(&format!("//{host}{default_port_part}/")))
-        };
+                    && self
+                        .config
+                        .basic_auths
+                        .contains_key(&format!("//{host}{default_port_part}/")));
 
-        if has_explicit_token {
-            return true;
+            if has_explicit_token {
+                return true;
+            }
         }
 
         // To receive the registry auth token, BOTH initial_url and current_url MUST be trusted hosts!
@@ -1600,6 +2207,16 @@ impl RegistryClient {
         if self.is_same_origin(initial_url, current_url) {
             return true;
         }
+
+        if self.config.trusted_hosts.is_empty() {
+            return false;
+        }
+
+        let host: Cow<'_, str> = if raw_host.bytes().any(|b| b.is_ascii_uppercase()) {
+            Cow::Owned(raw_host.to_ascii_lowercase())
+        } else {
+            Cow::Borrowed(raw_host)
+        };
 
         // For cross-origin redirects (different host, port, or scheme), only forward authorization
         // if current_url host and port are explicitly trusted in trusted_hosts
@@ -1612,13 +2229,49 @@ impl RegistryClient {
                 return true;
             }
         }
-        if self.config.trusted_hosts.contains(&host)
+        if self.config.trusted_hosts.contains(host.as_ref())
             && initial_url.port_or_known_default() == current_url.port_or_known_default()
         {
             return true;
         }
 
         false
+    }
+
+    #[cfg(test)]
+    #[inline]
+    fn base_client(&self) -> &Client {
+        self.base_client
+            .get_or_init(&self.config, &self.default_headers)
+            .expect("HTTP client initialization failed after config validation")
+    }
+
+    #[inline]
+    fn try_client_for_url(&self, url: &Url) -> Result<&Client, RegistryError> {
+        if url.scheme() != "https" {
+            return self
+                .base_client
+                .get_or_init(&self.config, &self.default_headers);
+        }
+
+        if self.scoped_clients.is_empty() && self.global_client.is_none() {
+            return self
+                .base_client
+                .get_or_init(&self.config, &self.default_headers);
+        }
+
+        if let Some(entry) = self.match_scoped_entry(url) {
+            return entry.get_or_init(&self.config, &self.default_headers);
+        }
+
+        if let Some(ref entry) = self.global_client {
+            if self.is_trusted_host(url) {
+                return entry.get_or_init(&self.config, &self.default_headers);
+            }
+        }
+
+        self.base_client
+            .get_or_init(&self.config, &self.default_headers)
     }
 
     /// Returns the appropriate `reqwest::Client` for a target URL:
@@ -1628,29 +2281,11 @@ impl RegistryClient {
     ///   configured with the global identity is returned.
     /// - Otherwise, the unauthenticated client (no client certificate) is returned.
     pub fn client_for_url(&self, url: &Url) -> &Client {
-        if url.scheme() != "https" {
-            return &self.client;
-        }
-
-        if self.scoped_clients.is_empty() && self.global_client.is_none() {
-            return &self.client;
-        }
-
-        if let Some(client) = self.match_scoped_client(url) {
-            return client;
-        }
-
-        if let Some(ref client) = self.global_client {
-            if self.is_trusted_host(url) {
-                return client;
-            }
-        }
-
-        &self.client
+        self.try_client_for_url(url)
+            .expect("HTTP client initialization failed after config validation")
     }
 
-    /// Match a target URL against scoped TLS identities using longest-prefix-first precedence.
-    pub fn match_scoped_client(&self, url: &Url) -> Option<&Client> {
+    fn match_scoped_entry(&self, url: &Url) -> Option<&Arc<LazyHttpClient>> {
         if url.scheme() != "https" || self.scoped_clients.is_empty() {
             return None;
         }
@@ -1720,9 +2355,18 @@ impl RegistryClient {
         None
     }
 
-    /// Check whether a scoped TLS client matches the target URL.
+    /// Match a target URL against scoped TLS identities using longest-prefix-first precedence.
+    pub fn match_scoped_client(&self, url: &Url) -> Option<&Client> {
+        self.match_scoped_entry(url).map(|entry| {
+            entry
+                .get_or_init(&self.config, &self.default_headers)
+                .expect("Scoped HTTP client initialization failed after config validation")
+        })
+    }
+
+    /// Check whether a scoped TLS client matches the target URL without triggering client init.
     pub fn has_scoped_tls_for_url(&self, url: &Url) -> bool {
-        self.match_scoped_client(url).is_some()
+        self.match_scoped_entry(url).is_some()
     }
 
     /// Check whether a global TLS identity client is configured.
@@ -1739,6 +2383,24 @@ impl RegistryClient {
         if_none_match: Option<&str>,
     ) -> Result<(Response, OwnedSemaphorePermit), RegistryError> {
         let permit = self.acquire_permit().await?;
+        let resp = self
+            .execute_request_loop(method, initial_url, accept_header, if_none_match)
+            .await?;
+        Ok((resp, permit))
+    }
+
+    async fn execute_with_borrowed_permit(
+        &self,
+        method: Method,
+        initial_url: Url,
+        accept_header: Option<&str>,
+        if_none_match: Option<&str>,
+    ) -> Result<(Response, SemaphorePermit<'_>), RegistryError> {
+        let permit = self
+            .semaphore
+            .acquire()
+            .await
+            .map_err(|e| RegistryError::Other(e.to_string()))?;
         let resp = self
             .execute_request_loop(method, initial_url, accept_header, if_none_match)
             .await?;
@@ -1777,21 +2439,33 @@ impl RegistryClient {
         accept_header: Option<&str>,
         if_none_match: Option<&str>,
     ) -> Result<Response, RegistryError> {
-        let host_key = if let Some(port) = initial_url.port() {
-            format!("{}:{}", initial_url.host_str().unwrap_or_default(), port).to_ascii_lowercase()
+        let host_key = if self.config.circuit_breaker_enabled {
+            let hk = url_host_key(&initial_url);
+            let state = self.circuit_breaker.check_state(&hk).await;
+            if state == CircuitBreakerState::Open {
+                return Err(RegistryError::CircuitBreakerOpen {
+                    host: hk.into_owned(),
+                });
+            }
+            Some(hk)
         } else {
-            initial_url
-                .host_str()
-                .unwrap_or_default()
-                .to_ascii_lowercase()
+            None
         };
 
-        if self.config.circuit_breaker_enabled {
-            let state = self.circuit_breaker.check_state(&host_key).await;
-            if state == CircuitBreakerState::Open {
-                return Err(RegistryError::CircuitBreakerOpen { host: host_key });
+        let initial_auth = if self.has_any_auth && self.is_trusted_target(&initial_url, &initial_url)
+        {
+            if !self.has_scoped_auth {
+                self.bearer_auth_header.clone().or_else(|| {
+                    self.auth_header_for_url(&initial_url)
+                        .and_then(|s| HeaderValue::from_str(&s).ok())
+                })
+            } else {
+                self.auth_header_for_url(&initial_url)
+                    .and_then(|s| HeaderValue::from_str(&s).ok())
             }
-        }
+        } else {
+            None
+        };
 
         let mut attempt = 0;
 
@@ -1799,14 +2473,14 @@ impl RegistryClient {
             let mut current_url = initial_url.clone();
             let mut current_method = method.clone();
             let mut redirect_count = 0;
-            let mut seen_redirect_urls: HashSet<Url> = HashSet::new();
-            seen_redirect_urls.insert(current_url.clone());
+            let mut seen_redirect_urls: Option<HashSet<Url>> = None;
 
             let response_result: Result<Response, RegistryError> = loop {
-                let client = self.client_for_url(&current_url);
-                let mut req = client
-                    .request(current_method.clone(), current_url.clone())
-                    .header(USER_AGENT, self.user_agent.clone());
+                let client = match self.try_client_for_url(&current_url) {
+                    Ok(c) => c,
+                    Err(e) => break Err(e),
+                };
+                let mut req = client.request(current_method.clone(), current_url.clone());
 
                 if let Some(accept) = accept_header {
                     req = req.header(ACCEPT, accept);
@@ -1817,17 +2491,27 @@ impl RegistryClient {
                 }
 
                 // Security check: only send auth headers if the target is trusted (same origin or in trusted_hosts)
-                let should_send_auth = self.is_trusted_target(&initial_url, &current_url);
-
-                if should_send_auth {
-                    if let Some(auth) = self.auth_header_for_url(&current_url) {
-                        req = req.header(AUTHORIZATION, auth);
+                if self.has_any_auth {
+                    if redirect_count == 0 {
+                        if let Some(ref auth) = initial_auth {
+                            req = req.header(AUTHORIZATION, auth.clone());
+                        }
+                    } else if self.is_trusted_target(&initial_url, &current_url) {
+                        if !self.has_scoped_auth {
+                            if let Some(ref bearer) = self.bearer_auth_header {
+                                req = req.header(AUTHORIZATION, bearer.clone());
+                            } else if let Some(auth) = self.auth_header_for_url(&current_url) {
+                                req = req.header(AUTHORIZATION, auth);
+                            }
+                        } else if let Some(auth) = self.auth_header_for_url(&current_url) {
+                            req = req.header(AUTHORIZATION, auth);
+                        }
+                    } else {
+                        debug!(
+                            "Stripping Authorization header on redirect from '{}' to untrusted '{}'",
+                            initial_url, current_url
+                        );
                     }
-                } else {
-                    debug!(
-                        "Stripping Authorization header on redirect from '{}' to untrusted '{}'",
-                        initial_url, current_url
-                    );
                 }
 
                 track_http_request(&current_method, &current_url);
@@ -1866,7 +2550,7 @@ impl RegistryClient {
                                 ))
                             }
                         };
-                        if loc_str.contains('\r') || loc_str.contains('\n') {
+                        if loc_str.as_bytes().iter().any(|&b| b == b'\r' || b == b'\n') {
                             break Err(RegistryError::SecurityViolation(
                                 "Location header contains forbidden CR/LF characters".into(),
                             ));
@@ -1875,13 +2559,21 @@ impl RegistryClient {
                             Ok(u) => u,
                             Err(e) => break Err(RegistryError::UrlParse(e)),
                         };
-                        let next_scheme = next_url.scheme().to_ascii_lowercase();
-                        if next_scheme != "http" && next_scheme != "https" {
+                        let next_scheme = next_url.scheme();
+                        if !next_scheme.eq_ignore_ascii_case("http")
+                            && !next_scheme.eq_ignore_ascii_case("https")
+                        {
                             break Err(RegistryError::SecurityViolation(format!(
-                                "Redirect to unsupported scheme '{next_scheme}': only http and https are allowed"
+                                "Redirect to unsupported scheme '{}': only http and https are allowed",
+                                next_scheme.to_ascii_lowercase()
                             )));
                         }
-                        if !seen_redirect_urls.insert(next_url.clone()) {
+                        let seen = seen_redirect_urls.get_or_insert_with(|| {
+                            let mut set = HashSet::with_capacity(4);
+                            set.insert(initial_url.clone());
+                            set
+                        });
+                        if !seen.insert(next_url.clone()) {
                             break Err(RegistryError::SecurityViolation(format!(
                                 "Redirect loop detected: '{next_url}' was visited more than once"
                             )));
@@ -1903,6 +2595,14 @@ impl RegistryClient {
             match response_result {
                 Ok(resp) => {
                     let status = resp.status();
+                    if !self.has_non_error_retry_status
+                        && (status.is_success() || status == StatusCode::NOT_MODIFIED)
+                    {
+                        if let Some(ref hk) = host_key {
+                            self.circuit_breaker.record_success(hk).await;
+                        }
+                        return Ok(resp);
+                    }
 
                     // Check for retryable HTTP status codes (429, 502, 503, 504)
                     let is_rate_limited = status == StatusCode::TOO_MANY_REQUESTS;
@@ -1936,8 +2636,8 @@ impl RegistryClient {
                             attempt += 1;
                             continue;
                         } else {
-                            if self.config.circuit_breaker_enabled {
-                                self.circuit_breaker.record_failure(&host_key).await;
+                            if let Some(ref hk) = host_key {
+                                self.circuit_breaker.record_failure(hk).await;
                             }
                             return Err(RegistryError::RateLimited {
                                 retry_after: retry_after_secs,
@@ -1970,15 +2670,15 @@ impl RegistryClient {
                             attempt += 1;
                             continue;
                         } else {
-                            if self.config.circuit_breaker_enabled {
-                                self.circuit_breaker.record_failure(&host_key).await;
+                            if let Some(ref hk) = host_key {
+                                self.circuit_breaker.record_failure(hk).await;
                             }
                             return Ok(resp);
                         }
                     }
 
-                    if self.config.circuit_breaker_enabled {
-                        self.circuit_breaker.record_success(&host_key).await;
+                    if let Some(ref hk) = host_key {
+                        self.circuit_breaker.record_success(hk).await;
                     }
                     return Ok(resp);
                 }
@@ -1998,8 +2698,10 @@ impl RegistryClient {
                         attempt += 1;
                         continue;
                     } else {
-                        if self.config.circuit_breaker_enabled && err.is_transient() {
-                            self.circuit_breaker.record_failure(&host_key).await;
+                        if let Some(ref hk) = host_key {
+                            if err.is_transient() {
+                                self.circuit_breaker.record_failure(hk).await;
+                            }
                         }
                         return Err(err);
                     }
@@ -2019,28 +2721,25 @@ impl RegistryClient {
         body: Vec<u8>,
     ) -> Result<Response, RegistryError> {
         if let Some(otp_code) = otp {
-            if otp_code.contains('\r') || otp_code.contains('\n') {
+            if otp_code.as_bytes().iter().any(|&b| b == b'\r' || b == b'\n') {
                 return Err(RegistryError::SecurityViolation(
                     "OTP code contains forbidden CR/LF characters".into(),
                 ));
             }
         }
 
-        let host_key = if let Some(port) = initial_url.port() {
-            format!("{}:{}", initial_url.host_str().unwrap_or_default(), port).to_ascii_lowercase()
-        } else {
-            initial_url
-                .host_str()
-                .unwrap_or_default()
-                .to_ascii_lowercase()
-        };
-
-        if self.config.circuit_breaker_enabled {
-            let state = self.circuit_breaker.check_state(&host_key).await;
+        let host_key = if self.config.circuit_breaker_enabled {
+            let hk = url_host_key(&initial_url);
+            let state = self.circuit_breaker.check_state(&hk).await;
             if state == CircuitBreakerState::Open {
-                return Err(RegistryError::CircuitBreakerOpen { host: host_key });
+                return Err(RegistryError::CircuitBreakerOpen {
+                    host: hk.into_owned(),
+                });
             }
-        }
+            Some(hk)
+        } else {
+            None
+        };
 
         let mut attempt = 0;
 
@@ -2050,14 +2749,14 @@ impl RegistryClient {
             let mut current_body = body.clone();
             let mut current_content_type = content_type;
             let mut redirect_count = 0;
-            let mut seen_redirect_urls: HashSet<Url> = HashSet::new();
-            seen_redirect_urls.insert(current_url.clone());
+            let mut seen_redirect_urls: Option<HashSet<Url>> = None;
 
             let response_result: Result<Response, RegistryError> = loop {
-                let client = self.client_for_url(&current_url);
-                let mut req = client
-                    .request(current_method.clone(), current_url.clone())
-                    .header(USER_AGENT, self.user_agent.clone());
+                let client = match self.try_client_for_url(&current_url) {
+                    Ok(c) => c,
+                    Err(e) => break Err(e),
+                };
+                let mut req = client.request(current_method.clone(), current_url.clone());
 
                 if let Some(ct) = current_content_type {
                     req = req.header(CONTENT_TYPE, ct);
@@ -2069,23 +2768,31 @@ impl RegistryClient {
 
                 // Security check: only send auth headers if the target is trusted (same origin or in trusted_hosts),
                 // and ONLY send npm-otp to the exact initial origin (an OTP belongs strictly to the origin it was issued for).
-                let should_send_auth = self.is_trusted_target(&initial_url, &current_url);
-                let is_same_origin = self.is_same_origin(&initial_url, &current_url);
-
-                if should_send_auth {
-                    if let Some(auth) = self.auth_header_for_url(&current_url) {
-                        req = req.header(AUTHORIZATION, auth);
-                    }
-                    if is_same_origin {
-                        if let Some(otp_code) = otp {
-                            req = req.header("npm-otp", otp_code);
+                if self.has_any_auth || otp.is_some() {
+                    let should_send_auth = self.is_trusted_target(&initial_url, &current_url);
+                    if should_send_auth {
+                        if self.has_any_auth {
+                            if !self.has_scoped_auth {
+                                if let Some(ref bearer) = self.bearer_auth_header {
+                                    req = req.header(AUTHORIZATION, bearer.clone());
+                                } else if let Some(auth) = self.auth_header_for_url(&current_url) {
+                                    req = req.header(AUTHORIZATION, auth);
+                                }
+                            } else if let Some(auth) = self.auth_header_for_url(&current_url) {
+                                req = req.header(AUTHORIZATION, auth);
+                            }
                         }
+                        if let Some(otp_code) = otp {
+                            if self.is_same_origin(&initial_url, &current_url) {
+                                req = req.header("npm-otp", otp_code);
+                            }
+                        }
+                    } else {
+                        debug!(
+                            "Stripping Authorization and OTP headers on redirect from '{}' to untrusted '{}'",
+                            initial_url, current_url
+                        );
                     }
-                } else {
-                    debug!(
-                        "Stripping Authorization and OTP headers on redirect from '{}' to untrusted '{}'",
-                        initial_url, current_url
-                    );
                 }
 
                 if current_method != Method::GET && current_method != Method::HEAD {
@@ -2130,7 +2837,7 @@ impl RegistryClient {
                                 ))
                             }
                         };
-                        if loc_str.contains('\r') || loc_str.contains('\n') {
+                        if loc_str.as_bytes().iter().any(|&b| b == b'\r' || b == b'\n') {
                             break Err(RegistryError::SecurityViolation(
                                 "Location header contains forbidden CR/LF characters".into(),
                             ));
@@ -2139,13 +2846,21 @@ impl RegistryClient {
                             Ok(u) => u,
                             Err(e) => break Err(RegistryError::UrlParse(e)),
                         };
-                        let next_scheme = next_url.scheme().to_ascii_lowercase();
-                        if next_scheme != "http" && next_scheme != "https" {
+                        let next_scheme = next_url.scheme();
+                        if !next_scheme.eq_ignore_ascii_case("http")
+                            && !next_scheme.eq_ignore_ascii_case("https")
+                        {
                             break Err(RegistryError::SecurityViolation(format!(
-                                "Redirect to unsupported scheme '{next_scheme}': only http and https are allowed"
+                                "Redirect to unsupported scheme '{}': only http and https are allowed",
+                                next_scheme.to_ascii_lowercase()
                             )));
                         }
-                        if !seen_redirect_urls.insert(next_url.clone()) {
+                        let seen = seen_redirect_urls.get_or_insert_with(|| {
+                            let mut set = HashSet::with_capacity(4);
+                            set.insert(initial_url.clone());
+                            set
+                        });
+                        if !seen.insert(next_url.clone()) {
                             break Err(RegistryError::SecurityViolation(format!(
                                 "Redirect loop detected: '{next_url}' was visited more than once"
                             )));
@@ -2199,8 +2914,8 @@ impl RegistryClient {
                             attempt += 1;
                             continue;
                         } else {
-                            if self.config.circuit_breaker_enabled {
-                                self.circuit_breaker.record_failure(&host_key).await;
+                            if let Some(ref hk) = host_key {
+                                self.circuit_breaker.record_failure(hk).await;
                             }
                             return Err(RegistryError::RateLimited {
                                 retry_after: retry_after_secs,
@@ -2233,15 +2948,15 @@ impl RegistryClient {
                             attempt += 1;
                             continue;
                         } else {
-                            if self.config.circuit_breaker_enabled {
-                                self.circuit_breaker.record_failure(&host_key).await;
+                            if let Some(ref hk) = host_key {
+                                self.circuit_breaker.record_failure(hk).await;
                             }
                             return Ok(resp);
                         }
                     }
 
-                    if self.config.circuit_breaker_enabled {
-                        self.circuit_breaker.record_success(&host_key).await;
+                    if let Some(ref hk) = host_key {
+                        self.circuit_breaker.record_success(hk).await;
                     }
                     return Ok(resp);
                 }
@@ -2260,8 +2975,10 @@ impl RegistryClient {
                         attempt += 1;
                         continue;
                     } else {
-                        if self.config.circuit_breaker_enabled && err.is_transient() {
-                            self.circuit_breaker.record_failure(&host_key).await;
+                        if let Some(ref hk) = host_key {
+                            if err.is_transient() {
+                                self.circuit_breaker.record_failure(hk).await;
+                            }
                         }
                         return Err(err);
                     }
@@ -2458,6 +3175,446 @@ impl RegistryClient {
         }
     }
 
+    /// Canonical representation-specific cache key for a package (`{url}::abbrev` vs `{url}::full`).
+    /// Keeps abbreviated (`application/vnd.npm.install-v1+json`) and full (`application/json`) entries
+    /// and ETags strictly isolated.
+    pub fn packument_cache_key(
+        &self,
+        package_name: &str,
+        representation: PackumentRepresentation,
+    ) -> Result<String, RegistryError> {
+        let url = self.package_metadata_url(package_name)?;
+        Ok(format!(
+            "{}::{}",
+            url.as_str(),
+            representation.cache_key_suffix()
+        ))
+    }
+
+    /// Return the cached ETag for `(package_name, representation)` if stored in memory.
+    pub fn cached_packument_etag(
+        &self,
+        package_name: &str,
+        representation: PackumentRepresentation,
+    ) -> Option<String> {
+        let url = self.package_metadata_url(package_name).ok()?;
+        let key = PackumentCacheKey {
+            url: url.as_str().to_owned(),
+            representation,
+        };
+        let guard = self
+            .packument_cache
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
+        guard.get(&key).and_then(|e| e.etag.clone())
+    }
+
+    /// Return the cached `(etag, metadata)` pair for `(package_name, representation)` if present.
+    pub fn cached_packument(
+        &self,
+        package_name: &str,
+        representation: PackumentRepresentation,
+    ) -> Option<(Option<String>, AbbreviatedPackageMetadata)> {
+        let url = self.package_metadata_url(package_name).ok()?;
+        let key = PackumentCacheKey {
+            url: url.as_str().to_owned(),
+            representation,
+        };
+        let guard = self
+            .packument_cache
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
+        guard
+            .get(&key)
+            .map(|e| (e.etag.clone(), e.metadata.clone()))
+    }
+
+    fn store_cached_packument(
+        &self,
+        url: &Url,
+        representation: PackumentRepresentation,
+        etag: Option<&str>,
+        metadata: &AbbreviatedPackageMetadata,
+        cache_metadata: &serde_json::Value,
+    ) {
+        const MAX_PACKUMENT_CACHE_ENTRIES: usize = 1024;
+        let no_store = cache_metadata
+            .pointer("/response/headers/cache-control")
+            .and_then(|v| v.as_str())
+            .is_some_and(|cc| {
+                cc.split(',')
+                    .any(|directive| directive.trim().eq_ignore_ascii_case("no-store"))
+            });
+        if no_store {
+            return;
+        }
+        let key = PackumentCacheKey {
+            url: url.as_str().to_owned(),
+            representation,
+        };
+        let mut guard = self
+            .packument_cache
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
+        if guard.len() >= MAX_PACKUMENT_CACHE_ENTRIES && !guard.contains_key(&key) {
+            if let Some(evict_key) = guard.keys().next().cloned() {
+                guard.remove(&evict_key);
+            }
+        }
+        guard.insert(
+            key,
+            CachedPackumentEntry {
+                etag: etag.map(str::to_owned),
+                metadata: metadata.clone(),
+                cache_metadata: cache_metadata.clone(),
+            },
+        );
+    }
+
+    /// Clear all cached packument representations held in memory.
+    pub fn clear_packument_cache(&self) {
+        self.packument_cache
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+    }
+
+    /// Negotiate packument metadata using representation-specific ETags and automatic fallback.
+    ///
+    /// - Requests `application/vnd.npm.install-v1+json` (`NPM_INSTALL_ACCEPT`) by default.
+    /// - When `options.require_publish_times` (`--before`) or `options.require_full_fields` is set,
+    ///   negotiates the full packument (`application/json`) cleanly under its separate cache key & ETag.
+    /// - Revalidates against representation-specific cached ETag via `If-None-Match` and serves `304`
+    ///   without re-parsing or overwriting the other representation's cache entry.
+    pub async fn get_package_metadata_negotiated(
+        &self,
+        package_name: &str,
+        options: PackumentFetchOptions,
+    ) -> Result<AbbreviatedPackageMetadata, RegistryError> {
+        let url = self.package_metadata_url(package_name)?;
+        let target_repr = options.effective_representation();
+        let cached_etag = {
+            let key = PackumentCacheKey {
+                url: url.as_str().to_owned(),
+                representation: target_repr,
+            };
+            let guard = self
+                .packument_cache
+                .read()
+                .unwrap_or_else(|e| e.into_inner());
+            guard.get(&key).and_then(|c| c.etag.clone())
+        };
+
+        match self
+            .get_package_metadata_negotiated_conditional_at_url(
+                package_name,
+                &url,
+                cached_etag.as_deref(),
+                options,
+            )
+            .await?
+        {
+            MetadataFetchResult::Fresh { metadata, .. } => Ok(metadata),
+            MetadataFetchResult::NotModified { etag, cache_metadata } => {
+                let key = PackumentCacheKey {
+                    url: url.as_str().to_owned(),
+                    representation: target_repr,
+                };
+                let cached_meta = {
+                    let mut guard = self
+                        .packument_cache
+                        .write()
+                        .unwrap_or_else(|e| e.into_inner());
+                    guard.get_mut(&key).map(|entry| {
+                        if etag.is_some() {
+                            entry.etag = etag;
+                        }
+                        entry.cache_metadata = cache_metadata;
+                        entry.metadata.clone()
+                    })
+                };
+                if let Some(metadata) = cached_meta {
+                    Ok(metadata)
+                } else {
+                    match self
+                        .get_package_metadata_negotiated_conditional_at_url(
+                            package_name,
+                            &url,
+                            None,
+                            options,
+                        )
+                        .await?
+                    {
+                        MetadataFetchResult::Fresh { metadata, .. } => Ok(metadata),
+                        MetadataFetchResult::NotModified { .. } => Err(RegistryError::Other(
+                            "Unexpected 304 Not Modified response for uncached request".into(),
+                        )),
+                    }
+                }
+            }
+        }
+    }
+
+    /// Fetch negotiated metadata with caller-supplied conditional `If-None-Match` ETag and
+    /// representation-isolated fallback to full JSON (`application/json`).
+    pub async fn get_package_metadata_negotiated_conditional(
+        &self,
+        package_name: &str,
+        if_none_match: Option<&str>,
+        options: PackumentFetchOptions,
+    ) -> Result<MetadataFetchResult, RegistryError> {
+        let url = self.package_metadata_url(package_name)?;
+        self.get_package_metadata_negotiated_conditional_at_url(
+            package_name,
+            &url,
+            if_none_match,
+            options,
+        )
+        .await
+    }
+
+    async fn get_package_metadata_negotiated_conditional_at_url(
+        &self,
+        package_name: &str,
+        url: &Url,
+        if_none_match: Option<&str>,
+        options: PackumentFetchOptions,
+    ) -> Result<MetadataFetchResult, RegistryError> {
+        let target_repr = options.effective_representation();
+        let accept = target_repr.accept_header();
+
+        let res = self
+            .get_package_metadata_from_url_conditional_with_accept(
+                package_name,
+                url.clone(),
+                if_none_match,
+                accept,
+            )
+            .await;
+
+        let mut stored_repr = target_repr;
+        let final_res = match res {
+            // Never reuse an abbreviated ETag when falling back to Full!
+            Err(RegistryError::PackageNotFound { .. })
+            | Err(RegistryError::ServerError {
+                status: 406 | 415, ..
+            }) if target_repr == PackumentRepresentation::Abbreviated => {
+                stored_repr = PackumentRepresentation::Full;
+                let full_etag = {
+                    let key = PackumentCacheKey {
+                        url: url.as_str().to_owned(),
+                        representation: PackumentRepresentation::Full,
+                    };
+                    self.packument_cache
+                        .read()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .get(&key)
+                        .and_then(|c| c.etag.clone())
+                };
+                self.get_package_metadata_from_url_conditional_with_accept(
+                    package_name,
+                    url.clone(),
+                    full_etag.as_deref(),
+                    "application/json",
+                )
+                .await?
+            }
+            other => other?,
+        };
+
+        if let MetadataFetchResult::Fresh {
+            ref metadata,
+            ref etag,
+            ref cache_metadata,
+        } = final_res
+        {
+            // Store under `stored_repr` (the representation/parse_mode actually produced),
+            // so Install-parsed responses never poison the Full slot even if the server replied
+            // with `Content-Type: application/json`.
+            self.store_cached_packument(
+                url,
+                stored_repr,
+                etag.as_deref(),
+                metadata,
+                cache_metadata,
+            );
+        }
+
+        Ok(final_res)
+    }
+
+    /// Try abbreviated negotiation first and fall back to full packument whenever `needs_full` returns `true`
+    /// (for example when abbreviated metadata omits `time` for `--before` or omits `license`/`scripts`).
+    pub async fn get_package_metadata_with_full_fallback<F>(
+        &self,
+        package_name: &str,
+        if_none_match: Option<&str>,
+        needs_full: F,
+    ) -> Result<MetadataFetchResult, RegistryError>
+    where
+        F: FnOnce(&AbbreviatedPackageMetadata) -> bool,
+    {
+        let url = self.package_metadata_url(package_name)?;
+        let res = self
+            .get_package_metadata_negotiated_conditional_at_url(
+                package_name,
+                &url,
+                if_none_match,
+                PackumentFetchOptions::abbreviated(),
+            )
+            .await?;
+
+        if let MetadataFetchResult::Fresh { ref metadata, .. } = res {
+            if needs_full(metadata) {
+                let full_etag = {
+                    let key = PackumentCacheKey {
+                        url: url.as_str().to_owned(),
+                        representation: PackumentRepresentation::Full,
+                    };
+                    self.packument_cache
+                        .read()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .get(&key)
+                        .and_then(|c| c.etag.clone())
+                };
+                let fb_res = self
+                    .get_package_metadata_negotiated_conditional_at_url(
+                        package_name,
+                        &url,
+                        full_etag.as_deref(),
+                        PackumentFetchOptions::full(),
+                    )
+                    .await?;
+                if let MetadataFetchResult::NotModified {
+                    etag,
+                    cache_metadata,
+                } = fb_res
+                {
+                    let key = PackumentCacheKey {
+                        url: url.as_str().to_owned(),
+                        representation: PackumentRepresentation::Full,
+                    };
+                    let cached_full = {
+                        let mut guard = self
+                            .packument_cache
+                            .write()
+                            .unwrap_or_else(|e| e.into_inner());
+                        guard.get_mut(&key).map(|entry| {
+                            if etag.is_some() {
+                                entry.etag = etag.clone();
+                            }
+                            entry.cache_metadata = cache_metadata.clone();
+                            (entry.etag.clone(), entry.metadata.clone())
+                        })
+                    };
+                    if let Some((cached_etag, cached_meta)) = cached_full {
+                        return Ok(MetadataFetchResult::Fresh {
+                            metadata: cached_meta,
+                            etag: cached_etag,
+                            cache_metadata,
+                        });
+                    }
+                    return self
+                        .get_package_metadata_negotiated_conditional_at_url(
+                            package_name,
+                            &url,
+                            None,
+                            PackumentFetchOptions::full(),
+                        )
+                        .await;
+                }
+                return Ok(fb_res);
+            }
+        }
+        Ok(res)
+    }
+
+    /// Concurrently fetch negotiated packuments with representation-specific ETags and full fallback.
+    pub async fn get_package_metadata_negotiated_concurrent<S: AsRef<str>>(
+        &self,
+        packages: &[(S, Option<String>)],
+        options: PackumentFetchOptions,
+    ) -> Vec<Result<MetadataFetchResult, RegistryError>> {
+        let mut key_to_group: HashMap<(&str, Option<&str>), usize> =
+            HashMap::with_capacity(packages.len());
+        let mut groups: Vec<(usize, Vec<usize>)> = Vec::with_capacity(packages.len());
+        for (idx, (pkg, if_none_match)) in packages.iter().enumerate() {
+            let key = (pkg.as_ref(), if_none_match.as_deref());
+            if let Some(&grp) = key_to_group.get(&key) {
+                groups[grp].1.push(idx);
+            } else {
+                let grp = groups.len();
+                key_to_group.insert(key, grp);
+                groups.push((idx, Vec::new()));
+            }
+        }
+
+        let mut join_set = tokio::task::JoinSet::new();
+        for (first_idx, dup_indices) in groups {
+            let client = self.clone();
+            let (pkg, if_none_match) = &packages[first_idx];
+            let name = pkg.as_ref().to_string();
+            let etag = if_none_match.clone();
+            join_set.spawn(async move {
+                let res = client
+                    .get_package_metadata_negotiated_conditional(&name, etag.as_deref(), options)
+                    .await;
+                if dup_indices.is_empty() {
+                    return vec![(first_idx, res)];
+                }
+                let mut out = Vec::with_capacity(1 + dup_indices.len());
+                match res {
+                    Ok(val) => {
+                        for dup_idx in dup_indices {
+                            out.push((dup_idx, Ok(val.clone())));
+                        }
+                        out.push((first_idx, Ok(val)));
+                    }
+                    Err(err) => {
+                        if clone_clonable_registry_error(&err).is_some() {
+                            for dup_idx in dup_indices {
+                                let c = clone_clonable_registry_error(&err).unwrap();
+                                out.push((dup_idx, Err(c)));
+                            }
+                            out.push((first_idx, Err(err)));
+                        } else {
+                            for dup_idx in dup_indices {
+                                out.push((
+                                    dup_idx,
+                                    client
+                                        .get_package_metadata_negotiated_conditional(
+                                            &name,
+                                            etag.as_deref(),
+                                            options,
+                                        )
+                                        .await,
+                                ));
+                            }
+                            out.push((first_idx, Err(err)));
+                        }
+                    }
+                }
+                out
+            });
+        }
+
+        let mut results: Vec<Option<Result<MetadataFetchResult, RegistryError>>> =
+            (0..packages.len()).map(|_| None).collect();
+
+        while let Some(res) = join_set.join_next().await {
+            if let Ok(items) = res {
+                for (idx, result) in items {
+                    results[idx] = Some(result);
+                }
+            }
+        }
+
+        results
+            .into_iter()
+            .map(|r| r.unwrap_or_else(|| Err(RegistryError::Other("Task cancelled".into()))))
+            .collect()
+    }
+
     /// Arborist resolves manifests from full packuments, including lockfile
     /// fields absent from the abbreviated install representation.
     pub async fn get_package_metadata_full_conditional(
@@ -2480,18 +3637,66 @@ impl RegistryClient {
         package_name: &str,
         url: Url,
         if_none_match: Option<&str>,
+        accept_header: &'static str,
+    ) -> Result<MetadataFetchResult, RegistryError> {
+        let key = Arc::new(MetadataInFlightKey {
+            url,
+            accept: Cow::Borrowed(accept_header),
+            if_none_match: if_none_match.map(str::to_owned),
+            package_name: package_name.to_owned(),
+        });
+
+        match self.in_flight_metadata.join_or_lead(Arc::clone(&key)) {
+            Ok(leader) => {
+                let res = self
+                    .get_package_metadata_from_url_conditional_with_accept_inner(
+                        package_name,
+                        &key.url,
+                        if_none_match,
+                        accept_header,
+                    )
+                    .await;
+                leader.finish(&res, Clone::clone);
+                return res;
+            }
+            Err(slot) => {
+                if let Some(coalesced) = wait_for_coalesced(&slot, Clone::clone).await {
+                    return coalesced;
+                }
+            }
+        }
+        // Leader dropped before publishing or returned a non-clonable error: fall back cleanly.
+        self.get_package_metadata_from_url_conditional_with_accept_inner(
+            package_name,
+            &key.url,
+            if_none_match,
+            accept_header,
+        )
+        .await
+    }
+
+    async fn get_package_metadata_from_url_conditional_with_accept_inner(
+        &self,
+        package_name: &str,
+        url: &Url,
+        if_none_match: Option<&str>,
         accept_header: &str,
     ) -> Result<MetadataFetchResult, RegistryError> {
-        let host_key = if let Some(port) = url.port() {
-            format!("{}:{}", url.host_str().unwrap_or_default(), port).to_ascii_lowercase()
-        } else {
-            url.host_str().unwrap_or_default().to_ascii_lowercase()
-        };
+        let host_key = self
+            .config
+            .circuit_breaker_enabled
+            .then(|| url_host_key(url));
 
         let mut stream_attempt = 0;
+        let mut idle_sleep = std::pin::pin!(tokio::time::sleep(Duration::ZERO));
         loop {
-            let (mut resp, _permit) = self
-                .execute_with_permit(Method::GET, url.clone(), Some(accept_header), if_none_match)
+            let (mut resp, permit) = self
+                .execute_with_borrowed_permit(
+                    Method::GET,
+                    url.clone(),
+                    Some(accept_header),
+                    if_none_match,
+                )
                 .await?;
 
             let status = resp.status();
@@ -2573,33 +3778,28 @@ impl RegistryClient {
             if let Some(content_length) = expected_content_length {
                 if content_length > self.config.max_metadata_size as u64 {
                     return Err(RegistryError::SizeLimitExceeded {
-                    limit: self.config.max_metadata_size as u64,
-                    actual: content_length,
-                    message: format!("Metadata Content-Length for package '{package_name}' exceeds maximum metadata size"),
-                });
+                        limit: self.config.max_metadata_size as u64,
+                        actual: content_length,
+                        message: format!(
+                            "Metadata Content-Length for package '{package_name}' exceeds maximum metadata size"
+                        ),
+                    });
                 }
             }
 
-            let mut bytes = if let Some(content_length) = expected_content_length {
-                Vec::with_capacity((content_length as usize).min(self.config.max_metadata_size))
-            } else {
-                Vec::new()
-            };
+            let mut bytes = Vec::new();
             let mut stream_err: Option<RegistryError> = None;
             loop {
-                let chunk_res =
-                    tokio::time::timeout(self.config.chunk_idle_timeout, resp.chunk()).await;
-
-                let chunk_opt = match chunk_res {
-                    Ok(Ok(chunk)) => chunk,
-                    Ok(Err(e)) => {
-                        stream_err = Some(RegistryError::Http(e));
-                        break;
-                    }
-                    Err(_) => {
-                        stream_err = Some(RegistryError::SlowlorisTimeout(
-                            self.config.chunk_idle_timeout,
-                        ));
+                let chunk_opt = match next_chunk_with_idle_timeout(
+                    &mut resp,
+                    self.config.chunk_idle_timeout,
+                    &mut idle_sleep,
+                )
+                .await
+                {
+                    Ok(opt) => opt,
+                    Err(e) => {
+                        stream_err = Some(e);
                         break;
                     }
                 };
@@ -2608,10 +3808,23 @@ impl RegistryClient {
                     Some(chunk) => {
                         if bytes.len() + chunk.len() > self.config.max_metadata_size {
                             return Err(RegistryError::SizeLimitExceeded {
-                            limit: self.config.max_metadata_size as u64,
-                            actual: (bytes.len() + chunk.len()) as u64,
-                            message: format!("Metadata payload for package '{package_name}' exceeds maximum metadata size"),
-                        });
+                                limit: self.config.max_metadata_size as u64,
+                                actual: (bytes.len() + chunk.len()) as u64,
+                                message: format!(
+                                    "Metadata payload for package '{package_name}' exceeds maximum metadata size"
+                                ),
+                            });
+                        }
+                        if bytes.is_empty() {
+                            if Some(chunk.len() as u64) == expected_content_length {
+                                bytes = Vec::from(chunk);
+                                continue;
+                            }
+                            if let Some(content_length) = expected_content_length {
+                                bytes.reserve(
+                                    (content_length as usize).min(self.config.max_metadata_size),
+                                );
+                            }
                         }
                         bytes.extend_from_slice(&chunk);
                     }
@@ -2619,19 +3832,24 @@ impl RegistryClient {
                 }
             }
 
+            // Release network concurrency slot now that socket reading finished (or errored)
+            drop(permit);
+
             if let Some(err) = stream_err {
                 if err.is_transient() && stream_attempt < self.config.max_retries {
                     let delay = self.calculate_backoff(stream_attempt);
                     debug!(
-                    "Stream metadata error {:?} for {}, retrying stream in {:?} (attempt {}/{})",
-                    err, url, delay, stream_attempt + 1, self.config.max_retries
-                );
+                        "Stream metadata error {:?} for {}, retrying stream in {:?} (attempt {}/{})",
+                        err, url, delay, stream_attempt + 1, self.config.max_retries
+                    );
                     tokio::time::sleep(delay).await;
                     stream_attempt += 1;
                     continue;
                 } else {
-                    if self.config.circuit_breaker_enabled && err.is_transient() {
-                        self.circuit_breaker.record_failure(&host_key).await;
+                    if let Some(ref hk) = host_key {
+                        if err.is_transient() {
+                            self.circuit_breaker.record_failure(hk).await;
+                        }
                     }
                     return Err(err);
                 }
@@ -2661,20 +3879,14 @@ impl RegistryClient {
                     PackumentParseMode::Full
                 };
 
-            let metadata = if bytes.len() > 64 * 1024 {
-                tokio::task::spawn_blocking(move || {
-                    let meta = parse_packument_with_mode(&bytes, parse_mode)?;
-                    meta.validate()?;
-                    Ok::<_, RegistryError>(meta)
-                })
-                .await
-                .map_err(|e| {
-                    RegistryError::Other(format!("Failed to join packument parsing task: {e}"))
-                })??
+            let metadata = if bytes.len() > 512 * 1024 {
+                tokio::task::spawn_blocking(move || parse_packument_with_mode(&bytes, parse_mode))
+                    .await
+                    .map_err(|e| {
+                        RegistryError::Other(format!("Failed to join packument parsing task: {e}"))
+                    })??
             } else {
-                let meta = parse_packument_with_mode(&bytes, parse_mode)?;
-                meta.validate()?;
-                meta
+                parse_packument_with_mode(&bytes, parse_mode)?
             };
             return Ok(MetadataFetchResult::Fresh {
                 metadata,
@@ -2775,42 +3987,104 @@ impl RegistryClient {
         packages: &[(S, Option<String>)],
         accept: &'static str,
     ) -> Vec<Result<MetadataFetchResult, RegistryError>> {
-        let mut join_set = tokio::task::JoinSet::new();
+        let mut key_to_group: HashMap<(&str, Option<&str>), usize> =
+            HashMap::with_capacity(packages.len());
+        let mut groups: Vec<(usize, Vec<usize>)> = Vec::with_capacity(packages.len());
         for (idx, (pkg, if_none_match)) in packages.iter().enumerate() {
+            let key = (pkg.as_ref(), if_none_match.as_deref());
+            if let Some(&grp) = key_to_group.get(&key) {
+                groups[grp].1.push(idx);
+            } else {
+                let grp = groups.len();
+                key_to_group.insert(key, grp);
+                groups.push((idx, Vec::new()));
+            }
+        }
+
+        let mut join_set = tokio::task::JoinSet::new();
+        for (first_idx, dup_indices) in groups {
             let client = self.clone();
+            let (pkg, if_none_match) = &packages[first_idx];
             let name = pkg.as_ref().to_string();
             let etag = if_none_match.clone();
             join_set.spawn(async move {
-                let res = match client.package_metadata_url(&name) {
-                    Ok(url) => {
-                        match client
-                            .get_package_metadata_from_url_conditional_with_accept(
-                                &name,
-                                url.clone(),
-                                etag.as_deref(),
-                                accept,
-                            )
-                            .await
-                        {
-                            Err(RegistryError::PackageNotFound { .. })
-                            | Err(RegistryError::ServerError {
-                                status: 406 | 415, ..
-                            }) if accept != "application/json" => {
-                                client
-                                    .get_package_metadata_from_url_conditional_with_accept(
-                                        &name,
-                                        url,
-                                        etag.as_deref(),
-                                        "application/json",
-                                    )
-                                    .await
+                let fetch_one = || async {
+                    match client.package_metadata_url(&name) {
+                        Ok(url) => {
+                            match client
+                                .get_package_metadata_from_url_conditional_with_accept(
+                                    &name,
+                                    url.clone(),
+                                    etag.as_deref(),
+                                    accept,
+                                )
+                                .await
+                            {
+                                Err(RegistryError::PackageNotFound { .. })
+                                | Err(RegistryError::ServerError {
+                                    status: 406 | 415, ..
+                                }) if accept != "application/json" => {
+                                    client
+                                        .get_package_metadata_from_url_conditional_with_accept(
+                                            &name,
+                                            url,
+                                            etag.as_deref(),
+                                            "application/json",
+                                        )
+                                        .await
+                                }
+                                other => other,
                             }
-                            other => other,
                         }
+                        Err(error) => Err(error),
                     }
-                    Err(error) => Err(error),
                 };
-                (idx, res)
+                let res = fetch_one().await;
+                if dup_indices.is_empty() {
+                    return vec![(first_idx, res)];
+                }
+                let mut out = Vec::with_capacity(1 + dup_indices.len());
+                match res {
+                    Ok(val) => {
+                        let heavy_clone = matches!(
+                            &val,
+                            MetadataFetchResult::Fresh { metadata, .. }
+                                if dup_indices.len() >= 2 && metadata.versions.len() >= 16
+                        );
+                        if heavy_clone {
+                            let cloned_items = tokio::task::spawn_blocking(move || {
+                                let mut cloned_vec = Vec::with_capacity(1 + dup_indices.len());
+                                for dup_idx in dup_indices {
+                                    cloned_vec.push((dup_idx, Ok(val.clone())));
+                                }
+                                cloned_vec.push((first_idx, Ok(val)));
+                                cloned_vec
+                            })
+                            .await
+                            .unwrap_or_default();
+                            return cloned_items;
+                        }
+                        for dup_idx in dup_indices {
+                            out.push((dup_idx, Ok(val.clone())));
+                        }
+                        out.push((first_idx, Ok(val)));
+                    }
+                    Err(err) => {
+                        if let Some(cloned) = clone_clonable_registry_error(&err) {
+                            drop(cloned);
+                            for dup_idx in dup_indices {
+                                let c = clone_clonable_registry_error(&err).unwrap();
+                                out.push((dup_idx, Err(c)));
+                            }
+                        } else {
+                            for dup_idx in dup_indices {
+                                out.push((dup_idx, fetch_one().await));
+                            }
+                        }
+                        out.push((first_idx, Err(err)));
+                    }
+                }
+                out
             });
         }
 
@@ -2818,8 +4092,10 @@ impl RegistryClient {
             (0..packages.len()).map(|_| None).collect();
 
         while let Some(res) = join_set.join_next().await {
-            if let Ok((idx, result)) = res {
-                results[idx] = Some(result);
+            if let Ok(items) = res {
+                for (idx, result) in items {
+                    results[idx] = Some(result);
+                }
             }
         }
 
@@ -2843,10 +4119,11 @@ impl RegistryClient {
         tarball_url: &str,
     ) -> Result<TarballStream, RegistryError> {
         let url = Url::parse(tarball_url)?;
-        let scheme = url.scheme().to_ascii_lowercase();
-        if scheme != "http" && scheme != "https" {
+        let scheme = url.scheme();
+        if !scheme.eq_ignore_ascii_case("http") && !scheme.eq_ignore_ascii_case("https") {
             return Err(RegistryError::SecurityViolation(format!(
-                "Invalid tarball URL scheme '{scheme}': only http and https are allowed"
+                "Invalid tarball URL scheme '{}': only http and https are allowed",
+                scheme.to_ascii_lowercase()
             )));
         }
 
@@ -2914,10 +4191,11 @@ impl RegistryClient {
         if_none_match: Option<&str>,
     ) -> Result<TarballFetchResult, RegistryError> {
         let url = Url::parse(tarball_url)?;
-        let scheme = url.scheme().to_ascii_lowercase();
-        if scheme != "http" && scheme != "https" {
+        let scheme = url.scheme();
+        if !scheme.eq_ignore_ascii_case("http") && !scheme.eq_ignore_ascii_case("https") {
             return Err(RegistryError::SecurityViolation(format!(
-                "Invalid tarball URL scheme '{scheme}': only http and https are allowed"
+                "Invalid tarball URL scheme '{}': only http and https are allowed",
+                scheme.to_ascii_lowercase()
             )));
         }
 
@@ -3018,23 +4296,81 @@ impl RegistryClient {
         if_none_match: Option<&str>,
     ) -> Result<BytesFetchResult, RegistryError> {
         let url = Url::parse(tarball_url)?;
-        let scheme = url.scheme().to_ascii_lowercase();
-        if scheme != "http" && scheme != "https" {
+        let scheme = url.scheme();
+        if !scheme.eq_ignore_ascii_case("http") && !scheme.eq_ignore_ascii_case("https") {
             return Err(RegistryError::SecurityViolation(format!(
-                "Invalid tarball URL scheme '{scheme}': only http and https are allowed"
+                "Invalid tarball URL scheme '{}': only http and https are allowed",
+                scheme.to_ascii_lowercase()
             )));
         }
 
-        let host_key = if let Some(port) = url.port() {
-            format!("{}:{}", url.host_str().unwrap_or_default(), port).to_ascii_lowercase()
-        } else {
-            url.host_str().unwrap_or_default().to_ascii_lowercase()
-        };
+        let key = Arc::new(TarballInFlightKey {
+            url,
+            if_none_match: if_none_match.map(str::to_owned),
+        });
+
+        match self.in_flight_tarballs.join_or_lead(Arc::clone(&key)) {
+            Ok(leader) => {
+                let res = self
+                    .download_tarball_bytes_core(&key.url, tarball_url, if_none_match, false)
+                    .await
+                    .map(|(result, _)| result);
+                leader.finish(&res, Clone::clone);
+                return res;
+            }
+            Err(slot) => {
+                if let Some(coalesced) = wait_for_coalesced(&slot, Clone::clone).await {
+                    return coalesced;
+                }
+            }
+        }
+
+        self.download_tarball_bytes_core(&key.url, tarball_url, if_none_match, false)
+            .await
+            .map(|(result, _)| result)
+    }
+
+    /// Download tarball directly to memory while computing its `sha512-...` SRI digest in a single streaming pass.
+    pub async fn download_tarball_bytes_with_sha512(
+        &self,
+        tarball_url: &str,
+    ) -> Result<(Vec<u8>, String), RegistryError> {
+        let url = Url::parse(tarball_url)?;
+        let scheme = url.scheme();
+        if !scheme.eq_ignore_ascii_case("http") && !scheme.eq_ignore_ascii_case("https") {
+            return Err(RegistryError::SecurityViolation(format!(
+                "Invalid tarball URL scheme '{}': only http and https are allowed",
+                scheme.to_ascii_lowercase()
+            )));
+        }
+        match self
+            .download_tarball_bytes_core(&url, tarball_url, None, true)
+            .await?
+        {
+            (BytesFetchResult::Fresh { bytes, .. }, Some(integrity)) => Ok((bytes, integrity)),
+            _ => Err(RegistryError::Other(
+                "Unexpected response state while streaming tarball integrity".into(),
+            )),
+        }
+    }
+
+    async fn download_tarball_bytes_core(
+        &self,
+        url: &Url,
+        tarball_url: &str,
+        if_none_match: Option<&str>,
+        compute_sha512: bool,
+    ) -> Result<(BytesFetchResult, Option<String>), RegistryError> {
+        let host_key = self
+            .config
+            .circuit_breaker_enabled
+            .then(|| url_host_key(url));
 
         let mut stream_attempt = 0;
+        let mut idle_sleep = std::pin::pin!(tokio::time::sleep(Duration::ZERO));
         loop {
             let (mut resp, _permit) = self
-                .execute_with_permit(Method::GET, url.clone(), None, if_none_match)
+                .execute_with_borrowed_permit(Method::GET, url.clone(), None, if_none_match)
                 .await?;
 
             let status = resp.status();
@@ -3045,7 +4381,7 @@ impl RegistryClient {
                     .and_then(|h| h.to_str().ok())
                     .map(|s| s.to_string())
                     .or_else(|| if_none_match.map(|s| s.to_string()));
-                return Ok(BytesFetchResult::NotModified { etag });
+                return Ok((BytesFetchResult::NotModified { etag }, None));
             }
 
             if status == StatusCode::NOT_FOUND {
@@ -3112,32 +4448,29 @@ impl RegistryClient {
                     return Err(RegistryError::SizeLimitExceeded {
                         limit: self.config.max_package_size,
                         actual: content_length,
-                        message: format!("Tarball Content-Length for '{tarball_url}' exceeds maximum package size"),
+                        message: format!(
+                            "Tarball Content-Length for '{tarball_url}' exceeds maximum package size"
+                        ),
                     });
                 }
             }
 
-            let mut bytes = if let Some(content_length) = expected_content_length {
-                Vec::with_capacity(content_length as usize)
-            } else {
-                Vec::new()
-            };
+            use sha2::Digest as _;
+            let mut bytes = Vec::new();
+            let mut hasher = compute_sha512.then(sha2::Sha512::new);
             let mut stream_err = None;
 
             loop {
-                let chunk_res =
-                    tokio::time::timeout(self.config.chunk_idle_timeout, resp.chunk()).await;
-
-                let chunk_opt = match chunk_res {
-                    Ok(Ok(opt)) => opt,
-                    Ok(Err(err)) => {
-                        stream_err = Some(RegistryError::Http(err));
-                        break;
-                    }
-                    Err(_) => {
-                        stream_err = Some(RegistryError::SlowlorisTimeout(
-                            self.config.chunk_idle_timeout,
-                        ));
+                let chunk_opt = match next_chunk_with_idle_timeout(
+                    &mut resp,
+                    self.config.chunk_idle_timeout,
+                    &mut idle_sleep,
+                )
+                .await
+                {
+                    Ok(opt) => opt,
+                    Err(e) => {
+                        stream_err = Some(e);
                         break;
                     }
                 };
@@ -3150,9 +4483,23 @@ impl RegistryClient {
                             stream_err = Some(RegistryError::SizeLimitExceeded {
                                 limit: self.config.max_package_size,
                                 actual: (bytes.len() as u64) + (chunk.len() as u64),
-                                message: format!("Tarball payload for '{tarball_url}' exceeds maximum package size"),
+                                message: format!(
+                                    "Tarball payload for '{tarball_url}' exceeds maximum package size"
+                                ),
                             });
                             break;
+                        }
+                        if let Some(ref mut ctx) = hasher {
+                            ctx.update(&chunk);
+                        }
+                        if bytes.is_empty() {
+                            if Some(chunk.len() as u64) == expected_content_length {
+                                bytes = Vec::from(chunk);
+                                continue;
+                            }
+                            if let Some(content_length) = expected_content_length {
+                                bytes.reserve(content_length as usize);
+                            }
                         }
                         bytes.extend_from_slice(&chunk);
                     }
@@ -3171,8 +4518,10 @@ impl RegistryClient {
                     stream_attempt += 1;
                     continue;
                 } else {
-                    if self.config.circuit_breaker_enabled && err.is_transient() {
-                        self.circuit_breaker.record_failure(&host_key).await;
+                    if let Some(ref hk) = host_key {
+                        if err.is_transient() {
+                            self.circuit_breaker.record_failure(hk).await;
+                        }
                     }
                     return Err(err);
                 }
@@ -3187,7 +4536,12 @@ impl RegistryClient {
                 }
             }
 
-            return Ok(BytesFetchResult::Fresh { bytes, etag });
+            let integrity = hasher.map(|ctx| {
+                let digest = sha2::Digest::finalize(ctx);
+                format!("sha512-{}", data_encoding::BASE64.encode(&digest))
+            });
+
+            return Ok((BytesFetchResult::Fresh { bytes, etag }, integrity));
         }
     }
 
@@ -3196,13 +4550,49 @@ impl RegistryClient {
         &self,
         tarball_urls: &[S],
     ) -> Vec<Result<Vec<u8>, RegistryError>> {
-        let mut join_set = tokio::task::JoinSet::new();
+        let mut key_to_group: HashMap<&str, usize> = HashMap::with_capacity(tarball_urls.len());
+        let mut groups: Vec<(usize, Vec<usize>)> = Vec::with_capacity(tarball_urls.len());
         for (idx, url) in tarball_urls.iter().enumerate() {
+            let s = url.as_ref();
+            if let Some(&grp) = key_to_group.get(s) {
+                groups[grp].1.push(idx);
+            } else {
+                let grp = groups.len();
+                key_to_group.insert(s, grp);
+                groups.push((idx, Vec::new()));
+            }
+        }
+
+        let mut join_set = tokio::task::JoinSet::new();
+        for (first_idx, dup_indices) in groups {
             let client = self.clone();
-            let url_str = url.as_ref().to_string();
+            let url_str = tarball_urls[first_idx].as_ref().to_string();
             join_set.spawn(async move {
                 let res = client.download_tarball_bytes(&url_str).await;
-                (idx, res)
+                let mut out = Vec::with_capacity(1 + dup_indices.len());
+                if !dup_indices.is_empty() {
+                    match &res {
+                        Ok(bytes) => {
+                            for dup_idx in dup_indices {
+                                out.push((dup_idx, Ok(bytes.clone())));
+                            }
+                        }
+                        Err(err) => {
+                            if clone_clonable_registry_error(err).is_some() {
+                                for dup_idx in dup_indices {
+                                    let c = clone_clonable_registry_error(err).unwrap();
+                                    out.push((dup_idx, Err(c)));
+                                }
+                            } else {
+                                for dup_idx in dup_indices {
+                                    out.push((dup_idx, client.download_tarball_bytes(&url_str).await));
+                                }
+                            }
+                        }
+                    }
+                }
+                out.push((first_idx, res));
+                out
             });
         }
 
@@ -3210,8 +4600,10 @@ impl RegistryClient {
             (0..tarball_urls.len()).map(|_| None).collect();
 
         while let Some(res) = join_set.join_next().await {
-            if let Ok((idx, result)) = res {
-                results[idx] = Some(result);
+            if let Ok(items) = res {
+                for (idx, result) in items {
+                    results[idx] = Some(result);
+                }
             }
         }
 
@@ -3227,27 +4619,31 @@ impl RegistryClient {
         tarball_url: &str,
         dest_path: &Path,
     ) -> Result<u64, RegistryError> {
+        const DISK_BUFFER_THRESHOLD: usize = 4 * 1024 * 1024;
+
         let url = Url::parse(tarball_url)?;
-        let scheme = url.scheme().to_ascii_lowercase();
-        if scheme != "http" && scheme != "https" {
+        let scheme = url.scheme();
+        if !scheme.eq_ignore_ascii_case("http") && !scheme.eq_ignore_ascii_case("https") {
             return Err(RegistryError::SecurityViolation(format!(
-                "Invalid tarball URL scheme '{scheme}': only http and https are allowed"
+                "Invalid tarball URL scheme '{}': only http and https are allowed",
+                scheme.to_ascii_lowercase()
             )));
         }
 
-        let host_key = if let Some(port) = url.port() {
-            format!("{}:{}", url.host_str().unwrap_or_default(), port).to_ascii_lowercase()
-        } else {
-            url.host_str().unwrap_or_default().to_ascii_lowercase()
-        };
+        let host_key = self
+            .config
+            .circuit_breaker_enabled
+            .then(|| url_host_key(&url));
 
         let parent = dest_path.parent().unwrap_or_else(|| Path::new("."));
-        tokio::fs::create_dir_all(parent).await.map_err(|e| {
-            RegistryError::Other(format!(
-                "Failed to create directories for {}: {e}",
-                dest_path.display()
-            ))
-        })?;
+        if !parent.as_os_str().is_empty() && !parent.is_dir() {
+            tokio::fs::create_dir_all(parent).await.map_err(|e| {
+                RegistryError::Other(format!(
+                    "Failed to create directories for {}: {e}",
+                    dest_path.display()
+                ))
+            })?;
+        }
 
         let temp_path = {
             let file_name = dest_path
@@ -3258,9 +4654,10 @@ impl RegistryClient {
         };
 
         let mut stream_attempt = 0;
+        let mut idle_sleep = std::pin::pin!(tokio::time::sleep(Duration::ZERO));
         loop {
-            let (mut resp, _permit) = self
-                .execute_with_permit(Method::GET, url.clone(), None, None)
+            let (mut resp, permit) = self
+                .execute_with_borrowed_permit(Method::GET, url.clone(), None, None)
                 .await?;
 
             let status = resp.status();
@@ -3322,32 +4719,40 @@ impl RegistryClient {
                     return Err(RegistryError::SizeLimitExceeded {
                         limit: self.config.max_package_size,
                         actual: content_length,
-                        message: format!("Tarball Content-Length for '{tarball_url}' exceeds maximum package size"),
+                        message: format!(
+                            "Tarball Content-Length for '{tarball_url}' exceeds maximum package size"
+                        ),
                     });
                 }
             }
 
-            let mut file = tokio::fs::File::create(&temp_path).await.map_err(|e| {
-                RegistryError::Other(format!("Failed to create {}: {e}", temp_path.display()))
-            })?;
+            let mut mem_buf: Option<Vec<u8>>;
+            let mut file: Option<BufWriter<tokio::fs::File>>;
+            if expected_content_length.is_some_and(|len| len > DISK_BUFFER_THRESHOLD as u64) {
+                let raw_file = tokio::fs::File::create(&temp_path).await.map_err(|e| {
+                    RegistryError::Other(format!("Failed to create {}: {e}", temp_path.display()))
+                })?;
+                mem_buf = None;
+                file = Some(BufWriter::with_capacity(256 * 1024, raw_file));
+            } else {
+                mem_buf = Some(Vec::new());
+                file = None;
+            }
 
             let mut written: u64 = 0;
             let mut stream_err = None;
 
             loop {
-                let chunk_res =
-                    tokio::time::timeout(self.config.chunk_idle_timeout, resp.chunk()).await;
-
-                let chunk_opt = match chunk_res {
-                    Ok(Ok(opt)) => opt,
-                    Ok(Err(err)) => {
-                        stream_err = Some(RegistryError::Http(err));
-                        break;
-                    }
-                    Err(_) => {
-                        stream_err = Some(RegistryError::SlowlorisTimeout(
-                            self.config.chunk_idle_timeout,
-                        ));
+                let chunk_opt = match next_chunk_with_idle_timeout(
+                    &mut resp,
+                    self.config.chunk_idle_timeout,
+                    &mut idle_sleep,
+                )
+                .await
+                {
+                    Ok(opt) => opt,
+                    Err(e) => {
+                        stream_err = Some(e);
                         break;
                     }
                 };
@@ -3358,26 +4763,84 @@ impl RegistryClient {
                             stream_err = Some(RegistryError::SizeLimitExceeded {
                                 limit: self.config.max_package_size,
                                 actual: written + (chunk.len() as u64),
-                                message: format!("Tarball payload for '{tarball_url}' exceeds maximum package size"),
+                                message: format!(
+                                    "Tarball payload for '{tarball_url}' exceeds maximum package size"
+                                ),
                             });
                             break;
                         }
-                        if let Err(e) = file.write_all(&chunk).await {
-                            stream_err = Some(RegistryError::Other(format!(
-                                "Failed to write chunk to {}: {e}",
-                                temp_path.display()
-                            )));
-                            break;
+                        if let Some(mut buf) = mem_buf.take() {
+                            if buf.len() + chunk.len() <= DISK_BUFFER_THRESHOLD {
+                                if buf.is_empty() {
+                                    if Some(chunk.len() as u64) == expected_content_length {
+                                        buf = Vec::from(chunk);
+                                        written = buf.len() as u64;
+                                        mem_buf = Some(buf);
+                                        continue;
+                                    }
+                                    if let Some(content_length) = expected_content_length {
+                                        buf.reserve(content_length as usize);
+                                    }
+                                }
+                                buf.extend_from_slice(&chunk);
+                                written += chunk.len() as u64;
+                                mem_buf = Some(buf);
+                            } else {
+                                let raw_file =
+                                    match tokio::fs::File::create(&temp_path).await {
+                                        Ok(f) => f,
+                                        Err(e) => {
+                                            stream_err = Some(RegistryError::Other(format!(
+                                                "Failed to create {}: {e}",
+                                                temp_path.display()
+                                            )));
+                                            break;
+                                        }
+                                    };
+                                let mut bw = BufWriter::with_capacity(256 * 1024, raw_file);
+                                if !buf.is_empty() {
+                                    if let Err(e) = bw.write_all(&buf).await {
+                                        file = Some(bw);
+                                        stream_err = Some(RegistryError::Other(format!(
+                                            "Failed to write chunk to {}: {e}",
+                                            temp_path.display()
+                                        )));
+                                        break;
+                                    }
+                                }
+                                if let Err(e) = bw.write_all(&chunk).await {
+                                    file = Some(bw);
+                                    stream_err = Some(RegistryError::Other(format!(
+                                        "Failed to write chunk to {}: {e}",
+                                        temp_path.display()
+                                    )));
+                                    break;
+                                }
+                                written += chunk.len() as u64;
+                                file = Some(bw);
+                            }
+                        } else if let Some(ref mut bw) = file {
+                            if let Err(e) = bw.write_all(&chunk).await {
+                                stream_err = Some(RegistryError::Other(format!(
+                                    "Failed to write chunk to {}: {e}",
+                                    temp_path.display()
+                                )));
+                                break;
+                            }
+                            written += chunk.len() as u64;
                         }
-                        written += chunk.len() as u64;
                     }
                     None => break,
                 }
             }
 
+            drop(permit);
+
             if let Some(err) = stream_err {
-                drop(file);
-                let _ = tokio::fs::remove_file(&temp_path).await;
+                if let Some(bw) = file.take() {
+                    drop(bw);
+                    let _ = tokio::fs::remove_file(&temp_path).await;
+                }
 
                 if err.is_transient() && stream_attempt < self.config.max_retries {
                     let delay = self.calculate_backoff(stream_attempt);
@@ -3389,8 +4852,10 @@ impl RegistryClient {
                     stream_attempt += 1;
                     continue;
                 } else {
-                    if self.config.circuit_breaker_enabled && err.is_transient() {
-                        self.circuit_breaker.record_failure(&host_key).await;
+                    if let Some(ref hk) = host_key {
+                        if err.is_transient() {
+                            self.circuit_breaker.record_failure(hk).await;
+                        }
                     }
                     return Err(err);
                 }
@@ -3398,8 +4863,10 @@ impl RegistryClient {
 
             if let Some(content_length) = expected_content_length {
                 if written != content_length {
-                    drop(file);
-                    let _ = tokio::fs::remove_file(&temp_path).await;
+                    if let Some(bw) = file.take() {
+                        drop(bw);
+                        let _ = tokio::fs::remove_file(&temp_path).await;
+                    }
                     return Err(RegistryError::ContentLengthMismatch {
                         expected: content_length,
                         actual: written,
@@ -3407,20 +4874,56 @@ impl RegistryClient {
                 }
             }
 
-            file.flush().await.map_err(|e| {
-                RegistryError::Other(format!("Failed to flush {}: {e}", temp_path.display()))
-            })?;
-            drop(file);
-
-            tokio::fs::rename(&temp_path, dest_path)
+            if let Some(buf) = mem_buf {
+                let tp = temp_path.clone();
+                let dp = dest_path.to_path_buf();
+                tokio::task::spawn_blocking(move || {
+                    let mut f = std::fs::File::create(&tp).map_err(|e| {
+                        RegistryError::Other(format!("Failed to create {}: {e}", tp.display()))
+                    })?;
+                    if let Err(e) = f.write_all(&buf) {
+                        drop(f);
+                        let _ = std::fs::remove_file(&tp);
+                        return Err(RegistryError::Other(format!(
+                            "Failed to write {}: {e}",
+                            tp.display()
+                        )));
+                    }
+                    drop(f);
+                    if let Err(e) = std::fs::rename(&tp, &dp) {
+                        let _ = std::fs::remove_file(&tp);
+                        return Err(RegistryError::Other(format!(
+                            "Failed to rename {} to {}: {e}",
+                            tp.display(),
+                            dp.display()
+                        )));
+                    }
+                    Ok(())
+                })
                 .await
                 .map_err(|e| {
-                    RegistryError::Other(format!(
+                    RegistryError::Other(format!("Failed to join tarball write task: {e}"))
+                })??;
+            } else if let Some(mut bw) = file {
+                if let Err(e) = bw.flush().await {
+                    drop(bw);
+                    let _ = tokio::fs::remove_file(&temp_path).await;
+                    return Err(RegistryError::Other(format!(
+                        "Failed to flush {}: {e}",
+                        temp_path.display()
+                    )));
+                }
+                drop(bw);
+
+                if let Err(e) = tokio::fs::rename(&temp_path, dest_path).await {
+                    let _ = tokio::fs::remove_file(&temp_path).await;
+                    return Err(RegistryError::Other(format!(
                         "Failed to rename {} to {}: {e}",
                         temp_path.display(),
                         dest_path.display()
-                    ))
-                })?;
+                    )));
+                }
+            }
 
             return Ok(written);
         }
@@ -5442,8 +6945,8 @@ nB99xJBcpcklOhB/x8L3Vb9kw8ZPzUvYKI7lj0+yjYJannulkI7H7LB4hxKnVKp5\n\
 
         // Pointers must be distinct for different scoped clients, not base unauthenticated client
         assert!(!std::ptr::eq(npm_c, other_c));
-        assert!(!std::ptr::eq(npm_c, &client.client));
-        assert!(!std::ptr::eq(other_c, &client.client));
+        assert!(!std::ptr::eq(npm_c, client.base_client()));
+        assert!(!std::ptr::eq(other_c, client.base_client()));
 
         // /npm2/pkg matches root scoped client, NOT /npm/ client
         assert!(std::ptr::eq(npm2_c, other_c));
@@ -5453,7 +6956,7 @@ nB99xJBcpcklOhB/x8L3Vb9kw8ZPzUvYKI7lj0+yjYJannulkI7H7LB4hxKnVKp5\n\
         let diff_host = Url::parse("https://other-registry.com/npm/pkg").unwrap();
         assert!(!client.has_scoped_tls_for_url(&diff_host));
         assert!(client.match_scoped_client(&diff_host).is_none());
-        assert!(std::ptr::eq(client.client_for_url(&diff_host), &client.client));
+        assert!(std::ptr::eq(client.client_for_url(&diff_host), client.base_client()));
     }
 
     #[test]
@@ -5481,12 +6984,12 @@ nB99xJBcpcklOhB/x8L3Vb9kw8ZPzUvYKI7lj0+yjYJannulkI7H7LB4hxKnVKp5\n\
         // 1. Scoped registry prefix gets its own client (neither base client nor global client)
         assert!(client.has_scoped_tls_for_url(&scoped_url));
         let scoped_c = client.client_for_url(&scoped_url);
-        assert!(!std::ptr::eq(scoped_c, &client.client));
+        assert!(!std::ptr::eq(scoped_c, client.base_client()));
 
         // 2. Global registry falls back to global TLS client because host is trusted
         assert!(!client.has_scoped_tls_for_url(&global_url));
         let global_c = client.client_for_url(&global_url);
-        assert!(!std::ptr::eq(global_c, &client.client));
+        assert!(!std::ptr::eq(global_c, client.base_client()));
         assert!(!std::ptr::eq(global_c, scoped_c));
         assert!(client.is_trusted_host(&global_url));
 
@@ -5494,22 +6997,22 @@ nB99xJBcpcklOhB/x8L3Vb9kw8ZPzUvYKI7lj0+yjYJannulkI7H7LB4hxKnVKp5\n\
         assert!(!client.has_scoped_tls_for_url(&untrusted_url));
         assert!(!client.is_trusted_host(&untrusted_url));
         let untrusted_c = client.client_for_url(&untrusted_url);
-        assert!(std::ptr::eq(untrusted_c, &client.client));
+        assert!(std::ptr::eq(untrusted_c, client.base_client()));
 
         // 4. Other untrusted registry also never receives scoped cert
         let other_c = client.client_for_url(&other_reg_url);
-        assert!(std::ptr::eq(other_c, &client.client));
+        assert!(std::ptr::eq(other_c, client.base_client()));
 
-        // 5. http:// URL (even on trusted or scoped host) returns &client.client
+        // 5. http:// URL (even on trusted or scoped host) returns client.base_client()
         let http_scoped = Url::parse("http://scoped-registry.example.com/scoped_prefix/pkg").unwrap();
         let http_global = Url::parse("http://global-registry.example.com/pkg").unwrap();
-        assert!(std::ptr::eq(client.client_for_url(&http_scoped), &client.client));
-        assert!(std::ptr::eq(client.client_for_url(&http_global), &client.client));
+        assert!(std::ptr::eq(client.client_for_url(&http_scoped), client.base_client()));
+        assert!(std::ptr::eq(client.client_for_url(&http_global), client.base_client()));
 
-        // 6. Unscoped path on a scoped-TLS host returns &client.client (does NOT leak global_client!)
+        // 6. Unscoped path on a scoped-TLS host returns client.base_client() (does NOT leak global_client!)
         assert!(!client.has_scoped_tls_for_url(&unscoped_on_scoped_host));
         let unscoped_c = client.client_for_url(&unscoped_on_scoped_host);
-        assert!(std::ptr::eq(unscoped_c, &client.client));
+        assert!(std::ptr::eq(unscoped_c, client.base_client()));
     }
 
     #[test]
@@ -5633,8 +7136,8 @@ nB99xJBcpcklOhB/x8L3Vb9kw8ZPzUvYKI7lj0+yjYJannulkI7H7LB4hxKnVKp5\n\
         let url_empty = Url::parse("https://registry.example.com/empty_entry/pkg").unwrap();
         assert!(!client.has_scoped_tls_for_url(&url_null));
         assert!(!client.has_scoped_tls_for_url(&url_empty));
-        assert!(std::ptr::eq(client.client_for_url(&url_null), &client.client));
-        assert!(std::ptr::eq(client.client_for_url(&url_empty), &client.client));
+        assert!(std::ptr::eq(client.client_for_url(&url_null), client.base_client()));
+        assert!(std::ptr::eq(client.client_for_url(&url_empty), client.base_client()));
     }
 
     #[test]
@@ -5659,7 +7162,7 @@ nB99xJBcpcklOhB/x8L3Vb9kw8ZPzUvYKI7lj0+yjYJannulkI7H7LB4hxKnVKp5\n\
         let client_inline = client_inline.unwrap();
         let inline_url = Url::parse("https://registry.example.com/inline/pkg").unwrap();
         assert!(client_inline.has_scoped_tls_for_url(&inline_url));
-        assert!(!std::ptr::eq(client_inline.client_for_url(&inline_url), &client_inline.client));
+        assert!(!std::ptr::eq(client_inline.client_for_url(&inline_url), client_inline.base_client()));
 
         // 2. Via combined certfile on disk without keyfile
         let mut combined_file = tempfile::NamedTempFile::new().unwrap();
@@ -5680,7 +7183,7 @@ nB99xJBcpcklOhB/x8L3Vb9kw8ZPzUvYKI7lj0+yjYJannulkI7H7LB4hxKnVKp5\n\
         let client_file = client_file.unwrap();
         let file_url = Url::parse("https://registry.example.com/file/pkg").unwrap();
         assert!(client_file.has_scoped_tls_for_url(&file_url));
-        assert!(!std::ptr::eq(client_file.client_for_url(&file_url), &client_file.client));
+        assert!(!std::ptr::eq(client_file.client_for_url(&file_url), client_file.base_client()));
     }
 
     #[test]
@@ -5721,7 +7224,7 @@ nB99xJBcpcklOhB/x8L3Vb9kw8ZPzUvYKI7lj0+yjYJannulkI7H7LB4hxKnVKp5\n\
 
         let sub_url = Url::parse("https://registry.example.com/sub/packages/pkg").unwrap();
         assert!(client.has_scoped_tls_for_url(&sub_url));
-        assert!(!std::ptr::eq(client.client_for_url(&sub_url), &client.client));
+        assert!(!std::ptr::eq(client.client_for_url(&sub_url), client.base_client()));
 
         // Different host does NOT inherit certfile from registry.example.com
         let mut config_diff = RegistryClientConfig::default();
@@ -5745,5 +7248,385 @@ nB99xJBcpcklOhB/x8L3Vb9kw8ZPzUvYKI7lj0+yjYJannulkI7H7LB4hxKnVKp5\n\
         );
         let client_diff = RegistryClient::with_config(config_diff);
         assert!(client_diff.is_err(), "Different host must NOT inherit certfile from another host");
+    }
+
+    #[test]
+    fn test_lazy_http_client_init_defers_construction_until_first_use() {
+        let client = RegistryClient::with_config(RegistryClientConfig::default()).unwrap();
+        assert!(
+            client.base_client.cell.get().is_none(),
+            "base HTTP/TLS client should stay uninitialized until first network use"
+        );
+        let url = Url::parse("https://registry.npmjs.org/lodash").unwrap();
+        let _ = client.client_for_url(&url);
+        assert!(
+            client.base_client.cell.get().is_some(),
+            "base HTTP/TLS client should initialize lazily on first client_for_url"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_negotiated_abbreviated_and_representation_isolated_cache_and_fallback() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let abbrev_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let full_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let saw_abbrev_etag_on_full = Arc::new(AtomicBool::new(false));
+
+        let abbrev_calls_c = Arc::clone(&abbrev_calls);
+        let full_calls_c = Arc::clone(&full_calls);
+        let bad_etag_c = Arc::clone(&saw_abbrev_etag_on_full);
+
+        let abbrev_body = serde_json::json!({
+            "name": "neg-pkg",
+            "dist-tags": { "latest": "1.0.0" },
+            "modified": "2026-01-01T00:00:00.000Z",
+            "versions": {
+                "1.0.0": {
+                    "name": "neg-pkg",
+                    "version": "1.0.0",
+                    "dist": {
+                        "tarball": format!("http://{addr}/neg-pkg/-/neg-pkg-1.0.0.tgz")
+                    },
+                    "dependencies": {}
+                }
+            }
+        })
+        .to_string();
+
+        let full_body = serde_json::json!({
+            "name": "neg-pkg",
+            "dist-tags": { "latest": "1.0.0" },
+            "time": {
+                "created": "2025-01-01T00:00:00.000Z",
+                "1.0.0": "2025-06-01T00:00:00.000Z"
+            },
+            "versions": {
+                "1.0.0": {
+                    "name": "neg-pkg",
+                    "version": "1.0.0",
+                    "license": "MIT",
+                    "scripts": { "test": "echo ok" },
+                    "dist": {
+                        "tarball": format!("http://{addr}/neg-pkg/-/neg-pkg-1.0.0.tgz")
+                    },
+                    "dependencies": {}
+                }
+            }
+        })
+        .to_string();
+
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let abbrev_body = abbrev_body.clone();
+                let full_body = full_body.clone();
+                let abbrev_calls = Arc::clone(&abbrev_calls_c);
+                let full_calls = Arc::clone(&full_calls_c);
+                let bad_etag = Arc::clone(&bad_etag_c);
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 8192];
+                    let n = stream.read(&mut buf).await.unwrap_or(0);
+                    if n == 0 {
+                        return;
+                    }
+                    let req_str = String::from_utf8_lossy(&buf[..n]);
+                    let mut accept = "";
+                    let mut inm = None;
+                    for line in req_str.split("\r\n").skip(1) {
+                        if let Some((k, v)) = line.split_once(':') {
+                            if k.eq_ignore_ascii_case("accept") {
+                                accept = v.trim();
+                            } else if k.eq_ignore_ascii_case("if-none-match") {
+                                inm = Some(v.trim());
+                            }
+                        }
+                    }
+                    let is_abbrev = accept.contains("vnd.npm.install-v1+json");
+                    let resp = if is_abbrev {
+                        abbrev_calls.fetch_add(1, Ordering::SeqCst);
+                        if inm == Some("\"etag-abbrev-1\"") {
+                            "HTTP/1.1 304 Not Modified\r\nETag: \"etag-abbrev-1\"\r\nContent-Type: application/vnd.npm.install-v1+json\r\nVary: Accept\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string()
+                        } else {
+                            format!(
+                                "HTTP/1.1 200 OK\r\nETag: \"etag-abbrev-1\"\r\nContent-Type: application/vnd.npm.install-v1+json\r\nVary: Accept\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                                abbrev_body.len(),
+                                abbrev_body
+                            )
+                        }
+                    } else {
+                        full_calls.fetch_add(1, Ordering::SeqCst);
+                        if inm == Some("\"etag-abbrev-1\"") || inm == Some("\"stale-abbrev\"") {
+                            bad_etag.store(true, Ordering::SeqCst);
+                        }
+                        if inm == Some("\"etag-full-1\"") {
+                            "HTTP/1.1 304 Not Modified\r\nETag: \"etag-full-1\"\r\nContent-Type: application/json\r\nVary: Accept\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string()
+                        } else {
+                            format!(
+                                "HTTP/1.1 200 OK\r\nETag: \"etag-full-1\"\r\nContent-Type: application/json\r\nVary: Accept\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                                full_body.len(),
+                                full_body
+                            )
+                        }
+                    };
+                    let _ = stream.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+
+        let cfg = RegistryClientConfig {
+            default_registry: Url::parse(&format!("http://{addr}/")).unwrap(),
+            ..Default::default()
+        };
+        let client = RegistryClient::with_config(cfg).unwrap();
+
+        let key_a = client
+            .packument_cache_key("neg-pkg", PackumentRepresentation::Abbreviated)
+            .unwrap();
+        let key_f = client
+            .packument_cache_key("neg-pkg", PackumentRepresentation::Full)
+            .unwrap();
+        assert_ne!(key_a, key_f);
+
+        // 1. Abbreviated request populates Abbreviated cache only
+        let m1 = client
+            .get_package_metadata_negotiated("neg-pkg", PackumentFetchOptions::abbreviated())
+            .await
+            .unwrap();
+        assert!(m1.time.is_empty());
+        assert_eq!(
+            client
+                .cached_packument_etag("neg-pkg", PackumentRepresentation::Abbreviated)
+                .as_deref(),
+            Some("\"etag-abbrev-1\"")
+        );
+        assert!(client
+            .cached_packument_etag("neg-pkg", PackumentRepresentation::Full)
+            .is_none());
+
+        // 2. Second abbreviated call revalidates with abbreviated ETag -> 304 hit from cache
+        let m2 = client
+            .get_package_metadata_negotiated("neg-pkg", PackumentFetchOptions::abbreviated())
+            .await
+            .unwrap();
+        assert_eq!(m1.versions.len(), m2.versions.len());
+        assert_eq!(abbrev_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(full_calls.load(Ordering::SeqCst), 0);
+
+        // 3. Time-based resolution (--before) negotiates Full cleanly without sending abbreviated ETag
+        let m_full = client
+            .get_package_metadata_negotiated(
+                "neg-pkg",
+                PackumentFetchOptions {
+                    require_publish_times: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            m_full.time.get("1.0.0").map(String::as_str),
+            Some("2025-06-01T00:00:00.000Z")
+        );
+        assert_eq!(
+            m_full.versions["1.0.0"].license.as_deref(),
+            Some("MIT")
+        );
+        assert_eq!(
+            client
+                .cached_packument_etag("neg-pkg", PackumentRepresentation::Full)
+                .as_deref(),
+            Some("\"etag-full-1\"")
+        );
+        assert_eq!(
+            client
+                .cached_packument_etag("neg-pkg", PackumentRepresentation::Abbreviated)
+                .as_deref(),
+            Some("\"etag-abbrev-1\"")
+        );
+
+        // 4. Fallback when abbreviated omits `time` falls back to Full without leaking stale abbreviated ETag
+        let fb = client
+            .get_package_metadata_with_full_fallback("neg-pkg", Some("\"stale-abbrev\""), |m| {
+                m.time.is_empty()
+            })
+            .await
+            .unwrap();
+        assert!(!saw_abbrev_etag_on_full.load(Ordering::SeqCst));
+        assert!(fb.is_fresh());
+        assert!(!fb.metadata().unwrap().time.is_empty());
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn test_negotiated_application_json_response_does_not_poison_full_cache() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let body = serde_json::json!({
+            "name": "plain-json-pkg",
+            "dist-tags": { "latest": "1.0.0" },
+            "time": { "1.0.0": "2025-06-01T00:00:00.000Z" },
+            "versions": {
+                "1.0.0": {
+                    "name": "plain-json-pkg",
+                    "version": "1.0.0",
+                    "license": "MIT",
+                    "repository": "git+https://github.com/example/plain-json-pkg.git",
+                    "dist": {
+                        "tarball": format!("http://{addr}/plain-json-pkg/-/plain-json-pkg-1.0.0.tgz")
+                    },
+                    "dependencies": {}
+                }
+            }
+        })
+        .to_string();
+
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let body = body.clone();
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 8192];
+                    let n = stream.read(&mut buf).await.unwrap_or(0);
+                    if n == 0 {
+                        return;
+                    }
+                    let req_str = String::from_utf8_lossy(&buf[..n]);
+                    let mut inm = None;
+                    for line in req_str.split("\r\n").skip(1) {
+                        if let Some((k, v)) = line.split_once(':') {
+                            if k.eq_ignore_ascii_case("if-none-match") {
+                                inm = Some(v.trim());
+                            }
+                        }
+                    }
+                    let resp = if inm == Some("\"plain-etag\"") {
+                        "HTTP/1.1 304 Not Modified\r\nETag: \"plain-etag\"\r\nContent-Type: application/json\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string()
+                    } else {
+                        format!(
+                            "HTTP/1.1 200 OK\r\nETag: \"plain-etag\"\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            body.len(),
+                            body
+                        )
+                    };
+                    let _ = stream.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+
+        let cfg = RegistryClientConfig {
+            default_registry: Url::parse(&format!("http://{addr}/")).unwrap(),
+            ..Default::default()
+        };
+        let client = RegistryClient::with_config(cfg).unwrap();
+
+        // Abbreviated fetch receives Content-Type: application/json from a server that ignores Accept
+        let m1 = client
+            .get_package_metadata_negotiated("plain-json-pkg", PackumentFetchOptions::abbreviated())
+            .await
+            .unwrap();
+        assert!(!m1.versions["1.0.0"].extra.contains_key("repository"));
+        assert_eq!(
+            client
+                .cached_packument_etag("plain-json-pkg", PackumentRepresentation::Abbreviated)
+                .as_deref(),
+            Some("\"plain-etag\"")
+        );
+        assert!(client
+            .cached_packument_etag("plain-json-pkg", PackumentRepresentation::Full)
+            .is_none());
+
+        // Second abbreviated fetch hits 304 Not Modified against Abbreviated cache
+        let url = Url::parse(&format!("http://{addr}/plain-json-pkg")).unwrap();
+        let abbrev_etag = client
+            .cached_packument_etag("plain-json-pkg", PackumentRepresentation::Abbreviated);
+        let res2 = client
+            .get_package_metadata_negotiated_conditional_at_url(
+                "plain-json-pkg",
+                &url,
+                abbrev_etag.as_deref(),
+                PackumentFetchOptions::abbreviated(),
+            )
+            .await
+            .unwrap();
+        assert!(res2.is_not_modified());
+
+        // Full fetch is NOT poisoned by the Install-parsed Abbreviated cache entry
+        let m_full = client
+            .get_package_metadata_negotiated(
+                "plain-json-pkg",
+                PackumentFetchOptions {
+                    representation: PackumentRepresentation::Full,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            m_full.versions["1.0.0"]
+                .extra
+                .get("repository")
+                .and_then(|v| v.as_str()),
+            Some("git+https://github.com/example/plain-json-pkg.git")
+        );
+        assert_eq!(
+            m_full.versions["1.0.0"].license.as_deref(),
+            Some("MIT")
+        );
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn test_download_tarball_bytes_with_sha512_integrity() {
+        use sha2::{Digest, Sha512};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let payload = vec![0x42u8; 131_072];
+        let expected_sri = {
+            let d = Sha512::digest(&payload);
+            format!("sha512-{}", data_encoding::BASE64.encode(&d))
+        };
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let payload_srv = payload.clone();
+        let server = tokio::spawn(async move {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                let mut buf = [0u8; 2048];
+                let _ = stream.read(&mut buf).await;
+                let hdr = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: application/octet-stream\r\nConnection: close\r\n\r\n",
+                    payload_srv.len()
+                );
+                let _ = stream.write_all(hdr.as_bytes()).await;
+                let _ = stream.write_all(&payload_srv).await;
+            }
+        });
+
+        let client = RegistryClient::with_config(RegistryClientConfig {
+            default_registry: Url::parse(&format!("http://{addr}/")).unwrap(),
+            ..Default::default()
+        })
+        .unwrap();
+        let (bytes, sri) = client
+            .download_tarball_bytes_with_sha512(&format!("http://{addr}/pkg/-/pkg-1.0.0.tgz"))
+            .await
+            .unwrap();
+        assert_eq!(bytes, payload);
+        assert_eq!(sri, expected_sri);
+        server.abort();
     }
 }

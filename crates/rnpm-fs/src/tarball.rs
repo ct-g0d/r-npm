@@ -134,33 +134,77 @@ fn ensure_dir_created(
         return Ok(());
     }
 
-    if let Err(e) = fs::create_dir_all(dir) {
-        #[cfg(unix)]
-        if e.kind() == std::io::ErrorKind::PermissionDenied {
-            if let Some(parent) = dir.parent() {
-                if let Ok(meta) = fs::metadata(parent) {
-                    use std::os::unix::fs::PermissionsExt;
-                    let mut perms = meta.permissions();
-                    if perms.mode() & 0o200 == 0 {
-                        perms.set_mode(perms.mode() | 0o700);
-                        let _ = fs::set_permissions(parent, perms);
+    #[cfg(windows)]
+    let fast_ok = {
+        let mut missing: Vec<&Path> = Vec::with_capacity(8);
+        let mut cur = Some(dir);
+        while let Some(p) = cur {
+            if created_dirs.contains(p) || !p.starts_with(root) {
+                break;
+            }
+            missing.push(p);
+            cur = p.parent();
+        }
+        let mut ok = true;
+        for &p in missing.iter().rev() {
+            let res = crate::path::with_verbatim_wide(p, |wide| {
+                extern "system" {
+                    fn CreateDirectoryW(
+                        lpPathName: *const u16,
+                        lpSecurityAttributes: *mut std::ffi::c_void,
+                    ) -> i32;
+                    fn GetLastError() -> u32;
+                }
+                const ERROR_ALREADY_EXISTS: u32 = 183;
+                let r = unsafe { CreateDirectoryW(wide.as_ptr(), std::ptr::null_mut()) };
+                if r == 0 {
+                    let err = unsafe { GetLastError() };
+                    if err != ERROR_ALREADY_EXISTS {
+                        return Err(err);
+                    }
+                }
+                Ok(())
+            });
+            if res.is_err() {
+                ok = false;
+                break;
+            }
+        }
+        ok
+    };
+
+    #[cfg(not(windows))]
+    let fast_ok = false;
+
+    if !fast_ok {
+        if let Err(e) = fs::create_dir_all(dir) {
+            #[cfg(unix)]
+            if e.kind() == std::io::ErrorKind::PermissionDenied {
+                if let Some(parent) = dir.parent() {
+                    if let Ok(meta) = fs::metadata(parent) {
+                        use std::os::unix::fs::PermissionsExt;
+                        let mut perms = meta.permissions();
+                        if perms.mode() & 0o200 == 0 {
+                            perms.set_mode(perms.mode() | 0o700);
+                            let _ = fs::set_permissions(parent, perms);
+                        }
                     }
                 }
             }
-        }
-        #[cfg(windows)]
-        if e.kind() == std::io::ErrorKind::PermissionDenied {
-            if let Some(parent) = dir.parent() {
-                if let Ok(meta) = fs::metadata(parent) {
-                    let mut perms = meta.permissions();
-                    if perms.readonly() {
-                        perms.set_readonly(false);
-                        let _ = fs::set_permissions(parent, perms);
+            #[cfg(windows)]
+            if e.kind() == std::io::ErrorKind::PermissionDenied {
+                if let Some(parent) = dir.parent() {
+                    if let Ok(meta) = fs::metadata(parent) {
+                        let mut perms = meta.permissions();
+                        if perms.readonly() {
+                            perms.set_readonly(false);
+                            let _ = fs::set_permissions(parent, perms);
+                        }
                     }
                 }
             }
+            fs::create_dir_all(dir)?;
         }
-        fs::create_dir_all(dir)?;
     }
 
     let mut curr = Some(dir);
@@ -225,7 +269,9 @@ pub fn extract_tar_gz<R: Read>(
     let mut seen_files_lower: HashSet<String> = HashSet::new();
     let mut hardlink_targets: std::collections::HashMap<PathBuf, PathBuf> =
         std::collections::HashMap::new();
-    let mut copy_buf = vec![0u8; 64 * 1024];
+    let mut copy_buf = vec![0u8; 128 * 1024];
+    let mut scratch_buf: Vec<u8> = Vec::with_capacity(64 * 1024);
+    let mut wide_buf: Vec<u16> = Vec::with_capacity(260);
 
     let entries = archive.entries().map_err(FsError::Io)?;
 
@@ -323,13 +369,24 @@ pub fn extract_tar_gz<R: Read>(
         // Security check relative path: path traversal, absolute paths, device names, trailing dots/spaces
         validate_entry_path(&relative_path)?;
 
-        let norm_rel = normalize_rel_path(&relative_path);
+        let mut path_depth = 0usize;
+        let mut target_path = PathBuf::with_capacity(
+            clean_dest.as_os_str().len() + relative_path.as_os_str().len() + 2,
+        );
+        target_path.push(&clean_dest);
+        let mut norm_exact = String::with_capacity(relative_path.as_os_str().len());
+        for c in relative_path.components() {
+            if let Component::Normal(s) = c {
+                path_depth += 1;
+                target_path.push(s);
+                if !norm_exact.is_empty() {
+                    norm_exact.push('/');
+                }
+                norm_exact.push_str(&s.to_string_lossy());
+            }
+        }
 
         // Check path depth: count components; if deeper than limits.max_path_depth
-        let path_depth = relative_path
-            .components()
-            .filter(|c| matches!(c, Component::Normal(_)))
-            .count();
         if path_depth > limits.max_path_depth {
             return Err(FsError::TarBombLimitExceeded {
                 limit_type: "path depth".to_string(),
@@ -364,21 +421,17 @@ pub fn extract_tar_gz<R: Read>(
             return Err(FsError::ForbiddenSpecialEntry { path: raw_path });
         }
 
-        let target_path = verbatim_dest.join(&relative_path);
-
         // Verify strict canonical path containment
-        let clean_target = clean(&target_path);
-        if !clean_target.starts_with(&clean_dest) {
+        if !target_path.starts_with(&clean_dest) {
             return Err(FsError::PathTraversal {
                 path: relative_path.clone(),
             });
         }
-        if clean_target == clean_dest && !entry_type.is_dir() {
+        if target_path == clean_dest && !entry_type.is_dir() {
             return Err(FsError::PathTraversal {
                 path: relative_path.clone(),
             });
         }
-        let target_path = clean_target;
 
         // Security check against Symlink Slip:
         // Ensure neither target_path nor any intermediate ancestor directory is a symlink or junction
@@ -395,14 +448,6 @@ pub fn extract_tar_gz<R: Read>(
         // mapping lowercase normalized path -> exact case-preserved normalized path.
         // Node-tar and npm rule: same path (case preserved) = later entry wins.
         // Only raise FsError::CaseCollision when two extracted paths differ only by case (e.g. foo.js vs FOO.JS).
-        let norm_exact = relative_path
-            .components()
-            .filter_map(|c| match c {
-                Component::Normal(s) => Some(s.to_string_lossy().to_string()),
-                _ => None,
-            })
-            .collect::<Vec<_>>()
-            .join("/");
         if norm_exact.is_empty() {
             continue;
         }
@@ -417,26 +462,26 @@ pub fn extract_tar_gz<R: Read>(
         }
 
         // Case collision check between files and directory ancestors
-        let path_segments: Vec<&str> = norm_lower.split('/').collect();
         if entry_type.is_dir() {
             if seen_files_lower.contains(&norm_lower) {
                 return Err(FsError::CaseCollision {
                     path: relative_path.clone(),
                 });
             }
-            seen_dirs_lower.insert(norm_lower.clone());
-            let mut prefix = String::new();
-            for seg in &path_segments {
-                if !prefix.is_empty() {
-                    prefix.push('/');
+            if seen_dirs_lower.insert(norm_lower.clone()) {
+                let mut end = norm_lower.len();
+                while let Some(pos) = norm_lower[..end].rfind('/') {
+                    let prefix = &norm_lower[..pos];
+                    if seen_files_lower.contains(prefix) {
+                        return Err(FsError::CaseCollision {
+                            path: relative_path.clone(),
+                        });
+                    }
+                    if !seen_dirs_lower.insert(prefix.to_string()) {
+                        break;
+                    }
+                    end = pos;
                 }
-                prefix.push_str(seg);
-                if seen_files_lower.contains(&prefix) {
-                    return Err(FsError::CaseCollision {
-                        path: relative_path.clone(),
-                    });
-                }
-                seen_dirs_lower.insert(prefix.clone());
             }
         } else {
             if seen_dirs_lower.contains(&norm_lower) {
@@ -445,25 +490,26 @@ pub fn extract_tar_gz<R: Read>(
                 });
             }
             seen_files_lower.insert(norm_lower.clone());
-            let mut prefix = String::new();
-            for seg in &path_segments[..path_segments.len().saturating_sub(1)] {
-                if !prefix.is_empty() {
-                    prefix.push('/');
-                }
-                prefix.push_str(seg);
-                if seen_files_lower.contains(&prefix) {
+            let mut end = norm_lower.len();
+            while let Some(pos) = norm_lower[..end].rfind('/') {
+                let prefix = &norm_lower[..pos];
+                if seen_files_lower.contains(prefix) {
                     return Err(FsError::CaseCollision {
                         path: relative_path.clone(),
                     });
                 }
-                seen_dirs_lower.insert(prefix.clone());
+                if !seen_dirs_lower.insert(prefix.to_string()) {
+                    break;
+                }
+                end = pos;
             }
         }
 
-        seen_paths.insert(norm_lower, norm_exact);
+        let _was_seen = seen_paths.insert(norm_lower, norm_exact.clone()).is_some();
 
         // Security check: escaping symlinks/hardlinks
         if entry_type.is_symlink() || entry_type.is_hard_link() {
+            let norm_rel = PathBuf::from(&norm_exact);
             symlink_count += 1;
             if symlink_count > limits.max_symlinks {
                 return Err(FsError::TarBombLimitExceeded {
@@ -512,7 +558,7 @@ pub fn extract_tar_gz<R: Read>(
                     extracted_regular_files.remove(&relative_path);
                     extracted_regular_files.remove(&norm_rel);
                     symlink_paths.insert(relative_path.clone());
-                    symlink_paths.insert(norm_rel.clone());
+                    symlink_paths.insert(norm_rel);
                     #[cfg(unix)]
                     {
                         let _ = &cleaned_rel;
@@ -581,7 +627,6 @@ pub fn extract_tar_gz<R: Read>(
 
                     let source_full = verbatim_dest.join(&cleaned_target);
                     let clean_source = clean(&source_full);
-                    let clean_dest = clean(&verbatim_dest);
                     if !clean_source.starts_with(&clean_dest) {
                         return Err(FsError::EscapingSymlink {
                             link: relative_path.clone(),
@@ -600,7 +645,7 @@ pub fn extract_tar_gz<R: Read>(
                         || symlink_paths.contains(&norm_cleaned)
                         || is_symlink_or_junction;
 
-                    if !has_symlink_ancestor {
+                    if !has_symlink_ancestor && !symlink_paths.is_empty() {
                         for ancestor in norm_cleaned.ancestors() {
                             if !ancestor.as_os_str().is_empty() && symlink_paths.contains(ancestor)
                             {
@@ -625,9 +670,12 @@ pub fn extract_tar_gz<R: Read>(
                                     break;
                                 }
                                 #[cfg(windows)]
-                                if crate::junction::is_junction(p).unwrap_or(false) {
-                                    has_symlink_ancestor = true;
-                                    break;
+                                {
+                                    use std::os::windows::fs::MetadataExt;
+                                    if (meta.file_attributes() & 0x400) != 0 {
+                                        has_symlink_ancestor = true;
+                                        break;
+                                    }
                                 }
                             }
                             curr_p = p.parent();
@@ -689,8 +737,8 @@ pub fn extract_tar_gz<R: Read>(
                     }
 
                     hardlink_targets.insert(relative_path.clone(), cleaned_target);
-                    extracted_regular_files.insert(relative_path.clone());
-                    extracted_regular_files.insert(norm_rel.clone());
+                    extracted_regular_files.insert(relative_path);
+                    extracted_regular_files.insert(norm_rel);
                 }
             }
             continue;
@@ -699,9 +747,11 @@ pub fn extract_tar_gz<R: Read>(
         // Unpack entry with size and ratio checks
         if entry_type.is_dir() {
             if !created_dirs.contains(&target_path) {
+                let norm_rel = PathBuf::from(&norm_exact);
                 let should_unlink = if is_fresh_dest {
-                    symlink_paths.contains(&relative_path)
-                        || symlink_paths.contains(&norm_rel)
+                    (!symlink_paths.is_empty()
+                        && (symlink_paths.contains(&relative_path)
+                            || symlink_paths.contains(&norm_rel)))
                         || extracted_regular_files.contains(&relative_path)
                         || extracted_regular_files.contains(&norm_rel)
                 } else {
@@ -719,7 +769,8 @@ pub fn extract_tar_gz<R: Read>(
             }
         } else if entry_type.is_file() {
             // Check single entry size limit from header if available
-            if let Ok(entry_size) = entry.header().size() {
+            let header_size = entry.header().size().ok();
+            if let Some(entry_size) = header_size {
                 if entry_size > limits.max_single_entry_size {
                     return Err(FsError::TarBombLimitExceeded {
                         limit_type: "entry size".to_string(),
@@ -750,11 +801,124 @@ pub fn extract_tar_gz<R: Read>(
                 )?;
             }
 
+            let norm_rel = PathBuf::from(&norm_exact);
+
+            if header_size.is_some_and(|sz| sz <= 256 * 1024) {
+                let sz = header_size.unwrap() as usize;
+                scratch_buf.clear();
+                if scratch_buf.capacity() < sz {
+                    scratch_buf.reserve(sz - scratch_buf.capacity());
+                }
+                let t_read = std::time::Instant::now();
+                entry.read_to_end(&mut scratch_buf).map_err(FsError::Io)?;
+                inflate_nanos += t_read.elapsed().as_nanos() as u64;
+
+                total_uncompressed += scratch_buf.len() as u64;
+                if total_uncompressed > limits.max_uncompressed_size {
+                    return Err(FsError::TarBombLimitExceeded {
+                        limit_type: "uncompressed size".to_string(),
+                        detail: format!(
+                            "Uncompressed size {} exceeded limit of {} bytes",
+                            total_uncompressed, limits.max_uncompressed_size
+                        ),
+                    });
+                }
+                if total_uncompressed > 50_000 {
+                    let compressed_so_far = compressed_counter.load(Ordering::Relaxed);
+                    let ratio = if compressed_so_far == 0 {
+                        f64::INFINITY
+                    } else {
+                        total_uncompressed as f64 / compressed_so_far as f64
+                    };
+                    if ratio > limits.max_compression_ratio {
+                        return Err(FsError::TarBombLimitExceeded {
+                            limit_type: "compression ratio".to_string(),
+                            detail: format!(
+                                "Compression ratio {:.1}:1 exceeded limit of {:.1}:1",
+                                ratio, limits.max_compression_ratio
+                            ),
+                        });
+                    }
+                }
+
+                if let Err(err) = crate::writer::write_file_fast_buf(
+                    &target_path,
+                    &scratch_buf,
+                    mode,
+                    64 * 1024,
+                    &mut wide_buf,
+                    false,
+                ) {
+                    if err.kind() == std::io::ErrorKind::PermissionDenied {
+                        unlink_target_path(&target_path);
+                        #[cfg(windows)]
+                        {
+                            if let Some(parent) = target_path.parent() {
+                                if let Ok(meta) = fs::metadata(parent) {
+                                    let mut perms = meta.permissions();
+                                    if perms.readonly() {
+                                        perms.set_readonly(false);
+                                        let _ = fs::set_permissions(parent, perms);
+                                    }
+                                }
+                            }
+                            if let Ok(meta) = fs::metadata(&target_path) {
+                                let mut perms = meta.permissions();
+                                if perms.readonly() {
+                                    perms.set_readonly(false);
+                                    let _ = fs::set_permissions(&target_path, perms);
+                                }
+                            }
+                        }
+                        #[cfg(unix)]
+                        {
+                            if let Some(parent) = target_path.parent() {
+                                if let Ok(meta) = fs::metadata(parent) {
+                                    use std::os::unix::fs::PermissionsExt;
+                                    let mut perms = meta.permissions();
+                                    if perms.mode() & 0o200 == 0 {
+                                        perms.set_mode(perms.mode() | 0o700);
+                                        let _ = fs::set_permissions(parent, perms);
+                                    }
+                                }
+                            }
+                            if let Ok(meta) = fs::metadata(&target_path) {
+                                use std::os::unix::fs::PermissionsExt;
+                                let mut perms = meta.permissions();
+                                perms.set_mode(perms.mode() | 0o600);
+                                let _ = fs::set_permissions(&target_path, perms);
+                            }
+                        }
+                        crate::writer::write_file_fast_buf(
+                            &target_path,
+                            &scratch_buf,
+                            mode,
+                            64 * 1024,
+                            &mut wide_buf,
+                            false,
+                        )?;
+                    } else {
+                        return Err(err.into());
+                    }
+                }
+
+                if !symlink_paths.is_empty() {
+                    symlink_paths.remove(&relative_path);
+                    symlink_paths.remove(&norm_rel);
+                }
+                extracted_regular_files.insert(relative_path);
+                if cfg!(windows) {
+                    extracted_regular_files.insert(norm_rel);
+                }
+                continue;
+            }
+
             // Replace the directory entry before opening it: truncating an existing
             // symlink or hardlink would modify the linked file, possibly outside dest.
             let should_unlink = if is_fresh_dest {
-                symlink_paths.contains(&relative_path)
-                    || symlink_paths.contains(&norm_rel)
+                (!symlink_paths.is_empty()
+                    && (symlink_paths.contains(&relative_path)
+                        || symlink_paths.contains(&norm_rel)))
                     || extracted_regular_files.contains(&relative_path)
                     || extracted_regular_files.contains(&norm_rel)
                     || created_dirs.contains(&target_path)
@@ -763,16 +927,6 @@ pub fn extract_tar_gz<R: Read>(
             };
             if should_unlink {
                 unlink_target_path(&target_path);
-            }
-
-            if let Ok(0) = entry.header().size() {
-                crate::writer::write_file_fast(&target_path, &[], mode, 64 * 1024)
-                    .map_err(FsError::Io)?;
-                symlink_paths.remove(&relative_path);
-                symlink_paths.remove(&norm_rel);
-                extracted_regular_files.insert(relative_path.clone());
-                extracted_regular_files.insert(norm_rel.clone());
-                continue;
             }
 
             let mut raw_file = match File::create(&target_path) {
@@ -873,10 +1027,14 @@ pub fn extract_tar_gz<R: Read>(
                 }
             }
             drop(raw_file);
-            symlink_paths.remove(&relative_path);
-            symlink_paths.remove(&norm_rel);
-            extracted_regular_files.insert(relative_path.clone());
-            extracted_regular_files.insert(norm_rel);
+            if !symlink_paths.is_empty() {
+                symlink_paths.remove(&relative_path);
+                symlink_paths.remove(&norm_rel);
+            }
+            extracted_regular_files.insert(relative_path);
+            if cfg!(windows) {
+                extracted_regular_files.insert(norm_rel);
+            }
         }
     }
 
@@ -912,48 +1070,59 @@ pub fn extract_tar_gz<R: Read>(
     })
 }
 
+#[cfg(windows)]
+pub(crate) fn unlink_target_path_wide(wide: &[u16], path_hint: &Path) {
+    extern "system" {
+        fn GetFileAttributesW(lpFileName: *const u16) -> u32;
+        fn SetFileAttributesW(lpFileName: *const u16, dwFileAttributes: u32) -> i32;
+        fn DeleteFileW(lpFileName: *const u16) -> i32;
+        fn RemoveDirectoryW(lpPathName: *const u16) -> i32;
+    }
+    const INVALID_FILE_ATTRIBUTES: u32 = u32::MAX;
+    const FILE_ATTRIBUTE_READONLY: u32 = 0x1;
+    const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x10;
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+    const FILE_ATTRIBUTE_NORMAL: u32 = 0x80;
+
+    let attrs = unsafe { GetFileAttributesW(wide.as_ptr()) };
+    if attrs == INVALID_FILE_ATTRIBUTES {
+        return;
+    }
+    if (attrs & FILE_ATTRIBUTE_READONLY) != 0 {
+        unsafe {
+            SetFileAttributesW(wide.as_ptr(), FILE_ATTRIBUTE_NORMAL);
+        }
+    }
+    if (attrs & FILE_ATTRIBUTE_DIRECTORY) != 0 {
+        let removed = unsafe { RemoveDirectoryW(wide.as_ptr()) };
+        if removed == 0 && (attrs & FILE_ATTRIBUTE_REPARSE_POINT) != 0 {
+            let _ = crate::junction::remove_junction(path_hint);
+        }
+    } else {
+        unsafe {
+            DeleteFileW(wide.as_ptr());
+        }
+    }
+}
+
 /// Safely unlinks a pre-existing target path before creating a new entry.
-/// On Windows, directory junctions are safely unlinked using `remove_junction` or `fs::remove_dir`
+/// On Windows, directory junctions are safely unlinked using `RemoveDirectoryW` / `remove_junction`
 /// to prevent `fs::remove_file` failures and avoid deleting target contents.
 pub(crate) fn unlink_target_path(path: &Path) {
-    let path_v = crate::path::to_verbatim_path(path);
-    if let Ok(meta) = fs::symlink_metadata(&path_v) {
-        #[cfg(windows)]
-        {
-            let mut perms = meta.permissions();
-            if perms.readonly() {
-                perms.set_readonly(false);
-                let _ = fs::set_permissions(&path_v, perms);
-            }
-            use std::os::windows::fs::MetadataExt;
-            const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x10;
-            const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
-            let attrs = meta.file_attributes();
-            if (attrs & FILE_ATTRIBUTE_REPARSE_POINT) != 0 || (attrs & FILE_ATTRIBUTE_DIRECTORY) != 0 {
-                if (attrs & FILE_ATTRIBUTE_DIRECTORY) != 0 {
-                    if (attrs & FILE_ATTRIBUTE_REPARSE_POINT) != 0 {
-                        let _ = crate::junction::remove_junction(&path_v);
-                    } else {
-                        let _ = fs::remove_dir(&path_v);
-                    }
-                    return;
-                } else {
-                    let _ = fs::remove_file(&path_v);
-                    return;
-                }
-            }
-        }
-        #[cfg(not(windows))]
-        {
+    #[cfg(windows)]
+    {
+        crate::path::with_verbatim_wide(path, |wide| unlink_target_path_wide(wide, path));
+    }
+    #[cfg(not(windows))]
+    {
+        let path_v = crate::path::to_verbatim_path(path);
+        if let Ok(meta) = fs::symlink_metadata(&path_v) {
             if meta.file_type().is_symlink() || !meta.is_dir() {
                 let _ = fs::remove_file(&path_v);
-                return;
-            } else if meta.is_dir() {
+            } else {
                 let _ = fs::remove_dir(&path_v);
-                return;
             }
         }
-        let _ = fs::remove_file(&path_v);
     }
 }
 
@@ -1009,30 +1178,43 @@ pub fn ensure_no_symlink_ancestors_with_cache(
     relative_path: &Path,
     mut safe_cache: Option<&mut HashSet<PathBuf>>,
 ) -> Result<(), FsError> {
-    // 1. Check if any intermediate ancestor directory was created as a symlink/junction by an earlier entry
-    let norm_rel = normalize_rel_path(relative_path);
-    for ancestor in norm_rel.ancestors() {
-        if !ancestor.as_os_str().is_empty()
-            && ancestor != norm_rel
-            && symlink_paths.contains(ancestor)
-        {
+    // 1 & 2. Check earlier symlink entries only when symlink entries exist in archive
+    if !symlink_paths.is_empty() {
+        let norm_rel = normalize_rel_path(relative_path);
+        for ancestor in norm_rel.ancestors() {
+            if !ancestor.as_os_str().is_empty()
+                && ancestor != norm_rel
+                && symlink_paths.contains(ancestor)
+            {
+                return Err(FsError::EscapingSymlink {
+                    link: destination.join(ancestor),
+                    target: target.to_path_buf(),
+                });
+            }
+        }
+        if symlink_paths.contains(&norm_rel) {
             return Err(FsError::EscapingSymlink {
-                link: destination.join(ancestor),
+                link: target.to_path_buf(),
                 target: target.to_path_buf(),
             });
         }
     }
 
-    // 2. Check if target_path itself was created as a symlink/junction by an earlier entry
-    if symlink_paths.contains(&norm_rel) {
-        return Err(FsError::EscapingSymlink {
-            link: target.to_path_buf(),
-            target: target.to_path_buf(),
-        });
+    // Fast path: if parent is destination or already cached as safe, skip Vec alloc & syscalls
+    let Some(first_parent) = target.parent() else {
+        return Ok(());
+    };
+    if first_parent == destination || first_parent.as_os_str().is_empty() {
+        return Ok(());
+    }
+    if let Some(ref cache) = safe_cache {
+        if cache.contains(first_parent) {
+            return Ok(());
+        }
     }
 
     // 3. Check all intermediate ancestors between destination and target on disk
-    let mut current = target.parent();
+    let mut current = Some(first_parent);
     let mut newly_verified = Vec::with_capacity(8);
     while let Some(parent) = current {
         if parent == destination || parent.as_os_str().is_empty() {
@@ -1055,7 +1237,8 @@ pub fn ensure_no_symlink_ancestors_with_cache(
             }
             #[cfg(windows)]
             {
-                if crate::junction::is_junction(parent).unwrap_or(false) {
+                use std::os::windows::fs::MetadataExt;
+                if (meta.file_attributes() & 0x400) != 0 {
                     return Err(FsError::EscapingSymlink {
                         link: parent.to_path_buf(),
                         target: target.to_path_buf(),
@@ -1171,25 +1354,15 @@ pub fn validate_entry_path(path: &Path) -> Result<(), FsError> {
                     }
                 };
 
-                // Reject null bytes, colons, or backslashes (Windows Alternate Data Streams, drive colons, or traversal)
-                if name.contains('\0') || name.contains(':') || name.contains('\\') {
-                    return Err(FsError::PathTraversal {
-                        path: path.to_path_buf(),
-                    });
-                }
-
-                // Reject ASCII control characters (0x00 to 0x1F)
-                if name.chars().any(|c| (c as u32) < 0x20) {
-                    return Err(FsError::PathTraversal {
-                        path: path.to_path_buf(),
-                    });
-                }
-
-                // Reject Windows invalid characters: *, ?, ", <, >, |
-                if name
-                    .chars()
-                    .any(|c| matches!(c, '*' | '?' | '"' | '<' | '>' | '|'))
-                {
+                // Reject null bytes, colons, backslashes, ASCII control chars (< 0x20),
+                // and Windows invalid chars (*, ?, ", <, >, |) in a single byte scan.
+                if name.bytes().any(|b| {
+                    b < 0x20
+                        || matches!(
+                            b,
+                            b':' | b'\\' | b'*' | b'?' | b'"' | b'<' | b'>' | b'|'
+                        )
+                }) {
                     return Err(FsError::PathTraversal {
                         path: path.to_path_buf(),
                     });
@@ -1229,30 +1402,43 @@ pub fn is_windows_reserved_name(name: &str) -> bool {
 
     // 2. Extract base stem before any extension: split on '.'
     // Trim trailing spaces and dots from the base stem (e.g. "aux .js", "nul.", "com1  .json")
-    let base = name
-        .split('.')
-        .next()
-        .unwrap_or(name)
-        .trim_matches(|c: char| c == ' ' || c == '.');
+    let stem = match name.find('.') {
+        Some(pos) => &name[..pos],
+        None => name,
+    };
+    let base = stem.trim_matches(|c: char| c == ' ' || c == '.');
 
-    if base.is_empty() {
+    if base.len() < 3 || base.len() > 7 {
         return false;
     }
 
-    let upper = base.to_ascii_uppercase();
-
-    match upper.as_str() {
-        "CON" | "PRN" | "AUX" | "NUL" | "CLOCK$" | "CONIN$" | "CONOUT$" => true,
-        "COM0" | "COM1" | "COM2" | "COM3" | "COM4" | "COM5" | "COM6" | "COM7" | "COM8" | "COM9" => {
-            true
-        }
-        "LPT0" | "LPT1" | "LPT2" | "LPT3" | "LPT4" | "LPT5" | "LPT6" | "LPT7" | "LPT8" | "LPT9" => {
-            true
-        }
-        "COM\u{00B9}" | "COM\u{00B2}" | "COM\u{00B3}" => true,
-        "LPT\u{00B9}" | "LPT\u{00B2}" | "LPT\u{00B3}" => true,
-        _ => false,
+    if base.eq_ignore_ascii_case("CON")
+        || base.eq_ignore_ascii_case("PRN")
+        || base.eq_ignore_ascii_case("AUX")
+        || base.eq_ignore_ascii_case("NUL")
+        || base.eq_ignore_ascii_case("CLOCK$")
+        || base.eq_ignore_ascii_case("CONIN$")
+        || base.eq_ignore_ascii_case("CONOUT$")
+    {
+        return true;
     }
+
+    let bytes = base.as_bytes();
+    if bytes.len() == 4
+        && (bytes[..3].eq_ignore_ascii_case(b"COM") || bytes[..3].eq_ignore_ascii_case(b"LPT"))
+        && bytes[3].is_ascii_digit()
+    {
+        return true;
+    }
+
+    if bytes.len() == 5
+        && (bytes[..3].eq_ignore_ascii_case(b"COM") || bytes[..3].eq_ignore_ascii_case(b"LPT"))
+        && (base[3..].eq("\u{00B9}") || base[3..].eq("\u{00B2}") || base[3..].eq("\u{00B3}"))
+    {
+        return true;
+    }
+
+    false
 }
 
 pub fn validate_link_target(
@@ -2079,6 +2265,7 @@ pub fn pack_directory(
     });
 
     // Build tar archive in memory
+    let mut file_meta_cache: HashMap<&str, (u64, u32)> = HashMap::with_capacity(files_to_pack.len());
     let mut tar_bytes = Vec::new();
     {
         let mut builder = Builder::new(&mut tar_bytes);
@@ -2100,6 +2287,7 @@ pub fn pack_directory(
             } else {
                 NPM_DEFAULT_FILE_MODE
             };
+            file_meta_cache.insert(rel_path.as_str(), (file_data.len() as u64, mode));
             header.set_mode(mode);
             let entry_path = format!("package/{rel_path}");
             header.set_path(entry_path).map_err(FsError::Io)?;
@@ -2140,17 +2328,22 @@ pub fn pack_directory(
     let integrity_str = integrity_obj.to_string();
 
     let mut unpacked_size = 0u64;
-    let mut summary_files = Vec::new();
+    let mut summary_files = Vec::with_capacity(files_to_pack.len());
 
     for (rel_path, full_path) in &files_to_pack {
-        let meta = fs::metadata(full_path)?;
-        let size = meta.len();
-        unpacked_size += size;
-        let mode = if is_file_executable(full_path) {
-            NPM_EXECUTABLE_FILE_MODE
-        } else {
-            NPM_DEFAULT_FILE_MODE
+        let (size, mode) = match file_meta_cache.get(rel_path.as_str()) {
+            Some(&pair) => pair,
+            None => {
+                let meta = fs::metadata(full_path)?;
+                let mode = if is_file_executable(full_path) {
+                    NPM_EXECUTABLE_FILE_MODE
+                } else {
+                    NPM_DEFAULT_FILE_MODE
+                };
+                (meta.len(), mode)
+            }
         };
+        unpacked_size += size;
         summary_files.push(PackedFileEntry {
             path: rel_path.clone(),
             size,

@@ -7,7 +7,6 @@ use std::thread::{self, JoinHandle};
 const NODE_WRITER_SCRIPT: &str = r#"
 const fs = require('fs');
 const path = require('path');
-const dirs = new Set();
 const q = [];
 let head = 0;
 let inflight = 0;
@@ -32,8 +31,10 @@ let sumQueueDelayMs = 0;
 let sumServiceTimeMs = 0;
 let maxServiceTimeMs = 0;
 
-let reading = false;
 let paused = false;
+const hdrBuf = Buffer.allocUnsafe(12);
+let hdrLen = 0;
+let activeFrame = null;
 
 // Exclusive creation avoids truncating a pre-existing hardlink or following a
 // symlink. Fresh installations pay no additional stat/unlink syscall.
@@ -48,6 +49,43 @@ function writeItem(item, done) {
   });
 }
 
+function finishWrite(item, err, tWriteStart) {
+  if (timing) {
+    const sTime = Date.now() - tWriteStart;
+    sumServiceTimeMs += sTime;
+    if (sTime > maxServiceTimeMs) maxServiceTimeMs = sTime;
+  }
+  if (err) {
+    if (err.code === 'ENOENT') {
+      mkdirCount++;
+      const tMkdirStart = timing ? Date.now() : 0;
+      try {
+        fs.mkdirSync(path.dirname(item.p), { recursive: true });
+      } catch (e) {}
+      if (timing) {
+        mkdirTimeMs += Date.now() - tMkdirStart;
+      }
+      writeItem(item, (retryErr) => {
+        if (retryErr) {
+          console.error('NodeWriter error after mkdir:', item.p, retryErr);
+          failed = true;
+        }
+        writesCompleted++;
+        inflight--;
+        pump();
+        checkResume();
+      });
+      return;
+    }
+    console.error('NodeWriter error:', item.p, err);
+    failed = true;
+  }
+  writesCompleted++;
+  inflight--;
+  pump();
+  checkResume();
+}
+
 function pump() {
   while (inflight < concurrency && head < q.length) {
     const item = q[head];
@@ -58,47 +96,12 @@ function pump() {
       sumQueueDelayMs += Date.now() - item.t;
     }
     const tWriteStart = timing ? Date.now() : 0;
-    const onWriteDone = (err) => {
-      if (timing) {
-        const sTime = Date.now() - tWriteStart;
-        sumServiceTimeMs += sTime;
-        if (sTime > maxServiceTimeMs) maxServiceTimeMs = sTime;
-      }
-      if (err) {
-        if (err.code === 'ENOENT') {
-          mkdirCount++;
-          const tMkdirStart = timing ? Date.now() : 0;
-          try {
-            fs.mkdirSync(path.dirname(item.p), { recursive: true });
-          } catch (e) {}
-          if (timing) {
-            mkdirTimeMs += Date.now() - tMkdirStart;
-          }
-          const onRetryDone = (retryErr) => {
-            if (retryErr) {
-              console.error('NodeWriter error after mkdir:', item.p, retryErr);
-              failed = true;
-            }
-            writesCompleted++;
-            inflight--;
-            pump();
-            checkResume();
-          };
-          writeItem(item, onRetryDone);
-          return;
-        }
-        console.error('NodeWriter error:', item.p, err);
-        failed = true;
-      }
-      writesCompleted++;
-      inflight--;
-      pump();
-      checkResume();
-    };
-
-    writeItem(item, onWriteDone);
+    writeItem(item, (err) => finishWrite(item, err, tWriteStart));
   }
-  if (head > 1024) {
+  if (head === q.length) {
+    q.length = 0;
+    head = 0;
+  } else if (head > 4096) {
     q.splice(0, head);
     head = 0;
   }
@@ -128,57 +131,100 @@ function pump() {
 function checkResume() {
   if (paused && (q.length - head) < concurrency) {
     paused = false;
-    readChunks();
+    process.stdin.resume();
   }
 }
 
-let hdr = null;
+function enqueueFrame(p, b, m) {
+  if (timing && tFirstItem === 0) tFirstItem = Date.now();
+  totalEnqueued++;
+  totalBytes += b.length;
+  q.push({ p, b, m, t: timing ? Date.now() : 0 });
+}
 
-function readChunks() {
-  if (reading) return;
-  reading = true;
-  while (true) {
-    const curQueued = q.length - head;
-    if (curQueued > peakQueue) peakQueue = curQueued;
-    if (curQueued >= maxQueue) {
-      paused = true;
+function startOrEmitFrame(pLen, mode, dLen, chunk, bodyStart, len) {
+  const bodyLen = pLen + dLen;
+  if (bodyStart + bodyLen <= len) {
+    const dStart = bodyStart + pLen;
+    enqueueFrame(
+      chunk.toString('utf8', bodyStart, dStart),
+      chunk.subarray(dStart, bodyStart + bodyLen),
+      mode
+    );
+    return bodyStart + bodyLen;
+  }
+  const buf = Buffer.allocUnsafe(bodyLen);
+  const avail = len - bodyStart;
+  if (avail > 0) chunk.copy(buf, 0, bodyStart, len);
+  activeFrame = { pLen, mode, bodyLen, buf, pos: avail };
+  return len;
+}
+
+process.stdin.on('data', (chunk) => {
+  const len = chunk.length;
+  let pos = 0;
+  while (pos < len) {
+    if (activeFrame !== null) {
+      const take = Math.min(activeFrame.bodyLen - activeFrame.pos, len - pos);
+      chunk.copy(activeFrame.buf, activeFrame.pos, pos, pos + take);
+      activeFrame.pos += take;
+      pos += take;
+      if (activeFrame.pos === activeFrame.bodyLen) {
+        const f = activeFrame;
+        activeFrame = null;
+        enqueueFrame(f.buf.toString('utf8', 0, f.pLen), f.buf.subarray(f.pLen), f.mode);
+      }
+      continue;
+    }
+    if (hdrLen > 0) {
+      const take = Math.min(12 - hdrLen, len - pos);
+      chunk.copy(hdrBuf, hdrLen, pos, pos + take);
+      hdrLen += take;
+      pos += take;
+      if (hdrLen < 12) break;
+      hdrLen = 0;
+      pos = startOrEmitFrame(
+        hdrBuf.readUInt32LE(0),
+        hdrBuf.readUInt32LE(4),
+        hdrBuf.readUInt32LE(8),
+        chunk,
+        pos,
+        len
+      );
+      continue;
+    }
+    if (len - pos < 12) {
+      chunk.copy(hdrBuf, 0, pos, len);
+      hdrLen = len - pos;
       break;
     }
-    if (!hdr) {
-      const h = process.stdin.read(12);
-      if (!h) break;
-      hdr = {
-        pLen: h.readUInt32LE(0),
-        mode: h.readUInt32LE(4),
-        dLen: h.readUInt32LE(8)
-      };
-    }
-    const body = process.stdin.read(hdr.pLen + hdr.dLen);
-    if (!body) break;
-    if (timing && tFirstItem === 0) tFirstItem = Date.now();
-    const p = body.toString('utf8', 0, hdr.pLen);
-    const b = body.subarray(hdr.pLen);
-    totalEnqueued++;
-    totalBytes += hdr.dLen;
-    q.push({ p, b, m: hdr.mode, t: timing ? Date.now() : 0 });
-    hdr = null;
+    pos = startOrEmitFrame(
+      chunk.readUInt32LE(pos),
+      chunk.readUInt32LE(pos + 4),
+      chunk.readUInt32LE(pos + 8),
+      chunk,
+      pos + 12,
+      len
+    );
   }
-  reading = false;
   pump();
-}
-
-process.stdin.on('readable', readChunks);
+  const curQueued = q.length - head;
+  if (curQueued > peakQueue) peakQueue = curQueued;
+  if (!paused && curQueued >= maxQueue) {
+    paused = true;
+    process.stdin.pause();
+  }
+});
 
 process.stdin.on('end', () => {
   stdinEnded = true;
   tStdinEnd = Date.now();
   writtenAtStdinEnd = writesCompleted;
-  if (paused) {
-    paused = false;
-    readChunks();
-  } else {
-    pump();
+  if (hdrLen > 0 || activeFrame !== null) {
+    console.error('NodeWriter truncated frame at EOF');
+    failed = true;
   }
+  pump();
 });
 "#;
 
@@ -292,6 +338,40 @@ mod worker_tests {
                 thread::sleep(std::time::Duration::from_millis(10));
             }
             assert_eq!(std::fs::read(dir.path().join("2047.js")).unwrap(), *payload);
+        }
+    }
+
+    #[test]
+    fn writer_handles_large_spanning_and_mixed_frames() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut writer = NodeWriterWorker::spawn("8", "8").unwrap();
+        let small: Arc<Vec<u8>> = Arc::new(b"small".to_vec());
+        let empty: Arc<Vec<u8>> = Arc::new(Vec::new());
+        let large_a: Arc<Vec<u8>> = Arc::new((0..(600 * 1024 + 17)).map(|i| (i % 251) as u8).collect());
+        let large_b: Arc<Vec<u8>> = Arc::new((0..(512 * 1024 + 3)).map(|i| ((i * 7) % 241) as u8).collect());
+
+        let items = [
+            ("empty.txt", Arc::clone(&empty)),
+            ("large_a.bin", Arc::clone(&large_a)),
+            ("tiny_1.txt", Arc::clone(&small)),
+            ("large_b.bin", Arc::clone(&large_b)),
+            ("tiny_2.txt", Arc::clone(&small)),
+        ];
+        for (name, data) in &items {
+            writer
+                .sender
+                .send(NodeWriterMsg::File {
+                    path: dir.path().join(name).to_string_lossy().into_owned(),
+                    data: Arc::clone(data),
+                    mode: 0o644,
+                })
+                .unwrap();
+        }
+        writer.close_input();
+        writer.wait().unwrap();
+
+        for (name, expected) in &items {
+            assert_eq!(std::fs::read(dir.path().join(name)).unwrap(), **expected, "mismatch for {name}");
         }
     }
 }
@@ -431,8 +511,8 @@ impl NodeWriterWorker {
             .stderr(Stdio::inherit())
             .spawn()?;
 
-        let mut stdin = std::io::BufWriter::with_capacity(64 * 1024, child.stdin.take().unwrap());
-        let (tx, rx): (SyncSender<NodeWriterMsg>, Receiver<NodeWriterMsg>) = sync_channel(256);
+        let mut stdin = std::io::BufWriter::with_capacity(512 * 1024, child.stdin.take().unwrap());
+        let (tx, rx): (SyncSender<NodeWriterMsg>, Receiver<NodeWriterMsg>) = sync_channel(1024);
 
         let handle = thread::spawn(move || -> std::io::Result<()> {
             use std::io::Write;
@@ -441,9 +521,21 @@ impl NodeWriterWorker {
                 match msg {
                     NodeWriterMsg::File { path, data, mode } => {
                         let path_bytes = path.as_bytes();
-                        hdr[0..4].copy_from_slice(&(path_bytes.len() as u32).to_le_bytes());
+                        let Ok(path_len) = u32::try_from(path_bytes.len()) else {
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::InvalidInput,
+                                "NodeWriter path exceeds u32::MAX bytes",
+                            ));
+                        };
+                        let Ok(data_len) = u32::try_from(data.len()) else {
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::InvalidInput,
+                                "NodeWriter file payload exceeds u32::MAX bytes",
+                            ));
+                        };
+                        hdr[0..4].copy_from_slice(&path_len.to_le_bytes());
                         hdr[4..8].copy_from_slice(&mode.to_le_bytes());
-                        hdr[8..12].copy_from_slice(&(data.len() as u32).to_le_bytes());
+                        hdr[8..12].copy_from_slice(&data_len.to_le_bytes());
                         if let Err(e) = stdin.write_all(&hdr) {
                             eprintln!("[NODE_WRITER_ERR] write hdr: {e}");
                             return Err(e);
@@ -452,11 +544,9 @@ impl NodeWriterWorker {
                             eprintln!("[NODE_WRITER_ERR] write path: {e}");
                             return Err(e);
                         }
-                        for chunk in data.chunks(64 * 1024) {
-                            if let Err(e) = stdin.write_all(chunk) {
-                                eprintln!("[NODE_WRITER_ERR] write data: {e}");
-                                return Err(e);
-                            }
+                        if let Err(e) = stdin.write_all(&data) {
+                            eprintln!("[NODE_WRITER_ERR] write data: {e}");
+                            return Err(e);
                         }
                     }
                     NodeWriterMsg::Close => break,
@@ -657,7 +747,8 @@ impl RustWriterPool {
         for _ in 0..num_threads {
             let rx = Arc::clone(&rx);
             handles.push(thread::spawn(move || -> std::io::Result<()> {
-                let mut batch = Vec::with_capacity(16);
+                let mut batch = Vec::with_capacity(32);
+                let mut wide_buf: Vec<u16> = Vec::with_capacity(260);
                 loop {
                     batch.clear();
                     {
@@ -669,7 +760,7 @@ impl RustWriterPool {
                                 let is_close = matches!(task, WriteTask::Close);
                                 batch.push(task);
                                 if !is_close {
-                                    while batch.len() < 16 {
+                                    while batch.len() < 32 {
                                         match guard.try_recv() {
                                             Ok(t) => {
                                                 let close = matches!(t, WriteTask::Close);
@@ -687,11 +778,17 @@ impl RustWriterPool {
                         }
                     }
                     let mut should_exit = false;
-                    for task in &batch {
+                    for task in batch.drain(..) {
                         match task {
                             WriteTask::File { path, data, mode } => {
-                                crate::tarball::unlink_target_path(path);
-                                crate::writer::write_file_fast(path, data, *mode, 65536)?;
+                                crate::writer::write_file_fast_buf(
+                                    &path,
+                                    &data,
+                                    mode,
+                                    65536,
+                                    &mut wide_buf,
+                                    true,
+                                )?;
                             }
                             WriteTask::Close => {
                                 should_exit = true;
