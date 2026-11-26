@@ -5791,9 +5791,7 @@ async fn finish_install_or_ci_output(
         let parsed_lock = if !dry_run && audit_val && fund_val {
             let (lock_path, _) = rnpm_install::resolve_lockfile_path(report_dir);
             if lock_path.exists() {
-                rnpm_lockfile::LockfileV3::load_from_file_readonly(&lock_path)
-                    .ok()
-                    .or_else(|| rnpm_lockfile::load_and_migrate(&lock_path).ok())
+                rnpm_lockfile::load_and_migrate_readonly(&lock_path).ok()
             } else {
                 None
             }
@@ -5850,9 +5848,7 @@ async fn finish_install_or_ci_output(
         let parsed_lock = if !silent && fund_val && audit_val {
             let (lock_path, _) = rnpm_install::resolve_lockfile_path(report_dir);
             if lock_path.exists() {
-                rnpm_lockfile::LockfileV3::load_from_file_readonly(&lock_path)
-                    .ok()
-                    .or_else(|| rnpm_lockfile::load_and_migrate(&lock_path).ok())
+                rnpm_lockfile::load_and_migrate_readonly(&lock_path).ok()
             } else {
                 None
             }

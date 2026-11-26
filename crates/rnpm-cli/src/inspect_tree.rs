@@ -364,9 +364,13 @@ pub(crate) fn scan_disk_packages_with_raw(
             let Ok(file_type) = entry.file_type() else {
                 continue;
             };
-            let is_link = is_dir_entry_reparse_or_symlink(&entry, &file_type);
             let entry_path = entry.path();
-            if !file_type.is_dir() && !(is_link && entry_path.is_dir()) {
+            let is_link = if is_dir_entry_reparse_or_symlink(&entry, &file_type) {
+                file_type.is_symlink() || is_junction(&entry_path).unwrap_or(false)
+            } else {
+                false
+            };
+            if !file_type.is_dir() && !is_link {
                 continue;
             }
 
@@ -382,9 +386,14 @@ pub(crate) fn scan_disk_packages_with_raw(
                         let Ok(sub_ft) = scoped_entry.file_type() else {
                             continue;
                         };
-                        let sub_is_link = is_dir_entry_reparse_or_symlink(&scoped_entry, &sub_ft);
                         let sub_path = scoped_entry.path();
-                        if !sub_ft.is_dir() && !(sub_is_link && sub_path.is_dir()) {
+                        let sub_is_link = if is_dir_entry_reparse_or_symlink(&scoped_entry, &sub_ft)
+                        {
+                            sub_ft.is_symlink() || is_junction(&sub_path).unwrap_or(false)
+                        } else {
+                            false
+                        };
+                        if !sub_ft.is_dir() && !sub_is_link {
                             continue;
                         }
 

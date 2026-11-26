@@ -1909,20 +1909,12 @@ impl PackStore {
             };
             // Always derive CAS path from this store's cas_dir + validated SHA-256;
             // never trust arbitrary deserialized paths from `.idx`.
-            let expected_matches = cas_dir.as_ref().is_some_and(|d| {
-                entry.cas_path.as_ref().is_some_and(|p| {
-                    p.file_name().and_then(|n| n.to_str()) == Some(sha.as_str())
-                        && p.starts_with(d)
-                })
-            });
-            if !expected_matches {
-                let cas_file = match cas_dir.as_ref() {
-                    Some(d) => d.join(&sha[0..2]).join(sha),
-                    None => self.cas_file_path(sha),
-                };
-                if entry.cas_path.is_some() || has_cas {
-                    entry.cas_path = Some(cas_file);
-                }
+            let cas_file = match cas_dir.as_ref() {
+                Some(d) => d.join(&sha[0..2]).join(sha),
+                None => self.cas_file_path(sha),
+            };
+            if entry.cas_path.as_ref() != Some(&cas_file) && (entry.cas_path.is_some() || has_cas) {
+                entry.cas_path = Some(cas_file);
             }
 
             if !has_cas {

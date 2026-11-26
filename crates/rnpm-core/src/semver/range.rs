@@ -411,10 +411,13 @@ fn parse_fast_partial_token(s: &str) -> Option<FastPartial> {
         }
     }
 
+    let major = segs[0];
+    let minor = if major.is_none() { None } else { segs[1] };
+    let patch = if minor.is_none() { None } else { segs[2] };
     Some(FastPartial {
-        major: segs[0],
-        minor: segs[1],
-        patch: segs[2],
+        major,
+        minor,
+        patch,
     })
 }
 
@@ -1057,11 +1060,17 @@ fn parse_partial_version(input: &str) -> Result<PartialVersion, SemverError> {
 
     let major = parse_segment(p0)?;
     let minor = match p1 {
-        Some(p) => parse_segment(p)?,
+        Some(p) => {
+            let m = parse_segment(p)?;
+            if major.is_none() { None } else { m }
+        }
         None => None,
     };
     let patch = match p2 {
-        Some(p) => parse_segment(p)?,
+        Some(p) => {
+            let pt = parse_segment(p)?;
+            if minor.is_none() { None } else { pt }
+        }
         None => None,
     };
 

@@ -500,9 +500,7 @@ pub(crate) async fn build_audit_report_with_advisories_and_config(
                  npm error Try creating one with `rnpm install`."
             ));
         }
-        owned_lockfile = rnpm_lockfile::LockfileV3::load_from_file_readonly(&lock_path)
-            .or_else(|_| rnpm_lockfile::load_and_migrate(&lock_path))
-            .map_err(|e| {
+        owned_lockfile = rnpm_lockfile::load_and_migrate_readonly(&lock_path).map_err(|e| {
             anyhow::anyhow!(
                 "Failed to parse {}: {e}",
                 if is_shrinkwrap {

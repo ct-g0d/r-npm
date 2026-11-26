@@ -618,6 +618,14 @@ impl Overrides {
         )
     }
 
+    /// Refresh compiled override indices if `self.rules` was mutated directly.
+    pub fn refresh_compiled(&mut self) {
+        if !self.indexed.matches_rules(&self.rules) {
+            self.indexed = PrecompiledOverrides::compile(&self.rules);
+            self.fast_idx = FastOverridesIndex::compile(&self.rules);
+        }
+    }
+
     /// Fast precompiled lookup bypassing `rules` mutation checks.
     /// Safe when `Overrides` has not been mutated directly via `pub rules`.
     #[inline]

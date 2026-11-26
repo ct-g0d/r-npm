@@ -482,7 +482,8 @@ pub fn arborist_compare(a: &str, b: &str) -> std::cmp::Ordering {
 }
 
 impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
-    pub fn new(provider: &'a P, options: ResolverOptions, overrides: Overrides) -> Self {
+    pub fn new(provider: &'a P, options: ResolverOptions, mut overrides: Overrides) -> Self {
+        overrides.refresh_compiled();
         let graph = DependencyGraph {
             legacy_peer_deps: options.legacy_peer_deps,
             ..DependencyGraph::new()
@@ -4237,5 +4238,23 @@ mod tests {
             placed_from,
             crate::explain::EdgeFrom::Node(ref loc) if loc == "node_modules/a-first-edge"
         ));
+    }
+
+    #[test]
+    fn test_solver_new_refreshes_mutated_overrides() {
+        let provider = crate::types::InMemoryPackageProvider::new();
+        let mut overrides = Overrides::default();
+        overrides.rules.insert(
+            "foo".to_string(),
+            rnpm_core::overrides::OverrideValue::Exact("2.0.0".to_string()),
+        );
+        let solver = Solver::new(&provider, ResolverOptions::default(), overrides);
+        assert_eq!(
+            solver
+                .overrides
+                .resolve_override_precompiled_with_caller("foo", "^1.0.0", &["root"], None)
+                .unwrap(),
+            Some("2.0.0".to_string())
+        );
     }
 }

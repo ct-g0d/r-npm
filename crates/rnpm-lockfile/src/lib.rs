@@ -19,7 +19,8 @@ pub mod model;
 pub use error::LockfileError;
 pub use integrity::{verify_lockfile_integrity, IntegrityPolicy, LockfileIntegrityChecker};
 pub use migration::{
-    load_and_migrate, migrate_to_v3, parse_and_migrate, AnyLockfile, LegacyDependency,
+    load_and_migrate, load_and_migrate_readonly, migrate_to_v3, parse_and_migrate,
+    parse_and_migrate_readonly, AnyLockfile, LegacyDependency,
 };
 pub use model::{
     get_format_package_lock, reset_format_package_lock, set_format_package_lock,

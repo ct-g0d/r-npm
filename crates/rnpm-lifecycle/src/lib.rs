@@ -2536,6 +2536,7 @@ fn configured_script_shell(ctx: &LifecycleContext) -> Option<&str> {
     })
 }
 
+#[cfg(any(windows, test))]
 fn is_shell_builtin(prog: &str) -> bool {
     #[cfg(windows)]
     let eq = |kw: &str| prog.eq_ignore_ascii_case(kw);
@@ -2558,6 +2559,7 @@ fn is_shell_builtin(prog: &str) -> bool {
 /// Conservatively splits a simple command line into argv tokens when guaranteed
 /// free of shell metacharacters, redirections, pipelines, globs, or variable
 /// expansions on both cmd.exe and /bin/sh.
+#[cfg(any(windows, test))]
 fn try_split_simple_args(cmd: &str) -> Option<Vec<String>> {
     let trimmed = cmd.trim();
     if trimmed.is_empty() {
@@ -2713,136 +2715,6 @@ fn resolve_executable_in_env(
 }
 
 #[cfg(windows)]
-fn try_unwrap_node_cmd_shim(
-    cmd_path: &Path,
-    extra_args: &[String],
-    package_dir: &Path,
-    env: &HashMap<String, String>,
-) -> Option<Command> {
-    let meta = std::fs::metadata(cmd_path).ok()?;
-    if meta.len() > 8192 {
-        return None;
-    }
-    let content = std::fs::read_to_string(cmd_path).ok()?;
-    if !content.contains("IF EXIST \"%dp0%\\node.exe\"") {
-        return None;
-    }
-    let exec_line = content
-        .lines()
-        .find(|line| line.starts_with("endLocal & goto #_undefined_# 2>NUL || title %COMSPEC% & \"%_prog%\""))?;
-    let rest = exec_line
-        .strip_prefix("endLocal & goto #_undefined_# 2>NUL || title %COMSPEC% & \"%_prog%\"")?
-        .trim()
-        .strip_suffix("%*")?
-        .trim();
-
-    // Expect `... "%dp0%\<rel_path>"` at the end of `rest`.
-    let rest_no_trailing_quote = rest.strip_suffix('"')?;
-    let quote_start = rest_no_trailing_quote.rfind('"')?;
-    let raw_target = &rest_no_trailing_quote[quote_start + 1..];
-    let rel_target = raw_target
-        .strip_prefix("%dp0%\\")
-        .or_else(|| raw_target.strip_prefix("%dp0%/"))?;
-    if rel_target.is_empty()
-        || rel_target
-            .chars()
-            .any(|c| matches!(c, '%' | '!' | '"' | '<' | '>' | '|' | '&' | '^' | '$'))
-    {
-        return None;
-    }
-
-    let before_target = rest_no_trailing_quote[..quote_start].trim();
-    let shim_args = if before_target.is_empty() {
-        Vec::new()
-    } else {
-        try_split_simple_args(before_target)?
-    };
-
-    let cmd_dir = cmd_path.parent()?;
-    let target_script = cmd_dir.join(rel_target.replace('/', "\\"));
-    if !target_script.is_file() {
-        return None;
-    }
-
-    let local_node = cmd_dir.join("node.exe");
-    let node_bin = if local_node.is_file() {
-        local_node
-    } else {
-        let resolved = resolve_executable_in_env("node", package_dir, env)?;
-        let is_exe = resolved
-            .extension()
-            .and_then(|e| e.to_str())
-            .is_some_and(|e| e.eq_ignore_ascii_case("exe"));
-        if !is_exe {
-            return None;
-        }
-        resolved
-    };
-
-    let mut cmd = Command::new(node_bin);
-    cmd.args(shim_args);
-    cmd.arg(target_script);
-    cmd.args(extra_args);
-    Some(cmd)
-}
-
-#[cfg(not(windows))]
-fn is_direct_unix_binary(path: &Path) -> bool {
-    use std::io::Read;
-    use std::os::unix::fs::PermissionsExt;
-    let Ok(meta) = std::fs::metadata(path) else {
-        return false;
-    };
-    if !meta.is_file() || (meta.permissions().mode() & 0o111) == 0 {
-        return false;
-    }
-    let Ok(mut file) = std::fs::File::open(path) else {
-        return false;
-    };
-    let mut magic = [0u8; 4];
-    let Ok(n) = file.read(&mut magic) else {
-        return false;
-    };
-    if n >= 2 && &magic[..2] == b"#!" {
-        return true;
-    }
-    n == 4
-        && (magic == [0x7f, b'E', b'L', b'F']
-            || magic == [0xfe, 0xed, 0xfa, 0xce]
-            || magic == [0xce, 0xfa, 0xed, 0xfe]
-            || magic == [0xfe, 0xed, 0xfa, 0xcf]
-            || magic == [0xcf, 0xfa, 0xed, 0xfe]
-            || magic == [0xca, 0xfe, 0xba, 0xbe])
-}
-
-#[cfg(not(windows))]
-fn resolve_unix_executable_in_env(
-    prog: &str,
-    package_dir: &Path,
-    env: &HashMap<String, String>,
-) -> Option<PathBuf> {
-    if prog.contains('/') {
-        let p = Path::new(prog);
-        let full = if p.is_absolute() {
-            p.to_path_buf()
-        } else {
-            package_dir.join(p)
-        };
-        return is_direct_unix_binary(&full).then_some(full);
-    }
-    let path_str = env.get("PATH").map(String::as_str)?;
-    for dir in std::env::split_paths(path_str) {
-        if dir.as_os_str().is_empty() {
-            continue;
-        }
-        let candidate = dir.join(prog);
-        if is_direct_unix_binary(&candidate) {
-            return Some(candidate);
-        }
-    }
-    None
-}
-
 fn try_create_direct_command(ctx: &LifecycleContext, env: &HashMap<String, String>) -> Option<Command> {
     if configured_script_shell(ctx).is_some() {
         return None;
@@ -2850,34 +2722,17 @@ fn try_create_direct_command(ctx: &LifecycleContext, env: &HashMap<String, Strin
     let argv = try_split_simple_args(&ctx.script_cmd)?;
     let (prog, rest) = argv.split_first()?;
 
-    #[cfg(windows)]
-    {
-        let resolved = resolve_executable_in_env(prog, &ctx.package_dir, env)?;
-        let ext = resolved
-            .extension()
-            .and_then(|e| e.to_str())
-            .map(|e| e.to_ascii_lowercase())?;
-        match ext.as_str() {
-            "exe" => {
-                let mut cmd = Command::new(resolved);
-                cmd.args(rest);
-                Some(cmd)
-            }
-            "cmd" => try_unwrap_node_cmd_shim(&resolved, rest, &ctx.package_dir, env),
-            _ => None,
-        }
-    }
-
-    #[cfg(not(windows))]
-    {
-        let resolved = resolve_unix_executable_in_env(prog, &ctx.package_dir, env)?;
+    let resolved = resolve_executable_in_env(prog, &ctx.package_dir, env)?;
+    let ext = resolved
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())?;
+    if ext == "exe" {
         let mut cmd = Command::new(resolved);
         cmd.args(rest);
-        {
-            use std::os::unix::process::CommandExt;
-            cmd.process_group(0);
-        }
         Some(cmd)
+    } else {
+        None
     }
 }
 
@@ -2885,11 +2740,14 @@ pub(crate) fn create_shell_command_with_env(
     ctx: &LifecycleContext,
     env: &HashMap<String, String>,
 ) -> Command {
+    #[cfg(windows)]
     if !env.is_empty() {
         if let Some(direct) = try_create_direct_command(ctx, env) {
             return direct;
         }
     }
+    #[cfg(not(windows))]
+    let _ = env;
     create_shell_command(ctx)
 }
 

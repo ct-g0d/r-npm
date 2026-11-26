@@ -1881,3 +1881,14 @@ fn test_manifest_readonly_neg_zero_extra_parity() {
     let m_ro = Manifest::from_str_readonly(json).expect("Manifest::from_str_readonly");
     assert_eq!(m_raw.extra.get("custom"), m_ro.extra.get("custom"));
 }
+
+#[test]
+fn test_caret_wildcard_cascade_parity() {
+    let v = crate::semver::Version::parse("0.0.1").unwrap();
+    let parsed = crate::semver::Range::parse("^0.x.5").unwrap();
+    assert!(parsed.satisfies(&v));
+    assert_eq!(
+        crate::semver::Range::satisfies_str("^0.x.5", &v).unwrap(),
+        parsed.satisfies(&v)
+    );
+}

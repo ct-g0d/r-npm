@@ -810,10 +810,28 @@ pub fn parse_and_migrate(json_str: &str) -> Result<LockfileV3, LockfileError> {
     }
 }
 
+/// Parse a lockfile JSON string of any version (1, 2, or 3) and migrate to v3,
+/// skipping raw JSON capture for read-only callers.
+pub fn parse_and_migrate_readonly(json_str: &str) -> Result<LockfileV3, LockfileError> {
+    if let Some(lock) = crate::fast_parse::try_parse_lockfile_v3_fast(json_str, false) {
+        if lock.lockfile_version == 3 && !lock.packages.is_empty() {
+            return Ok(lock);
+        }
+    }
+    parse_and_migrate(json_str)
+}
+
 /// Load a lockfile from disk and migrate to v3 if necessary.
 pub fn load_and_migrate(path: &Path) -> Result<LockfileV3, LockfileError> {
     let content = fs::read_to_string(path)?;
     parse_and_migrate(&content)
+}
+
+/// Load a lockfile from disk for read-only consumers, migrating v1/v2 layouts
+/// and rejecting unsupported lockfile versions.
+pub fn load_and_migrate_readonly(path: &Path) -> Result<LockfileV3, LockfileError> {
+    let content = fs::read_to_string(path)?;
+    parse_and_migrate_readonly(&content)
 }
 
 #[cfg(test)]
@@ -1184,6 +1202,12 @@ mod tests {
         ));
         assert!(matches!(
             parse_and_migrate(unsupported_last),
+            Err(LockfileError::UnsupportedVersion(99))
+        ));
+        let res_v1_ro = parse_and_migrate_readonly(v1_canonical).expect("v1 readonly");
+        assert!(res_v1_ro.packages.contains_key("node_modules/lodash"));
+        assert!(matches!(
+            parse_and_migrate_readonly(unsupported_first),
             Err(LockfileError::UnsupportedVersion(99))
         ));
     }

@@ -485,6 +485,23 @@ pub fn extract_tar_gz<R: Read>(
             });
         }
 
+        // Reject sparse entries before skipping archive roots.
+        let is_sparse = entry_type.as_byte() == b'S' || entry_type.is_gnu_sparse();
+        let has_pax_sparse = if let Ok(Some(extensions)) = entry.pax_extensions() {
+            extensions.filter_map(|e| e.ok()).any(|ext| {
+                ext.key()
+                    .map(|k| k.starts_with("GNU.sparse."))
+                    .unwrap_or(false)
+                    || ext.key_bytes().starts_with(b"GNU.sparse.")
+            })
+        } else {
+            false
+        };
+        if is_sparse || has_pax_sparse {
+            let err_path = entry.path().unwrap_or_default().to_path_buf();
+            return Err(FsError::ForbiddenSparseFile { path: err_path });
+        }
+
         // Check non-UTF-8 path bytes or embedded null bytes before entry.path()
         let fast_ascii: Option<(String, usize)> = {
             let path_bytes = entry.path_bytes();
@@ -502,26 +519,6 @@ pub fn extract_tar_gz<R: Read>(
                 Err(()) => None,
             }
         };
-
-        // Reject sparse entries: entry_type.as_byte() == b'S' or PAX sparse attributes
-        let is_sparse = entry_type.as_byte() == b'S' || entry_type.is_gnu_sparse();
-        let has_pax_sparse = if let Ok(Some(extensions)) = entry.pax_extensions() {
-            extensions.filter_map(|e| e.ok()).any(|ext| {
-                ext.key()
-                    .map(|k| k.starts_with("GNU.sparse."))
-                    .unwrap_or(false)
-                    || ext.key_bytes().starts_with(b"GNU.sparse.")
-            })
-        } else {
-            false
-        };
-        if is_sparse || has_pax_sparse {
-            let err_path = match fast_ascii {
-                Some((s, _)) => PathBuf::from(s),
-                None => entry.path().unwrap_or_default().to_path_buf(),
-            };
-            return Err(FsError::ForbiddenSparseFile { path: err_path });
-        }
 
         let (relative_path, target_path, norm_exact, path_depth, _is_ascii_clean) =
             if let Some((rel_str, depth)) = fast_ascii {

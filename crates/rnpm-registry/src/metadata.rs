@@ -2597,16 +2597,19 @@ mod tests {
                 }
             }
         }"#;
-        let fast = parse_full_packument(json.as_bytes()).unwrap();
-        let serde_meta: AbbreviatedPackageMetadata = serde_json::from_str(json).unwrap();
-        assert_eq!(fast.dist_tags.get("neg"), serde_meta.dist_tags.get("neg"));
+        let parsed = parse_full_packument(json.as_bytes()).unwrap();
+        assert_eq!(parsed.dist_tags.get("neg").map(String::as_str), Some("-0.0"));
         assert_eq!(
-            fast.versions["1.0.0"].dependencies.get("numdep"),
-            serde_meta.versions["1.0.0"].dependencies.get("numdep")
+            parsed.versions["1.0.0"].dependencies.get("numdep").map(String::as_str),
+            Some("-0.0")
         );
         assert_eq!(
-            fast.versions["1.0.0"].extra.get("custom").map(ToString::to_string),
-            serde_meta.versions["1.0.0"].extra.get("custom").map(ToString::to_string)
+            parsed.versions["1.0.0"]
+                .extra
+                .get("custom")
+                .map(ToString::to_string)
+                .as_deref(),
+            Some("-0.0")
         );
     }
 
