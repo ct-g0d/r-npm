@@ -1406,7 +1406,10 @@ pub(crate) fn unlink_target_path_wide(wide: &[u16], path_hint: &Path) {
     if (attrs & FILE_ATTRIBUTE_DIRECTORY) != 0 {
         let removed = unsafe { RemoveDirectoryW(wide.as_ptr()) };
         if removed == 0 && (attrs & FILE_ATTRIBUTE_REPARSE_POINT) != 0 {
-            let _ = crate::junction::remove_junction(path_hint);
+            use std::os::windows::ffi::OsStringExt;
+            let _ = path_hint;
+            let actual = std::ffi::OsString::from_wide(&wide[..wide.len().saturating_sub(1)]);
+            let _ = crate::junction::remove_junction(Path::new(&actual));
         }
     } else {
         unsafe {

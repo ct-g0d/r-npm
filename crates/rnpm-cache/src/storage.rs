@@ -1127,6 +1127,10 @@ impl Cache {
 
         let temp_path = self.write_temp_file("index", &buf)?;
 
+        let _shard_guard = self.lock_shards[shard_index_for_str(hash)]
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
         if !prefix_bitset_has(&self.index_prefix_dirs, hash) {
             if let Some(parent) = npm_path.parent() {
                 fs::create_dir_all(parent)?;
@@ -1147,9 +1151,6 @@ impl Cache {
             Err(_) => {}
         }
 
-        let _shard_guard = self.lock_shards[shard_index_for_str(hash)]
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
         let _key_lock = self.lock_key_by_hash_with_options(
             hash,
             self.lock_timeout,

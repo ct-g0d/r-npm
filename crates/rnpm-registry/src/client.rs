@@ -4997,21 +4997,29 @@ impl RegistryClient {
             return Vec::new();
         }
         let mut unique_parents: HashSet<&Path> = HashSet::with_capacity(8);
+        let mut failed_parents: HashMap<&Path, String> = HashMap::new();
         for &(_, dest) in downloads {
             if let Some(p) = dest.parent() {
                 if !p.as_os_str().is_empty() && unique_parents.insert(p) && !p.is_dir() {
                     if let Err(e) = std::fs::create_dir_all(p) {
-                        let msg = format!("Failed to create directories for {}: {e}", p.display());
-                        return (0..downloads.len())
-                            .map(|_| Err(RegistryError::Other(msg.clone())))
-                            .collect();
+                        failed_parents
+                            .insert(p, format!("Failed to create directories for {}: {e}", p.display()));
                     }
                 }
             }
         }
 
+        let mut results: Vec<Option<Result<u64, RegistryError>>> =
+            (0..downloads.len()).map(|_| None).collect();
+
         let mut join_set = tokio::task::JoinSet::new();
         for (idx, (url, dest)) in downloads.iter().enumerate() {
+            if let Some(p) = dest.parent() {
+                if let Some(msg) = failed_parents.get(p) {
+                    results[idx] = Some(Err(RegistryError::Other(msg.clone())));
+                    continue;
+                }
+            }
             let client = self.clone();
             let url_str = url.to_string();
             let dest_buf = dest.to_path_buf();
@@ -5022,9 +5030,6 @@ impl RegistryClient {
                 (idx, res)
             });
         }
-
-        let mut results: Vec<Option<Result<u64, RegistryError>>> =
-            (0..downloads.len()).map(|_| None).collect();
 
         while let Some(res) = join_set.join_next().await {
             if let Ok((idx, result)) = res {
@@ -7718,6 +7723,55 @@ nB99xJBcpcklOhB/x8L3Vb9kw8ZPzUvYKI7lj0+yjYJannulkI7H7LB4hxKnVKp5\n\
             .unwrap();
         assert_eq!(bytes, payload);
         assert_eq!(sri, expected_sri);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn test_download_tarballs_to_files_concurrent_isolates_parent_dir_errors() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 2048];
+                    let _ = stream.read(&mut buf).await;
+                    let body = b"tarball-ok";
+                    let hdr = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: application/octet-stream\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = stream.write_all(hdr.as_bytes()).await;
+                    let _ = stream.write_all(body).await;
+                });
+            }
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let blocking_file = dir.path().join("not-a-dir");
+        std::fs::write(&blocking_file, b"x").unwrap();
+        let bad_dest = blocking_file.join("pkg.tgz");
+        let good_dest = dir.path().join("ok").join("pkg.tgz");
+        let url = format!("http://{addr}/pkg/-/pkg-1.0.0.tgz");
+
+        let client = RegistryClient::with_config(RegistryClientConfig {
+            default_registry: Url::parse(&format!("http://{addr}/")).unwrap(),
+            ..Default::default()
+        })
+        .unwrap();
+
+        let results = client
+            .download_tarballs_to_files_concurrent(&[
+                (url.as_str(), bad_dest.as_path()),
+                (url.as_str(), good_dest.as_path()),
+            ])
+            .await;
+        assert_eq!(results.len(), 2);
+        assert!(results[0].is_err(), "invalid parent must fail its own item");
+        assert!(results[1].is_ok(), "sibling item with valid parent must succeed");
+        assert_eq!(std::fs::read(&good_dest).unwrap(), b"tarball-ok");
         server.abort();
     }
 }

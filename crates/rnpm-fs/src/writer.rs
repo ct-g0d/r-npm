@@ -292,7 +292,7 @@ fn dir_exists_wide(wide_null_term: &[u16]) -> bool {
 
 #[cfg(windows)]
 #[inline]
-fn create_dir_wide_or_fallback(wide: &[u16]) {
+fn create_dir_wide_or_fallback(wide: &[u16]) -> std::io::Result<()> {
     use std::os::windows::ffi::OsStringExt;
     extern "system" {
         fn CreateDirectoryW(
@@ -306,23 +306,24 @@ fn create_dir_wide_or_fallback(wide: &[u16]) {
     let ret = unsafe { CreateDirectoryW(wide.as_ptr(), std::ptr::null_mut()) };
     if ret == 0 {
         let err = unsafe { GetLastError() };
-        if err != ERROR_ALREADY_EXISTS && !dir_exists_wide(wide) {
+        if !(err == ERROR_ALREADY_EXISTS && dir_exists_wide(wide)) {
             let dir_path = std::ffi::OsString::from_wide(&wide[..wide.len().saturating_sub(1)]);
-            let _ = std::fs::create_dir_all(&dir_path);
+            std::fs::create_dir_all(&dir_path)?;
         }
     }
+    Ok(())
 }
 
 #[cfg(windows)]
 #[inline]
-fn create_dir_bytes_wide_buf(dir_bytes: &[u8], wide_buf: &mut Vec<u16>) {
+fn create_dir_bytes_wide_buf(dir_bytes: &[u8], wide_buf: &mut Vec<u16>) -> std::io::Result<()> {
     use std::os::windows::ffi::OsStrExt;
     wide_buf.clear();
     // Safety: sliced at ASCII '\\' boundary on valid WTF-8 bytes.
     let os = unsafe { std::ffi::OsStr::from_encoded_bytes_unchecked(dir_bytes) };
     wide_buf.extend(os.encode_wide());
     wide_buf.push(0);
-    create_dir_wide_or_fallback(wide_buf);
+    create_dir_wide_or_fallback(wide_buf)
 }
 
 /// Pre-creates a collection of directories in breadth-first order (by path depth),
@@ -409,7 +410,7 @@ where
             scratch_wide.extend(prefix.as_os_str().encode_wide());
             scratch_wide.push(0);
             if !dir_exists_wide(&scratch_wide) {
-                let _ = std::fs::create_dir_all(prefix);
+                std::fs::create_dir_all(prefix)?;
             }
             known_existing_bytes.insert(prefix.as_os_str().as_encoded_bytes());
         }
@@ -497,7 +498,7 @@ where
         if total_to_create <= 32 {
             for level in &levels {
                 for &slice in level {
-                    create_dir_bytes_wide_buf(slice, &mut scratch_wide);
+                    create_dir_bytes_wide_buf(slice, &mut scratch_wide)?;
                 }
             }
             return Ok(());
@@ -508,7 +509,7 @@ where
         let mut split_idx = 0usize;
         while split_idx + 1 < levels.len() && levels[split_idx].len() < 24 {
             for &slice in &levels[split_idx] {
-                create_dir_bytes_wide_buf(slice, &mut scratch_wide);
+                create_dir_bytes_wide_buf(slice, &mut scratch_wide)?;
             }
             split_idx += 1;
         }
@@ -518,19 +519,34 @@ where
             let num_threads = 16.min(level.len());
             let cursor = AtomicUsize::new(0);
             let chunk = (level.len() / (num_threads * 2)).clamp(1, 8);
+            let has_err = AtomicBool::new(false);
+            let first_err: Mutex<Option<std::io::Error>> = Mutex::new(None);
             crate::pool::run_parallel(num_threads, &|| {
                 let mut wide_buf = Vec::with_capacity(260);
                 loop {
+                    if has_err.load(Ordering::Relaxed) {
+                        break;
+                    }
                     let start = cursor.fetch_add(chunk, Ordering::Relaxed);
                     if start >= level.len() {
                         break;
                     }
                     let end = (start + chunk).min(level.len());
                     for &slice in &level[start..end] {
-                        create_dir_bytes_wide_buf(slice, &mut wide_buf);
+                        if let Err(e) = create_dir_bytes_wide_buf(slice, &mut wide_buf) {
+                            has_err.store(true, Ordering::Relaxed);
+                            let mut guard = first_err.lock().unwrap();
+                            if guard.is_none() {
+                                *guard = Some(e);
+                            }
+                            return;
+                        }
                     }
                 }
             });
+            if let Some(err) = first_err.into_inner().unwrap() {
+                return Err(err);
+            }
             return Ok(());
         }
 
@@ -554,7 +570,7 @@ where
             if high_fanout_count > 0 && high_fanout_count < 16 {
                 for &s in &levels[split_idx] {
                     if child_counts.get(s).copied().unwrap_or(0) >= 16 {
-                        create_dir_bytes_wide_buf(s, &mut scratch_wide);
+                        create_dir_bytes_wide_buf(s, &mut scratch_wide)?;
                         promoted.insert(s);
                     }
                 }
@@ -600,9 +616,14 @@ where
             let num_threads = 16.min(buckets.len());
             let cursor = AtomicUsize::new(0);
             let chunk = (buckets.len() / (num_threads * 4)).clamp(1, 8);
+            let has_err = AtomicBool::new(false);
+            let first_err: Mutex<Option<std::io::Error>> = Mutex::new(None);
             crate::pool::run_parallel(num_threads, &|| {
                 let mut wide_buf = Vec::with_capacity(260);
                 loop {
+                    if has_err.load(Ordering::Relaxed) {
+                        break;
+                    }
                     let start = cursor.fetch_add(chunk, Ordering::Relaxed);
                     if start >= buckets.len() {
                         break;
@@ -610,11 +631,21 @@ where
                     let end = (start + chunk).min(buckets.len());
                     for bucket in &buckets[start..end] {
                         for &slice in bucket {
-                            create_dir_bytes_wide_buf(slice, &mut wide_buf);
+                            if let Err(e) = create_dir_bytes_wide_buf(slice, &mut wide_buf) {
+                                has_err.store(true, Ordering::Relaxed);
+                                let mut guard = first_err.lock().unwrap();
+                                if guard.is_none() {
+                                    *guard = Some(e);
+                                }
+                                return;
+                            }
                         }
                     }
                 }
             });
+            if let Some(err) = first_err.into_inner().unwrap() {
+                return Err(err);
+            }
         }
 
         Ok(())
@@ -838,7 +869,12 @@ pub(crate) fn write_file_fast_wide(
                 )
             };
         } else if err == ERROR_PATH_NOT_FOUND {
-            if let Some(parent) = path_hint.parent() {
+            use std::os::windows::ffi::OsStringExt;
+            let trimmed = &path_wide[..path_wide.len().saturating_sub(1)];
+            if let Some(sep) = trimmed.iter().rposition(|&c| c == b'\\' as u16) {
+                let parent_os = std::ffi::OsString::from_wide(&trimmed[..sep]);
+                let _ = std::fs::create_dir_all(&parent_os);
+            } else if let Some(parent) = path_hint.parent() {
                 let parent_v = crate::path::to_verbatim_path(parent);
                 let _ = std::fs::create_dir_all(&parent_v);
             }

@@ -1256,7 +1256,11 @@ impl<'a> FastPackumentParser<'a> {
             }
             Some(b'-' | b'0'..=b'9') => {
                 let slice = self.skip_number()?;
-                if !slice.contains(&b'.') && !slice.contains(&b'e') && !slice.contains(&b'E') {
+                if slice != b"-0"
+                    && !slice.contains(&b'.')
+                    && !slice.contains(&b'e')
+                    && !slice.contains(&b'E')
+                {
                     // SAFETY: `skip_number` verified ASCII digits with optional leading '-'.
                     let s = unsafe { std::str::from_utf8_unchecked(slice) };
                     if slice[0] == b'-' {
@@ -1364,7 +1368,11 @@ impl<'a> FastPackumentParser<'a> {
             }
             Some(b'-' | b'0'..=b'9') => {
                 let slice = self.skip_number()?;
-                if !slice.contains(&b'.') && !slice.contains(&b'e') && !slice.contains(&b'E') {
+                if slice != b"-0"
+                    && !slice.contains(&b'.')
+                    && !slice.contains(&b'e')
+                    && !slice.contains(&b'E')
+                {
                     // Integer bytes match serde visit_i64/visit_u64 string representation unless outside u64/i64
                     if let Ok(s) = std::str::from_utf8(slice) {
                         if s.starts_with('-') {
@@ -4029,5 +4037,33 @@ mod tests {
         let mut bundled = meta.versions["1.0.0"].bundle_dependencies.clone();
         bundled.sort();
         assert_eq!(bundled, vec!["dep1".to_string(), "dep2".to_string()]);
+    }
+
+    #[test]
+    fn test_negative_zero_parity_with_serde_json() {
+        let json = r#"{
+            "name": "neg-zero",
+            "dist-tags": { "latest": "1.0.0", "neg": -0 },
+            "versions": {
+                "1.0.0": {
+                    "name": "neg-zero",
+                    "version": "1.0.0",
+                    "dependencies": { "numdep": -0 },
+                    "custom": -0,
+                    "dist": { "tarball": "https://registry.npmjs.org/neg-zero/-/neg-zero-1.0.0.tgz" }
+                }
+            }
+        }"#;
+        let fast = parse_full_packument(json.as_bytes()).unwrap();
+        let serde_meta: AbbreviatedPackageMetadata = serde_json::from_str(json).unwrap();
+        assert_eq!(fast.dist_tags.get("neg"), serde_meta.dist_tags.get("neg"));
+        assert_eq!(
+            fast.versions["1.0.0"].dependencies.get("numdep"),
+            serde_meta.versions["1.0.0"].dependencies.get("numdep")
+        );
+        assert_eq!(
+            fast.versions["1.0.0"].extra.get("custom").map(ToString::to_string),
+            serde_meta.versions["1.0.0"].extra.get("custom").map(ToString::to_string)
+        );
     }
 }

@@ -467,6 +467,20 @@ fn fast_size_and_mtime(path: &Path) -> Option<(u64, Option<u64>)> {
     }
 }
 
+#[inline]
+fn is_clean_rel_ascii_path(p: &str) -> bool {
+    p.is_ascii()
+        && !p.is_empty()
+        && !p.starts_with('/')
+        && !p.starts_with("./")
+        && !p.contains('\\')
+        && !p.contains("..")
+        && !p.contains("/./")
+        && !p.contains("//")
+        && !p.ends_with("/.")
+        && p != "."
+}
+
 #[cfg(windows)]
 #[inline]
 fn encode_verbatim_prefix_wide(dir: &Path) -> Vec<u16> {
@@ -985,7 +999,7 @@ impl PackagePack {
             let mut dir_wide_buf: Vec<u16> = Vec::with_capacity(260);
 
             for entry in &self.index.files {
-                if !entry.path.is_ascii() || entry.path.contains('\\') {
+                if !is_clean_rel_ascii_path(&entry.path) {
                     let full_path = target_dir.join(&entry.path);
                     if let Some(parent) = full_path.parent() {
                         std::fs::create_dir_all(parent)?;
@@ -1098,10 +1112,7 @@ impl PackagePack {
                     let write_res = {
                         #[cfg(windows)]
                         {
-                            if entry.path.is_ascii()
-                                && !entry.path.contains('\\')
-                                && !entry.path.contains("..")
-                            {
+                            if is_clean_rel_ascii_path(&entry.path) {
                                 append_ascii_rel_wide(&mut wide_buf, prefix_ref, &entry.path);
                                 rnpm_fs::writer::write_file_fast_wide_raw(
                                     &wide_buf,
@@ -1195,11 +1206,7 @@ impl PackagePack {
                 }
 
                 #[cfg(windows)]
-                if !can_block_clone
-                    && entry.path.is_ascii()
-                    && !entry.path.contains('\\')
-                    && !entry.path.contains("..")
-                {
+                if !can_block_clone && is_clean_rel_ascii_path(&entry.path) {
                     append_ascii_rel_wide(&mut wide_buf, &verbatim_prefix_wide, &entry.path);
                     if rnpm_fs::writer::write_file_fast_wide_raw(
                         &wide_buf,
@@ -5705,5 +5712,28 @@ mod tests {
         store.put_package_from_tarball_deferred(&integ, &tgz).unwrap();
         let pack = store.get_package_pack(&integ).unwrap().unwrap();
         assert_eq!(pack.get_file_slice("sub/.npmignore").unwrap(), b"ignore-me\n");
+    }
+
+    #[test]
+    fn test_materialize_unnormalized_dots_and_double_slashes() {
+        let dir = tempdir().unwrap();
+        let store = PackStore::new(dir.path().join("store")).unwrap();
+        let files = vec![
+            PackInputFile::new("./nested/./a.js", 0o644, b"export const a = 1;\n"),
+            PackInputFile::new("nested//b.js", 0o644, b"export const b = 2;\n"),
+        ];
+        let integ = "sha512-unnormalizedtest0000000000000000000000000000000000000000000000000000000000000000000000000000";
+        store.put_package_pack(integ, &files).unwrap();
+        let pack = store.get_package_pack(integ).unwrap().unwrap();
+        let out = dir.path().join("out");
+        pack.materialize_to(&out, None).unwrap();
+        assert_eq!(
+            std::fs::read(out.join("nested").join("a.js")).unwrap(),
+            b"export const a = 1;\n"
+        );
+        assert_eq!(
+            std::fs::read(out.join("nested").join("b.js")).unwrap(),
+            b"export const b = 2;\n"
+        );
     }
 }
