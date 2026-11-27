@@ -533,6 +533,7 @@ pub fn parse_x509_certificate(der: &[u8]) -> Result<ParsedCertificate, RegistryE
     let mut fulcio_extensions = HashMap::new();
     let mut basic_constraints_ca = None;
     let mut basic_constraints_path_len = None;
+    let mut seen_basic_constraints = false;
     let mut key_usage_cert_sign = None;
 
     while cursor < tbs_elems.len() {
@@ -556,8 +557,9 @@ pub fn parse_x509_certificate(der: &[u8]) -> Result<ParsedCertificate, RegistryE
                                     &mut fulcio_extensions,
                                     &mut basic_constraints_ca,
                                     &mut basic_constraints_path_len,
+                                    &mut seen_basic_constraints,
                                     &mut key_usage_cert_sign,
-                                );
+                                )?;
                             }
                         }
                     }
@@ -665,6 +667,7 @@ fn parse_der_non_negative_u32(bytes: &[u8]) -> Option<u32> {
     Some(val.min(u32::MAX as u64) as u32)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn parse_extension(
     oid: &str,
     extn_value: &[u8],
@@ -672,25 +675,46 @@ fn parse_extension(
     fulcio_extensions: &mut HashMap<String, String>,
     basic_constraints_ca: &mut Option<bool>,
     basic_constraints_path_len: &mut Option<u32>,
+    seen_basic_constraints: &mut bool,
     key_usage_cert_sign: &mut Option<bool>,
-) {
+) -> Result<(), RegistryError> {
     if oid == OID_BASIC_CONSTRAINTS {
+        if *seen_basic_constraints {
+            return Err(RegistryError::InvalidSigstoreBundle(
+                "Duplicate BasicConstraints extension in certificate".into(),
+            ));
+        }
+        *seen_basic_constraints = true;
         let (is_ca, path_len) = match read_tlv(extn_value) {
             Ok((TAG_SEQUENCE, bc_val, [])) => match parse_sequence(bc_val) {
                 Ok(elems) => match elems.as_slice() {
                     [] => (false, None),
-                    [(TAG_BOOLEAN, val)] if !val.is_empty() => (val[0] != 0, None),
-                    [(TAG_BOOLEAN, val), (TAG_INTEGER, plen)] if !val.is_empty() => {
-                        match parse_der_non_negative_u32(plen) {
-                            Some(n) => (val[0] != 0, Some(n)),
-                            None => (false, None),
-                        }
+                    [(TAG_BOOLEAN, val)] if val.len() == 1 => (val[0] != 0, None),
+                    [(TAG_BOOLEAN, val), (TAG_INTEGER, plen)] if val.len() == 1 => {
+                        let n = parse_der_non_negative_u32(plen).ok_or_else(|| {
+                            RegistryError::InvalidSigstoreBundle(
+                                "Malformed BasicConstraints pathLenConstraint".into(),
+                            )
+                        })?;
+                        (val[0] != 0, Some(n))
                     }
-                    _ => (false, None),
+                    _ => {
+                        return Err(RegistryError::InvalidSigstoreBundle(
+                            "Malformed BasicConstraints extension".into(),
+                        ));
+                    }
                 },
-                Err(_) => (false, None),
+                Err(_) => {
+                    return Err(RegistryError::InvalidSigstoreBundle(
+                        "Malformed BasicConstraints SEQUENCE".into(),
+                    ));
+                }
             },
-            _ => (false, None),
+            _ => {
+                return Err(RegistryError::InvalidSigstoreBundle(
+                    "Malformed BasicConstraints extension encoding".into(),
+                ));
+            }
         };
         *basic_constraints_ca = Some(is_ca);
         *basic_constraints_path_len = path_len;
@@ -741,6 +765,7 @@ fn parse_extension(
             fulcio_extensions.insert(oid.to_string(), text);
         }
     }
+    Ok(())
 }
 
 /// Helper for constructing an X.509 v3 certificate for deterministic testing and mock Fulcio.

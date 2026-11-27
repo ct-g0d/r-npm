@@ -56,13 +56,27 @@ pub fn extract_and_replace<R: Read>(
     Ok(summary)
 }
 
+fn destination_replace_lock(destination: &Path) -> &'static std::sync::Mutex<()> {
+    use std::hash::{Hash, Hasher};
+    use std::sync::{Mutex, OnceLock};
+    static STRIPES: OnceLock<Vec<Mutex<()>>> = OnceLock::new();
+    let stripes = STRIPES.get_or_init(|| (0..64).map(|_| Mutex::new(())).collect());
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    path_clean::clean(destination).hash(&mut hasher);
+    &stripes[(hasher.finish() as usize) % stripes.len()]
+}
+
 /// Replaces `destination` with `staging` using atomic directory rename with exponential backoff.
-/// Handles Windows EBUSY / EPERM / AccessDenied retries.
+/// Handles Windows EBUSY / EPERM / AccessDenied retries and serializes concurrent replacements
+/// at the same destination path so rollback cannot clobber a concurrent replacement.
 pub fn replace_dir_with_retries(
     staging: &Path,
     destination: &Path,
     max_retries: usize,
 ) -> Result<(), FsError> {
+    let _guard = destination_replace_lock(destination)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     let staging_v = crate::path::to_verbatim_path(staging);
     let destination_v = crate::path::to_verbatim_path(destination);
     let parent = destination_v.parent().unwrap_or_else(|| Path::new("."));
@@ -130,35 +144,45 @@ fn try_replace_dir(staging: &Path, destination: &Path, parent: &Path) -> std::io
         Ok(()) => {
             // Rename staging -> destination
             if let Err(rename_err) = fs::rename(staging, destination) {
-                // Safe rollback: only restore trash -> destination if destination does not
-                // already exist (a concurrent winner may have replaced destination in the gap).
-                let dest_absent = matches!(
-                    fs::symlink_metadata(destination),
-                    Err(ref e) if e.kind() == std::io::ErrorKind::NotFound
-                );
-                if dest_absent {
-                    let mut rollback_delay = Duration::from_millis(5);
-                    for attempt in 0..6 {
-                        match fs::rename(&trash_path, destination) {
-                            Ok(()) => break,
-                            Err(ref e) if attempt < 5 && is_retryable_error(e) => {
-                                std::thread::sleep(rollback_delay);
-                                rollback_delay = rollback_delay.saturating_mul(2);
-                            }
-                            Err(ref e) => {
-                                // Preserve the backup at `trash_path` rather than destroying the only copy.
-                                tracing::warn!(
-                                    "Failed to restore backup '{}' to '{}' after staging failure: {}; preserving backup on disk",
-                                    trash_path.display(),
-                                    destination.display(),
-                                    e
-                                );
-                                break;
+                // Safe rollback: serialize via destination lock and re-verify destination absence
+                // on every retry attempt. Only delete the backup if a valid replacement is
+                // confirmed to exist at `destination`; preserve the backup on any metadata error
+                // or failed restore.
+                let mut rollback_delay = Duration::from_millis(5);
+                for attempt in 0..6 {
+                    match fs::symlink_metadata(destination) {
+                        Ok(_) => {
+                            let _ = crate::junction::remove_dir_all_safe(&trash_path);
+                            break;
+                        }
+                        Err(ref e) if e.kind() == std::io::ErrorKind::NotFound => {
+                            match fs::rename(&trash_path, destination) {
+                                Ok(()) => break,
+                                Err(ref re) if attempt < 5 && is_retryable_error(re) => {
+                                    std::thread::sleep(rollback_delay);
+                                    rollback_delay = rollback_delay.saturating_mul(2);
+                                }
+                                Err(ref re) => {
+                                    tracing::warn!(
+                                        "Failed to restore backup '{}' to '{}' after staging failure: {}; preserving backup on disk",
+                                        trash_path.display(),
+                                        destination.display(),
+                                        re
+                                    );
+                                    break;
+                                }
                             }
                         }
+                        Err(ref meta_err) => {
+                            tracing::warn!(
+                                "Could not verify destination '{}' during rollback ({}); preserving backup '{}'",
+                                destination.display(),
+                                meta_err,
+                                trash_path.display()
+                            );
+                            break;
+                        }
                     }
-                } else {
-                    let _ = crate::junction::remove_dir_all_safe(&trash_path);
                 }
                 return Err(rename_err);
             }

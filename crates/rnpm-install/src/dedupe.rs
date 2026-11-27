@@ -265,13 +265,23 @@ pub fn execute_dedupe(options: &DedupeOptions) -> Result<DedupeSummary> {
                 deps.insert(d.clone(), r.clone());
                 req_entry.insert(d.clone(), r.clone());
             }
+            for (d, r) in &m.peer_dependencies {
+                deps.entry(d.clone()).or_insert_with(|| r.clone());
+                req_entry.entry(d.clone()).or_insert_with(|| r.clone());
+            }
         } else if let Some(ref l) = lockfile {
             if let Some(lp) = l.get_package(pkg_rel_path) {
+                let req_entry = requirements_map.entry(pkg_rel_path.clone()).or_default();
                 if let Some(ref d_map) = lp.dependencies {
-                    let req_entry = requirements_map.entry(pkg_rel_path.clone()).or_default();
                     for (d, r) in d_map {
                         deps.insert(d.clone(), r.clone());
                         req_entry.insert(d.clone(), r.clone());
+                    }
+                }
+                if let Some(ref p_map) = lp.peer_dependencies {
+                    for (d, r) in p_map {
+                        deps.entry(d.clone()).or_insert_with(|| r.clone());
+                        req_entry.entry(d.clone()).or_insert_with(|| r.clone());
                     }
                 }
             }

@@ -561,13 +561,24 @@ fn next_tracked_rules_id() -> u64 {
 }
 
 /// Mutation-tracked wrapper around `BTreeMap<String, OverrideValue>` that bumps a monotonic
-/// generation counter on mutable access and assigns a unique identity per instance so both
-/// in-place mutations and whole-map replacements invalidate cached indices in O(1).
-#[derive(Debug, Clone, Eq)]
+/// generation counter on mutable access and assigns a unique identity per instance (including
+/// clones) so both in-place mutations and whole-map replacements invalidate cached indices in O(1).
+#[derive(Debug, Eq)]
 pub struct TrackedRules {
     inner: BTreeMap<String, OverrideValue>,
     id: u64,
     generation: u64,
+}
+
+impl Clone for TrackedRules {
+    #[inline]
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+            id: next_tracked_rules_id(),
+            generation: 0,
+        }
+    }
 }
 
 impl Default for TrackedRules {
@@ -674,13 +685,31 @@ impl IntoIterator for TrackedRules {
 }
 
 /// Overrides engine implementing npm RFC 36 package overrides.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct Overrides {
     pub rules: TrackedRules,
     /// Root dependencies map (for reference overrides like `"$foo"`).
     pub root_dependencies: BTreeMap<String, String>,
     fast_idx: FastOverridesIndex,
     fast_idx_stamp: (u64, u64),
+}
+
+impl Clone for Overrides {
+    fn clone(&self) -> Self {
+        let rules = self.rules.clone();
+        let fast_idx = if self.fast_idx_stamp == self.rules.stamp() {
+            self.fast_idx.clone()
+        } else {
+            FastOverridesIndex::compile(&rules)
+        };
+        let fast_idx_stamp = rules.stamp();
+        Self {
+            rules,
+            root_dependencies: self.root_dependencies.clone(),
+            fast_idx,
+            fast_idx_stamp,
+        }
+    }
 }
 
 impl Default for Overrides {
