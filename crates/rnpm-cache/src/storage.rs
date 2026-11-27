@@ -721,11 +721,9 @@ fn write_and_rename_atomic_wide_impl(
     const GENERIC_WRITE: u32 = 0x4000_0000;
     const FILE_READ_ATTRIBUTES: u32 = 0x0080;
     const DELETE_ACCESS: u32 = 0x0001_0000;
-    const FILE_SHARE_DELETE: u32 = 4;
+    const FILE_SHARE_ALL: u32 = 1 | 2 | 4;
     const CREATE_NEW: u32 = 1;
     const FILE_ATTRIBUTE_NORMAL: u32 = 0x80;
-    const FILE_FLAG_SEQUENTIAL_SCAN: u32 = 0x0800_0000;
-    const FILE_TMP_FLAGS: u32 = FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN;
     const FILE_DISPOSITION_INFO: i32 = 4;
     const ERROR_PATH_NOT_FOUND: u32 = 3;
     const INVALID_HANDLE_VALUE: *mut std::ffi::c_void = -1isize as *mut std::ffi::c_void;
@@ -737,15 +735,14 @@ fn write_and_rename_atomic_wide_impl(
         GENERIC_WRITE | DELETE_ACCESS
     };
 
-    // Unique temp files block external read/write sharing probes until rename + CloseHandle.
     let mut handle = unsafe {
         CreateFileW(
             wide_tmp_null.as_ptr(),
             access,
-            FILE_SHARE_DELETE,
+            FILE_SHARE_ALL,
             std::ptr::null_mut(),
             CREATE_NEW,
-            FILE_TMP_FLAGS,
+            FILE_ATTRIBUTE_NORMAL,
             std::ptr::null_mut(),
         )
     };
@@ -759,10 +756,10 @@ fn write_and_rename_atomic_wide_impl(
                 CreateFileW(
                     wide_tmp_null.as_ptr(),
                     access,
-                    FILE_SHARE_DELETE,
+                    FILE_SHARE_ALL,
                     std::ptr::null_mut(),
                     CREATE_NEW,
-                    FILE_TMP_FLAGS,
+                    FILE_ATTRIBUTE_NORMAL,
                     std::ptr::null_mut(),
                 )
             };

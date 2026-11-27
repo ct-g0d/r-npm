@@ -455,31 +455,22 @@ fn contains_crlf(s: &str) -> bool {
     s.as_bytes().iter().any(|&b| b == b'\r' || b == b'\n')
 }
 
+const FAST_TARBALL_PATH_CHAR: [bool; 256] = {
+    let mut t = [false; 256];
+    let allowed = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~/@+=,;:$&'()*!";
+    let mut i = 0;
+    while i < allowed.len() {
+        t[allowed[i] as usize] = true;
+        i += 1;
+    }
+    t
+};
+
 #[inline]
 fn is_fast_tarball_path(path: &str) -> bool {
-    path.as_bytes().iter().all(|&b| {
-        b.is_ascii_alphanumeric()
-            || matches!(
-                b,
-                b'-' | b'.'
-                    | b'_'
-                    | b'~'
-                    | b'/'
-                    | b'@'
-                    | b'+'
-                    | b'='
-                    | b','
-                    | b';'
-                    | b':'
-                    | b'!'
-                    | b'$'
-                    | b'&'
-                    | b'\''
-                    | b'('
-                    | b')'
-                    | b'*'
-            )
-    })
+    path.as_bytes()
+        .iter()
+        .all(|&b| FAST_TARBALL_PATH_CHAR[b as usize])
 }
 
 /// Fast-path validation returning the validated scheme+authority prefix length (`"https://host/"`)
@@ -760,6 +751,23 @@ pub fn parse_packument_with_mode(
     Ok(metadata)
 }
 
+pub(crate) struct ConcurrentMetadataFetchGuard;
+
+impl ConcurrentMetadataFetchGuard {
+    #[inline]
+    pub(crate) fn enter() -> Self {
+        parallel_versions::ACTIVE_CONCURRENT_FETCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Self
+    }
+}
+
+impl Drop for ConcurrentMetadataFetchGuard {
+    #[inline]
+    fn drop(&mut self) {
+        parallel_versions::ACTIVE_CONCURRENT_FETCHES.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 mod parallel_versions {
     use super::{
         AbbreviatedPackageMetadata, AbbreviatedVersion, CowStr, DistTagsSeed, PackumentParseMode,
@@ -773,6 +781,7 @@ mod parallel_versions {
     use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
     use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
+    pub(super) static ACTIVE_CONCURRENT_FETCHES: AtomicUsize = AtomicUsize::new(0);
     static ACTIVE_PARALLEL_PARSERS: AtomicUsize = AtomicUsize::new(0);
 
     struct ActiveParserGuard;
@@ -1243,6 +1252,9 @@ mod parallel_versions {
         bytes: &[u8],
         mode: PackumentParseMode,
     ) -> Option<Result<AbbreviatedPackageMetadata, RegistryError>> {
+        if ACTIVE_CONCURRENT_FETCHES.load(Ordering::Relaxed) > 1 {
+            return None;
+        }
         let _active_guard = ActiveParserGuard;
         if ACTIVE_PARALLEL_PARSERS.fetch_add(1, Ordering::AcqRel) >= 1 {
             return None;
@@ -2330,75 +2342,73 @@ impl<'de, 'a> Visitor<'de> for VersionVisitor<'a> {
         let mut extra: BTreeMap<String, serde_json::Value> = BTreeMap::new();
 
         while let Some(key) = access.next_key::<CowStr<'_>>()? {
-            let k = key.0.as_ref();
-            let kb = k.as_bytes();
-            match (kb.len(), kb.first().copied()) {
-                (4, Some(b'n')) if k == "name" => {
+            match key.0.as_ref() {
+                "name" => {
                     name = access.next_value::<Option<String>>()?;
                 }
-                (7, Some(b'v')) if k == "version" => {
+                "version" => {
                     version = access.next_value::<Option<String>>()?;
                 }
-                (4, Some(b'd')) if k == "dist" => {
+                "dist" => {
                     dist = access.next_value_seed(DistInfoSeed)?;
                 }
-                (12, Some(b'd')) if k == "dependencies" => {
+                "dependencies" => {
                     dependencies = access.next_value_seed(DependencyMapSeed)?;
                 }
-                (15, Some(b'd')) if k == "devDependencies" => {
+                "devDependencies" => {
                     dev_dependencies = access.next_value_seed(DependencyMapSeed)?;
                 }
-                (16, Some(b'p')) if k == "peerDependencies" => {
+                "peerDependencies" => {
                     peer_dependencies = access.next_value_seed(DependencyMapSeed)?;
                 }
-                (20, Some(b'p')) if k == "peerDependenciesMeta" => {
+                "peerDependenciesMeta" => {
                     peer_dependencies_meta = access.next_value_seed(PeerDepsMetaSeed)?;
                 }
-                (20, Some(b'o')) if k == "optionalDependencies" => {
+                "optionalDependencies" => {
                     optional_dependencies = access.next_value_seed(DependencyMapSeed)?;
                 }
-                (18, Some(b'b')) if k == "bundleDependencies" => {
+                "bundleDependencies" => {
                     bundle_deps_raw = Some(access.next_value_seed(BundleDepsSeed)?);
                 }
-                (19, Some(b'b')) if k == "bundledDependencies" => {
+                "bundledDependencies" => {
                     bundled_deps_raw = Some(access.next_value_seed(BundleDepsSeed)?);
                 }
-                (3, Some(b'b')) if k == "bin" => {
+                "bin" => {
                     bin = access.next_value_seed(BinSeed)?;
                 }
-                (7, Some(b'l')) if k == "license" => {
+                "license" => {
                     license = access.next_value_seed(LicenseSeed)?;
                 }
-                (7, Some(b'e')) if k == "engines" => {
+                "engines" => {
                     let (eng_map, eng_raw) = access.next_value_seed(EnginesSeed)?;
                     engines = eng_map;
                     if eng_raw.is_some() {
                         engines_raw = eng_raw;
                     }
                 }
-                (2, Some(b'o')) if k == "os" => {
+                "os" => {
                     os = access.next_value_seed(PlatformListSeed)?;
                 }
-                (3, Some(b'c')) if k == "cpu" => {
+                "cpu" => {
                     cpu = access.next_value_seed(PlatformListSeed)?;
                 }
-                (4, Some(b'l')) if k == "libc" => {
+                "libc" => {
                     libc = access.next_value_seed(PlatformListSeed)?;
                 }
-                (16, Some(b'h')) if k == "hasInstallScript" => {
+                "hasInstallScript" => {
                     has_install_script = access.next_value::<Option<bool>>()?.unwrap_or(false);
                 }
-                (10, Some(b'd')) if k == "deprecated" => {
+                "deprecated" => {
                     deprecated = access.next_value_seed(DeprecatedSeed)?;
                 }
-                (7, Some(b's')) if k == "scripts" => {
+                "scripts" => {
                     let val = access.next_value_seed(FastJsonValueSeed)?;
                     extra.insert(key.into_owned(), val);
                 }
-                _ => {
+                other => {
                     let drop = match self.mode {
-                        PackumentParseMode::Install => is_heavy_unused_install_field(k),
-                        PackumentParseMode::Full => is_heavy_unused_full_field(k),
+                        PackumentParseMode::Install => is_heavy_unused_install_field(other),
+                        PackumentParseMode::Full => is_heavy_unused_full_field(other),
                     };
                     if drop {
                         let _ = access.next_value::<serde::de::IgnoredAny>()?;

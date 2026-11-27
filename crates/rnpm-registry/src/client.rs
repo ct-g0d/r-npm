@@ -3759,6 +3759,7 @@ impl RegistryClient {
         if_none_match: Option<&str>,
         accept_header: &str,
     ) -> Result<MetadataFetchResult, RegistryError> {
+        let _concurrent_fetch_guard = crate::metadata::ConcurrentMetadataFetchGuard::enter();
         let host_key = self
             .config
             .circuit_breaker_enabled

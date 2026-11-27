@@ -15,12 +15,13 @@ pub mod pool;
 pub mod tarball;
 pub mod writer;
 
-pub(crate) mod fast_hash {
+#[doc(hidden)]
+pub mod fast_hash {
     use std::collections::{HashMap, HashSet};
     use std::hash::{BuildHasherDefault, Hasher};
 
     #[derive(Default)]
-    pub(crate) struct FxHasher {
+    pub struct FxHasher {
         hash: u64,
     }
 
@@ -83,17 +84,17 @@ pub(crate) mod fast_hash {
         }
     }
 
-    pub(crate) type FxBuildHasher = BuildHasherDefault<FxHasher>;
-    pub(crate) type FxHashMap<K, V> = HashMap<K, V, FxBuildHasher>;
-    pub(crate) type FxHashSet<K> = HashSet<K, FxBuildHasher>;
+    pub type FxBuildHasher = BuildHasherDefault<FxHasher>;
+    pub type FxHashMap<K, V> = HashMap<K, V, FxBuildHasher>;
+    pub type FxHashSet<K> = HashSet<K, FxBuildHasher>;
 
     #[inline]
-    pub(crate) fn fx_map<K, V>(cap: usize) -> FxHashMap<K, V> {
+    pub fn fx_map<K, V>(cap: usize) -> FxHashMap<K, V> {
         HashMap::with_capacity_and_hasher(cap, FxBuildHasher::default())
     }
 
     #[inline]
-    pub(crate) fn fx_set<K>(cap: usize) -> FxHashSet<K> {
+    pub fn fx_set<K>(cap: usize) -> FxHashSet<K> {
         HashSet::with_capacity_and_hasher(cap, FxBuildHasher::default())
     }
 }

@@ -23,6 +23,7 @@ use flate2::bufread::GzDecoder;
 use memmap2::Mmap;
 use path_clean::clean;
 use rnpm_core::{Algorithm, Integrity};
+use rnpm_fs::fast_hash::{fx_set, FxHashSet};
 use rnpm_fs::writer::ParallelWriterConfig;
 #[cfg(windows)]
 use rnpm_fs::RawFileHandle;
@@ -559,10 +560,21 @@ fn append_ascii_rel_wide(buf: &mut Vec<u16>, prefix: &[u16], rel: &str) {
 }
 
 #[cfg(windows)]
+#[inline]
+fn append_ascii_rel_tail_wide(buf: &mut Vec<u16>, prefix_len: usize, rel: &str) {
+    buf.truncate(prefix_len);
+    buf.reserve(rel.len() + 1);
+    for &b in rel.as_bytes() {
+        buf.push(if b == b'/' { b'\\' as u16 } else { b as u16 });
+    }
+    buf.push(0);
+}
+
+#[cfg(windows)]
 fn win_create_dir_top_down_cached<'a>(
     prefix: &[u16],
     rel_dir: &'a str,
-    created_rel_dirs: &mut HashSet<&'a str>,
+    created_rel_dirs: &mut FxHashSet<&'a str>,
     wide_buf: &mut Vec<u16>,
 ) -> std::io::Result<()> {
     extern "system" {
@@ -628,7 +640,7 @@ fn win_create_dir_top_down_cached<'a>(
 fn create_dir_top_down_cached<'a>(
     target_dir: &Path,
     rel_dir: &'a str,
-    created_rel_dirs: &mut HashSet<&'a str>,
+    created_rel_dirs: &mut FxHashSet<&'a str>,
 ) -> std::io::Result<()> {
     if rel_dir.is_empty() || created_rel_dirs.contains(rel_dir) {
         return Ok(());
@@ -1078,8 +1090,8 @@ impl PackagePack {
             ensure_dir_fast_win32(target_dir, &verbatim_prefix_wide)?;
             #[cfg(not(windows))]
             std::fs::create_dir_all(target_dir)?;
-            let mut created_rel_dirs: HashSet<&str> =
-                HashSet::with_capacity(self.index.files.len() / 2 + 4);
+            let mut created_rel_dirs: FxHashSet<&str> = fx_set(self.index.files.len() / 2 + 4);
+            let mut last_rel_dir: &str = "";
             #[cfg(windows)]
             let mut dir_wide_buf: Vec<u16> = Vec::with_capacity(260);
 
@@ -1093,7 +1105,11 @@ impl PackagePack {
                 }
                 if let Some(slash) = entry.path.rfind('/') {
                     let rel_dir = &entry.path[..slash];
-                    if !rel_dir.is_empty() && !created_rel_dirs.contains(rel_dir) {
+                    if !rel_dir.is_empty()
+                        && rel_dir != last_rel_dir
+                        && !created_rel_dirs.contains(rel_dir)
+                    {
+                        last_rel_dir = rel_dir;
                         #[cfg(windows)]
                         win_create_dir_top_down_cached(
                             &verbatim_prefix_wide,
@@ -1158,12 +1174,7 @@ impl PackagePack {
         // 2. Direct materialization straight from memory mapping (or ReFS block cloning).
         let files = &self.index.files;
         if !can_block_clone && files.len() >= 8 {
-            let num_threads = if files.len() <= 64 {
-                16.min(files.len() / 2).clamp(2, 16)
-            } else {
-                24.min(files.len() / 2).max(2)
-            }
-            .min(files.len());
+            let num_threads = 24.min(files.len() / 2).max(2).min(files.len());
             let chunk_size = if files.len() <= 64 {
                 1
             } else {
@@ -1176,7 +1187,13 @@ impl PackagePack {
             let prefix_ref = &verbatim_prefix_wide;
             rnpm_fs::run_parallel(num_threads, &|| {
                 #[cfg(windows)]
-                let mut wide_buf: Vec<u16> = Vec::with_capacity(260);
+                let prefix_len = prefix_ref.len();
+                #[cfg(windows)]
+                let mut wide_buf: Vec<u16> = {
+                    let mut v = Vec::with_capacity(prefix_len + 128);
+                    v.extend_from_slice(prefix_ref);
+                    v
+                };
                 let mut local_files = 0u64;
                 let mut local_bytes = 0u64;
                 loop {
@@ -1211,7 +1228,7 @@ impl PackagePack {
                             #[cfg(windows)]
                             {
                                 if is_clean_rel_ascii_path(&entry.path) {
-                                    append_ascii_rel_wide(&mut wide_buf, prefix_ref, &entry.path);
+                                    append_ascii_rel_tail_wide(&mut wide_buf, prefix_len, &entry.path);
                                     match rnpm_fs::writer::write_file_fast_wide_raw(
                                         &wide_buf,
                                         target_dir,
@@ -1379,7 +1396,7 @@ pub struct DeferredPackPayloads {
 #[derive(Debug, Clone)]
 pub struct PackStore {
     root: PathBuf,
-    mmap_cache: Arc<RwLock<HashMap<String, PackagePack>>>,
+    mmap_cache: Arc<RwLock<HashMap<String, Arc<PackagePack>>>>,
     block_clone_cache: Arc<RwLock<HashMap<PathBuf, bool>>>,
     #[cfg(windows)]
     block_clone_drive_cache: Arc<[AtomicU8; 26]>,
@@ -1690,7 +1707,6 @@ impl PackStore {
                     let _ = fs::create_dir_all(parent);
                 }
             }
-            let _ = cas_may_exist;
             let count = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
             let pid = std::process::id();
             let tmp_path = cas_path.with_extension(format!("tmp_{pid}_{count}"));
@@ -1896,11 +1912,19 @@ impl PackStore {
     ///
     /// Caches open memory maps across process lifetime for fast reuse.
     pub fn get_package_pack(&self, integrity: &str) -> Result<Option<PackagePack>, CacheError> {
+        self.get_package_pack_arc(integrity)
+            .map(|opt| opt.map(|arc| (*arc).clone()))
+    }
+
+    fn get_package_pack_arc(
+        &self,
+        integrity: &str,
+    ) -> Result<Option<Arc<PackagePack>>, CacheError> {
         // 1. Check in-memory cache by exact string before parsing integrity
         {
             let guard = self.mmap_cache.read().unwrap();
             if let Some(pack) = guard.get(integrity) {
-                return Ok(Some(pack.clone()));
+                return Ok(Some(Arc::clone(pack)));
             }
         }
 
@@ -1914,7 +1938,7 @@ impl PackStore {
                 .or_else(|| guard.get(&sha512_hex))
                 .or_else(|| canon.as_deref().and_then(|c| guard.get(c)))
             {
-                return Ok(Some(pack.clone()));
+                return Ok(Some(Arc::clone(pack)));
             }
         }
 
@@ -2243,21 +2267,21 @@ impl PackStore {
             }
         }
 
-        let pack = PackagePack {
+        let pack = Arc::new(PackagePack {
             index,
             buffer,
             pack_path,
             idx_path,
-        };
+        });
 
         // 5. Store in cache across process lifetime
         {
             let mut guard = self.mmap_cache.write().unwrap();
-            guard.insert(integrity.to_string(), pack.clone());
-            guard.insert(safe_stem, pack.clone());
-            guard.insert(sha512_hex, pack.clone());
+            guard.insert(integrity.to_string(), Arc::clone(&pack));
+            guard.insert(safe_stem, Arc::clone(&pack));
+            guard.insert(sha512_hex, Arc::clone(&pack));
             if let Some(canon_key) = canon {
-                guard.insert(canon_key, pack.clone());
+                guard.insert(canon_key, Arc::clone(&pack));
             }
         }
 
@@ -2613,25 +2637,25 @@ impl PackStore {
             Arc::new(PackBuffer::Bytes(Arc::clone(&pack_bytes_arc)))
         };
 
-        let pack = PackagePack {
+        let pack = Arc::new(PackagePack {
             index,
             buffer,
             pack_path: final_pack.clone(),
             idx_path: final_idx.clone(),
-        };
+        });
 
         {
             let mut guard = self.mmap_cache.write().unwrap();
-            guard.insert(integrity.to_string(), pack.clone());
-            guard.insert(safe_stem, pack.clone());
-            guard.insert(sha512_hex, pack.clone());
+            guard.insert(integrity.to_string(), Arc::clone(&pack));
+            guard.insert(safe_stem, Arc::clone(&pack));
+            guard.insert(sha512_hex, Arc::clone(&pack));
             if let Some(canon_key) = canon {
-                guard.insert(canon_key, pack.clone());
+                guard.insert(canon_key, Arc::clone(&pack));
             }
         }
 
         Ok((
-            pack,
+            (*pack).clone(),
             DeferredPackPayloads {
                 pack: (final_pack, pack_bytes_arc),
                 idx: (final_idx, idx_bytes_arc),
@@ -2744,8 +2768,12 @@ impl PackStore {
         let next_idx = AtomicUsize::new(0);
         let num_workers = 16.min(unique_jobs.len());
         rnpm_fs::run_parallel(num_workers, &|| {
+            #[cfg(windows)]
             let mut wide_cas = Vec::with_capacity(260);
+            #[cfg(windows)]
             let mut wide_tmp = Vec::with_capacity(300);
+            #[cfg(not(windows))]
+            let (mut wide_cas, mut wide_tmp) = (Vec::new(), Vec::new());
             loop {
                 let idx = next_idx.fetch_add(1, Ordering::Relaxed);
                 if idx >= unique_jobs.len() {
@@ -4093,7 +4121,7 @@ impl PackStore {
         dirs_precreated: bool,
     ) -> Result<ExtractionSummary, CacheError> {
         let pack = self
-            .get_package_pack(integrity)?
+            .get_package_pack_arc(integrity)?
             .ok_or_else(|| CacheError::PackNotFound(integrity.to_string()))?;
         let can_block_clone = self.is_block_cloning_eligible(target_dir);
         match pack.materialize_to_opt(

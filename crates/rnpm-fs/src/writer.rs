@@ -906,41 +906,35 @@ pub(crate) fn write_file_fast_wide(
             lpOverlapped: *mut std::ffi::c_void,
         ) -> i32;
 
-        fn SetFileInformationByHandle(
-            hFile: *mut std::ffi::c_void,
-            FileInformationClass: i32,
-            lpFileInformation: *const std::ffi::c_void,
-            dwBufferSize: u32,
-        ) -> i32;
+        fn DeleteFileW(lpFileName: *const u16) -> i32;
 
         fn CloseHandle(hObject: *mut std::ffi::c_void) -> i32;
         fn GetLastError() -> u32;
     }
 
     const GENERIC_WRITE: u32 = 0x40000000;
-    const DELETE_ACCESS: u32 = 0x00010000;
+    const FILE_SHARE_READ: u32 = 1;
+    const FILE_SHARE_WRITE: u32 = 2;
     const FILE_SHARE_DELETE: u32 = 4;
+    const FILE_SHARE_ALL: u32 = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
     const CREATE_NEW: u32 = 1;
     const FILE_ATTRIBUTE_NORMAL: u32 = 0x80;
-    const FILE_FLAG_SEQUENTIAL_SCAN: u32 = 0x08000000;
-    const FILE_FLAGS_NEW: u32 = FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN;
-    const FILE_DISPOSITION_INFO: i32 = 4;
     const INVALID_HANDLE_VALUE: *mut std::ffi::c_void = -1isize as *mut std::ffi::c_void;
     const ERROR_PATH_NOT_FOUND: u32 = 3;
     const ERROR_ACCESS_DENIED: u32 = 5;
     const ERROR_FILE_EXISTS: u32 = 80;
     const ERROR_ALREADY_EXISTS: u32 = 183;
 
-    // Fast path: CREATE_NEW with FILE_SHARE_DELETE blocks read/write AV/indexer probes while
-    // writing sequentially, allows collision unlinks, and cleans up partial files on write failure.
+    // Fast path: exclusive creation avoids truncating an existing hardlink or
+    // following a symlink without paying a pre-stat syscall on fresh installs.
     let mut handle = unsafe {
         CreateFileW(
             path_wide.as_ptr(),
-            GENERIC_WRITE | DELETE_ACCESS,
-            FILE_SHARE_DELETE,
+            GENERIC_WRITE,
+            FILE_SHARE_ALL,
             std::ptr::null_mut(),
             CREATE_NEW,
-            FILE_FLAGS_NEW,
+            FILE_ATTRIBUTE_NORMAL,
             std::ptr::null_mut(),
         )
     };
@@ -952,11 +946,11 @@ pub(crate) fn write_file_fast_wide(
             handle = unsafe {
                 CreateFileW(
                     path_wide.as_ptr(),
-                    GENERIC_WRITE | DELETE_ACCESS,
-                    FILE_SHARE_DELETE,
+                    GENERIC_WRITE,
+                    FILE_SHARE_ALL,
                     std::ptr::null_mut(),
                     CREATE_NEW,
-                    FILE_FLAGS_NEW,
+                    FILE_ATTRIBUTE_NORMAL,
                     std::ptr::null_mut(),
                 )
             };
@@ -973,11 +967,11 @@ pub(crate) fn write_file_fast_wide(
             handle = unsafe {
                 CreateFileW(
                     path_wide.as_ptr(),
-                    GENERIC_WRITE | DELETE_ACCESS,
-                    FILE_SHARE_DELETE,
+                    GENERIC_WRITE,
+                    FILE_SHARE_ALL,
                     std::ptr::null_mut(),
                     CREATE_NEW,
-                    FILE_FLAGS_NEW,
+                    FILE_ATTRIBUTE_NORMAL,
                     std::ptr::null_mut(),
                 )
             };
@@ -1007,27 +1001,15 @@ pub(crate) fn write_file_fast_wide(
             if ok == 0 {
                 let err = unsafe { GetLastError() };
                 unsafe {
-                    let del: u8 = 1;
-                    SetFileInformationByHandle(
-                        handle,
-                        FILE_DISPOSITION_INFO,
-                        &del as *const u8 as *const std::ffi::c_void,
-                        1,
-                    );
                     CloseHandle(handle);
+                    DeleteFileW(path_wide.as_ptr());
                 }
                 return Err(std::io::Error::from_raw_os_error(err as i32));
             }
             if written == 0 {
                 unsafe {
-                    let del: u8 = 1;
-                    SetFileInformationByHandle(
-                        handle,
-                        FILE_DISPOSITION_INFO,
-                        &del as *const u8 as *const std::ffi::c_void,
-                        1,
-                    );
                     CloseHandle(handle);
+                    DeleteFileW(path_wide.as_ptr());
                 }
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::WriteZero,
@@ -1117,7 +1099,11 @@ fn write_file_fast_impl(
     }
 
     if !data.is_empty() {
-        file.write_all(data)?;
+        if let Err(e) = file.write_all(data) {
+            drop(file);
+            let _ = std::fs::remove_file(path);
+            return Err(e);
+        }
     }
 
     #[cfg(unix)]
@@ -1636,7 +1622,7 @@ fn materialize_items_slice<T: MatItem>(
 
     let prealloc_thresh = config.preallocate_threshold;
     let total_files = items.len();
-    let num_threads = if config.is_hdd {
+    let mut num_threads = if config.is_hdd {
         config.worker_threads.clamp(1, 4)
     } else if config.worker_threads == 0 {
         select_default_concurrency(Some(false)).0.clamp(1, 32)
@@ -1646,6 +1632,12 @@ fn materialize_items_slice<T: MatItem>(
     .min(total_files);
 
     if !config.is_hdd {
+        if total_files < 64 && num_threads > 12 {
+            let approx_bytes: usize = items.iter().map(|i| i.item_data().len()).sum();
+            if approx_bytes < 512 * 1024 {
+                num_threads = num_threads.min((total_files / 3).max(4)).min(12);
+            }
+        }
         if total_files == 1 || num_threads <= 1 {
             let mut src_buf = Vec::with_capacity(260);
             let mut dst_buf = Vec::with_capacity(260);
@@ -1684,7 +1676,7 @@ fn materialize_items_slice<T: MatItem>(
             }
         }
 
-        let chunk_size = (total_files / (num_threads * 6)).clamp(1, 4);
+        let chunk_size = (total_files / (num_threads * 4)).clamp(1, 16);
         let next_file = AtomicUsize::new(0);
         let has_err = AtomicBool::new(false);
         let first_err: Mutex<Option<FsError>> = Mutex::new(None);
@@ -1901,13 +1893,13 @@ pub fn decode_tar_entries<R: Read>(
 
     let counting_reader = CountingReader::new(reader);
     let compressed_counter = counting_reader.counter();
-    let mut buffered = std::io::BufReader::with_capacity(64 * 1024, counting_reader);
+    let mut buffered = std::io::BufReader::with_capacity(16 * 1024, counting_reader);
     let gzipped = std::io::BufRead::fill_buf(&mut buffered)
         .map_err(FsError::Io)?
         .starts_with(&[0x1f, 0x8b]);
     let payload = if gzipped {
         TarPayloadReader::Gzip(Box::new(std::io::BufReader::with_capacity(
-            64 * 1024,
+            16 * 1024,
             GzDecoder::new(buffered),
         )))
     } else {

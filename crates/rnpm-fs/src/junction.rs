@@ -810,9 +810,9 @@ mod win_rm {
             }
 
             let num_threads = std::thread::available_parallelism()
-                .map(|n| n.get() * 2)
-                .unwrap_or(8)
-                .clamp(4, 24)
+                .map(|n| n.get())
+                .unwrap_or(4)
+                .clamp(2, 16)
                 .min(stack.len().max(2));
             let state = Mutex::new(QueueState {
                 pending: stack.into_iter().collect(),
