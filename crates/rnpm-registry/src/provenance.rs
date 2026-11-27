@@ -1805,8 +1805,19 @@ impl ProvenanceVerifier {
             registry_key_expiries: HashMap::new(),
         };
 
+        // In `cfg(test)`, always include mock roots for unit tests.
+        // In debug builds (`cfg(debug_assertions)`), honor `RNPM_TEST_MOCK_ROOTS` so workspace
+        // integration tests (`cargo test --workspace`, notably `rnpm-cli`'s `provenance_cli_test`)
+        // can exercise signed bundles without compiling a production backdoor into release binaries.
+        // Release builds (`!debug_assertions`) compile this env-var branch out completely.
         #[cfg(test)]
         let verifier = verifier.with_test_mock_roots();
+        #[cfg(all(not(test), debug_assertions))]
+        let verifier = if std::env::var_os("RNPM_TEST_MOCK_ROOTS").is_some() {
+            verifier.with_test_mock_roots()
+        } else {
+            verifier
+        };
 
         verifier
     }

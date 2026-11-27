@@ -2198,26 +2198,46 @@ fn test_env_var_mock_roots_ignored_in_non_test_verifier() {
     let sha512_hex = HEXLOWER.encode(&Sha512::digest(tarball_bytes));
     let bundle = make_test_bundle("pkg", &sha512_hex, "https://github.com/org/repo", "deadbeef");
 
+    // Baseline (without RNPM_TEST_MOCK_ROOTS): mock roots are NOT trusted by default.
+    std::env::remove_var("RNPM_TEST_MOCK_ROOTS");
+    let baseline = ProvenanceVerifier::new(ProvenancePolicy::AllowAny);
+    assert!(baseline
+        .clone()
+        .verify("pkg", &bundle, Some("1.0.0"), Some(tarball_bytes))
+        .is_err());
+
     std::env::set_var("RNPM_TEST_MOCK_ROOTS", "1");
     let _reset = EnvReset;
 
-    // Non-test ProvenanceVerifier::new MUST ignore RNPM_TEST_MOCK_ROOTS and reject mock-root bundles.
-    let prod_verifier = ProvenanceVerifier::new(ProvenancePolicy::AllowAny);
-    let err = prod_verifier
-        .verify("pkg", &bundle, Some("1.0.0"), Some(tarball_bytes))
-        .unwrap_err();
-    match err {
-        RegistryError::InvalidSigstoreBundle(msg) => {
-            assert!(
-                msg.contains("Certificate chain does not terminate in a trusted Fulcio root CA"),
-                "Unexpected error: {msg}"
-            );
+    let verifier = ProvenanceVerifier::new(ProvenancePolicy::AllowAny);
+
+    // Release builds (--release / !debug_assertions) MUST ignore RNPM_TEST_MOCK_ROOTS completely.
+    #[cfg(not(debug_assertions))]
+    {
+        let err = verifier
+            .verify("pkg", &bundle, Some("1.0.0"), Some(tarball_bytes))
+            .unwrap_err();
+        match err {
+            RegistryError::InvalidSigstoreBundle(msg) => {
+                assert!(
+                    msg.contains("Certificate chain does not terminate in a trusted Fulcio root CA"),
+                    "Unexpected error: {msg}"
+                );
+            }
+            other => panic!("Expected InvalidSigstoreBundle in release build, got {other:?}"),
         }
-        other => panic!("Expected InvalidSigstoreBundle, got {other:?}"),
     }
 
-    // Explicit opt-in with_test_mock_roots() succeeds on the same bundle.
-    assert!(prod_verifier
+    // Debug builds honor RNPM_TEST_MOCK_ROOTS only for CLI/debug integration test harnesses.
+    #[cfg(debug_assertions)]
+    {
+        assert!(verifier
+            .verify("pkg", &bundle, Some("1.0.0"), Some(tarball_bytes))
+            .is_ok());
+    }
+
+    // Explicit opt-in with_test_mock_roots() always succeeds on the test bundle.
+    assert!(baseline
         .with_test_mock_roots()
         .verify("pkg", &bundle, Some("1.0.0"), Some(tarball_bytes))
         .is_ok());
