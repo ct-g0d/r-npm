@@ -1,6 +1,6 @@
 use crate::error::{HttpTransportError, RegistryError};
 use crate::network_errors::format_io_error;
-use flate2::read::{DeflateDecoder, MultiGzDecoder};
+use flate2::read::{DeflateDecoder, MultiGzDecoder, ZlibDecoder};
 use reqwest::header::HeaderMap;
 use reqwest::{Method, StatusCode};
 use std::collections::HashMap;
@@ -1521,11 +1521,10 @@ pub(crate) async fn execute_hop(
                                 MAX_ERROR_BODY_BYTES,
                             )
                             .unwrap_or(bytes),
-                            ContentEncoding::Deflate => decompress_bounded(
-                                DeflateDecoder::new(&bytes[..]),
-                                MAX_ERROR_BODY_BYTES,
-                            )
-                            .unwrap_or(bytes),
+                            ContentEncoding::Deflate => {
+                                decompress_http_deflate(&bytes, MAX_ERROR_BODY_BYTES)
+                                    .unwrap_or(bytes)
+                            }
                             ContentEncoding::Identity | ContentEncoding::Unsupported => bytes,
                         };
                         (String::from_utf8_lossy(&decoded).into_owned(), clean)
@@ -1662,9 +1661,7 @@ pub(crate) async fn execute_hop(
                     ContentEncoding::Gzip => {
                         decompress_bounded(MultiGzDecoder::new(&raw_bytes[..]), max_size)?
                     }
-                    ContentEncoding::Deflate => {
-                        decompress_bounded(DeflateDecoder::new(&raw_bytes[..]), max_size)?
-                    }
+                    ContentEncoding::Deflate => decompress_http_deflate(&raw_bytes, max_size)?,
                     ContentEncoding::Unsupported => unreachable!(),
                 };
                 return Ok(HopOutcome::Success {
@@ -2305,6 +2302,16 @@ async fn read_error_body(
         out.extend_from_slice(&scratch[..n]);
     }
     Ok((out, false))
+}
+
+fn decompress_http_deflate(raw: &[u8], max_size: usize) -> Result<Vec<u8>, RegistryError> {
+    // RFC 9110 §8.4.2 specifies zlib-wrapped DEFLATE (RFC 1950) for HTTP `Content-Encoding: deflate`.
+    // Fall back to raw DEFLATE (RFC 1951) only if zlib header/framing decoding fails, never on size-limit errors.
+    match decompress_bounded(ZlibDecoder::new(raw), max_size) {
+        Ok(bytes) => Ok(bytes),
+        Err(err @ RegistryError::SizeLimitExceeded { .. }) => Err(err),
+        Err(zlib_err) => decompress_bounded(DeflateDecoder::new(raw), max_size).map_err(|_| zlib_err),
+    }
 }
 
 fn decompress_bounded<R: Read>(decoder: R, max_size: usize) -> Result<Vec<u8>, RegistryError> {

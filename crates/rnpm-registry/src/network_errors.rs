@@ -126,14 +126,14 @@ pub(crate) fn format_io_error(
             Some("connect"),
             format!("connect ECONNREFUSED {host}:{port}"),
         )
+    } else if is_timeout && !is_connect_phase {
+        return format!("npm error code FETCH_ERROR\nnpm error errno FETCH_ERROR\nnpm error network timeout at: {url}");
     } else if kind == ErrorKind::TimedOut || (is_timeout && is_connect_phase) {
         (
             "ETIMEDOUT",
             Some("connect"),
             format!("connect ETIMEDOUT {host}:{port}"),
         )
-    } else if is_timeout {
-        return format!("npm error code FETCH_ERROR\nnpm error errno FETCH_ERROR\nnpm error network timeout at: {url}");
     } else if matches!(
         kind,
         ErrorKind::ConnectionReset
