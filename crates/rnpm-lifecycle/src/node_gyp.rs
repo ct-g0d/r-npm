@@ -328,19 +328,13 @@ fn find_standalone_node_gyp_on_path() -> Option<PathBuf> {
 
 fn find_cached_standalone_node_gyp(cache_dir: &Path) -> Option<PathBuf> {
     use std::sync::{Mutex, OnceLock};
-    use std::time::{Duration, Instant};
 
-    type CachedNodeGypEntry = (PathBuf, Option<PathBuf>, Instant);
-    static CACHE: OnceLock<Mutex<Option<CachedNodeGypEntry>>> = OnceLock::new();
+    static CACHE: OnceLock<Mutex<Option<(PathBuf, PathBuf)>>> = OnceLock::new();
     let cache = CACHE.get_or_init(|| Mutex::new(None));
     if let Ok(guard) = cache.lock() {
-        if let Some((ref cached_dir, ref result, ts)) = *guard {
-            if cached_dir == cache_dir {
-                match result {
-                    Some(p) if p.is_file() => return Some(p.clone()),
-                    None if ts.elapsed() < Duration::from_secs(2) => return None,
-                    _ => {}
-                }
+        if let Some((ref cached_dir, ref result)) = *guard {
+            if cached_dir == cache_dir && result.is_file() {
+                return Some(result.clone());
             }
         }
     }
@@ -356,9 +350,9 @@ fn find_cached_standalone_node_gyp(cache_dir: &Path) -> Option<PathBuf> {
             "Resolved node-gyp via cached standalone directory: {}",
             candidate.display()
         );
-    }
-    if let Ok(mut guard) = cache.lock() {
-        *guard = Some((cache_dir.to_path_buf(), found.clone(), Instant::now()));
+        if let Ok(mut guard) = cache.lock() {
+            *guard = Some((cache_dir.to_path_buf(), candidate.clone()));
+        }
     }
     found
 }

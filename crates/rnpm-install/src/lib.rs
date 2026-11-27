@@ -2291,6 +2291,49 @@ fn spawn_populate_cas_from_installed(
     });
 }
 
+fn manifest_has_warnable_scripts(manifest: &Manifest, pkg_is_registry: bool) -> bool {
+    manifest.scripts.contains_key("preinstall")
+        || manifest.scripts.contains_key("install")
+        || manifest.scripts.contains_key("postinstall")
+        || (!pkg_is_registry && manifest.scripts.contains_key("prepare"))
+}
+
+fn compute_top_level_funding_count(
+    options: &InstallOptions,
+    lockfile: &LockfileV3,
+    loc_base_dir: &Path,
+    platform_skipped: Option<&HashSet<String>>,
+    checked_funding_pkgs: &HashMap<String, bool>,
+    in_memory_manifests: &HashMap<String, Manifest>,
+) -> usize {
+    let mut count = 0usize;
+    for (pkg_key, pkg_info) in &lockfile.packages {
+        if !is_top_level_nm_pkg(pkg_key) {
+            continue;
+        }
+        if platform_skipped.is_some_and(|s| s.contains(pkg_key)) {
+            continue;
+        }
+        if lockfile_entry_omitted(options, lockfile, pkg_key, pkg_info) {
+            continue;
+        }
+        if let Some(&has_funding) = checked_funding_pkgs.get(pkg_key) {
+            if has_funding {
+                count += 1;
+            }
+        } else if let Some(m) = in_memory_manifests.get(pkg_key) {
+            if m.extra.contains_key("funding") {
+                count += 1;
+            }
+        } else if std::fs::read(loc_base_dir.join(pkg_key).join("package.json"))
+            .is_ok_and(|b| bytes_has_funding_field(&b))
+        {
+            count += 1;
+        }
+    }
+    count
+}
+
 fn has_unsatisfied_peer_dependency(graph: &DependencyGraph) -> bool {
     use rnpm_solver::graph::DependencyType;
     for edge in &graph.edges {
@@ -5285,6 +5328,9 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
             }
         }
 
+        let nm_clean_slate = tree_diff_opt.is_none()
+            && !node_modules_dir.exists()
+            && !rnpm_fs::is_junction(&node_modules_dir).unwrap_or(false);
         let mut lifecycle_nodes: Vec<LifecyclePackageNode> = Vec::new();
         let mut packages_to_download = Vec::new();
 
@@ -5787,9 +5833,6 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
             let mut all_dirs = std::collections::BTreeSet::new();
             all_dirs.insert(node_modules_dir.clone());
 
-            let nm_clean_slate = tree_diff_opt.is_none()
-                && !node_modules_dir.exists()
-                && !rnpm_fs::is_junction(&node_modules_dir).unwrap_or(false);
             for (loc, _) in &packages_to_download {
                 let pkg_target = loc_base_dir.join(loc);
                 if !(nm_clean_slate && loc.starts_with("node_modules/"))
@@ -5944,11 +5987,21 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                                         in_memory_manifests
                                             .insert(loc.clone(), pkg_manifest.clone());
                                     }
+                                    let pkg_is_registry = !node.flags.link
+                                        && node
+                                            .resolved
+                                            .as_deref()
+                                            .is_none_or(policy::is_registry_tarball);
                                     let has_install_script =
                                         pkg_manifest.scripts.contains_key("preinstall")
                                             || pkg_manifest.scripts.contains_key("install")
                                             || pkg_manifest.scripts.contains_key("postinstall");
-                                    if !has_gyp && !has_install_script {
+                                    if !has_gyp
+                                        && !manifest_has_warnable_scripts(
+                                            &pkg_manifest,
+                                            pkg_is_registry,
+                                        )
+                                    {
                                         no_script_locations.insert(loc.clone());
                                     }
                                     if has_install_script {
@@ -6889,33 +6942,36 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
             }
         }
 
-        let computed_funding_count = if used_fast_materialize && tree_diff_opt.is_none() && !self.options.is_global {
-            let mut count = checked_funding_pkgs.values().filter(|&&v| v).count();
-            for (loc, _) in &packages_to_download {
-                if is_top_level_nm_pkg(loc)
-                    && !checked_funding_pkgs.contains_key(loc)
-                    && std::fs::read(loc_base_dir.join(loc).join("package.json"))
-                        .is_ok_and(|b| bytes_has_funding_field(&b))
-                {
-                    count += 1;
-                }
-            }
-            Some(count)
+        let computed_funding_count = if nm_clean_slate
+            && used_fast_materialize
+            && !self.options.is_global
+        {
+            let platform_skipped =
+                lockfile_platform_skipped_packages(&lockfile, &self.options.platform());
+            Some(compute_top_level_funding_count(
+                &self.options,
+                &lockfile,
+                &loc_base_dir,
+                Some(&platform_skipped),
+                &checked_funding_pkgs,
+                &in_memory_manifests,
+            ))
         } else {
             None
         };
-        let cached_script_locs: Option<Vec<String>> = if used_fast_materialize && tree_diff_opt.is_none() && !self.options.is_global {
-            Some(
-                lockfile
-                    .packages
-                    .keys()
-                    .filter(|k| !k.is_empty() && !no_script_locations.contains(k.as_str()))
-                    .cloned()
-                    .collect(),
-            )
-        } else {
-            None
-        };
+        let cached_script_locs: Option<Vec<String>> =
+            if nm_clean_slate && used_fast_materialize && !self.options.is_global {
+                Some(
+                    lockfile
+                        .packages
+                        .keys()
+                        .filter(|k| !k.is_empty() && !no_script_locations.contains(k.as_str()))
+                        .cloned()
+                        .collect(),
+                )
+            } else {
+                None
+            };
 
         if !self.options.dry_run && !self.options.package_lock_only {
             if let Ok(fingerprint) =
@@ -8842,11 +8898,19 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                                             .any(|s| s.0.eq_ignore_ascii_case("binding.gyp"));
                                     if let Ok(pkg_manifest) = Manifest::from_slice_readonly(slice) {
                                         parsed_from_pack = true;
-                                        let has_install_script =
-                                            pkg_manifest.scripts.contains_key("preinstall")
-                                                || pkg_manifest.scripts.contains_key("install")
-                                                || pkg_manifest.scripts.contains_key("postinstall");
-                                        if !has_gyp && !has_install_script {
+                                        let pkg_is_registry =
+                                            lockfile.packages.get(pkg_key.as_str()).is_none_or(|p| {
+                                                p.link != Some(true)
+                                                    && p.resolved
+                                                        .as_deref()
+                                                        .is_none_or(policy::is_registry_tarball)
+                                            });
+                                        if !has_gyp
+                                            && !manifest_has_warnable_scripts(
+                                                &pkg_manifest,
+                                                pkg_is_registry,
+                                            )
+                                        {
                                             no_script_locations.insert(pkg_key.clone());
                                         }
                                         in_memory_manifests
@@ -9231,7 +9295,9 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
             }
 
             // Fill CAS by copying from node_modules on 16 threads for cold installs (offloaded if eligible)
-            if self.pack_store().is_block_cloning_eligible(&loc_base_dir) {
+            if missing_packs.is_empty()
+                && self.pack_store().is_block_cloning_eligible(&loc_base_dir)
+            {
                 let cas_pkgs: Vec<(String, String)> = packages_to_process
                     .iter()
                     .filter(|(_, _, integrity_str, _, _, _)| !integrity_str.is_empty())
@@ -9335,7 +9401,9 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
         if !pending_pack_tasks.is_empty() {
             finish_pack_tasks(pending_pack_tasks).await?;
             // Fill CAS by copying from node_modules on 16 threads for cold installs (offloaded if eligible)
-            if self.pack_store().is_block_cloning_eligible(&loc_base_dir) {
+            if missing_packs.is_empty()
+                && self.pack_store().is_block_cloning_eligible(&loc_base_dir)
+            {
                 let cas_pkgs: Vec<(String, String)> = packages_to_process
                     .iter()
                     .filter(|(_, _, integrity_str, _, _, _)| !integrity_str.is_empty())
@@ -9385,29 +9453,19 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
             }
         }
 
-        let computed_funding_count = if (used_fast_path || !missing_pack_results.is_empty()) && !self.options.is_global {
-            let mut count = checked_funding_pkgs.values().filter(|&&v| v).count();
-            for (pkg_key, pkg_info) in &lockfile.packages {
-                if is_top_level_nm_pkg(pkg_key)
-                    && !platform_skipped_packages.contains(pkg_key)
-                    && !lockfile_entry_omitted(&self.options, &lockfile, pkg_key, pkg_info)
-                    && !checked_funding_pkgs.contains_key(pkg_key)
-                {
-                    if let Some(m) = in_memory_manifests.get(pkg_key) {
-                        if m.extra.contains_key("funding") {
-                            count += 1;
-                        }
-                    } else if std::fs::read(loc_base_dir.join(pkg_key).join("package.json"))
-                        .is_ok_and(|b| bytes_has_funding_field(&b))
-                    {
-                        count += 1;
-                    }
-                }
-            }
-            Some(count)
-        } else {
-            None
-        };
+        let computed_funding_count =
+            if (used_fast_path || !missing_pack_results.is_empty()) && !self.options.is_global {
+                Some(compute_top_level_funding_count(
+                    &self.options,
+                    &lockfile,
+                    &loc_base_dir,
+                    Some(&platform_skipped_packages),
+                    &checked_funding_pkgs,
+                    &in_memory_manifests,
+                ))
+            } else {
+                None
+            };
         let cached_script_locs: Option<Vec<String>> = if (used_fast_path || !missing_pack_results.is_empty()) && !self.options.is_global {
             Some(
                 lockfile

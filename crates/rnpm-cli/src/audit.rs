@@ -1191,10 +1191,7 @@ impl SpeculativeAuditHandle {
         meta.len() == self.lock_len && meta.modified().ok() == self.lock_mtime
     }
 
-    fn verify_lockfile_hash(&self, spec_hash: u64, trust_meta_if_unchanged: bool) -> bool {
-        if trust_meta_if_unchanged && self.is_lockfile_unchanged() {
-            return true;
-        }
+    fn verify_lockfile_hash(&self, spec_hash: u64) -> bool {
         std::fs::read(&self.lock_path)
             .ok()
             .is_some_and(|bytes| fast_lockfile_hash(&bytes) == spec_hash)
@@ -1202,10 +1199,7 @@ impl SpeculativeAuditHandle {
 
     /// Completes the speculative audit synchronously when no non-empty advisories need
     /// async remediation resolution.
-    pub(crate) fn try_finish_sync(
-        mut self,
-        trust_meta_if_unchanged: bool,
-    ) -> SyncAuditOutcome {
+    pub(crate) fn try_finish_sync(mut self) -> SyncAuditOutcome {
         let Some(inner) = self.inner.take() else {
             return SyncAuditOutcome::Done(None);
         };
@@ -1216,7 +1210,7 @@ impl SpeculativeAuditHandle {
                 else {
                     return SyncAuditOutcome::Done(None);
                 };
-                if !self.verify_lockfile_hash(spec_hash, trust_meta_if_unchanged) {
+                if !self.verify_lockfile_hash(spec_hash) {
                     return SyncAuditOutcome::Done(None);
                 }
                 if advisories_by_pkg.is_empty() {
@@ -1240,7 +1234,7 @@ impl SpeculativeAuditHandle {
                 }
             }
             SpeculativeAuditInner::ReadySync(spec_hash, lockfile, inventory, advisories_by_pkg) => {
-                if !self.verify_lockfile_hash(spec_hash, trust_meta_if_unchanged) {
+                if !self.verify_lockfile_hash(spec_hash) {
                     return SyncAuditOutcome::Done(None);
                 }
                 if advisories_by_pkg.is_empty() {
@@ -1273,14 +1267,13 @@ impl SpeculativeAuditHandle {
     pub(crate) async fn finish(
         mut self,
         config: &rnpm_config::Config,
-        trust_meta_if_unchanged: bool,
     ) -> Option<(rnpm_lockfile::LockfileV3, AuditReport)> {
         let inner = self.inner.take()?;
         let (spec_hash, lockfile, report) = match inner {
             SpeculativeAuditInner::SyncHttpThread(handle) => {
                 let (spec_hash, lockfile, inventory, advisories_by_pkg) =
                     handle.join().ok().flatten()?;
-                if !self.verify_lockfile_hash(spec_hash, trust_meta_if_unchanged) {
+                if !self.verify_lockfile_hash(spec_hash) {
                     return None;
                 }
                 let report = if advisories_by_pkg.is_empty() {
@@ -1307,7 +1300,7 @@ impl SpeculativeAuditHandle {
                 return Some((lockfile, report));
             }
             SpeculativeAuditInner::ReadySync(spec_hash, lockfile, inventory, advisories_by_pkg) => {
-                if !self.verify_lockfile_hash(spec_hash, trust_meta_if_unchanged) {
+                if !self.verify_lockfile_hash(spec_hash) {
                     return None;
                 }
                 let (report, _, _) = finalize_audit_report(
@@ -1323,7 +1316,7 @@ impl SpeculativeAuditHandle {
             }
             SpeculativeAuditInner::AsyncTask(handle) => handle.await.ok().flatten()?,
         };
-        if !self.verify_lockfile_hash(spec_hash, trust_meta_if_unchanged) {
+        if !self.verify_lockfile_hash(spec_hash) {
             return None;
         }
         Some((lockfile, report))
@@ -1958,5 +1951,24 @@ mod tests {
         bytes.extend_from_slice(br#"{"name":"bom-pkg","funding":"https://example.com"}"#);
         std::fs::write(pkg_dir.join("package.json"), bytes).unwrap();
         assert_eq!(count_funding_packages_in_node_modules(dir.path()), 1);
+    }
+
+    #[test]
+    fn speculative_audit_verify_lockfile_hash_rejects_equal_length_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock_path = dir.path().join("package-lock.json");
+        std::fs::write(&lock_path, b"{\"version\":\"1.0.0\"}").unwrap();
+        let initial_hash = fast_lockfile_hash(&std::fs::read(&lock_path).unwrap());
+        let handle = SpeculativeAuditHandle {
+            lock_path: lock_path.clone(),
+            lock_len: 19,
+            lock_mtime: None,
+            registry: "http://127.0.0.1:4873".to_string(),
+            cancelled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            inner: None,
+        };
+        assert!(handle.verify_lockfile_hash(initial_hash));
+        std::fs::write(&lock_path, b"{\"version\":\"1.0.1\"}").unwrap();
+        assert!(!handle.verify_lockfile_hash(initial_hash));
     }
 }

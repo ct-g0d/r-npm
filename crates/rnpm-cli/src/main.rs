@@ -6143,9 +6143,8 @@ async fn finish_install_or_ci_output(
     preloaded_lockfile: Option<&rnpm_lockfile::LockfileV3>,
     speculative_audit: Option<audit::SpeculativeAuditHandle>,
 ) -> anyhow::Result<()> {
-    let trust_unchanged_meta = summary.packages_installed == 0;
     let (spec_lock_owned, spec_report) = match speculative_audit {
-        Some(handle) => match handle.finish(config, trust_unchanged_meta).await {
+        Some(handle) => match handle.finish(config).await {
             Some((lf, rep)) => (Some(lf), Some(rep)),
             None => (None, None),
         },
@@ -10787,7 +10786,7 @@ fn main() {
                         .take()
                         .filter(|h| h.is_lockfile_unchanged());
                     let audit_resolution = match sync_handle {
-                        Some(handle) => handle.try_finish_sync(summary.packages_installed == 0),
+                        Some(handle) => handle.try_finish_sync(),
                         None => audit::SyncAuditOutcome::Done(None),
                     };
                     match audit_resolution {

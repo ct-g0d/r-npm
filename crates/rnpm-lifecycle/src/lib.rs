@@ -964,14 +964,55 @@ fn replace_kv_pairs(text: &str, key_name: &str) -> String {
 
 /// Concurrently drains a readable stream in chunks, applying credential scrubbing
 /// on streaming chunks to ensure child processes cannot stall from filled pipe buffers.
+fn utf8_incomplete_tail_len(bytes: &[u8]) -> usize {
+    let check_start = bytes.len().saturating_sub(4);
+    for idx in (check_start..bytes.len()).rev() {
+        let b = bytes[idx];
+        if b < 0x80 {
+            return 0;
+        }
+        if b >= 0xC0 {
+            let expected_len = if b < 0xE0 {
+                2
+            } else if b < 0xF0 {
+                3
+            } else {
+                4
+            };
+            let avail = bytes.len() - idx;
+            return if avail < expected_len { avail } else { 0 };
+        }
+    }
+    0
+}
+
+fn floor_char_boundary_idx(s: &str, mut idx: usize) -> usize {
+    idx = idx.min(s.len());
+    while idx > 0 && !s.is_char_boundary(idx) {
+        idx -= 1;
+    }
+    idx
+}
+
 pub fn drain_and_scrub_reader<R: std::io::Read>(reader: &mut R) -> String {
     let mut out = String::new();
     let mut buf = [0u8; 8192];
+    let mut pending = [0u8; 4];
+    let mut pending_len = 0usize;
     let mut carry = String::new();
 
     loop {
-        match reader.read(&mut buf) {
+        let read_res = {
+            if pending_len > 0 {
+                buf[..pending_len].copy_from_slice(&pending[..pending_len]);
+            }
+            reader.read(&mut buf[pending_len..])
+        };
+        match read_res {
             Ok(0) => {
+                if pending_len > 0 {
+                    carry.push_str(&String::from_utf8_lossy(&pending[..pending_len]));
+                }
                 if !carry.is_empty() {
                     let scrubbed = scrub_text(&carry);
                     out.push_str(&scrubbed);
@@ -979,11 +1020,19 @@ pub fn drain_and_scrub_reader<R: std::io::Read>(reader: &mut R) -> String {
                 break;
             }
             Ok(n) => {
-                let chunk_str = String::from_utf8_lossy(&buf[..n]);
+                let total = pending_len + n;
+                let incomplete_tail = utf8_incomplete_tail_len(&buf[..total]);
+                let decode_end = total - incomplete_tail;
+                if incomplete_tail > 0 {
+                    pending[..incomplete_tail].copy_from_slice(&buf[decode_end..total]);
+                }
+                pending_len = incomplete_tail;
+
+                let chunk_str = String::from_utf8_lossy(&buf[..decode_end]);
                 let combined = format!("{carry}{chunk_str}");
 
                 if combined.len() > 512 {
-                    let split_candidate = combined.len() - 256;
+                    let split_candidate = floor_char_boundary_idx(&combined, combined.len() - 256);
                     let split_pos = match combined[..split_candidate].rfind(['\n', '\r', ' ', ';'])
                     {
                         Some(pos) => pos + 1,
@@ -1000,6 +1049,9 @@ pub fn drain_and_scrub_reader<R: std::io::Read>(reader: &mut R) -> String {
             }
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(_) => {
+                if pending_len > 0 {
+                    carry.push_str(&String::from_utf8_lossy(&pending[..pending_len]));
+                }
                 if !carry.is_empty() {
                     let scrubbed = scrub_text(&carry);
                     out.push_str(&scrubbed);

@@ -1052,7 +1052,7 @@ pub fn create_shims_with_preloaded_header(
         .map(Path::to_path_buf)
         .unwrap_or_else(|| bin_dir.join(&rel_target));
 
-    if preloaded_header.is_none() && !target_script.exists() {
+    if !target_script.exists() {
         return Ok(());
     }
 

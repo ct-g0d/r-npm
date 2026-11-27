@@ -596,13 +596,23 @@ pub(crate) fn sort_packages_for_bin_linking(packages: &mut [CiPackage]) {
     packages.sort_by(|a, b| bin_package_order_cmp(&a.0, &b.0));
 }
 
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn norm_bin_rel(rel: &str) -> String {
-    let stripped = rel.trim_start_matches("./").trim_start_matches(".\\");
-    if stripped.contains('\\') {
-        stripped.replace('\\', "/")
+    let norm = if rel.contains('\\') {
+        std::borrow::Cow::Owned(rel.replace('\\', "/"))
     } else {
-        stripped.to_string()
+        std::borrow::Cow::Borrowed(rel)
+    };
+    let mut s = norm.as_ref();
+    while let Some(rest) = s.strip_prefix("./") {
+        s = rest;
+    }
+    if s.len() == norm.len() {
+        match norm {
+            std::borrow::Cow::Owned(o) => o,
+            std::borrow::Cow::Borrowed(b) => b.to_string(),
+        }
+    } else {
+        s.to_string()
     }
 }
 
