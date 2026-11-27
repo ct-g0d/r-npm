@@ -3983,3 +3983,58 @@ fn test_extract_packages_direct_parallel_nested_dir_symlink_and_dangling_rm() {
     assert!(!root.path().exists());
     assert_eq!(fs::read(external.path().join("keep.txt")).unwrap(), b"must stay");
 }
+
+#[test]
+fn test_uppercase_file_before_its_own_dir_entry_succeeds() {
+    let build_tgz = |lower_conflict: bool| {
+        let mut gz = GzEncoder::new(Vec::new(), Compression::default());
+        {
+            let mut tar = tar::Builder::new(&mut gz);
+            let mut hf = tar::Header::new_gnu();
+            let payload = b"export const x = 1;";
+            hf.set_size(payload.len() as u64);
+            hf.set_mode(0o644);
+            hf.set_cksum();
+            tar.append_data(&mut hf, "package/Lib/index.js", &payload[..])
+                .unwrap();
+
+            let mut hd = tar::Header::new_gnu();
+            hd.set_entry_type(tar::EntryType::Directory);
+            hd.set_size(0);
+            hd.set_mode(0o755);
+            hd.set_cksum();
+            let dir_name = if lower_conflict {
+                "package/lib/"
+            } else {
+                "package/Lib/"
+            };
+            tar.append_data(&mut hd, dir_name, &[][..]).unwrap();
+            tar.finish().unwrap();
+        }
+        gz.finish().unwrap()
+    };
+
+    let tgz_ok = build_tgz(false);
+    let dest_stream = tempdir().unwrap();
+    crate::tarball::extract_tar_gz(std::io::Cursor::new(&tgz_ok), dest_stream.path(), None).unwrap();
+    assert_eq!(
+        fs::read(dest_stream.path().join("Lib").join("index.js")).unwrap(),
+        b"export const x = 1;"
+    );
+
+    let dest_decode = tempdir().unwrap();
+    crate::writer::decode_tar_entries(std::io::Cursor::new(&tgz_ok), dest_decode.path(), None, None)
+        .unwrap();
+
+    let tgz_conflict = build_tgz(true);
+    let dest_conflict = tempdir().unwrap();
+    assert!(matches!(
+        crate::writer::decode_tar_entries(
+            std::io::Cursor::new(&tgz_conflict),
+            dest_conflict.path(),
+            None,
+            None,
+        ),
+        Err(FsError::CaseCollision { .. })
+    ));
+}

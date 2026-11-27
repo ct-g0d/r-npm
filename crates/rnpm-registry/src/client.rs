@@ -8,7 +8,6 @@ use reqwest::header::{
     CONTENT_LENGTH, CONTENT_TYPE, DATE, ETAG, IF_NONE_MATCH, LOCATION, RETRY_AFTER, USER_AGENT,
     VARY,
 };
-use sha2::{Digest as _, Sha512};
 use reqwest::{Client, Method, Response, StatusCode};
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
@@ -2526,7 +2525,8 @@ impl RegistryClient {
             None
         };
 
-        let initial_auth = if self.has_any_auth && self.is_trusted_host(&initial_url) {
+        let initial_auth = if self.has_any_auth && self.is_trusted_target(&initial_url, &initial_url)
+        {
             if !self.has_scoped_auth {
                 self.bearer_auth_header.clone().or_else(|| {
                     self.auth_header_for_url(&initial_url)
@@ -4532,7 +4532,7 @@ impl RegistryClient {
             }
 
             let mut bytes = Vec::new();
-            let mut hasher = compute_sha512.then(Sha512::new);
+            let mut hasher = compute_sha512.then(|| ring::digest::Context::new(&ring::digest::SHA512));
             let mut stream_err = None;
 
             loop {
@@ -4612,8 +4612,8 @@ impl RegistryClient {
             }
 
             let integrity = hasher.map(|ctx| {
-                let digest = ctx.finalize();
-                format!("sha512-{}", data_encoding::BASE64.encode(&digest))
+                let digest = ctx.finish();
+                format!("sha512-{}", data_encoding::BASE64.encode(digest.as_ref()))
             });
 
             return Ok((BytesFetchResult::Fresh { bytes, etag }, integrity));
@@ -7798,6 +7798,61 @@ nB99xJBcpcklOhB/x8L3Vb9kw8ZPzUvYKI7lj0+yjYJannulkI7H7LB4hxKnVKp5\n\
         assert!(results[0].is_err(), "invalid parent must fail its own item");
         assert!(results[1].is_ok(), "sibling item with valid parent must succeed");
         assert_eq!(std::fs::read(&good_dest).unwrap(), b"tarball-ok");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn test_scoped_auth_token_sent_on_initial_external_url() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let captured_auth = Arc::new(Mutex::new(None::<String>));
+        let captured_clone = Arc::clone(&captured_auth);
+
+        let server = tokio::spawn(async move {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                let mut buf = [0u8; 4096];
+                let n = stream.read(&mut buf).await.unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]);
+                for line in req.lines() {
+                    if line.to_ascii_lowercase().starts_with("authorization:") {
+                        *captured_clone.lock().unwrap() = Some(line.trim().to_string());
+                    }
+                }
+                let body = b"ok";
+                let hdr = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(hdr.as_bytes()).await;
+                let _ = stream.write_all(body).await;
+            }
+        });
+
+        let mut auth_tokens = std::collections::BTreeMap::new();
+        auth_tokens.insert(
+            format!("//127.0.0.1:{}/", addr.port()),
+            "cdn-secret-token".to_string(),
+        );
+        let client = RegistryClient::with_config(RegistryClientConfig {
+            default_registry: Url::parse("https://registry.npmjs.org/").unwrap(),
+            auth_tokens,
+            ..Default::default()
+        })
+        .unwrap();
+
+        let bytes = client
+            .download_tarball_bytes(&format!("http://127.0.0.1:{}/pkg.tgz", addr.port()))
+            .await
+            .unwrap();
+        assert_eq!(bytes, b"ok");
+        assert_eq!(
+            captured_auth.lock().unwrap().as_deref(),
+            Some("authorization: Bearer cdn-secret-token"),
+            "explicit auth_tokens entry must be attached on redirect_count == 0 even if not in trusted_hosts"
+        );
         server.abort();
     }
 }

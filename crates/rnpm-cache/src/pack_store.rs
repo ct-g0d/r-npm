@@ -1113,21 +1113,21 @@ impl PackagePack {
                         }
                     }
 
-                    let write_res = {
+                    let write_res: std::io::Result<bool> = {
                         #[cfg(windows)]
                         {
                             if is_clean_rel_ascii_path(&entry.path) {
                                 append_ascii_rel_wide(&mut wide_buf, prefix_ref, &entry.path);
-                                rnpm_fs::writer::write_file_fast_wide_raw(
+                                match rnpm_fs::writer::write_file_fast_wide_raw(
                                     &wide_buf,
                                     target_dir,
                                     slice,
                                     entry.mode,
                                     prealloc_thresh,
                                     false,
-                                )
-                                .or_else(|_| {
-                                    clone_or_write_pack_file(
+                                ) {
+                                    Ok(()) => Ok(true),
+                                    Err(_) => clone_or_write_pack_file(
                                         None,
                                         &target_dir.join(&entry.path),
                                         slice,
@@ -1136,8 +1136,8 @@ impl PackagePack {
                                         entry.mode,
                                         prealloc_thresh,
                                     )
-                                    .map(|_| ())
-                                })
+                                    .map(|_| false),
+                                }
                             } else {
                                 clone_or_write_pack_file(
                                     None,
@@ -1148,7 +1148,7 @@ impl PackagePack {
                                     entry.mode,
                                     prealloc_thresh,
                                 )
-                                .map(|_| ())
+                                .map(|_| false)
                             }
                         }
                         #[cfg(not(windows))]
@@ -1162,22 +1162,27 @@ impl PackagePack {
                                 entry.mode,
                                 prealloc_thresh,
                             )
-                            .map(|_| ())
+                            .map(|_| false)
                         }
                     };
-                    if let Err(e) = write_res {
-                        if local_files > 0 {
-                            rnpm_fs::record_files_created_batch(local_files, local_bytes);
+                    match write_res {
+                        Err(e) => {
+                            if local_files > 0 {
+                                rnpm_fs::record_files_created_batch(local_files, local_bytes);
+                            }
+                            has_err.store(true, Ordering::Relaxed);
+                            let mut guard = first_err.lock().unwrap();
+                            if guard.is_none() {
+                                *guard = Some(CacheError::Io(e));
+                            }
+                            return;
                         }
-                        has_err.store(true, Ordering::Relaxed);
-                        let mut guard = first_err.lock().unwrap();
-                        if guard.is_none() {
-                            *guard = Some(CacheError::Io(e));
+                        Ok(true) => {
+                            local_files += 1;
+                            local_bytes += slice.len() as u64;
                         }
-                        return;
+                        Ok(false) => {}
                     }
-                    local_files += 1;
-                    local_bytes += slice.len() as u64;
                 }
                 if local_files > 0 {
                     rnpm_fs::record_files_created_batch(local_files, local_bytes);
@@ -1454,35 +1459,6 @@ impl PackStore {
     ) -> std::io::Result<Option<u64>> {
         #[cfg(windows)]
         {
-            extern "system" {
-                fn CreateFileW(
-                    lpFileName: *const u16,
-                    dwDesiredAccess: u32,
-                    dwShareMode: u32,
-                    lpSecurityAttributes: *mut std::ffi::c_void,
-                    dwCreationDisposition: u32,
-                    dwFlagsAndAttributes: u32,
-                    hTemplateFile: *mut std::ffi::c_void,
-                ) -> *mut std::ffi::c_void;
-                fn WriteFile(
-                    hFile: *mut std::ffi::c_void,
-                    lpBuffer: *const std::ffi::c_void,
-                    nNumberOfBytesToWrite: u32,
-                    lpNumberOfBytesWritten: *mut u32,
-                    lpOverlapped: *mut std::ffi::c_void,
-                ) -> i32;
-                fn CloseHandle(hObject: *mut std::ffi::c_void) -> i32;
-                fn GetLastError() -> u32;
-            }
-            const GENERIC_WRITE: u32 = 0x4000_0000;
-            const FILE_SHARE_ALL: u32 = 1 | 2 | 4;
-            const CREATE_NEW: u32 = 1;
-            const FILE_ATTRIBUTE_NORMAL: u32 = 0x80;
-            const ERROR_PATH_NOT_FOUND: u32 = 3;
-            const ERROR_FILE_EXISTS: u32 = 80;
-            const ERROR_ALREADY_EXISTS: u32 = 183;
-            const INVALID_HANDLE_VALUE: *mut std::ffi::c_void = -1isize as *mut std::ffi::c_void;
-
             let mut wide_cas = Vec::with_capacity(260);
             crate::storage::encode_verbatim_wide_into(cas_path, &mut wide_cas);
             if cas_may_exist {
@@ -1493,76 +1469,6 @@ impl PackStore {
                 }
             }
 
-            // Fast path: exclusive direct create on final content-addressed path avoids
-            // temp file creation + NTFS rename + extra Defender scan on cold puts.
-            let mut handle = unsafe {
-                CreateFileW(
-                    wide_cas.as_ptr(),
-                    GENERIC_WRITE,
-                    FILE_SHARE_ALL,
-                    std::ptr::null_mut(),
-                    CREATE_NEW,
-                    FILE_ATTRIBUTE_NORMAL,
-                    std::ptr::null_mut(),
-                )
-            };
-            if handle == INVALID_HANDLE_VALUE {
-                let err = unsafe { GetLastError() };
-                if err == ERROR_PATH_NOT_FOUND && !parent_created {
-                    if let Some(parent) = cas_path.parent() {
-                        let _ = fs::create_dir_all(parent);
-                    }
-                    handle = unsafe {
-                        CreateFileW(
-                            wide_cas.as_ptr(),
-                            GENERIC_WRITE,
-                            FILE_SHARE_ALL,
-                            std::ptr::null_mut(),
-                            CREATE_NEW,
-                            FILE_ATTRIBUTE_NORMAL,
-                            std::ptr::null_mut(),
-                        )
-                    };
-                } else if err == ERROR_FILE_EXISTS || err == ERROR_ALREADY_EXISTS {
-                    if let Some((sz, mt)) = fast_size_and_mtime_wide(&wide_cas) {
-                        if sz == data.len() as u64 && fs::read(cas_path).is_ok_and(|e| e == data) {
-                            return Ok(mt);
-                        }
-                    }
-                }
-            }
-
-            if handle != INVALID_HANDLE_VALUE {
-                let mut offset = 0usize;
-                let mut write_ok = true;
-                while offset < data.len() {
-                    let chunk = ((data.len() - offset).min(u32::MAX as usize)) as u32;
-                    let mut written = 0u32;
-                    let ok = unsafe {
-                        WriteFile(
-                            handle,
-                            data[offset..].as_ptr() as *const _,
-                            chunk,
-                            &mut written,
-                            std::ptr::null_mut(),
-                        )
-                    };
-                    if ok == 0 || written == 0 {
-                        write_ok = false;
-                        break;
-                    }
-                    offset += written as usize;
-                }
-                unsafe {
-                    CloseHandle(handle);
-                }
-                if write_ok {
-                    return Ok(fast_size_and_mtime_wide(&wide_cas).and_then(|(_, mt)| mt));
-                }
-                let _ = fs::remove_file(cas_path);
-            }
-
-            // Fallback: atomic temp + FileRenameInfoEx replace for existing/corrupt CAS entries.
             if !parent_created {
                 if let Some(parent) = cas_path.parent() {
                     let _ = fs::create_dir_all(parent);
@@ -1598,10 +1504,30 @@ impl PackStore {
                 .create(true)
                 .truncate(true)
                 .open(&tmp_path)?;
-            f.write_all(data)?;
+            if let Err(e) = f.write_all(data) {
+                drop(f);
+                let _ = fs::remove_file(&tmp_path);
+                return Err(e);
+            }
             drop(f);
-            let _ = fs::remove_file(cas_path);
-            fs::rename(&tmp_path, cas_path)?;
+            if let Err(e) = fs::rename(&tmp_path, cas_path) {
+                if let Ok(meta) = fs::symlink_metadata(cas_path) {
+                    let mut perms = meta.permissions();
+                    if perms.readonly() {
+                        perms.set_readonly(false);
+                        let _ = fs::set_permissions(cas_path, perms);
+                    }
+                }
+                let _ = fs::remove_file(cas_path);
+                if let Err(e2) = fs::rename(&tmp_path, cas_path) {
+                    let _ = fs::remove_file(&tmp_path);
+                    return Err(if e2.kind() != std::io::ErrorKind::NotFound {
+                        e2
+                    } else {
+                        e
+                    });
+                }
+            }
             Ok(fast_size_and_mtime_wide(&wide_cas).and_then(|(_, mt)| mt))
         }
 
@@ -3017,6 +2943,12 @@ impl PackStore {
                     pack_bytes.resize(padded, 0u8);
                     padded
                 };
+                if entry_size > limits.max_single_entry_size {
+                    return Err(CacheError::Fs(rnpm_fs::FsError::TarBombLimitExceeded {
+                        limit_type: "entry size".to_string(),
+                        detail: format!("Entry '{}' exceeded single file limit", norm_path),
+                    }));
+                }
                 if entry_size <= 4 * 1024 * 1024 {
                     let sz = entry_size as usize;
                     if sz > 0 {
@@ -3092,6 +3024,12 @@ impl PackStore {
                     index_files.push(new_entry);
                 }
             } else {
+                if entry_size > limits.max_single_entry_size {
+                    return Err(CacheError::Fs(rnpm_fs::FsError::TarBombLimitExceeded {
+                        limit_type: "entry size".to_string(),
+                        detail: format!("Entry '{}' exceeded single file limit", norm_path),
+                    }));
+                }
                 scratch.clear();
                 if entry_size > 0 && entry_size <= 4 * 1024 * 1024 {
                     let sz = entry_size as usize;

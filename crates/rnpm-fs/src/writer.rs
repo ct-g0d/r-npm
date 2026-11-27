@@ -1456,6 +1456,7 @@ fn materialize_one_item<T: MatItem>(
     let path = item.item_path();
     let data = item.item_data();
     let mode = item.item_mode();
+    #[cfg(windows)]
     let mut dst_preencoded = false;
 
     if skip_existing_matching {
@@ -1496,7 +1497,6 @@ fn materialize_one_item<T: MatItem>(
                 }
                 #[cfg(not(windows))]
                 {
-                    let _ = dst_preencoded;
                     write_file_fast_buf(path, data, mode, prealloc_thresh, dst_buf, record_stats)
                         .map_err(FsError::Io)?;
                 }
@@ -1535,7 +1535,6 @@ fn materialize_one_item<T: MatItem>(
     }
     #[cfg(not(windows))]
     {
-        let _ = dst_preencoded;
         write_file_fast_buf(path, data, mode, prealloc_thresh, dst_buf, record_stats)
             .map_err(FsError::Io)?;
     }
@@ -2374,7 +2373,7 @@ fn apply_decoded_links(
         unlink_target_path(link_path);
         #[cfg(windows)]
         {
-            let target_full = destination.join(target_rel);
+            let target_full = crate::path::to_verbatim_path(destination).join(target_rel);
             if target_full.is_dir() {
                 let _ = crate::junction::create_junction(link_path, &target_full);
             } else if target_full.is_file() {

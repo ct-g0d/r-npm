@@ -430,11 +430,16 @@ impl PathCollisionTracker {
             if self.map.contains_key(prefix) {
                 break;
             }
+            let prefix_exact = &norm_exact[..pos];
+            let anc_upper = prefix_exact
+                .bytes()
+                .any(|b| b.is_ascii_uppercase())
+                .then(|| prefix_exact.to_string());
             self.map.insert(
                 prefix.to_string(),
                 TrackedEntry {
                     kind: TrackedKind::Dir,
-                    exact_upper: None,
+                    exact_upper: anc_upper,
                     file_idx: None,
                 },
             );

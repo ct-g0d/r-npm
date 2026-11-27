@@ -389,6 +389,8 @@ pub(crate) fn encode_verbatim_wide_into(path: &Path, buf: &mut Vec<u16>) {
         && !bytes.windows(3).any(|w| w == b"\\.\\")
         && !bytes.windows(4).any(|w| w == b"\\..\\")
         && !bytes.ends_with(br"\.")
+        && !bytes.ends_with(br"\..")
+        && !bytes.ends_with(b"\\")
     {
         buf.extend_from_slice(&[b'\\' as u16, b'\\' as u16, b'?' as u16, b'\\' as u16]);
         buf.extend(os.encode_wide());
@@ -463,7 +465,8 @@ fn rename_handle_win32(
         *(buf_ptr.add(header_offset) as *mut u16).add(target_chars) = 0;
     }
 
-    let struct_size = (header_offset + target_chars * 2) as u32;
+    let struct_size = (header_offset + target_chars * 2)
+        .max(std::mem::size_of::<FileRenameInfoRaw>()) as u32;
 
     let try_rename = |info_class: i32, flags: u32| -> Result<(), u32> {
         unsafe {

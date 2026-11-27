@@ -1615,7 +1615,7 @@ impl<'de> Visitor<'de> for DistInfoMapVisitor {
         while let Some(key) = access.next_key::<CowStr<'_>>()? {
             match key.0.as_ref() {
                 "tarball" => {
-                    tarball = access.next_value::<Option<String>>()?;
+                    tarball = Some(access.next_value::<String>()?);
                 }
                 "shasum" => {
                     shasum = access.next_value::<Option<String>>()?;
@@ -1624,9 +1624,7 @@ impl<'de> Visitor<'de> for DistInfoMapVisitor {
                     integrity = access.next_value::<Option<String>>()?;
                 }
                 "signatures" => {
-                    if let Some(sigs) = access.next_value::<Option<Vec<DistSignature>>>()? {
-                        signatures = sigs;
-                    }
+                    signatures = access.next_value::<Vec<DistSignature>>()?;
                 }
                 "attestations" => {
                     attestations = access.next_value::<Option<DistAttestations>>()?;
