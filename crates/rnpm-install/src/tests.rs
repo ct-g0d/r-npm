@@ -6313,3 +6313,119 @@ fn test_installer_rejects_invalid_proxy_without_panicking() {
     });
     assert!(result.is_err());
 }
+
+#[test]
+fn test_stored_fingerprint_metadata_roundtrip_and_escaping() {
+    use crate::{format_stored_fingerprint, parse_stored_fingerprint};
+    assert_eq!(parse_stored_fingerprint("abc123"), ("abc123", None, None));
+
+    let empty_scripts = format_stored_fingerprint("fp0", Some(2), Some(&[]));
+    assert_eq!(empty_scripts, "fp0|f=2|s=0");
+    assert_eq!(
+        parse_stored_fingerprint(&empty_scripts),
+        ("fp0", Some(2), Some(Some(Vec::new())))
+    );
+
+    let some_scripts = format_stored_fingerprint(
+        "fp1",
+        Some(1),
+        Some(&["node_modules/a".to_string(), "node_modules/b".to_string()]),
+    );
+    assert_eq!(some_scripts, "fp1|f=1|s=node_modules/a,node_modules/b");
+    assert_eq!(
+        parse_stored_fingerprint(&some_scripts),
+        (
+            "fp1",
+            Some(1),
+            Some(Some(vec![
+                "node_modules/a".to_string(),
+                "node_modules/b".to_string()
+            ]))
+        )
+    );
+
+    let with_comma = format_stored_fingerprint("fp2", None, Some(&["node_modules/a,b".to_string()]));
+    assert_eq!(with_comma, "fp2|s=*");
+    assert_eq!(parse_stored_fingerprint(&with_comma), ("fp2", None, Some(None)));
+}
+
+#[test]
+fn test_compute_top_level_funding_count_includes_links_and_file_deps() {
+    use crate::compute_top_level_funding_count;
+    use std::collections::HashMap;
+    let tmp = tempdir().unwrap();
+    let nm = tmp.path().join("node_modules");
+    fs::create_dir_all(nm.join("linked-ws")).unwrap();
+    fs::write(
+        nm.join("linked-ws/package.json"),
+        br#"{"name":"linked-ws","version":"1.0.0","funding":"https://example.com/ws"}"#,
+    )
+    .unwrap();
+    fs::create_dir_all(nm.join("file-dep")).unwrap();
+    fs::write(
+        nm.join("file-dep/package.json"),
+        br#"{"name":"file-dep","version":"1.0.0","funding":"https://example.com/file"}"#,
+    )
+    .unwrap();
+    fs::create_dir_all(nm.join("reg-dep/node_modules/nested-funded")).unwrap();
+    fs::write(
+        nm.join("reg-dep/node_modules/nested-funded/package.json"),
+        br#"{"name":"nested-funded","version":"1.0.0","funding":"https://example.com/nested"}"#,
+    )
+    .unwrap();
+
+    let mut lock = rnpm_lockfile::LockfileV3::new("app", Some("1.0.0".to_string()));
+    lock.packages.insert(
+        "node_modules/linked-ws".to_string(),
+        rnpm_lockfile::LockfilePackage {
+            link: Some(true),
+            resolved: Some("packages/linked-ws".to_string()),
+            ..Default::default()
+        },
+    );
+    lock.packages.insert(
+        "node_modules/file-dep".to_string(),
+        rnpm_lockfile::LockfilePackage {
+            version: Some("1.0.0".to_string()),
+            resolved: Some("file:./vendor/file-dep".to_string()),
+            ..Default::default()
+        },
+    );
+    lock.packages.insert(
+        "node_modules/reg-dep".to_string(),
+        rnpm_lockfile::LockfilePackage {
+            version: Some("1.0.0".to_string()),
+            ..Default::default()
+        },
+    );
+    lock.packages.insert(
+        "node_modules/reg-dep/node_modules/nested-funded".to_string(),
+        rnpm_lockfile::LockfilePackage {
+            version: Some("1.0.0".to_string()),
+            ..Default::default()
+        },
+    );
+
+    let mut checked = HashMap::new();
+    checked.insert("node_modules/reg-dep".to_string(), true);
+
+    let opts = InstallOptions::default();
+    let count = compute_top_level_funding_count(
+        &opts,
+        &lock,
+        tmp.path(),
+        None,
+        &checked,
+        &HashMap::new(),
+    );
+    assert_eq!(count, 3, "must count reg-dep, linked-ws, and file-dep, excluding nested");
+}
+
+#[test]
+fn test_manifest_has_warnable_scripts_handles_non_registry_prepare() {
+    use crate::manifest_has_warnable_scripts;
+    let mut m = rnpm_core::manifest::Manifest::default();
+    m.scripts.insert("prepare".to_string(), "echo prep".to_string());
+    assert!(!manifest_has_warnable_scripts(&m, true));
+    assert!(manifest_has_warnable_scripts(&m, false));
+}

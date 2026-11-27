@@ -862,7 +862,9 @@ impl ProcessEnvSnapshot {
                 }
             }
         }
-        npm_config_vars.sort_by(|a, b| a.0.cmp(&b.0));
+        if npm_config_vars.len() > 1 {
+            npm_config_vars.sort_by(|a, b| a.0.cmp(&b.0));
+        }
         (snap, npm_config_vars)
     }
 
@@ -1133,10 +1135,15 @@ fn find_workspace_root_up_to(project_dir: &Path, stop_at: Option<&Path>) -> Opti
 }
 
 fn find_workspace_root_with_npmrc(project_dir: &Path) -> Option<PathBuf> {
+    if !project_dir.join("package.json").is_file() {
+        return None;
+    }
+    // A workspace root must have both `package.json` and `.npmrc`, so ignore
+    // standalone ancestor `.npmrc` files (such as `~/.npmrc`) when bounding search.
     let mut highest_npmrc_dir = None;
     let mut current = project_dir.parent();
     while let Some(dir) = current {
-        if dir.join(".npmrc").is_file() {
+        if dir.join(".npmrc").is_file() && dir.join("package.json").is_file() {
             highest_npmrc_dir = Some(dir);
         }
         current = dir.parent();

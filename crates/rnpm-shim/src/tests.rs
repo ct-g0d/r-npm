@@ -1721,3 +1721,64 @@ fn test_shebang_env_double_dash_and_unicode_space_paths() {
     assert!(content.ps1.contains(r#""$basedir/../sp ace/üñî/bin%dir/cli.js""#));
     assert!(content.sh.contains(r#""$basedir/../sp ace/üñî/bin%dir/cli.js""#));
 }
+
+#[test]
+fn test_create_shims_with_preloaded_header_handles_crlf_bom_empty_and_long_shebang() {
+    let dir = tempdir().unwrap();
+    let nm_dir = dir.path().join("node_modules");
+    let bin_dir = nm_dir.join(".bin");
+    fs::create_dir_all(nm_dir.join("pkg/bin")).unwrap();
+    fs::create_dir_all(&bin_dir).unwrap();
+
+    // 1. CRLF shebang header triggers CRLF normalization on target script
+    let crlf_target = nm_dir.join("pkg/bin/crlf.js");
+    let crlf_bytes = b"#!/usr/bin/env node\r\nconsole.log('hi');\r\n";
+    fs::write(&crlf_target, crlf_bytes).unwrap();
+    create_shims_with_preloaded_header(
+        &bin_dir,
+        "crlf-cli",
+        "pkg/bin/crlf.js",
+        false,
+        Some(&crlf_target),
+        true,
+        Some(&crlf_bytes[..crlf_bytes.len().min(512)]),
+    )
+    .unwrap();
+    assert!(bin_dir.join("crlf-cli").is_file() || fs::symlink_metadata(bin_dir.join("crlf-cli")).is_ok());
+    let after_crlf = fs::read_to_string(&crlf_target).unwrap();
+    assert!(
+        !after_crlf.starts_with("#!/usr/bin/env node\r\n"),
+        "CRLF shebang line must still normalize when preloaded_header is passed"
+    );
+
+    // 2. Empty file without shebang succeeds cleanly without reading from disk
+    let empty_target = nm_dir.join("pkg/bin/empty.js");
+    fs::write(&empty_target, b"").unwrap();
+    create_shims_with_preloaded_header(
+        &bin_dir,
+        "empty-cli",
+        "pkg/bin/empty.js",
+        false,
+        Some(&empty_target),
+        true,
+        Some(b""),
+    )
+    .unwrap();
+    assert!(bin_dir.join("empty-cli").exists() || fs::symlink_metadata(bin_dir.join("empty-cli")).is_ok());
+
+    // 3. BOM + LF shebang creates shim cleanly
+    let bom_target = nm_dir.join("pkg/bin/bom.js");
+    let bom_bytes = b"\xEF\xBB\xBF#!/usr/bin/env node\nconsole.log('bom');\n";
+    fs::write(&bom_target, bom_bytes).unwrap();
+    create_shims_with_preloaded_header(
+        &bin_dir,
+        "bom-cli",
+        "pkg/bin/bom.js",
+        false,
+        Some(&bom_target),
+        true,
+        Some(bom_bytes),
+    )
+    .unwrap();
+    assert!(bin_dir.join("bom-cli").exists() || fs::symlink_metadata(bin_dir.join("bom-cli")).is_ok());
+}

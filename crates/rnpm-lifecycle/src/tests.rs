@@ -4846,3 +4846,39 @@ fn test_try_unwrap_node_cmd_shim_and_fallback() {
     std::fs::write(&interp_args_cmd, modified_interp).unwrap();
     assert!(try_unwrap_node_cmd_shim(&interp_args_cmd, &rest, dir.path(), &env).is_none());
 }
+
+#[test]
+fn drain_and_scrub_reader_handles_utf8_across_8kb_and_split_boundaries() {
+    struct ChunkedReader<'a> {
+        data: &'a [u8],
+        pos: usize,
+        step: usize,
+    }
+    impl std::io::Read for ChunkedReader<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if self.pos >= self.data.len() {
+                return Ok(0);
+            }
+            let take = (self.data.len() - self.pos).min(self.step).min(buf.len());
+            buf[..take].copy_from_slice(&self.data[self.pos..self.pos + take]);
+            self.pos += take;
+            Ok(take)
+        }
+    }
+
+    // Place a 4-byte emoji right across the 8192-byte buffer boundary and repeat CJK chars
+    // continuously so combined.len() - 256 lands inside multi-byte sequences without spaces.
+    let mut text = "a".repeat(8190);
+    text.push('😀');
+    text.push_str(&"中文".repeat(600));
+    text.push_str("café");
+
+    let mut reader = ChunkedReader {
+        data: text.as_bytes(),
+        pos: 0,
+        step: 8192,
+    };
+    let drained = drain_and_scrub_reader(&mut reader);
+    assert_eq!(drained, text);
+    assert!(!drained.contains('\u{FFFD}'));
+}

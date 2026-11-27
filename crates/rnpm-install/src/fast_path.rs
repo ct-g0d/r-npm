@@ -26,31 +26,49 @@ use crate::InstallOptions;
 pub use compute_project_fingerprint as compute_input_fingerprint;
 
 pub fn compute_project_fingerprint(project_dir: &Path, options: &InstallOptions) -> Result<String> {
-    let manifest_path = project_dir.join("package.json");
-    let pkg_json_bytes = match std::fs::read(&manifest_path) {
-        Ok(b) => b,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Err(anyhow!(
-                "package.json not found in {}",
-                project_dir.display()
-            ));
-        }
-        Err(e) => {
-            return Err(e).with_context(|| format!("Failed to read {}", manifest_path.display()));
+    compute_project_fingerprint_with_inputs(project_dir, options, None, None)
+}
+
+pub(crate) fn compute_project_fingerprint_with_inputs(
+    project_dir: &Path,
+    options: &InstallOptions,
+    preloaded_pkg_json: Option<(&[u8], &Manifest)>,
+    preloaded_lockfile: Option<(&Path, &[u8])>,
+) -> Result<String> {
+    let owned_pkg_json: Vec<u8>;
+    let owned_manifest: Manifest;
+    let (pkg_json_bytes, manifest): (&[u8], &Manifest) = match preloaded_pkg_json {
+        Some((bytes, m)) => (bytes, m),
+        None => {
+            let manifest_path = project_dir.join("package.json");
+            owned_pkg_json = match std::fs::read(&manifest_path) {
+                Ok(b) => b,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    return Err(anyhow!(
+                        "package.json not found in {}",
+                        project_dir.display()
+                    ));
+                }
+                Err(e) => {
+                    return Err(e)
+                        .with_context(|| format!("Failed to read {}", manifest_path.display()));
+                }
+            };
+            owned_manifest = Manifest::from_slice_readonly(&owned_pkg_json)
+                .context("Failed to parse project package.json")?;
+            (&owned_pkg_json, &owned_manifest)
         }
     };
-    let manifest = Manifest::from_slice_readonly(&pkg_json_bytes)
-        .context("Failed to parse project package.json")?;
 
     let mut hasher = Sha256::new();
 
     // 1. Root package.json content
     hasher.update(b"manifest:package.json:\n");
-    hasher.update(&pkg_json_bytes);
+    hasher.update(pkg_json_bytes);
 
     // 2. Monorepo workspace manifests (if any)
     let mut workspace_members =
-        discover_workspaces_from_manifest(project_dir, &manifest).unwrap_or_default();
+        discover_workspaces_from_manifest(project_dir, manifest).unwrap_or_default();
     workspace_members.sort_by(|a, b| a.relative_path.cmp(&b.relative_path));
     for member in &workspace_members {
         let member_pkg_json = member.path.join("package.json");
@@ -69,30 +87,57 @@ pub fn compute_project_fingerprint(project_dir: &Path, options: &InstallOptions)
     // 3. Lockfile: npm-shrinkwrap.json takes precedence over package-lock.json in npm
     let shrinkwrap_path = project_dir.join("npm-shrinkwrap.json");
     let lockfile_path = project_dir.join("package-lock.json");
-    let mut lockfile_bytes_for_version: Option<Vec<u8>> = None;
-    match std::fs::read(&shrinkwrap_path) {
-        Ok(bytes) => {
+    let mut lockfile_version_num: Option<u32> = None;
+    let mut lockfile_bytes_owned: Option<Vec<u8>> = None;
+    let lockfile_bytes_ref: Option<&[u8]> = if let Some((pre_path, pre_bytes)) = preloaded_lockfile {
+        if pre_path == shrinkwrap_path {
             hasher.update(b"\nlockfile:npm-shrinkwrap.json:\n");
-            hasher.update(&bytes);
-            lockfile_bytes_for_version = Some(bytes);
+            hasher.update(pre_bytes);
+            Some(pre_bytes)
+        } else if pre_path == lockfile_path && !shrinkwrap_path.is_file() {
+            hasher.update(b"\nlockfile:package-lock.json:\n");
+            hasher.update(pre_bytes);
+            Some(pre_bytes)
+        } else {
+            None
         }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            match std::fs::read(&lockfile_path) {
-                Ok(bytes) => {
-                    hasher.update(b"\nlockfile:package-lock.json:\n");
-                    hasher.update(&bytes);
-                    lockfile_bytes_for_version = Some(bytes);
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    hasher.update(b"\nlockfile:none\n");
-                }
-                Err(_) => {
-                    hasher.update(b"\nlockfile:package-lock.json:unreadable\n");
+    } else {
+        None
+    };
+    if let Some(bytes) = lockfile_bytes_ref {
+        lockfile_version_num = std::str::from_utf8(bytes)
+            .ok()
+            .and_then(crate::detect_lockfile_version);
+    } else {
+        match std::fs::read(&shrinkwrap_path) {
+            Ok(bytes) => {
+                hasher.update(b"\nlockfile:npm-shrinkwrap.json:\n");
+                hasher.update(&bytes);
+                lockfile_bytes_owned = Some(bytes);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                match std::fs::read(&lockfile_path) {
+                    Ok(bytes) => {
+                        hasher.update(b"\nlockfile:package-lock.json:\n");
+                        hasher.update(&bytes);
+                        lockfile_bytes_owned = Some(bytes);
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        hasher.update(b"\nlockfile:none\n");
+                    }
+                    Err(_) => {
+                        hasher.update(b"\nlockfile:package-lock.json:unreadable\n");
+                    }
                 }
             }
+            Err(_) => {
+                hasher.update(b"\nlockfile:npm-shrinkwrap.json:unreadable\n");
+            }
         }
-        Err(_) => {
-            hasher.update(b"\nlockfile:npm-shrinkwrap.json:unreadable\n");
+        if let Some(ref bytes) = lockfile_bytes_owned {
+            lockfile_version_num = std::str::from_utf8(bytes)
+                .ok()
+                .and_then(crate::detect_lockfile_version);
         }
     }
 
@@ -212,19 +257,15 @@ pub fn compute_project_fingerprint(project_dir: &Path, options: &InstallOptions)
 
     let effective_lock_ver = if let Some(v) = options.lockfile_version {
         v
-    } else if let Some(ref bytes) = lockfile_bytes_for_version {
-        std::str::from_utf8(bytes)
-            .ok()
-            .and_then(crate::detect_lockfile_version)
-            .filter(|&v| v == 2)
-            .unwrap_or(3)
+    } else if let Some(v) = lockfile_version_num {
+        if v == 2 { 2 } else { 3 }
     } else {
         3
     };
 
     hasher.update(
         format!(
-            "\noptions:install_strategy={:?}:omit_dev={}:omit_opt={}:omit_peer={}:legacy_peer={}:strict_peer={}:global={}:os={:?}:cpu={:?}:libc={:?}:target_os={}:target_cpu={}:target_libc={:?}:lock_ver={}:include={:?}:workspaces={}:workspace_root={}:workspace={:?}:bin_links={}:force={}:ignore_scripts={}:offline={}:prefer_offline={}:prefer_online={}:prefer_dedupe={}:install_links={}:package_lock_only={}:pkg_lock={}:no_pkg_lock={}:registry_url={:?}:before={:?}:release_age_ex={:?}:store_dir={:?}:strict_sandbox={}:foreground_scripts={}:audit={}:fund={}:source_policy={:?}:force_non_root={}:config_override={}\n",
+            "\noptions:install_strategy={:?}:omit_dev={}:omit_opt={}:omit_peer={}:legacy_peer={}:strict_peer={}:global={}:os={:?}:cpu={:?}:libc={:?}:target_os={}:target_cpu={}:target_libc={:?}:lock_ver={}:include={:?}:workspaces={}:workspace_root={}:workspace={:?}:bin_links={}:force={}:ignore_scripts={}:offline={}:prefer_offline={}:prefer_online={}:prefer_dedupe={}:install_links={}:package_lock_only={}:pkg_lock={}:no_pkg_lock={}:registry_url={:?}:before={:?}:release_age_ex={:?}:store_dir={:?}:strict_sandbox={}:foreground_scripts={}:source_policy={:?}:force_non_root={}:config_override={}\n",
             options.install_strategy,
             options.omit_dev,
             options.omit_optional,
@@ -260,8 +301,6 @@ pub fn compute_project_fingerprint(project_dir: &Path, options: &InstallOptions)
             options.store_dir,
             options.strict_sandbox,
             options.foreground_scripts,
-            options.audit,
-            options.fund,
             options.source_policy_override,
             options.force_non_root_policy,
             options.config_override.is_some(),
@@ -294,6 +333,14 @@ pub fn validate_hidden_lockfile(project_dir: &Path, options: Option<&InstallOpti
 pub(crate) fn validate_hidden_lockfile_loaded(
     project_dir: &Path,
     options: Option<&InstallOptions>,
+) -> Option<(LockfileV3, Option<Manifest>)> {
+    validate_hidden_lockfile_loaded_with_root(project_dir, options, None)
+}
+
+pub(crate) fn validate_hidden_lockfile_loaded_with_root(
+    project_dir: &Path,
+    options: Option<&InstallOptions>,
+    preloaded_root: Option<(&[u8], &Manifest)>,
 ) -> Option<(LockfileV3, Option<Manifest>)> {
     let node_modules = project_dir.join("node_modules");
     if !node_modules.is_dir() {
@@ -381,23 +428,39 @@ pub(crate) fn validate_hidden_lockfile_loaded(
 
     // Verify root package.json if present on disk
     let pkg_json_path = project_dir.join("package.json");
-    let (root_manifest, root_may_have_overrides) = match std::fs::read(&pkg_json_path) {
-        Ok(bytes) => {
-            if let Ok(meta) = std::fs::symlink_metadata(&pkg_json_path) {
-                if let Ok(mtime) = meta.modified() {
-                    if mtime > hidden_mtime {
-                        debug!(
-                            "Hidden lockfile invalid: package.json mtime ({:?}) is newer than hidden lockfile ({:?})",
-                            mtime, hidden_mtime
-                        );
-                        return None;
-                    }
+    let (root_manifest, root_may_have_overrides) = if let Some((bytes, pre_manifest)) = preloaded_root {
+        if let Ok(meta) = std::fs::symlink_metadata(&pkg_json_path) {
+            if let Ok(mtime) = meta.modified() {
+                if mtime > hidden_mtime {
+                    debug!(
+                        "Hidden lockfile invalid: package.json mtime ({:?}) is newer than hidden lockfile ({:?})",
+                        mtime, hidden_mtime
+                    );
+                    return None;
                 }
             }
-            let has_overrides = bytes.windows(9).any(|w| w == b"overrides");
-            (Manifest::from_slice_readonly(&bytes).ok(), has_overrides)
         }
-        Err(_) => (None, false),
+        let has_overrides = bytes.windows(9).any(|w| w == b"overrides");
+        (Some(pre_manifest.clone()), has_overrides)
+    } else {
+        match std::fs::read(&pkg_json_path) {
+            Ok(bytes) => {
+                if let Ok(meta) = std::fs::symlink_metadata(&pkg_json_path) {
+                    if let Ok(mtime) = meta.modified() {
+                        if mtime > hidden_mtime {
+                            debug!(
+                                "Hidden lockfile invalid: package.json mtime ({:?}) is newer than hidden lockfile ({:?})",
+                                mtime, hidden_mtime
+                            );
+                            return None;
+                        }
+                    }
+                }
+                let has_overrides = bytes.windows(9).any(|w| w == b"overrides");
+                (Manifest::from_slice_readonly(&bytes).ok(), has_overrides)
+            }
+            Err(_) => (None, false),
+        }
     };
 
     if let (Some(manifest), Some(root_pkg)) = (&root_manifest, lockfile.packages.get("")) {
@@ -613,8 +676,6 @@ pub(crate) fn validate_hidden_lockfile_loaded(
     }
 
     let mut disk_packages: HashMap<String, DiskEntry> = HashMap::with_capacity(lockfile.packages.len());
-    #[cfg(windows)]
-    let mut disk_packages_lower: HashMap<String, String> = HashMap::with_capacity(lockfile.packages.len());
 
     let mut detected_junction = false;
 
@@ -685,9 +746,6 @@ pub(crate) fn validate_hidden_lockfile_loaded(
                     }
 
                     let key = format!("node_modules/{}/{}", name_str, sub_str);
-                    #[cfg(windows)]
-                    disk_packages_lower.insert(key.to_ascii_lowercase(), key.clone());
-
                     disk_packages.insert(key, DiskEntry {
                         path: scoped_entry.path(),
                         is_symlink: sub_is_symlink,
@@ -712,9 +770,6 @@ pub(crate) fn validate_hidden_lockfile_loaded(
             }
 
             let key = format!("node_modules/{}", name_str);
-            #[cfg(windows)]
-            disk_packages_lower.insert(key.to_ascii_lowercase(), key.clone());
-
             disk_packages.insert(key, DiskEntry {
                 path: entry.path(),
                 is_symlink,
@@ -739,17 +794,37 @@ pub(crate) fn validate_hidden_lockfile_loaded(
     };
 
     #[cfg(windows)]
-    let normalized_lockfile_keys_lower: HashSet<String> = if has_backslash_keys {
-        normalized_lockfile_keys_owned
-            .iter()
-            .map(|k| k.to_ascii_lowercase())
-            .collect()
-    } else {
-        lockfile
-            .packages
-            .keys()
-            .map(|k| k.to_ascii_lowercase())
-            .collect()
+    let disk_packages_lower_cell: std::cell::OnceCell<HashMap<String, String>> =
+        std::cell::OnceCell::new();
+    #[cfg(windows)]
+    let get_disk_packages_lower = || {
+        disk_packages_lower_cell.get_or_init(|| {
+            disk_packages
+                .keys()
+                .map(|k| (k.to_ascii_lowercase(), k.clone()))
+                .collect()
+        })
+    };
+
+    #[cfg(windows)]
+    let normalized_lockfile_keys_lower_cell: std::cell::OnceCell<HashSet<String>> =
+        std::cell::OnceCell::new();
+    #[cfg(windows)]
+    let get_normalized_lockfile_keys_lower = || {
+        normalized_lockfile_keys_lower_cell.get_or_init(|| {
+            if has_backslash_keys {
+                normalized_lockfile_keys_owned
+                    .iter()
+                    .map(|k| k.to_ascii_lowercase())
+                    .collect()
+            } else {
+                lockfile
+                    .packages
+                    .keys()
+                    .map(|k| k.to_ascii_lowercase())
+                    .collect()
+            }
+        })
     };
 
     for key in disk_packages.keys() {
@@ -759,7 +834,8 @@ pub(crate) fn validate_hidden_lockfile_loaded(
             lockfile.packages.contains_key(key)
         };
         #[cfg(windows)]
-        let is_known = is_known || normalized_lockfile_keys_lower.contains(&key.to_ascii_lowercase());
+        let is_known = is_known
+            || get_normalized_lockfile_keys_lower().contains(&key.to_ascii_lowercase());
 
         if !is_known {
             debug!(
@@ -777,7 +853,7 @@ pub(crate) fn validate_hidden_lockfile_loaded(
 
         let on_disk = disk_packages.contains_key(dep_key);
         #[cfg(windows)]
-        let on_disk = on_disk || disk_packages_lower.contains_key(&dep_key.to_ascii_lowercase());
+        let on_disk = on_disk || get_disk_packages_lower().contains_key(&dep_key.to_ascii_lowercase());
 
         let Some(pkg_info) = pkg_info else {
             // Platform-skipped optional / optional-peer direct dependencies (e.g. fsevents on Windows/Linux)
@@ -891,7 +967,7 @@ pub(crate) fn validate_hidden_lockfile_loaded(
             let disk_pkg = disk_packages.get(normalized_key.as_ref());
             #[cfg(windows)]
             let disk_pkg = disk_pkg.or_else(|| {
-                disk_packages_lower.get(&normalized_key.to_ascii_lowercase()).and_then(|k| disk_packages.get(k))
+                get_disk_packages_lower().get(&normalized_key.to_ascii_lowercase()).and_then(|k| disk_packages.get(k))
             });
 
             if let Some(entry) = disk_pkg {
@@ -978,9 +1054,9 @@ pub(crate) fn validate_hidden_lockfile_loaded(
     let avail = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(4);
-    let num_threads = checks.len().div_ceil(16).min(avail).min(8);
+    let num_threads = checks.len().div_ceil(48).min(avail).min(4);
 
-    if checks.len() <= 16 || num_threads <= 1 {
+    if checks.len() <= 48 || num_threads <= 1 {
         for check in &checks {
             if check.is_link_or_junction && !check.folder_path.exists() {
                 debug!(
