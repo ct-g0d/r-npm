@@ -3801,3 +3801,185 @@ fn test_failed_replacement_leaves_linked_file_intact() {
         }
     }
 }
+
+#[test]
+fn test_decode_tar_entries_pax_long_path_sparse_invalid_utf8_and_case_collision() {
+    let long_rel = format!("package/{}/leaf_file_name.js", "subsegment_1234567890".repeat(6));
+    let tgz_pax = {
+        let mut gz = GzEncoder::new(Vec::new(), Compression::default());
+        {
+            let mut builder = tar::Builder::new(&mut gz);
+            let mut h = tar::Header::new_gnu();
+            h.set_size("long-ok".len() as u64);
+            h.set_mode(0o644);
+            h.set_cksum();
+            builder.append_data(&mut h, &long_rel, &b"long-ok"[..]).unwrap();
+            let mut h_gi = tar::Header::new_gnu();
+            h_gi.set_size("*.log\n".len() as u64);
+            h_gi.set_mode(0o644);
+            h_gi.set_cksum();
+            builder
+                .append_data(&mut h_gi, "package/.gitignore", &b"*.log\n"[..])
+                .unwrap();
+            let mut h_dup = tar::Header::new_gnu();
+            h_dup.set_size("first".len() as u64);
+            h_dup.set_mode(0o644);
+            h_dup.set_cksum();
+            builder
+                .append_data(&mut h_dup, "package/dup.txt", &b"first"[..])
+                .unwrap();
+            let mut h_dup2 = tar::Header::new_gnu();
+            h_dup2.set_size("second".len() as u64);
+            h_dup2.set_mode(0o644);
+            h_dup2.set_cksum();
+            builder
+                .append_data(&mut h_dup2, "package/dup.txt", &b"second"[..])
+                .unwrap();
+            builder.finish().unwrap();
+        }
+        gz.finish().unwrap()
+    };
+
+    let dest_gz = tempdir().unwrap();
+    let dest_direct = tempdir().unwrap();
+    extract_tar_gz(std::io::Cursor::new(&tgz_pax), dest_gz.path(), None).unwrap();
+    crate::writer::extract_tarball_direct(
+        std::io::Cursor::new(&tgz_pax),
+        dest_direct.path(),
+        None,
+        None,
+    )
+    .unwrap();
+    let rel_suffix = long_rel.strip_prefix("package/").unwrap();
+    assert_eq!(fs::read(dest_gz.path().join(rel_suffix)).unwrap(), b"long-ok");
+    assert_eq!(fs::read(dest_direct.path().join(rel_suffix)).unwrap(), b"long-ok");
+    assert_eq!(fs::read(dest_direct.path().join(".npmignore")).unwrap(), b"*.log\n");
+    assert_eq!(fs::read(dest_direct.path().join("dup.txt")).unwrap(), b"second");
+
+    // Sparse entry WITH invalid UTF-8 path must report InvalidUtf8Path before ForbiddenSparseFile
+    let tgz_sparse_bad = {
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::GNUSparse);
+        header.set_size(0);
+        header.set_mode(0o644);
+        header.as_gnu_mut().unwrap().set_real_size(0);
+        let bad = [b'p', b'a', b'c', b'k', b'a', b'g', b'e', b'/', 0xff, b'b', b'a', b'd'];
+        header.as_mut_bytes()[..bad.len()].copy_from_slice(&bad);
+        header.set_cksum();
+        let mut gz_wrap = GzEncoder::new(Vec::new(), Compression::default());
+        {
+            let mut builder = tar::Builder::new(&mut gz_wrap);
+            builder.append(&header, std::io::Cursor::new(&[])).unwrap();
+            builder.finish().unwrap();
+        }
+        gz_wrap.finish().unwrap()
+    };
+    let dest_err = tempdir().unwrap();
+    assert!(matches!(
+        extract_tar_gz(std::io::Cursor::new(&tgz_sparse_bad), dest_err.path(), None),
+        Err(FsError::InvalidUtf8Path { .. })
+    ));
+    assert!(matches!(
+        crate::writer::decode_tar_entries(
+            std::io::Cursor::new(&tgz_sparse_bad),
+            dest_err.path(),
+            None,
+            None,
+        ),
+        Err(FsError::InvalidUtf8Path { .. })
+    ));
+
+    // Case collision in decode_tar_entries
+    let tgz_case = {
+        let mut gz = GzEncoder::new(Vec::new(), Compression::default());
+        {
+            let mut tar = tar::Builder::new(&mut gz);
+            for (path, data) in [("package/Sub/File.js", b"a"), ("package/sub/file.js", b"b")] {
+                let mut h = tar::Header::new_gnu();
+                h.set_size(data.len() as u64);
+                h.set_mode(0o644);
+                h.set_cksum();
+                tar.append_data(&mut h, path, &data[..]).unwrap();
+            }
+            tar.finish().unwrap();
+        }
+        gz.finish().unwrap()
+    };
+    assert!(matches!(
+        crate::writer::decode_tar_entries(
+            std::io::Cursor::new(&tgz_case),
+            dest_err.path(),
+            None,
+            None,
+        ),
+        Err(FsError::CaseCollision { .. })
+    ));
+}
+
+#[test]
+fn test_extract_packages_direct_parallel_nested_dir_symlink_and_dangling_rm() {
+    let root = tempdir().unwrap();
+    let mut items = Vec::new();
+    let mut tgzs = Vec::new();
+    for i in 0..4 {
+        let mut gz = GzEncoder::new(Vec::new(), Compression::default());
+        {
+            let mut tar = tar::Builder::new(&mut gz);
+            let mut hd = tar::Header::new_gnu();
+            hd.set_entry_type(tar::EntryType::Directory);
+            hd.set_size(0);
+            hd.set_mode(0o755);
+            hd.set_cksum();
+            tar.append_data(&mut hd, "package/lib/", &[][..]).unwrap();
+
+            let mut hf = tar::Header::new_gnu();
+            hf.set_size("export default 1;".len() as u64);
+            hf.set_mode(0o644);
+            hf.set_cksum();
+            tar.append_data(&mut hf, "package/lib/mod.js", &b"export default 1;"[..])
+                .unwrap();
+
+            let mut hs = tar::Header::new_gnu();
+            hs.set_entry_type(tar::EntryType::Symlink);
+            hs.set_size(0);
+            hs.set_mode(0o777);
+            hs.set_link_name("../lib").unwrap();
+            hs.set_cksum();
+            tar.append_data(&mut hs, "package/bin/linked_lib", &[][..])
+                .unwrap();
+            tar.finish().unwrap();
+        }
+        tgzs.push(gz.finish().unwrap());
+        let _ = i;
+    }
+    for (i, tgz) in tgzs.iter().enumerate() {
+        items.push(crate::writer::BatchDirectItem {
+            reader: std::io::Cursor::new(tgz.as_slice()),
+            destination: root.path().join(format!("pkg-{i}")),
+            package_id: format!("pkg-{i}"),
+            limits: None,
+        });
+    }
+    let res = crate::writer::extract_packages_direct_parallel(items, root.path(), None);
+    for (i, r) in res.into_iter().enumerate() {
+        r.unwrap();
+        let pkg_dir = root.path().join(format!("pkg-{i}"));
+        assert_eq!(
+            fs::read(pkg_dir.join("bin").join("linked_lib").join("mod.js")).unwrap(),
+            b"export default 1;"
+        );
+    }
+
+    // Dangling junction/symlink safety: removing tree must not affect external target
+    let external = tempdir().unwrap();
+    fs::write(external.path().join("keep.txt"), b"must stay").unwrap();
+    let junc = root.path().join("pkg-0").join("ext_link");
+    #[cfg(windows)]
+    crate::junction::create_junction(&junc, external.path()).unwrap();
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(external.path(), &junc).unwrap();
+
+    crate::junction::remove_dir_all_safe(root.path()).unwrap();
+    assert!(!root.path().exists());
+    assert_eq!(fs::read(external.path().join("keep.txt")).unwrap(), b"must stay");
+}

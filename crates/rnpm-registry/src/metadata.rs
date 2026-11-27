@@ -1018,7 +1018,7 @@ impl<'de> Visitor<'de> for FastJsonValueVisitor {
     where
         D: Deserializer<'de>,
     {
-        Deserialize::deserialize(deserializer)
+        FastJsonValueSeed.deserialize(deserializer)
     }
 
     #[inline]
@@ -1548,6 +1548,105 @@ impl<'de> DeserializeSeed<'de> for PlatformListSeed {
     }
 }
 
+struct DistInfoSeed;
+
+impl<'de> DeserializeSeed<'de> for DistInfoSeed {
+    type Value = Option<DistInfo>;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_option(DistInfoOptVisitor)
+    }
+}
+
+struct DistInfoOptVisitor;
+
+impl<'de> Visitor<'de> for DistInfoOptVisitor {
+    type Value = Option<DistInfo>;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+        formatter.write_str("an optional dist object")
+    }
+
+    fn visit_none<E>(self) -> Result<Self::Value, E> {
+        Ok(None)
+    }
+
+    fn visit_unit<E>(self) -> Result<Self::Value, E> {
+        Ok(None)
+    }
+
+    fn visit_some<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_map(DistInfoMapVisitor).map(Some)
+    }
+
+    fn visit_map<M>(self, access: M) -> Result<Self::Value, M::Error>
+    where
+        M: MapAccess<'de>,
+    {
+        DistInfoMapVisitor.visit_map(access).map(Some)
+    }
+}
+
+struct DistInfoMapVisitor;
+
+impl<'de> Visitor<'de> for DistInfoMapVisitor {
+    type Value = DistInfo;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+        formatter.write_str("a dist metadata object")
+    }
+
+    fn visit_map<M>(self, mut access: M) -> Result<Self::Value, M::Error>
+    where
+        M: MapAccess<'de>,
+    {
+        let mut tarball = None;
+        let mut shasum = None;
+        let mut integrity = None;
+        let mut signatures = Vec::new();
+        let mut attestations = None;
+
+        while let Some(key) = access.next_key::<CowStr<'_>>()? {
+            match key.0.as_ref() {
+                "tarball" => {
+                    tarball = access.next_value::<Option<String>>()?;
+                }
+                "shasum" => {
+                    shasum = access.next_value::<Option<String>>()?;
+                }
+                "integrity" => {
+                    integrity = access.next_value::<Option<String>>()?;
+                }
+                "signatures" => {
+                    if let Some(sigs) = access.next_value::<Option<Vec<DistSignature>>>()? {
+                        signatures = sigs;
+                    }
+                }
+                "attestations" => {
+                    attestations = access.next_value::<Option<DistAttestations>>()?;
+                }
+                _ => {
+                    let _ = access.next_value::<serde::de::IgnoredAny>()?;
+                }
+            }
+        }
+
+        Ok(DistInfo {
+            tarball: tarball.unwrap_or_default(),
+            shasum,
+            integrity,
+            signatures,
+            attestations,
+        })
+    }
+}
+
 pub struct VersionSeed<'a> {
     pub mode: PackumentParseMode,
     pub root_name: Option<&'a str>,
@@ -1617,7 +1716,7 @@ impl<'de, 'a> Visitor<'de> for VersionVisitor<'a> {
                     version = access.next_value::<Option<String>>()?;
                 }
                 "dist" => {
-                    dist = access.next_value::<Option<DistInfo>>()?;
+                    dist = access.next_value_seed(DistInfoSeed)?;
                 }
                 "dependencies" => {
                     dependencies = access.next_value_seed(DependencyMapSeed)?;
@@ -1669,15 +1768,20 @@ impl<'de, 'a> Visitor<'de> for VersionVisitor<'a> {
                     deprecated = access.next_value_seed(DeprecatedSeed)?;
                 }
                 other => {
-                    let drop = match self.mode {
-                        PackumentParseMode::Install => is_heavy_unused_install_field(other),
-                        PackumentParseMode::Full => is_heavy_unused_full_field(other),
-                    };
-                    if drop {
-                        let _ = access.next_value::<serde::de::IgnoredAny>()?;
-                    } else {
+                    if other == "scripts" {
                         let val = access.next_value_seed(FastJsonValueSeed)?;
                         extra.insert(key.into_owned(), val);
+                    } else {
+                        let drop = match self.mode {
+                            PackumentParseMode::Install => is_heavy_unused_install_field(other),
+                            PackumentParseMode::Full => is_heavy_unused_full_field(other),
+                        };
+                        if drop {
+                            let _ = access.next_value::<serde::de::IgnoredAny>()?;
+                        } else {
+                            let val = access.next_value_seed(FastJsonValueSeed)?;
+                            extra.insert(key.into_owned(), val);
+                        }
                     }
                 }
             }
@@ -2613,4 +2717,52 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_dist_info_custom_visitor_edge_cases() {
+        let json = r#"{
+            "name": "dist-edge",
+            "versions": {
+                "1.0.0": {
+                    "name": "dist-edge",
+                    "version": "1.0.0",
+                    "dist": null,
+                    "scripts": { "build": "tsc" },
+                    "readme": "very long readme omitted"
+                },
+                "1.0.1": {
+                    "name": "dist-edge",
+                    "version": "1.0.1",
+                    "dist": {
+                        "tarball": "https://registry.npmjs.org/dist-edge/-/dist-edge-1.0.1.tgz",
+                        "shasum": "0123456789abcdef0123456789abcdef01234567",
+                        "integrity": "sha512-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==",
+                        "fileCount": 12,
+                        "unpackedSize": 4096,
+                        "signatures": [{ "keyid": "SHA256:abc", "sig": "def" }],
+                        "attestations": { "provenance": { "predicateType": "https://slsa.dev/provenance/v1" } }
+                    }
+                }
+            }
+        }"#;
+        let meta = parse_install_packument(json.as_bytes()).unwrap();
+        let v0 = &meta.versions["1.0.0"];
+        assert_eq!(v0.dist.tarball, "");
+        assert!(v0.extra.contains_key("scripts"));
+        assert!(!v0.extra.contains_key("readme"));
+
+        let v1 = &meta.versions["1.0.1"];
+        assert_eq!(
+            v1.dist.tarball,
+            "https://registry.npmjs.org/dist-edge/-/dist-edge-1.0.1.tgz"
+        );
+        assert_eq!(v1.dist.signatures.len(), 1);
+        assert_eq!(
+            v1.dist
+                .attestations
+                .as_ref()
+                .and_then(|a| a.provenance.as_ref())
+                .and_then(|p| p.predicate_type.as_deref()),
+            Some("https://slsa.dev/provenance/v1")
+        );
+    }
 }
