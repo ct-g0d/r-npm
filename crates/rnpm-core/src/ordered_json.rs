@@ -242,13 +242,62 @@ impl OrderedJsonValue {
     }
 }
 
+/// Finds the index of the first byte requiring JSON escaping (`< 0x20`, `"`, or `\`).
+#[inline]
+pub(crate) fn find_first_json_escape(bytes: &[u8]) -> Option<usize> {
+    const LO: u64 = 0x0101_0101_0101_0101;
+    const HI: u64 = 0x8080_8080_8080_8080;
+    const QUOTE_MASK: u64 = (b'"' as u64) * LO;
+    const BACKSLASH_MASK: u64 = (b'\\' as u64) * LO;
+
+    let len = bytes.len();
+    let mut i = 0usize;
+    if len >= 16 {
+        let ptr = bytes.as_ptr();
+        while i + 8 <= len {
+            // SAFETY: `i + 8 <= len` guarantees 8 readable bytes within `bytes`.
+            let w = unsafe { ptr.add(i).cast::<u64>().read_unaligned() };
+            let has_ctrl = !(w | ((w & 0x7f7f_7f7f_7f7f_7f7f) + 0x6060_6060_6060_6060)) & HI;
+            let xq = w ^ QUOTE_MASK;
+            let has_quote = xq.wrapping_sub(LO) & !xq & HI;
+            let xb = w ^ BACKSLASH_MASK;
+            let has_bs = xb.wrapping_sub(LO) & !xb & HI;
+            let hit = has_ctrl | has_quote | has_bs;
+            if hit != 0 {
+                #[cfg(target_endian = "little")]
+                {
+                    return Some(i + (hit.trailing_zeros() >> 3) as usize);
+                }
+                #[cfg(not(target_endian = "little"))]
+                {
+                    for j in 0..8 {
+                        let b = bytes[i + j];
+                        if b < 0x20 || b == b'"' || b == b'\\' {
+                            return Some(i + j);
+                        }
+                    }
+                }
+            }
+            i += 8;
+        }
+    }
+    while i < len {
+        let b = bytes[i];
+        if b < 0x20 || b == b'"' || b == b'\\' {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
+}
+
 /// Writes a JSON-escaped quoted string directly into `out`, matching `serde_json` escaping byte-for-byte.
 #[inline]
 pub(crate) fn write_json_str(s: &str, out: &mut String) {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let bytes = s.as_bytes();
     out.push('"');
-    let Some(first_esc) = bytes.iter().position(|&b| b < 0x20 || b == b'"' || b == b'\\') else {
+    let Some(first_esc) = find_first_json_escape(bytes) else {
         out.push_str(s);
         out.push('"');
         return;

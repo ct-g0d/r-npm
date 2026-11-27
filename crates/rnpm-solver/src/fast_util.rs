@@ -293,4 +293,20 @@ impl AncestorArena {
         out.reverse();
         out
     }
+
+    #[inline]
+    pub(crate) fn to_str_vec_into<'a>(
+        &self,
+        mut head: u32,
+        interner: &'a StringInterner,
+        out: &mut Vec<&'a str>,
+    ) {
+        out.clear();
+        while head != NO_ANCESTOR {
+            let e = self.entries[head as usize];
+            out.push(interner.get(e.name));
+            head = e.parent;
+        }
+        out.reverse();
+    }
 }
