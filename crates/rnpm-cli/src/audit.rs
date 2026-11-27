@@ -398,17 +398,26 @@ fn audit_http_client(bypass_proxy: bool) -> anyhow::Result<&'static reqwest::Cli
     cached.as_ref().map_err(|msg| anyhow::anyhow!("{msg}"))
 }
 
-#[allow(dead_code)]
 enum FastHttpResponse {
     Fallback,
     Status { status: u16, body: Vec<u8> },
+}
+
+enum FastHeaderDecision {
+    Fallback,
+    Headers {
+        status: u16,
+        is_chunked: bool,
+        is_gzip: bool,
+        content_len: Option<usize>,
+    },
 }
 
 fn has_configured_http_proxy(config: &rnpm_config::Config, url: &Url) -> bool {
     if config.should_bypass_proxy(url) {
         return false;
     }
-    for key in ["proxy", "http-proxy", "https-proxy"] {
+    for key in ["proxy", "http-proxy", "http_proxy", "https-proxy", "https_proxy"] {
         if let Some(v) = config.get(key) {
             let trimmed = v.trim();
             if !trimmed.is_empty() && !trimmed.eq_ignore_ascii_case("null") && trimmed != "false" {
@@ -433,16 +442,27 @@ fn decode_chunked_body(raw: &[u8]) -> Option<Vec<u8>> {
         let line_rel = raw[pos..].windows(2).position(|w| w == b"\r\n")?;
         let line = std::str::from_utf8(&raw[pos..pos + line_rel]).ok()?;
         let size_hex = line.split(';').next()?.trim();
-        let size = usize::from_str_radix(size_hex, 16).ok()?;
-        pos += line_rel + 2;
-        if size == 0 {
-            return Some(out);
-        }
-        if pos + size + 2 > raw.len() {
+        if size_hex.is_empty() {
             return None;
         }
-        out.extend_from_slice(&raw[pos..pos + size]);
-        pos += size + 2;
+        let size = usize::from_str_radix(size_hex, 16).ok()?;
+        pos = pos.checked_add(line_rel + 2)?;
+        if size == 0 {
+            loop {
+                if raw.get(pos..pos.checked_add(2)?) == Some(b"\r\n") {
+                    return Some(out);
+                }
+                let trailer_rel = raw[pos..].windows(2).position(|w| w == b"\r\n")?;
+                pos = pos.checked_add(trailer_rel + 2)?;
+            }
+        }
+        let end = pos.checked_add(size)?;
+        let next = end.checked_add(2)?;
+        if next > raw.len() || &raw[end..next] != b"\r\n" {
+            return None;
+        }
+        out.extend_from_slice(&raw[pos..end]);
+        pos = next;
     }
 }
 
@@ -488,28 +508,22 @@ fn build_fast_http_post_request(
     Some((addr, head))
 }
 
-fn parse_fast_http_response(raw: &[u8]) -> FastHttpResponse {
-    let Some(hdr_end) = raw.windows(4).position(|w| w == b"\r\n\r\n") else {
-        return FastHttpResponse::Fallback;
-    };
-    let Ok(hdr_str) = std::str::from_utf8(&raw[..hdr_end]) else {
-        return FastHttpResponse::Fallback;
-    };
+fn inspect_fast_http_headers(hdr_str: &str) -> FastHeaderDecision {
     let mut lines = hdr_str.split("\r\n");
     let Some(status_line) = lines.next() else {
-        return FastHttpResponse::Fallback;
+        return FastHeaderDecision::Fallback;
     };
     let Some(status) = status_line
         .split_whitespace()
         .nth(1)
         .and_then(|s| s.parse::<u16>().ok())
     else {
-        return FastHttpResponse::Fallback;
+        return FastHeaderDecision::Fallback;
     };
 
-    // Let reqwest handle redirects or unexpected status nuances if needed.
-    if (300..400).contains(&status) {
-        return FastHttpResponse::Fallback;
+    // Let reqwest handle interim 1xx, 3xx redirects, or unexpected status nuances.
+    if !(200..600).contains(&status) || (300..400).contains(&status) {
+        return FastHeaderDecision::Fallback;
     }
 
     let mut is_chunked = false;
@@ -519,19 +533,92 @@ fn parse_fast_http_response(raw: &[u8]) -> FastHttpResponse {
         if let Some((k, v)) = line.split_once(':') {
             let key = k.trim();
             let val = v.trim();
-            if key.eq_ignore_ascii_case("transfer-encoding")
-                && val.to_ascii_lowercase().contains("chunked")
-            {
-                is_chunked = true;
-            } else if key.eq_ignore_ascii_case("content-encoding")
-                && val.to_ascii_lowercase().contains("gzip")
-            {
-                is_gzip = true;
+            if key.eq_ignore_ascii_case("transfer-encoding") {
+                for part in val.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+                    if part.eq_ignore_ascii_case("chunked") {
+                        is_chunked = true;
+                    } else if !part.eq_ignore_ascii_case("identity") {
+                        return FastHeaderDecision::Fallback;
+                    }
+                }
+            } else if key.eq_ignore_ascii_case("content-encoding") {
+                for part in val.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+                    if part.eq_ignore_ascii_case("gzip") || part.eq_ignore_ascii_case("x-gzip") {
+                        is_gzip = true;
+                    } else if !part.eq_ignore_ascii_case("identity") {
+                        return FastHeaderDecision::Fallback;
+                    }
+                }
             } else if key.eq_ignore_ascii_case("content-length") {
-                content_len = val.parse::<usize>().ok();
+                let Ok(len) = val.parse::<usize>() else {
+                    return FastHeaderDecision::Fallback;
+                };
+                if content_len.is_some_and(|prev| prev != len) {
+                    return FastHeaderDecision::Fallback;
+                }
+                content_len = Some(len);
             }
         }
     }
+
+    if is_chunked && content_len.is_some() {
+        return FastHeaderDecision::Fallback;
+    }
+
+    FastHeaderDecision::Headers {
+        status,
+        is_chunked,
+        is_gzip,
+        content_len,
+    }
+}
+
+fn fast_http_response_complete(raw: &[u8]) -> bool {
+    let Some(hdr_end) = raw.windows(4).position(|w| w == b"\r\n\r\n") else {
+        return false;
+    };
+    let Ok(hdr_str) = std::str::from_utf8(&raw[..hdr_end]) else {
+        return true;
+    };
+    match inspect_fast_http_headers(hdr_str) {
+        FastHeaderDecision::Fallback => true,
+        FastHeaderDecision::Headers {
+            status,
+            is_chunked,
+            content_len,
+            ..
+        } => {
+            if status == 204 || status == 304 {
+                return true;
+            }
+            let raw_body = &raw[hdr_end + 4..];
+            if is_chunked {
+                decode_chunked_body(raw_body).is_some()
+            } else if let Some(len) = content_len {
+                raw_body.len() >= len
+            } else {
+                false
+            }
+        }
+    }
+}
+
+fn parse_fast_http_response(raw: &[u8]) -> FastHttpResponse {
+    let Some(hdr_end) = raw.windows(4).position(|w| w == b"\r\n\r\n") else {
+        return FastHttpResponse::Fallback;
+    };
+    let Ok(hdr_str) = std::str::from_utf8(&raw[..hdr_end]) else {
+        return FastHttpResponse::Fallback;
+    };
+    let FastHeaderDecision::Headers {
+        status,
+        is_chunked,
+        is_gzip,
+        content_len,
+    } = inspect_fast_http_headers(hdr_str)
+    else {
+        return FastHttpResponse::Fallback;
+    };
 
     let raw_body = &raw[hdr_end + 4..];
     let mut body = if is_chunked {
@@ -598,9 +685,19 @@ async fn try_fast_http_post(
         })?;
 
         let mut raw = Vec::with_capacity(4096);
-        stream.read_to_end(&mut raw).await.map_err(|e| {
-            anyhow::anyhow!("Failed to read advisory response from {target_url}: {e}")
-        })?;
+        let mut buf = [0u8; 8192];
+        loop {
+            let n = stream.read(&mut buf).await.map_err(|e| {
+                anyhow::anyhow!("Failed to read advisory response from {target_url}: {e}")
+            })?;
+            if n == 0 {
+                break;
+            }
+            raw.extend_from_slice(&buf[..n]);
+            if fast_http_response_complete(&raw) {
+                break;
+            }
+        }
         Ok::<Vec<u8>, anyhow::Error>(raw)
     };
 
@@ -639,7 +736,17 @@ fn try_fast_http_post_sync(
     stream.write_all(body_bytes).ok()?;
     stream.flush().ok()?;
     let mut raw = Vec::with_capacity(4096);
-    stream.read_to_end(&mut raw).ok()?;
+    let mut buf = [0u8; 8192];
+    loop {
+        let n = stream.read(&mut buf).ok()?;
+        if n == 0 {
+            break;
+        }
+        raw.extend_from_slice(&buf[..n]);
+        if fast_http_response_complete(&raw) {
+            break;
+        }
+    }
     Some(parse_fast_http_response(&raw))
 }
 
@@ -1022,8 +1129,17 @@ pub(crate) async fn build_audit_report_with_config_and_lockfile(
 }
 
 type SyncAuditResult =
-    Option<(rnpm_lockfile::LockfileV3, AuditInventory, BTreeMap<String, Vec<AdvisoryPayload>>)>;
-type AsyncAuditResult = Option<(rnpm_lockfile::LockfileV3, AuditReport)>;
+    Option<(u64, rnpm_lockfile::LockfileV3, AuditInventory, BTreeMap<String, Vec<AdvisoryPayload>>)>;
+type AsyncAuditResult = Option<(u64, rnpm_lockfile::LockfileV3, AuditReport)>;
+
+fn fast_lockfile_hash(bytes: &[u8]) -> u64 {
+    let mut hash = 0xcbf29ce484222325u64;
+    for &b in bytes {
+        hash ^= b as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
 
 pub(crate) enum SpeculativeAuditInner {
     SyncHttpThread(std::thread::JoinHandle<SyncAuditResult>),
@@ -1035,7 +1151,18 @@ pub(crate) struct SpeculativeAuditHandle {
     lock_len: u64,
     lock_mtime: Option<std::time::SystemTime>,
     registry: String,
-    inner: SpeculativeAuditInner,
+    cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    inner: Option<SpeculativeAuditInner>,
+}
+
+impl Drop for SpeculativeAuditHandle {
+    fn drop(&mut self) {
+        self.cancelled
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Some(SpeculativeAuditInner::AsyncTask(handle)) = self.inner.take() {
+            handle.abort();
+        }
+    }
 }
 
 impl SpeculativeAuditHandle {
@@ -1047,12 +1174,14 @@ impl SpeculativeAuditHandle {
     }
 
     pub(crate) async fn finish(
-        self,
+        mut self,
         config: &rnpm_config::Config,
     ) -> Option<(rnpm_lockfile::LockfileV3, AuditReport)> {
-        match self.inner {
+        let inner = self.inner.take()?;
+        let (spec_hash, lockfile, report) = match inner {
             SpeculativeAuditInner::SyncHttpThread(handle) => {
-                let (lockfile, inventory, advisories_by_pkg) = handle.join().ok().flatten()?;
+                let (spec_hash, lockfile, inventory, advisories_by_pkg) =
+                    handle.join().ok().flatten()?;
                 if advisories_by_pkg.is_empty() {
                     let report = AuditReport {
                         audit_report_version: 2,
@@ -1062,21 +1191,27 @@ impl SpeculativeAuditHandle {
                             dependencies: inventory.dep_counts,
                         },
                     };
-                    return Some((lockfile, report));
+                    (spec_hash, lockfile, report)
+                } else {
+                    let (report, _, _) = finalize_audit_report(
+                        &lockfile,
+                        inventory,
+                        &advisories_by_pkg,
+                        &self.registry,
+                        config,
+                    )
+                    .await
+                    .ok()?;
+                    (spec_hash, lockfile, report)
                 }
-                let (report, _, _) = finalize_audit_report(
-                    &lockfile,
-                    inventory,
-                    &advisories_by_pkg,
-                    &self.registry,
-                    config,
-                )
-                .await
-                .ok()?;
-                Some((lockfile, report))
             }
-            SpeculativeAuditInner::AsyncTask(handle) => handle.await.ok().flatten(),
+            SpeculativeAuditInner::AsyncTask(handle) => handle.await.ok().flatten()?,
+        };
+        let current_bytes = std::fs::read(&self.lock_path).ok()?;
+        if fast_lockfile_hash(&current_bytes) != spec_hash {
+            return None;
         }
+        Some((lockfile, report))
     }
 }
 
@@ -1101,6 +1236,7 @@ pub(crate) fn spawn_speculative_post_install_audit(
     );
     let target_parsed = Url::parse(&target_url).ok()?;
     let mock_possible = cfg!(test) || std::env::var_os("RNPM_TEST_MOCK_ADVISORIES").is_some();
+    let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
     if target_parsed.scheme() == "http"
         && !mock_possible
@@ -1109,11 +1245,20 @@ pub(crate) fn spawn_speculative_post_install_audit(
         let lp = lock_path.clone();
         let user_agent = rnpm_registry::default_user_agent();
         let auth_token = config.npmrc.get_auth_token(&target_parsed).map(str::to_string);
+        let cancel_flag = std::sync::Arc::clone(&cancelled);
         let handle = std::thread::spawn(move || {
-            let lockfile = rnpm_lockfile::load_and_migrate_readonly(&lp).ok()?;
+            if cancel_flag.load(std::sync::atomic::Ordering::Relaxed) {
+                return None;
+            }
+            let content = std::fs::read_to_string(&lp).ok()?;
+            let spec_hash = fast_lockfile_hash(content.as_bytes());
+            let lockfile = rnpm_lockfile::parse_and_migrate_readonly(&content).ok()?;
             let inventory = collect_audit_inventory(&lockfile);
             if inventory.bulk_request.is_empty() {
-                return Some((lockfile, inventory, BTreeMap::new()));
+                return Some((spec_hash, lockfile, inventory, BTreeMap::new()));
+            }
+            if cancel_flag.load(std::sync::atomic::Ordering::Relaxed) {
+                return None;
             }
             let payload = serde_json::to_vec(&inventory.bulk_request).ok()?;
             if let Some(FastHttpResponse::Status { status, body }) = try_fast_http_post_sync(
@@ -1126,7 +1271,7 @@ pub(crate) fn spawn_speculative_post_install_audit(
                     let map =
                         serde_json::from_slice::<BTreeMap<String, Vec<AdvisoryPayload>>>(&body)
                             .ok()?;
-                    return Some((lockfile, inventory, map));
+                    return Some((spec_hash, lockfile, inventory, map));
                 }
             }
             None
@@ -1136,7 +1281,8 @@ pub(crate) fn spawn_speculative_post_install_audit(
             lock_len,
             lock_mtime,
             registry,
-            inner: SpeculativeAuditInner::SyncHttpThread(handle),
+            cancelled,
+            inner: Some(SpeculativeAuditInner::SyncHttpThread(handle)),
         });
     }
 
@@ -1147,8 +1293,17 @@ pub(crate) fn spawn_speculative_post_install_audit(
         let pdir = project_dir.to_path_buf();
         let cfg_clone = config.clone();
         let reg_clone = Some(registry.clone());
+        let cancel_flag = std::sync::Arc::clone(&cancelled);
         let handle = tokio::spawn(async move {
-            let lockfile = rnpm_lockfile::load_and_migrate_readonly(&lp).ok()?;
+            if cancel_flag.load(std::sync::atomic::Ordering::Relaxed) {
+                return None;
+            }
+            let content = std::fs::read_to_string(&lp).ok()?;
+            let spec_hash = fast_lockfile_hash(content.as_bytes());
+            let lockfile = rnpm_lockfile::parse_and_migrate_readonly(&content).ok()?;
+            if cancel_flag.load(std::sync::atomic::Ordering::Relaxed) {
+                return None;
+            }
             let (report, _) = build_audit_report_with_config_and_lockfile(
                 &pdir,
                 reg_clone,
@@ -1157,14 +1312,15 @@ pub(crate) fn spawn_speculative_post_install_audit(
             )
             .await
             .ok()?;
-            Some((lockfile, report))
+            Some((spec_hash, lockfile, report))
         });
         return Some(SpeculativeAuditHandle {
             lock_path,
             lock_len,
             lock_mtime,
             registry,
-            inner: SpeculativeAuditInner::AsyncTask(handle),
+            cancelled,
+            inner: Some(SpeculativeAuditInner::AsyncTask(handle)),
         });
     }
 
@@ -1507,7 +1663,8 @@ pub(crate) fn count_funding_packages_in_node_modules(project_dir: &Path) -> usiz
         if !bytes.windows(9).any(|w| w == b"\"funding\"") && !bytes.windows(2).any(|w| w == b"\\u") {
             return false;
         }
-        serde_json::from_slice::<FundingProbe>(&bytes).is_ok_and(|probe| probe.funding.0)
+        let json_bytes = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(&bytes);
+        serde_json::from_slice::<FundingProbe>(json_bytes).is_ok_and(|probe| probe.funding.0)
     };
 
     let mut manifest_paths = Vec::new();
@@ -1617,4 +1774,73 @@ pub fn check_report_threshold(report: &AuditReport, level: &str) -> anyhow::Resu
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fast_http_chunked_overflow_and_framing_guards() {
+        assert!(decode_chunked_body(b"ffffffffffffffff\r\nab\r\n0\r\n\r\n").is_none());
+        assert!(decode_chunked_body(b"2\r\nabxx0\r\n\r\n").is_none());
+        assert!(decode_chunked_body(b"2\r\nab\r\n0\r\n").is_none());
+        assert_eq!(decode_chunked_body(b"2\r\nab\r\n0\r\n\r\n"), Some(b"ab".to_vec()));
+        assert_eq!(
+            decode_chunked_body(b"2\r\nab\r\n0\r\nX-Trailer: 1\r\n\r\n"),
+            Some(b"ab".to_vec())
+        );
+
+        assert!(matches!(
+            parse_fast_http_response(b"HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}"),
+            FastHttpResponse::Fallback
+        ));
+        assert!(matches!(
+            parse_fast_http_response(b"HTTP/1.1 200 OK\r\nContent-Encoding: br\r\nContent-Length: 2\r\n\r\n{}"),
+            FastHttpResponse::Fallback
+        ));
+        assert!(matches!(
+            parse_fast_http_response(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip, chunked\r\n\r\n0\r\n\r\n"),
+            FastHttpResponse::Fallback
+        ));
+        assert!(matches!(
+            parse_fast_http_response(b"HTTP/1.1 200 OK\r\nContent-Length: nope\r\n\r\n{}"),
+            FastHttpResponse::Fallback
+        ));
+        assert!(matches!(
+            parse_fast_http_response(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nContent-Length: 3\r\n\r\n{}"),
+            FastHttpResponse::Fallback
+        ));
+
+        assert!(!fast_http_response_complete(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\n{}"
+        ));
+        assert!(fast_http_response_complete(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\n{}"
+        ));
+        assert!(fast_http_response_complete(
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\n{}\r\n0\r\n\r\n"
+        ));
+    }
+
+    #[test]
+    fn fast_http_proxy_detects_underscore_http_proxy() {
+        let mut cfg = rnpm_config::Config::default();
+        cfg.npmrc
+            .settings
+            .insert("http_proxy".to_string(), "http://127.0.0.1:8080".to_string());
+        let url = Url::parse("http://registry.npmjs.org/-/npm/v1/security/advisories/bulk").unwrap();
+        assert!(has_configured_http_proxy(&cfg, &url));
+    }
+
+    #[test]
+    fn funding_scan_handles_utf8_bom() {
+        let dir = tempfile::tempdir().unwrap();
+        let pkg_dir = dir.path().join("node_modules").join("bom-pkg");
+        std::fs::create_dir_all(&pkg_dir).unwrap();
+        let mut bytes = vec![0xEF, 0xBB, 0xBF];
+        bytes.extend_from_slice(br#"{"name":"bom-pkg","funding":"https://example.com"}"#);
+        std::fs::write(pkg_dir.join("package.json"), bytes).unwrap();
+        assert_eq!(count_funding_packages_in_node_modules(dir.path()), 1);
+    }
 }

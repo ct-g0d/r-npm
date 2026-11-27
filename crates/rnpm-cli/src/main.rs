@@ -6494,7 +6494,15 @@ pub(crate) async fn run_cli_with_config(
             };
 
             let start_time = std::time::Instant::now();
-            let speculative_audit = if options.packages.is_empty() && !dry_run && audit_val {
+            let install_offline = offline || effective_config.get_bool("offline").unwrap_or(false);
+            let speculative_audit = if options.packages.is_empty()
+                && !dry_run
+                && audit_val
+                && !global
+                && !install_offline
+                && package_lock_val
+                && !no_save
+            {
                 audit::spawn_speculative_post_install_audit(
                     &report_dir,
                     registry.as_deref(),
@@ -6505,8 +6513,7 @@ pub(crate) async fn run_cli_with_config(
             };
             let mut installer = Installer::new(options)?;
             let summary = installer.run().await?;
-            let valid_speculative = speculative_audit
-                .filter(|h| summary.packages_installed == 0 || h.is_lockfile_unchanged());
+            let valid_speculative = speculative_audit.filter(|h| h.is_lockfile_unchanged());
             finish_install_or_ci_output(
                 &report_dir,
                 &summary,
@@ -6669,7 +6676,14 @@ pub(crate) async fn run_cli_with_config(
             };
 
             let start_time = std::time::Instant::now();
-            let speculative_audit = if !dry_run && audit_val {
+            let ci_offline = offline || config.get_bool("offline").unwrap_or(false);
+            let speculative_audit = if !dry_run
+                && audit_val
+                && !ci_offline
+                && !omit_dev
+                && !omit_optional
+                && !omit_peer
+            {
                 audit::spawn_speculative_post_install_audit(
                     &current_dir,
                     registry.as_deref(),
@@ -10112,7 +10126,7 @@ fn try_parse_fast_command_with_overrides(
                     workspace_root = true;
                 } else if tok == "-s" || tok == "--silent" {
                     overrides.insert("loglevel".to_string(), "silent".to_string());
-                } else if tok.starts_with('-') && script_args.is_empty() {
+                } else if tok.starts_with('-') {
                     return None;
                 } else {
                     script_args.push(rest[i].clone());
@@ -10180,17 +10194,20 @@ fn try_parse_fast_command_with_overrides(
             let mut i = 0;
             while i < rest.len() {
                 let tok = rest[i].as_str();
-                if has_positional {
-                    exec_args.push(rest[i].clone());
-                } else if tok == "--" {
+                if tok == "--" {
                     i += 1;
-                    if call.is_some() {
+                    if has_positional || call.is_some() {
                         exec_args.extend(rest[i..].iter().cloned());
                     } else if i < rest.len() {
                         package = rest[i].clone();
                         exec_args.extend(rest[i + 1..].iter().cloned());
                     }
                     break;
+                } else if has_positional {
+                    if tok.starts_with('-') {
+                        return None;
+                    }
+                    exec_args.push(rest[i].clone());
                 } else if let Some(val) = tok.strip_prefix("--call=") {
                     if call.is_some() {
                         return None;
@@ -10252,8 +10269,16 @@ fn try_parse_fast_command_with_overrides(
                     workspace.push(val.clone());
                 } else {
                     match tok {
-                        "-y" | "--yes" => yes = true,
-                        "--no-yes" => no_yes = true,
+                        "-y" | "--yes" => {
+                            yes = true;
+                            no_yes = false;
+                            overrides.insert("yes".to_string(), "true".to_string());
+                        }
+                        "--no-yes" => {
+                            no_yes = true;
+                            yes = false;
+                            overrides.insert("yes".to_string(), "false".to_string());
+                        }
                         "--offline" => offline = true,
                         "--workspaces" => workspaces = true,
                         "--workspace-root" | "--include-workspace-root" => workspace_root = true,

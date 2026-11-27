@@ -1238,6 +1238,95 @@ pub fn unpack_tarball(tarball_bytes: &[u8], target_dir: &Path) -> anyhow::Result
     Ok(())
 }
 
+const NODE_GYP_CMD_SCRIPT: &str = "@ECHO off\r\nIF NOT DEFINED npm_config_node_gyp GOTO no_gyp\r\nSET \"GYP_PATH=%npm_config_node_gyp:\"=%\"\r\nIF /I \"%GYP_PATH:~-3%\"==\".js\" GOTO run_js\r\n\"%GYP_PATH%\" %*\r\nEXIT /B %ERRORLEVEL%\r\n:run_js\r\nnode \"%GYP_PATH%\" %*\r\nEXIT /B %ERRORLEVEL%\r\n:no_gyp\r\nnode \"%~dp0node-gyp.js\" %*\r\nEXIT /B %ERRORLEVEL%\r\n";
+const NODE_GYP_SH_SCRIPT: &str = "#!/usr/bin/env sh\nif [ -z \"$npm_config_node_gyp\" ]; then\n  exec node \"$(dirname \"$0\")/node-gyp.js\" \"$@\"\nelse\n  case \"$npm_config_node_gyp\" in\n    *.js) exec node \"$npm_config_node_gyp\" \"$@\" ;;\n    *) exec \"$npm_config_node_gyp\" \"$@\" ;;\n  esac\nfi\n";
+
+#[cfg(unix)]
+fn is_private_owned_dir(dir: &Path) -> bool {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let Ok(meta) = std::fs::symlink_metadata(dir) else {
+        return false;
+    };
+    if meta.file_type().is_symlink() || !meta.is_dir() {
+        return false;
+    }
+    if meta.uid() != unsafe { libc::geteuid() } {
+        return false;
+    }
+    if (meta.mode() & 0o077) != 0 {
+        if std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).is_err() {
+            return false;
+        }
+        let Ok(rechecked) = std::fs::symlink_metadata(dir) else {
+            return false;
+        };
+        if (rechecked.mode() & 0o077) != 0 {
+            return false;
+        }
+    }
+    true
+}
+
+fn has_valid_shim_file(path: &Path, expected: &[u8], require_exec: bool) -> bool {
+    let Ok(meta) = std::fs::symlink_metadata(path) else {
+        return false;
+    };
+    if meta.file_type().is_symlink() || !meta.is_file() || meta.len() != expected.len() as u64 {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        if meta.uid() != unsafe { libc::geteuid() } {
+            return false;
+        }
+        if require_exec && (meta.mode() & 0o777) != 0o755 {
+            if std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).is_err() {
+                return false;
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = require_exec;
+    std::fs::read(path).ok().as_deref() == Some(expected)
+}
+
+fn write_shim_atomic(target: &Path, content: &[u8], executable: bool) -> std::io::Result<()> {
+    static NEXT_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    if has_valid_shim_file(target, content, executable) {
+        return Ok(());
+    }
+    let parent = target.parent().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "shim path has no parent")
+    })?;
+    let name = target
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("node-gyp");
+    let seq = NEXT_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp_path = parent.join(format!(".{name}.tmp.{}.{seq}", std::process::id()));
+    std::fs::write(&tmp_path, content)?;
+    #[cfg(unix)]
+    if executable {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(0o755))?;
+    }
+    #[cfg(not(unix))]
+    let _ = executable;
+
+    match std::fs::rename(&tmp_path, target) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp_path);
+            if has_valid_shim_file(target, content, executable) {
+                Ok(())
+            } else {
+                Err(e)
+            }
+        }
+    }
+}
+
 /// Creates a dedicated private node-gyp shim directory on disk with strict private permissions
 /// (0o700 for the directory, 0o755 for the POSIX shim).
 pub fn create_private_node_gyp_shim(dir: &Path) -> std::io::Result<PathBuf> {
@@ -1248,29 +1337,29 @@ pub fn create_private_node_gyp_shim(dir: &Path) -> std::io::Result<PathBuf> {
     }
 
     let cmd_path = dir.join("node-gyp.cmd");
-    let cmd_script = "@ECHO off\r\nIF NOT DEFINED npm_config_node_gyp GOTO no_gyp\r\nSET \"GYP_PATH=%npm_config_node_gyp:\"=%\"\r\nIF /I \"%GYP_PATH:~-3%\"==\".js\" GOTO run_js\r\n\"%GYP_PATH%\" %*\r\nEXIT /B %ERRORLEVEL%\r\n:run_js\r\nnode \"%GYP_PATH%\" %*\r\nEXIT /B %ERRORLEVEL%\r\n:no_gyp\r\nnode \"%~dp0node-gyp.js\" %*\r\nEXIT /B %ERRORLEVEL%\r\n";
-    if std::fs::read_to_string(&cmd_path).ok().as_deref() != Some(cmd_script) {
-        std::fs::write(&cmd_path, cmd_script)?;
-    }
+    write_shim_atomic(&cmd_path, NODE_GYP_CMD_SCRIPT.as_bytes(), false)?;
 
     let sh_path = dir.join("node-gyp");
-    let sh_script = "#!/usr/bin/env sh\nif [ -z \"$npm_config_node_gyp\" ]; then\n  exec node \"$(dirname \"$0\")/node-gyp.js\" \"$@\"\nelse\n  case \"$npm_config_node_gyp\" in\n    *.js) exec node \"$npm_config_node_gyp\" \"$@\" ;;\n    *) exec \"$npm_config_node_gyp\" \"$@\" ;;\n  esac\nfi\n";
-    let sh_unchanged = std::fs::read_to_string(&sh_path).ok().as_deref() == Some(sh_script);
-    if !sh_unchanged {
-        std::fs::write(&sh_path, sh_script)?;
-    }
-
-    #[cfg(unix)]
-    if !sh_unchanged {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&sh_path, std::fs::Permissions::from_mode(0o755));
-    }
+    write_shim_atomic(&sh_path, NODE_GYP_SH_SCRIPT.as_bytes(), true)?;
 
     if cfg!(windows) {
         Ok(cmd_path)
     } else {
         Ok(sh_path)
     }
+}
+
+fn is_valid_existing_shim_dir(dir: &Path) -> bool {
+    #[cfg(unix)]
+    if !is_private_owned_dir(dir) {
+        return false;
+    }
+    #[cfg(not(unix))]
+    if !dir.is_dir() {
+        return false;
+    }
+    has_valid_shim_file(&dir.join("node-gyp.cmd"), NODE_GYP_CMD_SCRIPT.as_bytes(), false)
+        && has_valid_shim_file(&dir.join("node-gyp"), NODE_GYP_SH_SCRIPT.as_bytes(), true)
 }
 
 /// Prepares and returns a dedicated privately-owned directory containing standalone `node-gyp` shims
@@ -1280,23 +1369,28 @@ pub fn node_gyp_bin_dir() -> Option<PathBuf> {
     BIN_DIR
         .get_or_init(|| {
             #[cfg(unix)]
-            let dir_name = format!("rnpm-node-gyp-bin-{}", unsafe { libc::geteuid() });
+            let mut dir = std::env::temp_dir().join(format!("rnpm-node-gyp-bin-v1-{}", unsafe { libc::geteuid() }));
             #[cfg(not(unix))]
-            let dir_name = "rnpm-node-gyp-bin-v1".to_string();
-
-            let dir = std::env::temp_dir().join(dir_name);
-            let expected_shim = if cfg!(windows) {
-                dir.join("node-gyp.cmd")
-            } else {
-                dir.join("node-gyp")
-            };
-            if expected_shim.is_file() {
+            let dir = std::env::temp_dir().join("rnpm-node-gyp-bin-v1");
+            if is_valid_existing_shim_dir(&dir) {
                 return Some(dir);
             }
 
             if let Err(e) = std::fs::create_dir_all(&dir) {
                 warn!("Failed to create private node-gyp-bin directory: {}", e);
                 return None;
+            }
+            #[cfg(unix)]
+            if !is_private_owned_dir(&dir) {
+                dir = std::env::temp_dir().join(format!(
+                    "rnpm-node-gyp-bin-v1-{}-{}",
+                    unsafe { libc::geteuid() },
+                    std::process::id()
+                ));
+                if let Err(e) = std::fs::create_dir_all(&dir) {
+                    warn!("Failed to create fallback node-gyp-bin directory: {}", e);
+                    return None;
+                }
             }
             if let Err(e) = create_private_node_gyp_shim(&dir) {
                 warn!("Failed to populate private node-gyp-bin directory: {}", e);
