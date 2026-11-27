@@ -226,6 +226,43 @@ struct CachedPackumentEntry {
     cache_metadata: serde_json::Value,
 }
 
+#[derive(Clone, Copy)]
+enum FastBodyKind<'a> {
+    Metadata {
+        max_size: usize,
+        package_name: &'a str,
+    },
+    TarballBytes {
+        max_size: usize,
+        compute_sha512: bool,
+        not_found_label: &'a str,
+    },
+    TarballFile {
+        max_size: usize,
+        disk_threshold: usize,
+        temp_path: &'a Path,
+        dest_path: &'a Path,
+        not_found_label: &'a str,
+    },
+}
+
+enum DirectOrResume {
+    Success {
+        etag: Option<String>,
+        payload: crate::http1_pool::BodyPayload,
+    },
+    NotModified {
+        etag: Option<String>,
+        cache_metadata: serde_json::Value,
+    },
+    ResumeReqwest {
+        current_url: Url,
+        redirect_count: usize,
+        seen_redirect_urls: Option<HashSet<Url>>,
+        attempt: usize,
+    },
+}
+
 struct LazyHttpClient {
     identity: Mutex<Option<reqwest::Identity>>,
     cell: OnceLock<Result<Client, String>>,
@@ -331,6 +368,27 @@ fn track_http_request(method: &Method, url: &Url) {
     }
 }
 
+#[inline]
+fn has_proxy_env_vars() -> bool {
+    #[cfg(windows)]
+    {
+        const VARS: &[&str] = &["HTTP_PROXY", "HTTPS_PROXY", "PROXY"];
+        VARS.iter()
+            .any(|name| std::env::var_os(name).is_some_and(|v| !v.is_empty()))
+    }
+    #[cfg(not(windows))]
+    {
+        std::env::vars_os().any(|(k, v)| {
+            !v.is_empty()
+                && k.to_str().is_some_and(|s| {
+                    s.eq_ignore_ascii_case("http_proxy")
+                        || s.eq_ignore_ascii_case("https_proxy")
+                        || s.eq_ignore_ascii_case("proxy")
+                })
+        })
+    }
+}
+
 /// Returns a lowercase `host[:port]` key, borrowing zero-copy when the URL has no explicit port
 /// and its host is already lowercase ASCII (true for canonical `url::Url` DNS hosts).
 #[inline]
@@ -400,6 +458,7 @@ async fn next_chunk_with_idle_timeout(
 fn clone_clonable_registry_error(err: &RegistryError) -> Option<RegistryError> {
     Some(match err {
         RegistryError::Http(_) | RegistryError::Json(_) => return None,
+        RegistryError::Transport(e) => RegistryError::Transport(e.clone()),
         RegistryError::UrlParse(e) => RegistryError::UrlParse(*e),
         RegistryError::PackageNotFound { package, status } => RegistryError::PackageNotFound {
             package: package.clone(),
@@ -1723,6 +1782,10 @@ pub struct RegistryClient {
     has_any_auth: bool,
     has_non_error_retry_status: bool,
     bearer_auth_header: Option<HeaderValue>,
+    http1_pool: Arc<crate::http1_pool::Http1Pool>,
+    http1_static_headers: Arc<[u8]>,
+    http1_max_idle_per_host: usize,
+    may_use_http_proxy: bool,
     in_flight_metadata: Arc<InFlightGroup<MetadataInFlightKey, MetadataFetchResult>>,
     in_flight_tarballs: Arc<InFlightGroup<TarballInFlightKey, BytesFetchResult>>,
     packument_cache: Arc<std::sync::RwLock<HashMap<PackumentCacheKey, CachedPackumentEntry>>>,
@@ -1909,6 +1972,24 @@ impl RegistryClient {
             .as_deref()
             .and_then(|token| HeaderValue::from_str(&format!("Bearer {token}")).ok());
 
+        let http1_static_headers: Arc<[u8]> =
+            crate::http1_pool::format_static_headers(&default_headers).into();
+        let http1_max_idle_per_host = if let Some(sockets) = config.maxsockets {
+            if sockets == 0 {
+                DEFAULT_POOL_MAX_IDLE_PER_HOST
+            } else {
+                sockets
+            }
+        } else if config.pool_max_idle_per_host == 0 {
+            DEFAULT_POOL_MAX_IDLE_PER_HOST
+        } else {
+            config.pool_max_idle_per_host
+        };
+        let may_use_http_proxy = config.proxy.is_some()
+            || config.http_proxy.is_some()
+            || config.https_proxy.is_some()
+            || has_proxy_env_vars();
+
         Ok(Self {
             base_client,
             default_headers,
@@ -1923,6 +2004,10 @@ impl RegistryClient {
             has_any_auth,
             has_non_error_retry_status,
             bearer_auth_header,
+            http1_pool: Arc::new(crate::http1_pool::Http1Pool::new()),
+            http1_static_headers,
+            http1_max_idle_per_host,
+            may_use_http_proxy,
             in_flight_metadata: Arc::new(InFlightGroup::new()),
             in_flight_tarballs: Arc::new(InFlightGroup::new()),
             packument_cache: Arc::new(std::sync::RwLock::new(HashMap::new())),
@@ -2480,6 +2565,38 @@ impl RegistryClient {
         Ok((resp, permit))
     }
 
+    #[allow(clippy::too_many_arguments)]
+    async fn execute_with_borrowed_permit_from(
+        &self,
+        method: Method,
+        initial_url: Url,
+        resume_url: Url,
+        resume_redirect_count: usize,
+        resume_seen_redirects: Option<HashSet<Url>>,
+        start_attempt: usize,
+        accept_header: Option<&str>,
+        if_none_match: Option<&str>,
+    ) -> Result<(Response, SemaphorePermit<'_>), RegistryError> {
+        let permit = self
+            .semaphore
+            .acquire()
+            .await
+            .map_err(|e| RegistryError::Other(e.to_string()))?;
+        let resp = self
+            .execute_request_loop_state(
+                method,
+                initial_url,
+                resume_url,
+                resume_redirect_count,
+                resume_seen_redirects,
+                start_attempt,
+                accept_header,
+                if_none_match,
+            )
+            .await?;
+        Ok((resp, permit))
+    }
+
     /// Execute a request with an explicit body, content-type, and optional OTP header under semaphore permit.
     pub async fn execute_with_body_permit(
         &self,
@@ -2504,11 +2621,339 @@ impl RegistryClient {
         Ok((resp, permit))
     }
 
+    #[inline]
+    fn can_use_http1_pool(&self, url: &Url) -> bool {
+        !self.may_use_http_proxy && !self.has_non_error_retry_status && url.scheme() == "http"
+    }
+
+    async fn execute_http1_fast(
+        &self,
+        initial_url: &Url,
+        accept_header: Option<&str>,
+        accept_gzip: bool,
+        if_none_match: Option<&str>,
+        collect_cache_metadata: bool,
+        kind: FastBodyKind<'_>,
+    ) -> Result<DirectOrResume, RegistryError> {
+        let host_key = if self.config.circuit_breaker_enabled {
+            let hk = url_host_key(initial_url);
+            if self.circuit_breaker.check_state(&hk).await == CircuitBreakerState::Open {
+                return Err(RegistryError::CircuitBreakerOpen {
+                    host: hk.into_owned(),
+                });
+            }
+            Some(hk)
+        } else {
+            None
+        };
+
+        let auth_cow: Option<Cow<'_, str>> = if self.has_any_auth
+            && if self.has_scoped_auth {
+                self.is_trusted_target(initial_url, initial_url)
+            } else {
+                self.is_trusted_host(initial_url)
+            } {
+            if !self.has_scoped_auth {
+                if let Some(ref hdr) = self.bearer_auth_header {
+                    hdr.to_str().ok().map(Cow::Borrowed)
+                } else {
+                    self.auth_header_for_url(initial_url).map(Cow::Owned)
+                }
+            } else {
+                self.auth_header_for_url(initial_url).map(Cow::Owned)
+            }
+        } else {
+            None
+        };
+
+        let mut attempt = 0;
+        loop {
+            let permit = self
+                .semaphore
+                .acquire()
+                .await
+                .map_err(|e| RegistryError::Other(e.to_string()))?;
+
+            track_http_request(&Method::GET, initial_url);
+            self.http_requests
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+            let target = match kind {
+                FastBodyKind::Metadata { max_size, .. } => {
+                    crate::http1_pool::BodyTarget::Metadata { max_size }
+                }
+                FastBodyKind::TarballBytes {
+                    max_size,
+                    compute_sha512,
+                    ..
+                } => crate::http1_pool::BodyTarget::TarballBytes {
+                    max_size,
+                    compute_sha512,
+                },
+                FastBodyKind::TarballFile {
+                    max_size,
+                    disk_threshold,
+                    temp_path,
+                    dest_path,
+                    ..
+                } => crate::http1_pool::BodyTarget::TarballFile {
+                    max_size,
+                    disk_threshold,
+                    temp_path,
+                    dest_path,
+                },
+            };
+
+            let params = crate::http1_pool::Http1RequestParams {
+                method: &Method::GET,
+                url: initial_url,
+                static_headers: &self.http1_static_headers,
+                accept: accept_header,
+                accept_gzip,
+                if_none_match,
+                auth_header: auth_cow.as_deref(),
+                collect_cache_metadata,
+                connect_timeout: self.config.connect_timeout,
+                request_timeout: self.config.timeout,
+                chunk_idle_timeout: self.config.chunk_idle_timeout,
+                pool_idle_timeout: self.config.pool_idle_timeout,
+                max_idle_per_host: self.http1_max_idle_per_host,
+            };
+
+            let hop_res = crate::http1_pool::execute_hop(&self.http1_pool, params, target).await;
+            drop(permit);
+
+            match hop_res {
+                Ok(crate::http1_pool::HopOutcome::Success { etag, payload }) => {
+                    if let Some(ref hk) = host_key {
+                        self.circuit_breaker.record_success(hk).await;
+                    }
+                    return Ok(DirectOrResume::Success { etag, payload });
+                }
+                Ok(crate::http1_pool::HopOutcome::NotModified {
+                    etag,
+                    cache_metadata,
+                }) => {
+                    self.http_304s
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if let Some(ref hk) = host_key {
+                        self.circuit_breaker.record_success(hk).await;
+                    }
+                    return Ok(DirectOrResume::NotModified {
+                        etag,
+                        cache_metadata,
+                    });
+                }
+                Ok(crate::http1_pool::HopOutcome::FallbackToReqwest) => {
+                    return Ok(DirectOrResume::ResumeReqwest {
+                        current_url: initial_url.clone(),
+                        redirect_count: 0,
+                        seen_redirect_urls: None,
+                        attempt,
+                    });
+                }
+                Ok(crate::http1_pool::HopOutcome::Redirect { status, location }) => {
+                    if 1 > MAX_REDIRECTS {
+                        return Err(RegistryError::TooManyRedirects(MAX_REDIRECTS));
+                    }
+                    let Some(loc_res) = location else {
+                        return Err(RegistryError::ServerError {
+                            status: status.as_u16(),
+                            body: "Redirect response missing Location header".into(),
+                        });
+                    };
+                    let loc_str = match loc_res {
+                        Ok(s) => s,
+                        Err(()) => {
+                            return Err(RegistryError::SecurityViolation(
+                                "Invalid characters in redirect Location header".into(),
+                            ))
+                        }
+                    };
+                    if loc_str.as_bytes().iter().any(|&b| b == b'\r' || b == b'\n') {
+                        return Err(RegistryError::SecurityViolation(
+                            "Location header contains forbidden CR/LF characters".into(),
+                        ));
+                    }
+                    let next_url = initial_url.join(&loc_str).map_err(RegistryError::UrlParse)?;
+                    let next_scheme = next_url.scheme();
+                    if !next_scheme.eq_ignore_ascii_case("http")
+                        && !next_scheme.eq_ignore_ascii_case("https")
+                    {
+                        return Err(RegistryError::SecurityViolation(format!(
+                            "Redirect to unsupported scheme '{}': only http and https are allowed",
+                            next_scheme.to_ascii_lowercase()
+                        )));
+                    }
+                    let mut seen = HashSet::with_capacity(4);
+                    seen.insert(initial_url.clone());
+                    if !seen.insert(next_url.clone()) {
+                        return Err(RegistryError::SecurityViolation(format!(
+                            "Redirect loop detected: '{next_url}' was visited more than once"
+                        )));
+                    }
+                    debug!("Following redirect {} -> {}", initial_url, next_url);
+                    return Ok(DirectOrResume::ResumeReqwest {
+                        current_url: next_url,
+                        redirect_count: 1,
+                        seen_redirect_urls: Some(seen),
+                        attempt,
+                    });
+                }
+                Ok(crate::http1_pool::HopOutcome::ErrorStatus {
+                    status,
+                    retry_after,
+                    www_authenticate,
+                    body,
+                }) => {
+                    let is_rate_limited = status == StatusCode::TOO_MANY_REQUESTS;
+                    let is_retryable_server_error =
+                        self.config.retry_on_status.contains(&status.as_u16())
+                            || status.is_server_error();
+
+                    if is_rate_limited || is_retryable_server_error {
+                        let retry_after_secs = retry_after
+                            .as_deref()
+                            .and_then(parse_retry_after_str);
+                        let within_backoff_budget = if let Some(secs) = retry_after_secs {
+                            Duration::from_secs(secs) <= self.config.max_retry_backoff
+                        } else {
+                            true
+                        };
+                        if within_backoff_budget && attempt < self.config.max_retries {
+                            let delay = if let Some(secs) = retry_after_secs {
+                                Duration::from_secs(secs)
+                            } else {
+                                self.calculate_backoff(attempt)
+                            };
+                            debug!(
+                                "HTTP {} on {}, retrying in {:?} (attempt {}/{})",
+                                status.as_u16(),
+                                initial_url,
+                                delay,
+                                attempt + 1,
+                                self.config.max_retries
+                            );
+                            tokio::time::sleep(delay).await;
+                            attempt += 1;
+                            continue;
+                        }
+                        if let Some(ref hk) = host_key {
+                            self.circuit_breaker.record_failure(hk).await;
+                        }
+                        if is_rate_limited {
+                            return Err(RegistryError::RateLimited {
+                                retry_after: retry_after_secs,
+                            });
+                        }
+                    } else if let Some(ref hk) = host_key {
+                        self.circuit_breaker.record_success(hk).await;
+                    }
+
+                    if status == StatusCode::NOT_FOUND {
+                        let label = match kind {
+                            FastBodyKind::Metadata { package_name, .. } => {
+                                crate::not_found::record(
+                                    package_name,
+                                    initial_url.as_str(),
+                                    &body,
+                                );
+                                package_name.to_string()
+                            }
+                            FastBodyKind::TarballBytes {
+                                not_found_label, ..
+                            }
+                            | FastBodyKind::TarballFile {
+                                not_found_label, ..
+                            } => not_found_label.to_string(),
+                        };
+                        return Err(RegistryError::PackageNotFound {
+                            package: label,
+                            status: 404,
+                        });
+                    }
+                    if status == StatusCode::UNAUTHORIZED {
+                        if let Some(www) = www_authenticate {
+                            return Err(RegistryError::AuthChallenge {
+                                url: initial_url.to_string(),
+                                www_authenticate: www,
+                                body,
+                            });
+                        }
+                        return Err(RegistryError::Unauthorized {
+                            url: initial_url.to_string(),
+                            status: 401,
+                            message: body,
+                        });
+                    }
+                    if status == StatusCode::FORBIDDEN {
+                        return Err(RegistryError::Forbidden {
+                            url: initial_url.to_string(),
+                            status: 403,
+                            message: body,
+                        });
+                    }
+                    return Err(RegistryError::ServerError {
+                        status: status.as_u16(),
+                        body,
+                    });
+                }
+                Err(err) => {
+                    if err.is_transient() && attempt < self.config.max_retries {
+                        let delay = self.calculate_backoff(attempt);
+                        debug!(
+                            "HTTP/1.1 request error {:?} for {}, retrying in {:?} (attempt {}/{})",
+                            err,
+                            initial_url,
+                            delay,
+                            attempt + 1,
+                            self.config.max_retries
+                        );
+                        tokio::time::sleep(delay).await;
+                        attempt += 1;
+                        continue;
+                    }
+                    if let Some(ref hk) = host_key {
+                        if err.is_transient() {
+                            self.circuit_breaker.record_failure(hk).await;
+                        }
+                    }
+                    return Err(err);
+                }
+            }
+        }
+    }
+
     /// Internal request dispatch loop with redirect security policy, circuit breaking, and retry backoff.
     async fn execute_request_loop(
         &self,
         method: Method,
         initial_url: Url,
+        accept_header: Option<&str>,
+        if_none_match: Option<&str>,
+    ) -> Result<Response, RegistryError> {
+        self.execute_request_loop_state(
+            method,
+            initial_url.clone(),
+            initial_url,
+            0,
+            None,
+            0,
+            accept_header,
+            if_none_match,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn execute_request_loop_state(
+        &self,
+        method: Method,
+        initial_url: Url,
+        resume_url: Url,
+        resume_redirect_count: usize,
+        resume_seen_redirects: Option<HashSet<Url>>,
+        start_attempt: usize,
         accept_header: Option<&str>,
         if_none_match: Option<&str>,
     ) -> Result<Response, RegistryError> {
@@ -2545,13 +2990,14 @@ impl RegistryClient {
             None
         };
 
-        let mut attempt = 0;
+        let mut attempt = start_attempt;
+        let mut first_resume = Some((resume_url, resume_redirect_count, resume_seen_redirects));
 
         loop {
-            let mut current_url = initial_url.clone();
+            let (mut current_url, mut redirect_count, mut seen_redirect_urls) = first_resume
+                .take()
+                .unwrap_or_else(|| (initial_url.clone(), 0, None));
             let mut current_method = method.clone();
-            let mut redirect_count = 0;
-            let mut seen_redirect_urls: Option<HashSet<Url>> = None;
 
             let response_result: Result<Response, RegistryError> = loop {
                 let client = match self.try_client_for_url(&current_url) {
@@ -3760,6 +4206,79 @@ impl RegistryClient {
         accept_header: &str,
     ) -> Result<MetadataFetchResult, RegistryError> {
         let _concurrent_fetch_guard = crate::metadata::ConcurrentMetadataFetchGuard::enter();
+
+        let parse_mode =
+            if accept_header.contains("install-v1") || accept_header == NPM_INSTALL_ACCEPT {
+                PackumentParseMode::Install
+            } else {
+                PackumentParseMode::Full
+            };
+
+        let mut resume_state: Option<(Url, usize, Option<HashSet<Url>>, usize)> = None;
+        if self.can_use_http1_pool(url) {
+            match self
+                .execute_http1_fast(
+                    url,
+                    Some(accept_header),
+                    true,
+                    if_none_match,
+                    true,
+                    FastBodyKind::Metadata {
+                        max_size: self.config.max_metadata_size,
+                        package_name,
+                    },
+                )
+                .await?
+            {
+                DirectOrResume::NotModified {
+                    etag,
+                    cache_metadata,
+                } => {
+                    return Ok(MetadataFetchResult::NotModified {
+                        etag: etag.or_else(|| if_none_match.map(str::to_owned)),
+                        cache_metadata,
+                    });
+                }
+                DirectOrResume::Success {
+                    etag,
+                    payload:
+                        crate::http1_pool::BodyPayload::Bytes {
+                            bytes,
+                            cache_metadata,
+                            ..
+                        },
+                } => {
+                    let metadata = if bytes.len() > 512 * 1024 {
+                        tokio::task::spawn_blocking(move || {
+                            parse_packument_with_mode(&bytes, parse_mode)
+                        })
+                        .await
+                        .map_err(|e| {
+                            RegistryError::Other(format!(
+                                "Failed to join packument parsing task: {e}"
+                            ))
+                        })??
+                    } else {
+                        parse_packument_with_mode(&bytes, parse_mode)?
+                    };
+                    return Ok(MetadataFetchResult::Fresh {
+                        metadata,
+                        etag,
+                        cache_metadata,
+                    });
+                }
+                DirectOrResume::Success { .. } => unreachable!(),
+                DirectOrResume::ResumeReqwest {
+                    current_url,
+                    redirect_count,
+                    seen_redirect_urls,
+                    attempt,
+                } => {
+                    resume_state = Some((current_url, redirect_count, seen_redirect_urls, attempt));
+                }
+            }
+        }
+
         let host_key = self
             .config
             .circuit_breaker_enabled
@@ -3768,14 +4287,27 @@ impl RegistryClient {
         let mut stream_attempt = 0;
         let mut idle_sleep: Option<Pin<Box<tokio::time::Sleep>>> = None;
         loop {
-            let (mut resp, permit) = self
-                .execute_with_borrowed_permit(
+            let (mut resp, permit) = if let Some((ru, rc, sr, att)) = resume_state.take() {
+                self.execute_with_borrowed_permit_from(
+                    Method::GET,
+                    url.clone(),
+                    ru,
+                    rc,
+                    sr,
+                    att,
+                    Some(accept_header),
+                    if_none_match,
+                )
+                .await?
+            } else {
+                self.execute_with_borrowed_permit(
                     Method::GET,
                     url.clone(),
                     Some(accept_header),
                     if_none_match,
                 )
-                .await?;
+                .await?
+            };
 
             let status = resp.status();
             if status == StatusCode::NOT_MODIFIED {
@@ -3867,7 +4399,10 @@ impl RegistryClient {
                 }
             }
 
-            let mut bytes = Vec::new();
+            let initial_cap = expected_content_length
+                .map(|n| (n as usize).min(4 * 1024 * 1024))
+                .unwrap_or(0);
+            let mut bytes = Vec::with_capacity(initial_cap);
             let mut stream_err: Option<RegistryError> = None;
             loop {
                 let chunk_opt = match next_chunk_with_idle_timeout(
@@ -4441,6 +4976,49 @@ impl RegistryClient {
         if_none_match: Option<&str>,
         compute_sha512: bool,
     ) -> Result<(BytesFetchResult, Option<String>), RegistryError> {
+        let mut resume_state: Option<(Url, usize, Option<HashSet<Url>>, usize)> = None;
+        if self.can_use_http1_pool(url) {
+            match self
+                .execute_http1_fast(
+                    url,
+                    None,
+                    false,
+                    if_none_match,
+                    false,
+                    FastBodyKind::TarballBytes {
+                        max_size: self.config.max_package_size.min(usize::MAX as u64) as usize,
+                        compute_sha512,
+                        not_found_label: tarball_url,
+                    },
+                )
+                .await?
+            {
+                DirectOrResume::NotModified { etag, .. } => {
+                    return Ok((
+                        BytesFetchResult::NotModified {
+                            etag: etag.or_else(|| if_none_match.map(str::to_owned)),
+                        },
+                        None,
+                    ));
+                }
+                DirectOrResume::Success {
+                    etag,
+                    payload: crate::http1_pool::BodyPayload::Bytes { bytes, sha512, .. },
+                } => {
+                    return Ok((BytesFetchResult::Fresh { bytes, etag }, sha512));
+                }
+                DirectOrResume::Success { .. } => unreachable!(),
+                DirectOrResume::ResumeReqwest {
+                    current_url,
+                    redirect_count,
+                    seen_redirect_urls,
+                    attempt,
+                } => {
+                    resume_state = Some((current_url, redirect_count, seen_redirect_urls, attempt));
+                }
+            }
+        }
+
         let host_key = self
             .config
             .circuit_breaker_enabled
@@ -4449,9 +5027,22 @@ impl RegistryClient {
         let mut stream_attempt = 0;
         let mut idle_sleep: Option<Pin<Box<tokio::time::Sleep>>> = None;
         loop {
-            let (mut resp, _permit) = self
-                .execute_with_borrowed_permit(Method::GET, url.clone(), None, if_none_match)
-                .await?;
+            let (mut resp, _permit) = if let Some((ru, rc, sr, att)) = resume_state.take() {
+                self.execute_with_borrowed_permit_from(
+                    Method::GET,
+                    url.clone(),
+                    ru,
+                    rc,
+                    sr,
+                    att,
+                    None,
+                    if_none_match,
+                )
+                .await?
+            } else {
+                self.execute_with_borrowed_permit(Method::GET, url.clone(), None, if_none_match)
+                    .await?
+            };
 
             let status = resp.status();
             if status == StatusCode::NOT_MODIFIED {
@@ -4535,7 +5126,10 @@ impl RegistryClient {
                 }
             }
 
-            let mut bytes = Vec::new();
+            let initial_cap = expected_content_length
+                .map(|n| (n as usize).min(4 * 1024 * 1024))
+                .unwrap_or(0);
+            let mut bytes = Vec::with_capacity(initial_cap);
             let mut hasher = compute_sha512.then(|| ring::digest::Context::new(&ring::digest::SHA512));
             let mut stream_err = None;
 
@@ -4742,12 +5336,64 @@ impl RegistryClient {
             parent.join(format!("{file_name}.part"))
         };
 
+        let mut resume_state: Option<(Url, usize, Option<HashSet<Url>>, usize)> = None;
+        if self.can_use_http1_pool(&url) {
+            match self
+                .execute_http1_fast(
+                    &url,
+                    None,
+                    false,
+                    None,
+                    false,
+                    FastBodyKind::TarballFile {
+                        max_size: self.config.max_package_size.min(usize::MAX as u64) as usize,
+                        disk_threshold: DISK_BUFFER_THRESHOLD,
+                        temp_path: &temp_path,
+                        dest_path,
+                        not_found_label: tarball_url,
+                    },
+                )
+                .await?
+            {
+                DirectOrResume::Success {
+                    payload: crate::http1_pool::BodyPayload::File { written },
+                    ..
+                } => {
+                    return Ok(written);
+                }
+                DirectOrResume::Success { .. } | DirectOrResume::NotModified { .. } => {
+                    unreachable!()
+                }
+                DirectOrResume::ResumeReqwest {
+                    current_url,
+                    redirect_count,
+                    seen_redirect_urls,
+                    attempt,
+                } => {
+                    resume_state = Some((current_url, redirect_count, seen_redirect_urls, attempt));
+                }
+            }
+        }
+
         let mut stream_attempt = 0;
         let mut idle_sleep: Option<Pin<Box<tokio::time::Sleep>>> = None;
         loop {
-            let (mut resp, permit) = self
-                .execute_with_borrowed_permit(Method::GET, url.clone(), None, None)
-                .await?;
+            let (mut resp, permit) = if let Some((ru, rc, sr, att)) = resume_state.take() {
+                self.execute_with_borrowed_permit_from(
+                    Method::GET,
+                    url.clone(),
+                    ru,
+                    rc,
+                    sr,
+                    att,
+                    None,
+                    None,
+                )
+                .await?
+            } else {
+                self.execute_with_borrowed_permit(Method::GET, url.clone(), None, None)
+                    .await?
+            };
 
             let status = resp.status();
             if status == StatusCode::NOT_FOUND {

@@ -49,6 +49,17 @@ pub fn diagnostic(error: &reqwest::Error) -> Option<(&'static str, String)> {
     } else {
         return None;
     };
+    let message = format_diagnostic_message(url, host, code, syscall, &reason);
+    Some((code, message))
+}
+
+fn format_diagnostic_message(
+    url: &url::Url,
+    host: &str,
+    code: &str,
+    syscall: Option<&str>,
+    reason: &str,
+) -> String {
     let mut lines = Vec::new();
     if let Some(syscall) = syscall {
         lines.push(format!("syscall {syscall}"));
@@ -56,6 +67,7 @@ pub fn diagnostic(error: &reqwest::Error) -> Option<(&'static str, String)> {
     lines.push(format!("errno {code}"));
     let message = format!("request to {url} failed, reason: {reason}");
     if code == "ECONNREFUSED" {
+        let port = url.port_or_known_default().unwrap_or(80);
         lines.extend([
             format!("FetchError: {message}"),
             "{".into(),
@@ -63,7 +75,7 @@ pub fn diagnostic(error: &reqwest::Error) -> Option<(&'static str, String)> {
             format!("  errno: '{code}',"),
             "  syscall: 'connect',".into(),
             format!("  address: '{host}',"),
-            format!("  port: {},", url.port_or_known_default()?),
+            format!("  port: {port},"),
             "  type: 'system'".into(),
             "}".into(),
             String::new(),
@@ -78,12 +90,64 @@ pub fn diagnostic(error: &reqwest::Error) -> Option<(&'static str, String)> {
             "network If you are behind a proxy, please make sure that the 'proxy' config is set properly.  See: 'npm help config'".into(),
         ]);
     }
-    Some((
-        code,
-        lines
-            .join("\nnpm error ")
-            .replace("npm error \n", "npm error\n"),
-    ))
+    lines
+        .join("\nnpm error ")
+        .replace("npm error \n", "npm error\n")
+}
+
+/// Format a direct IO/transport error for npm error-contract parity.
+pub(crate) fn format_io_error(
+    url: &url::Url,
+    err: &std::io::Error,
+    is_connect_phase: bool,
+    is_timeout: bool,
+) -> String {
+    let Some(host) = url.host_str() else {
+        return format!("HTTP error: {err}");
+    };
+    let port = url.port_or_known_default().unwrap_or(80);
+    let kind = err.kind();
+    let msg_lower = err.to_string().to_ascii_lowercase();
+    let dns = msg_lower.contains("dns")
+        || msg_lower.contains("failed to lookup address")
+        || msg_lower.contains("no such host")
+        || msg_lower.contains("name or service not known")
+        || msg_lower.contains("temporary failure in name resolution");
+
+    let (code, syscall, reason) = if dns {
+        (
+            "ENOTFOUND",
+            Some("getaddrinfo"),
+            format!("getaddrinfo ENOTFOUND {host}"),
+        )
+    } else if kind == ErrorKind::ConnectionRefused {
+        (
+            "ECONNREFUSED",
+            Some("connect"),
+            format!("connect ECONNREFUSED {host}:{port}"),
+        )
+    } else if kind == ErrorKind::TimedOut || (is_timeout && is_connect_phase) {
+        (
+            "ETIMEDOUT",
+            Some("connect"),
+            format!("connect ETIMEDOUT {host}:{port}"),
+        )
+    } else if is_timeout {
+        return format!("npm error code FETCH_ERROR\nnpm error errno FETCH_ERROR\nnpm error network timeout at: {url}");
+    } else if matches!(
+        kind,
+        ErrorKind::ConnectionReset
+            | ErrorKind::ConnectionAborted
+            | ErrorKind::BrokenPipe
+            | ErrorKind::UnexpectedEof
+    ) {
+        ("ECONNRESET", None, "socket hang up".into())
+    } else {
+        return format!("HTTP error: {err}");
+    };
+
+    let body = format_diagnostic_message(url, host, code, syscall, &reason);
+    format!("npm error code {code}\nnpm error {body}")
 }
 
 /// Retain the npm error contract through string-based metadata-provider errors.
