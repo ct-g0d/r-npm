@@ -1,4 +1,4 @@
-use crate::circuit_breaker::{CircuitBreaker, CircuitBreakerState};
+use crate::circuit_breaker::{CircuitBreaker, CircuitBreakerState, HalfOpenProbeGuard};
 use crate::error::RegistryError;
 use crate::metadata::{
     parse_packument_with_mode, AbbreviatedPackageMetadata, PackumentParseMode,
@@ -16,7 +16,7 @@ use std::hash::{Hash, Hasher};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::task::Poll;
 use std::time::Duration;
@@ -28,6 +28,9 @@ use url::Url;
 static DEFAULT_USER_AGENT_STR: OnceLock<String> = OnceLock::new();
 static DEFAULT_UA_HEADER: OnceLock<HeaderValue> = OnceLock::new();
 static DEFAULT_REGISTRY_URL: OnceLock<Url> = OnceLock::new();
+static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
+const MAX_CONTENT_LENGTH_PREALLOC: usize = 4 * 1024 * 1024;
+type ResumeReqwestState = Option<(Url, usize, Option<HashSet<Url>>, usize, Option<HalfOpenProbeGuard>)>;
 
 #[inline]
 fn default_user_agent_str() -> &'static str {
@@ -246,6 +249,11 @@ enum FastBodyKind<'a> {
     },
 }
 
+enum LoopPermit<'a> {
+    Owned(OwnedSemaphorePermit),
+    Borrowed(SemaphorePermit<'a>),
+}
+
 enum DirectOrResume {
     Success {
         etag: Option<String>,
@@ -260,6 +268,7 @@ enum DirectOrResume {
         redirect_count: usize,
         seen_redirect_urls: Option<HashSet<Url>>,
         attempt: usize,
+        probe_guard: Option<HalfOpenProbeGuard>,
     },
 }
 
@@ -386,6 +395,17 @@ fn has_proxy_env_vars() -> bool {
                         || s.eq_ignore_ascii_case("proxy")
                 })
         })
+    }
+}
+
+#[inline]
+fn default_port_for_scheme(scheme: &str) -> Option<u16> {
+    if scheme.eq_ignore_ascii_case("https") {
+        Some(443)
+    } else if scheme.eq_ignore_ascii_case("http") {
+        Some(80)
+    } else {
+        None
     }
 }
 
@@ -2121,7 +2141,54 @@ impl RegistryClient {
                 return true;
             }
         }
-        self.config.trusted_hosts.contains(host.as_ref())
+
+        // Portless entries in `trusted_hosts` (such as the default registry host)
+        // only trust the scheme's default port so tokens never leak to arbitrary ports.
+        let is_default_port = url.port().is_none() || url.port() == default_port_for_scheme(url.scheme());
+        is_default_port && self.config.trusted_hosts.contains(host.as_ref())
+    }
+
+    fn lookup_scoped_credential<'a>(
+        map: &'a std::collections::BTreeMap<String, String>,
+        url: &Url,
+    ) -> Option<&'a str> {
+        if map.is_empty() {
+            return None;
+        }
+        let raw_host = url.host_str()?;
+        let host_lower: Cow<'_, str> = if raw_host.bytes().any(|b| b.is_ascii_uppercase()) {
+            Cow::Owned(raw_host.to_ascii_lowercase())
+        } else {
+            Cow::Borrowed(raw_host)
+        };
+        let explicit_port = url.port();
+        let scheme_default_port = default_port_for_scheme(url.scheme());
+        let is_default_port = explicit_port.is_none() || explicit_port == scheme_default_port;
+        let prefixes = generate_path_prefixes(url.path());
+
+        for prefix in &prefixes {
+            if let Some(port) = explicit_port {
+                let cand = format!("//{host_lower}:{port}{prefix}");
+                if let Some(val) = map.get(&cand) {
+                    return Some(val.as_str());
+                }
+            }
+            if is_default_port {
+                let cand = format!("//{host_lower}{prefix}");
+                if let Some(val) = map.get(&cand) {
+                    return Some(val.as_str());
+                }
+                if explicit_port.is_none() {
+                    if let Some(dp) = scheme_default_port {
+                        let cand_dp = format!("//{host_lower}:{dp}{prefix}");
+                        if let Some(val) = map.get(&cand_dp) {
+                            return Some(val.as_str());
+                        }
+                    }
+                }
+            }
+        }
+        None
     }
 
     /// The `Authorization` value npm would send: a Bearer token when one is
@@ -2130,75 +2197,15 @@ impl RegistryClient {
         if let Some(token) = self.auth_token_for_url(url) {
             return Some(format!("Bearer {token}"));
         }
-        if self.config.basic_auths.is_empty() {
-            return None;
-        }
-        let host = url.host_str()?.to_ascii_lowercase();
-        let port = url.port().map(|p| format!(":{p}")).unwrap_or_default();
-        let mut path = url.path().to_string();
-        loop {
-            let key = format!(
-                "//{host}{port}{}",
-                if path.ends_with('/') {
-                    path.clone()
-                } else {
-                    format!("{path}/")
-                }
-            );
-            if let Some(basic) = self.config.basic_auths.get(&key) {
-                return Some(format!("Basic {basic}"));
-            }
-            if path == "/" || path.is_empty() {
-                return None;
-            }
-            let trimmed = path.trim_end_matches('/');
-            path = match trimmed.rfind('/') {
-                Some(i) => trimmed[..=i].to_string(),
-                None => "/".to_string(),
-            };
-        }
+        Self::lookup_scoped_credential(&self.config.basic_auths, url)
+            .map(|basic| format!("Basic {basic}"))
     }
 
     /// Retrieve the auth token for a target URL if configured in `auth_tokens` or fallback to `auth_token`.
     /// Never returns the fallback registry auth token to untrusted hosts.
     pub fn auth_token_for_url(&self, url: &Url) -> Option<&str> {
-        let host = url.host_str()?;
-        if !self.config.auth_tokens.is_empty() {
-            let host_lower: Cow<'_, str> = if host.bytes().any(|b| b.is_ascii_uppercase()) {
-                Cow::Owned(host.to_ascii_lowercase())
-            } else {
-                Cow::Borrowed(host)
-            };
-            let port_part = if let Some(port) = url.port() {
-                format!(":{port}")
-            } else {
-                String::new()
-            };
-            let path = url.path();
-            let normalized_path: Cow<'_, str> = if path.ends_with('/') {
-                Cow::Borrowed(path)
-            } else {
-                Cow::Owned(format!("{path}/"))
-            };
-
-            let candidate1 = format!("//{host_lower}{port_part}{normalized_path}");
-            if let Some(token) = self.config.auth_tokens.get(&candidate1) {
-                return Some(token.as_str());
-            }
-            let candidate2 = format!("//{host_lower}{port_part}{path}");
-            if let Some(token) = self.config.auth_tokens.get(&candidate2) {
-                return Some(token.as_str());
-            }
-            let candidate3 = format!("//{host_lower}{port_part}/");
-            if let Some(token) = self.config.auth_tokens.get(&candidate3) {
-                return Some(token.as_str());
-            }
-            if !port_part.is_empty() {
-                let candidate4 = format!("//{host_lower}/");
-                if let Some(token) = self.config.auth_tokens.get(&candidate4) {
-                    return Some(token.as_str());
-                }
-            }
+        if let Some(token) = Self::lookup_scoped_credential(&self.config.auth_tokens, url) {
+            return Some(token);
         }
 
         // Hardening: Fallback to self.config.auth_token ONLY if the host is trusted
@@ -2271,71 +2278,13 @@ impl RegistryClient {
             return false;
         }
 
-        // If explicitly defined in auth_tokens or basic_auths map for this URL, that specific host token is allowed
-        if self.has_scoped_auth {
-            let host: Cow<'_, str> = if raw_host.bytes().any(|b| b.is_ascii_uppercase()) {
-                Cow::Owned(raw_host.to_ascii_lowercase())
-            } else {
-                Cow::Borrowed(raw_host)
-            };
-            let port_part = if let Some(port) = current_url.port() {
-                format!(":{port}")
-            } else {
-                String::new()
-            };
-            let default_port_part = if port_part.is_empty() {
-                if let Some(port) = current_url.port_or_known_default() {
-                    format!(":{port}")
-                } else {
-                    String::new()
-                }
-            } else {
-                String::new()
-            };
-            let path = current_url.path();
-            let normalized_path: Cow<'_, str> = if path.ends_with('/') {
-                Cow::Borrowed(path)
-            } else {
-                Cow::Owned(format!("{path}/"))
-            };
-            let has_explicit_token = self
-                .config
-                .auth_tokens
-                .contains_key(&format!("//{host}{port_part}{normalized_path}"))
-                || self
-                    .config
-                    .auth_tokens
-                    .contains_key(&format!("//{host}{port_part}{path}"))
-                || self
-                    .config
-                    .auth_tokens
-                    .contains_key(&format!("//{host}{port_part}/"))
-                || (!port_part.is_empty()
-                    && self.config.auth_tokens.contains_key(&format!("//{host}/")))
-                || (!default_port_part.is_empty()
-                    && (self.config.auth_tokens.contains_key(&format!(
-                        "//{host}{default_port_part}{normalized_path}"
-                    )) || self
-                        .config
-                        .auth_tokens
-                        .contains_key(&format!("//{host}{default_port_part}/"))))
-                || self
-                    .config
-                    .basic_auths
-                    .contains_key(&format!("//{host}{port_part}{normalized_path}"))
-                || self
-                    .config
-                    .basic_auths
-                    .contains_key(&format!("//{host}{port_part}/"))
-                || (!default_port_part.is_empty()
-                    && self
-                        .config
-                        .basic_auths
-                        .contains_key(&format!("//{host}{default_port_part}/")));
-
-            if has_explicit_token {
-                return true;
-            }
+        // If explicitly defined in auth_tokens or basic_auths map for this URL, that specific host/subpath token is allowed
+        if self.has_scoped_auth
+            && (Self::lookup_scoped_credential(&self.config.auth_tokens, current_url).is_some()
+                || Self::lookup_scoped_credential(&self.config.basic_auths, current_url)
+                    .is_some())
+        {
+            return true;
         }
 
         // To receive the registry auth token, BOTH initial_url and current_url MUST be trusted hosts!
@@ -2368,7 +2317,10 @@ impl RegistryClient {
                 return true;
             }
         }
-        if self.config.trusted_hosts.contains(host.as_ref())
+        let is_default_port = current_url.port().is_none()
+            || current_url.port() == default_port_for_scheme(current_url.scheme());
+        if is_default_port
+            && self.config.trusted_hosts.contains(host.as_ref())
             && initial_url.port_or_known_default() == current_url.port_or_known_default()
         {
             return true;
@@ -2479,6 +2431,9 @@ impl RegistryClient {
         let path = url.path();
         let prefixes = generate_path_prefixes(path);
 
+        let is_default_port =
+            port_part.is_empty() || url.port() == default_port_for_scheme(url.scheme());
+
         for prefix in &prefixes {
             if !port_part.is_empty() {
                 let cand1 = format!("//{host_lower}{port_part}{prefix}");
@@ -2508,15 +2463,17 @@ impl RegistryClient {
                 }
             }
 
-            let cand2 = format!("//{host_lower}{prefix}");
-            if let Some(client) = self.scoped_clients.get(&cand2) {
-                return Some(client);
-            }
-            if prefix.ends_with('/') {
-                let no_slash = &prefix[..prefix.len() - 1];
-                let cand3 = format!("//{host_lower}{no_slash}");
-                if let Some(client) = self.scoped_clients.get(&cand3) {
+            if is_default_port {
+                let cand2 = format!("//{host_lower}{prefix}");
+                if let Some(client) = self.scoped_clients.get(&cand2) {
                     return Some(client);
+                }
+                if prefix.ends_with('/') {
+                    let no_slash = &prefix[..prefix.len() - 1];
+                    let cand3 = format!("//{host_lower}{no_slash}");
+                    if let Some(client) = self.scoped_clients.get(&cand3) {
+                        return Some(client);
+                    }
                 }
             }
         }
@@ -2552,11 +2509,24 @@ impl RegistryClient {
         accept_header: Option<&str>,
         if_none_match: Option<&str>,
     ) -> Result<(Response, OwnedSemaphorePermit), RegistryError> {
-        let permit = self.acquire_permit().await?;
-        let resp = self
-            .execute_request_loop(method, initial_url, accept_header, if_none_match)
+        let (resp, permit) = self
+            .execute_request_loop_state(
+                method,
+                initial_url.clone(),
+                initial_url,
+                0,
+                None,
+                0,
+                accept_header,
+                if_none_match,
+                None,
+                true,
+            )
             .await?;
-        Ok((resp, permit))
+        let LoopPermit::Owned(owned) = permit else {
+            unreachable!("execute_with_permit requested owned permit");
+        };
+        Ok((resp, owned))
     }
 
     async fn execute_with_borrowed_permit(
@@ -2566,15 +2536,24 @@ impl RegistryClient {
         accept_header: Option<&str>,
         if_none_match: Option<&str>,
     ) -> Result<(Response, SemaphorePermit<'_>), RegistryError> {
-        let permit = self
-            .semaphore
-            .acquire()
-            .await
-            .map_err(|e| RegistryError::Other(e.to_string()))?;
-        let resp = self
-            .execute_request_loop(method, initial_url, accept_header, if_none_match)
+        let (resp, permit) = self
+            .execute_request_loop_state(
+                method,
+                initial_url.clone(),
+                initial_url,
+                0,
+                None,
+                0,
+                accept_header,
+                if_none_match,
+                None,
+                false,
+            )
             .await?;
-        Ok((resp, permit))
+        let LoopPermit::Borrowed(borrowed) = permit else {
+            unreachable!("execute_with_borrowed_permit requested borrowed permit");
+        };
+        Ok((resp, borrowed))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2588,13 +2567,9 @@ impl RegistryClient {
         start_attempt: usize,
         accept_header: Option<&str>,
         if_none_match: Option<&str>,
+        probe_guard: Option<HalfOpenProbeGuard>,
     ) -> Result<(Response, SemaphorePermit<'_>), RegistryError> {
-        let permit = self
-            .semaphore
-            .acquire()
-            .await
-            .map_err(|e| RegistryError::Other(e.to_string()))?;
-        let resp = self
+        let (resp, permit) = self
             .execute_request_loop_state(
                 method,
                 initial_url,
@@ -2604,9 +2579,14 @@ impl RegistryClient {
                 start_attempt,
                 accept_header,
                 if_none_match,
+                probe_guard,
+                false,
             )
             .await?;
-        Ok((resp, permit))
+        let LoopPermit::Borrowed(borrowed) = permit else {
+            unreachable!("execute_with_borrowed_permit_from requested borrowed permit");
+        };
+        Ok((resp, borrowed))
     }
 
     /// Execute a request with an explicit body, content-type, and optional OTP header under semaphore permit.
@@ -2619,18 +2599,15 @@ impl RegistryClient {
         otp: Option<&str>,
         body: Vec<u8>,
     ) -> Result<(Response, OwnedSemaphorePermit), RegistryError> {
-        let permit = self.acquire_permit().await?;
-        let resp = self
-            .execute_request_loop_with_body(
-                method,
-                initial_url,
-                content_type,
-                accept_header,
-                otp,
-                body,
-            )
-            .await?;
-        Ok((resp, permit))
+        self.execute_request_loop_with_body(
+            method,
+            initial_url,
+            content_type,
+            accept_header,
+            otp,
+            body,
+        )
+        .await
     }
 
     #[inline]
@@ -2651,16 +2628,18 @@ impl RegistryClient {
         collect_cache_metadata: bool,
         kind: FastBodyKind<'_>,
     ) -> Result<DirectOrResume, RegistryError> {
-        let host_key = if self.config.circuit_breaker_enabled {
+        let (host_key, mut probe_guard) = if self.config.circuit_breaker_enabled {
             let hk = url_host_key(initial_url);
-            if self.circuit_breaker.check_state(&hk).await == CircuitBreakerState::Open {
-                return Err(RegistryError::CircuitBreakerOpen {
-                    host: hk.into_owned(),
-                });
-            }
-            Some(hk)
+            let guard = self
+                .circuit_breaker
+                .try_acquire_request(&hk)
+                .await
+                .map_err(|_| RegistryError::CircuitBreakerOpen {
+                    host: hk.clone().into_owned(),
+                })?;
+            (Some(hk), guard)
         } else {
-            None
+            (None, None)
         };
 
         let auth_cow: Option<Cow<'_, str>> = if self.has_any_auth
@@ -2743,6 +2722,9 @@ impl RegistryClient {
                 Ok(crate::http1_pool::HopOutcome::Success { etag, payload }) => {
                     if let Some(ref hk) = host_key {
                         self.circuit_breaker.record_success(hk).await;
+                        if let Some(mut g) = probe_guard.take() {
+                            g.disarm();
+                        }
                     }
                     return Ok(DirectOrResume::Success { etag, payload });
                 }
@@ -2754,6 +2736,9 @@ impl RegistryClient {
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     if let Some(ref hk) = host_key {
                         self.circuit_breaker.record_success(hk).await;
+                        if let Some(mut g) = probe_guard.take() {
+                            g.disarm();
+                        }
                     }
                     return Ok(DirectOrResume::NotModified {
                         etag,
@@ -2766,6 +2751,7 @@ impl RegistryClient {
                         redirect_count: 0,
                         seen_redirect_urls: None,
                         attempt,
+                        probe_guard: probe_guard.take(),
                     });
                 }
                 Ok(crate::http1_pool::HopOutcome::Redirect { status, location }) => {
@@ -2814,6 +2800,7 @@ impl RegistryClient {
                         redirect_count: 1,
                         seen_redirect_urls: Some(seen),
                         attempt,
+                        probe_guard: probe_guard.take(),
                     });
                 }
                 Ok(crate::http1_pool::HopOutcome::ErrorStatus {
@@ -2856,6 +2843,9 @@ impl RegistryClient {
                         }
                         if let Some(ref hk) = host_key {
                             self.circuit_breaker.record_failure(hk).await;
+                            if let Some(mut g) = probe_guard.take() {
+                                g.disarm();
+                            }
                         }
                         if is_rate_limited {
                             return Err(RegistryError::RateLimited {
@@ -2864,6 +2854,9 @@ impl RegistryClient {
                         }
                     } else if let Some(ref hk) = host_key {
                         self.circuit_breaker.record_success(hk).await;
+                        if let Some(mut g) = probe_guard.take() {
+                            g.disarm();
+                        }
                     }
 
                     if status == StatusCode::NOT_FOUND {
@@ -2932,33 +2925,15 @@ impl RegistryClient {
                     if let Some(ref hk) = host_key {
                         if err.is_transient() {
                             self.circuit_breaker.record_failure(hk).await;
+                            if let Some(mut g) = probe_guard.take() {
+                                g.disarm();
+                            }
                         }
                     }
                     return Err(err);
                 }
             }
         }
-    }
-
-    /// Internal request dispatch loop with redirect security policy, circuit breaking, and retry backoff.
-    async fn execute_request_loop(
-        &self,
-        method: Method,
-        initial_url: Url,
-        accept_header: Option<&str>,
-        if_none_match: Option<&str>,
-    ) -> Result<Response, RegistryError> {
-        self.execute_request_loop_state(
-            method,
-            initial_url.clone(),
-            initial_url,
-            0,
-            None,
-            0,
-            accept_header,
-            if_none_match,
-        )
-        .await
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2972,18 +2947,24 @@ impl RegistryClient {
         start_attempt: usize,
         accept_header: Option<&str>,
         if_none_match: Option<&str>,
-    ) -> Result<Response, RegistryError> {
-        let host_key = if self.config.circuit_breaker_enabled {
+        incoming_probe_guard: Option<HalfOpenProbeGuard>,
+        owned_permit: bool,
+    ) -> Result<(Response, LoopPermit<'_>), RegistryError> {
+        let (host_key, mut probe_guard) = if self.config.circuit_breaker_enabled {
             let hk = url_host_key(&initial_url);
-            let state = self.circuit_breaker.check_state(&hk).await;
-            if state == CircuitBreakerState::Open {
-                return Err(RegistryError::CircuitBreakerOpen {
-                    host: hk.into_owned(),
-                });
-            }
-            Some(hk)
+            let guard = if incoming_probe_guard.is_some() {
+                incoming_probe_guard
+            } else {
+                self.circuit_breaker
+                    .try_acquire_request(&hk)
+                    .await
+                    .map_err(|_| RegistryError::CircuitBreakerOpen {
+                        host: hk.clone().into_owned(),
+                    })?
+            };
+            (Some(hk), guard)
         } else {
-            None
+            (None, None)
         };
 
         let initial_auth = if self.has_any_auth
@@ -3010,6 +2991,16 @@ impl RegistryClient {
         let mut first_resume = Some((resume_url, resume_redirect_count, resume_seen_redirects));
 
         loop {
+            let permit = if owned_permit {
+                LoopPermit::Owned(self.acquire_permit().await?)
+            } else {
+                LoopPermit::Borrowed(
+                    self.semaphore
+                        .acquire()
+                        .await
+                        .map_err(|e| RegistryError::Other(e.to_string()))?,
+                )
+            };
             let (mut current_url, mut redirect_count, mut seen_redirect_urls) = first_resume
                 .take()
                 .unwrap_or_else(|| (initial_url.clone(), 0, None));
@@ -3148,8 +3139,11 @@ impl RegistryClient {
                     {
                         if let Some(ref hk) = host_key {
                             self.circuit_breaker.record_success(hk).await;
+                            if let Some(mut g) = probe_guard.take() {
+                                g.disarm();
+                            }
                         }
-                        return Ok(resp);
+                        return Ok((resp, permit));
                     }
 
                     // Check for retryable HTTP status codes (429, 502, 503, 504)
@@ -3180,12 +3174,16 @@ impl RegistryClient {
                                 attempt + 1,
                                 self.config.max_retries
                             );
+                            drop(permit);
                             tokio::time::sleep(delay).await;
                             attempt += 1;
                             continue;
                         } else {
                             if let Some(ref hk) = host_key {
                                 self.circuit_breaker.record_failure(hk).await;
+                                if let Some(mut g) = probe_guard.take() {
+                                    g.disarm();
+                                }
                             }
                             return Err(RegistryError::RateLimited {
                                 retry_after: retry_after_secs,
@@ -3214,21 +3212,28 @@ impl RegistryClient {
                                 attempt + 1,
                                 self.config.max_retries
                             );
+                            drop(permit);
                             tokio::time::sleep(delay).await;
                             attempt += 1;
                             continue;
                         } else {
                             if let Some(ref hk) = host_key {
                                 self.circuit_breaker.record_failure(hk).await;
+                                if let Some(mut g) = probe_guard.take() {
+                                    g.disarm();
+                                }
                             }
-                            return Ok(resp);
+                            return Ok((resp, permit));
                         }
                     }
 
                     if let Some(ref hk) = host_key {
                         self.circuit_breaker.record_success(hk).await;
+                        if let Some(mut g) = probe_guard.take() {
+                            g.disarm();
+                        }
                     }
-                    return Ok(resp);
+                    return Ok((resp, permit));
                 }
                 Err(err) => {
                     // Check if network error is transient and retryable
@@ -3242,6 +3247,7 @@ impl RegistryClient {
                             attempt + 1,
                             self.config.max_retries
                         );
+                        drop(permit);
                         tokio::time::sleep(delay).await;
                         attempt += 1;
                         continue;
@@ -3249,6 +3255,9 @@ impl RegistryClient {
                         if let Some(ref hk) = host_key {
                             if err.is_transient() {
                                 self.circuit_breaker.record_failure(hk).await;
+                                if let Some(mut g) = probe_guard.take() {
+                                    g.disarm();
+                                }
                             }
                         }
                         return Err(err);
@@ -3267,7 +3276,7 @@ impl RegistryClient {
         accept_header: Option<&str>,
         otp: Option<&str>,
         body: Vec<u8>,
-    ) -> Result<Response, RegistryError> {
+    ) -> Result<(Response, OwnedSemaphorePermit), RegistryError> {
         if let Some(otp_code) = otp {
             if otp_code.as_bytes().iter().any(|&b| b == b'\r' || b == b'\n') {
                 return Err(RegistryError::SecurityViolation(
@@ -3276,22 +3285,24 @@ impl RegistryClient {
             }
         }
 
-        let host_key = if self.config.circuit_breaker_enabled {
+        let (host_key, mut probe_guard) = if self.config.circuit_breaker_enabled {
             let hk = url_host_key(&initial_url);
-            let state = self.circuit_breaker.check_state(&hk).await;
-            if state == CircuitBreakerState::Open {
-                return Err(RegistryError::CircuitBreakerOpen {
-                    host: hk.into_owned(),
-                });
-            }
-            Some(hk)
+            let guard = self
+                .circuit_breaker
+                .try_acquire_request(&hk)
+                .await
+                .map_err(|_| RegistryError::CircuitBreakerOpen {
+                    host: hk.clone().into_owned(),
+                })?;
+            (Some(hk), guard)
         } else {
-            None
+            (None, None)
         };
 
         let mut attempt = 0;
 
         loop {
+            let permit = self.acquire_permit().await?;
             let mut current_url = initial_url.clone();
             let mut current_method = method.clone();
             let mut current_body = body.clone();
@@ -3458,12 +3469,16 @@ impl RegistryClient {
                                 attempt + 1,
                                 self.config.max_retries
                             );
+                            drop(permit);
                             tokio::time::sleep(delay).await;
                             attempt += 1;
                             continue;
                         } else {
                             if let Some(ref hk) = host_key {
                                 self.circuit_breaker.record_failure(hk).await;
+                                if let Some(mut g) = probe_guard.take() {
+                                    g.disarm();
+                                }
                             }
                             return Err(RegistryError::RateLimited {
                                 retry_after: retry_after_secs,
@@ -3492,21 +3507,28 @@ impl RegistryClient {
                                 attempt + 1,
                                 self.config.max_retries
                             );
+                            drop(permit);
                             tokio::time::sleep(delay).await;
                             attempt += 1;
                             continue;
                         } else {
                             if let Some(ref hk) = host_key {
                                 self.circuit_breaker.record_failure(hk).await;
+                                if let Some(mut g) = probe_guard.take() {
+                                    g.disarm();
+                                }
                             }
-                            return Ok(resp);
+                            return Ok((resp, permit));
                         }
                     }
 
                     if let Some(ref hk) = host_key {
                         self.circuit_breaker.record_success(hk).await;
+                        if let Some(mut g) = probe_guard.take() {
+                            g.disarm();
+                        }
                     }
-                    return Ok(resp);
+                    return Ok((resp, permit));
                 }
                 Err(err) => {
                     if err.is_transient() && attempt < self.config.max_retries {
@@ -3519,6 +3541,7 @@ impl RegistryClient {
                             attempt + 1,
                             self.config.max_retries
                         );
+                        drop(permit);
                         tokio::time::sleep(delay).await;
                         attempt += 1;
                         continue;
@@ -3526,6 +3549,9 @@ impl RegistryClient {
                         if let Some(ref hk) = host_key {
                             if err.is_transient() {
                                 self.circuit_breaker.record_failure(hk).await;
+                                if let Some(mut g) = probe_guard.take() {
+                                    g.disarm();
+                                }
                             }
                         }
                         return Err(err);
@@ -4230,7 +4256,7 @@ impl RegistryClient {
                 PackumentParseMode::Full
             };
 
-        let mut resume_state: Option<(Url, usize, Option<HashSet<Url>>, usize)> = None;
+        let mut resume_state: ResumeReqwestState = None;
         if self.can_use_http1_pool(url) {
             match self
                 .execute_http1_fast(
@@ -4289,8 +4315,15 @@ impl RegistryClient {
                     redirect_count,
                     seen_redirect_urls,
                     attempt,
+                    probe_guard,
                 } => {
-                    resume_state = Some((current_url, redirect_count, seen_redirect_urls, attempt));
+                    resume_state = Some((
+                        current_url,
+                        redirect_count,
+                        seen_redirect_urls,
+                        attempt,
+                        probe_guard,
+                    ));
                 }
             }
         }
@@ -4303,7 +4336,7 @@ impl RegistryClient {
         let mut stream_attempt = 0;
         let mut idle_sleep: Option<Pin<Box<tokio::time::Sleep>>> = None;
         loop {
-            let (mut resp, permit) = if let Some((ru, rc, sr, att)) = resume_state.take() {
+            let (mut resp, permit) = if let Some((ru, rc, sr, att, pg)) = resume_state.take() {
                 self.execute_with_borrowed_permit_from(
                     Method::GET,
                     url.clone(),
@@ -4313,6 +4346,7 @@ impl RegistryClient {
                     att,
                     Some(accept_header),
                     if_none_match,
+                    pg,
                 )
                 .await?
             } else {
@@ -4453,7 +4487,9 @@ impl RegistryClient {
                             }
                             if let Some(content_length) = expected_content_length {
                                 bytes.reserve(
-                                    (content_length as usize).min(self.config.max_metadata_size),
+                                    (content_length as usize)
+                                        .min(self.config.max_metadata_size)
+                                        .min(MAX_CONTENT_LENGTH_PREALLOC),
                                 );
                             }
                         }
@@ -4992,7 +5028,7 @@ impl RegistryClient {
         if_none_match: Option<&str>,
         compute_sha512: bool,
     ) -> Result<(BytesFetchResult, Option<String>), RegistryError> {
-        let mut resume_state: Option<(Url, usize, Option<HashSet<Url>>, usize)> = None;
+        let mut resume_state: ResumeReqwestState = None;
         if self.can_use_http1_pool(url) {
             match self
                 .execute_http1_fast(
@@ -5029,8 +5065,15 @@ impl RegistryClient {
                     redirect_count,
                     seen_redirect_urls,
                     attempt,
+                    probe_guard,
                 } => {
-                    resume_state = Some((current_url, redirect_count, seen_redirect_urls, attempt));
+                    resume_state = Some((
+                        current_url,
+                        redirect_count,
+                        seen_redirect_urls,
+                        attempt,
+                        probe_guard,
+                    ));
                 }
             }
         }
@@ -5043,7 +5086,7 @@ impl RegistryClient {
         let mut stream_attempt = 0;
         let mut idle_sleep: Option<Pin<Box<tokio::time::Sleep>>> = None;
         loop {
-            let (mut resp, _permit) = if let Some((ru, rc, sr, att)) = resume_state.take() {
+            let (mut resp, permit) = if let Some((ru, rc, sr, att, pg)) = resume_state.take() {
                 self.execute_with_borrowed_permit_from(
                     Method::GET,
                     url.clone(),
@@ -5053,6 +5096,7 @@ impl RegistryClient {
                     att,
                     None,
                     if_none_match,
+                    pg,
                 )
                 .await?
             } else {
@@ -5187,7 +5231,9 @@ impl RegistryClient {
                                 continue;
                             }
                             if let Some(content_length) = expected_content_length {
-                                bytes.reserve(content_length as usize);
+                                bytes.reserve(
+                                    (content_length as usize).min(MAX_CONTENT_LENGTH_PREALLOC),
+                                );
                             }
                         }
                         bytes.extend_from_slice(&chunk);
@@ -5197,6 +5243,7 @@ impl RegistryClient {
             }
 
             if let Some(err) = stream_err {
+                drop(permit);
                 if err.is_transient() && stream_attempt < self.config.max_retries {
                     let delay = self.calculate_backoff(stream_attempt);
                     debug!(
@@ -5349,10 +5396,11 @@ impl RegistryClient {
                 .file_name()
                 .and_then(|f| f.to_str())
                 .unwrap_or("download");
-            parent.join(format!("{file_name}.part"))
+            let seq = TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
+            parent.join(format!("{file_name}.{}.{seq}.part", std::process::id()))
         };
 
-        let mut resume_state: Option<(Url, usize, Option<HashSet<Url>>, usize)> = None;
+        let mut resume_state: ResumeReqwestState = None;
         if self.can_use_http1_pool(&url) {
             match self
                 .execute_http1_fast(
@@ -5385,8 +5433,15 @@ impl RegistryClient {
                     redirect_count,
                     seen_redirect_urls,
                     attempt,
+                    probe_guard,
                 } => {
-                    resume_state = Some((current_url, redirect_count, seen_redirect_urls, attempt));
+                    resume_state = Some((
+                        current_url,
+                        redirect_count,
+                        seen_redirect_urls,
+                        attempt,
+                        probe_guard,
+                    ));
                 }
             }
         }
@@ -5394,7 +5449,7 @@ impl RegistryClient {
         let mut stream_attempt = 0;
         let mut idle_sleep: Option<Pin<Box<tokio::time::Sleep>>> = None;
         loop {
-            let (mut resp, permit) = if let Some((ru, rc, sr, att)) = resume_state.take() {
+            let (mut resp, permit) = if let Some((ru, rc, sr, att, pg)) = resume_state.take() {
                 self.execute_with_borrowed_permit_from(
                     Method::GET,
                     url.clone(),
@@ -5404,6 +5459,7 @@ impl RegistryClient {
                     att,
                     None,
                     None,
+                    pg,
                 )
                 .await?
             } else {
@@ -5530,7 +5586,11 @@ impl RegistryClient {
                                         continue;
                                     }
                                     if let Some(content_length) = expected_content_length {
-                                        buf.reserve(content_length as usize);
+                                        buf.reserve(
+                                            (content_length as usize)
+                                                .min(DISK_BUFFER_THRESHOLD)
+                                                .min(MAX_CONTENT_LENGTH_PREALLOC),
+                                        );
                                     }
                                 }
                                 buf.extend_from_slice(&chunk);

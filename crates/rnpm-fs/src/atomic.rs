@@ -112,9 +112,6 @@ fn try_replace_dir(staging: &Path, destination: &Path, parent: &Path) -> std::io
         }
     }
 
-    // Opportunistically cleanup any abandoned .rnpm-trash directories in parent
-    cleanup_stale_trash(parent);
-
     // If destination already exists:
     // Move existing destination to a unique trash path (that does NOT yet exist) on the same filesystem
     let trash_path = generate_unique_path(parent, ".rnpm-trash");
@@ -133,9 +130,19 @@ fn try_replace_dir(staging: &Path, destination: &Path, parent: &Path) -> std::io
         Ok(()) => {
             // Rename staging -> destination
             if let Err(rename_err) = fs::rename(staging, destination) {
-                // Attempt rollback if staging -> destination failed
-                // Attempt rollback if staging -> destination failed, with exponential backoff retries
-                let _ = replace_dir_with_retries(&trash_path, destination, 5);
+                // Safe rollback: only restore trash -> destination if destination does not
+                // already exist (a concurrent winner may have replaced destination in the gap).
+                let dest_absent = matches!(
+                    fs::symlink_metadata(destination),
+                    Err(ref e) if e.kind() == std::io::ErrorKind::NotFound
+                );
+                if dest_absent {
+                    if fs::rename(&trash_path, destination).is_err() {
+                        let _ = crate::junction::remove_dir_all_safe(&trash_path);
+                    }
+                } else {
+                    let _ = crate::junction::remove_dir_all_safe(&trash_path);
+                }
                 return Err(rename_err);
             }
 
@@ -149,36 +156,6 @@ fn try_replace_dir(staging: &Path, destination: &Path, parent: &Path) -> std::io
             fs::rename(staging, destination)
         }
         Err(e) => Err(e),
-    }
-}
-
-/// Opportunistic cleanup of any leftover .rnpm-trash-* and .rnpm-staging-* directories in parent.
-fn cleanup_stale_trash(parent: &Path) {
-    let now = SystemTime::now();
-    if let Ok(entries) = fs::read_dir(parent) {
-        for entry in entries.flatten() {
-            let file_name = entry.file_name();
-            let name_str = file_name.to_string_lossy();
-            if name_str.starts_with(".rnpm-trash-") || name_str.starts_with(".rnpm-staging-") {
-                // Only clean staging or trash dirs older than 30 seconds to avoid deleting in-flight extractions or rollbacks
-                let should_clean = if let Ok(meta) = entry.metadata() {
-                    if let Ok(mtime) = meta.modified() {
-                        if let Ok(age) = now.duration_since(mtime) {
-                            age >= Duration::from_secs(30)
-                        } else {
-                            false
-                        }
-                    } else {
-                        false
-                    }
-                } else {
-                    false
-                };
-                if should_clean {
-                    let _ = crate::junction::remove_dir_all_safe(&entry.path());
-                }
-            }
-        }
     }
 }
 

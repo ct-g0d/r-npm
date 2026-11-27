@@ -145,7 +145,7 @@ pub mod fast_hash {
 
 pub use node_writer::{
     AsyncFileWriter, AsyncFileWriterSender, NodeWriter, NodeWriterMsg, NodeWriterSender,
-    RustWriterPool, WriteTask,
+    RustWriterPool, RustWriterSender, WriteTask,
 };
 
 pub use atomic::{extract_and_replace, recover_atomic_writes, replace_dir_with_retries};

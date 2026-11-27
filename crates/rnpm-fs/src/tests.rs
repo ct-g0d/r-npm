@@ -4038,3 +4038,190 @@ fn test_uppercase_file_before_its_own_dir_entry_succeeds() {
         Err(FsError::CaseCollision { .. })
     ));
 }
+
+#[test]
+fn test_tarball_symlink_validates_raw_link_target_and_large_exec_mode() {
+    // 1. Symlink whose raw target escapes destination must be rejected with EscapingSymlink,
+    //    and a symlink `bin/rel -> package/../good` resolves relative to `bin/` (`bin/good`),
+    //    NOT stripped of `package/` before validation.
+    let evil_tgz = {
+        let mut gz = GzEncoder::new(Vec::new(), Compression::default());
+        {
+            let mut tar = tar::Builder::new(&mut gz);
+            let mut hl = tar::Header::new_gnu();
+            hl.set_entry_type(tar::EntryType::Symlink);
+            hl.set_size(0);
+            hl.set_mode(0o777);
+            hl.set_link_name("package/../../../outside_secret").unwrap();
+            hl.set_cksum();
+            tar.append_data(&mut hl, "package/bin/evil", &[][..]).unwrap();
+            tar.finish().unwrap();
+        }
+        gz.finish().unwrap()
+    };
+    let dest_evil = tempdir().unwrap();
+    let res = crate::tarball::extract_tar_gz(std::io::Cursor::new(&evil_tgz), dest_evil.path(), None);
+    assert!(
+        matches!(res, Err(FsError::EscapingSymlink { .. })),
+        "Expected EscapingSymlink for package/../../../outside_secret, got {res:?}"
+    );
+
+    // Symlink `package/bin/rel` -> `package/../good`: without stripping `package/`,
+    // `bin/` + `package/../good` validates/resolves as `bin/good`, NOT root `good`.
+    let rel_tgz = {
+        let mut gz = GzEncoder::new(Vec::new(), Compression::default());
+        {
+            let mut tar = tar::Builder::new(&mut gz);
+            let mut hf = tar::Header::new_gnu();
+            let payload = b"target-in-bin";
+            hf.set_size(payload.len() as u64);
+            hf.set_mode(0o644);
+            hf.set_cksum();
+            tar.append_data(&mut hf, "package/bin/good", &payload[..])
+                .unwrap();
+
+            let mut hl = tar::Header::new_gnu();
+            hl.set_entry_type(tar::EntryType::Symlink);
+            hl.set_size(0);
+            hl.set_mode(0o777);
+            hl.set_link_name("package/../good").unwrap();
+            hl.set_cksum();
+            tar.append_data(&mut hl, "package/bin/rel", &[][..]).unwrap();
+            tar.finish().unwrap();
+        }
+        gz.finish().unwrap()
+    };
+    let dest_rel = tempdir().unwrap();
+    crate::tarball::extract_tar_gz(std::io::Cursor::new(&rel_tgz), dest_rel.path(), None).unwrap();
+    #[cfg(windows)]
+    assert_eq!(
+        fs::read(dest_rel.path().join("bin").join("rel")).unwrap(),
+        b"target-in-bin"
+    );
+    #[cfg(unix)]
+    assert_eq!(
+        fs::read_link(dest_rel.path().join("bin").join("rel")).unwrap(),
+        std::path::Path::new("package/../good")
+    );
+
+    // 2. Streamed regular file > 256 KiB preserves executable permissions on Unix and extracts cleanly.
+    // Use high-entropy bytes so gzip ratio stays well under TarLimits::max_compression_ratio (100:1).
+    let large_payload: Vec<u8> = (0u32..300 * 1024)
+        .map(|i| ((i.wrapping_mul(1664525).wrapping_add(1013904223)) >> 16) as u8)
+        .collect();
+    let large_tgz = {
+        let mut gz = GzEncoder::new(Vec::new(), Compression::default());
+        {
+            let mut tar = tar::Builder::new(&mut gz);
+            let mut hf = tar::Header::new_gnu();
+            hf.set_size(large_payload.len() as u64);
+            hf.set_mode(0o755);
+            hf.set_cksum();
+            tar.append_data(&mut hf, "package/bin/large-tool", large_payload.as_slice())
+                .unwrap();
+            tar.finish().unwrap();
+        }
+        gz.finish().unwrap()
+    };
+    let dest_large = tempdir().unwrap();
+    crate::tarball::extract_tar_gz(std::io::Cursor::new(&large_tgz), dest_large.path(), None)
+        .unwrap();
+    let out_file = dest_large.path().join("bin").join("large-tool");
+    assert_eq!(fs::read(&out_file).unwrap().len(), large_payload.len());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = fs::metadata(&out_file).unwrap().permissions().mode();
+        assert_ne!(
+            mode & 0o111,
+            0,
+            "Expected streamed >256KiB executable file to retain +x bits, mode={mode:#o}"
+        );
+    }
+}
+
+#[test]
+fn test_rust_writer_pool_error_does_not_drop_remaining_batch_or_hang() {
+    use crate::node_writer::{RustWriterPool, WriteTask};
+    use std::sync::Arc;
+
+    let dir = tempdir().unwrap();
+    let blocking_file = dir.path().join("not_a_dir");
+    fs::write(&blocking_file, b"occupy path as regular file").unwrap();
+
+    let pool = RustWriterPool::spawn(2, 64).unwrap();
+    let sender = pool.sender();
+
+    // First task fails (parent is a regular file), followed by valid tasks in the same batch.
+    sender
+        .send(WriteTask::File {
+            path: blocking_file.join("child.txt"),
+            data: Arc::new(b"fail".to_vec()),
+            mode: 0o644,
+        })
+        .unwrap();
+
+    for i in 0..40 {
+        let ok_path = dir.path().join("ok").join(format!("file_{i}.txt"));
+        sender
+            .send(WriteTask::File {
+                path: ok_path,
+                data: Arc::new(format!("payload-{i}").into_bytes()),
+                mode: 0o644,
+            })
+            .unwrap();
+    }
+    drop(sender);
+
+    let res = pool.finish();
+    assert!(res.is_err(), "Expected pool.finish() to report the write failure");
+
+    for i in 0..40 {
+        let ok_path = dir.path().join("ok").join(format!("file_{i}.txt"));
+        assert_eq!(
+            fs::read(&ok_path).unwrap(),
+            format!("payload-{i}").as_bytes(),
+            "Valid task {i} in batch/queue must not be dropped on prior item error"
+        );
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn test_windows_unc_verbatim_path_preserves_server_share_and_junction_buffer_cap() {
+    let unc = crate::path::to_verbatim_path(Path::new(r"\\server\share\dir\..\..\evil"));
+    assert_eq!(
+        unc.to_string_lossy(),
+        r"\\?\UNC\server\share\evil",
+        "UNC cleanup must preserve \\server\\share root against .. traversal"
+    );
+
+    let dir = tempdir().unwrap();
+    let link = dir.path().join("too_long_junction");
+    let oversized_target = std::path::PathBuf::from(format!(r"C:\{}", "a".repeat(9000)));
+    let err = crate::junction::create_directory_link(&link, &oversized_target).unwrap_err();
+    assert!(
+        matches!(err, FsError::JunctionError { .. }),
+        "Expected JunctionError for >16KiB reparse buffer, got {err:?}"
+    );
+}
+
+#[test]
+fn test_atomic_replace_dir_missing_staging_restores_destination_safely() {
+    let dir = tempdir().unwrap();
+    let dest = dir.path().join("dest");
+    fs::create_dir_all(&dest).unwrap();
+    fs::write(dest.join("keep.txt"), b"original").unwrap();
+
+    let missing_staging = dir.path().join("missing_staging");
+    let err = crate::atomic::replace_dir_with_retries(&missing_staging, &dest, 2).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            FsError::AtomicReplacementFailed { ref source, .. }
+                if source.kind() == std::io::ErrorKind::NotFound
+        ),
+        "Expected AtomicReplacementFailed(NotFound), got {err:?}"
+    );
+    assert_eq!(fs::read(dest.join("keep.txt")).unwrap(), b"original");
+}

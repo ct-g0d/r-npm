@@ -28,7 +28,9 @@ pub const OID_EC_P256: &str = "1.2.840.10045.3.1.7";
 pub const OID_EC_P384: &str = "1.3.132.0.34";
 pub const OID_ED25519: &str = "1.3.101.112";
 pub const OID_ECDSA_SHA256: &str = "1.2.840.10045.4.3.2";
+pub const OID_KEY_USAGE: &str = "2.5.29.15";
 pub const OID_SUBJECT_ALT_NAME: &str = "2.5.29.17";
+pub const OID_BASIC_CONSTRAINTS: &str = "2.5.29.19";
 
 // Fulcio OIDs
 pub const OID_FULCIO_ISSUER: &str = "1.3.6.1.4.1.57264.1.1";
@@ -39,6 +41,7 @@ pub const OID_FULCIO_GITHUB_WORKFLOW_REPOSITORY: &str = "1.3.6.1.4.1.57264.1.5";
 pub const OID_FULCIO_GITHUB_WORKFLOW_REF: &str = "1.3.6.1.4.1.57264.1.6";
 pub const OID_FULCIO_BUILD_TRIGGER: &str = "1.3.6.1.4.1.57264.1.8";
 pub const OID_FULCIO_RUN_COMMIT_SHA: &str = "1.3.6.1.4.1.57264.1.9";
+pub const OID_FULCIO_SOURCE_REPOSITORY_URI: &str = "1.3.6.1.4.1.57264.1.12";
 
 /// Parsed X.509 leaf certificate details for Sigstore verification.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -57,6 +60,8 @@ pub struct ParsedCertificate {
     pub not_after: i64,
     pub san_uris: Vec<String>,
     pub fulcio_extensions: HashMap<String, String>,
+    pub basic_constraints_ca: Option<bool>,
+    pub key_usage_cert_sign: Option<bool>,
 }
 
 /// Reads a single DER Tag-Length-Value from `input`.
@@ -525,6 +530,8 @@ pub fn parse_x509_certificate(der: &[u8]) -> Result<ParsedCertificate, RegistryE
     // Optional extensions: scan remaining elements for [3] (0xA3)
     let mut san_uris = Vec::new();
     let mut fulcio_extensions = HashMap::new();
+    let mut basic_constraints_ca = None;
+    let mut key_usage_cert_sign = None;
 
     while cursor < tbs_elems.len() {
         if tbs_elems[cursor].0 == TAG_CONTEXT_3 {
@@ -545,6 +552,8 @@ pub fn parse_x509_certificate(der: &[u8]) -> Result<ParsedCertificate, RegistryE
                                     octet_value.1,
                                     &mut san_uris,
                                     &mut fulcio_extensions,
+                                    &mut basic_constraints_ca,
+                                    &mut key_usage_cert_sign,
                                 );
                             }
                         }
@@ -571,6 +580,8 @@ pub fn parse_x509_certificate(der: &[u8]) -> Result<ParsedCertificate, RegistryE
         not_after,
         san_uris,
         fulcio_extensions,
+        basic_constraints_ca,
+        key_usage_cert_sign,
     })
 }
 
@@ -644,8 +655,34 @@ fn parse_extension(
     extn_value: &[u8],
     san_uris: &mut Vec<String>,
     fulcio_extensions: &mut HashMap<String, String>,
+    basic_constraints_ca: &mut Option<bool>,
+    key_usage_cert_sign: &mut Option<bool>,
 ) {
-    if oid == OID_SUBJECT_ALT_NAME {
+    if oid == OID_BASIC_CONSTRAINTS {
+        let is_ca = match read_tlv(extn_value) {
+            Ok((TAG_SEQUENCE, bc_val, _)) => match parse_sequence(bc_val) {
+                Ok(elems) => elems
+                    .first()
+                    .is_some_and(|(tag, val)| *tag == TAG_BOOLEAN && !val.is_empty() && val[0] != 0),
+                Err(_) => false,
+            },
+            _ => false,
+        };
+        *basic_constraints_ca = Some(is_ca);
+    } else if oid == OID_KEY_USAGE {
+        // KeyUsage ::= BIT STRING; keyCertSign is bit 5 (0x04 in first content octet).
+        let cert_sign = match read_tlv(extn_value) {
+            Ok((TAG_BIT_STRING, bs, _)) if bs.len() >= 2 && bs[0] <= 7 => {
+                if bs.len() == 2 && bs[0] > 2 {
+                    false
+                } else {
+                    (bs[1] & 0x04) != 0
+                }
+            }
+            _ => false,
+        };
+        *key_usage_cert_sign = Some(cert_sign);
+    } else if oid == OID_SUBJECT_ALT_NAME {
         // GeneralNames SEQUENCE
         if let Ok((tag, gn_val, _)) = read_tlv(extn_value) {
             if tag == TAG_SEQUENCE {
@@ -691,6 +728,62 @@ pub fn create_test_x509_certificate(
     fulcio_exts: &[(&str, &str)],
     not_before: i64,
     not_after: i64,
+    signer: &dyn Fn(&[u8]) -> Vec<u8>,
+) -> Vec<u8> {
+    create_test_x509_certificate_with_constraints(
+        subject_cn,
+        issuer_cn,
+        public_key_uncompressed_point,
+        san_uri,
+        fulcio_exts,
+        not_before,
+        not_after,
+        None,
+        None,
+        signer,
+    )
+}
+
+/// Helper for constructing a CA X.509 v3 certificate (`BasicConstraints: cA=TRUE`,
+/// `KeyUsage: keyCertSign | cRLSign`) for deterministic testing and mock Fulcio.
+#[allow(clippy::too_many_arguments)]
+pub fn create_test_ca_x509_certificate(
+    subject_cn: &str,
+    issuer_cn: &str,
+    public_key_uncompressed_point: &[u8],
+    san_uri: Option<&str>,
+    fulcio_exts: &[(&str, &str)],
+    not_before: i64,
+    not_after: i64,
+    signer: &dyn Fn(&[u8]) -> Vec<u8>,
+) -> Vec<u8> {
+    create_test_x509_certificate_with_constraints(
+        subject_cn,
+        issuer_cn,
+        public_key_uncompressed_point,
+        san_uri,
+        fulcio_exts,
+        not_before,
+        not_after,
+        Some(true),
+        Some(0x06), // keyCertSign (0x04) | cRLSign (0x02), unused_bits = 1
+        signer,
+    )
+}
+
+/// Helper for constructing an X.509 v3 certificate with explicit optional `BasicConstraints` (`is_ca`)
+/// and `KeyUsage` bitmask (first byte of BIT STRING, e.g. `0x80` = digitalSignature, `0x04` = keyCertSign).
+#[allow(clippy::too_many_arguments)]
+pub fn create_test_x509_certificate_with_constraints(
+    subject_cn: &str,
+    issuer_cn: &str,
+    public_key_uncompressed_point: &[u8],
+    san_uri: Option<&str>,
+    fulcio_exts: &[(&str, &str)],
+    not_before: i64,
+    not_after: i64,
+    basic_constraints_is_ca: Option<bool>,
+    key_usage_byte: Option<u8>,
     signer: &dyn Fn(&[u8]) -> Vec<u8>,
 ) -> Vec<u8> {
     // 1. [0] Version 3
@@ -797,6 +890,37 @@ pub fn create_test_x509_certificate(
 
     // 8. Extensions
     let mut extensions = Vec::new();
+    if let Some(is_ca) = basic_constraints_is_ca {
+        let bc_inner = if is_ca {
+            der_tlv(TAG_SEQUENCE, &der_tlv(TAG_BOOLEAN, &[0xFF]))
+        } else {
+            der_tlv(TAG_SEQUENCE, &[])
+        };
+        let ext = der_tlv(
+            TAG_SEQUENCE,
+            &[
+                der_tlv(TAG_OID, &encode_oid(OID_BASIC_CONSTRAINTS)),
+                der_tlv(TAG_BOOLEAN, &[0xFF]), // critical = TRUE
+                der_tlv(TAG_OCTET_STRING, &bc_inner),
+            ]
+            .concat(),
+        );
+        extensions.push(ext);
+    }
+    if let Some(ku_byte) = key_usage_byte {
+        let unused_bits = if ku_byte == 0 { 0 } else { ku_byte.trailing_zeros().min(7) as u8 };
+        let ku_bitstring = der_tlv(TAG_BIT_STRING, &[unused_bits, ku_byte]);
+        let ext = der_tlv(
+            TAG_SEQUENCE,
+            &[
+                der_tlv(TAG_OID, &encode_oid(OID_KEY_USAGE)),
+                der_tlv(TAG_BOOLEAN, &[0xFF]), // critical = TRUE
+                der_tlv(TAG_OCTET_STRING, &ku_bitstring),
+            ]
+            .concat(),
+        );
+        extensions.push(ext);
+    }
     if let Some(uri) = san_uri {
         let gn_uri = der_tlv(0x86, uri.as_bytes());
         let gn_seq = der_tlv(TAG_SEQUENCE, &gn_uri);

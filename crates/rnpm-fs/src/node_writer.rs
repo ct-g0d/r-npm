@@ -1,7 +1,8 @@
+use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
-use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
-use std::sync::Arc;
+use std::sync::mpsc::{sync_channel, Receiver, SendError, SyncSender};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 
 const NODE_WRITER_SCRIPT: &str = r#"
@@ -493,41 +494,60 @@ impl NodeWriterWorker {
             let mut hdr = [0u8; 12];
             let mut files = 0;
             let mut bytes = 0;
+            let write_frame = |stdin: &mut std::io::BufWriter<std::process::ChildStdin>,
+                               hdr: &mut [u8; 12],
+                               path: &str,
+                               data: &[u8],
+                               mode: u32|
+             -> std::io::Result<u64> {
+                let path_bytes = path.as_bytes();
+                let Ok(path_len) = u32::try_from(path_bytes.len()) else {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "NodeWriter path exceeds u32::MAX bytes",
+                    ));
+                };
+                let Ok(data_len) = u32::try_from(data.len()) else {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "NodeWriter file payload exceeds u32::MAX bytes",
+                    ));
+                };
+                hdr[0..4].copy_from_slice(&path_len.to_le_bytes());
+                hdr[4..8].copy_from_slice(&mode.to_le_bytes());
+                hdr[8..12].copy_from_slice(&data_len.to_le_bytes());
+                if let Err(e) = stdin.write_all(hdr) {
+                    eprintln!("[NODE_WRITER_ERR] write hdr: {e}");
+                    return Err(e);
+                }
+                if let Err(e) = stdin.write_all(path_bytes) {
+                    eprintln!("[NODE_WRITER_ERR] write path: {e}");
+                    return Err(e);
+                }
+                if let Err(e) = stdin.write_all(data) {
+                    eprintln!("[NODE_WRITER_ERR] write data: {e}");
+                    return Err(e);
+                }
+                Ok(u64::from(data_len))
+            };
+
             while let Ok(msg) = rx.recv() {
                 match msg {
                     NodeWriterMsg::File { path, data, mode } => {
-                        let path_bytes = path.as_bytes();
-                        let Ok(path_len) = u32::try_from(path_bytes.len()) else {
-                            return Err(std::io::Error::new(
-                                std::io::ErrorKind::InvalidInput,
-                                "NodeWriter path exceeds u32::MAX bytes",
-                            ));
-                        };
-                        let Ok(data_len) = u32::try_from(data.len()) else {
-                            return Err(std::io::Error::new(
-                                std::io::ErrorKind::InvalidInput,
-                                "NodeWriter file payload exceeds u32::MAX bytes",
-                            ));
-                        };
-                        hdr[0..4].copy_from_slice(&path_len.to_le_bytes());
-                        hdr[4..8].copy_from_slice(&mode.to_le_bytes());
-                        hdr[8..12].copy_from_slice(&data_len.to_le_bytes());
-                        if let Err(e) = stdin.write_all(&hdr) {
-                            eprintln!("[NODE_WRITER_ERR] write hdr: {e}");
-                            return Err(e);
-                        }
-                        if let Err(e) = stdin.write_all(path_bytes) {
-                            eprintln!("[NODE_WRITER_ERR] write path: {e}");
-                            return Err(e);
-                        }
-                        if let Err(e) = stdin.write_all(&data) {
-                            eprintln!("[NODE_WRITER_ERR] write data: {e}");
-                            return Err(e);
-                        }
+                        let written = write_frame(&mut stdin, &mut hdr, &path, &data, mode)?;
                         files += 1;
-                        bytes += u64::from(data_len);
+                        bytes += written;
                     }
-                    NodeWriterMsg::Close => break,
+                    NodeWriterMsg::Close => {
+                        while let Ok(rem) = rx.try_recv() {
+                            if let NodeWriterMsg::File { path, data, mode } = rem {
+                                let written = write_frame(&mut stdin, &mut hdr, &path, &data, mode)?;
+                                files += 1;
+                                bytes += written;
+                            }
+                        }
+                        break;
+                    }
                 }
             }
             if let Err(e) = stdin.flush() {
@@ -710,68 +730,175 @@ pub enum WriteTask {
     Close,
 }
 
-/// A dedicated pool of OS threads that drain a bounded channel and write files via `write_file_fast`.
+struct RustWriterQueueState {
+    queue: VecDeque<WriteTask>,
+    closed: bool,
+    sender_count: usize,
+    capacity: usize,
+}
+
+struct RustWriterQueue {
+    state: Mutex<RustWriterQueueState>,
+    not_empty: Condvar,
+    not_full: Condvar,
+}
+
+impl RustWriterQueue {
+    fn new(capacity: usize) -> Arc<Self> {
+        let cap = capacity.max(1);
+        Arc::new(Self {
+            state: Mutex::new(RustWriterQueueState {
+                queue: VecDeque::with_capacity(cap.min(4096)),
+                closed: false,
+                sender_count: 1,
+                capacity: cap,
+            }),
+            not_empty: Condvar::new(),
+            not_full: Condvar::new(),
+        })
+    }
+
+    fn close(&self) {
+        if let Ok(mut guard) = self.state.lock() {
+            guard.closed = true;
+            self.not_empty.notify_all();
+            self.not_full.notify_all();
+        }
+    }
+}
+
+/// Cloneable bounded sender for `RustWriterPool` without blocking-wait mutex convoy.
+pub struct RustWriterSender {
+    inner: Arc<RustWriterQueue>,
+}
+
+impl Clone for RustWriterSender {
+    fn clone(&self) -> Self {
+        if let Ok(mut guard) = self.inner.state.lock() {
+            guard.sender_count = guard.sender_count.saturating_add(1);
+        }
+        Self {
+            inner: Arc::clone(&self.inner),
+        }
+    }
+}
+
+impl Drop for RustWriterSender {
+    fn drop(&mut self) {
+        if let Ok(mut guard) = self.inner.state.lock() {
+            guard.sender_count = guard.sender_count.saturating_sub(1);
+            if guard.sender_count == 0 {
+                guard.closed = true;
+                self.inner.not_empty.notify_all();
+            }
+        }
+    }
+}
+
+impl RustWriterSender {
+    /// Sends a write task to the worker queue, blocking if at capacity until space frees or the queue closes.
+    pub fn send(&self, task: WriteTask) -> Result<(), SendError<WriteTask>> {
+        let Ok(mut guard) = self.inner.state.lock() else {
+            return Err(SendError(task));
+        };
+        while guard.queue.len() >= guard.capacity && !guard.closed {
+            guard = match self.inner.not_full.wait(guard) {
+                Ok(g) => g,
+                Err(_) => return Err(SendError(task)),
+            };
+        }
+        if guard.closed {
+            return Err(SendError(task));
+        }
+        let was_empty = guard.queue.is_empty();
+        guard.queue.push_back(task);
+        drop(guard);
+        if was_empty {
+            self.inner.not_empty.notify_one();
+        }
+        Ok(())
+    }
+}
+
+/// A dedicated pool of OS threads that drain a bounded queue without lock-held blocking waits.
 pub struct RustWriterPool {
-    sender: Option<SyncSender<WriteTask>>,
+    queue: Arc<RustWriterQueue>,
+    sender: Option<RustWriterSender>,
     handles: Vec<JoinHandle<std::io::Result<()>>>,
 }
 
 impl RustWriterPool {
-    /// Spawns `num_threads` OS worker threads draining `capacity` bounded channel.
+    /// Spawns `num_threads` OS worker threads draining a bounded queue of `capacity` slots.
     pub fn spawn(num_threads: usize, capacity: usize) -> Result<Self, std::io::Error> {
-        let (tx, rx) = sync_channel::<WriteTask>(capacity);
-        let rx = Arc::new(std::sync::Mutex::new(rx));
+        let queue = RustWriterQueue::new(capacity);
+        let sender = RustWriterSender {
+            inner: Arc::clone(&queue),
+        };
         let mut handles = Vec::with_capacity(num_threads);
 
         for _ in 0..num_threads {
-            let rx = Arc::clone(&rx);
+            let q = Arc::clone(&queue);
             handles.push(thread::spawn(move || -> std::io::Result<()> {
                 let mut batch = Vec::with_capacity(32);
                 let mut wide_buf: Vec<u16> = Vec::with_capacity(260);
+                let mut first_err: Option<std::io::Error> = None;
                 loop {
                     batch.clear();
                     {
-                        let Ok(guard) = rx.lock() else {
+                        let Ok(mut guard) = q.state.lock() else {
                             break;
                         };
-                        match guard.recv() {
-                            Ok(task) => {
-                                let is_close = matches!(task, WriteTask::Close);
-                                batch.push(task);
-                                if !is_close {
-                                    while batch.len() < 32 {
-                                        match guard.try_recv() {
-                                            Ok(t) => {
-                                                let close = matches!(t, WriteTask::Close);
-                                                batch.push(t);
-                                                if close {
-                                                    break;
-                                                }
-                                            }
-                                            Err(_) => break,
-                                        }
+                        while guard.queue.is_empty() && !guard.closed {
+                            guard = match q.not_empty.wait(guard) {
+                                Ok(g) => g,
+                                Err(_) => {
+                                    return first_err.map_or(Ok(()), Err);
+                                }
+                            };
+                        }
+                        if guard.queue.is_empty() && guard.closed {
+                            break;
+                        }
+                        while batch.len() < 32 {
+                            match guard.queue.pop_front() {
+                                Some(task) => {
+                                    let is_close = matches!(task, WriteTask::Close);
+                                    batch.push(task);
+                                    if is_close {
+                                        break;
                                     }
                                 }
+                                None => break,
                             }
-                            Err(_) => break,
+                        }
+                        let still_pending = !guard.queue.is_empty();
+                        drop(guard);
+                        if !batch.is_empty() {
+                            q.not_full.notify_all();
+                        }
+                        if still_pending {
+                            q.not_empty.notify_one();
                         }
                     }
                     let mut should_exit = false;
                     for task in batch.drain(..) {
                         match task {
                             WriteTask::File { path, data, mode } => {
-                                crate::writer::write_file_fast_buf(
+                                if let Err(err) = crate::writer::write_file_fast_buf(
                                     &path,
                                     &data,
                                     mode,
                                     65536,
                                     &mut wide_buf,
                                     true,
-                                )?;
+                                ) {
+                                    if first_err.is_none() {
+                                        first_err = Some(err);
+                                    }
+                                }
                             }
                             WriteTask::Close => {
                                 should_exit = true;
-                                break;
                             }
                         }
                     }
@@ -779,28 +906,29 @@ impl RustWriterPool {
                         break;
                     }
                 }
-                Ok(())
+                first_err.map_or(Ok(()), Err)
             }));
         }
 
         Ok(Self {
-            sender: Some(tx),
+            queue,
+            sender: Some(sender),
             handles,
         })
     }
 
     /// Obtains a cloned sender for worker threads.
-    pub fn sender(&self) -> SyncSender<WriteTask> {
-        self.sender.as_ref().unwrap().clone()
+    pub fn sender(&self) -> RustWriterSender {
+        self.sender
+            .as_ref()
+            .expect("RustWriterPool sender already closed")
+            .clone()
     }
 
-    /// Signals workers that no more tasks will be enqueued.
+    /// Signals workers that no more tasks will be enqueued, allowing all queued tasks to drain.
     pub fn close_input(&mut self) {
-        if let Some(s) = self.sender.take() {
-            for _ in 0..self.handles.len() {
-                let _ = s.send(WriteTask::Close);
-            }
-        }
+        self.sender.take();
+        self.queue.close();
     }
 
     /// Waits for all worker threads to finish.
@@ -839,7 +967,7 @@ impl RustWriterPool {
 #[derive(Clone)]
 pub enum AsyncFileWriterSender {
     Node(NodeWriterSender),
-    Rust(SyncSender<WriteTask>),
+    Rust(RustWriterSender),
 }
 
 impl AsyncFileWriterSender {
