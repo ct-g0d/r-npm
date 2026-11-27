@@ -5824,11 +5824,7 @@ async fn finish_install_or_ci_output(
             None
         };
         let funding = if fund_val && !dry_run {
-            audit::count_funding_packages_with_lockfile_opt(
-                report_dir,
-                lock_ref,
-                preloaded_lockfile.is_some(),
-            )
+            audit::count_funding_packages_with_lockfile(report_dir, lock_ref)
         } else {
             0
         };
@@ -5889,11 +5885,7 @@ async fn finish_install_or_ci_output(
             }
 
             if fund_val {
-                let count = audit::count_funding_packages_with_lockfile_opt(
-                    report_dir,
-                    lock_ref,
-                    preloaded_lockfile.is_some(),
-                );
+                let count = audit::count_funding_packages_with_lockfile(report_dir, lock_ref);
                 if count > 0 {
                     println!(
                         "\n{} packages are looking for funding\n  run `npm fund` for details",
@@ -9111,7 +9103,7 @@ fn try_parse_fast_command_with_overrides(
                     }
                     omit.extend(val.split(',').map(str::to_string));
                 } else if let Some(val) = tok.strip_prefix("--prefix=") {
-                    if prefix.is_some() {
+                    if prefix.is_some() || val.is_empty() {
                         return None;
                     }
                     prefix = Some(PathBuf::from(val));
@@ -9121,7 +9113,7 @@ fn try_parse_fast_command_with_overrides(
                     }
                     i += 1;
                     let val = rest.get(i)?;
-                    if val.starts_with('-') {
+                    if val.is_empty() || val.starts_with('-') {
                         return None;
                     }
                     prefix = Some(PathBuf::from(val));
@@ -9319,7 +9311,7 @@ fn try_parse_fast_command_with_overrides(
                     }
                     registry = Some(val.clone());
                 } else if let Some(val) = tok.strip_prefix("--cache=") {
-                    if cache.is_some() {
+                    if cache.is_some() || val.is_empty() {
                         return None;
                     }
                     cache = Some(PathBuf::from(val));
@@ -9329,12 +9321,12 @@ fn try_parse_fast_command_with_overrides(
                     }
                     i += 1;
                     let val = rest.get(i)?;
-                    if val.starts_with('-') {
+                    if val.is_empty() || val.starts_with('-') {
                         return None;
                     }
                     cache = Some(PathBuf::from(val));
                 } else if let Some(val) = tok.strip_prefix("--prefix=") {
-                    if seen_prefix {
+                    if seen_prefix || val.is_empty() {
                         return None;
                     }
                     seen_prefix = true;
@@ -9350,7 +9342,7 @@ fn try_parse_fast_command_with_overrides(
                     seen_prefix = true;
                     i += 1;
                     let val = rest.get(i)?;
-                    if val.starts_with('-') {
+                    if val.is_empty() || val.starts_with('-') {
                         return None;
                     }
                     if is_ci {

@@ -2807,46 +2807,12 @@ fn try_unwrap_node_cmd_shim(
     }
     let tail_before_args = tail.trim().strip_suffix("%*").map(str::trim)?;
 
-    // Parse quoted tokens cleanly: optional shim args followed by `"%dp0%\<rel_path>"`.
-    let mut quoted_tokens = Vec::new();
-    let mut chars = tail_before_args.chars().peekable();
-    while let Some(&c) = chars.peek() {
-        if c.is_ascii_whitespace() {
-            chars.next();
-            continue;
-        }
-        if c == '"' {
-            chars.next();
-            let mut tok = String::new();
-            let mut closed = false;
-            for ch in chars.by_ref() {
-                if ch == '"' {
-                    closed = true;
-                    break;
-                }
-                tok.push(ch);
-            }
-            if !closed {
-                return None;
-            }
-            quoted_tokens.push(tok);
-        } else {
-            let mut tok = String::new();
-            while let Some(&ch) = chars.peek() {
-                if ch.is_ascii_whitespace() || ch == '"' {
-                    break;
-                }
-                if matches!(ch, '%' | '!' | '&' | '|' | '<' | '>' | '^') {
-                    return None;
-                }
-                tok.push(ch);
-                chars.next();
-            }
-            quoted_tokens.push(tok);
-        }
+    // Only unwrap canonical shims that invoke `"%dp0%\<rel_path>"` directly with no
+    // extra interpreter arguments (preserving exact cmd.exe quoting for shebang flags).
+    let raw_target = tail_before_args.strip_prefix('"')?.strip_suffix('"')?;
+    if raw_target.contains('"') {
+        return None;
     }
-
-    let raw_target = quoted_tokens.pop()?;
     let rel_after_dp0 = raw_target
         .strip_prefix("%dp0%\\")
         .or_else(|| raw_target.strip_prefix("%dp0%/"))?;
@@ -2872,9 +2838,6 @@ fn try_unwrap_node_cmd_shim(
     } else {
         rel_after_dp0.to_string()
     };
-    if quoted_tokens.iter().any(|t| t.contains('%')) {
-        return None;
-    }
 
     let target_script = bin_dir.join(&rel_clean);
     if !target_script.is_file() {
@@ -2897,9 +2860,6 @@ fn try_unwrap_node_cmd_shim(
     };
 
     let mut cmd = Command::new(node_exe);
-    for arg in &quoted_tokens {
-        cmd.arg(arg);
-    }
     cmd.arg(target_script);
     cmd.args(rest);
     Some(cmd)

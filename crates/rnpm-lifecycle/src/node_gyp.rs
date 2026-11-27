@@ -1278,24 +1278,11 @@ pub fn create_private_node_gyp_shim(dir: &Path) -> std::io::Result<PathBuf> {
 pub fn node_gyp_bin_dir() -> Option<PathBuf> {
     struct CachedBinDir {
         path: PathBuf,
-        _temp: Option<tempfile::TempDir>,
+        _temp: tempfile::TempDir,
     }
     static BIN_DIR: std::sync::OnceLock<Option<CachedBinDir>> = std::sync::OnceLock::new();
     BIN_DIR
         .get_or_init(|| {
-            #[cfg(windows)]
-            {
-                let stable_dir = std::env::temp_dir().join("rnpm").join("node-gyp-bin");
-                if std::fs::create_dir_all(&stable_dir).is_ok()
-                    && create_private_node_gyp_shim(&stable_dir).is_ok()
-                {
-                    return Some(CachedBinDir {
-                        path: stable_dir,
-                        _temp: None,
-                    });
-                }
-            }
-
             let tmp_dir = match tempfile::Builder::new()
                 .prefix("rnpm-node-gyp-bin-")
                 .tempdir()
@@ -1314,7 +1301,7 @@ pub fn node_gyp_bin_dir() -> Option<PathBuf> {
 
             Some(CachedBinDir {
                 path: dir,
-                _temp: Some(tmp_dir),
+                _temp: tmp_dir,
             })
         })
         .as_ref()

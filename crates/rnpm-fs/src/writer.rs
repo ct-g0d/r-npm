@@ -2231,26 +2231,24 @@ pub fn decode_tar_entries<R: Read>(
         if entry_type.is_dir() {
             directories.push(target_path);
         } else if entry_type.is_file() {
-            let header_size = entry.header().size().ok();
-            if let Some(entry_size) = header_size {
-                if entry_size > limits.max_single_entry_size {
-                    return Err(FsError::TarBombLimitExceeded {
-                        limit_type: "entry size".to_string(),
-                        detail: format!(
-                            "Entry size {} exceeded single file limit of {} bytes",
-                            entry_size, limits.max_single_entry_size
-                        ),
-                    });
-                }
-                if total_uncompressed.saturating_add(entry_size) > limits.max_uncompressed_size {
-                    return Err(FsError::TarBombLimitExceeded {
-                        limit_type: "uncompressed size".to_string(),
-                        detail: format!(
-                            "Projected uncompressed size exceeds limit of {} bytes",
-                            limits.max_uncompressed_size
-                        ),
-                    });
-                }
+            let entry_size = entry.size();
+            if entry_size > limits.max_single_entry_size {
+                return Err(FsError::TarBombLimitExceeded {
+                    limit_type: "entry size".to_string(),
+                    detail: format!(
+                        "Entry size {} exceeded single file limit of {} bytes",
+                        entry_size, limits.max_single_entry_size
+                    ),
+                });
+            }
+            if total_uncompressed.saturating_add(entry_size) > limits.max_uncompressed_size {
+                return Err(FsError::TarBombLimitExceeded {
+                    limit_type: "uncompressed size".to_string(),
+                    detail: format!(
+                        "Projected uncompressed size exceeds limit of {} bytes",
+                        limits.max_uncompressed_size
+                    ),
+                });
             }
 
             let file_mode = entry
@@ -2258,15 +2256,15 @@ pub fn decode_tar_entries<R: Read>(
                 .mode()
                 .unwrap_or(crate::tarball::NPM_DEFAULT_FILE_MODE);
             let t_read = std::time::Instant::now();
-            let file_buf = match header_size {
-                Some(0) => Vec::new(),
-                Some(sz) if sz <= 4 * 1024 * 1024 => {
+            let file_buf = match entry_size {
+                0 => Vec::new(),
+                sz if sz <= 4 * 1024 * 1024 => {
                     let mut buf = vec![0u8; sz as usize];
                     entry.read_exact(&mut buf).map_err(FsError::Io)?;
                     buf
                 }
                 _ => {
-                    let initial_cap = header_size.unwrap_or(0).min(4 * 1024 * 1024) as usize;
+                    let initial_cap = entry_size.min(4 * 1024 * 1024) as usize;
                     let mut buf = Vec::with_capacity(initial_cap);
                     entry.read_to_end(&mut buf).map_err(FsError::Io)?;
                     buf

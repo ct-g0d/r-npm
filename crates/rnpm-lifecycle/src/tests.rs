@@ -4836,4 +4836,13 @@ fn test_try_unwrap_node_cmd_shim_and_fallback() {
     let modified_invoke = shim_content.replace("title %COMSPEC% &", "title %COMSPEC% & SET FOO=bar &");
     std::fs::write(&inline_cmd, modified_invoke).unwrap();
     assert!(try_unwrap_node_cmd_shim(&inline_cmd, &rest, dir.path(), &env).is_none());
+
+    // Shims with interpreter arguments (e.g. `--require="path with spaces"`) must fall back to cmd.exe
+    let interp_args_cmd = bin_dir.join("interp-args.cmd");
+    let modified_interp = shim_content.replace(
+        "\"%_prog%\"  \"%dp0%",
+        "\"%_prog%\"  --require=\"path with spaces\" \"%dp0%",
+    );
+    std::fs::write(&interp_args_cmd, modified_interp).unwrap();
+    assert!(try_unwrap_node_cmd_shim(&interp_args_cmd, &rest, dir.path(), &env).is_none());
 }

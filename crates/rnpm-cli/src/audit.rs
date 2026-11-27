@@ -1025,14 +1025,6 @@ pub(crate) fn count_funding_packages_with_lockfile(
     project_dir: &Path,
     preloaded_lockfile: Option<&rnpm_lockfile::LockfileV3>,
 ) -> usize {
-    count_funding_packages_with_lockfile_opt(project_dir, preloaded_lockfile, false)
-}
-
-pub(crate) fn count_funding_packages_with_lockfile_opt(
-    project_dir: &Path,
-    preloaded_lockfile: Option<&rnpm_lockfile::LockfileV3>,
-    trust_empty_v2_plus: bool,
-) -> usize {
     let loaded_lockfile = if preloaded_lockfile.is_none() {
         let (lock_path, _) = rnpm_install::resolve_lockfile_path(project_dir);
         if lock_path.exists() {
@@ -1049,7 +1041,7 @@ pub(crate) fn count_funding_packages_with_lockfile_opt(
             .iter()
             .filter(|(k, p)| !k.is_empty() && p.extra.contains_key("funding"))
             .count();
-        if count > 0 || (trust_empty_v2_plus && lockfile.lockfile_version >= 2) {
+        if count > 0 {
             return count;
         }
     }

@@ -1142,38 +1142,36 @@ pub fn extract_tar_gz<R: Read>(
                 )?;
             }
         } else if entry_type.is_file() {
-            // Check single entry size limit from header if available
-            let header_size = entry.header().size().ok();
-            if let Some(entry_size) = header_size {
-                if entry_size > limits.max_single_entry_size {
-                    return Err(FsError::TarBombLimitExceeded {
-                        limit_type: "entry size".to_string(),
-                        detail: format!(
-                            "Entry size {} exceeded single file limit of {} bytes",
-                            entry_size, limits.max_single_entry_size
-                        ),
-                    });
-                }
-                if total_uncompressed.saturating_add(entry_size) > limits.max_uncompressed_size {
-                    return Err(FsError::TarBombLimitExceeded {
-                        limit_type: "uncompressed size".to_string(),
-                        detail: format!(
-                            "Projected uncompressed size exceeds limit of {} bytes",
-                            limits.max_uncompressed_size
-                        ),
-                    });
-                }
+            // Use PAX-aware entry size so PAX `size` overrides are never truncated.
+            let entry_size = entry.size();
+            if entry_size > limits.max_single_entry_size {
+                return Err(FsError::TarBombLimitExceeded {
+                    limit_type: "entry size".to_string(),
+                    detail: format!(
+                        "Entry size {} exceeded single file limit of {} bytes",
+                        entry_size, limits.max_single_entry_size
+                    ),
+                });
+            }
+            if total_uncompressed.saturating_add(entry_size) > limits.max_uncompressed_size {
+                return Err(FsError::TarBombLimitExceeded {
+                    limit_type: "uncompressed size".to_string(),
+                    detail: format!(
+                        "Projected uncompressed size exceeds limit of {} bytes",
+                        limits.max_uncompressed_size
+                    ),
+                });
             }
 
             // Fast parallel batching path for <=256KB files on a fresh destination without
             // duplicate paths or prior symlinks.
-            if header_size.is_some_and(|sz| sz <= 256 * 1024)
+            if entry_size <= 256 * 1024
                 && is_fresh_dest
                 && !was_seen
                 && !tracker.has_symlinks
                 && !created_dirs.contains(&target_path)
             {
-                let sz = header_size.unwrap() as usize;
+                let sz = entry_size as usize;
                 let mut file_data = vec![0u8; sz];
                 let t_read = std::time::Instant::now();
                 if sz > 0 {
@@ -1253,8 +1251,8 @@ pub fn extract_tar_gz<R: Read>(
                 )?;
             }
 
-            if header_size.is_some_and(|sz| sz <= 256 * 1024) {
-                let sz = header_size.unwrap() as usize;
+            if entry_size <= 256 * 1024 {
+                let sz = entry_size as usize;
                 scratch_buf.resize(sz, 0);
                 let t_read = std::time::Instant::now();
                 if sz > 0 {

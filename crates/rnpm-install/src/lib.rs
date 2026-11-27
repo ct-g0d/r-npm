@@ -5588,8 +5588,6 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
             let active_semaphore = Arc::new(tokio::sync::Semaphore::new(48));
             let cpu_semaphore = Arc::new(tokio::sync::Semaphore::new(16));
             let pack_persist_semaphore = Arc::new(tokio::sync::Semaphore::new(16));
-            let cache_has_entries = self.cache().root().join("index-v5").exists()
-                || self.cache().root().join("content-v2").exists();
 
             let mut pack_writer = rnpm_fs::AsyncFileWriter::spawn().ok();
             let pack_sender = pack_writer.as_ref().map(|w| w.sender());
@@ -5791,20 +5789,12 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
 
                     let t_fetch = std::time::Instant::now();
                     let _fetch_span = tracing::info_span!("fetch", package = %loc);
-                    let cached_blob = if cache_has_entries {
-                        expected_integrity
-                            .as_ref()
-                            .and_then(|integrity| cache.get_by_integrity(integrity).ok().flatten())
-                    } else {
-                        None
-                    };
+                    let cached_blob = expected_integrity
+                        .as_ref()
+                        .and_then(|integrity| cache.get_by_integrity(integrity).ok().flatten());
                     let (bytes, was_hit) = if let Some(data) = cached_blob {
                         (data, true)
-                    } else if let Some((_entry, data)) = if cache_has_entries {
-                        cache.get(&resolved_url).ok().flatten()
-                    } else {
-                        None
-                    } {
+                    } else if let Some((_entry, data)) = cache.get(&resolved_url).ok().flatten() {
                         let t_v = std::time::Instant::now();
                         let is_valid = expected_integrity
                             .as_ref()
@@ -7531,8 +7521,6 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
             let active_semaphore = Arc::new(tokio::sync::Semaphore::new(48));
             let cpu_semaphore = Arc::new(tokio::sync::Semaphore::new(16));
             let pack_persist_semaphore = Arc::new(tokio::sync::Semaphore::new(16));
-            let cache_has_entries = self.cache().root().join("index-v5").exists()
-                || self.cache().root().join("content-v2").exists();
             let mut init_dirs = std::collections::HashSet::with_capacity(dirs_to_precreate.len());
             init_dirs.extend(dirs_to_precreate);
             let seen_dirs = Arc::new(std::sync::RwLock::new(init_dirs));
@@ -7644,17 +7632,13 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                             .map_err(|e| anyhow!("Invalid integrity hash: {e}"))?;
 
                         let t_fetch = std::time::Instant::now();
-                        let (data, was_hit, sha_hex) = if let Some(data) = if cache_has_entries {
+                        let (data, was_hit, sha_hex) = if let Some(data) =
                             cache.get_by_integrity(&expected_integrity).ok().flatten()
-                        } else {
-                            None
-                        } {
+                        {
                             (data, true, None)
-                        } else if let Some((_entry, data)) = if cache_has_entries {
+                        } else if let Some((_entry, data)) =
                             cache.get(&resolved_url).ok().flatten()
-                        } else {
-                            None
-                        } {
+                        {
                             if expected_integrity.verify(&data).is_ok() {
                                 (data, true, None)
                             } else {
