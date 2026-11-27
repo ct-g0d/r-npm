@@ -469,7 +469,7 @@ impl Config {
 
         if let Some(path) = builtin_config_path {
             if path.as_os_str() != "false" && !path.as_os_str().is_empty() {
-                if let Some(builtin_config) = Npmrc::from_file_if_exists(&path)? {
+                if let Some(builtin_config) = Npmrc::from_file_if_exists_with_env(&path, env_lookup)? {
                     layers.push(ConfigLayer {
                         name: "builtin".to_string(),
                         source: Some(path),
@@ -514,7 +514,9 @@ impl Config {
 
             if let Some(path) = explicit_global {
                 if path.as_os_str() != "false" && !path.as_os_str().is_empty() {
-                    if let Some(global_config) = Npmrc::from_file_if_exists(&path)? {
+                    if let Some(global_config) =
+                        Npmrc::from_file_if_exists_with_env(&path, env_lookup)?
+                    {
                         layers.push(ConfigLayer {
                             name: "global".to_string(),
                             source: Some(path),
@@ -527,7 +529,9 @@ impl Config {
                 let primary_global = find_global_prefix_with_env(env_lookup)
                     .join("etc")
                     .join("npmrc");
-                if let Some(global_config) = Npmrc::from_file_if_exists(&primary_global)? {
+                if let Some(global_config) =
+                    Npmrc::from_file_if_exists_with_env(&primary_global, env_lookup)?
+                {
                     layers.push(ConfigLayer {
                         name: "global".to_string(),
                         source: Some(primary_global),
@@ -536,7 +540,9 @@ impl Config {
                     base_npmrc.merge(global_config);
                 } else {
                     let etc_path = PathBuf::from("/etc/npmrc");
-                    if let Some(global_config) = Npmrc::from_file_if_exists(&etc_path)? {
+                    if let Some(global_config) =
+                        Npmrc::from_file_if_exists_with_env(&etc_path, env_lookup)?
+                    {
                         layers.push(ConfigLayer {
                             name: "global".to_string(),
                             source: Some(etc_path),
@@ -587,7 +593,9 @@ impl Config {
 
         if let Some(path) = user_config_path {
             if path.as_os_str() != "false" && !path.as_os_str().is_empty() {
-                if let Some(user_config) = Npmrc::from_file_if_exists(&path)? {
+                if let Some(user_config) =
+                    Npmrc::from_file_if_exists_with_env(&path, env_lookup)?
+                {
                     layers.push(ConfigLayer {
                         name: "user".to_string(),
                         source: Some(path),
@@ -608,7 +616,9 @@ impl Config {
 
         if let Some(ws_path) = ws_root {
             let ws_npmrc_path = ws_path.join(".npmrc");
-            if let Some(ws_config) = Npmrc::from_file_if_exists(&ws_npmrc_path)? {
+            if let Some(ws_config) =
+                Npmrc::from_file_if_exists_with_env(&ws_npmrc_path, env_lookup)?
+            {
                 layers.push(ConfigLayer {
                     name: "workspace".to_string(),
                     source: Some(ws_npmrc_path),
@@ -620,7 +630,9 @@ impl Config {
 
         if let Some(dir) = options.project_dir {
             let project_npmrc_path = dir.join(".npmrc");
-            if let Some(project_config) = Npmrc::from_file_if_exists(&project_npmrc_path)? {
+            if let Some(project_config) =
+                Npmrc::from_file_if_exists_with_env(&project_npmrc_path, env_lookup)?
+            {
                 layers.push(ConfigLayer {
                     name: "project".to_string(),
                     source: Some(project_npmrc_path),
@@ -653,13 +665,17 @@ impl Config {
             let mut cli_layer_settings = BTreeMap::new();
             for (key, value) in cli_map {
                 let clean_key = key.strip_prefix("--").unwrap_or(&key);
-                let lower_clean = clean_key.to_ascii_lowercase();
-                let (prefix, body) = if let Some(stripped) = lower_clean.strip_prefix('_') {
-                    ("_", stripped)
+                let dashed = if clean_key.starts_with('@') || clean_key.starts_with("//") {
+                    clean_key.to_string()
                 } else {
-                    ("", lower_clean.as_str())
+                    let lower_clean = clean_key.to_ascii_lowercase();
+                    let (prefix, body) = if let Some(stripped) = lower_clean.strip_prefix('_') {
+                        ("_", stripped)
+                    } else {
+                        ("", lower_clean.as_str())
+                    };
+                    format!("{prefix}{}", body.replace('_', "-"))
                 };
-                let dashed = format!("{prefix}{}", body.replace('_', "-"));
                 let val_display = if crate::npmrc::is_sensitive_credential_key(clean_key) {
                     crate::npmrc::mask_credential(&value)
                 } else {

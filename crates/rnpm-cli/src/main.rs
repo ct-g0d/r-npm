@@ -2306,6 +2306,11 @@ where
     while i < args.len() {
         let arg = &args[i];
 
+        if arg == "--" {
+            remaining.extend(args[i..].iter().cloned());
+            break;
+        }
+
         // 1. Check combined form: `--@scope:registry=https://...` or `@scope:registry=https://...`
         if let Some((scope, url)) = parse_scoped_registry_arg(arg) {
             scoped.insert(scope, url);
@@ -2347,6 +2352,15 @@ where
     }
 
     (remaining, scoped)
+}
+
+pub(crate) fn merge_scoped_registries_into_overrides(
+    scoped_registries: &std::collections::BTreeMap<String, Url>,
+    overrides: &mut BTreeMap<String, String>,
+) {
+    for (scope, url) in scoped_registries {
+        overrides.insert(format!("{scope}:registry"), url.to_string());
+    }
 }
 
 /// Resolve the registry URL for a package using a default registry and scoped registries map.
@@ -3892,6 +3906,51 @@ pub(crate) fn check_npx_consent(
     }
 }
 
+pub(crate) fn npx_cache_dir_name(specs: &[String]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut sorted = specs.to_vec();
+    sorted.sort();
+    let mut hasher = Sha256::new();
+    for spec in &sorted {
+        hasher.update(spec.as_bytes());
+        hasher.update(b"\n");
+    }
+    let digest = hasher.finalize();
+    data_encoding::HEXLOWER.encode(&digest[..8])
+}
+
+fn legacy_npx_safe_spec(raw: &str) -> String {
+    raw.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+fn resolve_npx_env_dir(cache_path: &Path, specs: &[String]) -> PathBuf {
+    let npx_root = cache_path.join("_npx");
+    let hashed = npx_root.join(npx_cache_dir_name(specs));
+    if hashed.exists() {
+        return hashed;
+    }
+    let mut sorted = specs.to_vec();
+    sorted.sort();
+    let legacy_name = if sorted.len() == 1 {
+        legacy_npx_safe_spec(&sorted[0])
+    } else {
+        legacy_npx_safe_spec(&sorted.join("_"))
+    };
+    let legacy = npx_root.join(legacy_name);
+    if legacy.exists() {
+        return legacy;
+    }
+    hashed
+}
+
 /// Install `specs` into a cached npx environment and return its directory.
 pub(crate) async fn ensure_npx_environment(
     project_dir: &Path,
@@ -3901,31 +3960,22 @@ pub(crate) async fn ensure_npx_environment(
     offline: bool,
     consent: Option<bool>,
 ) -> anyhow::Result<PathBuf> {
+    let cfg = std::env::current_dir()
+        .ok()
+        .and_then(|dir| rnpm_config::Config::load(Some(&dir)).ok())
+        .or_else(|| rnpm_config::Config::load(Some(project_dir)).ok());
     let cache_path = cache
-        .or_else(|| {
-            let dir = std::env::current_dir().ok()?;
-            rnpm_config::Config::load(Some(&dir))
-                .ok()?
-                .get("cache")
-                .map(PathBuf::from)
-        })
+        .or_else(|| cfg.as_ref().and_then(|c| c.get("cache")).map(PathBuf::from))
         .unwrap_or_else(|| {
             std::env::var_os("LOCALAPPDATA")
                 .map(|d| PathBuf::from(d).join("rnpm").join("cache"))
                 .unwrap_or_else(|| std::env::temp_dir().join(".rnpm-cache"))
         });
-    let safe: String = specs
-        .join("+")
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '+') {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect();
-    let env_dir = cache_path.join("_npx").join(safe);
+    let ignore_scripts = cfg
+        .as_ref()
+        .and_then(|c| c.get_bool("ignore-scripts"))
+        .unwrap_or(false);
+    let env_dir = resolve_npx_env_dir(&cache_path, specs);
     let mut deps = serde_json::Map::new();
     for spec in specs {
         let (name, req) = parse_package_spec(spec);
@@ -3954,6 +4004,7 @@ pub(crate) async fn ensure_npx_environment(
             init_cwd: std::env::current_dir().ok(),
             registry_url: registry,
             cache_dir: Some(cache_path),
+            ignore_scripts,
             silent: true,
             ..Default::default()
         })?;
@@ -4066,14 +4117,41 @@ fn resolve_exec_cache_path(
         })
 }
 
+fn installed_pkg_version_in_nm(nm_dir: &Path, pkg_name: &str) -> Option<String> {
+    let pkg_json = nm_dir.join(pkg_name).join("package.json");
+    let content = std::fs::read_to_string(pkg_json).ok()?;
+    let parsed: serde_json::Value = serde_json::from_str(&content).ok()?;
+    parsed
+        .get("version")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+}
+
+fn bin_path_satisfies_spec(bin_path: &Path, pkg_name: &str, version_req: &str) -> bool {
+    let Some(bin_dir) = bin_path.parent() else {
+        return false;
+    };
+    if bin_dir.file_name().and_then(|n| n.to_str()) != Some(".bin") {
+        return false;
+    }
+    let Some(nm_dir) = bin_dir.parent() else {
+        return false;
+    };
+    let Some(installed_ver) = installed_pkg_version_in_nm(nm_dir, pkg_name) else {
+        return false;
+    };
+    rnpm_install::version_matches_range(&installed_ver, version_req)
+}
+
 fn resolve_local_or_system_exec_bin(
     dir: &std::path::Path,
     cmd_pkg_name: &str,
     cmd_bin_name: &str,
     command: &str,
+    explicit_version_req: Option<&str>,
     check_system: bool,
 ) -> Option<PathBuf> {
-    rnpm_lifecycle::find_local_binary(dir, cmd_pkg_name)
+    let local_match = rnpm_lifecycle::find_local_binary(dir, cmd_pkg_name)
         .or_else(|| {
             (cmd_bin_name != cmd_pkg_name)
                 .then(|| rnpm_lifecycle::find_local_binary(dir, cmd_bin_name))
@@ -4084,13 +4162,22 @@ fn resolve_local_or_system_exec_bin(
                 .then(|| rnpm_lifecycle::find_local_binary(dir, command))
                 .flatten()
         })
-        .or_else(|| {
-            if check_system {
-                find_system_binary(command)
-            } else {
-                None
-            }
-        })
+        .filter(|bin| match explicit_version_req {
+            Some(req) => bin_path_satisfies_spec(bin, cmd_pkg_name, req),
+            None => true,
+        });
+    if local_match.is_some() {
+        return local_match;
+    }
+    if check_system {
+        if let Some(req) = explicit_version_req {
+            let sys_bin = find_system_binary(cmd_bin_name)
+                .or_else(|| (cmd_pkg_name != cmd_bin_name).then(|| find_system_binary(cmd_pkg_name)).flatten());
+            return sys_bin.filter(|bin| bin_path_satisfies_spec(bin, cmd_pkg_name, req));
+        }
+        return find_system_binary(command);
+    }
+    None
 }
 
 fn try_execute_sync_exec_with_config(
@@ -4158,7 +4245,9 @@ fn try_execute_sync_exec_with_config(
         return Some(Ok(()));
     }
 
-    let (cmd_pkg_name, _) = parse_package_spec(target_command);
+    let (cmd_pkg_name, version_req) = parse_package_spec(target_command);
+    let explicit_req = (target_command != cmd_pkg_name && !version_req.is_empty() && version_req != "*")
+        .then_some(version_req.as_str());
     let cmd_bin_name = cmd_pkg_name
         .find('/')
         .map_or(cmd_pkg_name.as_str(), |s| &cmd_pkg_name[s + 1..]);
@@ -4168,27 +4257,19 @@ fn try_execute_sync_exec_with_config(
         &cmd_pkg_name,
         cmd_bin_name,
         target_command,
+        explicit_req,
         true,
     ) {
         bin
     } else {
         let cache_path = resolve_exec_cache_path(current_dir, cache, Some(config));
-        let safe_spec: String = target_command
-            .chars()
-            .map(|c| {
-                if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' {
-                    c
-                } else {
-                    '_'
-                }
-            })
-            .collect();
-        let npx_env_dir = cache_path.join("_npx").join(&safe_spec);
+        let npx_env_dir = resolve_npx_env_dir(&cache_path, &[target_command.to_string()]);
         resolve_local_or_system_exec_bin(
             &npx_env_dir,
             &cmd_pkg_name,
             cmd_bin_name,
             target_command,
+            None,
             false,
         )?
     };
@@ -4239,7 +4320,9 @@ pub(crate) async fn execute_exec_with_config(
     if command.is_empty() && package_specs.is_empty() {
         return Ok(());
     }
-    let (cmd_pkg_name, _) = parse_package_spec(command);
+    let (cmd_pkg_name, version_req) = parse_package_spec(command);
+    let explicit_req = (command != cmd_pkg_name && !version_req.is_empty() && version_req != "*")
+        .then_some(version_req.as_str());
     let cmd_bin_name = if let Some(slash) = cmd_pkg_name.find('/') {
         &cmd_pkg_name[slash + 1..]
     } else {
@@ -4255,15 +4338,21 @@ pub(crate) async fn execute_exec_with_config(
         }
     };
     let cache_path = resolve_exec_cache_path(current_dir, cache.as_ref(), config_ref);
+    let ignore_scripts = config_ref
+        .and_then(|c| c.get_bool("ignore-scripts"))
+        .unwrap_or(false);
+
+    let mut extra_npx_bin_dir: Option<PathBuf> = None;
 
     let binary_to_run = if package_specs.is_empty() {
         // When -p is NOT provided:
-        // 1. Check local node_modules/.bin first, or system PATH
+        // 1. Check local node_modules/.bin first (verifying semver if explicit spec given), or system PATH
         let local_bin = resolve_local_or_system_exec_bin(
             current_dir,
             &cmd_pkg_name,
             cmd_bin_name,
             command,
+            explicit_req,
             true,
         );
 
@@ -4271,19 +4360,7 @@ pub(crate) async fn execute_exec_with_config(
             bin_path
         } else {
             // Not found locally: derive package and version from command, and install into ephemeral _npx cache
-            let (pkg_name, version_req) = parse_package_spec(command);
-            let safe_spec: String = command
-                .chars()
-                .map(|c| {
-                    if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' {
-                        c
-                    } else {
-                        '_'
-                    }
-                })
-                .collect();
-
-            let npx_env_dir = cache_path.join("_npx").join(&safe_spec);
+            let npx_env_dir = resolve_npx_env_dir(&cache_path, &[command.to_string()]);
             let bin_target = rnpm_lifecycle::find_local_binary(&npx_env_dir, &cmd_pkg_name)
                 .or_else(|| rnpm_lifecycle::find_local_binary(&npx_env_dir, cmd_bin_name))
                 .or_else(|| rnpm_lifecycle::find_local_binary(&npx_env_dir, command));
@@ -4305,10 +4382,10 @@ pub(crate) async fn execute_exec_with_config(
                     "name": "rnpm-exec-env",
                     "version": "1.0.0",
                     "dependencies": {
-                        pkg_name.clone(): version_req.clone()
+                        cmd_pkg_name.clone(): version_req.clone()
                     },
                     "_npx": {
-                        "packages": [format!("{pkg_name}@{version_req}")]
+                        "packages": [format!("{cmd_pkg_name}@{version_req}")]
                     }
                 });
 
@@ -4323,7 +4400,7 @@ pub(crate) async fn execute_exec_with_config(
                     registry_url: registry,
                     cache_dir: Some(cache_path.clone()),
                     offline: false,
-                    ignore_scripts: false,
+                    ignore_scripts,
                     silent: true,
                     ..Default::default()
                 };
@@ -4344,36 +4421,39 @@ pub(crate) async fn execute_exec_with_config(
                 {
                     target
                 } else {
-                    package_binary(&npx_env_dir, &pkg_name)?
+                    package_binary(&npx_env_dir, &cmd_pkg_name)?
                 }
             }
         }
     } else {
         // When -p is provided:
-        // Strictly install packages provided via -p into ephemeral _npx cache,
-        // and execute command from the resulting node_modules/.bin
+        // Install packages provided via -p into ephemeral _npx cache if not already present,
+        // then resolve `command` from npx_env_dir/.bin, local node_modules/.bin, or PATH
+        // (matching npm's libnpmexec; never picking an arbitrary file from read_dir).
         let mut sorted_specs = package_specs.to_vec();
         sorted_specs.sort();
-        let raw_spec = sorted_specs.join("_");
-        let safe_spec: String = raw_spec
-            .chars()
-            .map(|c| {
-                if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' {
-                    c
-                } else {
-                    '_'
-                }
-            })
-            .collect();
+        let npx_env_dir = resolve_npx_env_dir(&cache_path, &sorted_specs);
 
-        let npx_env_dir = cache_path.join("_npx").join(&safe_spec);
-        let bin_target = rnpm_lifecycle::find_local_binary(&npx_env_dir, command)
-            .or_else(|| rnpm_lifecycle::find_local_binary(&npx_env_dir, cmd_bin_name))
-            .or_else(|| rnpm_lifecycle::find_local_binary(&npx_env_dir, &cmd_pkg_name));
+        let mut deps = serde_json::Map::new();
+        for spec in package_specs {
+            let (pkg_name, pkg_ver_req) = parse_package_spec(spec);
+            deps.insert(pkg_name, serde_json::Value::String(pkg_ver_req));
+        }
+        let minimal_manifest = serde_json::json!({
+            "name": "rnpm-exec-env",
+            "version": "1.0.0",
+            "dependencies": deps,
+            "_npx": {
+                "packages": package_specs
+            }
+        });
+        let manifest_text = serde_json::to_string_pretty(&minimal_manifest)?;
+        let already_installed = npx_env_dir.join("node_modules").is_dir()
+            && (!npx_env_dir.join("package.json").is_file()
+                || std::fs::read_to_string(npx_env_dir.join("package.json"))
+                    .is_ok_and(|t| t == manifest_text));
 
-        if let Some(target) = bin_target {
-            target
-        } else {
+        if !already_installed {
             check_npx_consent(current_dir, package_specs, consent)?;
             if offline {
                 return Err(anyhow::anyhow!(
@@ -4383,26 +4463,7 @@ pub(crate) async fn execute_exec_with_config(
             }
 
             std::fs::create_dir_all(&npx_env_dir)?;
-
-            let mut deps = serde_json::Map::new();
-            for spec in package_specs {
-                let (pkg_name, version_req) = parse_package_spec(spec);
-                deps.insert(pkg_name, serde_json::Value::String(version_req));
-            }
-
-            let minimal_manifest = serde_json::json!({
-                "name": "rnpm-exec-env",
-                "version": "1.0.0",
-                "dependencies": deps,
-                "_npx": {
-                    "packages": package_specs
-                }
-            });
-
-            std::fs::write(
-                npx_env_dir.join("package.json"),
-                serde_json::to_string_pretty(&minimal_manifest)?,
-            )?;
+            std::fs::write(npx_env_dir.join("package.json"), &manifest_text)?;
 
             let install_options = InstallOptions {
                 project_dir: npx_env_dir.clone(),
@@ -4410,45 +4471,41 @@ pub(crate) async fn execute_exec_with_config(
                 registry_url: registry,
                 cache_dir: Some(cache_path.clone()),
                 offline: false,
-                ignore_scripts: false,
+                ignore_scripts,
                 silent: true,
                 ..Default::default()
             };
 
             let mut installer = Installer::new(install_options)?;
             installer.run().await?;
+        }
 
-            if let Some(target) = rnpm_lifecycle::find_local_binary(&npx_env_dir, command) {
-                target
-            } else if let Some(target) =
-                rnpm_lifecycle::find_local_binary(&npx_env_dir, cmd_bin_name)
-            {
-                target
-            } else if let Some(target) =
-                rnpm_lifecycle::find_local_binary(&npx_env_dir, &cmd_pkg_name)
-            {
-                target
-            } else {
-                let bin_dir = npx_env_dir.join("node_modules").join(".bin");
-                let mut found = None;
-                if bin_dir.is_dir() {
-                    if let Ok(entries) = std::fs::read_dir(&bin_dir) {
-                        for entry in entries.flatten() {
-                            let p = entry.path();
-                            if p.is_file() {
-                                found = Some(p);
-                                break;
-                            }
-                        }
-                    }
-                }
-                found.ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "Could not determine binary to run for command '{}'",
-                        command
-                    )
-                })?
-            }
+        let npx_bin_dir = npx_env_dir.join("node_modules").join(".bin");
+        if npx_bin_dir.is_dir() {
+            extra_npx_bin_dir = Some(npx_bin_dir);
+        }
+
+        if let Some(target) = rnpm_lifecycle::find_local_binary(&npx_env_dir, command)
+            .or_else(|| rnpm_lifecycle::find_local_binary(&npx_env_dir, cmd_bin_name))
+            .or_else(|| rnpm_lifecycle::find_local_binary(&npx_env_dir, &cmd_pkg_name))
+        {
+            target
+        } else if package_specs.len() == 1 && command == package_specs[0] {
+            package_binary(&npx_env_dir, &cmd_pkg_name)?
+        } else if let Some(target) = resolve_local_or_system_exec_bin(
+            current_dir,
+            &cmd_pkg_name,
+            cmd_bin_name,
+            command,
+            explicit_req,
+            true,
+        ) {
+            target
+        } else {
+            return Err(anyhow::anyhow!(
+                "Could not determine binary to run for command '{}'",
+                command
+            ));
         }
     };
 
@@ -4475,8 +4532,13 @@ pub(crate) async fn execute_exec_with_config(
         println!("\n> {id}npx\n> {display_bin}{suffix}\n");
     }
 
-    // Execute the resolved binary with ancestor bin directories prepended to PATH
+    // Execute the resolved binary with ancestor bin directories (and _npx/.bin) prepended to PATH
     let mut path_entries = rnpm_lifecycle::collect_ancestor_bin_dirs(current_dir);
+    if let Some(npx_bin) = extra_npx_bin_dir {
+        if !path_entries.contains(&npx_bin) {
+            path_entries.insert(0, npx_bin);
+        }
+    }
     if let Some(parent_bin) = binary_to_run.parent() {
         if !path_entries.contains(&parent_bin.to_path_buf()) {
             path_entries.insert(0, parent_bin.to_path_buf());
@@ -8689,6 +8751,25 @@ fn npm_json_error(block: &str) -> String {
     serde_json::to_string_pretty(&serde_json::json!({ "error": error })).unwrap_or_default()
 }
 
+/// Normalize a process failure exit code so POSIX modulo-256 truncation can never
+/// turn an HTTP status code (e.g. `404`, `500`, `512`), `0`, or out-of-range error
+/// into a `0` success exit code. Standard script exit codes in `1..=255` are preserved.
+pub(crate) fn normalize_failure_exit_code(code: i32) -> i32 {
+    if (1..=255).contains(&code) {
+        code
+    } else {
+        1
+    }
+}
+
+fn missing_manifest_exit_code() -> i32 {
+    if cfg!(windows) {
+        -4058
+    } else {
+        (-2i32 as u8) as i32
+    }
+}
+
 fn finish_cli_error(err: &anyhow::Error) -> ! {
     let silent = is_loglevel_silent(&std::env::current_dir().unwrap_or_default());
     if err.is::<commands::login::InputClosed>() {
@@ -8702,7 +8783,7 @@ fn finish_cli_error(err: &anyhow::Error) -> ! {
             eprintln!("{}", exit.message);
         }
         write_error_log(err);
-        std::process::exit(exit.exit_code);
+        std::process::exit(normalize_failure_exit_code(exit.exit_code));
     }
     let rendered = format!("{err:#}");
     if json_error_requested() {
@@ -8729,13 +8810,10 @@ fn finish_cli_error(err: &anyhow::Error) -> ! {
     let status = diagnostics::classify_error(err)
         .code
         .parse::<i32>()
-        .unwrap_or({
+        .map(normalize_failure_exit_code)
+        .unwrap_or_else(|_| {
             if missing_manifest {
-                if cfg!(windows) {
-                    -4058
-                } else {
-                    -2
-                }
+                missing_manifest_exit_code()
             } else {
                 1
             }
@@ -10539,7 +10617,7 @@ fn main() {
         raw_args_vec.clone()
     };
 
-    let (filtered_args, _scoped_registries) = extract_scoped_registries(effective_args);
+    let (filtered_args, scoped_registries) = extract_scoped_registries(effective_args);
     let warn_workspaces = filtered_args
         .iter()
         .take_while(|a| a.as_str() != "--")
@@ -10563,6 +10641,11 @@ fn main() {
         let (preprocessed, cmd) = preprocess_cli_args_with_cmd(filtered_args);
         (preprocessed, cmd, None)
     };
+    if !scoped_registries.is_empty() {
+        let mut overrides = rnpm_config::get_process_cli_overrides().unwrap_or_default();
+        merge_scoped_registries_into_overrides(&scoped_registries, &mut overrides);
+        rnpm_config::set_process_cli_overrides(overrides);
+    }
     let mut ambient_config: Option<rnpm_config::Config> = None;
     if warn_workspaces {
         let cfg = rnpm_config::Config::load(Some(&inv_cwd)).unwrap_or_default();

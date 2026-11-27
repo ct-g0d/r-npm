@@ -1782,3 +1782,149 @@ fn test_create_shims_with_preloaded_header_handles_crlf_bom_empty_and_long_sheba
     .unwrap();
     assert!(bin_dir.join("bom-cli").exists() || fs::symlink_metadata(bin_dir.join("bom-cli")).is_ok());
 }
+
+#[test]
+fn test_shim_sed_backslash_and_shebang_injection_escaping() {
+    // 1. generator.rs must emit `sed -e 's,\\,/,g'` (two backslashes in generated .sh)
+    let content = generator::generate_shim_content(
+        "../pkg/cli.js",
+        Some(&shebang::ShebangInfo {
+            program: "node".to_string(),
+            args: Vec::new(),
+        }),
+    );
+    assert!(
+        content.sh.contains("sed -e 's,\\\\,/,g'"),
+        "sh shim must contain properly escaped sed pattern, got:\n{}",
+        content.sh
+    );
+
+    // 2. Malicious shebang program & args must be safely quoted across .sh, .cmd, and .ps1
+    let evil_prog = "node;touch /tmp/pwned\"'$(id)%PATH%`whoami`";
+    let evil_arg = "foo\" & echo PWNED'$(id)`date`\u{2018}\u{2019}\u{201c}\u{201d}";
+
+    let gen_evil = generator::generate_shim_content(
+        "../pkg/cli.js",
+        Some(&shebang::ShebangInfo {
+            program: evil_prog.to_string(),
+            args: vec![evil_arg.to_string()],
+        }),
+    );
+    // Single-quoted in .sh with embedded ' escaped as '\''
+    assert!(
+        gen_evil.sh.contains("exec 'node;touch /tmp/pwned\"'\\''$(id)%PATH%`whoami`'"),
+        "generator.sh must safely single-quote shebang program, got:\n{}",
+        gen_evil.sh
+    );
+    // Double quotes stripped from shebang program & % doubled inside .cmd SET "_prog=..."
+    assert!(
+        gen_evil.cmd.contains(r#"SET "_prog=node;touch \tmp\pwned'$(id)%%PATH%%`whoami`""#),
+        "generator.cmd must strip quotes and escape % in shebang program, got:\n{}",
+        gen_evil.cmd
+    );
+    assert!(
+        gen_evil.cmd.contains(r#""foo"\^"" & echo PWNED'$(id)`date`"#),
+        "generator.cmd must use cmd-safe quote escaping in args, got:\n{}",
+        gen_evil.cmd
+    );
+    // Double quotes and smart quotes escaped in .ps1
+    assert!(
+        gen_evil.ps1.contains("`\""),
+        "generator.ps1 must backtick-escape double quotes in double-quoted program/path"
+    );
+    assert!(
+        gen_evil.ps1.contains("\u{2018}\u{2018}"),
+        "generator.ps1 must double smart single quotes inside single-quoted args"
+    );
+
+    // 3. generate_program_shims must apply the same escaping to program & tokenized args
+    let prog_evil = generate_program_shims(
+        "../pkg/cli.js",
+        evil_prog,
+        r#"--msg="hello" foo\" & echo PWNED'$(id)`date`"# /* closed + escaped quote */,
+    );
+    let (prog_sh, prog_cmd, _prog_ps1) = prog_evil;
+    let (_, _, prog_ps1) =
+        generate_program_shims("../pkg/cli.js", evil_prog, evil_arg);
+    assert!(
+        prog_sh.contains("exec 'node;touch /tmp/pwned\"'\\''$(id)%PATH%`whoami`'"),
+        "generate_program_shims .sh must safely quote program"
+    );
+    assert!(
+        prog_cmd.contains(r#""\^"""#),
+        "generate_program_shims .cmd must prevent \\\" breakout, got:\n{prog_cmd}"
+    );
+    assert!(
+        prog_ps1.contains("\u{2018}\u{2018}"),
+        "generate_program_shims .ps1 must neutralize smart quotes"
+    );
+}
+
+#[test]
+fn test_ps1_smart_quote_breakout_escaping() {
+    let args = "arg\u{2018}break\u{2019}and\u{201A}more\u{201B}end";
+    let ps1_escaped = escape_ps1_path_cow("path\u{201C}with\u{201D}smart\u{201E}quotes\u{201F}");
+    assert!(ps1_escaped.contains("`\u{201C}"));
+    assert!(ps1_escaped.contains("`\u{201D}"));
+    assert!(ps1_escaped.contains("`\u{201E}"));
+    assert!(ps1_escaped.contains("`\u{201F}"));
+
+    let (_sh, _cmd, ps1) = generate_program_shims("../pkg/cli.js", "node", args);
+    assert!(
+        ps1.contains("\u{2018}\u{2018}"),
+        "Unicode left smart single quote must be doubled in ps1 args"
+    );
+    assert!(
+        ps1.contains("\u{2019}\u{2019}"),
+        "Unicode right smart single quote must be doubled in ps1 args"
+    );
+    assert!(
+        ps1.contains("\u{201A}\u{201A}") && ps1.contains("\u{201B}\u{201B}"),
+        "All Unicode smart single quote variants must be doubled in ps1 args"
+    );
+}
+
+#[test]
+fn test_normalize_shebang_file_preserves_hardlink_cas_source() {
+    let dir = tempdir().unwrap();
+    let cas_file = dir.path().join("cas_blob.js");
+    let linked_bin = dir.path().join("pkg_cli.js");
+    let original = b"#!/usr/bin/env node\r\nconsole.log('hello');\r\n";
+    fs::write(&cas_file, original).unwrap();
+    fs::hard_link(&cas_file, &linked_bin).unwrap();
+
+    let changed = shebang::normalize_shebang_file(&linked_bin).unwrap();
+    assert!(changed, "CRLF target with shebang should normalize");
+
+    assert_eq!(
+        fs::read(&linked_bin).unwrap(),
+        b"#!/usr/bin/env node\nconsole.log('hello');\r\n"
+    );
+    assert_eq!(
+        fs::read(&cas_file).unwrap(),
+        original,
+        "hardlinked CAS blob must NEVER be mutated in place during CRLF normalization"
+    );
+}
+
+#[test]
+fn test_read_long_shebang_over_512_bytes() {
+    let dir = tempdir().unwrap();
+    let long_script = dir.path().join("long_shebang.js");
+    let padding = "x".repeat(700);
+    let content = format!("#!/usr/bin/env node --title={padding}\r\nconsole.log(1);\r\n");
+    fs::write(&long_script, content.as_bytes()).unwrap();
+
+    let read_res = shebang::normalize_and_read_shebang_line(&long_script).unwrap();
+    let line = match read_res {
+        shebang::ShebangRead::Line(l) => l,
+        other => panic!("expected ShebangRead::Line, got {other:?}"),
+    };
+    let parsed = shebang::parse_shebang(&line).expect("must parse >512-byte shebang");
+    assert_eq!(parsed.program, "node");
+    assert_eq!(parsed.args, vec![format!("--title={padding}")]);
+    assert!(
+        fs::read(&long_script).unwrap().starts_with(b"#!/usr/bin/env node --title="),
+        "normalized script should remain intact"
+    );
+}

@@ -27,10 +27,10 @@ fn test_env_interpolation() {
     // Unset without fallback produces empty
     assert_eq!(interpolate_env("val=${UNSET_VAR}", &lookup), "val=");
 
-    // $VAR shorthand
+    // Unbraced $VAR is NOT expanded (npmrc only expands braced ${VAR})
     assert_eq!(
         interpolate_env("token=$AUTH_TOKEN", &lookup),
-        "token=secret_token_123"
+        "token=$AUTH_TOKEN"
     );
 }
 
@@ -1757,6 +1757,126 @@ fn test_find_workspace_root_escaped_workspaces_key() {
     assert_eq!(
         found.as_deref().and_then(|p| p.canonicalize().ok()),
         root.canonicalize().ok()
+    );
+}
+
+#[test]
+fn test_config_env_vars_used_for_npmrc_and_unset_var_does_not_clobber_token() {
+    let tmp = tempdir().unwrap();
+    let user_rc = tmp.path().join("user.npmrc");
+    let proj_dir = tmp.path().join("proj");
+    fs::create_dir_all(&proj_dir).unwrap();
+
+    fs::write(
+        &user_rc,
+        "//registry.npmjs.org/:_authToken=real_user_token\n//custom.example/:_authToken=${CUSTOM_TOKEN}\nliteral=$KEEP_LITERAL\n",
+    )
+    .unwrap();
+    // Project .npmrc references an unset env var; it must NOT wipe out user_rc's real_user_token!
+    fs::write(
+        proj_dir.join(".npmrc"),
+        "//registry.npmjs.org/:_authToken=${UNSET_PROJECT_TOKEN}\n",
+    )
+    .unwrap();
+
+    let mut env_map = std::collections::BTreeMap::new();
+    env_map.insert("CUSTOM_TOKEN".to_string(), "custom_from_options".to_string());
+    env_map.insert("KEEP_LITERAL".to_string(), "should_not_expand".to_string());
+
+    let cfg = Config::load_with_options(
+        ConfigOptions::new()
+            .project_dir(&proj_dir)
+            .userconfig(user_rc)
+            .globalconfig(std::path::PathBuf::from("false"))
+            .builtin_config(std::path::PathBuf::from("false"))
+            .env_vars(env_map),
+    )
+    .unwrap();
+
+    assert_eq!(
+        cfg.npmrc
+            .get_auth_token(&Url::parse("https://custom.example/pkg").unwrap()),
+        Some("custom_from_options"),
+        "ConfigOptions.env_vars must be used during .npmrc file interpolation"
+    );
+    assert_eq!(
+        cfg.npmrc
+            .get_auth_token(&Url::parse("https://registry.npmjs.org/pkg").unwrap()),
+        Some("real_user_token"),
+        "unset ${{UNSET_PROJECT_TOKEN}} must NOT clobber earlier auth token"
+    );
+    assert_eq!(
+        cfg.get("literal"),
+        Some("$KEEP_LITERAL"),
+        "unbraced $VAR must remain literal"
+    );
+}
+
+#[test]
+fn test_cross_port_auth_isolation_and_cli_underscore_scope() {
+    let content = r#"
+//localhost/:_authToken=portless_token
+//localhost/:_auth=dXNlcjpwYXNz
+//localhost/:cafile=/etc/portless.pem
+//localhost:4873/:_authToken=port_4873_token
+"#;
+    let npmrc = Npmrc::parse(content).unwrap();
+
+    // Exact non-default port matches its own token
+    let url_4873 = Url::parse("http://localhost:4873/pkg").unwrap();
+    assert_eq!(npmrc.get_auth_token(&url_4873), Some("port_4873_token"));
+
+    // Different non-default port must NOT fall back to portless //localhost/ credentials
+    let url_9999 = Url::parse("http://localhost:9999/pkg").unwrap();
+    assert_eq!(npmrc.get_auth_token(&url_9999), None);
+    assert_eq!(npmrc.get_basic_auth(&url_9999), None);
+    assert_eq!(npmrc.get_scoped_setting(&url_9999, "cafile"), None);
+
+    // Underscore in CLI @scope:registry must not be mangled into dashed @my-scope
+    let mut cli = std::collections::BTreeMap::new();
+    cli.insert(
+        "@my_scope:registry".to_string(),
+        "https://scope.example.com/npm/".to_string(),
+    );
+    let cfg = Config::load_with_options(
+        ConfigOptions::new()
+            .userconfig(std::path::PathBuf::from("false"))
+            .globalconfig(std::path::PathBuf::from("false"))
+            .builtin_config(std::path::PathBuf::from("false"))
+            .cli_overrides(cli)
+            .env_vars(std::collections::BTreeMap::new()),
+    )
+    .unwrap();
+    assert_eq!(
+        cfg.npmrc
+            .registry_for_package("@my_scope/pkg")
+            .as_str(),
+        "https://scope.example.com/npm/"
+    );
+    assert_eq!(
+        cfg.npmrc
+            .registry_for_package("@my-scope/pkg")
+            .as_str(),
+        crate::DEFAULT_REGISTRY
+    );
+}
+
+#[test]
+fn test_release_age_glob_linear_performance_on_adversarial_patterns() {
+    let start = std::time::Instant::now();
+    let pat = "*a*a*a*a*a*a*a*a*a*a*a*a*b";
+    let text = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaac";
+    assert!(!crate::release_age::is_release_age_excluded(text, &[pat]));
+
+    let deep_pat = "@scope/**/a/**/b/**/c/**/d/**/e/**/z";
+    let deep_txt = "@scope/a/x/x/x/x/x/x/x/x/x/b/y/y/y/y/y/y/c/w/w/w/w";
+    assert!(!crate::release_age::is_release_age_excluded(
+        deep_txt,
+        &[deep_pat]
+    ));
+    assert!(
+        start.elapsed() < std::time::Duration::from_secs(1),
+        "adversarial glob must finish in linear/polynomial time"
     );
 }
 

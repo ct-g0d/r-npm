@@ -1242,9 +1242,13 @@ async fn run_check(kind: DoctorCheckKind, env: &DoctorEnv) -> Result<String, Che
 }
 
 async fn node_version_check() -> Result<String, CheckFailure> {
-    let current = std::process::Command::new("node")
-        .arg("--version")
+    let mut cmd = tokio::process::Command::new("node");
+    cmd.arg("--version");
+    #[cfg(windows)]
+    cmd.creation_flags(0x0800_0000);
+    let current = cmd
         .output()
+        .await
         .ok()
         .filter(|o| o.status.success())
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
@@ -1376,23 +1380,38 @@ pub async fn run_npm_doctor(project_dir: &Path, groups: &[String]) -> anyhow::Re
     let config = rnpm_config::Config::load(Some(project_dir)).unwrap_or_default();
     let registry = config.npmrc.registry.clone();
     let silent = doctor_is_silent(&config);
-    let env = DoctorEnv {
+    let env = std::sync::Arc::new(DoctorEnv {
         config,
         registry,
         project_dir: project_dir.to_path_buf(),
-    };
+    });
+    let selected: Vec<&DoctorCheck> = DOCTOR_CHECKS
+        .iter()
+        .filter(|check| {
+            !(cfg!(windows) && !check.windows)
+                && (groups.is_empty() || groups.iter().any(|g| check.groups.contains(&g.as_str())))
+        })
+        .collect();
+    let mut results: Vec<Option<Result<String, CheckFailure>>> =
+        (0..selected.len()).map(|_| None).collect();
+    let mut join_set = tokio::task::JoinSet::new();
+    for (idx, check) in selected.iter().enumerate() {
+        let env_c = std::sync::Arc::clone(&env);
+        let kind = check.kind;
+        join_set.spawn(async move { (idx, run_check(kind, &env_c).await) });
+    }
+    while let Some(res) = join_set.join_next().await {
+        match res {
+            Ok((idx, outcome)) => results[idx] = Some(outcome),
+            Err(e) => anyhow::bail!("Doctor check panicked: {e}"),
+        }
+    }
     let mut all_ok = true;
-    for check in DOCTOR_CHECKS {
-        if cfg!(windows) && !check.windows {
-            continue;
-        }
-        if !groups.is_empty() && !groups.iter().any(|g| check.groups.contains(&g.as_str())) {
-            continue;
-        }
+    for (check, outcome) in selected.into_iter().zip(results) {
         if !silent {
             println!("{}", check.title);
         }
-        match run_check(check.kind, &env).await {
+        match outcome.unwrap_or_else(|| Err(CheckFailure::Error("Check did not complete".into()))) {
             Ok(result) => {
                 if !silent {
                     if result.is_empty() {

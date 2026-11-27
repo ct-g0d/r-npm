@@ -390,12 +390,50 @@ pub fn ensure_node_gyp(
     })
 }
 
-/// Downloads and unpacks node-gyp and its full production dependency tree from the configured
-/// npm registry into `<cache_dir>/node-gyp/current/` via atomic staging and verification.
-pub fn bootstrap_node_gyp(
+/// Async version of [`ensure_node_gyp`] that avoids blocking Tokio runtime worker threads.
+pub async fn ensure_node_gyp_async(
+    project_root: &Path,
+    package_dir: &Path,
+    config: &rnpm_config::Config,
+    explicit_opt: Option<&Path>,
+    offline: bool,
+    package_name: &str,
+) -> Result<PathBuf, LifecycleError> {
+    let pr = project_root.to_path_buf();
+    let pd = package_dir.to_path_buf();
+    let cfg = config.clone();
+    let exp = explicit_opt.map(|p| p.to_path_buf());
+    if let Ok(Some(path)) =
+        tokio::task::spawn_blocking(move || find_node_gyp(&pr, &pd, &cfg, exp.as_deref())).await
+    {
+        return Ok(path);
+    }
+
+    let is_offline = offline || is_offline_mode(config);
+    if is_offline {
+        return Err(LifecycleError::NodeGypOfflineAbsent {
+            package: package_name.to_string(),
+        });
+    }
+
+    info!(
+        "node-gyp not found locally or in bundled npm. Bootstrapping standalone node-gyp from registry for package '{}'...",
+        package_name
+    );
+
+    bootstrap_node_gyp_async(project_root, config)
+        .await
+        .map_err(|e| {
+            LifecycleError::ExecutionFailed(format!(
+                "Failed to automatically bootstrap node-gyp from registry: {e}"
+            ))
+        })
+}
+
+fn prepare_node_gyp_staging(
     project_root: &Path,
     config: &rnpm_config::Config,
-) -> anyhow::Result<PathBuf> {
+) -> anyhow::Result<(PathBuf, PathBuf, String, StagingGuard)> {
     let cache_dir = find_cache_dir(project_root, config);
     let node_gyp_dir = cache_dir.join("node-gyp");
     let target_dir = node_gyp_dir.join("current");
@@ -415,6 +453,37 @@ pub fn bootstrap_node_gyp(
     std::fs::create_dir_all(&staging_dir)?;
 
     let guard = StagingGuard::new(staging_dir.clone());
+    Ok((staging_dir, target_dir, registry, guard))
+}
+
+fn finish_node_gyp_staging(
+    staging_dir: &Path,
+    target_dir: &Path,
+    guard: StagingGuard,
+) -> anyhow::Result<PathBuf> {
+    // Atomically publish into the final target location only after full verification & install succeed
+    rnpm_fs::replace_dir_with_retries(staging_dir, target_dir, 30)?;
+    guard.commit();
+
+    let candidate1 = target_dir.join("bin").join("node-gyp.js");
+    if candidate1.is_file() {
+        return Ok(candidate1);
+    }
+    let candidate2 = target_dir.join("node-gyp.js");
+    if candidate2.is_file() {
+        return Ok(candidate2);
+    }
+
+    Ok(candidate1)
+}
+
+/// Downloads and unpacks node-gyp and its full production dependency tree from the configured
+/// npm registry into `<cache_dir>/node-gyp/current/` via atomic staging and verification.
+pub fn bootstrap_node_gyp(
+    project_root: &Path,
+    config: &rnpm_config::Config,
+) -> anyhow::Result<PathBuf> {
+    let (staging_dir, target_dir, registry, guard) = prepare_node_gyp_staging(project_root, config)?;
 
     // Run async network operations on a dedicated thread with a fresh single-thread runtime
     // to guarantee no nested block_on conflicts with existing tokio runtimes.
@@ -432,20 +501,26 @@ pub fn bootstrap_node_gyp(
     .join()
     .map_err(|_| anyhow::anyhow!("Worker thread panicked during node-gyp bootstrap"))??;
 
-    // Atomically publish into the final target location only after full verification & install succeed
-    rnpm_fs::replace_dir_with_retries(&staging_dir, &target_dir, 30)?;
-    guard.commit();
+    finish_node_gyp_staging(&staging_dir, &target_dir, guard)
+}
 
-    let candidate1 = target_dir.join("bin").join("node-gyp.js");
-    if candidate1.is_file() {
-        return Ok(candidate1);
-    }
-    let candidate2 = target_dir.join("node-gyp.js");
-    if candidate2.is_file() {
-        return Ok(candidate2);
-    }
+/// Async version of [`bootstrap_node_gyp`] that awaits downloads directly without spawning an
+/// inner Tokio runtime or blocking an async worker thread.
+pub async fn bootstrap_node_gyp_async(
+    project_root: &Path,
+    config: &rnpm_config::Config,
+) -> anyhow::Result<PathBuf> {
+    let pr = project_root.to_path_buf();
+    let cfg = config.clone();
+    let (staging_dir, target_dir, registry, guard) =
+        tokio::task::spawn_blocking(move || prepare_node_gyp_staging(&pr, &cfg)).await??;
 
-    Ok(candidate1)
+    download_and_unpack_node_gyp_with_config(&registry, &staging_dir, config).await?;
+
+    let staging_done = staging_dir.clone();
+    let target_done = target_dir.clone();
+    tokio::task::spawn_blocking(move || finish_node_gyp_staging(&staging_done, &target_done, guard))
+        .await?
 }
 
 fn build_bootstrap_client(

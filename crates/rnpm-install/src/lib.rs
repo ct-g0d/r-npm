@@ -4165,8 +4165,11 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                                 Ok(summary) => return Ok(summary),
                                 Err(err) => {
                                     let err_msg = err.to_string();
-                                    if err_msg.contains("ELOCKFILE_DRIFT") {
-                                        warn!("Lockfile drift detected during fast path; falling back to full solver: {err_msg}");
+                                    if err_msg.contains("ELOCKFILE_DRIFT")
+                                        || (err_msg.contains("EUSAGE")
+                                            && err_msg.contains("Missing:"))
+                                    {
+                                        warn!("Lockfile drift or missing entries detected during fast path; falling back to full solver: {err_msg}");
                                     } else {
                                         return Err(err);
                                     }
@@ -7419,14 +7422,141 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
             let base = self.options.project_dir.clone();
             (nm, bin, base)
         };
-        // An install that reuses the lockfile keeps a linked tree: its store
-        // folders are reconciled in place, as arborist's reify diff does.
-        let keeps_linked_tree =
-            !from_scratch && self.options.install_strategy == InstallStrategy::Linked;
-        if !keeps_linked_tree
-            && (node_modules_dir.exists() || rnpm_fs::is_junction(&node_modules_dir).unwrap_or(false))
+        // `rnpm ci` (`from_scratch == true`) performs a clean wipe of `node_modules`.
+        // Incremental `rnpm install` (`from_scratch == false`) preserves `node_modules`
+        // and only removes extraneous/mismatched packages in place.
+        let mut incremental_skip_packages: HashSet<String> = HashSet::new();
+        if from_scratch {
+            if node_modules_dir.exists()
+                || rnpm_fs::is_junction(&node_modules_dir).unwrap_or(false)
+            {
+                fast_trash_wipe_dir(&node_modules_dir)?;
+            }
+        } else if self.options.install_strategy != InstallStrategy::Linked
+            && node_modules_dir.exists()
+            && !rnpm_fs::is_junction(&node_modules_dir).unwrap_or(false)
         {
-            fast_trash_wipe_dir(&node_modules_dir)?;
+            let hidden_valid =
+                validate_hidden_lockfile(&self.options.project_dir, Some(&self.options));
+            let actual_packages = reify_report::load_actual(
+                &self.options.project_dir,
+                hidden_valid,
+                Some(&lockfile.packages),
+            );
+            let mut desired_packages: HashMap<&str, &rnpm_lockfile::LockfilePackage> =
+                HashMap::new();
+            for (pkg_key, pkg_info) in &lockfile.packages {
+                if pkg_key.is_empty()
+                    || platform_skipped_packages.contains(pkg_key)
+                    || pkg_info.is_extraneous()
+                    || lockfile_entry_omitted(&self.options, &lockfile, pkg_key, pkg_info)
+                {
+                    continue;
+                }
+                if pkg_key.contains("node_modules/") || pkg_info.link == Some(true) {
+                    desired_packages.insert(pkg_key.as_str(), pkg_info);
+                }
+            }
+
+            let pkg_matches_on_disk =
+                |pkg_key: &str,
+                 desired: &rnpm_lockfile::LockfilePackage,
+                 actual: &rnpm_lockfile::LockfilePackage| {
+                    if desired.link != actual.link || desired.version != actual.version {
+                        return false;
+                    }
+                    match (desired.integrity.as_deref(), actual.integrity.as_deref()) {
+                        (Some(di), Some(ai)) if di != ai => return false,
+                        (Some(_), None) | (None, Some(_)) => return false,
+                        _ => {}
+                    }
+                    if let (Some(dr), Some(ar)) =
+                        (desired.resolved.as_deref(), actual.resolved.as_deref())
+                    {
+                        if dr != ar {
+                            return false;
+                        }
+                    }
+                    let target = loc_base_dir.join(pkg_key);
+                    if desired.link == Some(true) {
+                        return rnpm_fs::is_junction(&target).unwrap_or(false) || target.is_dir();
+                    }
+                    target.join("package.json").is_file()
+                };
+
+            let mut to_remove: Vec<String> = Vec::new();
+            let mut removed_set: HashSet<String> = HashSet::new();
+            for (actual_key, actual_pkg) in &actual_packages {
+                if !actual_key.starts_with("node_modules/") {
+                    continue;
+                }
+                let keep = desired_packages
+                    .get(actual_key.as_str())
+                    .is_some_and(|desired| pkg_matches_on_disk(actual_key, desired, actual_pkg));
+                if !keep {
+                    to_remove.push(actual_key.clone());
+                    removed_set.insert(actual_key.clone());
+                }
+            }
+            // Also check for desired packages that changed (might differ even if an ancestor didn't)
+            for desired_key in desired_packages.keys() {
+                if !desired_key.starts_with("node_modules/") {
+                    continue;
+                }
+                let has_removed_ancestor = {
+                    let mut p = *desired_key;
+                    let mut hit = false;
+                    while let Some(idx) = p.rfind("/node_modules/") {
+                        let parent = &p[..idx];
+                        if removed_set.contains(parent) {
+                            hit = true;
+                            break;
+                        }
+                        p = parent;
+                    }
+                    hit
+                };
+                if has_removed_ancestor {
+                    removed_set.insert((*desired_key).to_string());
+                } else if let Some(actual_pkg) = actual_packages.get(*desired_key) {
+                    let desired_pkg = desired_packages[desired_key];
+                    if pkg_matches_on_disk(desired_key, desired_pkg, actual_pkg) {
+                        incremental_skip_packages.insert((*desired_key).to_string());
+                    }
+                }
+            }
+
+            // Delete nested subpaths before parent directories to preserve any kept parent trees
+            to_remove.sort_by_key(|p| std::cmp::Reverse(p.len()));
+            for rel_dir in to_remove {
+                let target_path = loc_base_dir.join(&rel_dir);
+                let is_junc = is_junction(&target_path).unwrap_or(false);
+                if target_path.exists() || is_junc {
+                    if let Ok(pkg_manifest) =
+                        Manifest::from_file_readonly(target_path.join("package.json"))
+                    {
+                        for (bin_name, _) in pkg_manifest.bin_entries() {
+                            let _ = std::fs::remove_file(bin_dir.join(&bin_name));
+                            #[cfg(windows)]
+                            {
+                                let _ = std::fs::remove_file(
+                                    bin_dir.join(format!("{bin_name}.cmd")),
+                                );
+                                let _ = std::fs::remove_file(
+                                    bin_dir.join(format!("{bin_name}.ps1")),
+                                );
+                            }
+                        }
+                    }
+                    if is_junc {
+                        let _ = remove_junction(&target_path);
+                    } else if target_path.is_dir() {
+                        let _ = rnpm_fs::remove_dir_all_safe(&target_path);
+                    } else {
+                        let _ = std::fs::remove_file(&target_path);
+                    }
+                }
+            }
         }
         std::fs::create_dir_all(&node_modules_dir)?;
 
@@ -7918,6 +8048,10 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                 .map(|d| d.keys().cloned().collect())
                 .unwrap_or_default();
 
+            if incremental_skip_packages.contains(pkg_key) {
+                continue;
+            }
+
             let has_scripts = pkg_info.has_install_script.unwrap_or(false);
             let has_bins_or_scripts = has_scripts;
 
@@ -8017,7 +8151,7 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
         let mut deferred_pack_tasks = AbortTasksOnDrop::new();
         let ci_pack_cancel = deferred_pack_tasks.cancel_flag();
 
-        if !missing_packs.is_empty() {
+        let already_materialized_keys: HashSet<String> = if !missing_packs.is_empty() {
             let t_missing_start = std::time::Instant::now();
             let node_modules_dir_v = rnpm_fs::to_verbatim_path(&node_modules_dir);
             let mut dirs_to_precreate = Vec::with_capacity(missing_packs.len() * 2 + 1);
@@ -8557,6 +8691,15 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                 }
             }
 
+            let mut already_materialized_keys: HashSet<String> = HashSet::new();
+            for &idx in missing_pack_results.keys() {
+                if !failed_optional_indices.contains(&idx) {
+                    if let Some((pkg_key, ..)) = packages_to_process.get(idx) {
+                        already_materialized_keys.insert(pkg_key.clone());
+                    }
+                }
+            }
+
             if !failed_optional_indices.is_empty() {
                 let mut kept = Vec::new();
                 for (i, pkg) in packages_to_process.into_iter().enumerate() {
@@ -8566,31 +8709,15 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                 }
                 packages_to_process = kept;
             }
-        }
 
-        let all_direct_materialized = !missing_pack_results.is_empty()
-            && missing_pack_results.len() == packages_to_process.len();
+            already_materialized_keys
+        } else {
+            HashSet::new()
+        };
 
-        let all_packs_available = !all_direct_materialized
-            && !packages_to_process.is_empty()
-            && if missing_packs.is_empty() {
-                packages_to_process
-                    .iter()
-                    .all(|(_, _, integrity_str, _, _, _)| !integrity_str.is_empty())
-            } else {
-                packages_to_process
-                    .iter()
-                    .all(|(_, _, integrity_str, _, _, _)| {
-                        !integrity_str.is_empty()
-                            && self.pack_store().has_package_pack(integrity_str)
-                    })
-            };
-
-        let mut used_fast_path = false;
-        let mut bin_packages = packages_to_process.clone();
-        sort_packages_for_bin_linking(&mut bin_packages);
-
-        if all_direct_materialized {
+        // Account stats and lifecycle metadata ONCE for packages directly materialized by
+        // `missing_packs`, even when other packages still come from `pack_store` or fallback.
+        if !already_materialized_keys.is_empty() {
             for (
                 pkg_key,
                 resolved_url,
@@ -8598,8 +8725,11 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                 is_optional,
                 declared_dependencies,
                 has_bins_or_scripts,
-            ) in &bin_packages
+            ) in &packages_to_process
             {
+                if !already_materialized_keys.contains(pkg_key) {
+                    continue;
+                }
                 let target_path = loc_base_dir.join(pkg_key);
                 if *has_bins_or_scripts {
                     let found_node = if let Some(pkg_manifest) = in_memory_manifests.get(pkg_key) {
@@ -8626,7 +8756,6 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                 }
                 packages_installed += 1;
             }
-
             for was_hit in missing_pack_results.values() {
                 if *was_hit {
                     cache_hits += 1;
@@ -8636,12 +8765,48 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                     collector.record_cache_miss();
                 }
             }
+        }
+
+        let remaining_to_materialize: Vec<_> = if already_materialized_keys.is_empty() {
+            packages_to_process.clone()
+        } else {
+            packages_to_process
+                .iter()
+                .filter(|(pkg_key, ..)| !already_materialized_keys.contains(pkg_key))
+                .cloned()
+                .collect()
+        };
+
+        let all_direct_materialized =
+            !already_materialized_keys.is_empty() && remaining_to_materialize.is_empty();
+
+        let all_packs_available = !all_direct_materialized
+            && !remaining_to_materialize.is_empty()
+            && if missing_packs.is_empty() {
+                remaining_to_materialize
+                    .iter()
+                    .all(|(_, _, integrity_str, _, _, _)| !integrity_str.is_empty())
+            } else {
+                remaining_to_materialize
+                    .iter()
+                    .all(|(_, _, integrity_str, _, _, _)| {
+                        !integrity_str.is_empty()
+                            && self.pack_store().has_package_pack(integrity_str)
+                    })
+            };
+
+        let mut used_fast_path = false;
+        let mut bin_packages = packages_to_process.clone();
+        sort_packages_for_bin_linking(&mut bin_packages);
+
+        if all_direct_materialized {
+            // Stats and lifecycle nodes were already recorded above.
         } else if all_packs_available {
             let t_mat = std::time::Instant::now();
             let mut all_dirs = std::collections::BTreeSet::new();
             all_dirs.insert(rnpm_fs::to_verbatim_path(&node_modules_dir));
 
-            for (pkg_key, _, _, _, _, _) in &packages_to_process {
+            for (pkg_key, _, _, _, _, _) in &remaining_to_materialize {
                 let pkg_target = loc_base_dir.join(pkg_key);
                 if !(from_scratch && pkg_key.starts_with("node_modules/"))
                     && rnpm_fs::is_junction(&pkg_target).unwrap_or(false)
@@ -8657,7 +8822,7 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
             let (loaded_packs, mut load_success) = crate::fast_path::parallel_load_packs(
                 &self.pack_store,
                 &loc_base_dir,
-                &packages_to_process,
+                &remaining_to_materialize,
             );
 
             if load_success {
@@ -8875,6 +9040,9 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                         has_bins_or_scripts,
                     ) in &bin_packages
                     {
+                        if already_materialized_keys.contains(pkg_key) {
+                            continue;
+                        }
                         let target_path = loc_base_dir.join(pkg_key);
                         let is_top_pkg = is_top_level_nm_pkg(pkg_key);
                         if *has_bins_or_scripts {
@@ -8987,7 +9155,7 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                 is_optional,
                 declared_dependencies,
                 has_bins_or_scripts,
-            ) in &packages_to_process
+            ) in &remaining_to_materialize
             {
                 let sem = Arc::clone(&semaphore);
                 let cache = self.cache().clone();
@@ -11039,8 +11207,10 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
 
         let lockfile_path = project_lockfile_path(&self.options.project_dir);
         let mut pruned_nodes: HashSet<String> = HashSet::new();
+        let has_lockfile = lockfile_path.exists();
+        let mut remaining_lockfile_keys: HashSet<String> = HashSet::new();
 
-        if lockfile_path.exists() {
+        if has_lockfile {
             let lockfile_str = std::fs::read_to_string(&lockfile_path)
                 .with_context(|| format!("Failed to read {}", lockfile_path.display()))?;
             let mut lockfile = LockfileV3::from_json_str(&lockfile_str)
@@ -11076,6 +11246,7 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
             // Prune unreferenced dependencies using reachability graph
             pruned_nodes = prune_lockfile(&mut lockfile, &manifest);
             pruned_nodes.extend(graph_pruned);
+            remaining_lockfile_keys = lockfile.packages.keys().cloned().collect();
 
             // Write updated deterministic lockfile
             lockfile
@@ -11121,14 +11292,55 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                 (nm, bin, base)
             };
 
-        // Clean direct removed packages and all pruned lockfile nodes
+        // Only remove uninstalled packages if no lockfile / remaining dependency still requires them.
         let mut dirs_to_remove = HashSet::new();
-        for pkg in &removed_packages {
-            dirs_to_remove.insert(format!("node_modules/{pkg}"));
-        }
-        for pruned in &pruned_nodes {
-            if pruned.starts_with("node_modules/") {
-                dirs_to_remove.insert(pruned.clone());
+        if has_lockfile {
+            for pruned in &pruned_nodes {
+                if pruned.starts_with("node_modules/") && !remaining_lockfile_keys.contains(pruned)
+                {
+                    dirs_to_remove.insert(pruned.clone());
+                }
+            }
+            for pkg in &removed_packages {
+                let top_key = format!("node_modules/{pkg}");
+                if !remaining_lockfile_keys.contains(&top_key) {
+                    dirs_to_remove.insert(top_key);
+                }
+            }
+        } else {
+            let mut still_required: HashSet<String> = HashSet::new();
+            for dep in manifest
+                .dependencies
+                .keys()
+                .chain(manifest.dev_dependencies.keys())
+                .chain(manifest.optional_dependencies.keys())
+                .chain(manifest.peer_dependencies.keys())
+            {
+                still_required.insert(dep.clone());
+            }
+            for rel_path in crate::prune::scan_node_modules(&self.options.project_dir).unwrap_or_default() {
+                if let Some(pkg_name) = rel_path.strip_prefix("node_modules/") {
+                    if removed_packages.iter().any(|r| r == pkg_name) {
+                        continue;
+                    }
+                }
+                if let Ok(dep_manifest) =
+                    Manifest::from_file_readonly(self.options.project_dir.join(&rel_path).join("package.json"))
+                {
+                    for dep in dep_manifest
+                        .dependencies
+                        .keys()
+                        .chain(dep_manifest.optional_dependencies.keys())
+                        .chain(dep_manifest.peer_dependencies.keys())
+                    {
+                        still_required.insert(dep.clone());
+                    }
+                }
+            }
+            for pkg in &removed_packages {
+                if !still_required.contains(pkg) {
+                    dirs_to_remove.insert(format!("node_modules/{pkg}"));
+                }
             }
         }
 
@@ -11666,9 +11878,15 @@ pub fn prune_lockfile(lockfile: &mut LockfileV3, manifest: &Manifest) -> HashSet
         }
     }
 
-    // Workspace packages and links are entry points
+    // Workspace packages and workspace links are entry points; external file links
+    // (`node_modules/foo` with `link: true` not pointing at a workspace package)
+    // must remain reachable from a manifest dependency to survive pruning.
     for (key, pkg) in &lockfile.packages {
-        if !key.starts_with("node_modules/") || pkg.link == Some(true) {
+        let is_workspace_link = pkg.link == Some(true)
+            && pkg.resolved.as_deref().is_some_and(|target| {
+                !target.starts_with("node_modules/") && lockfile.packages.contains_key(target)
+            });
+        if !key.starts_with("node_modules/") || is_workspace_link {
             reachable_keys.insert(key.clone());
             queue.push_back(key.clone());
         }

@@ -158,6 +158,15 @@ impl Npmrc {
             let key = interpolate_env_cow(&decoded_key, &env_lookup);
             let value = interpolate_env_cow(&decoded_val, &env_lookup);
 
+            // Do not let an unset/empty interpolated credential env var clobber
+            // tokens configured in earlier lines or lower-precedence .npmrc layers.
+            if value.trim().is_empty()
+                && decoded_val.trim() != value.trim()
+                && is_sensitive_credential_key(&key)
+            {
+                continue;
+            }
+
             npmrc.set(&key, &value)?;
         }
 
@@ -170,6 +179,16 @@ impl Npmrc {
     }
 
     pub(crate) fn from_file_if_exists(path: &Path) -> Result<Option<Self>, ConfigError> {
+        Self::from_file_if_exists_with_env(path, |var| env::var(var).ok())
+    }
+
+    pub(crate) fn from_file_if_exists_with_env<F>(
+        path: &Path,
+        env_lookup: F,
+    ) -> Result<Option<Self>, ConfigError>
+    where
+        F: Fn(&str) -> Option<String>,
+    {
         let content = match fs::read_to_string(path) {
             Ok(c) => c,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -181,7 +200,7 @@ impl Npmrc {
             }
         };
 
-        Self::parse(&content).map(Some)
+        Self::parse_with_env(&content, env_lookup).map(Some)
     }
 
     /// Set a key-value setting and update parsed registry/auth structures.
@@ -251,10 +270,12 @@ impl Npmrc {
                     "Auth token contains illegal whitespace or control characters".to_string(),
                 ));
             }
-            self.auth_tokens
-                .insert(norm_prefix, value_trimmed.to_string());
-            self.settings
-                .insert(key_trimmed.to_string(), value_trimmed.to_string());
+            if !value_trimmed.is_empty() {
+                self.auth_tokens
+                    .insert(norm_prefix, value_trimmed.to_string());
+                self.settings
+                    .insert(key_trimmed.to_string(), value_trimmed.to_string());
+            }
             return Ok(());
         }
 
@@ -327,9 +348,14 @@ impl Npmrc {
             self.scoped_registries.insert(scope, url);
         }
         for (uri, token) in other.auth_tokens {
-            self.auth_tokens.insert(uri, token);
+            if !token.is_empty() {
+                self.auth_tokens.insert(uri, token);
+            }
         }
         for (k, v) in other.settings {
+            if v.trim().is_empty() && is_sensitive_credential_key(&k) {
+                continue;
+            }
             self.settings.insert(k, v);
         }
     }
@@ -409,10 +435,11 @@ impl Npmrc {
                 if let Some(token) = self.auth_tokens.get(&cand1) {
                     return Some(token.as_str());
                 }
-            }
-            let cand2 = format!("//{host_lower}{prefix}");
-            if let Some(token) = self.auth_tokens.get(&cand2) {
-                return Some(token.as_str());
+            } else {
+                let cand2 = format!("//{host_lower}{prefix}");
+                if let Some(token) = self.auth_tokens.get(&cand2) {
+                    return Some(token.as_str());
+                }
             }
         }
 
@@ -451,10 +478,11 @@ impl Npmrc {
                 if let Some(auth) = basic_map.get(&cand1) {
                     return Some(auth.clone());
                 }
-            }
-            let cand2 = format!("//{host_lower}{prefix}");
-            if let Some(auth) = basic_map.get(&cand2) {
-                return Some(auth.clone());
+            } else {
+                let cand2 = format!("//{host_lower}{prefix}");
+                if let Some(auth) = basic_map.get(&cand2) {
+                    return Some(auth.clone());
+                }
             }
         }
 
@@ -570,16 +598,25 @@ impl Npmrc {
                     if let Some(val) = self.settings.get(&cand1) {
                         return Some(val.as_str());
                     }
-                }
-                let cand2 = format!("//{host_lower}{prefix}:{suffix_key}");
-                if let Some(val) = self.settings.get(&cand2) {
-                    return Some(val.as_str());
-                }
-                if prefix.ends_with('/') {
-                    let no_slash = &prefix[..prefix.len() - 1];
-                    let cand3 = format!("//{host_lower}{no_slash}:{suffix_key}");
-                    if let Some(val) = self.settings.get(&cand3) {
+                    if prefix.ends_with('/') {
+                        let no_slash = &prefix[..prefix.len() - 1];
+                        let cand1_no_slash =
+                            format!("//{host_lower}{port_part}{no_slash}:{suffix_key}");
+                        if let Some(val) = self.settings.get(&cand1_no_slash) {
+                            return Some(val.as_str());
+                        }
+                    }
+                } else {
+                    let cand2 = format!("//{host_lower}{prefix}:{suffix_key}");
+                    if let Some(val) = self.settings.get(&cand2) {
                         return Some(val.as_str());
+                    }
+                    if prefix.ends_with('/') {
+                        let no_slash = &prefix[..prefix.len() - 1];
+                        let cand3 = format!("//{host_lower}{no_slash}:{suffix_key}");
+                        if let Some(val) = self.settings.get(&cand3) {
+                            return Some(val.as_str());
+                        }
                     }
                 }
             }
@@ -1087,22 +1124,6 @@ where
                         result.push('{');
                         continue;
                     }
-                } else if next_ch.is_ascii_alphabetic() || next_ch == '_' {
-                    let start_var = idx + 1;
-                    chars.next();
-                    let mut end_var = start_var + next_ch.len_utf8();
-                    while let Some(&(c_idx, c)) = chars.peek() {
-                        if c.is_ascii_alphanumeric() || c == '_' {
-                            end_var = c_idx + c.len_utf8();
-                            chars.next();
-                        } else {
-                            break;
-                        }
-                    }
-                    let var_name = &input[start_var..end_var];
-                    let val = lookup(var_name).unwrap_or_default();
-                    result.push_str(&val);
-                    continue;
                 } else if next_ch == '$' {
                     chars.next();
                     result.push('$');
