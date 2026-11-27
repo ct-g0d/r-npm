@@ -1280,6 +1280,10 @@ fn is_private_owned_dir(dir: &Path) -> bool {
     if meta.uid() != unsafe { libc::geteuid() } {
         return false;
     }
+    // Reject any pre-existing directory writable by group or others (tamper risk).
+    if (meta.mode() & 0o022) != 0 {
+        return false;
+    }
     if (meta.mode() & 0o077) != 0 {
         if std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).is_err() {
             return false;
@@ -1403,22 +1407,41 @@ pub fn node_gyp_bin_dir() -> Option<PathBuf> {
                 return Some(dir);
             }
 
-            if let Err(e) = std::fs::create_dir_all(&dir) {
-                warn!("Failed to create private node-gyp-bin directory: {}", e);
-                return None;
-            }
             #[cfg(unix)]
-            if !is_private_owned_dir(&dir) {
-                let prefix = format!("rnpm-node-gyp-bin-v1-{}-", unsafe { libc::geteuid() });
-                match tempfile::Builder::new().prefix(&prefix).tempdir() {
-                    Ok(td) => {
-                        dir = td.keep();
-                    }
+            {
+                use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+                if let Some(parent) = dir.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                match std::fs::DirBuilder::new().mode(0o700).create(&dir) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
                     Err(e) => {
-                        warn!("Failed to create fallback node-gyp-bin directory: {}", e);
+                        warn!("Failed to create private node-gyp-bin directory: {}", e);
                         return None;
                     }
                 }
+                if !is_private_owned_dir(&dir) {
+                    let prefix = format!("rnpm-node-gyp-bin-v1-{}-", unsafe { libc::geteuid() });
+                    match tempfile::Builder::new()
+                        .prefix(&prefix)
+                        .permissions(std::fs::Permissions::from_mode(0o700))
+                        .tempdir()
+                    {
+                        Ok(td) => {
+                            dir = td.keep();
+                        }
+                        Err(e) => {
+                            warn!("Failed to create fallback node-gyp-bin directory: {}", e);
+                            return None;
+                        }
+                    }
+                }
+            }
+            #[cfg(not(unix))]
+            if let Err(e) = std::fs::create_dir_all(&dir) {
+                warn!("Failed to create private node-gyp-bin directory: {}", e);
+                return None;
             }
             if let Err(e) = create_private_node_gyp_shim(&dir) {
                 warn!("Failed to populate private node-gyp-bin directory: {}", e);

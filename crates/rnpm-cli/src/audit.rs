@@ -466,13 +466,34 @@ fn decode_chunked_body(raw: &[u8]) -> Option<Vec<u8>> {
     }
 }
 
+fn can_use_fast_http_audit(target_parsed: &Url, config: &rnpm_config::Config) -> bool {
+    target_parsed.scheme() == "http"
+        && target_parsed.username().is_empty()
+        && target_parsed.password().is_none()
+        && !has_configured_http_proxy(config, target_parsed)
+}
+
+fn fast_http_literal_socket_addr(target_parsed: &Url) -> Option<std::net::SocketAddr> {
+    let host = target_parsed.host_str()?;
+    let port = target_parsed.port_or_known_default().unwrap_or(80);
+    let addr = if host.contains(':') && !host.starts_with('[') {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    };
+    addr.parse::<std::net::SocketAddr>().ok()
+}
+
 fn build_fast_http_post_request(
     target_parsed: &Url,
     body_bytes: &[u8],
     user_agent: &str,
     auth_token: Option<&str>,
 ) -> Option<(String, String)> {
-    if target_parsed.scheme() != "http" {
+    if target_parsed.scheme() != "http"
+        || !target_parsed.username().is_empty()
+        || target_parsed.password().is_some()
+    {
         return None;
     }
     let host = target_parsed.host_str()?;
@@ -573,34 +594,121 @@ fn inspect_fast_http_headers(hdr_str: &str) -> FastHeaderDecision {
     }
 }
 
-fn fast_http_response_complete(raw: &[u8]) -> bool {
-    let Some(hdr_end) = raw.windows(4).position(|w| w == b"\r\n\r\n") else {
-        return false;
-    };
-    let Ok(hdr_str) = std::str::from_utf8(&raw[..hdr_end]) else {
-        return true;
-    };
-    match inspect_fast_http_headers(hdr_str) {
-        FastHeaderDecision::Fallback => true,
-        FastHeaderDecision::Headers {
-            status,
-            is_chunked,
-            content_len,
-            ..
-        } => {
-            if status == 204 || status == 304 {
-                return true;
-            }
-            let raw_body = &raw[hdr_end + 4..];
-            if is_chunked {
-                decode_chunked_body(raw_body).is_some()
-            } else if let Some(len) = content_len {
-                raw_body.len() >= len
+#[derive(Default)]
+struct FastHttpScanState {
+    hdr_scan_offset: usize,
+    headers: Option<(usize, FastHeaderDecision)>,
+    chunk_pos: usize,
+    chunk_in_trailers: bool,
+}
+
+impl FastHttpScanState {
+    fn is_complete(&mut self, raw: &[u8]) -> bool {
+        if self.headers.is_none() {
+            let start = self.hdr_scan_offset.saturating_sub(3);
+            if let Some(rel) = raw[start..].windows(4).position(|w| w == b"\r\n\r\n") {
+                let hdr_end = start + rel;
+                let decision = match std::str::from_utf8(&raw[..hdr_end]) {
+                    Ok(hdr_str) => inspect_fast_http_headers(hdr_str),
+                    Err(_) => FastHeaderDecision::Fallback,
+                };
+                self.chunk_pos = hdr_end + 4;
+                self.headers = Some((hdr_end, decision));
             } else {
-                false
+                self.hdr_scan_offset = raw.len();
+                return false;
+            }
+        }
+
+        let Some((hdr_end, ref decision)) = self.headers else {
+            return false;
+        };
+        match *decision {
+            FastHeaderDecision::Fallback => true,
+            FastHeaderDecision::Headers {
+                status,
+                is_chunked,
+                content_len,
+                ..
+            } => {
+                if status == 204 || status == 304 {
+                    return true;
+                }
+                let body_start = hdr_end + 4;
+                if is_chunked {
+                    self.advance_chunked(raw)
+                } else if let Some(len) = content_len {
+                    raw.len().saturating_sub(body_start) >= len
+                } else {
+                    false
+                }
             }
         }
     }
+
+    fn advance_chunked(&mut self, raw: &[u8]) -> bool {
+        loop {
+            if self.chunk_in_trailers {
+                if raw.len() < self.chunk_pos + 2 {
+                    return false;
+                }
+                if &raw[self.chunk_pos..self.chunk_pos + 2] == b"\r\n" {
+                    return true;
+                }
+                let Some(rel_end) = raw[self.chunk_pos..]
+                    .windows(2)
+                    .position(|w| w == b"\r\n")
+                else {
+                    return false;
+                };
+                self.chunk_pos += rel_end + 2;
+                continue;
+            }
+
+            let Some(rel_crlf) = raw[self.chunk_pos..]
+                .windows(2)
+                .position(|w| w == b"\r\n")
+            else {
+                return false;
+            };
+            let line = &raw[self.chunk_pos..self.chunk_pos + rel_crlf];
+            let Ok(line_str) = std::str::from_utf8(line) else {
+                // Malformed framing; stop reading so parse_fast_http_response falls back.
+                return true;
+            };
+            let size_hex = line_str.split(';').next().unwrap_or("").trim();
+            if size_hex.is_empty() {
+                return true;
+            }
+            let Ok(chunk_size) = usize::from_str_radix(size_hex, 16) else {
+                return true;
+            };
+            let data_start = self.chunk_pos + rel_crlf + 2;
+            if chunk_size == 0 {
+                self.chunk_pos = data_start;
+                self.chunk_in_trailers = true;
+                continue;
+            }
+            let Some(data_end) = data_start.checked_add(chunk_size) else {
+                return true;
+            };
+            let Some(next_pos) = data_end.checked_add(2) else {
+                return true;
+            };
+            if next_pos > raw.len() {
+                return false;
+            }
+            if &raw[data_end..next_pos] != b"\r\n" {
+                return true;
+            }
+            self.chunk_pos = next_pos;
+        }
+    }
+}
+
+#[cfg(test)]
+fn fast_http_response_complete(raw: &[u8]) -> bool {
+    FastHttpScanState::default().is_complete(raw)
 }
 
 fn parse_fast_http_response(raw: &[u8]) -> FastHttpResponse {
@@ -686,6 +794,7 @@ async fn try_fast_http_post(
 
         let mut raw = Vec::with_capacity(4096);
         let mut buf = [0u8; 8192];
+        let mut scan = FastHttpScanState::default();
         loop {
             let n = stream.read(&mut buf).await.map_err(|e| {
                 anyhow::anyhow!("Failed to read advisory response from {target_url}: {e}")
@@ -694,7 +803,7 @@ async fn try_fast_http_post(
                 break;
             }
             raw.extend_from_slice(&buf[..n]);
-            if fast_http_response_complete(&raw) {
+            if scan.is_complete(&raw) {
                 break;
             }
         }
@@ -717,6 +826,9 @@ fn try_fast_http_post_sync(
     use std::io::{Read, Write};
     let (addr, head) =
         build_fast_http_post_request(target_parsed, body_bytes, user_agent, auth_token)?;
+    // Sync path only connects to IP literals so DNS resolution never blocks unboundedly
+    // outside a deadline; hostnames use the async tokio::time::timeout path instead.
+    let sa = addr.parse::<std::net::SocketAddr>().ok()?;
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     let remaining = |cap: std::time::Duration| -> Option<std::time::Duration> {
         let rem = deadline.checked_duration_since(std::time::Instant::now())?;
@@ -726,43 +838,42 @@ fn try_fast_http_post_sync(
             Some(rem.min(cap))
         }
     };
-    let connect_cap = std::time::Duration::from_secs(10);
-    let stream = if let Ok(sa) = addr.parse::<std::net::SocketAddr>() {
-        let to = remaining(connect_cap)?;
-        std::net::TcpStream::connect_timeout(&sa, to).ok()
-    } else {
-        let sock_addrs: Vec<std::net::SocketAddr> = std::net::ToSocketAddrs::to_socket_addrs(&*addr)
-            .ok()?
-            .collect();
-        let mut connected = None;
-        for sa in sock_addrs {
-            let to = remaining(connect_cap)?;
-            if let Ok(s) = std::net::TcpStream::connect_timeout(&sa, to) {
-                connected = Some(s);
-                break;
-            }
-        }
-        connected
-    };
-    let mut stream = stream?;
+    let connect_to = remaining(std::time::Duration::from_secs(10))?;
+    let mut stream = std::net::TcpStream::connect_timeout(&sa, connect_to).ok()?;
     let _ = stream.set_nodelay(true);
-    let _ = stream.set_write_timeout(Some(remaining(std::time::Duration::from_secs(10))?));
     let mut req_buf = Vec::with_capacity(head.len() + body_bytes.len());
     req_buf.extend_from_slice(head.as_bytes());
     req_buf.extend_from_slice(body_bytes);
-    stream.write_all(&req_buf).ok()?;
+    let mut written = 0usize;
+    while written < req_buf.len() {
+        let write_to = remaining(std::time::Duration::from_secs(10))?;
+        let _ = stream.set_write_timeout(Some(write_to));
+        match stream.write(&req_buf[written..]) {
+            Ok(0) => return None,
+            Ok(n) => written += n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => return None,
+        }
+    }
+    let flush_to = remaining(std::time::Duration::from_secs(10))?;
+    let _ = stream.set_write_timeout(Some(flush_to));
     stream.flush().ok()?;
     let mut raw = Vec::with_capacity(4096);
     let mut buf = [0u8; 8192];
+    let mut scan = FastHttpScanState::default();
     loop {
         let read_to = remaining(std::time::Duration::from_secs(30))?;
         let _ = stream.set_read_timeout(Some(read_to));
-        let n = stream.read(&mut buf).ok()?;
+        let n = match stream.read(&mut buf) {
+            Ok(n) => n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => return None,
+        };
         if n == 0 {
             break;
         }
         raw.extend_from_slice(&buf[..n]);
-        if fast_http_response_complete(&raw) {
+        if scan.is_complete(&raw) {
             break;
         }
     }
@@ -804,7 +915,7 @@ async fn fetch_advisories(
     let user_agent = rnpm_registry::default_user_agent();
     let auth_token = config.npmrc.get_auth_token(&target_parsed);
 
-    if target_parsed.scheme() == "http" && !has_configured_http_proxy(config, &target_parsed) {
+    if can_use_fast_http_audit(&target_parsed, config) {
         let payload = serde_json::to_vec(bulk_request)
             .map_err(|e| anyhow::anyhow!("Failed to serialize advisory request: {e}"))?;
         if let FastHttpResponse::Status { status, body } =
@@ -1358,9 +1469,9 @@ pub(crate) fn spawn_speculative_post_install_audit(
     let mock_possible = cfg!(test) || std::env::var_os("RNPM_TEST_MOCK_ADVISORIES").is_some();
     let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
-    if target_parsed.scheme() == "http"
+    if can_use_fast_http_audit(&target_parsed, config)
+        && fast_http_literal_socket_addr(&target_parsed).is_some()
         && !mock_possible
-        && !has_configured_http_proxy(config, &target_parsed)
     {
         let lp = lock_path.clone();
         let user_agent = rnpm_registry::default_user_agent();
@@ -1942,6 +2053,26 @@ mod tests {
         assert!(fast_http_response_complete(
             b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\n{}\r\n0\r\n\r\n"
         ));
+
+        // Incremental chunked scanner advances across partial reads without re-scanning.
+        let full_chunked = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n2\r\nde\r\n0\r\nX-Trailer: ok\r\n\r\n";
+        let mut scan = FastHttpScanState::default();
+        for split in 1..full_chunked.len() {
+            assert!(!scan.is_complete(&full_chunked[..split]));
+        }
+        assert!(scan.is_complete(full_chunked));
+
+        // URLs with embedded credentials must bypass direct HTTP path and fall back to reqwest.
+        let cfg = rnpm_config::Config::default();
+        let cred_url = Url::parse("http://user:pass@127.0.0.1:4873/-/npm/v1/security/advisories/bulk").unwrap();
+        assert!(!can_use_fast_http_audit(&cred_url, &cfg));
+        assert!(build_fast_http_post_request(&cred_url, b"{}", "ua", None).is_none());
+
+        // Hostnames must not qualify for sync IP-literal connect.
+        let host_url = Url::parse("http://registry.example.test:4873/-/npm/v1/security/advisories/bulk").unwrap();
+        assert!(fast_http_literal_socket_addr(&host_url).is_none());
+        let ip_url = Url::parse("http://127.0.0.1:4873/-/npm/v1/security/advisories/bulk").unwrap();
+        assert!(fast_http_literal_socket_addr(&ip_url).is_some());
     }
 
     #[test]

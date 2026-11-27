@@ -988,7 +988,7 @@ pub fn remove_dir_all_safe(path: &Path) -> Result<(), FsError> {
         // unlinking files/symlinks in parallel and removing directories bottom-up by depth.
         let mut dir_stack = vec![(path_v, 0usize)];
         let mut dirs_collected: Vec<(PathBuf, usize)> = Vec::new();
-        let mut unlinks: Vec<(PathBuf, bool)> = Vec::new();
+        let mut unlinks: Vec<PathBuf> = Vec::new();
 
         while let Some((current_dir, depth)) = dir_stack.pop() {
             let entries = match fs::read_dir(&current_dir) {
@@ -1026,11 +1026,11 @@ pub fn remove_dir_all_safe(path: &Path) -> Result<(), FsError> {
                 };
 
                 if ft.is_symlink() {
-                    unlinks.push((entry_path, true));
+                    unlinks.push(entry_path);
                 } else if ft.is_dir() {
                     dir_stack.push((entry_path, depth + 1));
                 } else {
-                    unlinks.push((entry_path, false));
+                    unlinks.push(entry_path);
                 }
             }
             dirs_collected.push((current_dir, depth));
@@ -1038,16 +1038,8 @@ pub fn remove_dir_all_safe(path: &Path) -> Result<(), FsError> {
 
         let total_unlinks = unlinks.len();
         if total_unlinks < 32 {
-            for (p, is_sym) in unlinks {
-                if is_sym {
-                    match fs::remove_file(&p) {
-                        Ok(()) => {}
-                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                        Err(e) => return Err(FsError::Io(e)),
-                    }
-                } else {
-                    remove_file_safe(&p, None, true)?;
-                }
+            for p in unlinks {
+                remove_file_safe(&p, None, true)?;
             }
         } else {
             let concurrency = std::thread::available_parallelism()
@@ -1062,17 +1054,8 @@ pub fn remove_dir_all_safe(path: &Path) -> Result<(), FsError> {
                 for chunk in unlinks.chunks(chunk_size) {
                     let err_ref = &first_error;
                     scope.spawn(move || {
-                        for (p, is_sym) in chunk {
-                            let res = if *is_sym {
-                                match fs::remove_file(p) {
-                                    Ok(()) => Ok(()),
-                                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-                                    Err(e) => Err(FsError::Io(e)),
-                                }
-                            } else {
-                                remove_file_safe(p, None, true)
-                            };
-                            if let Err(e) = res {
+                        for p in chunk {
+                            if let Err(e) = remove_file_safe(p, None, true) {
                                 let mut guard = err_ref.lock().unwrap();
                                 if guard.is_none() {
                                     *guard = Some(e);
