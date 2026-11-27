@@ -11,15 +11,24 @@ struct FastLockfileScanner<'a> {
 impl<'a> FastLockfileScanner<'a> {
     #[inline]
     fn skip_ws(&mut self) {
-        let len = self.bytes.len();
-        while self.pos < len {
-            let b = self.bytes[self.pos];
+        let bytes = self.bytes;
+        let len = bytes.len();
+        let mut p = self.pos;
+        if p < len && bytes[p] > b' ' {
+            return;
+        }
+        while p < len {
+            let b = bytes[p];
+            if b > b' ' {
+                break;
+            }
             if b == b' ' || matches!(b, b'\n' | b'\r' | b'\t') {
-                self.pos += 1;
+                p += 1;
             } else {
                 break;
             }
         }
+        self.pos = p;
     }
 
     #[inline]
@@ -30,6 +39,10 @@ impl<'a> FastLockfileScanner<'a> {
 
     #[inline]
     fn expect_byte(&mut self, expected: u8) -> Option<()> {
+        if self.pos < self.bytes.len() && self.bytes[self.pos] == expected {
+            self.pos += 1;
+            return Some(());
+        }
         self.skip_ws();
         if *self.bytes.get(self.pos)? == expected {
             self.pos += 1;
@@ -48,24 +61,18 @@ impl<'a> FastLockfileScanner<'a> {
         self.pos += 1;
         let start = self.pos;
         let rest = &self.bytes[start..];
-        let mut i = 0usize;
-        let quick = rest.len().min(8);
-        while i < quick {
-            let b = rest[i];
-            if b == b'"' {
-                self.pos = start + i + 1;
-                // SAFETY: `self.bytes` originates from a valid `&str`, and both boundaries are ASCII `"`.
-                return Some(unsafe {
-                    std::str::from_utf8_unchecked(&self.bytes[start..start + i])
-                });
+        let idx = if rest.len() >= 8 {
+            crate::model::find_first_json_escape(rest)?
+        } else {
+            let mut found = None;
+            for (i, &b) in rest.iter().enumerate() {
+                if b == b'"' || b == b'\\' || b < 0x20 {
+                    found = Some(i);
+                    break;
+                }
             }
-            if b == b'\\' || b < 0x20 {
-                return None;
-            }
-            i += 1;
-        }
-        let rel = crate::model::find_first_json_escape(&rest[i..])?;
-        let idx = i + rel;
+            found?
+        };
         if rest[idx] != b'"' {
             return None;
         }
@@ -853,7 +860,11 @@ impl<'a> FastLockfileScanner<'a> {
             if pkg.has_shrinkwrap.is_none() && has_shrinkwrap {
                 pkg.has_shrinkwrap = Some(true);
             }
-            pkg.normalize_flags();
+            if pkg.dev_optional == Some(true) {
+                pkg.dev = None;
+                pkg.optional = None;
+            }
+            pkg.raw_value = None;
             path_buf.truncate(prev_len);
 
             match self.peek()? {
@@ -905,6 +916,8 @@ fn try_parse_lockfile_fast_impl(
     let mut requires: Option<Option<bool>> = None;
     let mut packages: Option<BTreeMap<String, LockfilePackage>> = None;
     let mut deps_start: Option<usize> = None;
+    let mut seen_deps = false;
+    let mut v2_enriched = false;
 
     if r.peek()? == b'}' {
         r.pos += 1;
@@ -1001,12 +1014,28 @@ fn try_parse_lockfile_fast_impl(
                 packages = Some(pkgs);
             }
             "dependencies" => {
-                if deps_start.is_some() {
+                if seen_deps {
                     return None;
                 }
-                r.skip_ws();
-                deps_start = Some(r.pos);
-                r.skip_plain_value(0)?;
+                seen_deps = true;
+                let mut enriched_now = false;
+                if migrate_v2 && lockfile_version == Some(2) {
+                    if let Some(ref mut pkgs) = packages {
+                        if !pkgs.is_empty()
+                            && pkgs.get("").is_some_and(|root| root.dependencies.is_some())
+                        {
+                            let mut path_buf = String::with_capacity(64);
+                            r.enrich_v2_deps_map(&mut path_buf, pkgs)?;
+                            v2_enriched = true;
+                            enriched_now = true;
+                        }
+                    }
+                }
+                if !enriched_now {
+                    r.skip_ws();
+                    deps_start = Some(r.pos);
+                    r.skip_plain_value(0)?;
+                }
             }
             _ => r.skip_plain_value(0)?,
         }
@@ -1042,13 +1071,15 @@ fn try_parse_lockfile_fast_impl(
                         {
                             return None;
                         }
-                        if let Some(ds) = deps_start {
-                            let mut deps_scanner = FastLockfileScanner {
-                                bytes: content.as_bytes(),
-                                pos: ds,
-                            };
-                            let mut path_buf = String::with_capacity(64);
-                            deps_scanner.enrich_v2_deps_map(&mut path_buf, &mut pkgs)?;
+                        if !v2_enriched {
+                            if let Some(ds) = deps_start {
+                                let mut deps_scanner = FastLockfileScanner {
+                                    bytes: content.as_bytes(),
+                                    pos: ds,
+                                };
+                                let mut path_buf = String::with_capacity(64);
+                                deps_scanner.enrich_v2_deps_map(&mut path_buf, &mut pkgs)?;
+                            }
                         }
                         if let Some(root) = pkgs.get_mut("") {
                             root.normalize_flags();

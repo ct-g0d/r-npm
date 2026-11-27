@@ -650,8 +650,12 @@ pub fn resolve_workspace_graph<P: PackageMetadataProvider>(
     provider: &P,
     options: &ResolverOptions,
 ) -> Result<DependencyGraph, SolverError> {
-    // 1. Construct and validate workspace graph
-    let ws_graph = WorkspaceDependencyGraph::construct(members)?;
+    // 1. Index workspace members by name without cloning WorkspaceMember / Manifest structs
+    let mut member_by_name: crate::fast_util::FastMap<&str, &WorkspaceMember> =
+        crate::fast_util::fast_map_with_capacity(members.len());
+    for m in members {
+        member_by_name.insert(m.name.as_str(), m);
+    }
 
     let mut graph = DependencyGraph::new();
 
@@ -793,54 +797,125 @@ pub fn resolve_workspace_graph<P: PackageMetadataProvider>(
             dep_type: DependencyType::Prod,
         });
 
-        // Add production edges between workspace members
-        let sibling_deps = ws_graph.dependencies.get(&member.name);
-        if let Some(sibling_deps) = sibling_deps {
-            for (sibling_name, spec) in sibling_deps {
-                let sibling_link_loc = format!("node_modules/{sibling_name}");
-                graph.edges.push(DependencyEdge {
-                    from_location: member_loc.clone(),
-                    to_location: sibling_link_loc,
-                    install_name: sibling_name.clone(),
-                    package_name: sibling_name.clone(),
-                    spec: spec.clone(),
-                    dep_type: DependencyType::Prod,
-                });
+        let mut sibling_prod: BTreeMap<&str, &str> = BTreeMap::new();
+        for (dep_name, dep_spec) in &member.manifest.dependencies {
+            let trimmed_spec = dep_spec.trim();
+            if let Some(ws_spec) = trimmed_spec.strip_prefix("workspace:") {
+                let sibling = member_by_name.get(dep_name.as_str()).copied().ok_or_else(|| {
+                    SolverError::UnresolvedDependency {
+                        name: dep_name.clone(),
+                        spec: dep_spec.clone(),
+                        message: format!(
+                            "Workspace package '{}' not found in monorepo, requested by '{}' via '{}'",
+                            dep_name, member.name, dep_spec
+                        ),
+                    }
+                })?;
+                validate_workspace_protocol_constraint(member, sibling, ws_spec, dep_spec)?;
+                sibling_prod.insert(dep_name.as_str(), dep_spec.as_str());
+            } else if let Some(&sibling) = member_by_name.get(dep_name.as_str()) {
+                if is_sibling_compatible(sibling, trimmed_spec) {
+                    sibling_prod.insert(dep_name.as_str(), dep_spec.as_str());
+                }
             }
         }
-
-        // Add development edges between workspace members (deduped in O(log deg) via ws_graph.dependencies)
-        let sibling_dev_deps = ws_graph.dev_dependencies.get(&member.name);
-        if let Some(sibling_dev_deps) = sibling_dev_deps {
-            for (sibling_name, spec) in sibling_dev_deps {
-                if sibling_deps.is_some_and(|p| p.contains_key(sibling_name)) {
-                    continue;
+        for (dep_name, dep_spec) in &member.manifest.optional_dependencies {
+            if member.manifest.dependencies.contains_key(dep_name) {
+                continue;
+            }
+            let trimmed_spec = dep_spec.trim();
+            if let Some(ws_spec) = trimmed_spec.strip_prefix("workspace:") {
+                let sibling = member_by_name.get(dep_name.as_str()).copied().ok_or_else(|| {
+                    SolverError::UnresolvedDependency {
+                        name: dep_name.clone(),
+                        spec: dep_spec.clone(),
+                        message: format!(
+                            "Workspace package '{}' not found in monorepo, requested by '{}' via '{}'",
+                            dep_name, member.name, dep_spec
+                        ),
+                    }
+                })?;
+                validate_workspace_protocol_constraint(member, sibling, ws_spec, dep_spec)?;
+                sibling_prod.insert(dep_name.as_str(), dep_spec.as_str());
+            } else if let Some(&sibling) = member_by_name.get(dep_name.as_str()) {
+                if is_sibling_compatible(sibling, trimmed_spec) {
+                    sibling_prod.insert(dep_name.as_str(), dep_spec.as_str());
                 }
-                let sibling_link_loc = format!("node_modules/{sibling_name}");
-                graph.edges.push(DependencyEdge {
-                    from_location: member_loc.clone(),
-                    to_location: sibling_link_loc,
-                    install_name: sibling_name.clone(),
-                    package_name: sibling_name.clone(),
-                    spec: spec.clone(),
-                    dep_type: DependencyType::Dev,
-                });
             }
         }
+        for (&sibling_name, &spec) in &sibling_prod {
+            let sibling_link_loc = format!("node_modules/{sibling_name}");
+            graph.edges.push(DependencyEdge {
+                from_location: member_loc.clone(),
+                to_location: sibling_link_loc,
+                install_name: sibling_name.to_string(),
+                package_name: sibling_name.to_string(),
+                spec: spec.to_string(),
+                dep_type: DependencyType::Prod,
+            });
+        }
 
-        // Add peer edges between workspace members (deduped in O(log deg) via prod & dev maps)
-        if let Some(sibling_peer_deps) = ws_graph.peer_dependencies.get(&member.name) {
-            for (sibling_name, spec) in sibling_peer_deps {
-                if sibling_deps.is_some_and(|p| p.contains_key(sibling_name))
-                    || sibling_dev_deps.is_some_and(|d| d.contains_key(sibling_name))
-                {
-                    continue;
+        let mut sibling_dev: BTreeMap<&str, &str> = BTreeMap::new();
+        for (dep_name, dep_spec) in &member.manifest.dev_dependencies {
+            if sibling_prod.contains_key(dep_name.as_str()) {
+                continue;
+            }
+            let trimmed_spec = dep_spec.trim();
+            if let Some(ws_spec) = trimmed_spec.strip_prefix("workspace:") {
+                let sibling = member_by_name.get(dep_name.as_str()).copied().ok_or_else(|| {
+                    SolverError::UnresolvedDependency {
+                        name: dep_name.clone(),
+                        spec: dep_spec.clone(),
+                        message: format!(
+                            "Workspace package '{}' not found in monorepo, requested by '{}' via '{}'",
+                            dep_name, member.name, dep_spec
+                        ),
+                    }
+                })?;
+                validate_workspace_protocol_constraint(member, sibling, ws_spec, dep_spec)?;
+                sibling_dev.insert(dep_name.as_str(), dep_spec.as_str());
+            } else if let Some(&sibling) = member_by_name.get(dep_name.as_str()) {
+                if is_sibling_compatible(sibling, trimmed_spec) {
+                    sibling_dev.insert(dep_name.as_str(), dep_spec.as_str());
                 }
-                let sibling_link_loc = format!("node_modules/{sibling_name}");
+            }
+        }
+        for (&sibling_name, &spec) in &sibling_dev {
+            let sibling_link_loc = format!("node_modules/{sibling_name}");
+            graph.edges.push(DependencyEdge {
+                from_location: member_loc.clone(),
+                to_location: sibling_link_loc,
+                install_name: sibling_name.to_string(),
+                package_name: sibling_name.to_string(),
+                spec: spec.to_string(),
+                dep_type: DependencyType::Dev,
+            });
+        }
+
+        for (dep_name, dep_spec) in &member.manifest.peer_dependencies {
+            let Some(&sibling) = member_by_name.get(dep_name.as_str()) else {
+                continue;
+            };
+            let trimmed_spec = dep_spec.trim();
+            let compatible = if let Some(ws_spec) = trimmed_spec.strip_prefix("workspace:") {
+                validate_workspace_protocol_constraint(member, sibling, ws_spec, dep_spec)?;
+                true
+            } else if sibling_prod.contains_key(dep_name.as_str())
+                || sibling_dev.contains_key(dep_name.as_str())
+            {
+                false
+            } else {
+                is_sibling_compatible(sibling, trimmed_spec)
+            };
+            if compatible
+                && !sibling_prod.contains_key(dep_name.as_str())
+                && !sibling_dev.contains_key(dep_name.as_str())
+            {
+                let sibling_link_loc = format!("node_modules/{dep_name}");
                 let is_opt = member
                     .manifest
                     .peer_dependencies_meta
-                    .get(sibling_name)
+                    .get(dep_name)
                     .map(|m| m.optional)
                     .unwrap_or(false);
                 let dep_type = if is_opt {
@@ -851,9 +926,9 @@ pub fn resolve_workspace_graph<P: PackageMetadataProvider>(
                 graph.edges.push(DependencyEdge {
                     from_location: member_loc.clone(),
                     to_location: sibling_link_loc,
-                    install_name: sibling_name.clone(),
-                    package_name: sibling_name.clone(),
-                    spec: spec.clone(),
+                    install_name: dep_name.clone(),
+                    package_name: dep_name.clone(),
+                    spec: dep_spec.clone(),
                     dep_type,
                 });
             }
@@ -874,32 +949,35 @@ pub fn resolve_workspace_graph<P: PackageMetadataProvider>(
     } else {
         Overrides::default()
     };
-    let mut solver = Solver::new(provider, options.clone(), overrides).with_graph(graph);
+    let mut solver = Solver::new(provider, options.clone(), overrides).with_graph_defer_indices(graph);
 
-    let root_ancestors = std::sync::Arc::new(vec![root_name.clone()]);
+    let root_ancestor_head = solver.intern_ancestor_chain(&[&root_name]);
 
     // Enqueue root external dependencies borrowing manifest strings in sorted order
     let mut root_deps: BTreeMap<&str, (&str, DependencyType)> = BTreeMap::new();
+    let is_ws_member = |name: &str, spec: &str| {
+        member_by_name.contains_key(name) || spec.trim().starts_with("workspace:")
+    };
     if options.dev {
         for (k, v) in &root_manifest.dev_dependencies {
-            if !(ws_graph.is_member(k) || v.trim().starts_with("workspace:")) {
+            if !is_ws_member(k, v) {
                 root_deps.insert(k.as_str(), (v.as_str(), DependencyType::Dev));
             }
         }
     }
     for (k, v) in &root_manifest.dependencies {
-        if !(ws_graph.is_member(k) || v.trim().starts_with("workspace:")) {
+        if !is_ws_member(k, v) {
             root_deps.insert(k.as_str(), (v.as_str(), DependencyType::Prod));
         }
     }
     for (k, v) in &root_manifest.optional_dependencies {
-        if !(ws_graph.is_member(k) || v.trim().starts_with("workspace:")) {
+        if !is_ws_member(k, v) {
             root_deps.insert(k.as_str(), (v.as_str(), DependencyType::Optional));
         }
     }
     if !options.legacy_peer_deps {
         for (k, v) in &root_manifest.peer_dependencies {
-            if !(ws_graph.is_member(k) || v.trim().starts_with("workspace:")) {
+            if !is_ws_member(k, v) {
                 let is_opt_peer = root_manifest
                     .peer_dependencies_meta
                     .get(k)
@@ -916,42 +994,51 @@ pub fn resolve_workspace_graph<P: PackageMetadataProvider>(
     }
 
     for (install_name, (raw_spec, dep_type)) in root_deps {
-        solver.enqueue_task(
-            String::new(),
-            root_name.clone(),
-            install_name.to_string(),
-            raw_spec.to_string(),
+        solver.enqueue_root_task_borrowed(
+            "",
+            &root_name,
+            install_name,
+            raw_spec,
             dep_type,
-            root_ancestors.clone(),
+            root_ancestor_head,
         );
     }
 
-    // Enqueue member external dependencies in deterministic sorted order
+    // Enqueue member external dependencies directly into deferred workspace storage
+    let has_compatible_sibling = |sibling_name: &str, raw_spec: &str| {
+        let trimmed = raw_spec.trim();
+        if trimmed.starts_with("workspace:") {
+            return true;
+        }
+        member_by_name
+            .get(sibling_name)
+            .is_some_and(|sibling| is_sibling_compatible(sibling, trimmed))
+    };
     let mut member_deps: BTreeMap<&str, (&str, DependencyType)> = BTreeMap::new();
     for member in members {
-        let member_ancestors = std::sync::Arc::new(vec![root_name.clone(), member.name.clone()]);
+        let member_ancestor_head = solver.intern_ancestor_chain(&[&root_name, &member.name]);
         member_deps.clear();
 
         if options.dev {
             for (k, v) in &member.manifest.dev_dependencies {
-                if !ws_graph.has_compatible_sibling(k, v) {
+                if !has_compatible_sibling(k, v) {
                     member_deps.insert(k.as_str(), (v.as_str(), DependencyType::Dev));
                 }
             }
         }
         for (k, v) in &member.manifest.dependencies {
-            if !ws_graph.has_compatible_sibling(k, v) {
+            if !has_compatible_sibling(k, v) {
                 member_deps.insert(k.as_str(), (v.as_str(), DependencyType::Prod));
             }
         }
         for (k, v) in &member.manifest.optional_dependencies {
-            if !ws_graph.has_compatible_sibling(k, v) {
+            if !has_compatible_sibling(k, v) {
                 member_deps.insert(k.as_str(), (v.as_str(), DependencyType::Optional));
             }
         }
         if !options.legacy_peer_deps {
             for (k, v) in &member.manifest.peer_dependencies {
-                if !ws_graph.has_compatible_sibling(k, v) {
+                if !has_compatible_sibling(k, v) {
                     let is_opt_peer = member
                         .manifest
                         .peer_dependencies_meta
@@ -969,20 +1056,16 @@ pub fn resolve_workspace_graph<P: PackageMetadataProvider>(
         }
 
         for (install_name, (raw_spec, dep_type)) in &member_deps {
-            solver.enqueue_task(
-                member.relative_path.clone(),
-                member.name.clone(),
-                (*install_name).to_string(),
-                (*raw_spec).to_string(),
+            solver.enqueue_deferred_workspace_task(
+                &member.relative_path,
+                &member.name,
+                install_name,
+                raw_spec,
                 *dep_type,
-                member_ancestors.clone(),
+                member_ancestor_head,
             );
         }
     }
-
-    // Link targets are deferred unless an earlier placement invalidates an
-    // edge from a workspace, in which case Arborist queues it immediately.
-    solver.defer_workspace_tasks();
 
     // Process external dependency queue
     solver.resolve_tasks()?;

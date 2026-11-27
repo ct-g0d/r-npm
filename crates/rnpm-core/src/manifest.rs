@@ -1176,19 +1176,32 @@ struct FastManifestScanner<'a> {
 impl<'a> FastManifestScanner<'a> {
     #[inline]
     fn skip_ws(&mut self) {
-        let len = self.bytes.len();
-        while self.pos < len {
-            let b = self.bytes[self.pos];
+        let bytes = self.bytes;
+        let len = bytes.len();
+        let mut p = self.pos;
+        if p < len && bytes[p] > b' ' {
+            return;
+        }
+        while p < len {
+            let b = bytes[p];
+            if b > b' ' {
+                break;
+            }
             if matches!(b, b' ' | b'\n' | b'\r' | b'\t') {
-                self.pos += 1;
+                p += 1;
             } else {
                 break;
             }
         }
+        self.pos = p;
     }
 
     #[inline]
     fn expect_byte(&mut self, expected: u8) -> Option<()> {
+        if self.pos < self.bytes.len() && self.bytes[self.pos] == expected {
+            self.pos += 1;
+            return Some(());
+        }
         self.skip_ws();
         if *self.bytes.get(self.pos)? == expected {
             self.pos += 1;
@@ -1301,7 +1314,7 @@ impl<'a> FastManifestScanner<'a> {
         self.expect_byte(b'{')?;
         let mut map = BTreeMap::new();
         let mut raw_map = if CAPTURE_RAW {
-            Some(OrderedJsonMap::with_capacity(4))
+            Some(OrderedJsonMap::with_capacity(8))
         } else {
             None
         };
@@ -1349,9 +1362,9 @@ impl<'a> FastManifestScanner<'a> {
             b'{' => {
                 self.pos += 1;
                 let mut map = BTreeMap::new();
-                let mut order = Vec::with_capacity(8);
+                let mut order = Vec::with_capacity(16);
                 let mut raw_map = if CAPTURE_RAW {
-                    Some(OrderedJsonMap::with_capacity(8))
+                    Some(OrderedJsonMap::with_capacity(16))
                 } else {
                     None
                 };
@@ -1429,8 +1442,8 @@ impl<'a> FastManifestScanner<'a> {
             }
             b'[' => {
                 self.pos += 1;
-                let mut arr = Vec::new();
-                let mut rarr = if CAPTURE_RAW { Some(Vec::new()) } else { None };
+                let mut arr = Vec::with_capacity(4);
+                let mut rarr = if CAPTURE_RAW { Some(Vec::with_capacity(4)) } else { None };
                 if self.peek()? == b']' {
                     self.pos += 1;
                     return Some((
@@ -1459,9 +1472,9 @@ impl<'a> FastManifestScanner<'a> {
             }
             b'{' => {
                 self.pos += 1;
-                let mut map = serde_json::Map::new();
+                let mut map = serde_json::Map::with_capacity(4);
                 let mut rmap = if CAPTURE_RAW {
-                    Some(OrderedJsonMap::new())
+                    Some(OrderedJsonMap::with_capacity(4))
                 } else {
                     None
                 };
@@ -1554,7 +1567,7 @@ fn try_parse_manifest_fast<const CAPTURE_RAW: bool>(clean_str: &str) -> Option<M
     r.expect_byte(b'{')?;
     let mut m = Manifest::default();
     let mut raw_map = if CAPTURE_RAW {
-        Some(OrderedJsonMap::with_capacity(16))
+        Some(OrderedJsonMap::with_capacity(24))
     } else {
         None
     };
@@ -2215,6 +2228,114 @@ impl Manifest {
         } else {
             self.format.newline.as_str()
         };
+        let colon = if pretty { ": " } else { ":" };
+        let (nl_indent_1, nl_indent_2, nl_indent_3) = if pretty {
+            let mut s1 = String::with_capacity(newline.len() + indent.len());
+            s1.push_str(newline);
+            s1.push_str(indent);
+            let mut s2 = String::with_capacity(newline.len() + indent.len() * 2);
+            s2.push_str(newline);
+            s2.push_str(indent);
+            s2.push_str(indent);
+            let mut s3 = String::with_capacity(newline.len() + indent.len() * 3);
+            s3.push_str(newline);
+            s3.push_str(indent);
+            s3.push_str(indent);
+            s3.push_str(indent);
+            (s1, s2, s3)
+        } else {
+            (String::new(), String::new(), String::new())
+        };
+        let mut deps_seen_scratch = crate::fast_hash::FxHashSet::default();
+        fn write_ordered_deps_impl<'a>(
+            out: &mut String,
+            deps: &'a BTreeMap<String, String>,
+            order: &'a [String],
+            nl_indent_1: &str,
+            nl_indent_2: &str,
+            colon: &str,
+            deps_seen_scratch: &mut crate::fast_hash::FxHashSet<&'a str>,
+        ) {
+            if deps.is_empty() {
+                out.push_str("{}");
+                return;
+            }
+            let pretty = !nl_indent_1.is_empty();
+            out.push('{');
+            if order.len() == deps.len() && deps.keys().eq(order.iter()) {
+                for (idx, (k, v)) in deps.iter().enumerate() {
+                    if idx > 0 {
+                        out.push(',');
+                    }
+                    if pretty {
+                        out.push_str(nl_indent_2);
+                    }
+                    write_json_str(k, out);
+                    out.push_str(colon);
+                    write_json_str(v, out);
+                }
+                if pretty {
+                    out.push_str(nl_indent_1);
+                }
+                out.push('}');
+                return;
+            }
+            let mut idx = 0usize;
+            let mut emitted_unique = 0usize;
+            let use_set = order.len() > 16;
+            if use_set {
+                deps_seen_scratch.clear();
+                deps_seen_scratch.reserve(order.len());
+            }
+            for (i, k) in order.iter().enumerate() {
+                if let Some(v) = deps.get(k) {
+                    let is_dup = if use_set {
+                        !deps_seen_scratch.insert(k.as_str())
+                    } else {
+                        order[..i].iter().any(|prev| prev == k)
+                    };
+                    if is_dup {
+                        continue;
+                    }
+                    if idx > 0 {
+                        out.push(',');
+                    }
+                    if pretty {
+                        out.push_str(nl_indent_2);
+                    }
+                    write_json_str(k, out);
+                    out.push_str(colon);
+                    write_json_str(v, out);
+                    idx += 1;
+                    emitted_unique += 1;
+                }
+            }
+            if emitted_unique < deps.len() {
+                for (k, v) in deps {
+                    let already = if use_set {
+                        deps_seen_scratch.contains(k.as_str())
+                    } else {
+                        order.iter().any(|ok| ok == k)
+                    };
+                    if !already {
+                        if idx > 0 {
+                            out.push(',');
+                        }
+                        if pretty {
+                            out.push_str(nl_indent_2);
+                        }
+                        write_json_str(k, out);
+                        out.push_str(colon);
+                        write_json_str(v, out);
+                        idx += 1;
+                    }
+                }
+            }
+            if pretty {
+                out.push_str(nl_indent_1);
+            }
+            out.push('}');
+        }
 
         let write_entry_prefix = |out: &mut String, first: &mut bool, key: &str| {
             if *first {
@@ -2223,11 +2344,10 @@ impl Manifest {
                 out.push(',');
             }
             if pretty {
-                out.push_str(newline);
-                out.push_str(indent);
+                out.push_str(&nl_indent_1);
             }
             write_json_str(key, out);
-            out.push_str(if pretty { ": " } else { ":" });
+            out.push_str(colon);
         };
 
         let write_str_map = |out: &mut String, map: &BTreeMap<String, String>| {
@@ -2241,82 +2361,14 @@ impl Manifest {
                     out.push(',');
                 }
                 if pretty {
-                    out.push_str(newline);
-                    push_indent(out, indent, 2);
+                    out.push_str(&nl_indent_2);
                 }
                 write_json_str(k, out);
-                out.push_str(if pretty { ": " } else { ":" });
+                out.push_str(colon);
                 write_json_str(v, out);
             }
             if pretty {
-                out.push_str(newline);
-                out.push_str(indent);
-            }
-            out.push('}');
-        };
-
-        let write_ordered_deps = |out: &mut String, deps: &BTreeMap<String, String>, order: &[String]| {
-            if deps.is_empty() {
-                out.push_str("{}");
-                return;
-            }
-            out.push('{');
-            let mut idx = 0usize;
-            let mut emitted_unique = 0usize;
-            let mut seen_large = if order.len() > 16 {
-                Some(crate::fast_hash::fx_set_with_capacity(order.len()))
-            } else {
-                None
-            };
-            for (i, k) in order.iter().enumerate() {
-                if let Some(v) = deps.get(k) {
-                    let is_dup = if let Some(ref mut set) = seen_large {
-                        !set.insert(k.as_str())
-                    } else {
-                        order[..i].iter().any(|prev| prev == k)
-                    };
-                    if is_dup {
-                        continue;
-                    }
-                    if idx > 0 {
-                        out.push(',');
-                    }
-                    if pretty {
-                        out.push_str(newline);
-                        push_indent(out, indent, 2);
-                    }
-                    write_json_str(k, out);
-                    out.push_str(if pretty { ": " } else { ":" });
-                    write_json_str(v, out);
-                    idx += 1;
-                    emitted_unique += 1;
-                }
-            }
-            if emitted_unique < deps.len() {
-                for (k, v) in deps {
-                    let already = if let Some(ref set) = seen_large {
-                        set.contains(k.as_str())
-                    } else {
-                        order.iter().any(|ok| ok == k)
-                    };
-                    if !already {
-                        if idx > 0 {
-                            out.push(',');
-                        }
-                        if pretty {
-                            out.push_str(newline);
-                            push_indent(out, indent, 2);
-                        }
-                        write_json_str(k, out);
-                        out.push_str(if pretty { ": " } else { ":" });
-                        write_json_str(v, out);
-                        idx += 1;
-                    }
-                }
-            }
-            if pretty {
-                out.push_str(newline);
-                out.push_str(indent);
+                out.push_str(&nl_indent_1);
             }
             out.push('}');
         };
@@ -2334,14 +2386,12 @@ impl Manifest {
                         out.push(',');
                     }
                     if pretty {
-                        out.push_str(newline);
-                        push_indent(out, indent, 2);
+                        out.push_str(&nl_indent_2);
                     }
                     write_json_str(item, out);
                 }
                 if pretty {
-                    out.push_str(newline);
-                    out.push_str(indent);
+                    out.push_str(&nl_indent_1);
                 }
                 out.push(']');
             }
@@ -2358,26 +2408,22 @@ impl Manifest {
                     out.push(',');
                 }
                 if pretty {
-                    out.push_str(newline);
-                    push_indent(out, indent, 2);
+                    out.push_str(&nl_indent_2);
                 }
                 write_json_str(k, out);
                 out.push_str(if pretty { ": {" } else { ":{" });
                 if pretty {
-                    out.push_str(newline);
-                    push_indent(out, indent, 3);
+                    out.push_str(&nl_indent_3);
                 }
                 out.push_str(if pretty { "\"optional\": " } else { "\"optional\":" });
                 out.push_str(if pm.optional { "true" } else { "false" });
                 if pretty {
-                    out.push_str(newline);
-                    push_indent(out, indent, 2);
+                    out.push_str(&nl_indent_2);
                 }
                 out.push('}');
             }
             if pretty {
-                out.push_str(newline);
-                out.push_str(indent);
+                out.push_str(&nl_indent_1);
             }
             out.push('}');
         };
@@ -2507,17 +2553,29 @@ impl Manifest {
                     seen_deps = true;
                     if !self.dependencies.is_empty() {
                         write_entry_prefix(&mut out, &mut first, "dependencies");
-                        write_ordered_deps(&mut out, &self.dependencies, &self.dependency_order);
+                        write_ordered_deps_impl(
+                            &mut out,
+                            &self.dependencies,
+                            &self.dependency_order,
+                            &nl_indent_1,
+                            &nl_indent_2,
+                            colon,
+                            &mut deps_seen_scratch,
+                        );
                     }
                 }
                 "devDependencies" => {
                     seen_dev_deps = true;
                     if !self.dev_dependencies.is_empty() {
                         write_entry_prefix(&mut out, &mut first, "devDependencies");
-                        write_ordered_deps(
+                        write_ordered_deps_impl(
                             &mut out,
                             &self.dev_dependencies,
                             &self.dev_dependency_order,
+                            &nl_indent_1,
+                            &nl_indent_2,
+                            colon,
+                            &mut deps_seen_scratch,
                         );
                     }
                 }
@@ -2525,10 +2583,14 @@ impl Manifest {
                     seen_peer_deps = true;
                     if !self.peer_dependencies.is_empty() {
                         write_entry_prefix(&mut out, &mut first, "peerDependencies");
-                        write_ordered_deps(
+                        write_ordered_deps_impl(
                             &mut out,
                             &self.peer_dependencies,
                             &self.peer_dependency_order,
+                            &nl_indent_1,
+                            &nl_indent_2,
+                            colon,
+                            &mut deps_seen_scratch,
                         );
                     }
                 }
@@ -2536,10 +2598,14 @@ impl Manifest {
                     seen_opt_deps = true;
                     if !self.optional_dependencies.is_empty() {
                         write_entry_prefix(&mut out, &mut first, "optionalDependencies");
-                        write_ordered_deps(
+                        write_ordered_deps_impl(
                             &mut out,
                             &self.optional_dependencies,
                             &self.optional_dependency_order,
+                            &nl_indent_1,
+                            &nl_indent_2,
+                            colon,
+                            &mut deps_seen_scratch,
                         );
                     }
                 }
@@ -2604,30 +2670,50 @@ impl Manifest {
         }
         if !seen_deps && !self.dependencies.is_empty() {
             write_entry_prefix(&mut out, &mut first, "dependencies");
-            write_ordered_deps(&mut out, &self.dependencies, &self.dependency_order);
+            write_ordered_deps_impl(
+                &mut out,
+                &self.dependencies,
+                &self.dependency_order,
+                &nl_indent_1,
+                &nl_indent_2,
+                colon,
+                &mut deps_seen_scratch,
+            );
         }
         if !seen_dev_deps && !self.dev_dependencies.is_empty() {
             write_entry_prefix(&mut out, &mut first, "devDependencies");
-            write_ordered_deps(
+            write_ordered_deps_impl(
                 &mut out,
                 &self.dev_dependencies,
                 &self.dev_dependency_order,
+                &nl_indent_1,
+                &nl_indent_2,
+                colon,
+                &mut deps_seen_scratch,
             );
         }
         if !seen_peer_deps && !self.peer_dependencies.is_empty() {
             write_entry_prefix(&mut out, &mut first, "peerDependencies");
-            write_ordered_deps(
+            write_ordered_deps_impl(
                 &mut out,
                 &self.peer_dependencies,
                 &self.peer_dependency_order,
+                &nl_indent_1,
+                &nl_indent_2,
+                colon,
+                &mut deps_seen_scratch,
             );
         }
         if !seen_opt_deps && !self.optional_dependencies.is_empty() {
             write_entry_prefix(&mut out, &mut first, "optionalDependencies");
-            write_ordered_deps(
+            write_ordered_deps_impl(
                 &mut out,
                 &self.optional_dependencies,
                 &self.optional_dependency_order,
+                &nl_indent_1,
+                &nl_indent_2,
+                colon,
+                &mut deps_seen_scratch,
             );
         }
         if !seen_bundle_deps {

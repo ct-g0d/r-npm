@@ -401,6 +401,45 @@ pub fn determine_placement_with_peers(
     placing_peer: bool,
     strategy: PlacementStrategy,
 ) -> PlacementDecision {
+    let resolved_parsed = resolved_version.and_then(cached_version_rc);
+    determine_placement_with_peers_parsed(
+        graph,
+        parent_location,
+        install_name,
+        package_name,
+        target,
+        dependencies,
+        peer_dependencies,
+        peer_dependencies_meta,
+        resolved_version,
+        resolved_parsed.as_deref(),
+        resolved,
+        integrity,
+        placing_peer,
+        strategy,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn determine_placement_with_peers_parsed(
+    graph: &DependencyGraph,
+    parent_location: &str,
+    install_name: &str,
+    package_name: &str,
+    target: &PackageTarget,
+    dependencies: &std::collections::BTreeMap<String, String>,
+    peer_dependencies: &std::collections::BTreeMap<String, String>,
+    peer_dependencies_meta: &std::collections::BTreeMap<
+        String,
+        rnpm_core::manifest::PeerDependencyMeta,
+    >,
+    resolved_version: Option<&str>,
+    resolved_parsed: Option<&Version>,
+    resolved: Option<&str>,
+    integrity: Option<&str>,
+    placing_peer: bool,
+    strategy: PlacementStrategy,
+) -> PlacementDecision {
     let mut path_buf = String::with_capacity(parent_location.len() + 14 + install_name.len());
     path_buf.push_str("node_modules/");
     path_buf.push_str(install_name);
@@ -528,7 +567,6 @@ pub fn determine_placement_with_peers(
             } else {
                 overflow_ancestors.as_slice()
             };
-            let resolved_parsed = resolved_version.and_then(cached_version_rc);
             for &ancestor in ancestor_slice.iter().rev() {
                 let mut found: Option<PlacementDecision> = None;
                 with_scoped_path(ancestor, install_name, |cand_loc| {
@@ -567,13 +605,13 @@ pub fn determine_placement_with_peers(
                         package_name,
                         target,
                         resolved_version,
-                        resolved_parsed.as_deref(),
+                        resolved_parsed,
                     ) && !candidate_shadows_descendant_dep_parsed(
                         graph,
                         ancestor,
                         install_name,
                         resolved_version,
-                        resolved_parsed.as_deref(),
+                        resolved_parsed,
                     ) {
                         found = Some(PlacementDecision::PlaceNew(cand_loc.to_owned()));
                     }
@@ -765,24 +803,32 @@ fn candidate_shadows_descendant_dep_parsed(
             .is_some_and(|current| node_satisfies_target(current, &target))
     };
 
-    let has_dep_index = !graph.nodes_by_dep_name.is_empty();
-    let has_edge_index = !graph.edges_by_install_name.is_empty();
+    let has_dep_index = graph.has_dep_index();
+    let has_edge_index = graph.has_edge_install_index();
     let rel_nodes = if has_dep_index {
-        graph.nodes_by_dep_name.get(install_name)
+        graph.nodes_for_dep(install_name)
     } else {
         None
     };
     let rel_edges = if has_edge_index {
-        graph.edges_by_install_name.get(install_name)
+        graph.edges_for_install(install_name)
     } else {
         None
     };
+    if has_dep_index
+        && has_edge_index
+        && rel_nodes.is_none_or(<[String]>::is_empty)
+        && rel_edges.is_none_or(<[usize]>::is_empty)
+    {
+        return false;
+    }
 
     // For non-root scopes when `install_name` has many dependents across the whole tree,
-    // walk only `scope`'s subtree via BTreeMap range instead of scanning 100s of unrelated nodes/edges.
+    // walk only `scope`'s subtree via BTreeMap range instead of scanning unrelated nodes/edges.
     if !scope.is_empty()
-        && !graph.outgoing_edges_by_location.is_empty()
-        && (rel_nodes.map_or(0, Vec::len) > 48 || rel_edges.map_or(0, Vec::len) > 48)
+        && graph.has_outgoing_index()
+        && (rel_nodes.map_or(0, <[String]>::len) > 16
+            || rel_edges.map_or(0, <[usize]>::len) > 16)
     {
         let check_subtree_entry = |loc: &str, node: &crate::graph::Node| -> bool {
             if !is_in_scope_subtree(loc, scope) {
@@ -791,7 +837,7 @@ fn candidate_shadows_descendant_dep_parsed(
             if check_node_ref(node) {
                 return true;
             }
-            if let Some(out_indices) = graph.outgoing_edges_by_location.get(loc) {
+            if let Some(out_indices) = graph.outgoing_edges_for(loc) {
                 for &idx in out_indices {
                     if check_edge(&graph.edges[idx]) {
                         return true;
@@ -1001,24 +1047,35 @@ fn provider_accepts_parsed_version(
     let Some(existing) = graph.nodes.get(location) else {
         return false;
     };
-    let replacement = crate::graph::Node {
-        version: version.to_string(),
-        parsed_version,
-        resolved: None,
-        integrity: None,
-        ..existing.clone()
+    let matches_replacement = |target: &PackageTarget| -> bool {
+        let mut curr = target;
+        loop {
+            match curr {
+                PackageTarget::Url(_) | PackageTarget::File(_) | PackageTarget::Git { .. } => {
+                    return false;
+                }
+                PackageTarget::Alias { name, target } => {
+                    if existing.name != *name {
+                        return false;
+                    }
+                    curr = target.as_ref();
+                }
+                _ => {
+                    return version_entry_satisfies_target(version, parsed_version.as_ref(), curr);
+                }
+            }
+        }
     };
     // A provider whose placing edge is not recorded yet (a late optional peer
     // activated while it is being placed) has dependents this cannot see.
-    if !graph.incoming_edges_by_location.is_empty() {
-        if let Some(incoming) = graph.incoming_edges_by_location.get(location) {
+    if graph.has_incoming_index() {
+        if let Some(incoming) = graph.incoming_edges_for(location) {
             if incoming.is_empty() {
                 return false;
             }
             incoming.iter().all(|&idx| {
                 let edge = &graph.edges[idx];
-                cached_target_rc(&edge.spec)
-                    .is_some_and(|target| node_satisfies_target(&replacement, &target))
+                cached_target_rc(&edge.spec).is_some_and(|target| matches_replacement(&target))
             })
         } else {
             false
@@ -1031,8 +1088,7 @@ fn provider_accepts_parsed_version(
             .peekable();
         incoming.peek().is_some()
             && incoming.all(|edge| {
-                cached_target_rc(&edge.spec)
-                    .is_some_and(|target| node_satisfies_target(&replacement, &target))
+                cached_target_rc(&edge.spec).is_some_and(|target| matches_replacement(&target))
             })
     }
 }
@@ -1046,13 +1102,11 @@ fn is_shadowed_by_incompatible_between(
     install_name: &str,
     target: &PackageTarget,
 ) -> bool {
-    if !graph.nodes_by_install_name.is_empty() {
-        let Some(locs) = graph.nodes_by_install_name.get(install_name) else {
+    if graph.has_install_index() {
+        let Some(locs) = graph.nodes_for_install(install_name) else {
             return false;
         };
-        // Fast exit for small bucket sizes; for large buckets (>8), walking the short
-        // ancestor chain directly is O(depth) instead of scanning all nested locations.
-        if locs.len() <= 8 {
+        if locs.len() <= 32 {
             let suffix_len = 14 + install_name.len();
             let any_potential_intermediate = locs.iter().any(|loc| {
                 if loc.len() <= suffix_len {
@@ -1094,7 +1148,7 @@ fn is_shadowed_by_incompatible_between(
 }
 
 #[inline]
-fn with_scoped_path<R>(scope: &str, install_name: &str, f: impl FnOnce(&str) -> R) -> R {
+pub(crate) fn with_scoped_path<R>(scope: &str, install_name: &str, f: impl FnOnce(&str) -> R) -> R {
     let need = if scope.is_empty() {
         13 + install_name.len()
     } else {
@@ -1152,8 +1206,8 @@ pub fn find_visible_peer_node<'a>(
     install_name: &str,
     package_name: &str,
 ) -> Option<&'a crate::graph::Node> {
-    if !graph.nodes_by_install_name.is_empty() {
-        let by_install = graph.nodes_by_install_name.get(install_name);
+    if graph.has_install_index() {
+        let by_install = graph.nodes_for_install(install_name);
         if package_name == install_name {
             let locs = by_install?;
             if locs.is_empty() {
@@ -1180,8 +1234,10 @@ pub fn find_visible_peer_node<'a>(
                 }
             }
         } else {
-            let by_pkg = graph.nodes_by_install_name.get(package_name);
-            if by_install.is_none_or(Vec::is_empty) && by_pkg.is_none_or(Vec::is_empty) {
+            let by_pkg = graph.nodes_for_install(package_name);
+            if by_install.is_none_or(<[String]>::is_empty)
+                && by_pkg.is_none_or(<[String]>::is_empty)
+            {
                 return None;
             }
         }

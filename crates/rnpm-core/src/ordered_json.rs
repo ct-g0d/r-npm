@@ -203,7 +203,7 @@ impl<'de> Visitor<'de> for OrderedJsonVisitor {
     where
         M: MapAccess<'de>,
     {
-        let mut index_map = IndexMap::with_capacity(map.size_hint().unwrap_or(4));
+        let mut index_map = OrderedJsonMap::with_capacity(map.size_hint().unwrap_or(4));
         while let Some((k, v)) = map.next_entry()? {
             index_map.insert(k, v);
         }
@@ -439,7 +439,7 @@ impl From<serde_json::Value> for OrderedJsonValue {
                 OrderedJsonValue::Array(arr.into_iter().map(Into::into).collect())
             }
             serde_json::Value::Object(map) => {
-                let mut m = IndexMap::with_capacity(map.len());
+                let mut m = OrderedJsonMap::with_capacity(map.len());
                 for (k, v) in map {
                     m.insert(k, v.into());
                 }
