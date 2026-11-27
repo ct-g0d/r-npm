@@ -371,18 +371,22 @@ fn track_http_request(method: &Method, url: &Url) {
 #[inline]
 fn has_proxy_env_vars() -> bool {
     #[cfg(windows)]
-    const VARS: &[&str] = &["HTTP_PROXY", "HTTPS_PROXY", "PROXY"];
+    {
+        const VARS: &[&str] = &["HTTP_PROXY", "HTTPS_PROXY", "PROXY"];
+        VARS.iter()
+            .any(|name| std::env::var_os(name).is_some_and(|v| !v.is_empty()))
+    }
     #[cfg(not(windows))]
-    const VARS: &[&str] = &[
-        "http_proxy",
-        "HTTP_PROXY",
-        "https_proxy",
-        "HTTPS_PROXY",
-        "proxy",
-        "PROXY",
-    ];
-    VARS.iter()
-        .any(|name| std::env::var_os(name).is_some_and(|v| !v.is_empty()))
+    {
+        std::env::vars_os().any(|(k, v)| {
+            !v.is_empty()
+                && k.to_str().is_some_and(|s| {
+                    s.eq_ignore_ascii_case("http_proxy")
+                        || s.eq_ignore_ascii_case("https_proxy")
+                        || s.eq_ignore_ascii_case("proxy")
+                })
+        })
+    }
 }
 
 /// Returns a lowercase `host[:port]` key, borrowing zero-copy when the URL has no explicit port
@@ -2842,13 +2846,7 @@ impl RegistryClient {
                                 retry_after: retry_after_secs,
                             });
                         }
-                        return Err(RegistryError::ServerError {
-                            status: status.as_u16(),
-                            body,
-                        });
-                    }
-
-                    if let Some(ref hk) = host_key {
+                    } else if let Some(ref hk) = host_key {
                         self.circuit_breaker.record_success(hk).await;
                     }
 

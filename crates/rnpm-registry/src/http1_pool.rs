@@ -1,6 +1,6 @@
 use crate::error::{HttpTransportError, RegistryError};
 use crate::network_errors::format_io_error;
-use flate2::read::{DeflateDecoder, GzDecoder};
+use flate2::read::{DeflateDecoder, MultiGzDecoder};
 use reqwest::header::HeaderMap;
 use reqwest::{Method, StatusCode};
 use std::collections::HashMap;
@@ -239,7 +239,7 @@ struct ParsedHeaders {
     cache_metadata: serde_json::Value,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ContentEncoding {
     Identity,
     Gzip,
@@ -253,8 +253,32 @@ fn has_crlf_bytes(bytes: &[u8]) -> bool {
 }
 
 #[inline]
+fn has_control_bytes(bytes: &[u8]) -> bool {
+    bytes.iter().any(|&b| b < 0x20 || b == 0x7f)
+}
+
+#[inline]
 fn is_valid_header_str(bytes: &[u8]) -> bool {
     bytes.iter().all(|&b| b == b'\t' || (0x20..0x7f).contains(&b))
+}
+
+#[inline]
+fn trim_trailing_ascii_ws(mut b: &[u8]) -> &[u8] {
+    while let Some(&last) = b.last() {
+        if last == b' ' || last == b'\t' {
+            b = &b[..b.len() - 1];
+        } else {
+            break;
+        }
+    }
+    b
+}
+
+#[inline]
+fn trim_ascii_ows_str(s: &str) -> &str {
+    let b = trim_ascii_ws(s.as_bytes());
+    // SAFETY: stripping leading/trailing ASCII ' ' and '\t' preserves valid UTF-8 boundaries.
+    std::str::from_utf8(b).unwrap_or(s)
 }
 
 #[inline]
@@ -279,7 +303,7 @@ fn trim_ascii_ws(mut b: &[u8]) -> &[u8] {
 #[inline]
 fn contains_token_ascii_ci(val: &str, token: &str) -> bool {
     val.split(',')
-        .any(|part| part.trim().eq_ignore_ascii_case(token))
+        .any(|part| trim_ascii_ows_str(part).eq_ignore_ascii_case(token))
 }
 
 fn parse_headers(raw: &[u8], collect_cache_metadata: bool) -> Result<ParsedHeaders, RegistryError> {
@@ -295,6 +319,15 @@ fn parse_headers(raw: &[u8], collect_cache_metadata: bool) -> Result<ParsedHeade
 
     let mut lines = text.split("\r\n");
     let status_line = lines.next().unwrap_or("");
+    if has_crlf_bytes(status_line.as_bytes()) {
+        return Err(RegistryError::Transport(HttpTransportError {
+            message: "HTTP status line contains bare CR/LF".into(),
+            is_connect: false,
+            is_timeout: false,
+            is_decode: true,
+            is_transient: false,
+        }));
+    }
     let (is_http_11, status_rest) = if let Some(rest) = status_line.strip_prefix("HTTP/1.1 ") {
         (true, rest)
     } else if let Some(rest) = status_line.strip_prefix("HTTP/1.0 ") {
@@ -353,7 +386,16 @@ fn parse_headers(raw: &[u8], collect_cache_metadata: bool) -> Result<ParsedHeade
         if line.is_empty() {
             continue;
         }
-        let Some((name_raw, val_raw)) = line.split_once(':') else {
+        if has_crlf_bytes(line.as_bytes()) {
+            return Err(RegistryError::Transport(HttpTransportError {
+                message: "HTTP header line contains bare CR/LF".into(),
+                is_connect: false,
+                is_timeout: false,
+                is_decode: true,
+                is_transient: false,
+            }));
+        }
+        let Some((name, val_raw)) = line.split_once(':') else {
             return Err(RegistryError::Transport(HttpTransportError {
                 message: format!("Malformed HTTP header line: {line}"),
                 is_connect: false,
@@ -362,10 +404,31 @@ fn parse_headers(raw: &[u8], collect_cache_metadata: bool) -> Result<ParsedHeade
                 is_transient: false,
             }));
         };
-        let name = name_raw.trim();
-        let val = val_raw.trim();
+        if name.is_empty()
+            || name
+                .bytes()
+                .any(|b| b.is_ascii_whitespace() || b.is_ascii_control())
+        {
+            return Err(RegistryError::Transport(HttpTransportError {
+                message: format!("Invalid HTTP header name: {name}"),
+                is_connect: false,
+                is_timeout: false,
+                is_decode: true,
+                is_transient: false,
+            }));
+        }
+        let val = trim_ascii_ows_str(val_raw);
 
         if name.eq_ignore_ascii_case("content-length") {
+            if val.is_empty() || !val.bytes().all(|b| b.is_ascii_digit()) {
+                return Err(RegistryError::Transport(HttpTransportError {
+                    message: format!("Invalid Content-Length header: {val}"),
+                    is_connect: false,
+                    is_timeout: false,
+                    is_decode: true,
+                    is_transient: false,
+                }));
+            }
             let parsed = val.parse::<u64>().map_err(|_| {
                 RegistryError::Transport(HttpTransportError {
                     message: format!("Invalid Content-Length header: {val}"),
@@ -388,7 +451,11 @@ fn parse_headers(raw: &[u8], collect_cache_metadata: bool) -> Result<ParsedHeade
             }
             content_length = Some(parsed);
         } else if name.eq_ignore_ascii_case("transfer-encoding") {
-            for tok in val.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+            for tok in val
+                .split(',')
+                .map(trim_ascii_ows_str)
+                .filter(|s| !s.is_empty())
+            {
                 if tok.eq_ignore_ascii_case("chunked") {
                     is_chunked = true;
                 } else if !tok.eq_ignore_ascii_case("identity") {
@@ -403,13 +470,23 @@ fn parse_headers(raw: &[u8], collect_cache_metadata: bool) -> Result<ParsedHeade
                 conn_keep_alive = true;
             }
         } else if name.eq_ignore_ascii_case("content-encoding") {
-            let enc = val.trim();
-            if enc.eq_ignore_ascii_case("gzip") || enc.eq_ignore_ascii_case("x-gzip") {
-                content_encoding = ContentEncoding::Gzip;
-            } else if enc.eq_ignore_ascii_case("deflate") {
-                content_encoding = ContentEncoding::Deflate;
-            } else if !enc.is_empty() && !enc.eq_ignore_ascii_case("identity") {
-                content_encoding = ContentEncoding::Unsupported;
+            for enc in val
+                .split(',')
+                .map(trim_ascii_ows_str)
+                .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("identity"))
+            {
+                if content_encoding != ContentEncoding::Identity {
+                    content_encoding = ContentEncoding::Unsupported;
+                    break;
+                }
+                if enc.eq_ignore_ascii_case("gzip") || enc.eq_ignore_ascii_case("x-gzip") {
+                    content_encoding = ContentEncoding::Gzip;
+                } else if enc.eq_ignore_ascii_case("deflate") {
+                    content_encoding = ContentEncoding::Deflate;
+                } else {
+                    content_encoding = ContentEncoding::Unsupported;
+                    break;
+                }
             }
         } else if name.eq_ignore_ascii_case("etag") {
             if etag.is_none() {
@@ -452,8 +529,14 @@ fn parse_headers(raw: &[u8], collect_cache_metadata: bool) -> Result<ParsedHeade
         }
     }
 
-    if is_chunked {
-        content_length = None;
+    if (is_chunked || unsupported_te) && content_length.is_some() {
+        return Err(RegistryError::Transport(HttpTransportError {
+            message: "Conflicting Transfer-Encoding and Content-Length headers".into(),
+            is_connect: false,
+            is_timeout: false,
+            is_decode: true,
+            is_transient: false,
+        }));
     }
 
     let keep_alive = if conn_close {
@@ -743,12 +826,47 @@ fn is_stale_reused_io(err: &std::io::Error) -> bool {
     )
 }
 
-async fn connect_addrs(addrs: &[SocketAddr]) -> std::io::Result<TcpStream> {
+async fn connect_addrs(
+    addrs: &[SocketAddr],
+    deadline: tokio::time::Instant,
+) -> std::io::Result<TcpStream> {
+    if addrs.is_empty() {
+        return Err(std::io::Error::new(
+            ErrorKind::AddrNotAvailable,
+            "no addresses",
+        ));
+    }
+    if addrs.len() == 1 {
+        return match tokio::time::timeout_at(deadline, TcpStream::connect(addrs[0])).await {
+            Ok(res) => res,
+            Err(_) => Err(std::io::Error::new(
+                ErrorKind::TimedOut,
+                "connect timed out",
+            )),
+        };
+    }
     let mut last_err = None;
-    for &addr in addrs {
-        match TcpStream::connect(addr).await {
-            Ok(s) => return Ok(s),
-            Err(e) => last_err = Some(e),
+    for (idx, &addr) in addrs.iter().enumerate() {
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            return Err(last_err.unwrap_or_else(|| {
+                std::io::Error::new(ErrorKind::TimedOut, "connect timed out")
+            }));
+        }
+        let remaining = deadline - now;
+        let rem_count = (addrs.len() - idx) as u32;
+        let per_addr = (remaining / rem_count)
+            .max(Duration::from_millis(250))
+            .min(remaining);
+        match tokio::time::timeout(per_addr, TcpStream::connect(addr)).await {
+            Ok(Ok(s)) => return Ok(s),
+            Ok(Err(e)) => last_err = Some(e),
+            Err(_) => {
+                last_err = Some(std::io::Error::new(
+                    ErrorKind::TimedOut,
+                    "connect timed out",
+                ));
+            }
         }
     }
     Err(last_err.unwrap_or_else(|| std::io::Error::new(ErrorKind::AddrNotAvailable, "no addresses")))
@@ -767,7 +885,7 @@ struct BodySink<'a> {
 impl<'a> BodySink<'a> {
     fn new_memory(max_size: usize, expected_len: Option<u64>, compute_sha512: bool) -> Self {
         let cap = expected_len
-            .map(|l| (l as usize).min(max_size))
+            .map(|l| (l.min(max_size as u64).min(4 * 1024 * 1024)) as usize)
             .unwrap_or(0);
         Self {
             mem: Some(Vec::with_capacity(cap)),
@@ -815,10 +933,11 @@ impl<'a> BodySink<'a> {
 
     #[inline]
     fn check_limit(&self, add: u64) -> Result<(), RegistryError> {
-        if self.written + add > self.max_size {
+        let next = self.written.saturating_add(add);
+        if next > self.max_size {
             return Err(RegistryError::SizeLimitExceeded {
                 limit: self.max_size,
-                actual: self.written + add,
+                actual: next,
                 message: "Payload exceeds maximum allowed size".into(),
             });
         }
@@ -952,6 +1071,22 @@ fn append_request_bytes(buf: &mut Vec<u8>, params: &Http1RequestParams<'_>, raw_
     buf.extend_from_slice(b"connection: keep-alive\r\n\r\n");
 }
 
+struct StackWriter<'a> {
+    buf: &'a mut [u8],
+    pos: usize,
+}
+
+impl<'a> StackWriter<'a> {
+    #[inline]
+    fn push(&mut self, bytes: &[u8]) -> Option<()> {
+        let end = self.pos.checked_add(bytes.len())?;
+        let dst = self.buf.get_mut(self.pos..end)?;
+        dst.copy_from_slice(bytes);
+        self.pos = end;
+        Some(())
+    }
+}
+
 #[inline]
 fn format_request_to_stack<'a>(
     stack_buf: &'a mut [u8; 512],
@@ -959,64 +1094,49 @@ fn format_request_to_stack<'a>(
     raw_host: &str,
     path_str: &str,
 ) -> Option<&'a [u8]> {
-    let mut est = params.method.as_str().len()
-        + path_str.len()
-        + params.url.query().map_or(0, |q| q.len() + 1)
-        + raw_host.len()
-        + 12
-        + params.static_headers.len()
-        + params.accept.map_or(0, |a| a.len() + 10)
-        + if params.accept_gzip { 32 } else { 0 }
-        + params.if_none_match.map_or(0, |i| i.len() + 17)
-        + params.auth_header.map_or(0, |a| a.len() + 17)
-        + 26;
-    if est > stack_buf.len() {
-        return None;
-    }
-    let mut pos = 0usize;
-    let mut push = |bytes: &[u8]| {
-        stack_buf[pos..pos + bytes.len()].copy_from_slice(bytes);
-        pos += bytes.len();
+    let mut w = StackWriter {
+        buf: stack_buf,
+        pos: 0,
     };
-    push(params.method.as_str().as_bytes());
-    push(b" ");
-    push(path_str.as_bytes());
+    w.push(params.method.as_str().as_bytes())?;
+    w.push(b" ")?;
+    w.push(path_str.as_bytes())?;
     if let Some(q) = params.url.query() {
-        push(b"?");
-        push(q.as_bytes());
+        w.push(b"?")?;
+        w.push(q.as_bytes())?;
     }
-    push(b" HTTP/1.1\r\nhost: ");
-    push(raw_host.as_bytes());
+    w.push(b" HTTP/1.1\r\nhost: ")?;
+    w.push(raw_host.as_bytes())?;
     if let Some(explicit_port) = params.url.port() {
         let mut port_buf = [0u8; 8];
         let mut c = std::io::Cursor::new(&mut port_buf[..]);
-        let _ = write!(&mut c, ":{explicit_port}");
+        write!(&mut c, ":{explicit_port}").ok()?;
         let plen = c.position() as usize;
-        push(&port_buf[..plen]);
+        w.push(&port_buf[..plen])?;
     }
-    push(b"\r\n");
-    push(params.static_headers);
+    w.push(b"\r\n")?;
+    w.push(params.static_headers)?;
     if let Some(accept) = params.accept {
-        push(b"accept: ");
-        push(accept.as_bytes());
-        push(b"\r\n");
+        w.push(b"accept: ")?;
+        w.push(accept.as_bytes())?;
+        w.push(b"\r\n")?;
     }
     if params.accept_gzip {
-        push(b"accept-encoding: gzip, deflate\r\n");
+        w.push(b"accept-encoding: gzip, deflate\r\n")?;
     }
     if let Some(inm) = params.if_none_match {
-        push(b"if-none-match: ");
-        push(inm.as_bytes());
-        push(b"\r\n");
+        w.push(b"if-none-match: ")?;
+        w.push(inm.as_bytes())?;
+        w.push(b"\r\n")?;
     }
     if let Some(auth) = params.auth_header {
-        push(b"authorization: ");
-        push(auth.as_bytes());
-        push(b"\r\n");
+        w.push(b"authorization: ")?;
+        w.push(auth.as_bytes())?;
+        w.push(b"\r\n")?;
     }
-    push(b"connection: keep-alive\r\n\r\n");
-    let _ = &mut est;
-    Some(&stack_buf[..pos])
+    w.push(b"connection: keep-alive\r\n\r\n")?;
+    let len = w.pos;
+    Some(&stack_buf[..len])
 }
 
 pub(crate) async fn execute_hop(
@@ -1040,39 +1160,41 @@ pub(crate) async fn execute_hop(
 
     let path = params.url.path();
     let path_str = if path.is_empty() { "/" } else { path };
-    if has_crlf_bytes(path_str.as_bytes()) {
+    if has_control_bytes(path_str.as_bytes()) {
         return Err(RegistryError::SecurityViolation(
-            "Request path contains forbidden CR/LF characters".into(),
+            "Request path contains forbidden control characters".into(),
         ));
     }
     if let Some(q) = params.url.query() {
-        if has_crlf_bytes(q.as_bytes()) {
+        if has_control_bytes(q.as_bytes()) {
             return Err(RegistryError::SecurityViolation(
-                "Request query contains forbidden CR/LF characters".into(),
+                "Request query contains forbidden control characters".into(),
             ));
         }
     }
     if let Some(a) = params.accept {
-        if has_crlf_bytes(a.as_bytes()) {
+        if !is_valid_header_str(a.as_bytes()) {
             return Err(RegistryError::SecurityViolation(
-                "Accept header contains forbidden CR/LF characters".into(),
+                "Accept header contains forbidden control characters".into(),
             ));
         }
     }
     if let Some(inm) = params.if_none_match {
-        if has_crlf_bytes(inm.as_bytes()) {
+        if !is_valid_header_str(inm.as_bytes()) {
             return Err(RegistryError::SecurityViolation(
-                "If-None-Match header contains forbidden CR/LF characters".into(),
+                "If-None-Match header contains forbidden control characters".into(),
             ));
         }
     }
     if let Some(auth) = params.auth_header {
-        if has_crlf_bytes(auth.as_bytes()) {
+        if !is_valid_header_str(auth.as_bytes()) {
             return Err(RegistryError::SecurityViolation(
-                "Authorization header contains forbidden CR/LF characters".into(),
+                "Authorization header contains forbidden control characters".into(),
             ));
         }
     }
+
+    let can_retry_stale = *params.method == Method::GET || *params.method == Method::HEAD;
 
     let mut stack_req = [0u8; 512];
     let mut heap_req: Vec<u8> = Vec::new();
@@ -1126,7 +1248,7 @@ pub(crate) async fn execute_hop(
 
         // Fast synchronous try_write first; only arms Tokio timer on WouldBlock.
         if let Err(err) = write_all_fast(&mut stream, req_bytes, params.url, total_deadline).await {
-            if reused && is_stale_reused_io(&err) {
+            if reused && can_retry_stale && is_stale_reused_io(&err) {
                 allow_pooled = false;
                 continue;
             }
@@ -1204,7 +1326,7 @@ pub(crate) async fn execute_hop(
                 {
                     Ok(n) => n,
                     Err(RegistryError::Transport(ref te))
-                        if reused && filled == 0 && te.is_transient =>
+                        if reused && can_retry_stale && filled == 0 && !te.is_timeout && te.is_transient =>
                     {
                         allow_pooled = false;
                         break 0;
@@ -1214,7 +1336,7 @@ pub(crate) async fn execute_hop(
             };
 
             if n == 0 {
-                if reused && filled == 0 {
+                if reused && can_retry_stale && filled == 0 {
                     allow_pooled = false;
                     break 0;
                 }
@@ -1298,20 +1420,39 @@ pub(crate) async fn execute_hop(
 
         // Non-success status (401, 403, 404, 429, 5xx, etc.)
         if !parsed.status.is_success() {
-            let body_bytes = read_error_body(
-                &mut stream,
-                body_rem,
-                &parsed,
-                params.method,
-                params.url,
-                params.chunk_idle_timeout,
-                total_deadline,
-                &mut idle_sleep,
-            )
-            .await;
-            let (body_text, clean_eof) = match body_bytes {
-                Ok((bytes, clean)) => (String::from_utf8_lossy(&bytes).into_owned(), clean),
-                Err(_) => (String::new(), false),
+            let (body_text, clean_eof) = if parsed.status == StatusCode::TOO_MANY_REQUESTS {
+                (String::new(), false)
+            } else {
+                let body_bytes = read_error_body(
+                    &mut stream,
+                    body_rem,
+                    &parsed,
+                    params.method,
+                    params.url,
+                    params.chunk_idle_timeout,
+                    total_deadline,
+                    &mut idle_sleep,
+                )
+                .await;
+                match body_bytes {
+                    Ok((bytes, clean)) => {
+                        let decoded = match parsed.content_encoding {
+                            ContentEncoding::Gzip => decompress_bounded(
+                                MultiGzDecoder::new(&bytes[..]),
+                                MAX_ERROR_BODY_BYTES,
+                            )
+                            .unwrap_or(bytes),
+                            ContentEncoding::Deflate => decompress_bounded(
+                                DeflateDecoder::new(&bytes[..]),
+                                MAX_ERROR_BODY_BYTES,
+                            )
+                            .unwrap_or(bytes),
+                            ContentEncoding::Identity | ContentEncoding::Unsupported => bytes,
+                        };
+                        (String::from_utf8_lossy(&decoded).into_owned(), clean)
+                    }
+                    Err(_) => (String::new(), false),
+                }
             };
             if clean_eof && parsed.keep_alive {
                 pool.checkin(
@@ -1440,7 +1581,7 @@ pub(crate) async fn execute_hop(
                 let final_bytes = match parsed.content_encoding {
                     ContentEncoding::Identity => raw_bytes,
                     ContentEncoding::Gzip => {
-                        decompress_bounded(GzDecoder::new(&raw_bytes[..]), max_size)?
+                        decompress_bounded(MultiGzDecoder::new(&raw_bytes[..]), max_size)?
                     }
                     ContentEncoding::Deflate => {
                         decompress_bounded(DeflateDecoder::new(&raw_bytes[..]), max_size)?
@@ -1574,8 +1715,14 @@ async fn open_fresh_connection(
         }
     };
 
-    let connect_result = if let Some(addr) = single_addr {
-        tokio::time::timeout_at(deadline, TcpStream::connect(addr)).await
+    let connect_result: std::io::Result<TcpStream> = if let Some(addr) = single_addr {
+        match tokio::time::timeout_at(deadline, TcpStream::connect(addr)).await {
+            Ok(res) => res,
+            Err(_) => Err(std::io::Error::new(
+                ErrorKind::TimedOut,
+                "connect timed out",
+            )),
+        }
     } else {
         let Some(Host::Domain(dom)) = url.host() else {
             unreachable!()
@@ -1625,15 +1772,15 @@ async fn open_fresh_connection(
             pool.put_cached_dns(key, Arc::clone(&resolved));
             resolved
         };
-        tokio::time::timeout_at(deadline, connect_addrs(&addrs)).await
+        connect_addrs(&addrs, deadline).await
     };
 
     match connect_result {
-        Ok(Ok(stream)) => {
+        Ok(stream) => {
             let _ = stream.set_nodelay(true);
             Ok(stream)
         }
-        Ok(Err(err)) => {
+        Err(err) => {
             pool.invalidate_dns(key);
             let is_to = err.kind() == ErrorKind::TimedOut;
             Err(RegistryError::Transport(HttpTransportError {
@@ -1642,21 +1789,6 @@ async fn open_fresh_connection(
                 is_timeout: is_to,
                 is_decode: false,
                 is_transient: is_transient_io(&err),
-            }))
-        }
-        Err(_) => {
-            pool.invalidate_dns(key);
-            Err(RegistryError::Transport(HttpTransportError {
-                message: format_io_error(
-                    url,
-                    &std::io::Error::new(ErrorKind::TimedOut, "connect timed out"),
-                    true,
-                    true,
-                ),
-                is_connect: true,
-                is_timeout: true,
-                is_decode: false,
-                is_transient: true,
             }))
         }
     }
@@ -1805,8 +1937,8 @@ async fn read_chunked_body(
 
         let line = &buf[pos..line_end];
         let size_bytes = match line.iter().position(|&b| b == b';') {
-            Some(semi) => trim_ascii_ws(&line[..semi]),
-            None => trim_ascii_ws(line),
+            Some(semi) => trim_trailing_ascii_ws(&line[..semi]),
+            None => line,
         };
         let size_str = std::str::from_utf8(size_bytes).map_err(|_| {
             RegistryError::Transport(HttpTransportError {
@@ -1853,7 +1985,13 @@ async fn read_chunked_body(
                     pos = 0;
                 }
                 if buf.len() > MAX_HEADER_BYTES {
-                    return Ok(false);
+                    return Err(RegistryError::Transport(HttpTransportError {
+                        message: "Chunked response trailers exceed maximum header size".into(),
+                        is_connect: false,
+                        is_timeout: false,
+                        is_decode: true,
+                        is_transient: false,
+                    }));
                 }
                 let old_len = buf.len();
                 buf.resize(old_len + 4096, 0);
@@ -1889,7 +2027,13 @@ async fn read_chunked_body(
 
         sink.check_limit(chunk_size)?;
 
-        let mut remaining = chunk_size as usize;
+        let mut remaining = usize::try_from(chunk_size).map_err(|_| {
+            RegistryError::SizeLimitExceeded {
+                limit: sink.max_size,
+                actual: chunk_size,
+                message: "Chunk exceeds addressable memory".into(),
+            }
+        })?;
         if pos < buf.len() {
             let take = remaining.min(buf.len() - pos);
             sink.push(&buf[pos..pos + take]).await?;
@@ -2059,20 +2203,41 @@ async fn read_error_body(
         .await?;
         return Ok((sink.mem.unwrap_or_default(), clean));
     }
-    let capped = initial_rem.len().min(MAX_ERROR_BODY_BYTES);
-    Ok((initial_rem[..capped].to_vec(), false))
+    let mut out = initial_rem[..initial_rem.len().min(MAX_ERROR_BODY_BYTES)].to_vec();
+    let mut scratch = [0u8; 4096];
+    while out.len() < MAX_ERROR_BODY_BYTES {
+        let want = (MAX_ERROR_BODY_BYTES - out.len()).min(scratch.len());
+        let n = match read_with_timeouts(
+            stream,
+            &mut scratch[..want],
+            url,
+            idle_timeout,
+            total_deadline,
+            idle_sleep,
+        )
+        .await
+        {
+            Ok(n) => n,
+            Err(_) => break,
+        };
+        if n == 0 {
+            break;
+        }
+        out.extend_from_slice(&scratch[..n]);
+    }
+    Ok((out, false))
 }
 
 fn decompress_bounded<R: Read>(decoder: R, max_size: usize) -> Result<Vec<u8>, RegistryError> {
     let mut out = Vec::new();
-    let mut limited = decoder.take((max_size as u64) + 1);
+    let mut limited = decoder.take((max_size as u64).saturating_add(1));
     limited.read_to_end(&mut out).map_err(|err| {
         RegistryError::Transport(HttpTransportError {
             message: format!("Failed to decompress HTTP response body: {err}"),
             is_connect: false,
             is_timeout: false,
             is_decode: true,
-            is_transient: false,
+            is_transient: true,
         })
     })?;
     if out.len() > max_size {
@@ -2083,4 +2248,257 @@ fn decompress_bounded<R: Read>(decoder: R, max_size: usize) -> Result<Vec<u8>, R
         });
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use flate2::write::GzEncoder;
+    use flate2::Compression;
+    use tokio::net::TcpListener;
+
+    #[test]
+    fn test_format_request_to_stack_boundary_no_panic() {
+        for path_len in 380..=490 {
+            let path = format!("/{}", "a".repeat(path_len));
+            let url = Url::parse(&format!("http://127.0.0.1:4873{path}")).unwrap();
+            let params = Http1RequestParams {
+                method: &Method::GET,
+                url: &url,
+                static_headers: b"user-agent: rnpm\r\n",
+                accept: Some("application/json"),
+                accept_gzip: true,
+                if_none_match: Some("\"abc\""),
+                auth_header: Some("Bearer tok"),
+                collect_cache_metadata: false,
+                connect_timeout: Duration::from_secs(5),
+                request_timeout: Duration::from_secs(5),
+                chunk_idle_timeout: Duration::from_secs(5),
+                pool_idle_timeout: Duration::from_secs(5),
+                max_idle_per_host: 8,
+            };
+            let mut stack_req = [0u8; 512];
+            let mut expected = Vec::new();
+            append_request_bytes(&mut expected, &params, "127.0.0.1", url.path());
+            if let Some(stack_slice) =
+                format_request_to_stack(&mut stack_req, &params, "127.0.0.1", url.path())
+            {
+                assert_eq!(stack_slice, expected.as_slice());
+            } else {
+                assert!(expected.len() > 512);
+            }
+        }
+    }
+
+    #[test]
+    fn test_body_sink_check_limit_saturates_without_wrap() {
+        let mut sink = BodySink::new_memory(1024, None, false);
+        sink.written = 10;
+        let err = sink
+            .check_limit(u64::MAX)
+            .expect_err("u64::MAX must trigger SizeLimitExceeded");
+        assert!(matches!(err, RegistryError::SizeLimitExceeded { .. }));
+    }
+
+    #[test]
+    fn test_parse_headers_rfc9112_smuggling_and_encoding_checks() {
+        assert!(parse_headers(b"HTTP/1.1 200 OK\nContent-Length: 0", false).is_err());
+        assert!(parse_headers(b"HTTP/1.1 200 OK\r\nBad Name: 1", false).is_err());
+        assert!(parse_headers(b"HTTP/1.1 200 OK\r\n: 1", false).is_err());
+        assert!(parse_headers(b"HTTP/1.1 200 OK\r\nContent-Length: +10", false).is_err());
+        assert!(parse_headers(
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Length: 5",
+            false
+        )
+        .is_err());
+
+        let dual_ce = parse_headers(
+            b"HTTP/1.1 200 OK\r\nContent-Encoding: br\r\nContent-Encoding: gzip\r\nContent-Length: 0",
+            false,
+        )
+        .unwrap();
+        assert_eq!(dual_ce.content_encoding, ContentEncoding::Unsupported);
+
+        let double_gzip = parse_headers(
+            b"HTTP/1.1 200 OK\r\nContent-Encoding: gzip, gzip\r\nContent-Length: 0",
+            false,
+        )
+        .unwrap();
+        assert_eq!(double_gzip.content_encoding, ContentEncoding::Unsupported);
+    }
+
+    #[test]
+    fn test_decompress_bounded_multi_member_gzip_and_limit() {
+        let mut combined = Vec::new();
+        for part in [b"hello ".as_slice(), b"world".as_slice()] {
+            let mut enc = GzEncoder::new(Vec::new(), Compression::default());
+            enc.write_all(part).unwrap();
+            combined.extend_from_slice(&enc.finish().unwrap());
+        }
+        let ok = decompress_bounded(MultiGzDecoder::new(&combined[..]), 64).unwrap();
+        assert_eq!(ok, b"hello world");
+
+        let bomb = decompress_bounded(MultiGzDecoder::new(&combined[..]), 5);
+        assert!(matches!(bomb, Err(RegistryError::SizeLimitExceeded { .. })));
+    }
+
+    #[tokio::test]
+    async fn test_execute_hop_chunked_trailers_leading_ws_and_control_chars() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            // 1. Valid chunked with trailing OWS before extension
+            let (mut s1, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 1024];
+            let _ = s1.read(&mut buf).await.unwrap();
+            s1.write_all(
+                b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n5 ;ext=1\r\nhello\r\n0\r\n\r\n",
+            )
+            .await
+            .unwrap();
+            drop(s1);
+
+            // 2. Invalid leading OWS before chunk size
+            let (mut s2, _) = listener.accept().await.unwrap();
+            let _ = s2.read(&mut buf).await.unwrap();
+            s2.write_all(
+                b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n 5\r\nhello\r\n0\r\n\r\n",
+            )
+            .await
+            .unwrap();
+            drop(s2);
+
+            // 3. Oversized trailers > 64 KiB must fail, not succeed
+            let (mut s3, _) = listener.accept().await.unwrap();
+            let _ = s3.read(&mut buf).await.unwrap();
+            s3.write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n")
+                .await
+                .unwrap();
+            let big_trailer = vec![b'X'; MAX_HEADER_BYTES + 256];
+            let _ = s3.write_all(&big_trailer).await;
+            drop(s3);
+
+            // 4. Slow response triggers request_timeout on pooled socket without silent reset retry
+            let (mut s4, _) = listener.accept().await.unwrap();
+            let _ = s4.read(&mut buf).await.unwrap();
+            s4.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                .await
+                .unwrap();
+            let _ = s4.read(&mut buf).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            drop(s4);
+
+            // 5. Gzipped EOF-delimited 404 body is decompressed completely
+            let (mut s5, _) = listener.accept().await.unwrap();
+            let _ = s5.read(&mut buf).await.unwrap();
+            let mut enc = GzEncoder::new(Vec::new(), Compression::default());
+            enc.write_all(b"missing package detail").unwrap();
+            let gz = enc.finish().unwrap();
+            s5.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Encoding: gzip\r\n\r\n")
+                .await
+                .unwrap();
+            s5.write_all(&gz).await.unwrap();
+            drop(s5);
+        });
+
+        let pool = Http1Pool::new();
+        let url = Url::parse(&format!("http://{addr}/pkg")).unwrap();
+
+        fn make_params(u: &Url, req_to: Duration) -> Http1RequestParams<'_> {
+            Http1RequestParams {
+                method: &Method::GET,
+                url: u,
+                static_headers: b"",
+                accept: Some("application/json"),
+                accept_gzip: true,
+                if_none_match: None,
+                auth_header: None,
+                collect_cache_metadata: false,
+                connect_timeout: Duration::from_secs(2),
+                request_timeout: req_to,
+                chunk_idle_timeout: Duration::from_secs(2),
+                pool_idle_timeout: Duration::from_secs(5),
+                max_idle_per_host: 8,
+            }
+        }
+
+        // 1. Valid chunk ext
+        let r1 = execute_hop(
+            &pool,
+            make_params(&url, Duration::from_secs(2)),
+            BodyTarget::Metadata { max_size: 4096 },
+        )
+        .await
+        .unwrap();
+        match r1 {
+            HopOutcome::Success {
+                payload: BodyPayload::Bytes { bytes, .. },
+                ..
+            } => assert_eq!(bytes, b"hello"),
+            _ => panic!("expected Success"),
+        }
+
+        // 2. Leading OWS rejected
+        let r2 = execute_hop(
+            &pool,
+            make_params(&url, Duration::from_secs(2)),
+            BodyTarget::Metadata { max_size: 4096 },
+        )
+        .await;
+        assert!(r2.is_err());
+
+        // 3. Oversized trailers rejected
+        let r3 = execute_hop(
+            &pool,
+            make_params(&url, Duration::from_secs(2)),
+            BodyTarget::Metadata { max_size: 4096 },
+        )
+        .await;
+        assert!(r3.is_err());
+
+        // 4. Prime pool then hit request_timeout on pooled socket -> must fail with timeout (no extra connect)
+        let r4_prime = execute_hop(
+            &pool,
+            make_params(&url, Duration::from_secs(2)),
+            BodyTarget::Metadata { max_size: 4096 },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(r4_prime, HopOutcome::Success { .. }));
+        let r4_timeout = execute_hop(
+            &pool,
+            make_params(&url, Duration::from_millis(80)),
+            BodyTarget::Metadata { max_size: 4096 },
+        )
+        .await;
+        match r4_timeout {
+            Err(e) => assert!(e.is_timeout(), "expected timeout error, got {e:?}"),
+            Ok(_) => panic!("expected timeout"),
+        }
+
+        // 5. Gzipped EOF-delimited 404 body decoded cleanly
+        let r5 = execute_hop(
+            &pool,
+            make_params(&url, Duration::from_secs(2)),
+            BodyTarget::Metadata { max_size: 4096 },
+        )
+        .await
+        .unwrap();
+        match r5 {
+            HopOutcome::ErrorStatus { status, body, .. } => {
+                assert_eq!(status, StatusCode::NOT_FOUND);
+                assert_eq!(body, "missing package detail");
+            }
+            _ => panic!("expected ErrorStatus"),
+        }
+
+        // 6. Control character in accept rejected
+        let mut p6 = make_params(&url, Duration::from_secs(2));
+        p6.accept = Some("application/json\0bad");
+        let r6 = execute_hop(&pool, p6, BodyTarget::Metadata { max_size: 4096 }).await;
+        assert!(matches!(r6, Err(RegistryError::SecurityViolation(_))));
+
+        server.await.unwrap();
+    }
 }
