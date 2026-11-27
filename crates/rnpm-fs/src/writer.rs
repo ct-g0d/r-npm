@@ -2365,10 +2365,13 @@ fn apply_decoded_links(
     hardlinks: &[(PathBuf, PathBuf)],
 ) {
     #[cfg(unix)]
-    let clean_dest = clean(&crate::path::to_verbatim_path(destination));
+    let clean_dest = clean(crate::path::to_verbatim_path(destination));
 
     for (link_path, target_rel) in symlinks {
         unlink_target_path(link_path);
+        if let Some(parent) = link_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
         #[cfg(windows)]
         {
             let target_full = crate::path::to_verbatim_path(destination).join(target_rel);
@@ -2408,6 +2411,9 @@ fn apply_decoded_links(
 
     for (link_path, source_full) in hardlinks {
         unlink_target_path(link_path);
+        if let Some(parent) = link_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
         if std::fs::hard_link(source_full, link_path).is_err() && source_full.is_file() {
             let _ = std::fs::copy(source_full, link_path);
         }

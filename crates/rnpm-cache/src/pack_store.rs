@@ -34,7 +34,9 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256, Sha512};
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, OpenOptions};
-use std::io::{BufReader, Read, Write};
+#[cfg(windows)]
+use std::io::Write;
+use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
 #[cfg(windows)]
 use std::sync::atomic::AtomicU8;
