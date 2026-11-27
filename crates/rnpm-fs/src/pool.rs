@@ -107,7 +107,9 @@ impl Drop for BatchFinishGuard<'_> {
 struct PoolState {
     queue: VecDeque<Arc<Batch>>,
     idle_workers: usize,
+    pending_wakes: usize,
     spawned_workers: usize,
+    next_thread_id: usize,
 }
 
 struct IoPool {
@@ -128,7 +130,9 @@ impl IoPool {
                 state: Mutex::new(PoolState {
                     queue: VecDeque::with_capacity(16),
                     idle_workers: 0,
+                    pending_wakes: 0,
                     spawned_workers: 0,
+                    next_thread_id: 0,
                 }),
                 cvar: Condvar::new(),
                 max_workers,
@@ -159,6 +163,7 @@ impl IoPool {
                     guard.idle_workers += 1;
                     guard = self.cvar.wait(guard).unwrap_or_else(|e| e.into_inner());
                     guard.idle_workers = guard.idle_workers.saturating_sub(1);
+                    guard.pending_wakes = guard.pending_wakes.saturating_sub(1);
                 }
             };
             batch.execute_as_helper();
@@ -207,20 +212,27 @@ pub fn run_parallel<F: Fn() + Sync>(requested_threads: usize, f: &F) {
         }
         guard.queue.push_back(Arc::clone(&batch));
 
-        // Lazily grow the persistent pool only up to the concurrency actually needed.
+        // Lazily grow the persistent pool only up to the concurrency actually needed,
+        // discounting idle workers already notified but not yet back under lock.
+        let avail_idle = guard.idle_workers.saturating_sub(guard.pending_wakes);
         let desired_workers = helper_slots.min(pool.max_workers);
         let needed = desired_workers
-            .saturating_sub(guard.idle_workers)
+            .saturating_sub(avail_idle)
             .min(pool.max_workers.saturating_sub(guard.spawned_workers));
-        let start = guard.spawned_workers;
+        let start = guard.next_thread_id;
+        guard.next_thread_id += needed;
         guard.spawned_workers += needed;
 
-        let to_wake = helper_slots.min(guard.idle_workers);
-        if to_wake >= guard.idle_workers && to_wake > 1 {
-            pool.cvar.notify_all();
-        } else {
-            for _ in 0..to_wake {
-                pool.cvar.notify_one();
+        let to_wake = helper_slots.min(avail_idle);
+        if to_wake > 0 {
+            if guard.pending_wakes == 0 && to_wake >= guard.idle_workers && to_wake > 1 {
+                guard.pending_wakes = guard.idle_workers;
+                pool.cvar.notify_all();
+            } else {
+                guard.pending_wakes += to_wake;
+                for _ in 0..to_wake {
+                    pool.cvar.notify_one();
+                }
             }
         }
         (start, start + needed)

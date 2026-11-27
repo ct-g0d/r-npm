@@ -4665,13 +4665,14 @@ fn is_destination_valid(to: &Path) -> bool {
                     return meta.len() == index.total_pack_size || meta.len() == expected_padded;
                 }
             }
+            return false;
         }
         if meta.len() >= PACK_V2_FOOTER_LEN as u64 {
             if let Ok(bytes) = fs::read(to) {
                 return matches!(parse_pack_v2_buffer(&bytes), Some(Ok(_)));
             }
         }
-        meta.len() > 0
+        false
     } else {
         if let Some(name) = to.file_name().and_then(|n| n.to_str()) {
             if name.len() == 64 && name.chars().all(|c| c.is_ascii_hexdigit()) {
@@ -6628,5 +6629,30 @@ mod tests {
         assert_eq!(reloaded.get_file_slice("index.js").unwrap(), b"legacy payload");
         let updated_idx = PackIndex::from_bytes(&fs::read(&idx_path).unwrap()).unwrap();
         assert!(updated_idx.pack_mtime.is_some());
+    }
+
+    #[test]
+    fn test_is_destination_valid_rejects_truncated_pack_and_replaces() {
+        let dir = tempdir().unwrap();
+        let store = PackStore::new(dir.path()).unwrap();
+        let integrity = "sha512-truncateddestvalidcheck==";
+        let files = [PackInputFile::new("index.js", 0o644, b"healthy v2 payload")];
+
+        store.put_package_pack_deferred(integrity, &files).unwrap();
+        let (pack_path, _idx_path) = store.pack_paths(integrity);
+        let healthy_bytes = fs::read(&pack_path).unwrap();
+
+        // Corrupt existing `.pack` into a short truncated file (no `.idx` present).
+        store.clear_mmap_cache();
+        fs::write(&pack_path, b"truncated").unwrap();
+        assert!(!is_destination_valid(&pack_path));
+
+        // Atomic rename from a valid staged `.pack` must replace the truncated file.
+        let staged = store.tmp_dir().join("healthy_replace.tmp");
+        fs::write(&staged, &healthy_bytes).unwrap();
+        rename_atomic(&staged, &pack_path).unwrap();
+
+        let loaded = store.get_package_pack(integrity).unwrap().unwrap();
+        assert_eq!(loaded.get_file_slice("index.js").unwrap(), b"healthy v2 payload");
     }
 }

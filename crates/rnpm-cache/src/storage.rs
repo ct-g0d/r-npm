@@ -11,6 +11,8 @@ use sha1::Digest as _;
 use std::collections::HashSet;
 use std::fmt::Write as _;
 use std::fs::{self, OpenOptions};
+#[cfg(not(windows))]
+use std::io::Read;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -707,14 +709,14 @@ pub(crate) fn with_temp_wide_stack<R>(
     let pid = std::process::id();
     let now = process_start_nanos();
     const STACK_CAP: usize = 320;
-    // "\\?\" (4) + root + "\tmp\" (5) + prefix + "_" + 10 + "_" + 39 + "_" + 20 + ".tmp\0" (77)
+    // "\\?\" (4) + root + "\tmp\" (5) + prefix + "_" (1) + 10 + "_" (1) + 39 + "_" (1) + 20 + ".tmp\0" (5) = root + prefix + 87
     if prefix.is_ascii()
         && root_bytes.is_ascii()
         && root_bytes.len() >= 3
         && root_bytes[0].is_ascii_alphabetic()
         && root_bytes[1] == b':'
         && root_bytes[2] == b'\\'
-        && root_bytes.len() + prefix.len() + 86 <= STACK_CAP
+        && root_bytes.len() + prefix.len() + 87 <= STACK_CAP
         && !root_bytes.contains(&b'/')
         && !root_bytes[3..].windows(2).any(|w| w == b"\\\\")
         && !root_bytes.windows(3).any(|w| w == b"\\.\\")
@@ -1841,11 +1843,14 @@ impl Cache {
                                 return Ok(Some(()));
                             }
                         } else {
+                            // `GetFileAttributesExW` reported `ERROR_PATH_NOT_FOUND`, so pass `None`
+                            // for cached bitsets to bypass any stale directory-existence bits and
+                            // recreate `<p1>/<p2>` before staging the temp file.
                             ensure_sharded_parent_win32_cached(
                                 wide_target,
                                 &npm_path,
-                                Some(&self.blob_p1_dirs),
-                                Some(&self.blob_prefix_dirs),
+                                None,
+                                None,
                                 sha512_hex,
                             )?;
                         }
@@ -3444,5 +3449,25 @@ mod atomic_win_tests {
         fs::write(&idx_path, [0xffu8, 0xfe, 0x00]).unwrap();
         assert!(cache.get(key).unwrap().is_none());
         assert!(!idx_path.exists());
+    }
+
+    #[test]
+    fn put_blob_recovers_after_external_shard_dir_deletion() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::new(dir.path()).unwrap();
+        let payload1 = b"first blob payload in shard";
+        let sha1 = cache.put_blob(payload1, None).unwrap();
+        let blob1 = cache.blob_path(&sha1);
+        assert!(blob1.is_file());
+
+        // Delete the `<p1>` parent shard externally while in-process bitsets still think it exists.
+        let p2_dir = blob1.parent().unwrap().to_path_buf();
+        let p1_dir = p2_dir.parent().unwrap().to_path_buf();
+        fs::remove_dir_all(&p1_dir).unwrap();
+        assert!(!p1_dir.exists());
+
+        // Putting another blob with the same `<p1>`/`<p2>` prefix must succeed cleanly.
+        cache.put_blob_direct(payload1, &sha1).unwrap();
+        assert_eq!(fs::read(&blob1).unwrap(), payload1);
     }
 }
