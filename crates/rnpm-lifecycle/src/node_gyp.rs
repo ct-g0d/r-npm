@@ -1311,10 +1311,11 @@ fn has_valid_shim_file(path: &Path, expected: &[u8], require_exec: bool) -> bool
         if meta.uid() != unsafe { libc::geteuid() } {
             return false;
         }
-        if require_exec && (meta.mode() & 0o777) != 0o755 {
-            if std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).is_err() {
-                return false;
-            }
+        if require_exec
+            && (meta.mode() & 0o777) != 0o755
+            && std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).is_err()
+        {
+            return false;
         }
     }
     #[cfg(not(unix))]
