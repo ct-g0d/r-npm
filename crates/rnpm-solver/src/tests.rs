@@ -7668,3 +7668,104 @@ fn test_workspace_protocols_star_caret_tilde_edge_cases() {
         3
     );
 }
+
+#[test]
+fn test_alias_real_pkg_override_falls_through_on_non_matching_install_name_rule() {
+    use crate::overrides::Overrides;
+    use crate::solver::{ResolverOptions, Solver};
+    use crate::types::InMemoryPackageProvider;
+
+    let mut provider = InMemoryPackageProvider::new();
+    provider.add_version("lodash", "4.17.15", |_| {});
+    provider.add_version("lodash", "4.17.21", |_| {});
+
+    let mut manifest = Manifest {
+        name: Some("alias-override-app".into()),
+        version: Some("1.0.0".into()),
+        ..Default::default()
+    };
+    manifest
+        .dependencies
+        .insert("my-alias".into(), "npm:lodash@4.17.15".into());
+    manifest.extra.insert(
+        "overrides".into(),
+        serde_json::json!({
+            "my-alias@1.0.0": "2.0.0",
+            "lodash": "4.17.21"
+        }),
+    );
+
+    let overrides = Overrides::from_json_value(
+        manifest.extra.get("overrides"),
+        Overrides::reference_specs(&manifest),
+    );
+    let solver = Solver::new(&provider, ResolverOptions::default(), overrides);
+    let graph = solver.resolve(&manifest).expect("alias override resolution");
+    assert_eq!(graph.nodes["node_modules/my-alias"].name, "lodash");
+    assert_eq!(graph.nodes["node_modules/my-alias"].version, "4.17.21");
+}
+
+#[test]
+fn test_prefer_dedupe_unrecords_overwritten_occupied_node() {
+    use crate::graph::{DependencyGraph, Node};
+    use crate::overrides::Overrides;
+    use crate::solver::{ResolverOptions, Solver};
+    use crate::types::InMemoryPackageProvider;
+
+    let mut provider = InMemoryPackageProvider::new();
+    provider.add_version("target-pkg", "1.0.0", |_| {});
+    provider.add_version("target-pkg", "1.4.0", |_| {});
+    provider.add_version("target-pkg", "2.0.0", |_| {});
+    provider.add_version("consumer", "1.0.0", |v| {
+        v.dependencies.insert("target-pkg".into(), "^1.0.0".into());
+    });
+
+    // Seed a graph whose root has a stale 1.0.0 entry that gets overwritten before consumer resolves.
+    let mut base_graph = DependencyGraph::new();
+    base_graph.add_node(
+        "".into(),
+        Node {
+            location: "".into(),
+            install_name: "app".into(),
+            name: "app".into(),
+            version: "1.0.0".into(),
+            ..Default::default()
+        },
+    );
+    base_graph.add_node(
+        "node_modules/target-pkg".into(),
+        Node {
+            location: "node_modules/target-pkg".into(),
+            install_name: "target-pkg".into(),
+            name: "target-pkg".into(),
+            version: "1.0.0".into(),
+            ..Default::default()
+        },
+    );
+
+    let mut manifest = Manifest {
+        name: Some("app".into()),
+        version: Some("1.0.0".into()),
+        ..Default::default()
+    };
+    // Overwrite `node_modules/target-pkg` directly with 2.0.0 first, then ask `consumer` for `^1.0.0`.
+    manifest.dependencies.insert("target-pkg".into(), "2.0.0".into());
+    manifest.dependencies.insert("consumer".into(), "1.0.0".into());
+
+    let solver = Solver::new(
+        &provider,
+        ResolverOptions {
+            prefer_dedupe: true,
+            ..Default::default()
+        },
+        Overrides::default(),
+    )
+    .with_graph(base_graph);
+    let graph = solver.resolve(&manifest).expect("prefer_dedupe overwrite test");
+    assert_eq!(graph.nodes["node_modules/target-pkg"].version, "2.0.0");
+    // Must pick 1.4.0 (latest compatible) rather than phantom evicted 1.0.0.
+    assert_eq!(
+        graph.nodes["node_modules/consumer/node_modules/target-pkg"].version,
+        "1.4.0"
+    );
+}

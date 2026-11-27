@@ -553,6 +553,26 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
         }
     }
 
+    #[inline]
+    fn add_graph_node(&mut self, location: String, node: Node) {
+        if self.options.prefer_dedupe {
+            if let Some(prev) = self.graph.nodes.get(&location) {
+                Self::unrecord_dedupe_node(
+                    &mut self.dedupe_ver_counts,
+                    &prev.name,
+                    &prev.version,
+                );
+            }
+            Self::record_dedupe_node(
+                &mut self.dedupe_ver_counts,
+                &node.name,
+                &node.version,
+                node.parsed_version.as_ref(),
+            );
+        }
+        self.graph.add_node(location, node);
+    }
+
     /// Attaches an existing LockfileV3 for fast-path resolution.
     pub fn with_lockfile(mut self, lockfile: std::sync::Arc<rnpm_lockfile::LockfileV3>) -> Self {
         self.options.lockfile = Some(lockfile);
@@ -983,15 +1003,7 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                 extra
             },
         };
-        if self.options.prefer_dedupe {
-            Self::record_dedupe_node(
-                &mut self.dedupe_ver_counts,
-                &root_node.name,
-                &root_node.version,
-                root_node.parsed_version.as_ref(),
-            );
-        }
-        self.graph.add_node(String::new(), root_node);
+        self.add_graph_node(String::new(), root_node);
 
         // Collect effective root dependency types, then place their edges
         // in name order. Arborist's node queue uses depth and path rather
@@ -1252,36 +1264,41 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                     &mut task_ancestors,
                 );
             }
-            let effective_spec = if self.overrides.has_target(install_name_str) {
-                if let Some(overridden) = self.overrides.resolve_override_precompiled_with_caller(
+            let direct_override = if self.overrides.has_target(install_name_str) {
+                self.overrides.resolve_override_precompiled_with_caller(
                     install_name_str,
                     raw_spec_str,
                     &task_ancestors,
                     caller_specs.as_ref(),
-                )? {
-                    debug!(
-                        "Overriding dependency '{}': '{}' -> '{}'",
-                        install_name_str, raw_spec_str, overridden
-                    );
-                    overridden
-                } else {
-                    raw_spec_str.to_string()
-                }
+                )?
+            } else {
+                None
+            };
+            let effective_spec = if let Some(overridden) = direct_override {
+                debug!(
+                    "Overriding dependency '{}': '{}' -> '{}'",
+                    install_name_str, raw_spec_str, overridden
+                );
+                overridden
             } else if let Some((real_pkg, inner_spec)) = alias_split {
-                if let Some(overridden) = self.overrides.resolve_override_precompiled_with_caller(
-                    real_pkg,
-                    inner_spec,
-                    &task_ancestors,
-                    caller_specs.as_ref(),
-                )? {
-                    debug!(
-                        "Overriding aliased package '{}' (install: '{}'): '{}' -> '{}'",
-                        real_pkg, install_name_str, inner_spec, overridden
-                    );
-                    if overridden.starts_with("npm:") {
-                        overridden
+                if self.overrides.has_target(real_pkg) {
+                    if let Some(overridden) = self.overrides.resolve_override_precompiled_with_caller(
+                        real_pkg,
+                        inner_spec,
+                        &task_ancestors,
+                        caller_specs.as_ref(),
+                    )? {
+                        debug!(
+                            "Overriding aliased package '{}' (install: '{}'): '{}' -> '{}'",
+                            real_pkg, install_name_str, inner_spec, overridden
+                        );
+                        if overridden.starts_with("npm:") {
+                            overridden
+                        } else {
+                            format!("npm:{}@{}", real_pkg, overridden)
+                        }
                     } else {
-                        format!("npm:{}@{}", real_pkg, overridden)
+                        raw_spec_str.to_string()
                     }
                 } else {
                     raw_spec_str.to_string()
@@ -2375,15 +2392,7 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                     },
                 };
 
-                if self.options.prefer_dedupe {
-                    Self::record_dedupe_node(
-                        &mut self.dedupe_ver_counts,
-                        &node.name,
-                        &node.version,
-                        node.parsed_version.as_ref(),
-                    );
-                }
-                self.graph.add_node(target_loc.clone(), node);
+                self.add_graph_node(target_loc.clone(), node);
                 self.activate_invalidated_workspaces(&target_loc);
                 self.activate_deferred_optional_peers(&target_loc);
                 if target_loc.strip_prefix("node_modules/") == Some(dep_spec.install_name.as_str()) {
