@@ -277,16 +277,8 @@ fn find_standalone_node_gyp_on_path() -> Option<PathBuf> {
 
     // d. rnpm's own cached standalone node-gyp directory (<cache>/node-gyp/current/bin/node-gyp.js)
     let cache_dir = find_cache_dir(project_root, config);
-    let cached_candidates = [
-        cache_dir.join("node-gyp").join("current").join("bin").join("node-gyp.js"),
-        cache_dir.join("node-gyp").join("current").join("node-gyp.js"),
-        cache_dir.join("node-gyp").join("bin").join("node-gyp.js"),
-    ];
-    for candidate in cached_candidates {
-        if candidate.is_file() {
-            debug!("Resolved node-gyp via cached standalone directory: {}", candidate.display());
-            return Some(candidate);
-        }
+    if let Some(found) = find_cached_standalone_node_gyp(&cache_dir) {
+        return Some(found);
     }
 
     // e. Bundled npm node-gyp (fallback only if npm happens to be installed alongside Node)
@@ -304,30 +296,71 @@ fn find_standalone_node_gyp_on_path() -> Option<PathBuf> {
         });
 
     if allow_npm_fallback {
-        if let Some(gyp) = crate::node_executable()
-            .and_then(|n| n.parent().map(Path::to_path_buf))
-            .map(|d| {
-                if cfg!(windows) {
-                    d.join("node_modules")
-                } else {
-                    d.parent().unwrap_or(&d).join("lib").join("node_modules")
-                }
-            })
-            .map(|d| {
-                d.join("npm")
-                    .join("node_modules")
-                    .join("node-gyp")
-                    .join("bin")
-                    .join("node-gyp.js")
-            })
-            .filter(|p| p.is_file())
-        {
+        static BUNDLED_NPM_NODE_GYP: std::sync::OnceLock<Option<PathBuf>> =
+            std::sync::OnceLock::new();
+        let bundled = BUNDLED_NPM_NODE_GYP.get_or_init(|| {
+            crate::node_executable()
+                .and_then(|n| n.parent().map(Path::to_path_buf))
+                .map(|d| {
+                    if cfg!(windows) {
+                        d.join("node_modules")
+                    } else {
+                        d.parent().unwrap_or(&d).join("lib").join("node_modules")
+                    }
+                })
+                .map(|d| {
+                    d.join("npm")
+                        .join("node_modules")
+                        .join("node-gyp")
+                        .join("bin")
+                        .join("node-gyp.js")
+                })
+                .filter(|p| p.is_file())
+        });
+        if let Some(gyp) = bundled {
             debug!("Resolved node-gyp via bundled npm fallback: {}", gyp.display());
-            return Some(gyp);
+            return Some(gyp.clone());
         }
     }
 
     None
+}
+
+fn find_cached_standalone_node_gyp(cache_dir: &Path) -> Option<PathBuf> {
+    use std::sync::{Mutex, OnceLock};
+    use std::time::{Duration, Instant};
+
+    type CachedNodeGypEntry = (PathBuf, Option<PathBuf>, Instant);
+    static CACHE: OnceLock<Mutex<Option<CachedNodeGypEntry>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(None));
+    if let Ok(guard) = cache.lock() {
+        if let Some((ref cached_dir, ref result, ts)) = *guard {
+            if cached_dir == cache_dir {
+                match result {
+                    Some(p) if p.is_file() => return Some(p.clone()),
+                    None if ts.elapsed() < Duration::from_secs(2) => return None,
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    let cached_candidates = [
+        cache_dir.join("node-gyp").join("current").join("bin").join("node-gyp.js"),
+        cache_dir.join("node-gyp").join("current").join("node-gyp.js"),
+        cache_dir.join("node-gyp").join("bin").join("node-gyp.js"),
+    ];
+    let found = cached_candidates.into_iter().find(|c| c.is_file());
+    if let Some(ref candidate) = found {
+        debug!(
+            "Resolved node-gyp via cached standalone directory: {}",
+            candidate.display()
+        );
+    }
+    if let Ok(mut guard) = cache.lock() {
+        *guard = Some((cache_dir.to_path_buf(), found.clone(), Instant::now()));
+    }
+    found
 }
 
 /// Ensures node-gyp is available, performing on-demand bootstrap from the registry if needed

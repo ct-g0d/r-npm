@@ -674,10 +674,10 @@ async fn try_fast_http_post(
             anyhow::anyhow!("Failed to connect to security advisory registry {target_url}: {e}")
         })?;
         let _ = stream.set_nodelay(true);
-        stream.write_all(head.as_bytes()).await.map_err(|e| {
-            anyhow::anyhow!("Failed to send advisory request to {target_url}: {e}")
-        })?;
-        stream.write_all(body_bytes).await.map_err(|e| {
+        let mut req_buf = Vec::with_capacity(head.len() + body_bytes.len());
+        req_buf.extend_from_slice(head.as_bytes());
+        req_buf.extend_from_slice(body_bytes);
+        stream.write_all(&req_buf).await.map_err(|e| {
             anyhow::anyhow!("Failed to send advisory request to {target_url}: {e}")
         })?;
         stream.flush().await.map_err(|e| {
@@ -717,23 +717,30 @@ fn try_fast_http_post_sync(
     use std::io::{Read, Write};
     let (addr, head) =
         build_fast_http_post_request(target_parsed, body_bytes, user_agent, auth_token)?;
-    let sock_addrs: Vec<std::net::SocketAddr> = std::net::ToSocketAddrs::to_socket_addrs(&*addr)
-        .ok()?
-        .collect();
-    let mut stream = None;
-    for sa in sock_addrs {
-        if let Ok(s) = std::net::TcpStream::connect_timeout(&sa, std::time::Duration::from_secs(10))
-        {
-            stream = Some(s);
-            break;
+    let stream = if let Ok(sa) = addr.parse::<std::net::SocketAddr>() {
+        std::net::TcpStream::connect_timeout(&sa, std::time::Duration::from_secs(10)).ok()
+    } else {
+        let sock_addrs: Vec<std::net::SocketAddr> = std::net::ToSocketAddrs::to_socket_addrs(&*addr)
+            .ok()?
+            .collect();
+        let mut connected = None;
+        for sa in sock_addrs {
+            if let Ok(s) = std::net::TcpStream::connect_timeout(&sa, std::time::Duration::from_secs(10))
+            {
+                connected = Some(s);
+                break;
+            }
         }
-    }
+        connected
+    };
     let mut stream = stream?;
     let _ = stream.set_nodelay(true);
     let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(30)));
     let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(10)));
-    stream.write_all(head.as_bytes()).ok()?;
-    stream.write_all(body_bytes).ok()?;
+    let mut req_buf = Vec::with_capacity(head.len() + body_bytes.len());
+    req_buf.extend_from_slice(head.as_bytes());
+    req_buf.extend_from_slice(body_bytes);
+    stream.write_all(&req_buf).ok()?;
     stream.flush().ok()?;
     let mut raw = Vec::with_capacity(4096);
     let mut buf = [0u8; 8192];
@@ -1143,6 +1150,12 @@ fn fast_lockfile_hash(bytes: &[u8]) -> u64 {
 
 pub(crate) enum SpeculativeAuditInner {
     SyncHttpThread(std::thread::JoinHandle<SyncAuditResult>),
+    ReadySync(
+        u64,
+        rnpm_lockfile::LockfileV3,
+        AuditInventory,
+        BTreeMap<String, Vec<AdvisoryPayload>>,
+    ),
     AsyncTask(tokio::task::JoinHandle<AsyncAuditResult>),
 }
 
@@ -1165,6 +1178,11 @@ impl Drop for SpeculativeAuditHandle {
     }
 }
 
+pub(crate) enum SyncAuditOutcome {
+    Done(Option<(rnpm_lockfile::LockfileV3, AuditReport)>),
+    NeedsAsync(SpeculativeAuditHandle),
+}
+
 impl SpeculativeAuditHandle {
     pub(crate) fn is_lockfile_unchanged(&self) -> bool {
         let Ok(meta) = std::fs::metadata(&self.lock_path) else {
@@ -1173,15 +1191,34 @@ impl SpeculativeAuditHandle {
         meta.len() == self.lock_len && meta.modified().ok() == self.lock_mtime
     }
 
-    pub(crate) async fn finish(
+    fn verify_lockfile_hash(&self, spec_hash: u64, trust_meta_if_unchanged: bool) -> bool {
+        if trust_meta_if_unchanged && self.is_lockfile_unchanged() {
+            return true;
+        }
+        std::fs::read(&self.lock_path)
+            .ok()
+            .is_some_and(|bytes| fast_lockfile_hash(&bytes) == spec_hash)
+    }
+
+    /// Completes the speculative audit synchronously when no non-empty advisories need
+    /// async remediation resolution.
+    pub(crate) fn try_finish_sync(
         mut self,
-        config: &rnpm_config::Config,
-    ) -> Option<(rnpm_lockfile::LockfileV3, AuditReport)> {
-        let inner = self.inner.take()?;
-        let (spec_hash, lockfile, report) = match inner {
+        trust_meta_if_unchanged: bool,
+    ) -> SyncAuditOutcome {
+        let Some(inner) = self.inner.take() else {
+            return SyncAuditOutcome::Done(None);
+        };
+        match inner {
             SpeculativeAuditInner::SyncHttpThread(handle) => {
-                let (spec_hash, lockfile, inventory, advisories_by_pkg) =
-                    handle.join().ok().flatten()?;
+                let Some((spec_hash, lockfile, inventory, advisories_by_pkg)) =
+                    handle.join().ok().flatten()
+                else {
+                    return SyncAuditOutcome::Done(None);
+                };
+                if !self.verify_lockfile_hash(spec_hash, trust_meta_if_unchanged) {
+                    return SyncAuditOutcome::Done(None);
+                }
                 if advisories_by_pkg.is_empty() {
                     let report = AuditReport {
                         audit_report_version: 2,
@@ -1191,9 +1228,72 @@ impl SpeculativeAuditHandle {
                             dependencies: inventory.dep_counts,
                         },
                     };
-                    (spec_hash, lockfile, report)
+                    SyncAuditOutcome::Done(Some((lockfile, report)))
                 } else {
-                    let (report, _, _) = finalize_audit_report(
+                    self.inner = Some(SpeculativeAuditInner::ReadySync(
+                        spec_hash,
+                        lockfile,
+                        inventory,
+                        advisories_by_pkg,
+                    ));
+                    SyncAuditOutcome::NeedsAsync(self)
+                }
+            }
+            SpeculativeAuditInner::ReadySync(spec_hash, lockfile, inventory, advisories_by_pkg) => {
+                if !self.verify_lockfile_hash(spec_hash, trust_meta_if_unchanged) {
+                    return SyncAuditOutcome::Done(None);
+                }
+                if advisories_by_pkg.is_empty() {
+                    let report = AuditReport {
+                        audit_report_version: 2,
+                        vulnerabilities: BTreeMap::new(),
+                        metadata: AuditMetadata {
+                            vulnerabilities: VulnerabilitiesCount::default(),
+                            dependencies: inventory.dep_counts,
+                        },
+                    };
+                    SyncAuditOutcome::Done(Some((lockfile, report)))
+                } else {
+                    self.inner = Some(SpeculativeAuditInner::ReadySync(
+                        spec_hash,
+                        lockfile,
+                        inventory,
+                        advisories_by_pkg,
+                    ));
+                    SyncAuditOutcome::NeedsAsync(self)
+                }
+            }
+            SpeculativeAuditInner::AsyncTask(handle) => {
+                self.inner = Some(SpeculativeAuditInner::AsyncTask(handle));
+                SyncAuditOutcome::NeedsAsync(self)
+            }
+        }
+    }
+
+    pub(crate) async fn finish(
+        mut self,
+        config: &rnpm_config::Config,
+        trust_meta_if_unchanged: bool,
+    ) -> Option<(rnpm_lockfile::LockfileV3, AuditReport)> {
+        let inner = self.inner.take()?;
+        let (spec_hash, lockfile, report) = match inner {
+            SpeculativeAuditInner::SyncHttpThread(handle) => {
+                let (spec_hash, lockfile, inventory, advisories_by_pkg) =
+                    handle.join().ok().flatten()?;
+                if !self.verify_lockfile_hash(spec_hash, trust_meta_if_unchanged) {
+                    return None;
+                }
+                let report = if advisories_by_pkg.is_empty() {
+                    AuditReport {
+                        audit_report_version: 2,
+                        vulnerabilities: BTreeMap::new(),
+                        metadata: AuditMetadata {
+                            vulnerabilities: VulnerabilitiesCount::default(),
+                            dependencies: inventory.dep_counts,
+                        },
+                    }
+                } else {
+                    finalize_audit_report(
                         &lockfile,
                         inventory,
                         &advisories_by_pkg,
@@ -1201,14 +1301,29 @@ impl SpeculativeAuditHandle {
                         config,
                     )
                     .await
-                    .ok()?;
-                    (spec_hash, lockfile, report)
+                    .ok()?
+                    .0
+                };
+                return Some((lockfile, report));
+            }
+            SpeculativeAuditInner::ReadySync(spec_hash, lockfile, inventory, advisories_by_pkg) => {
+                if !self.verify_lockfile_hash(spec_hash, trust_meta_if_unchanged) {
+                    return None;
                 }
+                let (report, _, _) = finalize_audit_report(
+                    &lockfile,
+                    inventory,
+                    &advisories_by_pkg,
+                    &self.registry,
+                    config,
+                )
+                .await
+                .ok()?;
+                return Some((lockfile, report));
             }
             SpeculativeAuditInner::AsyncTask(handle) => handle.await.ok().flatten()?,
         };
-        let current_bytes = std::fs::read(&self.lock_path).ok()?;
-        if fast_lockfile_hash(&current_bytes) != spec_hash {
+        if !self.verify_lockfile_hash(spec_hash, trust_meta_if_unchanged) {
             return None;
         }
         Some((lockfile, report))
@@ -1694,17 +1809,18 @@ pub(crate) fn count_funding_packages_in_node_modules(project_dir: &Path) -> usiz
         }
     }
 
-    if manifest_paths.len() <= 8 {
+    if manifest_paths.len() <= 48 {
         return manifest_paths
             .iter()
             .filter(|p| has_funding_field(p))
             .count();
     }
 
+    let cap = if manifest_paths.len() <= 200 { 4 } else { 16 };
     let workers = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(4)
-        .min(16)
+        .min(cap)
         .min(manifest_paths.len());
     let next_idx = std::sync::atomic::AtomicUsize::new(0);
     std::thread::scope(|scope| {

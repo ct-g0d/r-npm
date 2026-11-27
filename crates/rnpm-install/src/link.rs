@@ -2,7 +2,7 @@ use anyhow::{anyhow, Context, Result};
 use rnpm_config::{find_global_bin_dir, find_global_node_modules};
 use rnpm_core::manifest::Manifest;
 use rnpm_fs::junction::{create_junction, is_junction, remove_dir_all_safe, remove_junction};
-use rnpm_shim::create_shims_with_options;
+use rnpm_shim::create_shims_with_preloaded_header;
 use rnpm_shim::generator::create_shim_trio;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -597,8 +597,28 @@ pub(crate) fn sort_packages_for_bin_linking(packages: &mut [CiPackage]) {
 }
 
 #[allow(clippy::too_many_arguments)]
+pub(crate) fn norm_bin_rel(rel: &str) -> String {
+    let stripped = rel.trim_start_matches("./").trim_start_matches(".\\");
+    if stripped.contains('\\') {
+        stripped.replace('\\', "/")
+    } else {
+        stripped.to_string()
+    }
+}
+
+struct ShimLinkItem<'a> {
+    target_path: PathBuf,
+    pkg_bin_dir: PathBuf,
+    bin_name: String,
+    script_rel: String,
+    script_path: PathBuf,
+    fast_rel: Option<String>,
+    header: Option<&'a [u8]>,
+}
+
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn link_tree_bins(
-    mut package_locs: Vec<String>,
+    package_locs: Vec<String>,
     known_bins: Option<&HashMap<String, Vec<(String, String)>>>,
     loc_base_dir: &Path,
     root_bin_dir: &Path,
@@ -607,11 +627,43 @@ pub(crate) fn link_tree_bins(
     collector: Option<&TimingCollector>,
     force: bool,
 ) -> Result<()> {
+    link_tree_bins_with_headers(
+        package_locs,
+        known_bins,
+        loc_base_dir,
+        root_bin_dir,
+        node_modules_dir,
+        is_clean_install,
+        collector,
+        force,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn link_tree_bins_with_headers(
+    mut package_locs: Vec<String>,
+    known_bins: Option<&HashMap<String, Vec<(String, String)>>>,
+    loc_base_dir: &Path,
+    root_bin_dir: &Path,
+    node_modules_dir: &Path,
+    is_clean_install: bool,
+    collector: Option<&TimingCollector>,
+    force: bool,
+    preloaded_headers: Option<&HashMap<(String, String), &[u8]>>,
+) -> Result<()> {
     let t_bins = std::time::Instant::now();
 
     // 1. If known_bins is provided, filter package_locs to only packages that actually have bins in memory!
     if let Some(bins) = known_bins {
         package_locs.retain(|loc| bins.contains_key(loc));
+    }
+
+    if is_clean_install && package_locs.is_empty() {
+        if let Some(c) = collector {
+            c.record_phase(Phase::Bins, t_bins.elapsed());
+        }
+        return Ok(());
     }
 
     // 2. Walk packages shallowest first (depth based on `node_modules/` count), sorted according to npm precedence.
@@ -620,8 +672,7 @@ pub(crate) fn link_tree_bins(
     // 3. Track claimed bin names per .bin directory in memory for the current run.
     let mut claimed_bins: HashMap<PathBuf, HashSet<String>> = HashMap::new();
     let mut wanted_shims: HashMap<PathBuf, HashSet<String>> = HashMap::new();
-    let mut shims_to_link: Vec<(PathBuf, PathBuf, String, String, PathBuf, Option<String>)> =
-        Vec::new();
+    let mut shims_to_link: Vec<ShimLinkItem<'_>> = Vec::new();
     let nm_is_direct_child = loc_base_dir.join("node_modules") == node_modules_dir
         || is_same_or_matching_root_nm(&loc_base_dir.join("node_modules"), node_modules_dir);
     let clean_root_bin = path_clean::clean(root_bin_dir);
@@ -663,7 +714,15 @@ pub(crate) fn link_tree_bins(
 
         let claimed_set = claimed_bins.entry(clean_bin_dir.clone()).or_default();
 
-        let outside_node_modules = if is_top_level_nm && nm_is_direct_child && !is_path_symlink_or_reparse(&target_path) {
+        let pack_has_pkg = preloaded_headers.is_some_and(|headers| {
+            bin_entries
+                .iter()
+                .any(|(_, rel)| headers.contains_key(&(loc.clone(), norm_bin_rel(rel))))
+        });
+        let outside_node_modules = if is_top_level_nm
+            && nm_is_direct_child
+            && (pack_has_pkg || !is_path_symlink_or_reparse(&target_path))
+        {
             false
         } else {
             let nm_real = nm_real_cache.get_or_insert_with(|| node_modules_dir.canonicalize().ok());
@@ -675,6 +734,11 @@ pub(crate) fn link_tree_bins(
         let can_fast_rel = is_top_level_nm && nm_is_direct_child && !outside_node_modules;
         for (bin_name, script_rel) in bin_entries {
             let script_path = target_path.join(&script_rel);
+            let header_opt = preloaded_headers.and_then(|headers| {
+                headers
+                    .get(&(loc.clone(), norm_bin_rel(&script_rel)))
+                    .copied()
+            });
             // cmd-shim's cmdShimIfExists: a bin whose target is missing (e.g. an
             // unbuilt workspace) gets no shim and claims no name. Only checked for
             // packages living outside node_modules: registry packages may still be
@@ -695,14 +759,15 @@ pub(crate) fn link_tree_bins(
                     wset.insert(format!("{bin_name}.cmd"));
                     wset.insert(format!("{bin_name}.ps1"));
                 }
-                shims_to_link.push((
-                    target_path.clone(),
-                    pkg_bin_dir.clone(),
+                shims_to_link.push(ShimLinkItem {
+                    target_path: target_path.clone(),
+                    pkg_bin_dir: pkg_bin_dir.clone(),
                     bin_name,
                     script_rel,
                     script_path,
                     fast_rel,
-                ));
+                    header: header_opt,
+                });
             } else {
                 debug!(
                     "Bin '{bin_name}' in '{}' already claimed in this run; skipping",
@@ -718,36 +783,38 @@ pub(crate) fn link_tree_bins(
             .with_context(|| format!("Failed to create bin dir {}", dir.display()))?;
     }
 
-    let link_entry = |(target_path, pkg_bin_dir, bin_name, script_rel, script_path, fast_rel): &(
-        PathBuf,
-        PathBuf,
-        String,
-        String,
-        PathBuf,
-        Option<String>,
-    )|
-     -> Result<()> {
-        if let Some(ref rel) = fast_rel {
-            create_shims_with_options(pkg_bin_dir, bin_name, rel, force, Some(script_path), true)
+    let link_entry = |item: &ShimLinkItem<'_>| -> Result<()> {
+        if let Some(ref rel) = item.fast_rel {
+            create_shims_with_preloaded_header(
+                &item.pkg_bin_dir,
+                &item.bin_name,
+                rel,
+                force,
+                Some(&item.script_path),
+                true,
+                item.header,
+            )
         } else {
-            let target_rel = compute_bin_target_rel(target_path, pkg_bin_dir, script_rel);
-            create_shims_with_options(
-                pkg_bin_dir,
-                bin_name,
+            let target_rel =
+                compute_bin_target_rel(&item.target_path, &item.pkg_bin_dir, &item.script_rel);
+            create_shims_with_preloaded_header(
+                &item.pkg_bin_dir,
+                &item.bin_name,
                 &target_rel,
                 force,
-                Some(script_path),
+                Some(&item.script_path),
                 true,
+                item.header,
             )
         }
     };
 
-    if shims_to_link.len() <= 2 {
+    if shims_to_link.len() <= 8 {
         for item in &shims_to_link {
             link_entry(item)?;
         }
     } else {
-        let num_threads = 16.min(shims_to_link.len());
+        let num_threads = 16.min(shims_to_link.len().div_ceil(8));
         let chunk_size = shims_to_link.len().div_ceil(num_threads);
         std::thread::scope(|scope| {
             let mut handles = Vec::new();
