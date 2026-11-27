@@ -1,5 +1,7 @@
 # rnpm Windows Speed Plan: 5x npm on an i7-8750H
 
+> **Historical snapshot (2026-11-07):** The baseline numbers and "slower than npm" status below were recorded before Milestones M0–M7 and PRs #63–#67. Since then, warm/no-op installs (`hot-noop`, `.rnpm-fp`, incremental `rnpm install`), single-file `.pack` v2 storage, persistent HTTP/1.1 keep-alive pooling, lock-free `RustWriterQueue`, and full differential parity (`652/652` across Windows/Linux/macOS) have shipped. Keep this document as historical design rationale, not current benchmark status.
+
 Design plan, 2026-11-07. Target machine: the dev laptop rnpm is built on. Every number below
 was measured on it unless marked **(estimate)**.
 
