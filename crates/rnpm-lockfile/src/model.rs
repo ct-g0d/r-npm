@@ -2589,11 +2589,52 @@ impl LockfileV3 {
             return false;
         }
         let eff_spec: std::borrow::Cow<'_, str> = if let Some(ov) = overrides {
-            ov.resolve_override_precompiled_with_caller::<&str>(dep, spec, &[], None)
+            let direct = ov
+                .resolve_override_precompiled_with_caller::<&str>(dep, spec, &[], None)
                 .ok()
-                .flatten()
-                .map(std::borrow::Cow::Owned)
-                .unwrap_or(std::borrow::Cow::Borrowed(spec))
+                .flatten();
+            if let Some(found) = direct {
+                std::borrow::Cow::Owned(found)
+            } else if let Some(alias_rest) = spec.trim().strip_prefix("npm:") {
+                let (real_pkg, inner_spec) = if let Some(after_scope) = alias_rest.strip_prefix('@')
+                {
+                    match after_scope.find('@') {
+                        Some(idx) => (&alias_rest[..idx + 1], &after_scope[idx + 1..]),
+                        None => (alias_rest, "*"),
+                    }
+                } else {
+                    match alias_rest.find('@') {
+                        Some(idx) => (&alias_rest[..idx], &alias_rest[idx + 1..]),
+                        None => (alias_rest, "*"),
+                    }
+                };
+                if let Ok(Some(overridden)) =
+                    ov.resolve_override_precompiled_with_caller::<&str>(real_pkg, inner_spec, &[], None)
+                {
+                    let ov_t = overridden.trim();
+                    let full = if ov_t.starts_with("npm:")
+                        || ov_t.starts_with("workspace:")
+                        || ov_t.starts_with("file:")
+                        || ov_t.starts_with("git:")
+                        || ov_t.starts_with("git+")
+                        || ov_t.starts_with("github:")
+                        || ov_t.starts_with("gitlab:")
+                        || ov_t.starts_with("bitbucket:")
+                        || ov_t.starts_with("gist:")
+                        || ov_t.starts_with("http://")
+                        || ov_t.starts_with("https://")
+                    {
+                        overridden
+                    } else {
+                        format!("npm:{real_pkg}@{overridden}")
+                    };
+                    std::borrow::Cow::Owned(full)
+                } else {
+                    std::borrow::Cow::Borrowed(spec)
+                }
+            } else {
+                std::borrow::Cow::Borrowed(spec)
+            }
         } else {
             std::borrow::Cow::Borrowed(spec)
         };

@@ -2270,3 +2270,57 @@ fn test_workspace_discovery_includes_build_dist_target_dirs() {
     let explicit = vec!["packages/build".to_string()];
     assert!(path_matches_workspace_patterns("packages/build", &explicit));
 }
+
+#[test]
+fn test_overrides_deeper_chain_beats_shallower_rule_at_same_parent() {
+    use crate::overrides::Overrides;
+    use std::collections::BTreeMap;
+
+    let json = serde_json::json!({
+        "inner": { "leaf": "2.0.0" },
+        "outer": {
+            "inner": { "leaf": "3.0.0" },
+            "mid": {
+                "inner": { "leaf": "4.0.0" }
+            }
+        }
+    });
+    let ov = Overrides::from_json_value(Some(&json), BTreeMap::new());
+    let empty_refs = BTreeMap::new();
+
+    // `outer > inner` (depth 2) must beat shallower `inner` (depth 1) for `["outer@1.0.0", "inner@1.0.0"]`
+    assert_eq!(
+        ov.resolve_override_precompiled_with_caller(
+            "leaf",
+            "^1.0.0",
+            &["outer@1.0.0", "inner@1.0.0"],
+            Some(&empty_refs),
+        )
+        .unwrap(),
+        Some("3.0.0".to_string())
+    );
+
+    // `outer > mid > inner` (depth 3) must beat `outer > inner` (depth 2) and `inner` (depth 1)
+    assert_eq!(
+        ov.resolve_override_precompiled_with_caller(
+            "leaf",
+            "^1.0.0",
+            &["outer@1.0.0", "mid@1.0.0", "inner@1.0.0"],
+            Some(&empty_refs),
+        )
+        .unwrap(),
+        Some("4.0.0".to_string())
+    );
+
+    // Standalone `inner` still wins when outer is absent
+    assert_eq!(
+        ov.resolve_override_precompiled_with_caller(
+            "leaf",
+            "^1.0.0",
+            &["other@1.0.0", "inner@1.0.0"],
+            Some(&empty_refs),
+        )
+        .unwrap(),
+        Some("2.0.0".to_string())
+    );
+}

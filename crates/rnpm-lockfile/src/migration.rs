@@ -7,7 +7,7 @@ use rnpm_core::{to_posix_path, to_posix_path_cow};
 use serde::de::{DeserializeSeed, MapAccess, Visitor};
 use serde::{Deserialize, Deserializer};
 use std::borrow::Cow;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::BTreeMap;
 use std::fmt;
 use std::fs;
 use std::path::Path;
@@ -403,31 +403,10 @@ fn enrich_packages_from_legacy_buf(
     }
 }
 
-fn collect_legacy_requires<'a>(
-    deps: &'a BTreeMap<String, LegacyDependency>,
-    out: &mut HashSet<&'a str>,
-) {
-    for (owner_name, dep) in deps {
-        if let Some(reqs) = &dep.requires {
-            for req_name in reqs.keys() {
-                if req_name != owner_name {
-                    out.insert(req_name.as_str());
-                }
-            }
-        }
-        if let Some(nested) = &dep.dependencies {
-            collect_legacy_requires(nested, out);
-        }
-    }
-}
-
 fn populate_root_deps_from_legacy(
     deps: &BTreeMap<String, LegacyDependency>,
     root: &mut LockfilePackage,
 ) {
-    let mut transitive_requires = HashSet::new();
-    collect_legacy_requires(deps, &mut transitive_requires);
-
     let mut root_deps = BTreeMap::new();
     let mut root_dev_deps = BTreeMap::new();
     let mut root_opt_deps = BTreeMap::new();
@@ -436,22 +415,24 @@ fn populate_root_deps_from_legacy(
     let mut root_bundled = Vec::new();
 
     for (name, dep) in deps {
-        if transitive_requires.contains(name.as_str()) {
-            continue;
-        }
-        if dep.peer == Some(true) {
+        let is_peer = dep.peer == Some(true);
+        let is_dev_opt = dep.dev_optional == Some(true);
+        let is_dev = dep.dev == Some(true);
+        let is_opt = dep.optional == Some(true);
+
+        if is_peer {
             root_peer_deps.insert(name.clone(), dep.version.clone());
             if dep.peer_optional == Some(true) {
                 root_peer_meta.insert(name.clone(), serde_json::json!({ "optional": true }));
             }
-        } else if dep.dev_optional == Some(true) {
+        }
+        if is_dev_opt || is_dev {
             root_dev_deps.insert(name.clone(), dep.version.clone());
+        }
+        if is_dev_opt || is_opt {
             root_opt_deps.insert(name.clone(), dep.version.clone());
-        } else if dep.dev == Some(true) {
-            root_dev_deps.insert(name.clone(), dep.version.clone());
-        } else if dep.optional == Some(true) {
-            root_opt_deps.insert(name.clone(), dep.version.clone());
-        } else {
+        }
+        if !is_peer && !is_dev_opt && !is_dev && !is_opt {
             root_deps.insert(name.clone(), dep.version.clone());
         }
 

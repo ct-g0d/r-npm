@@ -4612,12 +4612,15 @@ fn validate_fast_path_graph(
 
 #[inline]
 fn fast_path_node_satisfies_target(target_node: &Node, target: &PackageTarget) -> bool {
+    if let PackageTarget::Alias { target: inner, .. } = target {
+        return fast_path_node_satisfies_target(target_node, inner);
+    }
     if crate::hoisting::node_satisfies_target(target_node, target) {
         return true;
     }
     // Lockfile v3 resolves git tags/branches like `#v1.0.0` to a full 40/64-char hex commit SHA
     // in `resolved`. Allow that locked commit when repo and `#path:` subdir match and `committish`
-    // is a non-hex tag/branch ref.
+    // is a non-hex tag/branch ref (or verify `#semver:` range against the locked node version).
     if let PackageTarget::Git {
         url,
         committish: Some(c),
@@ -4640,6 +4643,14 @@ fn fast_path_node_satisfies_target(target_node: &Node, target: &PackageTarget) -
                         if (rc.len() == 40 || rc.len() == 64)
                             && crate::hoisting::is_git_hex_hash(rc, 40)
                         {
+                            if let Some(semver_spec) = c.strip_prefix("semver:").map(str::trim) {
+                                return cached_target_rc(semver_spec).is_some_and(|range_target| {
+                                    crate::hoisting::node_satisfies_target(
+                                        target_node,
+                                        &range_target,
+                                    )
+                                });
+                            }
                             return true;
                         }
                     }
@@ -4701,7 +4712,7 @@ fn validate_fast_path_dep(
         .map(|(real_name, inner)| (real_name, inner.unwrap_or("*")));
     let check_direct = has_overrides && overrides.has_target(dep_name);
     let check_alias =
-        !check_direct && has_overrides && alias_split.is_some_and(|(real, _)| overrides.has_target(real));
+        has_overrides && alias_split.is_some_and(|(real, _)| overrides.has_target(real));
 
     let overridden_spec = if !check_direct && !check_alias {
         None
@@ -4724,25 +4735,41 @@ fn validate_fast_path_dep(
             }
             ancestors.reverse();
         }
-        let resolved_override = if check_direct {
-            overrides.resolve_override_precompiled_with_caller(
-                dep_name,
-                raw_spec,
-                &ancestors,
-                caller_specs.as_ref(),
-            )
-        } else if let Some((real_pkg, inner_spec)) = alias_split {
-            overrides.resolve_override_precompiled_with_caller(
-                real_pkg,
-                inner_spec,
-                &ancestors,
-                caller_specs.as_ref(),
-            )
-        } else {
-            Ok(None)
+        let mut via_alias = false;
+        let resolved_override = {
+            let direct_res = if check_direct {
+                overrides.resolve_override_precompiled_with_caller(
+                    dep_name,
+                    raw_spec,
+                    &ancestors,
+                    caller_specs.as_ref(),
+                )
+            } else {
+                Ok(None)
+            };
+            match direct_res {
+                Ok(Some(found)) => Ok(Some(found)),
+                Ok(None) if check_alias => {
+                    if let Some((real_pkg, inner_spec)) = alias_split {
+                        via_alias = true;
+                        overrides.resolve_override_precompiled_with_caller(
+                            real_pkg,
+                            inner_spec,
+                            &ancestors,
+                            caller_specs.as_ref(),
+                        )
+                    } else {
+                        Ok(None)
+                    }
+                }
+                other => other,
+            }
         };
-        if let Ok(Some(overridden)) = resolved_override {
-            let final_override = if !check_direct {
+        let Ok(maybe_overridden) = resolved_override else {
+            return false;
+        };
+        if let Some(overridden) = maybe_overridden {
+            let final_override = if via_alias {
                 if let Some((real_pkg, _)) = alias_split {
                     let ov_t = overridden.trim();
                     if ov_t.starts_with("npm:")

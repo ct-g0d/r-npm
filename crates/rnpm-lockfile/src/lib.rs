@@ -2175,7 +2175,8 @@ mod tests {
         );
         assert!(root.dependencies.as_ref().is_none_or(|d| !d.contains_key("chalk")));
 
-        // #15b: v1 migration must not dump dev, optional, or hoisted transitive deps into root.dependencies
+        // #15b: v1 migration must not dump dev, optional, devOptional, or peer deps into root.dependencies,
+        // while preserving shared direct prod dependencies so matches_manifest_for_ci does not falsely drift.
         let v1_json = r#"{
   "name": "v1-app",
   "version": "1.0.0",
@@ -2184,9 +2185,9 @@ mod tests {
   "dependencies": {
     "prod-direct": {
       "version": "1.0.0",
-      "requires": { "hoisted-transitive": "^1.0.0" }
+      "requires": { "shared-prod": "^1.2.0" }
     },
-    "hoisted-transitive": {
+    "shared-prod": {
       "version": "1.2.0"
     },
     "dev-only": {
@@ -2196,6 +2197,15 @@ mod tests {
     "opt-only": {
       "version": "3.0.0",
       "optional": true
+    },
+    "dev-and-opt": {
+      "version": "4.0.0",
+      "dev": true,
+      "optional": true
+    },
+    "peer-only": {
+      "version": "5.0.0",
+      "peer": true
     }
   }
 }"#;
@@ -2203,9 +2213,11 @@ mod tests {
         let v1_root = migrated.root_package().unwrap();
         let prod = v1_root.dependencies.as_ref().unwrap();
         assert_eq!(prod.get("prod-direct").map(String::as_str), Some("1.0.0"));
-        assert!(!prod.contains_key("hoisted-transitive"));
+        assert_eq!(prod.get("shared-prod").map(String::as_str), Some("1.2.0"));
         assert!(!prod.contains_key("dev-only"));
         assert!(!prod.contains_key("opt-only"));
+        assert!(!prod.contains_key("dev-and-opt"));
+        assert!(!prod.contains_key("peer-only"));
         assert_eq!(
             v1_root
                 .dev_dependencies
@@ -2216,11 +2228,58 @@ mod tests {
         );
         assert_eq!(
             v1_root
+                .dev_dependencies
+                .as_ref()
+                .and_then(|d| d.get("dev-and-opt"))
+                .map(String::as_str),
+            Some("4.0.0")
+        );
+        assert_eq!(
+            v1_root
                 .optional_dependencies
                 .as_ref()
                 .and_then(|d| d.get("opt-only"))
                 .map(String::as_str),
             Some("3.0.0")
+        );
+        assert_eq!(
+            v1_root
+                .optional_dependencies
+                .as_ref()
+                .and_then(|d| d.get("dev-and-opt"))
+                .map(String::as_str),
+            Some("4.0.0")
+        );
+        assert_eq!(
+            v1_root
+                .peer_dependencies
+                .as_ref()
+                .and_then(|d| d.get("peer-only"))
+                .map(String::as_str),
+            Some("5.0.0")
+        );
+
+        let mut v1_manifest = rnpm_core::manifest::Manifest::default();
+        v1_manifest.name = Some("v1-app".to_string());
+        v1_manifest.version = Some("1.0.0".to_string());
+        v1_manifest
+            .dependencies
+            .insert("prod-direct".to_string(), "^1.0.0".to_string());
+        v1_manifest
+            .dependencies
+            .insert("shared-prod".to_string(), "^1.2.0".to_string());
+        v1_manifest
+            .dev_dependencies
+            .insert("dev-only".to_string(), "^2.0.0".to_string());
+        v1_manifest
+            .optional_dependencies
+            .insert("opt-only".to_string(), "^3.0.0".to_string());
+        v1_manifest
+            .peer_dependencies
+            .insert("peer-only".to_string(), "^5.0.0".to_string());
+        assert!(
+            migrated.matches_manifest_for_ci(&v1_manifest, true),
+            "migrated v1 lockfile with shared direct+transitive prod dep must match CI manifest"
         );
     }
 }

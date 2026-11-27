@@ -8151,3 +8151,100 @@ fn test_fast_path_allows_omitted_optional_peers_and_reuse_clears_skipped_poisoni
     assert!(graph.nodes["node_modules/opt-parent"].flags.skipped);
     assert!(graph.skipped.contains("opt-parent"));
 }
+
+#[test]
+fn test_fast_path_alias_override_fallback_and_git_semver_range_check() {
+    use crate::solver::resolve_fast_path;
+    use rnpm_lockfile::{LockfilePackage, LockfileV3};
+
+    let options = ResolverOptions::default();
+
+    // Finding 3: unmatched rule on alias `dep_name` must still fall back to `real_pkg` override
+    let mut alias_manifest = Manifest::default();
+    alias_manifest.name = Some("alias-fallback-app".to_string());
+    alias_manifest
+        .dependencies
+        .insert("my-alias".to_string(), "npm:lodash@4.17.15".to_string());
+    alias_manifest.extra.insert(
+        "overrides".to_string(),
+        serde_json::json!({
+            "my-alias@1.0.0": "2.0.0",
+            "lodash": "4.17.21"
+        }),
+    );
+
+    let mut alias_lockfile = LockfileV3::new("alias-fallback-app", Some("1.0.0".to_string()));
+    if let Some(root) = alias_lockfile.root_package_mut() {
+        root.dependencies = Some(BTreeMap::from([(
+            "my-alias".to_string(),
+            "npm:lodash@4.17.15".to_string(),
+        )]));
+    }
+    alias_lockfile.insert_package(
+        "node_modules/my-alias",
+        LockfilePackage {
+            name: Some("lodash".to_string()),
+            version: Some("4.17.15".to_string()),
+            ..Default::default()
+        },
+    );
+    // Locked 4.17.15 violates fallen-through `lodash: 4.17.21` override -> fast path rejects
+    assert!(resolve_fast_path(&alias_manifest, &alias_lockfile, &options).is_none());
+
+    alias_lockfile.insert_package(
+        "node_modules/my-alias",
+        LockfilePackage {
+            name: Some("lodash".to_string()),
+            version: Some("4.17.21".to_string()),
+            ..Default::default()
+        },
+    );
+    assert!(resolve_fast_path(&alias_manifest, &alias_lockfile, &options).is_some());
+
+    // Finding 4: `#semver:<range>` with locked 40-char git SHA must enforce range against node.version
+    let mut git_manifest = Manifest::default();
+    git_manifest.name = Some("git-semver-app".to_string());
+    git_manifest.dependencies.insert(
+        "git-pkg".to_string(),
+        "github:foo/bar#semver:^2.0.0".to_string(),
+    );
+
+    let mut git_lockfile = LockfileV3::new("git-semver-app", Some("1.0.0".to_string()));
+    if let Some(root) = git_lockfile.root_package_mut() {
+        root.dependencies = Some(BTreeMap::from([(
+            "git-pkg".to_string(),
+            "github:foo/bar#semver:^2.0.0".to_string(),
+        )]));
+    }
+    git_lockfile.insert_package(
+        "node_modules/git-pkg",
+        LockfilePackage {
+            version: Some("1.5.0".to_string()),
+            resolved: Some(
+                "git+https://github.com/foo/bar.git#0123456789abcdef0123456789abcdef01234567"
+                    .to_string(),
+            ),
+            ..Default::default()
+        },
+    );
+    assert!(
+        resolve_fast_path(&git_manifest, &git_lockfile, &options).is_none(),
+        "locked 1.5.0 must not satisfy #semver:^2.0.0 even with valid 40-char SHA"
+    );
+
+    git_lockfile.insert_package(
+        "node_modules/git-pkg",
+        LockfilePackage {
+            version: Some("2.1.0".to_string()),
+            resolved: Some(
+                "git+https://github.com/foo/bar.git#0123456789abcdef0123456789abcdef01234567"
+                    .to_string(),
+            ),
+            ..Default::default()
+        },
+    );
+    assert!(
+        resolve_fast_path(&git_manifest, &git_lockfile, &options).is_some(),
+        "locked 2.1.0 satisfies #semver:^2.0.0 with valid 40-char SHA"
+    );
+}

@@ -130,6 +130,19 @@ pub struct PrecompiledNode {
     pub rules_by_pkg: BTreeMap<String, Vec<PrecompiledRule>>,
 }
 
+#[inline]
+fn split_parent_name_ver(parent_str: &str) -> (&str, &str) {
+    if parent_str
+        .as_bytes()
+        .get(1..)
+        .is_some_and(|tail| tail.contains(&b'@'))
+    {
+        parse_key_and_spec(parent_str).unwrap_or((parent_str, ""))
+    } else {
+        (parent_str, "")
+    }
+}
+
 impl PrecompiledNode {
     pub fn compile(
         rules: &BTreeMap<String, OverrideValue>,
@@ -221,22 +234,26 @@ impl PrecompiledNode {
         dep_name: &str,
         requested_spec: &str,
     ) -> Option<&'a OverrideValue> {
+        self.find_in_nested_scored(rules, ancestors, dep_name, requested_spec)
+            .map(|(val, _)| val)
+    }
+
+    fn find_in_nested_scored<'a, T: AsRef<str>>(
+        &self,
+        rules: &'a BTreeMap<String, OverrideValue>,
+        ancestors: &[T],
+        dep_name: &str,
+        requested_spec: &str,
+    ) -> Option<(&'a OverrideValue, (usize, usize))> {
         if ancestors.is_empty() {
-            return self.find_direct(rules, dep_name, requested_spec);
+            return self
+                .find_direct(rules, dep_name, requested_spec)
+                .map(|val| (val, (0, 0)));
         }
 
-        let parent_str = ancestors[0].as_ref();
-        let (parent_name, parent_ver) = if parent_str
-            .as_bytes()
-            .get(1..)
-            .is_some_and(|tail| tail.contains(&b'@'))
-        {
-            parse_key_and_spec(parent_str).unwrap_or((parent_str, ""))
-        } else {
-            (parent_str, "")
-        };
-
+        let (parent_name, parent_ver) = split_parent_name_ver(ancestors[0].as_ref());
         let rule_list = self.rules_by_pkg.get(parent_name)?;
+        let mut best: Option<(&'a OverrideValue, (usize, usize))> = None;
 
         for want_spec in [true, false] {
             for rule in rule_list {
@@ -256,27 +273,39 @@ impl PrecompiledNode {
                 };
 
                 if matches_parent {
-                    if ancestors.len() > 1 {
-                        for next_idx in (1..ancestors.len()).rev() {
-                            if let Some(res) = nested_node.find_in_nested(
+                    let mut rule_best: Option<(&'a OverrideValue, (usize, usize))> = None;
+                    for next_idx in 1..ancestors.len() {
+                        if let Some((res, (child_end, child_depth))) = nested_node
+                            .find_in_nested_scored(
                                 nested_map,
                                 &ancestors[next_idx..],
                                 dep_name,
                                 requested_spec,
-                            ) {
-                                return Some(res);
+                            )
+                        {
+                            let score = (next_idx + child_end, 1 + child_depth);
+                            if rule_best.is_none_or(|(_, s)| score > s) {
+                                rule_best = Some((res, score));
                             }
                         }
                     }
-                    if let Some(res) = nested_node.find_direct(nested_map, dep_name, requested_spec)
-                    {
-                        return Some(res);
+                    if rule_best.is_none() {
+                        if let Some(res) =
+                            nested_node.find_direct(nested_map, dep_name, requested_spec)
+                        {
+                            rule_best = Some((res, (0, 1)));
+                        }
+                    }
+                    if let Some((res, score)) = rule_best {
+                        if best.is_none_or(|(_, s)| score > s) {
+                            best = Some((res, score));
+                        }
                     }
                 }
             }
         }
 
-        None
+        best
     }
 }
 
@@ -429,28 +458,21 @@ impl FastNode {
         None
     }
 
-    fn find_in_nested<T: AsRef<str>>(
+    fn find_in_nested_scored<T: AsRef<str>>(
         &self,
         ancestors: &[T],
         dep_name: &str,
         requested_spec: &str,
-    ) -> Option<&str> {
+    ) -> Option<(&str, (usize, usize))> {
         if ancestors.is_empty() {
-            return self.find_direct(dep_name, requested_spec);
+            return self
+                .find_direct(dep_name, requested_spec)
+                .map(|val| (val, (0, 0)));
         }
 
-        let parent_str = ancestors[0].as_ref();
-        let (parent_name, parent_ver) = if parent_str
-            .as_bytes()
-            .get(1..)
-            .is_some_and(|tail| tail.contains(&b'@'))
-        {
-            parse_key_and_spec(parent_str).unwrap_or((parent_str, ""))
-        } else {
-            (parent_str, "")
-        };
-
+        let (parent_name, parent_ver) = split_parent_name_ver(ancestors[0].as_ref());
         let rule_list = self.rules_by_pkg.get(parent_name)?;
+        let mut best: Option<(&str, (usize, usize))> = None;
 
         for want_spec in [true, false] {
             for rule in rule_list {
@@ -468,25 +490,36 @@ impl FastNode {
                 };
 
                 if matches_parent {
-                    if ancestors.len() > 1 {
-                        for next_idx in (1..ancestors.len()).rev() {
-                            if let Some(res) = nested_node.find_in_nested(
+                    let mut rule_best: Option<(&str, (usize, usize))> = None;
+                    for next_idx in 1..ancestors.len() {
+                        if let Some((res, (child_end, child_depth))) = nested_node
+                            .find_in_nested_scored(
                                 &ancestors[next_idx..],
                                 dep_name,
                                 requested_spec,
-                            ) {
-                                return Some(res);
+                            )
+                        {
+                            let score = (next_idx + child_end, 1 + child_depth);
+                            if rule_best.is_none_or(|(_, s)| score > s) {
+                                rule_best = Some((res, score));
                             }
                         }
                     }
-                    if let Some(res) = nested_node.find_direct(dep_name, requested_spec) {
-                        return Some(res);
+                    if rule_best.is_none() {
+                        if let Some(res) = nested_node.find_direct(dep_name, requested_spec) {
+                            rule_best = Some((res, (0, 1)));
+                        }
+                    }
+                    if let Some((res, score)) = rule_best {
+                        if best.is_none_or(|(_, s)| score > s) {
+                            best = Some((res, score));
+                        }
                     }
                 }
             }
         }
 
-        None
+        best
     }
 }
 
@@ -930,16 +963,23 @@ impl Overrides {
 
         let mut matched: Option<&str> = None;
 
-        // 1. Check nested scoped overrides from closer parents outward so nearer parents
-        //    take precedence over outer ancestors.
+        // 1. Check nested scoped overrides, preferring the closest matched ancestor
+        //    and breaking ties in favor of deeper/more-specific ancestor chains.
         if !ancestors.is_empty() && fast.nested_target_names.contains(dep_name) {
-            for i in (0..ancestors.len()).rev() {
+            let mut best: Option<(&str, (usize, usize))> = None;
+            for i in 0..ancestors.len() {
                 let slice = &ancestors[i..];
-                if let Some(val) = fast.root_node.find_in_nested(slice, dep_name, requested_spec) {
-                    matched = Some(val);
-                    break;
+                if let Some((val, (end_offset, depth))) =
+                    fast.root_node
+                        .find_in_nested_scored(slice, dep_name, requested_spec)
+                {
+                    let score = (i + end_offset, depth);
+                    if best.is_none_or(|(_, best_score)| score > best_score) {
+                        best = Some((val, score));
+                    }
                 }
             }
+            matched = best.map(|(val, _)| val);
         }
 
         // 2. If no nested override matched (or matched nested map lacked "."),
