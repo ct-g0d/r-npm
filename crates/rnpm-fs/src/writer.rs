@@ -1,8 +1,8 @@
 use crate::error::FsError;
 use crate::tarball::{
-    fast_validate_and_strip_ascii, join_clean_rel, normalize_rel_path, strip_package_prefix,
-    unlink_target_path, validate_entry_path, validate_link_target, CountingReader,
-    ExtractionSummary, TarLimits,
+    fast_validate_and_strip_ascii, join_clean_rel, strip_package_prefix, unlink_target_path,
+    validate_entry_path, validate_link_target, CountingReader, ExtractionSummary,
+    PathCollisionTracker, TarLimits, TrackReject, TrackedKind,
 };
 use data_encoding::HEXLOWER;
 use flate2::read::GzDecoder;
@@ -1451,23 +1451,27 @@ fn materialize_one_item<T: MatItem>(
     prealloc_thresh: usize,
     _src_buf: &mut Vec<u16>,
     dst_buf: &mut Vec<u16>,
-) -> Result<(), FsError> {
+    record_stats: bool,
+) -> Result<(u64, u64), FsError> {
     let path = item.item_path();
     let data = item.item_data();
     let mode = item.item_mode();
+    #[cfg(windows)]
+    let mut dst_preencoded = false;
 
     if skip_existing_matching {
         #[cfg(windows)]
         {
             crate::path::encode_verbatim_wide(path, dst_buf);
+            dst_preencoded = true;
             if file_size_if_exists_wide(dst_buf) == Some(data.len() as u64) {
-                return Ok(());
+                return Ok((0, 0));
             }
         }
         #[cfg(not(windows))]
         if let Ok(meta) = std::fs::metadata(path) {
             if meta.len() == data.len() as u64 {
-                return Ok(());
+                return Ok((0, 0));
             }
         }
     }
@@ -1483,8 +1487,20 @@ fn materialize_one_item<T: MatItem>(
             // When the file payload is already mapped in memory, writing directly
             // avoids opening and reading a separate CAS file on disk.
             if !data.is_empty() {
-                return write_file_fast_buf(path, data, mode, prealloc_thresh, dst_buf, true)
-                    .map_err(FsError::Io);
+                #[cfg(windows)]
+                {
+                    if !dst_preencoded {
+                        crate::path::encode_verbatim_wide(path, dst_buf);
+                    }
+                    write_file_fast_wide(dst_buf, path, data, mode, prealloc_thresh, record_stats)
+                        .map_err(FsError::Io)?;
+                }
+                #[cfg(not(windows))]
+                {
+                    write_file_fast_buf(path, data, mode, prealloc_thresh, dst_buf, record_stats)
+                        .map_err(FsError::Io)?;
+                }
+                return Ok((1, data.len() as u64));
             }
             #[cfg(windows)]
             let copy_ok = copy_file_fast_buf(src, path, _src_buf, dst_buf).is_ok();
@@ -1501,13 +1517,28 @@ fn materialize_one_item<T: MatItem>(
                         );
                     }
                 }
-                crate::tarball::record_file_created(data.len() as u64);
-                return Ok(());
+                if record_stats {
+                    crate::tarball::record_file_created(data.len() as u64);
+                }
+                return Ok((1, data.len() as u64));
             }
         }
     }
 
-    write_file_fast_buf(path, data, mode, prealloc_thresh, dst_buf, true).map_err(FsError::Io)
+    #[cfg(windows)]
+    {
+        if !dst_preencoded {
+            crate::path::encode_verbatim_wide(path, dst_buf);
+        }
+        write_file_fast_wide(dst_buf, path, data, mode, prealloc_thresh, record_stats)
+            .map_err(FsError::Io)?;
+    }
+    #[cfg(not(windows))]
+    {
+        write_file_fast_buf(path, data, mode, prealloc_thresh, dst_buf, record_stats)
+            .map_err(FsError::Io)?;
+    }
+    Ok((1, data.len() as u64))
 }
 
 fn materialize_items_slice<T: MatItem>(
@@ -1519,26 +1550,40 @@ fn materialize_items_slice<T: MatItem>(
     }
 
     let prealloc_thresh = config.preallocate_threshold;
-    let num_threads = if config.is_hdd {
+    let total_files = items.len();
+    let mut num_threads = if config.is_hdd {
         config.worker_threads.clamp(1, 4)
     } else {
         config.worker_threads.clamp(1, 32)
     }
-    .min(items.len());
+    .min(total_files);
 
     if !config.is_hdd {
-        let total_files = items.len();
+        if total_files < 64 && num_threads > 12 {
+            let approx_bytes: usize = items.iter().map(|i| i.item_data().len()).sum();
+            if approx_bytes < 512 * 1024 {
+                num_threads = num_threads.min((total_files / 3).max(4)).min(12);
+            }
+        }
         if total_files == 1 || num_threads <= 1 {
             let mut src_buf = Vec::with_capacity(260);
             let mut dst_buf = Vec::with_capacity(260);
+            let mut batch_files = 0u64;
+            let mut batch_bytes = 0u64;
             for item in &items {
-                materialize_one_item(
+                let (cnt, bytes) = materialize_one_item(
                     item,
                     config.skip_existing_matching,
                     prealloc_thresh,
                     &mut src_buf,
                     &mut dst_buf,
+                    false,
                 )?;
+                batch_files += cnt;
+                batch_bytes += bytes;
+            }
+            if batch_files > 0 {
+                crate::tarball::record_files_created_batch(batch_files, batch_bytes);
             }
             return Ok(());
         }
@@ -1567,6 +1612,8 @@ fn materialize_items_slice<T: MatItem>(
         crate::pool::run_parallel(num_threads, &|| {
             let mut src_buf = Vec::with_capacity(260);
             let mut dst_buf = Vec::with_capacity(260);
+            let mut local_files = 0u64;
+            let mut local_bytes = 0u64;
 
             loop {
                 if has_err.load(Ordering::Relaxed) {
@@ -1578,21 +1625,37 @@ fn materialize_items_slice<T: MatItem>(
                 }
                 let end = (start + chunk_size).min(total_files);
                 for item in &items_slice[start..end] {
-                    if let Err(e) = materialize_one_item(
+                    match materialize_one_item(
                         item,
                         config.skip_existing_matching,
                         prealloc_thresh,
                         &mut src_buf,
                         &mut dst_buf,
+                        false,
                     ) {
-                        has_err.store(true, Ordering::Relaxed);
-                        let mut guard = first_err.lock().unwrap_or_else(|p| p.into_inner());
-                        if guard.is_none() {
-                            *guard = Some(e);
+                        Ok((cnt, bytes)) => {
+                            local_files += cnt;
+                            local_bytes += bytes;
                         }
-                        return;
+                        Err(e) => {
+                            if local_files > 0 {
+                                crate::tarball::record_files_created_batch(
+                                    local_files,
+                                    local_bytes,
+                                );
+                            }
+                            has_err.store(true, Ordering::Relaxed);
+                            let mut guard = first_err.lock().unwrap_or_else(|p| p.into_inner());
+                            if guard.is_none() {
+                                *guard = Some(e);
+                            }
+                            return;
+                        }
                     }
                 }
+            }
+            if local_files > 0 {
+                crate::tarball::record_files_created_batch(local_files, local_bytes);
             }
         });
 
@@ -1639,6 +1702,8 @@ fn materialize_items_slice<T: MatItem>(
         crate::pool::run_parallel(num_threads, &|| {
             let mut src_buf = Vec::with_capacity(260);
             let mut dst_buf = Vec::with_capacity(260);
+            let mut local_files = 0u64;
+            let mut local_bytes = 0u64;
             loop {
                 if has_err.load(Ordering::Relaxed) {
                     break;
@@ -1648,21 +1713,37 @@ fn materialize_items_slice<T: MatItem>(
                     break;
                 }
                 for item in &batches_slice[idx] {
-                    if let Err(e) = materialize_one_item(
+                    match materialize_one_item(
                         item,
                         config.skip_existing_matching,
                         prealloc_thresh,
                         &mut src_buf,
                         &mut dst_buf,
+                        false,
                     ) {
-                        has_err.store(true, Ordering::Relaxed);
-                        let mut guard = first_err.lock().unwrap_or_else(|p| p.into_inner());
-                        if guard.is_none() {
-                            *guard = Some(e);
+                        Ok((cnt, bytes)) => {
+                            local_files += cnt;
+                            local_bytes += bytes;
                         }
-                        return;
+                        Err(e) => {
+                            if local_files > 0 {
+                                crate::tarball::record_files_created_batch(
+                                    local_files,
+                                    local_bytes,
+                                );
+                            }
+                            has_err.store(true, Ordering::Relaxed);
+                            let mut guard = first_err.lock().unwrap_or_else(|p| p.into_inner());
+                            if guard.is_none() {
+                                *guard = Some(e);
+                            }
+                            return;
+                        }
                     }
                 }
+            }
+            if local_files > 0 {
+                crate::tarball::record_files_created_batch(local_files, local_bytes);
             }
         });
 
@@ -1705,6 +1786,21 @@ pub struct DecodedTarball {
     pub inflate_duration: std::time::Duration,
 }
 
+enum TarPayloadReader<R: Read> {
+    Plain(std::io::BufReader<CountingReader<R>>),
+    Gzip(Box<std::io::BufReader<GzDecoder<std::io::BufReader<CountingReader<R>>>>>),
+}
+
+impl<R: Read> Read for TarPayloadReader<R> {
+    #[inline]
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            Self::Plain(r) => r.read(buf),
+            Self::Gzip(r) => r.read(buf),
+        }
+    }
+}
+
 /// Decodes a tarball into structured files and directories while validating all security constraints:
 /// path traversal, SUID/SGID bits, invalid UTF-8, reserved Windows device names, tar bombs,
 /// and case collisions.
@@ -1717,17 +1813,24 @@ pub fn decode_tar_entries<R: Read>(
     let limits = limits.unwrap_or_default();
     let verbatim_dest = crate::path::to_verbatim_path(destination);
     let clean_dest = clean(&verbatim_dest);
+    let is_fresh_dest = match std::fs::read_dir(&verbatim_dest) {
+        Ok(mut it) => it.next().is_none(),
+        Err(_) => true,
+    };
 
     let counting_reader = CountingReader::new(reader);
     let compressed_counter = counting_reader.counter();
-    let mut buffered = std::io::BufReader::with_capacity(64 * 1024, counting_reader);
+    let mut buffered = std::io::BufReader::with_capacity(16 * 1024, counting_reader);
     let gzipped = std::io::BufRead::fill_buf(&mut buffered)
         .map_err(FsError::Io)?
         .starts_with(&[0x1f, 0x8b]);
-    let payload: Box<dyn Read + '_> = if gzipped {
-        Box::new(GzDecoder::new(buffered))
+    let payload = if gzipped {
+        TarPayloadReader::Gzip(Box::new(std::io::BufReader::with_capacity(
+            16 * 1024,
+            GzDecoder::new(buffered),
+        )))
     } else {
-        Box::new(buffered)
+        TarPayloadReader::Plain(buffered)
     };
     let mut archive = Archive::new(payload);
 
@@ -1737,20 +1840,16 @@ pub fn decode_tar_entries<R: Read>(
     let mut directory_count = 0usize;
     let mut symlink_count = 0usize;
 
-    let mut seen_paths: HashMap<String, String> = HashMap::new();
-    let mut seen_dirs_lower: HashSet<String> = HashSet::new();
-    let mut seen_files_lower: HashSet<String> = HashSet::new();
-    let mut symlink_paths: HashSet<PathBuf> = HashSet::new();
-    let mut extracted_regular_files: HashSet<PathBuf> = HashSet::new();
+    let mut tracker = PathCollisionTracker::with_capacity(32);
     let mut hardlink_targets: HashMap<PathBuf, PathBuf> = HashMap::new();
     let mut safe_ancestors = HashSet::new();
+    let empty_symlinks = HashSet::new();
 
     let mut directories = Vec::new();
-    let mut files: Vec<Option<MaterializeFile>> = Vec::new();
-    let mut file_indices: HashMap<String, usize> = HashMap::new();
+    let mut files: Vec<Option<MaterializeFile>> = Vec::with_capacity(32);
     let mut symlinks = Vec::new();
     let mut hardlinks = Vec::new();
-    let mut saw_npmignores: HashSet<PathBuf> = HashSet::new();
+    let mut saw_npmignores: HashSet<String> = HashSet::new();
 
     let entries = archive.entries().map_err(FsError::Io)?;
 
@@ -1822,7 +1921,9 @@ pub fn decode_tar_entries<R: Read>(
             Ok(Some((rel, depth))) => {
                 if entry_type.is_file() {
                     if rel == ".npmignore" || rel.ends_with("/.npmignore") {
-                        saw_npmignores.insert(PathBuf::from(&rel));
+                        if !saw_npmignores.contains(&rel) {
+                            saw_npmignores.insert(rel.clone());
+                        }
                         Some((rel, depth))
                     } else if rel == ".gitignore" || rel.ends_with("/.gitignore") {
                         let rewritten = if rel.len() == ".gitignore".len() {
@@ -1830,7 +1931,7 @@ pub fn decode_tar_entries<R: Read>(
                         } else {
                             format!("{}/.npmignore", &rel[..rel.len() - "/.gitignore".len()])
                         };
-                        if saw_npmignores.contains(Path::new(&rewritten)) {
+                        if saw_npmignores.contains(&rewritten) {
                             continue;
                         }
                         Some((rewritten, depth))
@@ -1844,11 +1945,10 @@ pub fn decode_tar_entries<R: Read>(
             Err(()) => None,
         };
 
-        let (relative_path, target_path, norm_exact, path_depth, _is_ascii_clean) =
+        let (mut relative_path_opt, target_path, norm_exact, path_depth) =
             if let Some((rel_str, depth)) = fast_ascii {
                 let target_path = join_clean_rel(&clean_dest, &rel_str);
-                let relative_path = PathBuf::from(&rel_str);
-                (relative_path, target_path, rel_str, depth, true)
+                (None, target_path, rel_str, depth)
             } else {
                 let path_bytes = entry.path_bytes();
                 let raw_path = match entry.path() {
@@ -1881,11 +1981,13 @@ pub fn decode_tar_entries<R: Read>(
                 // unless a .npmignore file is already present.
                 if entry_type.is_file() {
                     if relative_path.file_name() == Some(std::ffi::OsStr::new(".npmignore")) {
-                        saw_npmignores.insert(relative_path.clone());
+                        let s = relative_path.to_string_lossy().replace('\\', "/");
+                        saw_npmignores.insert(s);
                     } else if relative_path.file_name() == Some(std::ffi::OsStr::new(".gitignore"))
                     {
                         let ni = relative_path.with_file_name(".npmignore");
-                        if saw_npmignores.contains(&ni) {
+                        let ni_str = ni.to_string_lossy().replace('\\', "/");
+                        if saw_npmignores.contains(&ni_str) {
                             continue;
                         }
                         relative_path = ni;
@@ -1910,8 +2012,12 @@ pub fn decode_tar_entries<R: Read>(
                         norm_exact.push_str(&s.to_string_lossy());
                     }
                 }
-                (relative_path, target_path, norm_exact, path_depth, false)
+                (Some(relative_path), target_path, norm_exact, path_depth)
             };
+
+        let get_rel_path = |opt: &mut Option<PathBuf>, norm: &str| -> PathBuf {
+            opt.get_or_insert_with(|| PathBuf::from(norm)).clone()
+        };
 
         if path_depth > limits.max_path_depth {
             return Err(FsError::TarBombLimitExceeded {
@@ -1920,7 +2026,7 @@ pub fn decode_tar_entries<R: Read>(
                     "Path depth {} exceeded maximum allowed path depth of {}: '{}'",
                     path_depth,
                     limits.max_path_depth,
-                    relative_path.display()
+                    get_rel_path(&mut relative_path_opt, &norm_exact).display()
                 ),
             });
         }
@@ -1942,89 +2048,57 @@ pub fn decode_tar_entries<R: Read>(
             || entry_type.is_character_special()
             || entry_type.is_fifo()
         {
-            return Err(FsError::ForbiddenSpecialEntry { path: relative_path });
+            return Err(FsError::ForbiddenSpecialEntry {
+                path: get_rel_path(&mut relative_path_opt, &norm_exact),
+            });
         }
 
         if !target_path.starts_with(&clean_dest) {
             return Err(FsError::PathTraversal {
-                path: relative_path.clone(),
+                path: get_rel_path(&mut relative_path_opt, &norm_exact),
             });
         }
         if target_path == clean_dest && !entry_type.is_dir() {
             return Err(FsError::PathTraversal {
-                path: relative_path.clone(),
+                path: get_rel_path(&mut relative_path_opt, &norm_exact),
             });
         }
 
-        crate::tarball::ensure_no_symlink_ancestors_with_cache(
-            &target_path,
-            &verbatim_dest,
-            &symlink_paths,
-            &relative_path,
-            Some(&mut safe_ancestors),
-        )?;
+        if !is_fresh_dest {
+            let rel_for_check = get_rel_path(&mut relative_path_opt, &norm_exact);
+            crate::tarball::ensure_no_symlink_ancestors_with_cache(
+                &target_path,
+                &verbatim_dest,
+                &empty_symlinks,
+                &rel_for_check,
+                Some(&mut safe_ancestors),
+            )?;
+        }
 
         if norm_exact.is_empty() {
             continue;
         }
-        let norm_lower = if norm_exact.bytes().any(|b| b.is_ascii_uppercase()) {
-            norm_exact.to_ascii_lowercase()
+
+        let tracked_kind = if entry_type.is_dir() {
+            TrackedKind::Dir
+        } else if entry_type.is_symlink() {
+            TrackedKind::Symlink
         } else {
-            norm_exact.clone()
+            TrackedKind::File
         };
 
-        if let Some(existing_exact) = seen_paths.get(&norm_lower) {
-            if existing_exact != &norm_exact {
-                return Err(FsError::CaseCollision {
-                    path: relative_path.clone(),
-                });
-            }
-        }
-
-        if entry_type.is_dir() {
-            if seen_files_lower.contains(&norm_lower) {
-                return Err(FsError::CaseCollision {
-                    path: relative_path.clone(),
-                });
-            }
-            if seen_dirs_lower.insert(norm_lower.clone()) {
-                let mut end = norm_lower.len();
-                while let Some(pos) = norm_lower[..end].rfind('/') {
-                    let prefix = &norm_lower[..pos];
-                    if seen_files_lower.contains(prefix) {
-                        return Err(FsError::CaseCollision {
-                            path: relative_path.clone(),
-                        });
-                    }
-                    if !seen_dirs_lower.insert(prefix.to_string()) {
-                        break;
-                    }
-                    end = pos;
-                }
-            }
-        } else {
-            if seen_dirs_lower.contains(&norm_lower) {
-                return Err(FsError::CaseCollision {
-                    path: relative_path.clone(),
-                });
-            }
-            seen_files_lower.insert(norm_lower.clone());
-            let mut end = norm_lower.len();
-            while let Some(pos) = norm_lower[..end].rfind('/') {
-                let prefix = &norm_lower[..pos];
-                if seen_files_lower.contains(prefix) {
-                    return Err(FsError::CaseCollision {
-                        path: relative_path.clone(),
-                    });
-                }
-                if !seen_dirs_lower.insert(prefix.to_string()) {
-                    break;
-                }
-                end = pos;
-            }
-        }
-
-        let was_seen = seen_paths.insert(norm_lower, norm_exact.clone()).is_some();
+        let (was_seen, prev_file_idx) =
+            tracker
+                .record(&norm_exact, tracked_kind)
+                .map_err(|rej| match rej {
+                    TrackReject::CaseCollision => FsError::CaseCollision {
+                        path: get_rel_path(&mut relative_path_opt, &norm_exact),
+                    },
+                    TrackReject::SymlinkAncestor(anc) => FsError::EscapingSymlink {
+                        link: PathBuf::from(anc),
+                        target: get_rel_path(&mut relative_path_opt, &norm_exact),
+                    },
+                })?;
 
         if entry_type.is_symlink() || entry_type.is_hard_link() {
             symlink_count += 1;
@@ -2052,6 +2126,7 @@ pub fn decode_tar_entries<R: Read>(
             }
 
             if let Some(link_target) = entry.link_name().map_err(FsError::Io)? {
+                let relative_path = get_rel_path(&mut relative_path_opt, &norm_exact);
                 // Symlink targets are relative to the link's parent. Only tar
                 // hardlink targets are relative to the archive root.
                 let normalized_target = if entry_type.is_hard_link() {
@@ -2063,18 +2138,16 @@ pub fn decode_tar_entries<R: Read>(
                 if entry_type.is_symlink() {
                     let cleaned_rel =
                         validate_link_target(&relative_path, &normalized_target, destination)?;
-                    extracted_regular_files.remove(&relative_path);
-                    extracted_regular_files.remove(&normalize_rel_path(&relative_path));
-                    symlink_paths.insert(relative_path.clone());
-                    symlink_paths.insert(normalize_rel_path(&relative_path));
-                    if let Some(prev_idx) = file_indices.remove(&norm_exact) {
+                    if let Some(prev_idx) = prev_file_idx {
                         files[prev_idx] = None;
                     }
-                    if !symlinks.is_empty() {
-                        symlinks.retain(|(p, _)| p != &target_path);
-                    }
-                    if !hardlinks.is_empty() {
-                        hardlinks.retain(|(p, _)| p != &target_path);
+                    if was_seen {
+                        if !symlinks.is_empty() {
+                            symlinks.retain(|(p, _)| p != &target_path);
+                        }
+                        if !hardlinks.is_empty() {
+                            hardlinks.retain(|(p, _)| p != &target_path);
+                        }
                     }
                     symlinks.push((target_path, cleaned_rel));
                 } else if entry_type.is_hard_link() {
@@ -2104,7 +2177,6 @@ pub fn decode_tar_entries<R: Read>(
                         });
                     }
 
-                    let norm_cleaned = normalize_rel_path(&cleaned_target);
                     if cleaned_target == relative_path {
                         return Err(FsError::CircularHardlink {
                             link: relative_path.clone(),
@@ -2124,26 +2196,31 @@ pub fn decode_tar_entries<R: Read>(
                         curr = next.clone();
                     }
 
-                    if !extracted_regular_files.contains(&cleaned_target)
-                        && !extracted_regular_files.contains(&norm_cleaned)
+                    let target_norm = cleaned_target.to_string_lossy();
+                    let target_norm_slash: std::borrow::Cow<'_, str> = if target_norm.contains('\\')
                     {
+                        std::borrow::Cow::Owned(target_norm.replace('\\', "/"))
+                    } else {
+                        target_norm
+                    };
+                    if !tracker.is_regular_file(&target_norm_slash) {
                         return Err(FsError::DanglingHardlink {
                             link: relative_path.clone(),
                             target: normalized_target,
                         });
                     }
 
-                    hardlink_targets.insert(relative_path.clone(), cleaned_target);
-                    extracted_regular_files.insert(relative_path.clone());
-                    extracted_regular_files.insert(normalize_rel_path(&relative_path));
-                    if let Some(prev_idx) = file_indices.remove(&norm_exact) {
+                    hardlink_targets.insert(relative_path, cleaned_target);
+                    if let Some(prev_idx) = prev_file_idx {
                         files[prev_idx] = None;
                     }
-                    if !symlinks.is_empty() {
-                        symlinks.retain(|(p, _)| p != &target_path);
-                    }
-                    if !hardlinks.is_empty() {
-                        hardlinks.retain(|(p, _)| p != &target_path);
+                    if was_seen {
+                        if !symlinks.is_empty() {
+                            symlinks.retain(|(p, _)| p != &target_path);
+                        }
+                        if !hardlinks.is_empty() {
+                            hardlinks.retain(|(p, _)| p != &target_path);
+                        }
                     }
                     hardlinks.push((target_path, source_full));
                 }
@@ -2154,26 +2231,24 @@ pub fn decode_tar_entries<R: Read>(
         if entry_type.is_dir() {
             directories.push(target_path);
         } else if entry_type.is_file() {
-            let header_size = entry.header().size().ok();
-            if let Some(entry_size) = header_size {
-                if entry_size > limits.max_single_entry_size {
-                    return Err(FsError::TarBombLimitExceeded {
-                        limit_type: "entry size".to_string(),
-                        detail: format!(
-                            "Entry size {} exceeded single file limit of {} bytes",
-                            entry_size, limits.max_single_entry_size
-                        ),
-                    });
-                }
-                if total_uncompressed.saturating_add(entry_size) > limits.max_uncompressed_size {
-                    return Err(FsError::TarBombLimitExceeded {
-                        limit_type: "uncompressed size".to_string(),
-                        detail: format!(
-                            "Projected uncompressed size exceeds limit of {} bytes",
-                            limits.max_uncompressed_size
-                        ),
-                    });
-                }
+            let entry_size = entry.size();
+            if entry_size > limits.max_single_entry_size {
+                return Err(FsError::TarBombLimitExceeded {
+                    limit_type: "entry size".to_string(),
+                    detail: format!(
+                        "Entry size {} exceeded single file limit of {} bytes",
+                        entry_size, limits.max_single_entry_size
+                    ),
+                });
+            }
+            if total_uncompressed.saturating_add(entry_size) > limits.max_uncompressed_size {
+                return Err(FsError::TarBombLimitExceeded {
+                    limit_type: "uncompressed size".to_string(),
+                    detail: format!(
+                        "Projected uncompressed size exceeds limit of {} bytes",
+                        limits.max_uncompressed_size
+                    ),
+                });
             }
 
             let file_mode = entry
@@ -2181,9 +2256,20 @@ pub fn decode_tar_entries<R: Read>(
                 .mode()
                 .unwrap_or(crate::tarball::NPM_DEFAULT_FILE_MODE);
             let t_read = std::time::Instant::now();
-            let initial_cap = header_size.unwrap_or(0).min(4 * 1024 * 1024) as usize;
-            let mut file_buf = Vec::with_capacity(initial_cap);
-            entry.read_to_end(&mut file_buf).map_err(FsError::Io)?;
+            let file_buf = match entry_size {
+                0 => Vec::new(),
+                sz if sz <= 4 * 1024 * 1024 => {
+                    let mut buf = vec![0u8; sz as usize];
+                    entry.read_exact(&mut buf).map_err(FsError::Io)?;
+                    buf
+                }
+                _ => {
+                    let initial_cap = entry_size.min(4 * 1024 * 1024) as usize;
+                    let mut buf = Vec::with_capacity(initial_cap);
+                    entry.read_to_end(&mut buf).map_err(FsError::Io)?;
+                    buf
+                }
+            };
             inflate_nanos += t_read.elapsed().as_nanos() as u64;
 
             total_uncompressed += file_buf.len() as u64;
@@ -2216,28 +2302,11 @@ pub fn decode_tar_entries<R: Read>(
             }
 
             if was_seen {
-                if !symlink_paths.is_empty() {
-                    symlink_paths.remove(&relative_path);
-                    symlink_paths.remove(&normalize_rel_path(&relative_path));
-                }
                 if !symlinks.is_empty() {
                     symlinks.retain(|(p, _)| p != &target_path);
                 }
                 if !hardlinks.is_empty() {
                     hardlinks.retain(|(p, _)| p != &target_path);
-                }
-            }
-            if !was_seen {
-                if _is_ascii_clean || !cfg!(windows) {
-                    extracted_regular_files.insert(relative_path);
-                } else {
-                    extracted_regular_files.insert(relative_path.clone());
-                    extracted_regular_files.insert(normalize_rel_path(&relative_path));
-                }
-            } else {
-                extracted_regular_files.insert(relative_path.clone());
-                if cfg!(windows) && !_is_ascii_clean {
-                    extracted_regular_files.insert(normalize_rel_path(&relative_path));
                 }
             }
 
@@ -2248,15 +2317,13 @@ pub fn decode_tar_entries<R: Read>(
                 package_id: package_id.clone(),
             };
 
-            // Deduplicate: later entry in tarball wins (keyed on case-preserved normalized path)
-            match file_indices.entry(norm_exact) {
-                std::collections::hash_map::Entry::Occupied(occ) => {
-                    files[*occ.get()] = Some(mat_file);
-                }
-                std::collections::hash_map::Entry::Vacant(vac) => {
-                    vac.insert(files.len());
-                    files.push(Some(mat_file));
-                }
+            // Deduplicate: later entry in tarball wins (keyed on exact path inside tracker)
+            if let Some(prev_idx) = prev_file_idx {
+                files[prev_idx] = Some(mat_file);
+            } else {
+                let idx = files.len();
+                files.push(Some(mat_file));
+                tracker.set_file_idx(&norm_exact, idx);
             }
         }
     }
@@ -2292,6 +2359,67 @@ pub fn decode_tar_entries<R: Read>(
     })
 }
 
+fn apply_decoded_links(
+    destination: &Path,
+    symlinks: &[(PathBuf, PathBuf)],
+    hardlinks: &[(PathBuf, PathBuf)],
+) {
+    #[cfg(unix)]
+    let clean_dest = clean(crate::path::to_verbatim_path(destination));
+
+    for (link_path, target_rel) in symlinks {
+        unlink_target_path(link_path);
+        if let Some(parent) = link_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        #[cfg(windows)]
+        {
+            let target_full = crate::path::to_verbatim_path(destination).join(target_rel);
+            if target_full.is_dir() {
+                let _ = crate::junction::create_junction(link_path, &target_full);
+            } else if target_full.is_file() {
+                let _ = std::fs::copy(&target_full, link_path);
+            }
+        }
+        #[cfg(unix)]
+        {
+            let rel_target = if let Ok(rel_link) = link_path.strip_prefix(&clean_dest) {
+                let depth = rel_link
+                    .parent()
+                    .map(|p| {
+                        p.components()
+                            .filter(|c| matches!(c, std::path::Component::Normal(_)))
+                            .count()
+                    })
+                    .unwrap_or(0);
+                if depth == 0 {
+                    target_rel.clone()
+                } else {
+                    let mut p = PathBuf::new();
+                    for _ in 0..depth {
+                        p.push("..");
+                    }
+                    p.push(target_rel);
+                    p
+                }
+            } else {
+                target_rel.clone()
+            };
+            let _ = std::os::unix::fs::symlink(&rel_target, link_path);
+        }
+    }
+
+    for (link_path, source_full) in hardlinks {
+        unlink_target_path(link_path);
+        if let Some(parent) = link_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if std::fs::hard_link(source_full, link_path).is_err() && source_full.is_file() {
+            let _ = std::fs::copy(source_full, link_path);
+        }
+    }
+}
+
 /// Extracts a package tarball directly into place using the native Windows parallel writer:
 /// 1. Decodes tarball in memory with full security and ratio validations
 /// 2. Pre-creates all directories in breadth-first order (CreateDirectoryW), eliminating redundant exists() calls
@@ -2305,12 +2433,6 @@ pub fn extract_tarball_direct<R: Read>(
     limits: Option<TarLimits>,
     config: Option<&ParallelWriterConfig>,
 ) -> Result<ExtractionSummary, FsError> {
-    let pkg_id = destination
-        .file_name()
-        .map(|s| s.to_string_lossy().to_string());
-    let decoded = decode_tar_entries(reader, destination, limits, pkg_id)?;
-    let inflate_dur = decoded.inflate_duration;
-
     let default_cfg;
     let cfg = match config {
         Some(c) => c,
@@ -2320,10 +2442,21 @@ pub fn extract_tarball_direct<R: Read>(
         }
     };
 
+    let pkg_id = if cfg.is_hdd {
+        destination
+            .file_name()
+            .map(|s| s.to_string_lossy().to_string())
+    } else {
+        None
+    };
+    let decoded = decode_tar_entries(reader, destination, limits, pkg_id)?;
+    let inflate_dur = decoded.inflate_duration;
+
     let t_mat = std::time::Instant::now();
 
     // 1. Directory pre-creation with pre-deduplication to avoid redundant allocations and syscalls
-    let mut unique_dirs: std::collections::HashSet<&Path> = std::collections::HashSet::new();
+    let mut unique_dirs: std::collections::HashSet<&Path> =
+        std::collections::HashSet::with_capacity(decoded.directories.len() + 8);
     unique_dirs.insert(destination);
     for d in &decoded.directories {
         unique_dirs.insert(d.as_path());
@@ -2339,31 +2472,8 @@ pub fn extract_tarball_direct<R: Read>(
     // 2. Parallel file materialization
     materialize_files_parallel(decoded.files, cfg)?;
 
-    // 3. Symlinks
-    for (link_path, target_rel) in decoded.symlinks {
-        unlink_target_path(&link_path);
-        #[cfg(windows)]
-        {
-            let target_full = destination.join(&target_rel);
-            if target_full.is_dir() {
-                let _ = crate::junction::create_junction(&link_path, &target_full);
-            } else if target_full.is_file() {
-                let _ = std::fs::copy(&target_full, &link_path);
-            }
-        }
-        #[cfg(unix)]
-        {
-            let _ = std::os::unix::fs::symlink(&target_rel, &link_path);
-        }
-    }
-
-    // 4. Hardlinks
-    for (link_path, source_full) in decoded.hardlinks {
-        unlink_target_path(&link_path);
-        if std::fs::hard_link(&source_full, &link_path).is_err() && source_full.is_file() {
-            let _ = std::fs::copy(&source_full, &link_path);
-        }
-    }
+    // 3. Symlinks and hardlinks
+    apply_decoded_links(destination, &decoded.symlinks, &decoded.hardlinks);
 
     let mat_dur = t_mat.elapsed();
 
@@ -2405,16 +2515,18 @@ pub fn extract_packages_direct_parallel<R: Read + Send>(
         }
     };
 
+    let item_dests: Vec<PathBuf> = items.iter().map(|i| i.destination.clone()).collect();
+
     let mut decoded_results: Vec<Result<DecodedTarball, FsError>> = if num_items == 1 {
         items
             .into_iter()
             .map(|item| {
-                decode_tar_entries(
-                    item.reader,
-                    &item.destination,
-                    item.limits,
-                    Some(item.package_id),
-                )
+                let pkg_id = if cfg.is_hdd {
+                    Some(item.package_id)
+                } else {
+                    None
+                };
+                decode_tar_entries(item.reader, &item.destination, item.limits, pkg_id)
             })
             .collect()
     } else {
@@ -2435,6 +2547,7 @@ pub fn extract_packages_direct_parallel<R: Read + Send>(
             .map(|_| DisjointSlot(std::cell::UnsafeCell::new(None)))
             .collect();
         let next_idx = AtomicUsize::new(0);
+        let need_pkg_id = cfg.is_hdd;
 
         crate::pool::run_parallel(decode_threads, &|| {
             loop {
@@ -2445,12 +2558,13 @@ pub fn extract_packages_direct_parallel<R: Read + Send>(
                 // SAFETY: `fetch_add` assigns each `idx < num_items` to at most one worker.
                 let item = unsafe { (*inputs[idx].0.get()).take() };
                 let Some(item) = item else { continue };
-                let decoded = decode_tar_entries(
-                    item.reader,
-                    &item.destination,
-                    item.limits,
-                    Some(item.package_id),
-                );
+                let pkg_id = if need_pkg_id {
+                    Some(item.package_id)
+                } else {
+                    None
+                };
+                let decoded =
+                    decode_tar_entries(item.reader, &item.destination, item.limits, pkg_id);
                 // SAFETY: Each `idx < num_items` is claimed by at most one worker via `next_idx.fetch_add(1)`,
                 // and `run_parallel` synchronizes all helpers before `results` is consumed.
                 unsafe {
@@ -2487,9 +2601,12 @@ pub fn extract_packages_direct_parallel<R: Read + Send>(
     let mut unique_dirs: std::collections::HashSet<&Path> =
         std::collections::HashSet::with_capacity(total_dirs_count);
     unique_dirs.insert(root_destination);
-    for decoded in decoded_results.iter().flatten() {
-        for d in &decoded.directories {
-            unique_dirs.insert(d.as_path());
+    for (idx, res) in decoded_results.iter().enumerate() {
+        if let Ok(decoded) = res {
+            unique_dirs.insert(item_dests[idx].as_path());
+            for d in &decoded.directories {
+                unique_dirs.insert(d.as_path());
+            }
         }
     }
     for f in &all_files {
@@ -2519,34 +2636,10 @@ pub fn extract_packages_direct_parallel<R: Read + Send>(
     // Apply symlinks and hardlinks for each package
     decoded_results
         .into_iter()
-        .map(|res| {
+        .zip(item_dests)
+        .map(|(res, dest)| {
             res.map(|decoded| {
-                for (link_path, target_rel) in &decoded.symlinks {
-                    unlink_target_path(link_path);
-                    #[cfg(windows)]
-                    {
-                        let target_full = link_path
-                            .parent()
-                            .unwrap_or(Path::new("."))
-                            .join(target_rel);
-                        if target_full.is_dir() {
-                            let _ = crate::junction::create_junction(link_path, &target_full);
-                        } else if target_full.is_file() {
-                            let _ = std::fs::copy(&target_full, link_path);
-                        }
-                    }
-                    #[cfg(unix)]
-                    {
-                        let _ = std::os::unix::fs::symlink(target_rel, link_path);
-                    }
-                }
-                for (link_path, source_full) in &decoded.hardlinks {
-                    unlink_target_path(link_path);
-                    if std::fs::hard_link(source_full, link_path).is_err() && source_full.is_file()
-                    {
-                        let _ = std::fs::copy(source_full, link_path);
-                    }
-                }
+                apply_decoded_links(&dest, &decoded.symlinks, &decoded.hardlinks);
                 ExtractionSummary {
                     entries_extracted: decoded.entry_count,
                     total_uncompressed_bytes: decoded.total_uncompressed_bytes,

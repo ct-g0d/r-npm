@@ -696,8 +696,10 @@ pub fn execute_prune(project_dir: &Path, extraneous: &[ExtraneousPackage]) -> Re
 
     // Remove extraneous packages (already ordered deepest first)
     for pkg in extraneous {
+        let meta_opt = std::fs::symlink_metadata(&pkg.full_path).ok();
         let is_junc = is_junction(&pkg.full_path).unwrap_or(false);
-        if pkg.full_path.exists() || is_junc {
+        let is_symlink = meta_opt.as_ref().is_some_and(|m| m.file_type().is_symlink());
+        if meta_opt.is_some() || is_junc {
             info!("Pruning package {}", pkg.path);
             // Remove binary shims from enclosing .bin if package had bin entries
             let pkg_manifest = pkg.full_path.join("package.json");
@@ -733,9 +735,20 @@ pub fn execute_prune(project_dir: &Path, extraneous: &[ExtraneousPackage]) -> Re
                 }
             }
 
-            // Remove junction or directory safely with fast background trash deletion
+            // Remove junction, symlink, or directory safely with fast background trash deletion
             let removed = if is_junc {
                 remove_junction(&pkg.full_path).is_ok()
+            } else if is_symlink {
+                #[cfg(windows)]
+                {
+                    std::fs::remove_dir(&pkg.full_path)
+                        .or_else(|_| std::fs::remove_file(&pkg.full_path))
+                        .is_ok()
+                }
+                #[cfg(not(windows))]
+                {
+                    std::fs::remove_file(&pkg.full_path).is_ok()
+                }
             } else if pkg.full_path.is_dir() {
                 let nm_dir = project_dir.join("node_modules");
                 crate::trash::fast_trash_delete(&pkg.full_path, &nm_dir).is_ok()
@@ -744,7 +757,10 @@ pub fn execute_prune(project_dir: &Path, extraneous: &[ExtraneousPackage]) -> Re
                 std::fs::remove_file(&pkg.full_path).is_ok()
             };
 
-            if removed || !pkg.full_path.exists() {
+            if removed
+                || (std::fs::symlink_metadata(&pkg.full_path).is_err()
+                    && !is_junction(&pkg.full_path).unwrap_or(false))
+            {
                 removed_packages.push(pkg.path.clone());
             }
 
@@ -1129,5 +1145,30 @@ mod tests {
             external_scoped_dep.join("package.json").exists(),
             "Scoped junction target's nested dependency must stay intact"
         );
+    }
+
+    #[test]
+    fn test_prune_removes_dangling_extraneous_junction() {
+        let tmp = tempdir().unwrap();
+        let root = tmp.path();
+        fs::write(
+            root.join("package.json"),
+            r#"{"name": "dangling-prune", "version": "1.0.0"}"#,
+        )
+        .unwrap();
+
+        let target = root.join("deleted-target");
+        fs::create_dir_all(&target).unwrap();
+        let nm = root.join("node_modules");
+        fs::create_dir_all(&nm).unwrap();
+        let dangling = nm.join("ghost-link");
+        rnpm_fs::create_junction(&dangling, &target).unwrap();
+        fs::remove_dir_all(&target).unwrap();
+
+        let analysis = discover_extraneous_packages(root, &PruneOptions::default()).unwrap();
+        assert!(analysis.extraneous_paths().contains(&"node_modules/ghost-link".to_string()));
+        let summary = execute_prune(root, &analysis.extraneous_packages).unwrap();
+        assert!(summary.removed_packages.contains(&"node_modules/ghost-link".to_string()));
+        assert!(fs::symlink_metadata(&dangling).is_err());
     }
 }

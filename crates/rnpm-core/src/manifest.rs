@@ -1176,7 +1176,9 @@ struct FastManifestScanner<'a> {
 impl<'a> FastManifestScanner<'a> {
     #[inline]
     fn skip_ws(&mut self) {
-        while let Some(&b) = self.bytes.get(self.pos) {
+        let len = self.bytes.len();
+        while self.pos < len {
+            let b = self.bytes[self.pos];
             if matches!(b, b' ' | b'\n' | b'\r' | b'\t') {
                 self.pos += 1;
             } else {
@@ -1253,23 +1255,35 @@ impl<'a> FastManifestScanner<'a> {
     }
 
     #[inline]
-    fn read_string_vec(&mut self) -> Option<Vec<String>> {
+    fn read_string_vec_with_raw<const CAPTURE_RAW: bool>(
+        &mut self,
+    ) -> Option<(Vec<String>, Option<crate::ordered_json::OrderedJsonValue>)> {
+        use crate::ordered_json::OrderedJsonValue;
         self.expect_byte(b'[')?;
-        let mut out = Vec::new();
+        let mut out = Vec::with_capacity(4);
+        let mut raw = if CAPTURE_RAW {
+            Some(Vec::with_capacity(4))
+        } else {
+            None
+        };
         if self.peek()? == b']' {
             self.pos += 1;
-            return Some(out);
+            return Some((out, raw.map(OrderedJsonValue::Array)));
         }
         loop {
             let s = self.read_plain_str()?;
-            out.push(s.to_owned());
+            let s_owned = s.to_owned();
+            if let Some(ref mut rvec) = raw {
+                rvec.push(OrderedJsonValue::String(s_owned.clone()));
+            }
+            out.push(s_owned);
             match self.peek()? {
                 b',' => {
                     self.pos += 1;
                 }
                 b']' => {
                     self.pos += 1;
-                    return Some(out);
+                    return Some((out, raw.map(OrderedJsonValue::Array)));
                 }
                 _ => return None,
             }
@@ -1277,25 +1291,41 @@ impl<'a> FastManifestScanner<'a> {
     }
 
     #[inline]
-    fn read_string_btree(&mut self) -> Option<BTreeMap<String, String>> {
+    fn read_string_btree_with_raw<const CAPTURE_RAW: bool>(
+        &mut self,
+    ) -> Option<(
+        BTreeMap<String, String>,
+        Option<crate::ordered_json::OrderedJsonValue>,
+    )> {
+        use crate::ordered_json::{OrderedJsonMap, OrderedJsonValue};
         self.expect_byte(b'{')?;
         let mut map = BTreeMap::new();
+        let mut raw_map = if CAPTURE_RAW {
+            Some(OrderedJsonMap::with_capacity(4))
+        } else {
+            None
+        };
         if self.peek()? == b'}' {
             self.pos += 1;
-            return Some(map);
+            return Some((map, raw_map.map(OrderedJsonValue::Object)));
         }
         loop {
             let k = self.read_plain_str()?;
             self.expect_byte(b':')?;
             let v = self.read_plain_str()?;
-            map.insert(k.to_owned(), v.to_owned());
+            let k_owned = k.to_owned();
+            let v_owned = v.to_owned();
+            if let Some(ref mut rmap) = raw_map {
+                rmap.insert(k_owned.clone(), OrderedJsonValue::String(v_owned.clone()));
+            }
+            map.insert(k_owned, v_owned);
             match self.peek()? {
                 b',' => {
                     self.pos += 1;
                 }
                 b'}' => {
                     self.pos += 1;
-                    return Some(map);
+                    return Some((map, raw_map.map(OrderedJsonValue::Object)));
                 }
                 _ => return None,
             }
@@ -1303,32 +1333,48 @@ impl<'a> FastManifestScanner<'a> {
     }
 
     #[inline]
-    fn read_ordered_deps(&mut self) -> Option<(BTreeMap<String, String>, Vec<String>)> {
+    fn read_ordered_deps_with_raw<const CAPTURE_RAW: bool>(
+        &mut self,
+    ) -> Option<(OrderedDeps, Option<crate::ordered_json::OrderedJsonValue>)> {
+        use crate::ordered_json::{OrderedJsonMap, OrderedJsonValue};
         self.skip_ws();
         match self.bytes.get(self.pos)? {
             b'n' => {
                 self.read_null()?;
-                Some((BTreeMap::new(), Vec::new()))
+                Some((
+                    (BTreeMap::new(), Vec::new()),
+                    CAPTURE_RAW.then_some(OrderedJsonValue::Null),
+                ))
             }
             b'{' => {
                 self.pos += 1;
                 let mut map = BTreeMap::new();
-                let mut order = Vec::new();
+                let mut order = Vec::with_capacity(8);
+                let mut raw_map = if CAPTURE_RAW {
+                    Some(OrderedJsonMap::with_capacity(8))
+                } else {
+                    None
+                };
                 if self.peek()? == b'}' {
                     self.pos += 1;
-                    return Some((map, order));
+                    return Some(((map, order), raw_map.map(OrderedJsonValue::Object)));
                 }
                 loop {
                     let k = self.read_plain_str()?;
                     self.expect_byte(b':')?;
                     let v = self.read_plain_str()?;
-                    match map.entry(k.to_owned()) {
+                    let k_owned = k.to_owned();
+                    let v_owned = v.to_owned();
+                    if let Some(ref mut rmap) = raw_map {
+                        rmap.insert(k_owned.clone(), OrderedJsonValue::String(v_owned.clone()));
+                    }
+                    match map.entry(k_owned) {
                         std::collections::btree_map::Entry::Vacant(e) => {
                             order.push(e.key().clone());
-                            e.insert(v.to_owned());
+                            e.insert(v_owned);
                         }
                         std::collections::btree_map::Entry::Occupied(mut e) => {
-                            e.insert(v.to_owned());
+                            e.insert(v_owned);
                         }
                     }
                     match self.peek()? {
@@ -1337,7 +1383,7 @@ impl<'a> FastManifestScanner<'a> {
                         }
                         b'}' => {
                             self.pos += 1;
-                            return Some((map, order));
+                            return Some(((map, order), raw_map.map(OrderedJsonValue::Object)));
                         }
                         _ => return None,
                     }
@@ -1347,32 +1393,65 @@ impl<'a> FastManifestScanner<'a> {
         }
     }
 
-    fn read_serde_value(&mut self, depth: u8) -> Option<serde_json::Value> {
+    fn read_any_value_with_raw<const CAPTURE_RAW: bool>(
+        &mut self,
+        depth: u8,
+    ) -> Option<(
+        serde_json::Value,
+        Option<crate::ordered_json::OrderedJsonValue>,
+    )> {
+        use crate::ordered_json::{OrderedJsonMap, OrderedJsonValue};
         if depth > 24 {
             return None;
         }
         let b = self.peek()?;
         match b {
-            b'"' => self.read_plain_str().map(|s| serde_json::Value::String(s.to_owned())),
-            b't' | b'f' => self.read_bool().map(serde_json::Value::Bool),
+            b'"' => {
+                let s = self.read_plain_str()?.to_owned();
+                let raw = if CAPTURE_RAW {
+                    Some(OrderedJsonValue::String(s.clone()))
+                } else {
+                    None
+                };
+                Some((serde_json::Value::String(s), raw))
+            }
+            b't' | b'f' => {
+                let v = self.read_bool()?;
+                let raw = CAPTURE_RAW.then_some(OrderedJsonValue::Bool(v));
+                Some((serde_json::Value::Bool(v), raw))
+            }
             b'n' => {
                 self.read_null()?;
-                Some(serde_json::Value::Null)
+                Some((
+                    serde_json::Value::Null,
+                    CAPTURE_RAW.then_some(OrderedJsonValue::Null),
+                ))
             }
             b'[' => {
                 self.pos += 1;
                 let mut arr = Vec::new();
+                let mut rarr = if CAPTURE_RAW { Some(Vec::new()) } else { None };
                 if self.peek()? == b']' {
                     self.pos += 1;
-                    return Some(serde_json::Value::Array(arr));
+                    return Some((
+                        serde_json::Value::Array(arr),
+                        rarr.map(OrderedJsonValue::Array),
+                    ));
                 }
                 loop {
-                    arr.push(self.read_serde_value(depth + 1)?);
+                    let (sv, rv) = self.read_any_value_with_raw::<CAPTURE_RAW>(depth + 1)?;
+                    arr.push(sv);
+                    if let (Some(ref mut ra), Some(rv)) = (&mut rarr, rv) {
+                        ra.push(rv);
+                    }
                     match self.peek()? {
                         b',' => self.pos += 1,
                         b']' => {
                             self.pos += 1;
-                            return Some(serde_json::Value::Array(arr));
+                            return Some((
+                                serde_json::Value::Array(arr),
+                                rarr.map(OrderedJsonValue::Array),
+                            ));
                         }
                         _ => return None,
                     }
@@ -1381,20 +1460,35 @@ impl<'a> FastManifestScanner<'a> {
             b'{' => {
                 self.pos += 1;
                 let mut map = serde_json::Map::new();
+                let mut rmap = if CAPTURE_RAW {
+                    Some(OrderedJsonMap::new())
+                } else {
+                    None
+                };
                 if self.peek()? == b'}' {
                     self.pos += 1;
-                    return Some(serde_json::Value::Object(map));
+                    return Some((
+                        serde_json::Value::Object(map),
+                        rmap.map(OrderedJsonValue::Object),
+                    ));
                 }
                 loop {
                     let k = self.read_plain_str()?;
                     self.expect_byte(b':')?;
-                    let v = self.read_serde_value(depth + 1)?;
-                    map.insert(k.to_owned(), v);
+                    let (sv, rv) = self.read_any_value_with_raw::<CAPTURE_RAW>(depth + 1)?;
+                    let k_owned = k.to_owned();
+                    if let (Some(ref mut rm), Some(rv)) = (&mut rmap, rv) {
+                        rm.insert(k_owned.clone(), rv);
+                    }
+                    map.insert(k_owned, sv);
                     match self.peek()? {
                         b',' => self.pos += 1,
                         b'}' => {
                             self.pos += 1;
-                            return Some(serde_json::Value::Object(map));
+                            return Some((
+                                serde_json::Value::Object(map),
+                                rmap.map(OrderedJsonValue::Object),
+                            ));
                         }
                         _ => return None,
                     }
@@ -1431,30 +1525,47 @@ impl<'a> FastManifestScanner<'a> {
                     return None;
                 }
                 let s = std::str::from_utf8(&self.bytes[start..self.pos]).ok()?;
-                if b == b'-' {
+                let num = if b == b'-' {
                     let v: i64 = s.parse().ok()?;
-                    Some(serde_json::Value::Number(serde_json::Number::from(v)))
+                    serde_json::Number::from(v)
                 } else {
                     let v: u64 = s.parse().ok()?;
-                    Some(serde_json::Value::Number(serde_json::Number::from(v)))
-                }
+                    serde_json::Number::from(v)
+                };
+                let raw = if CAPTURE_RAW {
+                    Some(OrderedJsonValue::Number(num.clone()))
+                } else {
+                    None
+                };
+                Some((serde_json::Value::Number(num), raw))
             }
             _ => None,
         }
     }
 }
 
-fn try_parse_manifest_readonly_fast(clean_str: &str) -> Option<Manifest> {
+fn try_parse_manifest_fast<const CAPTURE_RAW: bool>(clean_str: &str) -> Option<Manifest> {
+    use crate::ordered_json::{OrderedJsonMap, OrderedJsonValue};
+
     let mut r = FastManifestScanner {
         bytes: clean_str.as_bytes(),
         pos: 0,
     };
     r.expect_byte(b'{')?;
     let mut m = Manifest::default();
+    let mut raw_map = if CAPTURE_RAW {
+        Some(OrderedJsonMap::with_capacity(16))
+    } else {
+        None
+    };
+
     if r.peek()? == b'}' {
         r.pos += 1;
         r.skip_ws();
         return if r.pos == r.bytes.len() {
+            if let Some(rmap) = raw_map {
+                m.raw_json = Some(OrderedJsonValue::Object(rmap));
+            }
             Some(m)
         } else {
             None
@@ -1464,37 +1575,62 @@ fn try_parse_manifest_readonly_fast(clean_str: &str) -> Option<Manifest> {
     loop {
         let key = r.read_plain_str()?;
         r.expect_byte(b':')?;
-        match key {
+        let raw_val: Option<OrderedJsonValue> = match key {
             "name" => match r.peek()? {
                 b'n' => {
                     r.read_null()?;
                     m.name = None;
+                    CAPTURE_RAW.then_some(OrderedJsonValue::Null)
                 }
-                _ => m.name = Some(r.read_plain_str()?.to_owned()),
+                _ => {
+                    let s = r.read_plain_str()?.to_owned();
+                    let rv = CAPTURE_RAW.then(|| OrderedJsonValue::String(s.clone()));
+                    m.name = Some(s);
+                    rv
+                }
             },
             "version" => match r.peek()? {
                 b'n' => {
                     r.read_null()?;
                     m.version = None;
+                    CAPTURE_RAW.then_some(OrderedJsonValue::Null)
                 }
-                _ => m.version = Some(r.read_plain_str()?.to_owned()),
+                _ => {
+                    let s = r.read_plain_str()?.to_owned();
+                    let rv = CAPTURE_RAW.then(|| OrderedJsonValue::String(s.clone()));
+                    m.version = Some(s);
+                    rv
+                }
             },
             "description" => match r.peek()? {
                 b'n' => {
                     r.read_null()?;
                     m.description = None;
+                    CAPTURE_RAW.then_some(OrderedJsonValue::Null)
                 }
-                _ => m.description = Some(r.read_plain_str()?.to_owned()),
+                _ => {
+                    let s = r.read_plain_str()?.to_owned();
+                    let rv = CAPTURE_RAW.then(|| OrderedJsonValue::String(s.clone()));
+                    m.description = Some(s);
+                    rv
+                }
             },
             "main" => match r.peek()? {
-                b'"' => m.main = Some(r.read_plain_str()?.to_owned()),
+                b'"' => {
+                    let s = r.read_plain_str()?.to_owned();
+                    let rv = CAPTURE_RAW.then(|| OrderedJsonValue::String(s.clone()));
+                    m.main = Some(s);
+                    rv
+                }
                 b't' | b'f' => {
-                    r.read_bool()?;
+                    let b = r.read_bool()?;
                     m.main = None;
+                    CAPTURE_RAW.then_some(OrderedJsonValue::Bool(b))
                 }
                 b'n' => {
                     r.read_null()?;
                     m.main = None;
+                    CAPTURE_RAW.then_some(OrderedJsonValue::Null)
                 }
                 _ => return None,
             },
@@ -1502,47 +1638,82 @@ fn try_parse_manifest_readonly_fast(clean_str: &str) -> Option<Manifest> {
                 b'n' => {
                     r.read_null()?;
                     m.bin = None;
+                    CAPTURE_RAW.then_some(OrderedJsonValue::Null)
                 }
-                b'"' => m.bin = Some(PackageBin::Single(r.read_plain_str()?.to_owned())),
-                b'{' => m.bin = Some(PackageBin::Map(r.read_string_btree()?)),
+                b'"' => {
+                    let s = r.read_plain_str()?.to_owned();
+                    let rv = CAPTURE_RAW.then(|| OrderedJsonValue::String(s.clone()));
+                    m.bin = Some(PackageBin::Single(s));
+                    rv
+                }
+                b'{' => {
+                    let (map, rv) = r.read_string_btree_with_raw::<CAPTURE_RAW>()?;
+                    m.bin = Some(PackageBin::Map(map));
+                    rv
+                }
                 _ => return None,
             },
             "files" => match r.peek()? {
                 b'n' => {
                     r.read_null()?;
                     m.files = None;
+                    CAPTURE_RAW.then_some(OrderedJsonValue::Null)
                 }
-                b'"' => m.files = Some(vec![r.read_plain_str()?.to_owned()]),
-                b'[' => m.files = Some(r.read_string_vec()?),
+                b'"' => {
+                    let s = r.read_plain_str()?.to_owned();
+                    let rv = CAPTURE_RAW.then(|| OrderedJsonValue::String(s.clone()));
+                    m.files = Some(vec![s]);
+                    rv
+                }
+                b'[' => {
+                    let (vec, rv) = r.read_string_vec_with_raw::<CAPTURE_RAW>()?;
+                    m.files = Some(vec);
+                    rv
+                }
                 _ => return None,
             },
             "scripts" => {
-                m.scripts = r.read_string_btree()?;
+                let (map, rv) = r.read_string_btree_with_raw::<CAPTURE_RAW>()?;
+                m.scripts = map;
+                rv
             }
             "dependencies" => {
-                let (map, order) = r.read_ordered_deps()?;
+                let ((map, order), rv) = r.read_ordered_deps_with_raw::<CAPTURE_RAW>()?;
                 m.dependencies = map;
                 m.dependency_order = order;
+                rv
             }
             "devDependencies" => {
-                let (map, order) = r.read_ordered_deps()?;
+                let ((map, order), rv) = r.read_ordered_deps_with_raw::<CAPTURE_RAW>()?;
                 m.dev_dependencies = map;
                 m.dev_dependency_order = order;
+                rv
             }
             "peerDependencies" => {
-                let (map, order) = r.read_ordered_deps()?;
+                let ((map, order), rv) = r.read_ordered_deps_with_raw::<CAPTURE_RAW>()?;
                 m.peer_dependencies = map;
                 m.peer_dependency_order = order;
+                rv
             }
             "peerDependenciesMeta" => {
                 r.expect_byte(b'{')?;
                 let mut pmeta = BTreeMap::new();
+                let mut pmeta_raw = if CAPTURE_RAW {
+                    Some(OrderedJsonMap::new())
+                } else {
+                    None
+                };
                 if r.peek()? != b'}' {
                     loop {
                         let dep_k = r.read_plain_str()?;
                         r.expect_byte(b':')?;
                         r.expect_byte(b'{')?;
                         let mut optional = false;
+                        let mut inner_raw = if CAPTURE_RAW {
+                            Some(OrderedJsonMap::new())
+                        } else {
+                            None
+                        };
                         if r.peek()? != b'}' {
                             loop {
                                 let mk = r.read_plain_str()?;
@@ -1551,6 +1722,12 @@ fn try_parse_manifest_readonly_fast(clean_str: &str) -> Option<Manifest> {
                                     return None;
                                 }
                                 optional = r.read_bool()?;
+                                if let Some(ref mut iraw) = inner_raw {
+                                    iraw.insert(
+                                        mk.to_owned(),
+                                        OrderedJsonValue::Bool(optional),
+                                    );
+                                }
                                 match r.peek()? {
                                     b',' => r.pos += 1,
                                     b'}' => break,
@@ -1559,7 +1736,11 @@ fn try_parse_manifest_readonly_fast(clean_str: &str) -> Option<Manifest> {
                             }
                         }
                         r.pos += 1;
-                        pmeta.insert(dep_k.to_owned(), PeerDependencyMeta { optional });
+                        let dep_k_owned = dep_k.to_owned();
+                        if let (Some(ref mut pr), Some(ir)) = (&mut pmeta_raw, inner_raw) {
+                            pr.insert(dep_k_owned.clone(), OrderedJsonValue::Object(ir));
+                        }
+                        pmeta.insert(dep_k_owned, PeerDependencyMeta { optional });
                         match r.peek()? {
                             b',' => r.pos += 1,
                             b'}' => break,
@@ -1569,22 +1750,29 @@ fn try_parse_manifest_readonly_fast(clean_str: &str) -> Option<Manifest> {
                 }
                 r.pos += 1;
                 m.peer_dependencies_meta = pmeta;
+                pmeta_raw.map(OrderedJsonValue::Object)
             }
             "optionalDependencies" => {
-                let (map, order) = r.read_ordered_deps()?;
+                let ((map, order), rv) = r.read_ordered_deps_with_raw::<CAPTURE_RAW>()?;
                 m.optional_dependencies = map;
                 m.optional_dependency_order = order;
+                rv
             }
             "bundledDependencies" | "bundleDependencies" => match r.peek()? {
                 b'n' => {
                     r.read_null()?;
                     m.bundled_dependencies = None;
+                    CAPTURE_RAW.then_some(OrderedJsonValue::Null)
                 }
                 b't' | b'f' => {
-                    m.bundled_dependencies = Some(BundledDependencies::Boolean(r.read_bool()?));
+                    let b = r.read_bool()?;
+                    m.bundled_dependencies = Some(BundledDependencies::Boolean(b));
+                    CAPTURE_RAW.then_some(OrderedJsonValue::Bool(b))
                 }
                 b'[' => {
-                    m.bundled_dependencies = Some(BundledDependencies::List(r.read_string_vec()?));
+                    let (vec, rv) = r.read_string_vec_with_raw::<CAPTURE_RAW>()?;
+                    m.bundled_dependencies = Some(BundledDependencies::List(vec));
+                    rv
                 }
                 _ => return None,
             },
@@ -1592,9 +1780,12 @@ fn try_parse_manifest_readonly_fast(clean_str: &str) -> Option<Manifest> {
                 b'n' => {
                     r.read_null()?;
                     m.workspaces = None;
+                    CAPTURE_RAW.then_some(OrderedJsonValue::Null)
                 }
                 b'[' => {
-                    m.workspaces = Some(PackageWorkspaces::List(r.read_string_vec()?));
+                    let (vec, rv) = r.read_string_vec_with_raw::<CAPTURE_RAW>()?;
+                    m.workspaces = Some(PackageWorkspaces::List(vec));
+                    rv
                 }
                 _ => return None,
             },
@@ -1602,41 +1793,81 @@ fn try_parse_manifest_readonly_fast(clean_str: &str) -> Option<Manifest> {
                 b'n' => {
                     r.read_null()?;
                     m.os = None;
+                    CAPTURE_RAW.then_some(OrderedJsonValue::Null)
                 }
-                b'"' => m.os = Some(PlatformList::from(r.read_plain_str()?.to_owned())),
-                b'[' => m.os = Some(PlatformList::from(r.read_string_vec()?)),
+                b'"' => {
+                    let s = r.read_plain_str()?.to_owned();
+                    let rv = CAPTURE_RAW.then(|| OrderedJsonValue::String(s.clone()));
+                    m.os = Some(PlatformList::from(s));
+                    rv
+                }
+                b'[' => {
+                    let (vec, rv) = r.read_string_vec_with_raw::<CAPTURE_RAW>()?;
+                    m.os = Some(PlatformList::from(vec));
+                    rv
+                }
                 _ => return None,
             },
             "cpu" => match r.peek()? {
                 b'n' => {
                     r.read_null()?;
                     m.cpu = None;
+                    CAPTURE_RAW.then_some(OrderedJsonValue::Null)
                 }
-                b'"' => m.cpu = Some(PlatformList::from(r.read_plain_str()?.to_owned())),
-                b'[' => m.cpu = Some(PlatformList::from(r.read_string_vec()?)),
+                b'"' => {
+                    let s = r.read_plain_str()?.to_owned();
+                    let rv = CAPTURE_RAW.then(|| OrderedJsonValue::String(s.clone()));
+                    m.cpu = Some(PlatformList::from(s));
+                    rv
+                }
+                b'[' => {
+                    let (vec, rv) = r.read_string_vec_with_raw::<CAPTURE_RAW>()?;
+                    m.cpu = Some(PlatformList::from(vec));
+                    rv
+                }
                 _ => return None,
             },
             "libc" => match r.peek()? {
                 b'n' => {
                     r.read_null()?;
                     m.libc = None;
+                    CAPTURE_RAW.then_some(OrderedJsonValue::Null)
                 }
-                b'"' => m.libc = Some(PlatformList::from(r.read_plain_str()?.to_owned())),
-                b'[' => m.libc = Some(PlatformList::from(r.read_string_vec()?)),
+                b'"' => {
+                    let s = r.read_plain_str()?.to_owned();
+                    let rv = CAPTURE_RAW.then(|| OrderedJsonValue::String(s.clone()));
+                    m.libc = Some(PlatformList::from(s));
+                    rv
+                }
+                b'[' => {
+                    let (vec, rv) = r.read_string_vec_with_raw::<CAPTURE_RAW>()?;
+                    m.libc = Some(PlatformList::from(vec));
+                    rv
+                }
                 _ => return None,
             },
             "engines" => match r.peek()? {
                 b'n' => {
                     r.read_null()?;
                     m.engines = BTreeMap::new();
+                    CAPTURE_RAW.then_some(OrderedJsonValue::Null)
                 }
-                b'{' => m.engines = r.read_string_btree()?,
+                b'{' => {
+                    let (map, rv) = r.read_string_btree_with_raw::<CAPTURE_RAW>()?;
+                    m.engines = map;
+                    rv
+                }
                 _ => return None,
             },
             _ => {
-                let val = r.read_serde_value(0)?;
+                let (val, rv) = r.read_any_value_with_raw::<CAPTURE_RAW>(0)?;
                 m.extra.insert(key.to_owned(), val);
+                rv
             }
+        };
+
+        if let (Some(ref mut rmap), Some(rv)) = (&mut raw_map, raw_val) {
+            rmap.insert(key.to_owned(), rv);
         }
 
         match r.peek()? {
@@ -1647,6 +1878,9 @@ fn try_parse_manifest_readonly_fast(clean_str: &str) -> Option<Manifest> {
                 r.pos += 1;
                 r.skip_ws();
                 return if r.pos == r.bytes.len() {
+                    if let Some(rmap) = raw_map {
+                        m.raw_json = Some(OrderedJsonValue::Object(rmap));
+                    }
                     Some(m)
                 } else {
                     None
@@ -1687,6 +1921,11 @@ impl Manifest {
     pub fn from_str(s: &str) -> Result<Self, ManifestError> {
         let format = ManifestFormat::detect(s);
         let clean_str = s.strip_prefix('\u{feff}').unwrap_or(s);
+        if let Some(mut manifest) = try_parse_manifest_fast::<true>(clean_str) {
+            manifest.format = format;
+            manifest.raw_text = Some(clean_str.to_string());
+            return Ok(manifest);
+        }
         let mut de = serde_json::Deserializer::from_str(clean_str);
         let mut manifest = de
             .deserialize_map(ManifestVisitor { capture_raw: true })
@@ -1720,7 +1959,7 @@ impl Manifest {
     pub fn from_str_readonly(s: &str) -> Result<Self, ManifestError> {
         let format = ManifestFormat::detect(s);
         let clean_str = s.strip_prefix('\u{feff}').unwrap_or(s);
-        if let Some(mut manifest) = try_parse_manifest_readonly_fast(clean_str) {
+        if let Some(mut manifest) = try_parse_manifest_fast::<false>(clean_str) {
             manifest.format = format;
             return Ok(manifest);
         }

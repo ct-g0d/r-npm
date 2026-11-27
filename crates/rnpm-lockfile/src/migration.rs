@@ -767,6 +767,7 @@ impl<'de> Deserialize<'de> for ParsedLockfile {
 
 /// Parse a lockfile JSON string of any version (1, 2, or 3) and migrate to v3.
 pub fn parse_and_migrate(json_str: &str) -> Result<LockfileV3, LockfileError> {
+    let json_str = json_str.strip_prefix('\u{feff}').unwrap_or(json_str);
     let parsed: ParsedLockfile = serde_json::from_str(json_str)?;
     match parsed.lockfile_version {
         3 => {
@@ -813,10 +814,9 @@ pub fn parse_and_migrate(json_str: &str) -> Result<LockfileV3, LockfileError> {
 /// Parse a lockfile JSON string of any version (1, 2, or 3) and migrate to v3,
 /// skipping raw JSON capture for read-only callers.
 pub fn parse_and_migrate_readonly(json_str: &str) -> Result<LockfileV3, LockfileError> {
-    if let Some(lock) = crate::fast_parse::try_parse_lockfile_v3_fast(json_str, false) {
-        if lock.lockfile_version == 3 && !lock.packages.is_empty() {
-            return Ok(lock);
-        }
+    let json_str = json_str.strip_prefix('\u{feff}').unwrap_or(json_str);
+    if let Some(lock) = crate::fast_parse::try_parse_and_migrate_readonly_fast(json_str) {
+        return Ok(lock);
     }
     parse_and_migrate(json_str)
 }
@@ -1210,5 +1210,67 @@ mod tests {
             parse_and_migrate_readonly(unsupported_first),
             Err(LockfileError::UnsupportedVersion(99))
         ));
+    }
+
+    #[test]
+    fn test_lockfile_edge_cases_bom_unicode_surrogates_neg_zero_v2_fast_parity() {
+        // v2 with BOM, surrogate pair, escapes, -0 extra, bundledDependencies object, bin string/map, negated os/cpu/libc
+        let v2_with_bom = "\u{feff}{\n  \"name\": \"edge-lock\",\n  \"version\": \"1.0.0\",\n  \"lockfileVersion\": 2,\n  \"requires\": true,\n  \"packages\": {\n    \"\": {\n      \"name\": \"edge-lock\",\n      \"version\": \"1.0.0\",\n      \"dependencies\": { \"a\": \"^1.0.0\", \"b\": \"^2.0.0\" },\n      \"bundleDependencies\": { \"a\": true }\n    },\n    \"node_modules\\\\a\": {\n      \"version\": \"1.2.3\",\n      \"bin\": \"./bin/a.js\",\n      \"os\": [\"!win32\", \"linux\"],\n      \"cpu\": \"!ia32\",\n      \"libc\": [\"glibc\", \"!musl\"],\n      \"resolved\": \"https://registry.npmjs.org/a/-/a-1.2.3.tgz\",\n      \"integrity\": \"sha512-abc\\u003d\",\n      \"license\": \"MIT \\uD83D\\uDE00\",\n      \"negZero\": -0\n    },\n    \"node_modules/b\": {\n      \"version\": \"2.0.0\",\n      \"bin\": { \"b1\": \"bin/b1.js\" },\n      \"bundledDependencies\": true\n    }\n  },\n  \"dependencies\": {\n    \"a\": { \"version\": \"1.2.3\", \"dev\": true },\n    \"b\": { \"version\": \"2.0.0\", \"optional\": true }\n  }\n}";
+
+        let migrated_full = parse_and_migrate(v2_with_bom).expect("v2 full");
+        let migrated_ro = parse_and_migrate_readonly(v2_with_bom).expect("v2 ro");
+        assert_eq!(migrated_ro.lockfile_version, 3);
+        assert_eq!(migrated_ro.packages.len(), migrated_full.packages.len());
+        let a_full = migrated_full.packages.get("node_modules/a").unwrap();
+        let a_ro = migrated_ro.packages.get("node_modules/a").unwrap();
+        assert_eq!(a_ro.dev, Some(true));
+        assert_eq!(a_ro.dev, a_full.dev);
+        assert_eq!(a_ro.bin, Some(PackageBin::Single("./bin/a.js".to_string())));
+        assert_eq!(a_ro.os, a_full.os);
+        assert_eq!(a_ro.cpu, a_full.cpu);
+        assert_eq!(a_ro.libc, a_full.libc);
+        assert_eq!(a_ro.license.as_deref(), Some("MIT 😀"));
+        assert_eq!(a_ro.extra.get("negZero"), a_full.extra.get("negZero"));
+
+        let b_ro = migrated_ro.packages.get("node_modules/b").unwrap();
+        assert_eq!(b_ro.optional, Some(true));
+        assert!(matches!(b_ro.bin, Some(PackageBin::Map(_))));
+        assert_eq!(b_ro.bundle_dependencies, Some(BundledDependencies::Boolean(true)));
+
+        // Fast v2 pure path without escapes or -0 must produce identical migrated output to parse_and_migrate
+        let v2_plain = r#"{
+            "name": "plain-v2",
+            "version": "1.0.0",
+            "lockfileVersion": 2,
+            "packages": {
+                "": { "name": "plain-v2", "version": "1.0.0", "dependencies": { "x": "^1.0.0" } },
+                "node_modules/x": {
+                    "version": "1.0.0",
+                    "resolved": "https://registry.npmjs.org/x/-/x-1.0.0.tgz",
+                    "integrity": "sha512-xyz",
+                    "dependencies": { "y": "^1.0.0" }
+                },
+                "node_modules/x/node_modules/y": { "version": "1.1.0" }
+            },
+            "dependencies": {
+                "x": {
+                    "version": "1.0.0",
+                    "dev": true,
+                    "requires": { "y": "^1.0.0" },
+                    "dependencies": {
+                        "y": { "version": "1.1.0", "optional": true }
+                    }
+                }
+            }
+        }"#;
+        let plain_full = parse_and_migrate(v2_plain).expect("plain full");
+        let plain_ro = parse_and_migrate_readonly(v2_plain).expect("plain ro");
+        assert_eq!(plain_full, plain_ro);
+
+        // v3 with BOM on from_json_str and from_json_str_readonly
+        let v3_bom = format!("\u{feff}{}", plain_ro.to_json_string().unwrap());
+        let parsed_v3 = LockfileV3::from_json_str(&v3_bom).expect("v3 bom");
+        let parsed_v3_ro = LockfileV3::from_json_str_readonly(&v3_bom).expect("v3 bom ro");
+        assert_eq!(parsed_v3.packages.len(), parsed_v3_ro.packages.len());
     }
 }

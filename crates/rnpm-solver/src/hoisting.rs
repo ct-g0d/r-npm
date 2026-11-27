@@ -498,7 +498,9 @@ pub fn determine_placement_with_peers(
     // Attempt 2: Check intermediate ancestor scopes from root towards parent
     if let Some(first_parent) = parent_scope(parent_location) {
         if !first_parent.is_empty() {
-            let mut ancestors = Vec::new();
+            let mut stack_ancestors = [""; 16];
+            let mut stack_len = 0usize;
+            let mut overflow_ancestors: Vec<&str> = Vec::new();
             let mut curr = parent_location;
             while let Some(next) = parent_scope(curr) {
                 if next.is_empty() {
@@ -508,62 +510,76 @@ pub fn determine_placement_with_peers(
                     || next.starts_with("node_modules/")
                     || graph.nodes.contains_key(next)
                 {
-                    ancestors.push(next);
+                    if stack_len < 16 && overflow_ancestors.is_empty() {
+                        stack_ancestors[stack_len] = next;
+                        stack_len += 1;
+                    } else {
+                        if overflow_ancestors.is_empty() {
+                            overflow_ancestors.extend_from_slice(&stack_ancestors[..stack_len]);
+                        }
+                        overflow_ancestors.push(next);
+                    }
                 }
                 curr = next;
             }
 
+            let ancestor_slice = if overflow_ancestors.is_empty() {
+                &stack_ancestors[..stack_len]
+            } else {
+                overflow_ancestors.as_slice()
+            };
             let resolved_parsed = resolved_version.and_then(cached_version_rc);
-            for ancestor in ancestors.into_iter().rev() {
-                path_buf.clear();
-                path_buf.push_str(ancestor);
-                path_buf.push_str("/node_modules/");
-                path_buf.push_str(install_name);
-
-                if let Some(existing) = graph.nodes.get(&path_buf) {
-                    if existing.name == package_name
-                        && node_satisfies_target(existing, target)
-                        && reuse_peer_set(existing, &path_buf)
-                        && !is_shadowed_by_incompatible_between(
-                            graph,
-                            parent_location,
-                            ancestor,
-                            install_name,
-                            target,
-                        )
-                    {
-                        return PlacementDecision::Reuse(path_buf);
+            for &ancestor in ancestor_slice.iter().rev() {
+                let mut found: Option<PlacementDecision> = None;
+                with_scoped_path(ancestor, install_name, |cand_loc| {
+                    if let Some(existing) = graph.nodes.get(cand_loc) {
+                        if existing.name == package_name
+                            && node_satisfies_target(existing, target)
+                            && reuse_peer_set(existing, cand_loc)
+                            && !is_shadowed_by_incompatible_between(
+                                graph,
+                                parent_location,
+                                ancestor,
+                                install_name,
+                                target,
+                            )
+                        {
+                            found = Some(PlacementDecision::Reuse(cand_loc.to_owned()));
+                        }
+                    } else if !is_shadowed_by_incompatible_between(
+                        graph,
+                        parent_location,
+                        ancestor,
+                        install_name,
+                        target,
+                    ) && !candidate_peer_conflict(
+                        graph,
+                        cand_loc,
+                        parent_location,
+                        dependencies,
+                        peer_dependencies,
+                        peer_dependencies_meta,
+                        placing_peer,
+                    ) && !candidate_shadows_ancestor_dep(
+                        graph,
+                        ancestor,
+                        install_name,
+                        package_name,
+                        target,
+                        resolved_version,
+                        resolved_parsed.as_deref(),
+                    ) && !candidate_shadows_descendant_dep_parsed(
+                        graph,
+                        ancestor,
+                        install_name,
+                        resolved_version,
+                        resolved_parsed.as_deref(),
+                    ) {
+                        found = Some(PlacementDecision::PlaceNew(cand_loc.to_owned()));
                     }
-                } else if !is_shadowed_by_incompatible_between(
-                    graph,
-                    parent_location,
-                    ancestor,
-                    install_name,
-                    target,
-                ) && !candidate_peer_conflict(
-                    graph,
-                    &path_buf,
-                    parent_location,
-                    dependencies,
-                    peer_dependencies,
-                    peer_dependencies_meta,
-                    placing_peer,
-                ) && !candidate_shadows_ancestor_dep(
-                    graph,
-                    ancestor,
-                    install_name,
-                    package_name,
-                    target,
-                    resolved_version,
-                    resolved_parsed.as_deref(),
-                ) && !candidate_shadows_descendant_dep_parsed(
-                    graph,
-                    ancestor,
-                    install_name,
-                    resolved_version,
-                    resolved_parsed.as_deref(),
-                ) {
-                    return PlacementDecision::PlaceNew(path_buf);
+                });
+                if let Some(decision) = found {
+                    return decision;
                 }
             }
         }
@@ -766,15 +782,8 @@ fn candidate_shadows_descendant_dep_parsed(
     // walk only `scope`'s subtree via BTreeMap range instead of scanning 100s of unrelated nodes/edges.
     if !scope.is_empty()
         && !graph.outgoing_edges_by_location.is_empty()
-        && (rel_nodes.map_or(0, Vec::len) > 8 || rel_edges.map_or(0, Vec::len) > 8)
+        && (rel_nodes.map_or(0, Vec::len) > 48 || rel_edges.map_or(0, Vec::len) > 48)
     {
-        let mut scope_slash = String::with_capacity(scope.len() + 1);
-        scope_slash.push_str(scope);
-        scope_slash.push('/');
-        let mut scope_zero = String::with_capacity(scope.len() + 1);
-        scope_zero.push_str(scope);
-        scope_zero.push('0');
-
         let check_subtree_entry = |loc: &str, node: &crate::graph::Node| -> bool {
             if !is_in_scope_subtree(loc, scope) {
                 return false;
@@ -792,12 +801,39 @@ fn candidate_shadows_descendant_dep_parsed(
             false
         };
 
-        for (loc, node) in graph
-            .nodes
-            .range::<str, _>((std::ops::Bound::Included(scope_slash.as_str()), std::ops::Bound::Excluded(scope_zero.as_str())))
-        {
-            if check_subtree_entry(loc, node) {
-                return true;
+        if scope.len() < 256 {
+            let mut sb = [0u8; 256];
+            let mut zb = [0u8; 256];
+            let n = scope.len();
+            sb[..n].copy_from_slice(scope.as_bytes());
+            sb[n] = b'/';
+            zb[..n].copy_from_slice(scope.as_bytes());
+            zb[n] = b'0';
+            // SAFETY: `scope`, `'/'`, and `'0'` are valid UTF-8.
+            let scope_slash = unsafe { std::str::from_utf8_unchecked(&sb[..n + 1]) };
+            let scope_zero = unsafe { std::str::from_utf8_unchecked(&zb[..n + 1]) };
+            for (loc, node) in graph.nodes.range::<str, _>((
+                std::ops::Bound::Included(scope_slash),
+                std::ops::Bound::Excluded(scope_zero),
+            )) {
+                if check_subtree_entry(loc, node) {
+                    return true;
+                }
+            }
+        } else {
+            let mut scope_slash = String::with_capacity(scope.len() + 1);
+            scope_slash.push_str(scope);
+            scope_slash.push('/');
+            let mut scope_zero = String::with_capacity(scope.len() + 1);
+            scope_zero.push_str(scope);
+            scope_zero.push('0');
+            for (loc, node) in graph.nodes.range::<str, _>((
+                std::ops::Bound::Included(scope_slash.as_str()),
+                std::ops::Bound::Excluded(scope_zero.as_str()),
+            )) {
+                if check_subtree_entry(loc, node) {
+                    return true;
+                }
             }
         }
         return false;
@@ -1039,14 +1075,15 @@ fn is_shadowed_by_incompatible_between(
         }
     }
     let mut current = from_scope;
-    let mut candidate_buf = String::with_capacity(from_scope.len() + 14 + install_name.len());
     while !current.is_empty() && current != to_ancestor {
-        candidate_buf.clear();
-        candidate_buf.push_str(current);
-        candidate_buf.push_str("/node_modules/");
-        candidate_buf.push_str(install_name);
-        if let Some(node) = graph.nodes.get(&candidate_buf) {
-            return !node_satisfies_target(node, target);
+        let matched = with_scoped_path(current, install_name, |cand| {
+            graph
+                .nodes
+                .get(cand)
+                .map(|node| !node_satisfies_target(node, target))
+        });
+        if let Some(shadowed) = matched {
+            return shadowed;
         }
         current = match parent_scope(current) {
             Some(p) => p,
@@ -1054,6 +1091,44 @@ fn is_shadowed_by_incompatible_between(
         };
     }
     false
+}
+
+#[inline]
+fn with_scoped_path<R>(scope: &str, install_name: &str, f: impl FnOnce(&str) -> R) -> R {
+    let need = if scope.is_empty() {
+        13 + install_name.len()
+    } else {
+        scope.len() + 14 + install_name.len()
+    };
+    if need <= 256 {
+        let mut buf = [0u8; 256];
+        let mut pos;
+        if !scope.is_empty() {
+            let sb = scope.as_bytes();
+            buf[..sb.len()].copy_from_slice(sb);
+            pos = sb.len();
+            buf[pos..pos + 14].copy_from_slice(b"/node_modules/");
+            pos += 14;
+        } else {
+            buf[..13].copy_from_slice(b"node_modules/");
+            pos = 13;
+        }
+        let ib = install_name.as_bytes();
+        buf[pos..pos + ib.len()].copy_from_slice(ib);
+        // SAFETY: `scope`, `install_name`, and literals are valid UTF-8.
+        let s = unsafe { std::str::from_utf8_unchecked(&buf[..need]) };
+        f(s)
+    } else {
+        let mut s = String::with_capacity(need);
+        if !scope.is_empty() {
+            s.push_str(scope);
+            s.push_str("/node_modules/");
+        } else {
+            s.push_str("node_modules/");
+        }
+        s.push_str(install_name);
+        f(&s)
+    }
 }
 
 /// Helper check if a node matches either `install_name` or physical `name`.

@@ -5772,6 +5772,24 @@ fn prepare_command_execution(
 }
 
 #[allow(clippy::too_many_arguments)]
+async fn resolve_post_install_audit(
+    report_dir: &Path,
+    registry: Option<String>,
+    config: &rnpm_config::Config,
+    lockfile: Option<&rnpm_lockfile::LockfileV3>,
+) -> Option<audit::AuditReport> {
+    audit::build_audit_report_with_config_and_lockfile(
+        report_dir,
+        registry,
+        Some(config),
+        lockfile,
+    )
+    .await
+    .ok()
+    .map(|(r, _)| r)
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn finish_install_or_ci_output(
     report_dir: &Path,
     summary: &rnpm_install::InstallSummary,
@@ -5784,11 +5802,12 @@ async fn finish_install_or_ci_output(
     json: bool,
     timing_val: bool,
     elapsed: std::time::Duration,
+    preloaded_lockfile: Option<&rnpm_lockfile::LockfileV3>,
 ) -> anyhow::Result<()> {
     let elapsed_str = format_duration(elapsed);
 
     if let Some(report) = summary.reify.as_ref() {
-        let parsed_lock = if !dry_run && audit_val && fund_val {
+        let owned_lock = if preloaded_lockfile.is_none() && !dry_run && (audit_val || fund_val) {
             let (lock_path, _) = rnpm_install::resolve_lockfile_path(report_dir);
             if lock_path.exists() {
                 rnpm_lockfile::load_and_migrate_readonly(&lock_path).ok()
@@ -5798,34 +5817,28 @@ async fn finish_install_or_ci_output(
         } else {
             None
         };
+        let lock_ref = preloaded_lockfile.or(owned_lock.as_ref());
         let audit_report = if audit_val && !dry_run {
-            audit::build_audit_report_with_config_and_lockfile(
-                report_dir,
-                registry,
-                Some(config),
-                parsed_lock.as_ref(),
-            )
-            .await
-            .ok()
-            .map(|(r, _)| r)
+            resolve_post_install_audit(report_dir, registry, config, lock_ref).await
         } else {
             None
         };
         let funding = if fund_val && !dry_run {
-            audit::count_funding_packages_with_lockfile(report_dir, parsed_lock.as_ref())
+            audit::count_funding_packages_with_lockfile(report_dir, lock_ref)
         } else {
             0
         };
         let mut out =
             reify_output::ReifyOutputOptions::from_config_loaded(config, json, dry_run, fund_val);
         out.silent |= silent;
-        reify_output::print(
+        reify_output::print_with_lockfile(
             report_dir,
             report,
             audit_report.as_ref(),
             funding,
             &out,
             elapsed,
+            lock_ref,
         )?;
     } else if json {
         let json_output = serde_json::json!({
@@ -5845,7 +5858,7 @@ async fn finish_install_or_ci_output(
             summary.packages_installed
         );
     } else if !dry_run {
-        let parsed_lock = if !silent && fund_val && audit_val {
+        let owned_lock = if preloaded_lockfile.is_none() && (audit_val || (!silent && fund_val)) {
             let (lock_path, _) = rnpm_install::resolve_lockfile_path(report_dir);
             if lock_path.exists() {
                 rnpm_lockfile::load_and_migrate_readonly(&lock_path).ok()
@@ -5855,6 +5868,7 @@ async fn finish_install_or_ci_output(
         } else {
             None
         };
+        let lock_ref = preloaded_lockfile.or(owned_lock.as_ref());
         if !silent {
             if summary.packages_installed > 0 {
                 let pkg_str = if summary.packages_installed == 1 {
@@ -5871,8 +5885,7 @@ async fn finish_install_or_ci_output(
             }
 
             if fund_val {
-                let count =
-                    audit::count_funding_packages_with_lockfile(report_dir, parsed_lock.as_ref());
+                let count = audit::count_funding_packages_with_lockfile(report_dir, lock_ref);
                 if count > 0 {
                     println!(
                         "\n{} packages are looking for funding\n  run `npm fund` for details",
@@ -5883,13 +5896,13 @@ async fn finish_install_or_ci_output(
         }
 
         if audit_val {
-            let _ = audit::run_post_install_audit_with_config(
-                report_dir,
-                registry,
-                Some(config),
-                parsed_lock.as_ref(),
-            )
-            .await;
+            if let Some(report) =
+                resolve_post_install_audit(report_dir, registry, config, lock_ref).await
+            {
+                if config.get("loglevel") != Some("silent") {
+                    audit::print_concise_audit_summary(&report);
+                }
+            }
         }
     }
 
@@ -6195,6 +6208,7 @@ pub(crate) async fn run_cli_with_config(
                 json,
                 timing_val,
                 start_time.elapsed(),
+                installer.last_lockfile(),
             )
             .await?;
         }
@@ -6357,6 +6371,7 @@ pub(crate) async fn run_cli_with_config(
                 json,
                 timing_val,
                 start_time.elapsed(),
+                installer.last_lockfile(),
             )
             .await?;
         }
@@ -8489,6 +8504,51 @@ fn execute_sync_command_inner(
             current_dir.to_path_buf(),
             Some(config),
         )),
+        Commands::Prune {
+            omit,
+            include,
+            production,
+            dry_run,
+            workspace_root,
+            workspace,
+            workspaces,
+            json,
+        } => {
+            if run_prechecks {
+                if !*dry_run {
+                    rnpm_install::trash::cleanup_leftover_trash(current_dir);
+                    init_cli_request_context("prune", config);
+                }
+                if let Err(e) = enforce_dev_engines_with_config(current_dir, config) {
+                    return Some(Err(e));
+                }
+            }
+            let silent = is_loglevel_silent_with_config(config);
+            let args = commands::prune::PruneCommandArgs {
+                omit: omit.clone(),
+                include: include.clone(),
+                production: *production,
+                dry_run: *dry_run,
+                json: *json,
+                silent,
+                workspace_root: *workspace_root,
+                workspace: workspace.clone(),
+                workspaces: *workspaces,
+            };
+            let rt = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(rt) => rt,
+                Err(e) => return Some(Err(e.into())),
+            };
+            let res = rt.block_on(commands::prune::run_with_config(
+                args,
+                current_dir.to_path_buf(),
+                Some(config),
+            ));
+            Some(res)
+        }
         Commands::Get { key, extra_keys } => Some(commands::config::run_get_keys_with_config(
             key.as_deref(),
             extra_keys,
@@ -8862,7 +8922,17 @@ fn execute_sync_command_inner(
     }
 }
 
-fn try_parse_fast_command(args: &[String]) -> Option<Cli> {
+fn parse_opt_bool_val(val: &str) -> Option<bool> {
+    match val {
+        "true" => Some(true),
+        "false" => Some(false),
+        _ => None,
+    }
+}
+
+fn try_parse_fast_command_with_overrides(
+    args: &[String],
+) -> Option<(Cli, BTreeMap<String, String>)> {
     if args.len() < 2 {
         return None;
     }
@@ -8870,18 +8940,23 @@ fn try_parse_fast_command(args: &[String]) -> Option<Cli> {
         .iter()
         .skip(1)
         .take_while(|a| a.as_str() != "--")
-        .any(|a| matches!(a.as_str(), "--help" | "-h" | "--version" | "-v" | "-V" | "--"))
+        .any(|a| matches!(a.as_str(), "--help" | "-h" | "--version" | "-v" | "-V" | "-ws"))
     {
         return None;
     }
     let cmd_name = args[1].as_str();
     let rest = &args[2..];
+    let mut overrides = BTreeMap::new();
+
     match cmd_name {
         "prefix" | "root" | "bin" => {
             let mut global = false;
             for tok in rest {
                 match tok.as_str() {
                     "-g" | "--global" if !global => global = true,
+                    "-s" | "--silent" => {
+                        overrides.insert("loglevel".to_string(), "silent".to_string());
+                    }
                     _ => return None,
                 }
             }
@@ -8890,7 +8965,7 @@ fn try_parse_fast_command(args: &[String]) -> Option<Cli> {
                 "root" => Commands::Root { global },
                 _ => Commands::Bin { global },
             };
-            Some(Cli { command })
+            Some((Cli { command }, overrides))
         }
         "get" => {
             let mut keys = Vec::new();
@@ -8903,9 +8978,12 @@ fn try_parse_fast_command(args: &[String]) -> Option<Cli> {
             let mut iter = keys.into_iter();
             let key = iter.next();
             let extra_keys: Vec<String> = iter.collect();
-            Some(Cli {
-                command: Commands::Get { key, extra_keys },
-            })
+            Some((
+                Cli {
+                    command: Commands::Get { key, extra_keys },
+                },
+                overrides,
+            ))
         }
         "config" | "c" => {
             let sub = rest.first()?.as_str();
@@ -8922,11 +9000,14 @@ fn try_parse_fast_command(args: &[String]) -> Option<Cli> {
                     let mut iter = keys.into_iter();
                     let key = iter.next();
                     let extra_keys: Vec<String> = iter.collect();
-                    Some(Cli {
-                        command: Commands::Config {
-                            action: ConfigAction::Get { key, extra_keys },
+                    Some((
+                        Cli {
+                            command: Commands::Config {
+                                action: ConfigAction::Get { key, extra_keys },
+                            },
                         },
-                    })
+                        overrides,
+                    ))
                 }
                 "list" | "ls" => {
                     let mut json = false;
@@ -8935,17 +9016,51 @@ fn try_parse_fast_command(args: &[String]) -> Option<Cli> {
                         match tok.as_str() {
                             "--json" if !json => json = true,
                             "-l" | "--long" if !long => long = true,
+                            "-s" | "--silent" => {
+                                overrides.insert("loglevel".to_string(), "silent".to_string());
+                            }
                             _ => return None,
                         }
                     }
-                    Some(Cli {
-                        command: Commands::Config {
-                            action: ConfigAction::List { json, long },
+                    Some((
+                        Cli {
+                            command: Commands::Config {
+                                action: ConfigAction::List { json, long },
+                            },
                         },
-                    })
+                        overrides,
+                    ))
                 }
                 _ => None,
             }
+        }
+        "explain" => {
+            let mut package: Option<String> = None;
+            let mut json = false;
+            let mut i = 0;
+            while i < rest.len() {
+                let tok = rest[i].as_str();
+                match tok {
+                    "--json" if !json => json = true,
+                    "-s" | "--silent" => {
+                        overrides.insert("loglevel".to_string(), "silent".to_string());
+                    }
+                    t if !t.starts_with('-') && package.is_none() => {
+                        package = Some(t.to_string());
+                    }
+                    _ => return None,
+                }
+                i += 1;
+            }
+            Some((
+                Cli {
+                    command: Commands::Explain {
+                        package: package?,
+                        json,
+                    },
+                },
+                overrides,
+            ))
         }
         "list" | "ls" | "la" | "ll" => {
             let mut packages = Vec::new();
@@ -8955,7 +9070,12 @@ fn try_parse_fast_command(args: &[String]) -> Option<Cli> {
             let mut long_flag = false;
             let mut parseable = false;
             let mut package_lock_only = false;
+            let mut omit = Vec::new();
             let mut global = false;
+            let mut prefix = None;
+            let mut workspace = Vec::new();
+            let mut workspaces = false;
+            let mut workspace_root = false;
             let mut i = 0;
             while i < rest.len() {
                 let tok = rest[i].as_str();
@@ -8970,6 +9090,42 @@ fn try_parse_fast_command(args: &[String]) -> Option<Cli> {
                     }
                     i += 1;
                     depth = Some(rest.get(i)?.parse::<usize>().ok()?);
+                } else if let Some(val) = tok.strip_prefix("--omit=") {
+                    if val.is_empty() {
+                        return None;
+                    }
+                    omit.extend(val.split(',').map(str::to_string));
+                } else if tok == "--omit" {
+                    i += 1;
+                    let val = rest.get(i)?;
+                    if val.is_empty() || val.starts_with('-') {
+                        return None;
+                    }
+                    omit.extend(val.split(',').map(str::to_string));
+                } else if let Some(val) = tok.strip_prefix("--prefix=") {
+                    if prefix.is_some() || val.is_empty() {
+                        return None;
+                    }
+                    prefix = Some(PathBuf::from(val));
+                } else if tok == "--prefix" {
+                    if prefix.is_some() {
+                        return None;
+                    }
+                    i += 1;
+                    let val = rest.get(i)?;
+                    if val.is_empty() || val.starts_with('-') {
+                        return None;
+                    }
+                    prefix = Some(PathBuf::from(val));
+                } else if let Some(val) = tok.strip_prefix("--workspace=") {
+                    workspace.push(val.to_string());
+                } else if tok == "-w" || tok == "--workspace" {
+                    i += 1;
+                    let val = rest.get(i)?;
+                    if val.starts_with('-') {
+                        return None;
+                    }
+                    workspace.push(val.clone());
                 } else {
                     match tok {
                         "-a" | "--all" if !all => all = true,
@@ -8978,32 +9134,620 @@ fn try_parse_fast_command(args: &[String]) -> Option<Cli> {
                         "-p" | "--parseable" if !parseable => parseable = true,
                         "--package-lock-only" if !package_lock_only => package_lock_only = true,
                         "-g" | "--global" if !global => global = true,
+                        "--workspaces" => workspaces = true,
+                        "--workspace-root" | "--include-workspace-root" => workspace_root = true,
+                        "-s" | "--silent" => {
+                            overrides.insert("loglevel".to_string(), "silent".to_string());
+                        }
                         t if !t.starts_with('-') => packages.push(t.to_string()),
                         _ => return None,
                     }
                 }
                 i += 1;
             }
-            Some(Cli {
-                command: Commands::List {
-                    packages,
-                    depth,
-                    all,
-                    json,
-                    long: long_flag || cmd_name == "la" || cmd_name == "ll",
-                    parseable,
-                    package_lock_only,
-                    omit: Vec::new(),
-                    global,
-                    prefix: None,
-                    workspace: Vec::new(),
-                    workspaces: false,
-                    workspace_root: false,
+            Some((
+                Cli {
+                    command: Commands::List {
+                        packages,
+                        depth,
+                        all,
+                        json,
+                        long: long_flag || cmd_name == "la" || cmd_name == "ll",
+                        parseable,
+                        package_lock_only,
+                        omit,
+                        global,
+                        prefix,
+                        workspace,
+                        workspaces,
+                        workspace_root,
+                    },
                 },
-            })
+                overrides,
+            ))
+        }
+        "prune" => {
+            let mut omit = Vec::new();
+            let mut include = Vec::new();
+            let mut production = false;
+            let mut dry_run = false;
+            let mut json = false;
+            let mut workspace_root = false;
+            let mut workspace = Vec::new();
+            let mut workspaces = false;
+            let mut i = 0;
+            while i < rest.len() {
+                let tok = rest[i].as_str();
+                if let Some(val) = tok.strip_prefix("--omit=") {
+                    omit.extend(val.split(',').filter(|s| !s.is_empty()).map(str::to_string));
+                } else if tok == "--omit" {
+                    i += 1;
+                    let val = rest.get(i)?;
+                    if val.starts_with('-') {
+                        return None;
+                    }
+                    omit.extend(val.split(',').filter(|s| !s.is_empty()).map(str::to_string));
+                } else if let Some(val) = tok.strip_prefix("--include=") {
+                    include.extend(val.split(',').filter(|s| !s.is_empty()).map(str::to_string));
+                } else if tok == "--include" {
+                    i += 1;
+                    let val = rest.get(i)?;
+                    if val.starts_with('-') {
+                        return None;
+                    }
+                    include.extend(val.split(',').filter(|s| !s.is_empty()).map(str::to_string));
+                } else if let Some(val) = tok.strip_prefix("--workspace=") {
+                    workspace.push(val.to_string());
+                } else if tok == "-w" || tok == "--workspace" {
+                    i += 1;
+                    let val = rest.get(i)?;
+                    if val.starts_with('-') {
+                        return None;
+                    }
+                    workspace.push(val.clone());
+                } else {
+                    match tok {
+                        "-p" | "--production" => production = true,
+                        "--dry-run" => dry_run = true,
+                        "--json" => json = true,
+                        "--workspace-root" | "--include-workspace-root" => workspace_root = true,
+                        "--workspaces" => workspaces = true,
+                        "-s" | "--silent" => {
+                            overrides.insert("loglevel".to_string(), "silent".to_string());
+                        }
+                        _ => return None,
+                    }
+                }
+                i += 1;
+            }
+            Some((
+                Cli {
+                    command: Commands::Prune {
+                        omit,
+                        include,
+                        production,
+                        dry_run,
+                        json,
+                        workspace_root,
+                        workspace,
+                        workspaces,
+                    },
+                },
+                overrides,
+            ))
+        }
+        "install" | "i" | "add" | "in" | "ins" | "inst" | "insta" | "instal" | "isnt"
+        | "isnta" | "isntal" | "isntall" | "ci" | "clean-install" | "ic" | "install-clean"
+        | "isntall-clean" => {
+            let is_ci = matches!(
+                cmd_name,
+                "ci" | "clean-install" | "ic" | "install-clean" | "isntall-clean"
+            );
+            let mut packages = Vec::new();
+            let mut registry = None;
+            let mut cache = None;
+            let mut offline = false;
+            let mut force = false;
+            let mut ignore_scripts = false;
+            let mut foreground_scripts = false;
+            let mut strict_sandbox = false;
+            let mut legacy_peer_deps = false;
+            let mut strict_peer_deps = false;
+            let mut package_lock_only = false;
+            let mut omit = Vec::new();
+            let mut include = Vec::new();
+            let mut no_package_lock = false;
+            let mut no_format_package_lock = false;
+            let mut format_package_lock = None;
+            let mut lockfile_version = None;
+            let mut package_lock = None;
+            let mut dry_run = false;
+            let mut os = None;
+            let mut cpu = None;
+            let mut libc = None;
+            let mut no_audit = false;
+            let mut audit = None;
+            let mut no_fund = false;
+            let mut fund = None;
+            let mut workspace_root = false;
+            let mut workspace = Vec::new();
+            let mut workspaces = false;
+            let mut save_dev = false;
+            let mut save_exact = false;
+            let mut save_prefix = None;
+            let mut save_prod = false;
+            let mut save_optional = false;
+            let mut save_peer = false;
+            let mut no_save = false;
+            let mut global = false;
+            let mut prefix = None;
+            let mut timing = false;
+            let mut install_strategy = None;
+            let mut wait_for_trash = false;
+            let mut detached_trash = true;
+            let mut seen_detached_trash = false;
+            let mut seen_prefix = false;
+            let mut seen_loglevel = false;
+            let mut json = false;
+            let mut no_bin_links = false;
+            let mut bin_links = None;
+
+            let mut i = 0;
+            while i < rest.len() {
+                let tok = rest[i].as_str();
+                if let Some(val) = tok.strip_prefix("--registry=") {
+                    if registry.is_some() {
+                        return None;
+                    }
+                    registry = Some(val.to_string());
+                } else if tok == "--registry" {
+                    if registry.is_some() {
+                        return None;
+                    }
+                    i += 1;
+                    let val = rest.get(i)?;
+                    if val.starts_with('-') {
+                        return None;
+                    }
+                    registry = Some(val.clone());
+                } else if let Some(val) = tok.strip_prefix("--cache=") {
+                    if cache.is_some() || val.is_empty() {
+                        return None;
+                    }
+                    cache = Some(PathBuf::from(val));
+                } else if tok == "--cache" {
+                    if cache.is_some() {
+                        return None;
+                    }
+                    i += 1;
+                    let val = rest.get(i)?;
+                    if val.is_empty() || val.starts_with('-') {
+                        return None;
+                    }
+                    cache = Some(PathBuf::from(val));
+                } else if let Some(val) = tok.strip_prefix("--prefix=") {
+                    if seen_prefix || val.is_empty() {
+                        return None;
+                    }
+                    seen_prefix = true;
+                    if is_ci {
+                        overrides.insert("prefix".to_string(), val.to_string());
+                    } else {
+                        prefix = Some(PathBuf::from(val));
+                    }
+                } else if tok == "--prefix" {
+                    if seen_prefix {
+                        return None;
+                    }
+                    seen_prefix = true;
+                    i += 1;
+                    let val = rest.get(i)?;
+                    if val.is_empty() || val.starts_with('-') {
+                        return None;
+                    }
+                    if is_ci {
+                        overrides.insert("prefix".to_string(), val.clone());
+                    } else {
+                        prefix = Some(PathBuf::from(val));
+                    }
+                } else if let Some(val) = tok.strip_prefix("--omit=") {
+                    if val.is_empty() {
+                        return None;
+                    }
+                    omit.extend(val.split(',').map(str::to_string));
+                } else if tok == "--omit" {
+                    i += 1;
+                    let val = rest.get(i)?;
+                    if val.is_empty() || val.starts_with('-') {
+                        return None;
+                    }
+                    omit.extend(val.split(',').map(str::to_string));
+                } else if let Some(val) = tok.strip_prefix("--include=") {
+                    if val.is_empty() {
+                        return None;
+                    }
+                    include.extend(val.split(',').map(str::to_string));
+                } else if tok == "--include" {
+                    i += 1;
+                    let val = rest.get(i)?;
+                    if val.is_empty() || val.starts_with('-') {
+                        return None;
+                    }
+                    include.extend(val.split(',').map(str::to_string));
+                } else if let Some(val) = tok.strip_prefix("--install-strategy=") {
+                    if install_strategy.is_some()
+                        || !matches!(val, "hoisted" | "linked" | "nested" | "shallow")
+                    {
+                        return None;
+                    }
+                    install_strategy = Some(val.to_string());
+                } else if tok == "--install-strategy" {
+                    if install_strategy.is_some() {
+                        return None;
+                    }
+                    i += 1;
+                    let val = rest.get(i)?;
+                    if !matches!(val.as_str(), "hoisted" | "linked" | "nested" | "shallow") {
+                        return None;
+                    }
+                    install_strategy = Some(val.clone());
+                } else if let Some(val) = tok.strip_prefix("--lockfile-version=") {
+                    if lockfile_version.is_some() {
+                        return None;
+                    }
+                    let v = val.parse::<u32>().ok()?;
+                    if !(1..=3).contains(&v) {
+                        return None;
+                    }
+                    lockfile_version = Some(v);
+                } else if tok == "--lockfile-version" {
+                    if lockfile_version.is_some() {
+                        return None;
+                    }
+                    i += 1;
+                    let v = rest.get(i)?.parse::<u32>().ok()?;
+                    if !(1..=3).contains(&v) {
+                        return None;
+                    }
+                    lockfile_version = Some(v);
+                } else if let Some(val) = tok.strip_prefix("--os=") {
+                    if os.is_some() {
+                        return None;
+                    }
+                    os = Some(val.to_string());
+                } else if tok == "--os" {
+                    if os.is_some() {
+                        return None;
+                    }
+                    i += 1;
+                    let val = rest.get(i)?;
+                    if val.starts_with('-') {
+                        return None;
+                    }
+                    os = Some(val.clone());
+                } else if let Some(val) = tok.strip_prefix("--cpu=") {
+                    if cpu.is_some() {
+                        return None;
+                    }
+                    cpu = Some(val.to_string());
+                } else if tok == "--cpu" {
+                    if cpu.is_some() {
+                        return None;
+                    }
+                    i += 1;
+                    let val = rest.get(i)?;
+                    if val.starts_with('-') {
+                        return None;
+                    }
+                    cpu = Some(val.clone());
+                } else if let Some(val) = tok.strip_prefix("--libc=") {
+                    if libc.is_some() {
+                        return None;
+                    }
+                    libc = Some(val.to_string());
+                } else if tok == "--libc" {
+                    if libc.is_some() {
+                        return None;
+                    }
+                    i += 1;
+                    let val = rest.get(i)?;
+                    if val.starts_with('-') {
+                        return None;
+                    }
+                    libc = Some(val.clone());
+                } else if let Some(val) = tok.strip_prefix("--workspace=") {
+                    workspace.push(val.to_string());
+                } else if tok == "-w" || tok == "--workspace" {
+                    i += 1;
+                    let val = rest.get(i)?;
+                    if val.starts_with('-') {
+                        return None;
+                    }
+                    workspace.push(val.clone());
+                } else if let Some(val) = tok.strip_prefix("--save-prefix=") {
+                    if is_ci || save_prefix.is_some() {
+                        return None;
+                    }
+                    save_prefix = Some(val.to_string());
+                } else if tok == "--save-prefix" {
+                    if is_ci || save_prefix.is_some() {
+                        return None;
+                    }
+                    i += 1;
+                    let val = rest.get(i)?;
+                    if val.starts_with('-') {
+                        return None;
+                    }
+                    save_prefix = Some(val.clone());
+                } else if let Some(val) = tok.strip_prefix("--loglevel=") {
+                    if seen_loglevel {
+                        return None;
+                    }
+                    seen_loglevel = true;
+                    overrides.insert("loglevel".to_string(), val.to_string());
+                } else if tok == "--loglevel" {
+                    if seen_loglevel {
+                        return None;
+                    }
+                    seen_loglevel = true;
+                    i += 1;
+                    let val = rest.get(i)?;
+                    if val.starts_with('-') {
+                        return None;
+                    }
+                    overrides.insert("loglevel".to_string(), val.clone());
+                } else if let Some(val) = tok.strip_prefix("--audit=") {
+                    if audit.is_some() || no_audit {
+                        return None;
+                    }
+                    audit = Some(parse_opt_bool_val(val)?);
+                } else if let Some(val) = tok.strip_prefix("--fund=") {
+                    if fund.is_some() || no_fund {
+                        return None;
+                    }
+                    fund = Some(parse_opt_bool_val(val)?);
+                } else if let Some(val) = tok.strip_prefix("--package-lock=") {
+                    if package_lock.is_some() || no_package_lock {
+                        return None;
+                    }
+                    package_lock = Some(parse_opt_bool_val(val)?);
+                } else if let Some(val) = tok.strip_prefix("--format-package-lock=") {
+                    if format_package_lock.is_some() || no_format_package_lock {
+                        return None;
+                    }
+                    format_package_lock = Some(parse_opt_bool_val(val)?);
+                } else if let Some(val) = tok.strip_prefix("--bin-links=") {
+                    if bin_links.is_some() || no_bin_links {
+                        return None;
+                    }
+                    bin_links = Some(parse_opt_bool_val(val)?);
+                } else if let Some(val) = tok.strip_prefix("--detached-trash=") {
+                    if seen_detached_trash {
+                        return None;
+                    }
+                    seen_detached_trash = true;
+                    detached_trash = parse_opt_bool_val(val)?;
+                } else if tok == "--detached-trash" {
+                    if seen_detached_trash {
+                        return None;
+                    }
+                    seen_detached_trash = true;
+                    i += 1;
+                    let val = rest.get(i)?;
+                    detached_trash = parse_opt_bool_val(val)?;
+                } else {
+                    match tok {
+                        "--offline" if !offline => offline = true,
+                        "-f" | "--force" if !force => force = true,
+                        "--ignore-scripts" if !ignore_scripts => ignore_scripts = true,
+                        "--foreground-scripts" if !foreground_scripts => foreground_scripts = true,
+                        "--strict-sandbox" if !strict_sandbox => strict_sandbox = true,
+                        "--legacy-peer-deps" if !legacy_peer_deps => legacy_peer_deps = true,
+                        "--strict-peer-deps" if !strict_peer_deps => strict_peer_deps = true,
+                        "--package-lock-only" if !package_lock_only => package_lock_only = true,
+                        "--no-package-lock" if !no_package_lock && package_lock.is_none() => {
+                            no_package_lock = true;
+                        }
+                        "--package-lock" if package_lock.is_none() && !no_package_lock => {
+                            if let Some(val) = rest.get(i + 1).and_then(|v| parse_opt_bool_val(v)) {
+                                i += 1;
+                                package_lock = Some(val);
+                            } else {
+                                package_lock = Some(true);
+                            }
+                        }
+                        "--no-format-package-lock"
+                            if !no_format_package_lock && format_package_lock.is_none() =>
+                        {
+                            no_format_package_lock = true;
+                        }
+                        "--format-package-lock"
+                            if format_package_lock.is_none() && !no_format_package_lock =>
+                        {
+                            if let Some(val) = rest.get(i + 1).and_then(|v| parse_opt_bool_val(v)) {
+                                i += 1;
+                                format_package_lock = Some(val);
+                            } else {
+                                format_package_lock = Some(true);
+                            }
+                        }
+                        "--dry-run" if !dry_run => dry_run = true,
+                        "--no-audit" if !no_audit && audit.is_none() => no_audit = true,
+                        "--audit" if audit.is_none() && !no_audit => {
+                            if let Some(val) = rest.get(i + 1).and_then(|v| parse_opt_bool_val(v)) {
+                                i += 1;
+                                audit = Some(val);
+                            } else {
+                                audit = Some(true);
+                            }
+                        }
+                        "--no-fund" if !no_fund && fund.is_none() => no_fund = true,
+                        "--fund" if fund.is_none() && !no_fund => {
+                            if let Some(val) = rest.get(i + 1).and_then(|v| parse_opt_bool_val(v)) {
+                                i += 1;
+                                fund = Some(val);
+                            } else {
+                                fund = Some(true);
+                            }
+                        }
+                        "--no-bin-links" if !no_bin_links && bin_links.is_none() => {
+                            no_bin_links = true;
+                        }
+                        "--bin-links" if bin_links.is_none() && !no_bin_links => {
+                            if let Some(val) = rest.get(i + 1).and_then(|v| parse_opt_bool_val(v)) {
+                                i += 1;
+                                bin_links = Some(val);
+                            } else {
+                                bin_links = Some(true);
+                            }
+                        }
+                        "--workspace-root" | "--include-workspace-root" if !workspace_root => {
+                            workspace_root = true;
+                        }
+                        "--workspaces" if !workspaces => workspaces = true,
+                        "--timing" if !timing => timing = true,
+                        "--wait-for-trash" | "--wait-trash" if !wait_for_trash => {
+                            wait_for_trash = true;
+                        }
+                        "--json" if !json => json = true,
+                        "-s" | "--silent" => {
+                            overrides.insert("loglevel".to_string(), "silent".to_string());
+                        }
+                        "--prefer-offline" => {
+                            overrides.insert("prefer-offline".to_string(), "true".to_string());
+                        }
+                        "--prefer-online" => {
+                            overrides.insert("prefer-online".to_string(), "true".to_string());
+                        }
+                        "--prefer-dedupe" => {
+                            overrides.insert("prefer-dedupe".to_string(), "true".to_string());
+                        }
+                        "--install-links" => {
+                            overrides.insert("install-links".to_string(), "true".to_string());
+                        }
+                        "-D" | "--save-dev" if !is_ci && !save_dev => save_dev = true,
+                        "-E" | "--save-exact" if !is_ci && !save_exact => save_exact = true,
+                        "-P" | "-S" | "--save-prod" | "--save" if !is_ci && !save_prod => {
+                            save_prod = true;
+                        }
+                        "-O" | "--save-optional" if !is_ci && !save_optional => {
+                            save_optional = true;
+                        }
+                        "--save-peer" if !is_ci && !save_peer => save_peer = true,
+                        "--no-save" if !is_ci && !no_save => no_save = true,
+                        "-g" | "--global" if !is_ci && !global => global = true,
+                        t if !t.starts_with('-') && !is_ci => packages.push(t.to_string()),
+                        _ => return None,
+                    }
+                }
+                i += 1;
+            }
+            let command = if is_ci {
+                Commands::Ci {
+                    registry,
+                    cache,
+                    offline,
+                    force,
+                    ignore_scripts,
+                    foreground_scripts,
+                    strict_sandbox,
+                    omit,
+                    legacy_peer_deps,
+                    strict_peer_deps,
+                    package_lock_only,
+                    include,
+                    no_package_lock,
+                    no_format_package_lock,
+                    format_package_lock,
+                    package_lock,
+                    lockfile_version,
+                    dry_run,
+                    os,
+                    cpu,
+                    libc,
+                    no_audit,
+                    audit,
+                    no_fund,
+                    fund,
+                    workspace_root,
+                    workspace,
+                    workspaces,
+                    timing,
+                    install_strategy,
+                    wait_for_trash,
+                    detached_trash,
+                    json,
+                    no_bin_links,
+                    bin_links,
+                }
+            } else {
+                Commands::Install {
+                    packages,
+                    registry,
+                    cache,
+                    offline,
+                    force,
+                    ignore_scripts,
+                    foreground_scripts,
+                    strict_sandbox,
+                    legacy_peer_deps,
+                    strict_peer_deps,
+                    package_lock_only,
+                    omit,
+                    include,
+                    no_package_lock,
+                    no_format_package_lock,
+                    format_package_lock,
+                    lockfile_version,
+                    package_lock,
+                    dry_run,
+                    os,
+                    cpu,
+                    libc,
+                    no_audit,
+                    audit,
+                    no_fund,
+                    fund,
+                    workspace_root,
+                    workspace,
+                    workspaces,
+                    save_dev,
+                    save_exact,
+                    save_prefix,
+                    save_prod,
+                    save_optional,
+                    save_peer,
+                    no_save,
+                    global,
+                    prefix,
+                    timing,
+                    install_strategy,
+                    wait_for_trash,
+                    detached_trash,
+                    json,
+                    no_bin_links,
+                    bin_links,
+                }
+            };
+            Some((Cli { command }, overrides))
         }
         _ => None,
     }
+}
+
+fn init_cli_request_context(command_name: &str, config: &rnpm_config::Config) {
+    let mut agent = config
+        .npmrc
+        .settings
+        .get("user-agent")
+        .cloned()
+        .unwrap_or_else(crate::node_info::npm_user_agent);
+    if config.get_bool("workspaces") == Some(true)
+        || config.get("workspace").is_some_and(|v| !v.is_empty())
+    {
+        agent = agent.replace("workspaces/false", "workspaces/true");
+    }
+    rnpm_registry::client::set_cli_request_context(command_name.to_string(), agent);
 }
 
 fn main() {
@@ -9068,8 +9812,18 @@ fn main() {
         std::process::exit(1);
     }
 
-    let (filtered_args, cached_cmd) = preprocess_cli_args_with_cmd(filtered_args);
     let inv_cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let fast_parsed = try_parse_fast_command_with_overrides(&filtered_args);
+    let (filtered_args, cached_cmd, fast_cli_opt) = if let Some((fast_cli, overrides)) = fast_parsed
+    {
+        if !overrides.is_empty() {
+            rnpm_config::set_process_cli_overrides(overrides);
+        }
+        (filtered_args, None, Some(fast_cli))
+    } else {
+        let (preprocessed, cmd) = preprocess_cli_args_with_cmd(filtered_args);
+        (preprocessed, cmd, None)
+    };
     let mut ambient_config: Option<rnpm_config::Config> = None;
     if warn_workspaces {
         let cfg = rnpm_config::Config::load(Some(&inv_cwd)).unwrap_or_default();
@@ -9168,7 +9922,7 @@ fn main() {
         }
     }
 
-    let parse_res = if let Some(fast_cli) = try_parse_fast_command(&filtered_args) {
+    let parse_res = if let Some(fast_cli) = fast_cli_opt {
         Ok(fast_cli)
     } else {
         match cached_cmd {
@@ -9246,21 +10000,13 @@ fn main() {
         std::process::exit(0);
     }
 
-    let command_name = cli.command.command_name();
-    let mut agent = effective_config
-        .npmrc
-        .settings
-        .get("user-agent")
-        .cloned()
-        .unwrap_or_else(crate::node_info::npm_user_agent);
-    if effective_config.get_bool("workspaces") == Some(true)
-        || effective_config.get("workspace").is_some_and(|v| !v.is_empty())
-    {
-        agent = agent.replace("workspaces/false", "workspaces/true");
-    }
-    rnpm_registry::client::set_cli_request_context(command_name.to_string(), agent);
+    init_cli_request_context(cli.command.command_name(), &effective_config);
 
+    let worker_threads = std::thread::available_parallelism()
+        .map(|n| n.get().clamp(2, 4))
+        .unwrap_or(4);
     let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(worker_threads)
         .enable_all()
         .build()
         .expect("Failed to initialize async runtime");
@@ -9271,6 +10017,10 @@ fn main() {
         }
         finish_cli_error(&err);
     }
+    let _ = std::io::Write::flush(&mut std::io::stdout());
+    let _ = std::io::Write::flush(&mut std::io::stderr());
+    std::mem::forget(rt);
+    std::process::exit(0);
 }
 
 #[cfg(test)]

@@ -69,16 +69,19 @@ pub fn compute_project_fingerprint(project_dir: &Path, options: &InstallOptions)
     // 3. Lockfile: npm-shrinkwrap.json takes precedence over package-lock.json in npm
     let shrinkwrap_path = project_dir.join("npm-shrinkwrap.json");
     let lockfile_path = project_dir.join("package-lock.json");
+    let mut lockfile_bytes_for_version: Option<Vec<u8>> = None;
     match std::fs::read(&shrinkwrap_path) {
         Ok(bytes) => {
             hasher.update(b"\nlockfile:npm-shrinkwrap.json:\n");
             hasher.update(&bytes);
+            lockfile_bytes_for_version = Some(bytes);
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             match std::fs::read(&lockfile_path) {
                 Ok(bytes) => {
                     hasher.update(b"\nlockfile:package-lock.json:\n");
                     hasher.update(&bytes);
+                    lockfile_bytes_for_version = Some(bytes);
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                     hasher.update(b"\nlockfile:none\n");
@@ -94,8 +97,8 @@ pub fn compute_project_fingerprint(project_dir: &Path, options: &InstallOptions)
     }
 
     // 4. .npmrc configuration & registry settings
-    let config = if let Some(ref c) = options.config_override {
-        c.clone()
+    let config: std::borrow::Cow<'_, Config> = if let Some(ref c) = options.config_override {
+        std::borrow::Cow::Borrowed(c)
     } else {
         let mut config_opts = rnpm_config::ConfigOptions::new().project_dir(project_dir);
         if let Some(userconfig) = rnpm_config::get_process_userconfig() {
@@ -114,9 +117,11 @@ pub fn compute_project_fingerprint(project_dir: &Path, options: &InstallOptions)
         if let Some(ref ws) = ws_root {
             config_opts = config_opts.workspace_root(ws.as_path());
         }
-        Config::load_with_options(config_opts)
-            .or_else(|_| Config::load(Some(project_dir)))
-            .unwrap_or_default()
+        std::borrow::Cow::Owned(
+            Config::load_with_options(config_opts)
+                .or_else(|_| Config::load(Some(project_dir)))
+                .unwrap_or_default(),
+        )
     };
     hasher.update(format!("\nnpmrc:registry:{}\n", config.npmrc.registry).as_bytes());
     let mut sorted_scoped: Vec<_> = config.npmrc.scoped_registries.iter().collect();
@@ -198,6 +203,18 @@ pub fn compute_project_fingerprint(project_dir: &Path, options: &InstallOptions)
     let mut sorted_min_release_age_exclude = options.min_release_age_exclude.clone();
     sorted_min_release_age_exclude.sort();
 
+    let effective_lock_ver = if let Some(v) = options.lockfile_version {
+        v
+    } else if let Some(ref bytes) = lockfile_bytes_for_version {
+        std::str::from_utf8(bytes)
+            .ok()
+            .and_then(crate::detect_lockfile_version)
+            .filter(|&v| v == 2)
+            .unwrap_or(3)
+    } else {
+        3
+    };
+
     hasher.update(
         format!(
             "\noptions:install_strategy={:?}:omit_dev={}:omit_opt={}:omit_peer={}:legacy_peer={}:strict_peer={}:global={}:os={:?}:cpu={:?}:libc={:?}:target_os={}:target_cpu={}:target_libc={:?}:lock_ver={}:include={:?}:workspaces={}:workspace_root={}:workspace={:?}:bin_links={}:force={}:ignore_scripts={}:offline={}:prefer_offline={}:prefer_online={}:prefer_dedupe={}:install_links={}:package_lock_only={}:pkg_lock={}:no_pkg_lock={}:registry_url={:?}:before={:?}:release_age_ex={:?}:store_dir={:?}:strict_sandbox={}:foreground_scripts={}:audit={}:fund={}:source_policy={:?}:force_non_root={}:config_override={}\n",
@@ -214,7 +231,7 @@ pub fn compute_project_fingerprint(project_dir: &Path, options: &InstallOptions)
             target_platform.os,
             target_platform.cpu,
             target_platform.libc,
-            options.effective_lockfile_version(),
+            effective_lock_ver,
             sorted_include,
             options.workspaces,
             options.workspace_root,

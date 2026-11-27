@@ -355,7 +355,7 @@ fn remove_dir_safe(path: &Path) -> Result<(), FsError> {
 mod win_rm {
     use super::*;
     use std::collections::VecDeque;
-    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::{AtomicBool, AtomicUsize};
     use std::sync::{Arc, Condvar, Mutex};
 
     const FILE_ATTRIBUTE_READONLY: u32 = 0x1;
@@ -558,146 +558,183 @@ mod win_rm {
         pattern_buf: &mut Vec<u16>,
         child_buf: &mut Vec<u16>,
         subdirs_out: &mut Vec<DirItem>,
+        single_chain: &mut Vec<Vec<u16>>,
     ) -> Result<(), FsError> {
-        if dir.is_ro {
-            dir.wide_no_null.push(0);
-            unsafe {
-                SetFileAttributesW(dir.wide_no_null.as_ptr(), FILE_ATTRIBUTE_NORMAL);
-            }
-            dir.wide_no_null.pop();
-        }
+        single_chain.clear();
+        let top_parent = dir.parent.take();
 
-        let needs_sep = !dir.wide_no_null.ends_with(&[b'\\' as u16]);
-        pattern_buf.clear();
-        pattern_buf.extend_from_slice(&dir.wide_no_null);
-        if needs_sep {
-            pattern_buf.push(b'\\' as u16);
-        }
-        pattern_buf.push(b'*' as u16);
-        pattern_buf.push(0);
-
-        let mut find_data: WIN32_FIND_DATAW = unsafe { std::mem::zeroed() };
-        let mut handle = unsafe {
-            FindFirstFileExW(
-                pattern_buf.as_ptr(),
-                FIND_EX_INFO_BASIC,
-                &mut find_data,
-                FIND_EX_SEARCH_NAME_MATCH,
-                std::ptr::null_mut(),
-                FIND_FIRST_EX_LARGE_FETCH,
-            )
-        };
-        if handle == INVALID_HANDLE_VALUE {
-            let err = unsafe { GetLastError() };
-            if err == ERROR_INVALID_PARAMETER || err == ERROR_NOT_SUPPORTED {
-                handle = unsafe {
-                    FindFirstFileExW(
-                        pattern_buf.as_ptr(),
-                        FIND_EX_INFO_STANDARD,
-                        &mut find_data,
-                        FIND_EX_SEARCH_NAME_MATCH,
-                        std::ptr::null_mut(),
-                        0,
-                    )
-                };
-            }
-        }
-        if handle == INVALID_HANDLE_VALUE {
-            let err = unsafe { GetLastError() };
-            if err == ERROR_ACCESS_DENIED {
+        loop {
+            if dir.is_ro {
                 dir.wide_no_null.push(0);
                 unsafe {
                     SetFileAttributesW(dir.wide_no_null.as_ptr(), FILE_ATTRIBUTE_NORMAL);
                 }
                 dir.wide_no_null.pop();
-                handle = unsafe {
-                    FindFirstFileExW(
-                        pattern_buf.as_ptr(),
-                        FIND_EX_INFO_BASIC,
-                        &mut find_data,
-                        FIND_EX_SEARCH_NAME_MATCH,
-                        std::ptr::null_mut(),
-                        FIND_FIRST_EX_LARGE_FETCH,
-                    )
+            }
+
+            let needs_sep = !dir.wide_no_null.ends_with(&[b'\\' as u16]);
+            pattern_buf.clear();
+            pattern_buf.extend_from_slice(&dir.wide_no_null);
+            if needs_sep {
+                pattern_buf.push(b'\\' as u16);
+            }
+            pattern_buf.push(b'*' as u16);
+            pattern_buf.push(0);
+
+            let mut find_data: WIN32_FIND_DATAW = unsafe { std::mem::zeroed() };
+            let mut handle = unsafe {
+                FindFirstFileExW(
+                    pattern_buf.as_ptr(),
+                    FIND_EX_INFO_BASIC,
+                    &mut find_data,
+                    FIND_EX_SEARCH_NAME_MATCH,
+                    std::ptr::null_mut(),
+                    FIND_FIRST_EX_LARGE_FETCH,
+                )
+            };
+            if handle == INVALID_HANDLE_VALUE {
+                let err = unsafe { GetLastError() };
+                if err == ERROR_INVALID_PARAMETER || err == ERROR_NOT_SUPPORTED {
+                    handle = unsafe {
+                        FindFirstFileExW(
+                            pattern_buf.as_ptr(),
+                            FIND_EX_INFO_STANDARD,
+                            &mut find_data,
+                            FIND_EX_SEARCH_NAME_MATCH,
+                            std::ptr::null_mut(),
+                            0,
+                        )
+                    };
+                }
+            }
+            if handle == INVALID_HANDLE_VALUE {
+                let err = unsafe { GetLastError() };
+                if err == ERROR_ACCESS_DENIED {
+                    dir.wide_no_null.push(0);
+                    unsafe {
+                        SetFileAttributesW(dir.wide_no_null.as_ptr(), FILE_ATTRIBUTE_NORMAL);
+                    }
+                    dir.wide_no_null.pop();
+                    handle = unsafe {
+                        FindFirstFileExW(
+                            pattern_buf.as_ptr(),
+                            FIND_EX_INFO_BASIC,
+                            &mut find_data,
+                            FIND_EX_SEARCH_NAME_MATCH,
+                            std::ptr::null_mut(),
+                            FIND_FIRST_EX_LARGE_FETCH,
+                        )
+                    };
+                }
+            }
+            if handle == INVALID_HANDLE_VALUE {
+                let err = unsafe { GetLastError() };
+                if err == ERROR_FILE_NOT_FOUND || err == ERROR_PATH_NOT_FOUND {
+                    while let Some(mut anc_wide) = single_chain.pop() {
+                        anc_wide.push(0);
+                        remove_dir_wide(&anc_wide, false)?;
+                    }
+                    return cascade_remove_parents(top_parent);
+                }
+                return Err(FsError::Io(std::io::Error::from_raw_os_error(err as i32)));
+            }
+
+            let mut raw_subdirs: Vec<(Vec<u16>, bool)> = Vec::new();
+            {
+                let _guard = FindGuard(handle);
+                loop {
+                    let c = &find_data.cFileName;
+                    let is_dot = (c[0] == b'.' as u16 && c[1] == 0)
+                        || (c[0] == b'.' as u16 && c[1] == b'.' as u16 && c[2] == 0);
+                    if !is_dot {
+                        let name_len = c.iter().position(|&ch| ch == 0).unwrap_or(c.len());
+                        child_buf.clear();
+                        child_buf.extend_from_slice(&dir.wide_no_null);
+                        if needs_sep {
+                            child_buf.push(b'\\' as u16);
+                        }
+                        child_buf.extend_from_slice(&c[..name_len]);
+
+                        let attrs = find_data.dwFileAttributes;
+                        let is_ro = (attrs & FILE_ATTRIBUTE_READONLY) != 0;
+                        let is_reparse = (attrs & FILE_ATTRIBUTE_REPARSE_POINT) != 0;
+                        let is_dir = (attrs & FILE_ATTRIBUTE_DIRECTORY) != 0;
+
+                        if is_reparse {
+                            // Reparse points / junctions / symlinks: NEVER push to subdirs!
+                            child_buf.push(0);
+                            remove_reparse_wide(child_buf, is_dir, is_ro)?;
+                        } else if is_dir {
+                            raw_subdirs.push((child_buf.clone(), is_ro));
+                        } else {
+                            child_buf.push(0);
+                            remove_file_wide(child_buf, is_ro)?;
+                        }
+                    }
+
+                    if unsafe { FindNextFileW(handle, &mut find_data) } == 0 {
+                        let err = unsafe { GetLastError() };
+                        if err == ERROR_NO_MORE_FILES {
+                            break;
+                        }
+                        return Err(FsError::Io(std::io::Error::from_raw_os_error(err as i32)));
+                    }
+                }
+            }
+
+            if raw_subdirs.is_empty() {
+                dir.wide_no_null.push(0);
+                remove_dir_wide(&dir.wide_no_null, false)?;
+                while let Some(mut anc_wide) = single_chain.pop() {
+                    anc_wide.push(0);
+                    remove_dir_wide(&anc_wide, false)?;
+                }
+                return cascade_remove_parents(top_parent);
+            }
+
+            if raw_subdirs.len() == 1 {
+                // Single-child directory: descend immediately on this worker without
+                // Arc allocation or global queue synchronization.
+                single_chain.push(dir.wide_no_null);
+                let (sub_wide, is_ro) = raw_subdirs.pop().unwrap();
+                dir = DirItem {
+                    wide_no_null: sub_wide,
+                    is_ro,
+                    parent: None,
                 };
+                continue;
             }
-        }
-        if handle == INVALID_HANDLE_VALUE {
-            let err = unsafe { GetLastError() };
-            if err == ERROR_FILE_NOT_FOUND || err == ERROR_PATH_NOT_FOUND {
-                return cascade_remove_parents(dir.parent);
+
+            let mut curr_parent = top_parent;
+            for mut anc_wide in single_chain.drain(..) {
+                anc_wide.push(0);
+                curr_parent = Some(Arc::new(ParentDir {
+                    wide_null: anc_wide,
+                    remaining: AtomicUsize::new(1),
+                    parent: curr_parent,
+                }));
             }
-            return Err(FsError::Io(std::io::Error::from_raw_os_error(err as i32)));
-        }
-
-        let mut raw_subdirs: Vec<(Vec<u16>, bool)> = Vec::new();
-        {
-            let _guard = FindGuard(handle);
-            loop {
-                let c = &find_data.cFileName;
-                let is_dot = (c[0] == b'.' as u16 && c[1] == 0)
-                    || (c[0] == b'.' as u16 && c[1] == b'.' as u16 && c[2] == 0);
-                if !is_dot {
-                    let name_len = c.iter().position(|&ch| ch == 0).unwrap_or(c.len());
-                    child_buf.clear();
-                    child_buf.extend_from_slice(&dir.wide_no_null);
-                    if needs_sep {
-                        child_buf.push(b'\\' as u16);
-                    }
-                    child_buf.extend_from_slice(&c[..name_len]);
-
-                    let attrs = find_data.dwFileAttributes;
-                    let is_ro = (attrs & FILE_ATTRIBUTE_READONLY) != 0;
-                    let is_reparse = (attrs & FILE_ATTRIBUTE_REPARSE_POINT) != 0;
-                    let is_dir = (attrs & FILE_ATTRIBUTE_DIRECTORY) != 0;
-
-                    if is_reparse {
-                        // Reparse points / junctions / symlinks: NEVER push to subdirs!
-                        child_buf.push(0);
-                        remove_reparse_wide(child_buf, is_dir, is_ro)?;
-                    } else if is_dir {
-                        raw_subdirs.push((child_buf.clone(), is_ro));
-                    } else {
-                        child_buf.push(0);
-                        remove_file_wide(child_buf, is_ro)?;
-                    }
-                }
-
-                if unsafe { FindNextFileW(handle, &mut find_data) } == 0 {
-                    let err = unsafe { GetLastError() };
-                    if err == ERROR_NO_MORE_FILES {
-                        break;
-                    }
-                    return Err(FsError::Io(std::io::Error::from_raw_os_error(err as i32)));
-                }
-            }
-        }
-
-        dir.wide_no_null.push(0);
-        if raw_subdirs.is_empty() {
-            // Leaf directory: all files are unlinked and FindHandle is closed.
-            remove_dir_wide(&dir.wide_no_null, false)?;
-            return cascade_remove_parents(dir.parent);
-        }
-
-        let parent_node = Arc::new(ParentDir {
-            wide_null: dir.wide_no_null,
-            remaining: AtomicUsize::new(raw_subdirs.len()),
-            parent: dir.parent,
-        });
-        for (sub_wide, is_ro) in raw_subdirs {
-            subdirs_out.push(DirItem {
-                wide_no_null: sub_wide,
-                is_ro,
-                parent: Some(Arc::clone(&parent_node)),
+            dir.wide_no_null.push(0);
+            let parent_node = Arc::new(ParentDir {
+                wide_null: dir.wide_no_null,
+                remaining: AtomicUsize::new(raw_subdirs.len()),
+                parent: curr_parent,
             });
+            for (sub_wide, is_ro) in raw_subdirs {
+                subdirs_out.push(DirItem {
+                    wide_no_null: sub_wide,
+                    is_ro,
+                    parent: Some(Arc::clone(&parent_node)),
+                });
+            }
+            return Ok(());
         }
-        Ok(())
     }
 
     struct QueueState {
         pending: VecDeque<DirItem>,
         active: usize,
+        waiters: usize,
         error: Option<FsError>,
     }
 
@@ -712,13 +749,20 @@ mod win_rm {
         let mut pattern_buf = Vec::with_capacity(300);
         let mut child_buf = Vec::with_capacity(300);
         let mut local_subdirs = Vec::with_capacity(16);
+        let mut single_chain = Vec::with_capacity(8);
 
         // Traverse sequentially until queue fans out (>= 2 subdirs), avoiding thread
         // dispatch overhead on tiny trees while scaling cleanly for nested node_modules.
         while stack.len() == 1 {
             let dir = stack.pop().unwrap();
             local_subdirs.clear();
-            scan_and_unlink_dir(dir, &mut pattern_buf, &mut child_buf, &mut local_subdirs)?;
+            scan_and_unlink_dir(
+                dir,
+                &mut pattern_buf,
+                &mut child_buf,
+                &mut local_subdirs,
+                &mut single_chain,
+            )?;
             stack.append(&mut local_subdirs);
         }
 
@@ -746,70 +790,107 @@ mod win_rm {
             let num_threads = std::thread::available_parallelism()
                 .map(|n| n.get())
                 .unwrap_or(4)
-                .clamp(2, 16);
+                .clamp(2, 16)
+                .min(stack.len().max(2));
             let state = Mutex::new(QueueState {
                 pending: stack.into_iter().collect(),
                 active: 0,
+                waiters: 0,
                 error: None,
             });
+            let has_waiters = AtomicBool::new(false);
             let cvar = Condvar::new();
 
             crate::pool::run_parallel(num_threads, &|| {
                 let mut p_buf = Vec::with_capacity(300);
                 let mut c_buf = Vec::with_capacity(300);
                 let mut local_subs = Vec::with_capacity(16);
+                let mut local_single = Vec::with_capacity(8);
+                let mut local_stack: Vec<DirItem> = Vec::with_capacity(16);
+                let mut active_guard = ActiveGuard {
+                    state: &state,
+                    cvar: &cvar,
+                    armed: false,
+                };
 
                 loop {
-                    let dir = {
+                    if !local_stack.is_empty() && has_waiters.load(Ordering::Relaxed) && local_stack.len() > 1 {
                         let mut guard = state.lock().unwrap_or_else(|e| e.into_inner());
-                        loop {
+                        if guard.error.is_some() {
+                            guard.active = guard.active.saturating_sub(1);
+                            active_guard.armed = false;
+                            break;
+                        }
+                        while local_stack.len() > 1 {
+                            if let Some(extra) = local_stack.pop() {
+                                guard.pending.push_back(extra);
+                            }
+                        }
+                        cvar.notify_all();
+                    }
+
+                    let dir = if let Some(d) = local_stack.pop() {
+                        d
+                    } else {
+                        let mut guard = state.lock().unwrap_or_else(|e| e.into_inner());
+                        if active_guard.armed {
+                            guard.active = guard.active.saturating_sub(1);
+                            active_guard.armed = false;
+                        }
+                        let popped = loop {
                             if guard.error.is_some() {
                                 break None;
                             }
                             if let Some(d) = guard.pending.pop_back() {
                                 guard.active += 1;
+                                active_guard.armed = true;
                                 break Some(d);
                             }
                             if guard.active == 0 {
                                 cvar.notify_all();
                                 break None;
                             }
+                            guard.waiters += 1;
+                            has_waiters.store(true, Ordering::Relaxed);
                             guard = cvar.wait(guard).unwrap_or_else(|e| e.into_inner());
+                            guard.waiters = guard.waiters.saturating_sub(1);
+                            has_waiters.store(guard.waiters > 0, Ordering::Relaxed);
+                        };
+                        match popped {
+                            Some(d) => d,
+                            None => break,
                         }
-                    };
-                    let Some(dir) = dir else {
-                        break;
-                    };
-
-                    let mut active_guard = ActiveGuard {
-                        state: &state,
-                        cvar: &cvar,
-                        armed: true,
                     };
 
                     local_subs.clear();
-                    let res = scan_and_unlink_dir(dir, &mut p_buf, &mut c_buf, &mut local_subs);
-
-                    let mut guard = state.lock().unwrap_or_else(|e| e.into_inner());
-                    guard.active = guard.active.saturating_sub(1);
-                    active_guard.armed = false;
-                    match res {
-                        Ok(()) => {
-                            if !local_subs.is_empty() {
-                                for sub in local_subs.drain(..) {
-                                    guard.pending.push_back(sub);
-                                }
-                                cvar.notify_all();
-                            } else if guard.pending.is_empty() && guard.active == 0 {
-                                cvar.notify_all();
-                            }
+                    if let Err(e) = scan_and_unlink_dir(
+                        dir,
+                        &mut p_buf,
+                        &mut c_buf,
+                        &mut local_subs,
+                        &mut local_single,
+                    ) {
+                        local_stack.clear();
+                        let mut guard = state.lock().unwrap_or_else(|e| e.into_inner());
+                        guard.active = guard.active.saturating_sub(1);
+                        active_guard.armed = false;
+                        if guard.error.is_none() {
+                            guard.error = Some(e);
                         }
-                        Err(e) => {
-                            if guard.error.is_none() {
-                                guard.error = Some(e);
+                        cvar.notify_all();
+                        break;
+                    }
+
+                    if !local_subs.is_empty() {
+                        if local_subs.len() > 1 && has_waiters.load(Ordering::Relaxed) {
+                            local_stack.push(local_subs.pop().unwrap());
+                            let mut guard = state.lock().unwrap_or_else(|e| e.into_inner());
+                            for sub in local_subs.drain(..) {
+                                guard.pending.push_back(sub);
                             }
                             cvar.notify_all();
-                            break;
+                        } else {
+                            local_stack.append(&mut local_subs);
                         }
                     }
                 }

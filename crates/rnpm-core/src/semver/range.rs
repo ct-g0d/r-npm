@@ -582,7 +582,8 @@ fn eval_fast_partial_on_release(
     }
 }
 
-/// Fast path for a single comparator token without whitespace or prerelease/build tags.
+/// Fast path for a single comparator set (single token, space-separated comparators, or hyphen range)
+/// without prerelease/build tags or `||`.
 #[inline]
 fn try_fast_comparator_set(
     s: &str,
@@ -595,10 +596,19 @@ fn try_fast_comparator_set(
     }
 
     let (op, rest) = split_fast_op_prefix(s);
-    let partial = parse_fast_partial_token(rest)?;
-    let mut comparators = Vec::with_capacity(2);
-    if let Err(e) = push_fast_partial_comparators(op, partial, input_for_err, &mut comparators) {
-        return Some(Err(e));
+    if let Some(partial) = parse_fast_partial_token(rest) {
+        let mut comparators = Vec::with_capacity(2);
+        if let Err(e) = push_fast_partial_comparators(op, partial, input_for_err, &mut comparators) {
+            return Some(Err(e));
+        }
+        return Some(Ok(ComparatorSet { comparators }));
+    }
+
+    let mut stack = [StackComparator::new(Op::Eq, 0, 0, 0, false); 4];
+    let len = try_parse_fast_set_stack(s, &mut stack)?;
+    let mut comparators = Vec::with_capacity(len);
+    for c in &stack[..len] {
+        comparators.push(stack_to_comparator(c));
     }
     Some(Ok(ComparatorSet { comparators }))
 }

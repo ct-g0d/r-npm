@@ -309,6 +309,7 @@ impl FastNode {
         rules: &BTreeMap<String, OverrideValue>,
         all_targets: &mut FxHashSet<String>,
         nested_targets: &mut FxHashSet<String>,
+        has_references: &mut bool,
         in_nested: bool,
     ) -> Self {
         let mut rules_by_pkg: FxHashMap<String, Vec<FastRule>> =
@@ -333,15 +334,31 @@ impl FastNode {
             };
 
             let (exact_override, nested) = match v {
-                OverrideValue::Exact(s) => (Some(s.clone()), None),
+                OverrideValue::Exact(s) => {
+                    if s.starts_with('$') {
+                        *has_references = true;
+                    }
+                    (Some(s.clone()), None)
+                }
                 OverrideValue::Nested(sub_map) => {
                     let dot = match sub_map.get(".") {
-                        Some(OverrideValue::Exact(s)) => Some(s.clone()),
+                        Some(OverrideValue::Exact(s)) => {
+                            if s.starts_with('$') {
+                                *has_references = true;
+                            }
+                            Some(s.clone())
+                        }
                         _ => None,
                     };
                     (
                         dot,
-                        Some(FastNode::compile(sub_map, all_targets, nested_targets, true)),
+                        Some(FastNode::compile(
+                            sub_map,
+                            all_targets,
+                            nested_targets,
+                            has_references,
+                            true,
+                        )),
                     )
                 }
             };
@@ -433,6 +450,7 @@ impl FastNode {
 struct FastOverridesIndex {
     all_target_names: FxHashSet<String>,
     nested_target_names: FxHashSet<String>,
+    has_references: bool,
     root_node: FastNode,
 }
 
@@ -440,11 +458,18 @@ impl FastOverridesIndex {
     fn compile(rules: &BTreeMap<String, OverrideValue>) -> Self {
         let mut all_targets = fx_set_with_capacity(rules.len());
         let mut nested_targets = fx_set_with_capacity(rules.len());
-        let root_node =
-            FastNode::compile(rules, &mut all_targets, &mut nested_targets, false);
+        let mut has_references = false;
+        let root_node = FastNode::compile(
+            rules,
+            &mut all_targets,
+            &mut nested_targets,
+            &mut has_references,
+            false,
+        );
         Self {
             all_target_names: all_targets,
             nested_target_names: nested_targets,
+            has_references,
             root_node,
         }
     }
@@ -645,6 +670,24 @@ impl Overrides {
         )
     }
 
+    /// Returns `true` if `dep_name` appears anywhere as a target in this `Overrides` rule set.
+    #[inline]
+    pub fn has_target(&self, dep_name: &str) -> bool {
+        self.fast_idx.all_target_names.contains(dep_name)
+    }
+
+    /// Returns `true` if `dep_name` has any ancestor-scoped (`a > b`) override rule.
+    #[inline]
+    pub fn has_nested_target(&self, dep_name: &str) -> bool {
+        self.fast_idx.nested_target_names.contains(dep_name)
+    }
+
+    /// Returns `true` if any override rule uses a `$ref` dependency reference.
+    #[inline]
+    pub fn has_references(&self) -> bool {
+        self.fast_idx.has_references
+    }
+
     /// Fast precompiled lookup in a caller context, bypassing `rules` mutation checks.
     #[inline]
     pub fn resolve_override_precompiled_in_context<T: AsRef<str>>(
@@ -711,6 +754,16 @@ impl Overrides {
         }
 
         // 5. Resolve reference override ($pkg) if present, following chained references with cycle detection
+        if let Some(first_ref) = raw_override.strip_prefix('$') {
+            let direct_spec = reference_root
+                .get(first_ref)
+                .or_else(|| caller_specs.and_then(|specs| specs.get(first_ref)));
+            if let Some(spec) = direct_spec {
+                if !spec.starts_with('$') {
+                    return Ok(Some(spec.clone()));
+                }
+            }
+        }
         let mut current_spec = raw_override.to_string();
         let mut visited_refs = BTreeSet::new();
 

@@ -332,6 +332,179 @@ fn ensure_dir_created(
     Ok(())
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TrackedKind {
+    Dir,
+    File,
+    Symlink,
+}
+
+pub(crate) struct TrackedEntry {
+    pub(crate) kind: TrackedKind,
+    pub(crate) exact_upper: Option<String>,
+    pub(crate) file_idx: Option<usize>,
+}
+
+pub(crate) enum TrackReject {
+    CaseCollision,
+    SymlinkAncestor(String),
+}
+
+pub(crate) struct PathCollisionTracker {
+    pub(crate) map: HashMap<String, TrackedEntry>,
+    pub(crate) has_symlinks: bool,
+}
+
+impl PathCollisionTracker {
+    pub(crate) fn with_capacity(cap: usize) -> Self {
+        Self {
+            map: HashMap::with_capacity(cap),
+            has_symlinks: false,
+        }
+    }
+
+    #[inline]
+    pub(crate) fn lower_cow(s: &str) -> std::borrow::Cow<'_, str> {
+        if s.bytes().any(|b| b.is_ascii_uppercase()) {
+            std::borrow::Cow::Owned(s.to_ascii_lowercase())
+        } else {
+            std::borrow::Cow::Borrowed(s)
+        }
+    }
+
+    pub(crate) fn record(
+        &mut self,
+        norm_exact: &str,
+        kind: TrackedKind,
+    ) -> Result<(bool, Option<usize>), TrackReject> {
+        let has_upper = norm_exact.bytes().any(|b| b.is_ascii_uppercase());
+        let norm_lower: std::borrow::Cow<'_, str> = if has_upper {
+            std::borrow::Cow::Owned(norm_exact.to_ascii_lowercase())
+        } else {
+            std::borrow::Cow::Borrowed(norm_exact)
+        };
+        let is_dir = kind == TrackedKind::Dir;
+
+        // Check ancestors first if symlink ancestors or file-vs-dir collisions could exist
+        let mut end = norm_lower.len();
+        while let Some(pos) = norm_lower[..end].rfind('/') {
+            let prefix = &norm_lower[..pos];
+            if let Some(anc) = self.map.get(prefix) {
+                match anc.kind {
+                    TrackedKind::Symlink => {
+                        return Err(TrackReject::SymlinkAncestor(norm_exact[..pos].to_string()));
+                    }
+                    TrackedKind::File => return Err(TrackReject::CaseCollision),
+                    TrackedKind::Dir => break,
+                }
+            }
+            end = pos;
+        }
+
+        if let Some(existing) = self.map.get_mut(norm_lower.as_ref()) {
+            let exact_matches = match &existing.exact_upper {
+                Some(u) => u == norm_exact,
+                None => !has_upper && norm_lower.as_ref() == norm_exact,
+            };
+            if !exact_matches {
+                return Err(TrackReject::CaseCollision);
+            }
+            if (is_dir && existing.kind != TrackedKind::Dir)
+                || (!is_dir && existing.kind == TrackedKind::Dir)
+            {
+                return Err(TrackReject::CaseCollision);
+            }
+            let prev_file_idx = existing.file_idx;
+            if kind == TrackedKind::Symlink {
+                self.has_symlinks = true;
+                existing.file_idx = None;
+            }
+            existing.kind = kind;
+            return Ok((true, prev_file_idx));
+        }
+
+        // Insert missing ancestor directories
+        let mut end = norm_lower.len();
+        while let Some(pos) = norm_lower[..end].rfind('/') {
+            let prefix = &norm_lower[..pos];
+            if self.map.contains_key(prefix) {
+                break;
+            }
+            let prefix_exact = &norm_exact[..pos];
+            let anc_upper = prefix_exact
+                .bytes()
+                .any(|b| b.is_ascii_uppercase())
+                .then(|| prefix_exact.to_string());
+            self.map.insert(
+                prefix.to_string(),
+                TrackedEntry {
+                    kind: TrackedKind::Dir,
+                    exact_upper: anc_upper,
+                    file_idx: None,
+                },
+            );
+            end = pos;
+        }
+
+        if kind == TrackedKind::Symlink {
+            self.has_symlinks = true;
+        }
+        self.map.insert(
+            norm_lower.into_owned(),
+            TrackedEntry {
+                kind,
+                exact_upper: if has_upper {
+                    Some(norm_exact.to_string())
+                } else {
+                    None
+                },
+                file_idx: None,
+            },
+        );
+        Ok((false, None))
+    }
+
+    #[inline]
+    pub(crate) fn set_file_idx(&mut self, norm_exact: &str, idx: usize) {
+        let lower = Self::lower_cow(norm_exact);
+        if let Some(entry) = self.map.get_mut(lower.as_ref()) {
+            entry.file_idx = Some(idx);
+        }
+    }
+
+    #[inline]
+    pub(crate) fn is_regular_file(&self, rel: &str) -> bool {
+        let lower = Self::lower_cow(rel);
+        self.map
+            .get(lower.as_ref())
+            .is_some_and(|e| e.kind == TrackedKind::File)
+    }
+
+    #[inline]
+    pub(crate) fn has_symlink_ancestor(&self, rel: &str) -> Option<String> {
+        if !self.has_symlinks {
+            return None;
+        }
+        let lower = Self::lower_cow(rel);
+        if let Some(e) = self.map.get(lower.as_ref()) {
+            if e.kind == TrackedKind::Symlink {
+                return Some(rel.to_string());
+            }
+        }
+        let mut end = lower.len();
+        while let Some(pos) = lower[..end].rfind('/') {
+            let prefix = &lower[..pos];
+            if let Some(e) = self.map.get(prefix) {
+                if e.kind == TrackedKind::Symlink {
+                    return Some(rel[..pos].to_string());
+                }
+            }
+            end = pos;
+        }
+        None
+    }
+}
+
 /// Extract a .tar.gz stream into destination, stripping the archive's first root component
 /// and enforcing all security and tar-bomb defenses.
 pub fn extract_tar_gz<R: Read>(
@@ -362,7 +535,7 @@ pub fn extract_tar_gz<R: Read>(
     verified_safe_ancestors.insert(verbatim_dest.clone());
 
     let compressed_counter = Arc::new(AtomicU64::new(0));
-    let buf_reader = io::BufReader::with_capacity(64 * 1024, reader);
+    let buf_reader = io::BufReader::with_capacity(32 * 1024, reader);
     let counting_reader = CountingReader::with_counter(buf_reader, Arc::clone(&compressed_counter));
     let gz = GzDecoder::new(counting_reader);
     let buffered_gz = io::BufReader::with_capacity(64 * 1024, gz);
@@ -372,15 +545,12 @@ pub fn extract_tar_gz<R: Read>(
     let mut directory_count = 0usize;
     let mut symlink_count = 0;
     let mut total_uncompressed = 0u64;
-    let mut symlink_paths: HashSet<PathBuf> = HashSet::new();
-    let mut extracted_regular_files: HashSet<PathBuf> = HashSet::new();
-    let mut seen_paths: HashMap<String, String> = HashMap::new();
-    let mut seen_dirs_lower: HashSet<String> = HashSet::new();
-    let mut seen_files_lower: HashSet<String> = HashSet::new();
+    let mut tracker = PathCollisionTracker::with_capacity(32);
+    let mut saw_npmignores: HashSet<String> = HashSet::new();
     let mut hardlink_targets: std::collections::HashMap<PathBuf, PathBuf> =
         std::collections::HashMap::new();
-    let mut copy_buf = vec![0u8; 128 * 1024];
-    let mut scratch_buf: Vec<u8> = Vec::with_capacity(64 * 1024);
+    let mut copy_buf: Vec<u8> = Vec::new();
+    let mut scratch_buf: Vec<u8> = Vec::new();
     let mut wide_buf: Vec<u16> = Vec::with_capacity(260);
     let mut pending_files: Vec<crate::writer::MaterializeFile> = Vec::with_capacity(64);
     let mut pending_bytes: u64 = 0;
@@ -525,15 +695,37 @@ pub fn extract_tar_gz<R: Read>(
 
         let fast_ascii: Option<(String, usize)> = match path_ascii_result {
             Ok(None) => continue,
-            Ok(Some(v)) => Some(v),
+            Ok(Some((rel, depth))) => {
+                if entry_type.is_file() {
+                    if rel == ".npmignore" || rel.ends_with("/.npmignore") {
+                        if !saw_npmignores.contains(&rel) {
+                            saw_npmignores.insert(rel.clone());
+                        }
+                        Some((rel, depth))
+                    } else if rel == ".gitignore" || rel.ends_with("/.gitignore") {
+                        let rewritten = if rel.len() == ".gitignore".len() {
+                            ".npmignore".to_string()
+                        } else {
+                            format!("{}/.npmignore", &rel[..rel.len() - "/.gitignore".len()])
+                        };
+                        if saw_npmignores.contains(&rewritten) {
+                            continue;
+                        }
+                        Some((rewritten, depth))
+                    } else {
+                        Some((rel, depth))
+                    }
+                } else {
+                    Some((rel, depth))
+                }
+            }
             Err(()) => None,
         };
 
-        let (relative_path, target_path, norm_exact, path_depth, _is_ascii_clean) =
+        let (mut relative_path_opt, target_path, norm_exact, path_depth) =
             if let Some((rel_str, depth)) = fast_ascii {
                 let target_path = join_clean_rel(&clean_dest, &rel_str);
-                let relative_path = PathBuf::from(&rel_str);
-                (relative_path, target_path, rel_str, depth, true)
+                (None, target_path, rel_str, depth)
             } else {
                 let path_bytes = entry.path_bytes();
                 let raw_path = match entry.path() {
@@ -548,7 +740,7 @@ pub fn extract_tar_gz<R: Read>(
 
                 validate_entry_path(&raw_path)?;
 
-                let relative_path = match strip_package_prefix(&raw_path) {
+                let mut relative_path = match strip_package_prefix(&raw_path) {
                     Some(p) => {
                         let cleaned: PathBuf = p
                             .components()
@@ -561,6 +753,21 @@ pub fn extract_tar_gz<R: Read>(
                     }
                     None => continue,
                 };
+
+                if entry_type.is_file() {
+                    if relative_path.file_name() == Some(std::ffi::OsStr::new(".npmignore")) {
+                        let s = relative_path.to_string_lossy().replace('\\', "/");
+                        saw_npmignores.insert(s);
+                    } else if relative_path.file_name() == Some(std::ffi::OsStr::new(".gitignore"))
+                    {
+                        let ni = relative_path.with_file_name(".npmignore");
+                        let ni_str = ni.to_string_lossy().replace('\\', "/");
+                        if saw_npmignores.contains(&ni_str) {
+                            continue;
+                        }
+                        relative_path = ni;
+                    }
+                }
 
                 validate_entry_path(&relative_path)?;
 
@@ -580,8 +787,12 @@ pub fn extract_tar_gz<R: Read>(
                         norm_exact.push_str(&s.to_string_lossy());
                     }
                 }
-                (relative_path, target_path, norm_exact, path_depth, false)
+                (Some(relative_path), target_path, norm_exact, path_depth)
             };
+
+        let get_rel_path = |opt: &mut Option<PathBuf>, norm: &str| -> PathBuf {
+            opt.get_or_insert_with(|| PathBuf::from(norm)).clone()
+        };
 
         // Check path depth: count components; if deeper than limits.max_path_depth
         if path_depth > limits.max_path_depth {
@@ -591,7 +802,7 @@ pub fn extract_tar_gz<R: Read>(
                     "Path depth {} exceeded maximum allowed path depth of {}: '{}'",
                     path_depth,
                     limits.max_path_depth,
-                    relative_path.display()
+                    get_rel_path(&mut relative_path_opt, &norm_exact).display()
                 ),
             });
         }
@@ -623,87 +834,52 @@ pub fn extract_tar_gz<R: Read>(
         // Verify strict canonical path containment
         if !target_path.starts_with(&clean_dest) {
             return Err(FsError::PathTraversal {
-                path: relative_path.clone(),
+                path: get_rel_path(&mut relative_path_opt, &norm_exact),
             });
         }
         if target_path == clean_dest && !entry_type.is_dir() {
             return Err(FsError::PathTraversal {
-                path: relative_path.clone(),
+                path: get_rel_path(&mut relative_path_opt, &norm_exact),
             });
-        }
-
-        if !symlink_paths.is_empty() || !is_fresh_dest {
-            ensure_no_symlink_ancestors_with_cache(
-                &target_path,
-                &verbatim_dest,
-                &symlink_paths,
-                &relative_path,
-                Some(&mut verified_safe_ancestors),
-            )?;
         }
 
         if norm_exact.is_empty() {
             continue;
         }
-        let norm_lower = if norm_exact.bytes().any(|b| b.is_ascii_uppercase()) {
-            norm_exact.to_ascii_lowercase()
+
+        if !is_fresh_dest {
+            let rel_for_check = get_rel_path(&mut relative_path_opt, &norm_exact);
+            let empty_set = HashSet::new();
+            ensure_no_symlink_ancestors_with_cache(
+                &target_path,
+                &verbatim_dest,
+                &empty_set,
+                &rel_for_check,
+                Some(&mut verified_safe_ancestors),
+            )?;
+        }
+
+        let tracked_kind = if entry_type.is_dir() {
+            TrackedKind::Dir
+        } else if entry_type.is_symlink() {
+            TrackedKind::Symlink
         } else {
-            norm_exact.clone()
+            TrackedKind::File
         };
-
-        if let Some(existing_exact) = seen_paths.get(&norm_lower) {
-            if existing_exact != &norm_exact {
+        let was_seen = match tracker.record(&norm_exact, tracked_kind) {
+            Ok((seen, _)) => seen,
+            Err(TrackReject::CaseCollision) => {
                 return Err(FsError::CaseCollision {
-                    path: relative_path.clone(),
+                    path: get_rel_path(&mut relative_path_opt, &norm_exact),
                 });
             }
-        }
-
-        // Case collision check between files and directory ancestors
-        if entry_type.is_dir() {
-            if seen_files_lower.contains(&norm_lower) {
-                return Err(FsError::CaseCollision {
-                    path: relative_path.clone(),
+            Err(TrackReject::SymlinkAncestor(anc)) => {
+                return Err(FsError::EscapingSymlink {
+                    link: verbatim_dest.join(anc),
+                    target: target_path,
                 });
             }
-            if seen_dirs_lower.insert(norm_lower.clone()) {
-                let mut end = norm_lower.len();
-                while let Some(pos) = norm_lower[..end].rfind('/') {
-                    let prefix = &norm_lower[..pos];
-                    if seen_files_lower.contains(prefix) {
-                        return Err(FsError::CaseCollision {
-                            path: relative_path.clone(),
-                        });
-                    }
-                    if !seen_dirs_lower.insert(prefix.to_string()) {
-                        break;
-                    }
-                    end = pos;
-                }
-            }
-        } else {
-            if seen_dirs_lower.contains(&norm_lower) {
-                return Err(FsError::CaseCollision {
-                    path: relative_path.clone(),
-                });
-            }
-            seen_files_lower.insert(norm_lower.clone());
-            let mut end = norm_lower.len();
-            while let Some(pos) = norm_lower[..end].rfind('/') {
-                let prefix = &norm_lower[..pos];
-                if seen_files_lower.contains(prefix) {
-                    return Err(FsError::CaseCollision {
-                        path: relative_path.clone(),
-                    });
-                }
-                if !seen_dirs_lower.insert(prefix.to_string()) {
-                    break;
-                }
-                end = pos;
-            }
-        }
-
-        let was_seen = seen_paths.insert(norm_lower, norm_exact.clone()).is_some();
+        };
 
         // Security check: escaping symlinks/hardlinks
         if entry_type.is_symlink() || entry_type.is_hard_link() {
@@ -718,7 +894,7 @@ pub fn extract_tar_gz<R: Read>(
                     &mut wide_buf,
                 )?;
             }
-            let norm_rel = PathBuf::from(&norm_exact);
+            let relative_path = get_rel_path(&mut relative_path_opt, &norm_exact);
             symlink_count += 1;
             if symlink_count > limits.max_symlinks {
                 return Err(FsError::TarBombLimitExceeded {
@@ -764,10 +940,6 @@ pub fn extract_tar_gz<R: Read>(
                     // If target_path exists, safely unlink it (handling Windows junctions) before creating link
                     unlink_target_path(&target_path);
 
-                    extracted_regular_files.remove(&relative_path);
-                    extracted_regular_files.remove(&norm_rel);
-                    symlink_paths.insert(relative_path.clone());
-                    symlink_paths.insert(norm_rel);
                     #[cfg(unix)]
                     {
                         let _ = &cleaned_rel;
@@ -849,20 +1021,14 @@ pub fn extract_tar_gz<R: Read>(
                     #[cfg(not(windows))]
                     let is_symlink_or_junction = source_full.is_symlink();
 
-                    let norm_cleaned = normalize_rel_path(&cleaned_target);
-                    let mut has_symlink_ancestor = symlink_paths.contains(&cleaned_target)
-                        || symlink_paths.contains(&norm_cleaned)
-                        || is_symlink_or_junction;
-
-                    if !has_symlink_ancestor && !symlink_paths.is_empty() {
-                        for ancestor in norm_cleaned.ancestors() {
-                            if !ancestor.as_os_str().is_empty() && symlink_paths.contains(ancestor)
-                            {
-                                has_symlink_ancestor = true;
-                                break;
-                            }
-                        }
-                    }
+                    let norm_cleaned_str = cleaned_target
+                        .to_string_lossy()
+                        .replace('\\', "/");
+                    let norm_cleaned_trimmed = norm_cleaned_str
+                        .trim_start_matches("./")
+                        .trim_start_matches('/');
+                    let mut has_symlink_ancestor =
+                        is_symlink_or_junction || tracker.has_symlink_ancestor(norm_cleaned_trimmed).is_some();
 
                     if !has_symlink_ancestor {
                         let mut curr_p = source_full.parent();
@@ -919,8 +1085,7 @@ pub fn extract_tar_gz<R: Read>(
                     }
 
                     // Reject dangling hardlinks: hardlinks can only point to previously extracted regular files
-                    if (!extracted_regular_files.contains(&cleaned_target)
-                        && !extracted_regular_files.contains(&norm_cleaned))
+                    if !tracker.is_regular_file(norm_cleaned_trimmed)
                         || !source_full.exists()
                         || !source_full.is_file()
                     {
@@ -945,9 +1110,7 @@ pub fn extract_tar_gz<R: Read>(
                         let _ = fs::copy(&source_full, &target_path);
                     }
 
-                    hardlink_targets.insert(relative_path.clone(), cleaned_target);
-                    extracted_regular_files.insert(relative_path);
-                    extracted_regular_files.insert(norm_rel);
+                    hardlink_targets.insert(relative_path, cleaned_target);
                 }
             }
             continue;
@@ -967,16 +1130,7 @@ pub fn extract_tar_gz<R: Read>(
                 )?;
             }
             if !created_dirs.contains(&target_path) {
-                let norm_rel = PathBuf::from(&norm_exact);
-                let should_unlink = if is_fresh_dest {
-                    (!symlink_paths.is_empty()
-                        && (symlink_paths.contains(&relative_path)
-                            || symlink_paths.contains(&norm_rel)))
-                        || extracted_regular_files.contains(&relative_path)
-                        || extracted_regular_files.contains(&norm_rel)
-                } else {
-                    true
-                };
+                let should_unlink = if is_fresh_dest { was_seen } else { true };
                 if should_unlink {
                     unlink_target_path(&target_path);
                 }
@@ -988,41 +1142,41 @@ pub fn extract_tar_gz<R: Read>(
                 )?;
             }
         } else if entry_type.is_file() {
-            // Check single entry size limit from header if available
-            let header_size = entry.header().size().ok();
-            if let Some(entry_size) = header_size {
-                if entry_size > limits.max_single_entry_size {
-                    return Err(FsError::TarBombLimitExceeded {
-                        limit_type: "entry size".to_string(),
-                        detail: format!(
-                            "Entry size {} exceeded single file limit of {} bytes",
-                            entry_size, limits.max_single_entry_size
-                        ),
-                    });
-                }
-                if total_uncompressed.saturating_add(entry_size) > limits.max_uncompressed_size {
-                    return Err(FsError::TarBombLimitExceeded {
-                        limit_type: "uncompressed size".to_string(),
-                        detail: format!(
-                            "Projected uncompressed size exceeds limit of {} bytes",
-                            limits.max_uncompressed_size
-                        ),
-                    });
-                }
+            // Use PAX-aware entry size so PAX `size` overrides are never truncated.
+            let entry_size = entry.size();
+            if entry_size > limits.max_single_entry_size {
+                return Err(FsError::TarBombLimitExceeded {
+                    limit_type: "entry size".to_string(),
+                    detail: format!(
+                        "Entry size {} exceeded single file limit of {} bytes",
+                        entry_size, limits.max_single_entry_size
+                    ),
+                });
+            }
+            if total_uncompressed.saturating_add(entry_size) > limits.max_uncompressed_size {
+                return Err(FsError::TarBombLimitExceeded {
+                    limit_type: "uncompressed size".to_string(),
+                    detail: format!(
+                        "Projected uncompressed size exceeds limit of {} bytes",
+                        limits.max_uncompressed_size
+                    ),
+                });
             }
 
             // Fast parallel batching path for <=256KB files on a fresh destination without
             // duplicate paths or prior symlinks.
-            if header_size.is_some_and(|sz| sz <= 256 * 1024)
+            if entry_size <= 256 * 1024
                 && is_fresh_dest
                 && !was_seen
-                && symlink_paths.is_empty()
+                && !tracker.has_symlinks
                 && !created_dirs.contains(&target_path)
             {
-                let sz = header_size.unwrap() as usize;
-                let mut file_data = Vec::with_capacity(sz);
+                let sz = entry_size as usize;
+                let mut file_data = vec![0u8; sz];
                 let t_read = std::time::Instant::now();
-                entry.read_to_end(&mut file_data).map_err(FsError::Io)?;
+                if sz > 0 {
+                    entry.read_exact(&mut file_data).map_err(FsError::Io)?;
+                }
                 inflate_nanos += t_read.elapsed().as_nanos() as u64;
 
                 total_uncompressed += file_data.len() as u64;
@@ -1061,11 +1215,6 @@ pub fn extract_tar_gz<R: Read>(
                     package_id: None,
                 });
 
-                if cfg!(windows) && !_is_ascii_clean {
-                    extracted_regular_files.insert(PathBuf::from(&norm_exact));
-                }
-                extracted_regular_files.insert(relative_path);
-
                 if pending_bytes >= PENDING_FLUSH_BYTES {
                     flush_pending(
                         &mut pending_files,
@@ -1102,16 +1251,13 @@ pub fn extract_tar_gz<R: Read>(
                 )?;
             }
 
-            let norm_rel = PathBuf::from(&norm_exact);
-
-            if header_size.is_some_and(|sz| sz <= 256 * 1024) {
-                let sz = header_size.unwrap() as usize;
-                scratch_buf.clear();
-                if scratch_buf.capacity() < sz {
-                    scratch_buf.reserve(sz - scratch_buf.capacity());
-                }
+            if entry_size <= 256 * 1024 {
+                let sz = entry_size as usize;
+                scratch_buf.resize(sz, 0);
                 let t_read = std::time::Instant::now();
-                entry.read_to_end(&mut scratch_buf).map_err(FsError::Io)?;
+                if sz > 0 {
+                    entry.read_exact(&mut scratch_buf).map_err(FsError::Io)?;
+                }
                 inflate_nanos += t_read.elapsed().as_nanos() as u64;
 
                 total_uncompressed += scratch_buf.len() as u64;
@@ -1202,27 +1348,13 @@ pub fn extract_tar_gz<R: Read>(
                         return Err(err.into());
                     }
                 }
-
-                if !symlink_paths.is_empty() {
-                    symlink_paths.remove(&relative_path);
-                    symlink_paths.remove(&norm_rel);
-                }
-                extracted_regular_files.insert(relative_path);
-                if cfg!(windows) {
-                    extracted_regular_files.insert(norm_rel);
-                }
                 continue;
             }
 
             // Replace the directory entry before opening it: truncating an existing
             // symlink or hardlink would modify the linked file, possibly outside dest.
             let should_unlink = if is_fresh_dest {
-                (!symlink_paths.is_empty()
-                    && (symlink_paths.contains(&relative_path)
-                        || symlink_paths.contains(&norm_rel)))
-                    || extracted_regular_files.contains(&relative_path)
-                    || extracted_regular_files.contains(&norm_rel)
-                    || created_dirs.contains(&target_path)
+                was_seen || created_dirs.contains(&target_path)
             } else {
                 true
             };
@@ -1287,6 +1419,9 @@ pub fn extract_tar_gz<R: Read>(
                 }
                 Err(err) => return Err(err.into()),
             };
+            if copy_buf.is_empty() {
+                copy_buf.resize(128 * 1024, 0);
+            }
             loop {
                 let t_read = std::time::Instant::now();
                 let n = entry.read(&mut copy_buf).map_err(FsError::Io)?;
@@ -1328,14 +1463,6 @@ pub fn extract_tar_gz<R: Read>(
                 }
             }
             drop(raw_file);
-            if !symlink_paths.is_empty() {
-                symlink_paths.remove(&relative_path);
-                symlink_paths.remove(&norm_rel);
-            }
-            extracted_regular_files.insert(relative_path);
-            if cfg!(windows) {
-                extracted_regular_files.insert(norm_rel);
-            }
         }
     }
 

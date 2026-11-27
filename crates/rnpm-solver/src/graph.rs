@@ -19,6 +19,9 @@ fn normalize_bin_paths(bin: Option<&PackageBin>, package_name: &str) -> Option<P
             if paths.is_empty() {
                 return None;
             }
+            if paths.values().all(|p| !p.starts_with("./")) {
+                return Some(PackageBin::Map(paths.clone()));
+            }
             let map = paths
                 .iter()
                 .map(|(name, path)| {
@@ -510,23 +513,49 @@ impl DependencyGraph {
         Self::push_index_usize(outgoing_edges_by_location, &edge.from_location, idx);
     }
 
+    #[inline]
+    fn push_fast<'a, V>(map: &mut FastMap<&'a str, Vec<V>>, key: &'a str, val: V) {
+        match map.entry(key) {
+            std::collections::hash_map::Entry::Vacant(e) => {
+                e.insert(vec![val]);
+            }
+            std::collections::hash_map::Entry::Occupied(mut e) => {
+                e.get_mut().push(val);
+            }
+        }
+    }
+
     /// Rebuilds edge secondary indices from scratch.
     pub fn rebuild_edge_indices(&mut self) {
         self.edges_by_install_name.clear();
         self.incoming_edges_by_location.clear();
         self.outgoing_edges_by_location.clear();
         let edge_count = self.edges.len();
-        self.edges_by_install_name.reserve(edge_count / 4 + 16);
-        self.incoming_edges_by_location.reserve(edge_count / 4 + 16);
-        self.outgoing_edges_by_location.reserve(edge_count / 8 + 16);
+        if edge_count == 0 {
+            return;
+        }
+        let mut by_install: FastMap<&str, Vec<usize>> =
+            fast_map_with_capacity(edge_count / 4 + 16);
+        let mut by_incoming: FastMap<&str, Vec<usize>> =
+            fast_map_with_capacity(edge_count / 4 + 16);
+        let mut by_outgoing: FastMap<&str, Vec<usize>> =
+            fast_map_with_capacity(edge_count / 8 + 16);
         for (idx, edge) in self.edges.iter().enumerate() {
-            Self::add_edge_to_indices(
-                &mut self.edges_by_install_name,
-                &mut self.incoming_edges_by_location,
-                &mut self.outgoing_edges_by_location,
-                idx,
-                edge,
-            );
+            Self::push_fast(&mut by_install, edge.install_name.as_str(), idx);
+            Self::push_fast(&mut by_incoming, edge.to_location.as_str(), idx);
+            Self::push_fast(&mut by_outgoing, edge.from_location.as_str(), idx);
+        }
+        self.edges_by_install_name.reserve(by_install.len());
+        for (k, v) in by_install {
+            self.edges_by_install_name.insert(k.to_string(), v);
+        }
+        self.incoming_edges_by_location.reserve(by_incoming.len());
+        for (k, v) in by_incoming {
+            self.incoming_edges_by_location.insert(k.to_string(), v);
+        }
+        self.outgoing_edges_by_location.reserve(by_outgoing.len());
+        for (k, v) in by_outgoing {
+            self.outgoing_edges_by_location.insert(k.to_string(), v);
         }
     }
 
@@ -537,19 +566,68 @@ impl DependencyGraph {
         self.nodes_by_install_name.clear();
         self.children_by_parent.clear();
         let node_count = self.nodes.len();
-        self.nodes_by_dep_name.reserve(node_count / 2 + 16);
-        self.nodes_by_name.reserve(node_count / 2 + 16);
-        self.nodes_by_install_name.reserve(node_count / 2 + 16);
-        self.children_by_parent.reserve(node_count / 8 + 16);
-        for (loc, node) in &self.nodes {
-            Self::add_node_to_indices(
-                &mut self.nodes_by_dep_name,
-                &mut self.nodes_by_name,
-                &mut self.nodes_by_install_name,
-                &mut self.children_by_parent,
-                loc,
-                node,
-            );
+        if node_count > 0 {
+            let mut by_dep: FastMap<&str, Vec<String>> =
+                fast_map_with_capacity(node_count / 2 + 16);
+            let mut by_name: FastMap<&str, Vec<String>> =
+                fast_map_with_capacity(node_count / 2 + 16);
+            let mut by_install: FastMap<&str, Vec<String>> =
+                fast_map_with_capacity(node_count / 2 + 16);
+            let mut by_parent: FastMap<&str, Vec<String>> =
+                fast_map_with_capacity(node_count / 8 + 16);
+
+            for (loc, node) in &self.nodes {
+                let loc_str = loc.as_str();
+                for name in node.dependencies.keys() {
+                    Self::push_fast(&mut by_dep, name.as_str(), loc_str.to_string());
+                }
+                for name in node.optional_dependencies.keys() {
+                    if !node.dependencies.contains_key(name) {
+                        Self::push_fast(&mut by_dep, name.as_str(), loc_str.to_string());
+                    }
+                }
+                for name in node.peer_dependencies.keys() {
+                    if !node.dependencies.contains_key(name)
+                        && !node.optional_dependencies.contains_key(name)
+                    {
+                        Self::push_fast(&mut by_dep, name.as_str(), loc_str.to_string());
+                    }
+                }
+                for name in node.dev_dependencies.keys() {
+                    if !node.dependencies.contains_key(name)
+                        && !node.optional_dependencies.contains_key(name)
+                        && !node.peer_dependencies.contains_key(name)
+                    {
+                        Self::push_fast(&mut by_dep, name.as_str(), loc_str.to_string());
+                    }
+                }
+                Self::push_fast(&mut by_name, node.name.as_str(), loc_str.to_string());
+                Self::push_fast(
+                    &mut by_install,
+                    node.install_name.as_str(),
+                    loc_str.to_string(),
+                );
+                if let Some(parent) = crate::hoisting::parent_scope(loc_str) {
+                    Self::push_fast(&mut by_parent, parent, loc_str.to_string());
+                }
+            }
+
+            self.nodes_by_dep_name.reserve(by_dep.len());
+            for (k, v) in by_dep {
+                self.nodes_by_dep_name.insert(k.to_string(), v);
+            }
+            self.nodes_by_name.reserve(by_name.len());
+            for (k, v) in by_name {
+                self.nodes_by_name.insert(k.to_string(), v);
+            }
+            self.nodes_by_install_name.reserve(by_install.len());
+            for (k, v) in by_install {
+                self.nodes_by_install_name.insert(k.to_string(), v);
+            }
+            self.children_by_parent.reserve(by_parent.len());
+            for (k, v) in by_parent {
+                self.children_by_parent.insert(k.to_string(), v);
+            }
         }
         self.rebuild_edge_indices();
     }
@@ -1077,7 +1155,12 @@ impl DependencyGraph {
                             node.peer_dependencies_meta
                                 .iter()
                                 .map(|(k, v)| {
-                                    (k.clone(), serde_json::to_value(v).unwrap_or_default())
+                                    let mut obj = serde_json::Map::with_capacity(1);
+                                    obj.insert(
+                                        "optional".to_string(),
+                                        serde_json::Value::Bool(v.optional),
+                                    );
+                                    (k.clone(), serde_json::Value::Object(obj))
                                 })
                                 .collect(),
                         );
@@ -1292,7 +1375,12 @@ impl DependencyGraph {
                             node.peer_dependencies_meta
                                 .iter()
                                 .map(|(k, v)| {
-                                    (k.clone(), serde_json::to_value(v).unwrap_or_default())
+                                    let mut obj = serde_json::Map::with_capacity(1);
+                                    obj.insert(
+                                        "optional".to_string(),
+                                        serde_json::Value::Bool(v.optional),
+                                    );
+                                    (k.clone(), serde_json::Value::Object(obj))
                                 })
                                 .collect(),
                         )
@@ -1328,7 +1416,9 @@ impl DependencyGraph {
                     ..Default::default()
                 };
                 let mut pkg = pkg;
-                pkg.normalize_flags();
+                if has_extra {
+                    pkg.normalize_flags();
+                }
                 let posix_loc = if loc.contains('\\') {
                     rnpm_core::to_posix_path(loc)
                 } else {
@@ -1453,81 +1543,144 @@ impl DependencyGraph {
         let mut candidate_buf = String::with_capacity(128);
         graph.edges.reserve(estimated_edges);
 
-        // Build edges based on dependencies
+        let node_count = graph.nodes.len();
+        let mut by_dep: FastMap<&str, Vec<String>> = fast_map_with_capacity(node_count / 2 + 16);
+        let mut by_name: FastMap<&str, Vec<String>> = fast_map_with_capacity(node_count / 2 + 16);
+        let mut by_install: FastMap<&str, Vec<String>> =
+            fast_map_with_capacity(node_count / 2 + 16);
+        let mut by_parent: FastMap<&str, Vec<String>> =
+            fast_map_with_capacity(node_count / 8 + 16);
+        let mut edge_by_install: FastMap<&str, Vec<usize>> =
+            fast_map_with_capacity(estimated_edges / 4 + 16);
+        let mut edge_by_incoming: FastMap<&str, Vec<usize>> =
+            fast_map_with_capacity(estimated_edges / 4 + 16);
+        graph
+            .outgoing_edges_by_location
+            .reserve(node_count / 2 + 16);
+
+        // Build edges and all 7 secondary indices in one single pass
         for (loc, node) in &graph.nodes {
-            let all_deps = node
-                .dependencies
-                .iter()
-                .map(|(n, s)| (n, s, DependencyType::Prod))
-                .chain(
-                    node.dev_dependencies
-                        .iter()
-                        .map(|(n, s)| (n, s, DependencyType::Dev)),
-                )
-                .chain(
-                    node.optional_dependencies
-                        .iter()
-                        .map(|(n, s)| (n, s, DependencyType::Optional)),
-                )
-                .chain(
-                    node.peer_dependencies
-                        .iter()
-                        .filter(|(name, _)| {
-                            !node.dependencies.contains_key(*name)
-                                && !node.optional_dependencies.contains_key(*name)
-                                && !node.dev_dependencies.contains_key(*name)
-                        })
-                        .map(|(name, spec)| {
-                            (
-                                name,
-                                spec,
-                                if node
-                                    .peer_dependencies_meta
-                                    .get(name)
-                                    .is_some_and(|meta| meta.optional)
-                                {
-                                    DependencyType::PeerOptional
-                                } else {
-                                    DependencyType::Peer
-                                },
-                            )
-                        }),
-                );
+            let loc_str = loc.as_str();
+            Self::push_fast(&mut by_name, node.name.as_str(), loc_str.to_string());
+            Self::push_fast(&mut by_install, node.install_name.as_str(), loc_str.to_string());
+            if let Some(parent) = crate::hoisting::parent_scope(loc_str) {
+                Self::push_fast(&mut by_parent, parent, loc_str.to_string());
+            }
 
-            for (dep_name, dep_spec, dep_type) in all_deps {
-                let mut found_node: Option<&Node> = None;
-                for scope in crate::hoisting::iter_ancestor_scopes(loc) {
-                    if !parent_scopes.contains(scope) {
-                        continue;
+            let out_start = graph.edges.len();
+            macro_rules! resolve_edge {
+                ($dep_name:expr, $dep_spec:expr, $dep_type:expr) => {{
+                    let mut found_node: Option<&Node> = None;
+                    for scope in crate::hoisting::iter_ancestor_scopes(loc_str) {
+                        if !parent_scopes.contains(scope) {
+                            continue;
+                        }
+                        candidate_buf.clear();
+                        if scope.is_empty() {
+                            candidate_buf.push_str("node_modules/");
+                        } else {
+                            candidate_buf.push_str(scope);
+                            candidate_buf.push_str("/node_modules/");
+                        }
+                        candidate_buf.push_str($dep_name);
+                        if let Some(&target_node) = node_by_loc.get(candidate_buf.as_str()) {
+                            found_node = Some(target_node);
+                            break;
+                        }
                     }
-                    candidate_buf.clear();
-                    if scope.is_empty() {
-                        candidate_buf.push_str("node_modules/");
-                    } else {
-                        candidate_buf.push_str(scope);
-                        candidate_buf.push_str("/node_modules/");
-                    }
-                    candidate_buf.push_str(dep_name);
-                    if let Some(&target_node) = node_by_loc.get(candidate_buf.as_str()) {
-                        found_node = Some(target_node);
-                        break;
-                    }
-                }
 
-                if let Some(target_node) = found_node {
-                    graph.edges.push(DependencyEdge {
-                        from_location: loc.clone(),
-                        to_location: target_node.location.clone(),
-                        install_name: dep_name.clone(),
-                        package_name: target_node.name.clone(),
-                        spec: dep_spec.clone(),
-                        dep_type,
-                    });
+                    if let Some(target_node) = found_node {
+                        let idx = graph.edges.len();
+                        Self::push_fast(&mut edge_by_install, $dep_name.as_str(), idx);
+                        Self::push_fast(&mut edge_by_incoming, target_node.location.as_str(), idx);
+                        graph.edges.push(DependencyEdge {
+                            from_location: loc.clone(),
+                            to_location: target_node.location.clone(),
+                            install_name: $dep_name.clone(),
+                            package_name: target_node.name.clone(),
+                            spec: $dep_spec.clone(),
+                            dep_type: $dep_type,
+                        });
+                    }
+                }};
+            }
+
+            for (n, s) in &node.dependencies {
+                Self::push_fast(&mut by_dep, n.as_str(), loc_str.to_string());
+                resolve_edge!(n, s, DependencyType::Prod);
+            }
+            for (n, s) in &node.dev_dependencies {
+                if !node.dependencies.contains_key(n)
+                    && !node.optional_dependencies.contains_key(n)
+                    && !node.peer_dependencies.contains_key(n)
+                {
+                    Self::push_fast(&mut by_dep, n.as_str(), loc_str.to_string());
                 }
+                resolve_edge!(n, s, DependencyType::Dev);
+            }
+            for (n, s) in &node.optional_dependencies {
+                if !node.dependencies.contains_key(n) {
+                    Self::push_fast(&mut by_dep, n.as_str(), loc_str.to_string());
+                }
+                resolve_edge!(n, s, DependencyType::Optional);
+            }
+            for (name, spec) in &node.peer_dependencies {
+                if !node.dependencies.contains_key(name)
+                    && !node.optional_dependencies.contains_key(name)
+                {
+                    Self::push_fast(&mut by_dep, name.as_str(), loc_str.to_string());
+                }
+                if node.dependencies.contains_key(name)
+                    || node.optional_dependencies.contains_key(name)
+                    || node.dev_dependencies.contains_key(name)
+                {
+                    continue;
+                }
+                let dep_type = if node
+                    .peer_dependencies_meta
+                    .get(name)
+                    .is_some_and(|meta| meta.optional)
+                {
+                    DependencyType::PeerOptional
+                } else {
+                    DependencyType::Peer
+                };
+                resolve_edge!(name, spec, dep_type);
+            }
+            let out_end = graph.edges.len();
+            if out_end > out_start {
+                graph
+                    .outgoing_edges_by_location
+                    .insert(loc.clone(), (out_start..out_end).collect());
             }
         }
 
-        graph.rebuild_indices();
+        graph.nodes_by_dep_name.reserve(by_dep.len());
+        for (k, v) in by_dep {
+            graph.nodes_by_dep_name.insert(k.to_string(), v);
+        }
+        graph.nodes_by_name.reserve(by_name.len());
+        for (k, v) in by_name {
+            graph.nodes_by_name.insert(k.to_string(), v);
+        }
+        graph.nodes_by_install_name.reserve(by_install.len());
+        for (k, v) in by_install {
+            graph.nodes_by_install_name.insert(k.to_string(), v);
+        }
+        graph.children_by_parent.reserve(by_parent.len());
+        for (k, v) in by_parent {
+            graph.children_by_parent.insert(k.to_string(), v);
+        }
+        graph.edges_by_install_name.reserve(edge_by_install.len());
+        for (k, v) in edge_by_install {
+            graph.edges_by_install_name.insert(k.to_string(), v);
+        }
+        graph
+            .incoming_edges_by_location
+            .reserve(edge_by_incoming.len());
+        for (k, v) in edge_by_incoming {
+            graph.incoming_edges_by_location.insert(k.to_string(), v);
+        }
         graph
     }
 

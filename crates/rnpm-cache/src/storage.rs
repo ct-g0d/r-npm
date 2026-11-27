@@ -363,11 +363,339 @@ fn rename_with_retries(from: &Path, to: &Path) -> std::io::Result<()> {
     }
 }
 
+#[cfg(windows)]
+#[inline]
+pub(crate) fn encode_verbatim_wide_into(path: &Path, buf: &mut Vec<u16>) {
+    use std::os::windows::ffi::OsStrExt;
+    buf.clear();
+    let os = path.as_os_str();
+    let bytes = os.as_encoded_bytes();
+    if bytes.starts_with(br"\\?\")
+        && !bytes.contains(&b'/')
+        && !bytes[4..].windows(2).any(|w| w == b"\\\\")
+        && !bytes.windows(3).any(|w| w == b"\\.\\")
+        && !bytes.windows(4).any(|w| w == b"\\..\\")
+    {
+        buf.extend(os.encode_wide());
+        buf.push(0);
+        return;
+    }
+    if bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && bytes[2] == b'\\'
+        && !bytes.contains(&b'/')
+        && !bytes[3..].windows(2).any(|w| w == b"\\\\")
+        && !bytes.windows(3).any(|w| w == b"\\.\\")
+        && !bytes.windows(4).any(|w| w == b"\\..\\")
+        && !bytes.ends_with(br"\.")
+        && !bytes.ends_with(br"\..")
+        && !bytes.ends_with(b"\\")
+    {
+        buf.extend_from_slice(&[b'\\' as u16, b'\\' as u16, b'?' as u16, b'\\' as u16]);
+        buf.extend(os.encode_wide());
+        buf.push(0);
+        return;
+    }
+    let verb = rnpm_fs::to_verbatim_path(path);
+    buf.extend(verb.as_os_str().encode_wide());
+    buf.push(0);
+}
+
+#[cfg(windows)]
+fn rename_handle_win32(
+    handle: *mut std::ffi::c_void,
+    wide_target_null: &[u16],
+    target_hint: &Path,
+) -> std::io::Result<()> {
+    extern "system" {
+        fn SetFileInformationByHandle(
+            hFile: *mut std::ffi::c_void,
+            FileInformationClass: i32,
+            lpFileInformation: *const std::ffi::c_void,
+            dwBufferSize: u32,
+        ) -> i32;
+        fn SetFileAttributesW(lpFileName: *const u16, dwFileAttributes: u32) -> i32;
+        fn GetLastError() -> u32;
+    }
+    const FILE_RENAME_INFO: i32 = 3;
+    const FILE_RENAME_INFO_EX: i32 = 22;
+    const FILE_RENAME_FLAG_REPLACE_IF_EXISTS: u32 = 0x01;
+    const FILE_RENAME_FLAG_POSIX_SEMANTICS: u32 = 0x02;
+    const FILE_ATTRIBUTE_NORMAL: u32 = 0x80;
+    const ERROR_PATH_NOT_FOUND: u32 = 3;
+    const ERROR_ACCESS_DENIED: u32 = 5;
+    const ERROR_NOT_SUPPORTED: u32 = 50;
+    const ERROR_INVALID_PARAMETER: u32 = 87;
+
+    #[repr(C)]
+    #[allow(non_snake_case)]
+    struct FileRenameInfoRaw {
+        Flags: u32,
+        RootDirectory: *mut std::ffi::c_void,
+        FileNameLength: u32,
+        FileName: [u16; 1],
+    }
+
+    let target_chars = wide_target_null.len().saturating_sub(1);
+    let name_bytes = (target_chars * 2) as u32;
+    let header_offset = std::mem::offset_of!(FileRenameInfoRaw, FileName);
+    let total_bytes = header_offset + (target_chars + 1) * 2;
+    let total_u64s = total_bytes.div_ceil(8);
+
+    let mut stack_buf = [0u64; 256];
+    let mut heap_buf: Vec<u64>;
+    let buf_ptr: *mut u8 = if total_u64s <= stack_buf.len() {
+        stack_buf.as_mut_ptr() as *mut u8
+    } else {
+        heap_buf = vec![0u64; total_u64s];
+        heap_buf.as_mut_ptr() as *mut u8
+    };
+
+    unsafe {
+        let info = &mut *(buf_ptr as *mut FileRenameInfoRaw);
+        info.Flags = FILE_RENAME_FLAG_REPLACE_IF_EXISTS | FILE_RENAME_FLAG_POSIX_SEMANTICS;
+        info.RootDirectory = std::ptr::null_mut();
+        info.FileNameLength = name_bytes;
+        std::ptr::copy_nonoverlapping(
+            wide_target_null.as_ptr(),
+            buf_ptr.add(header_offset) as *mut u16,
+            target_chars,
+        );
+        *(buf_ptr.add(header_offset) as *mut u16).add(target_chars) = 0;
+    }
+
+    let struct_size = (header_offset + target_chars * 2)
+        .max(std::mem::size_of::<FileRenameInfoRaw>()) as u32;
+
+    let try_rename = |info_class: i32, flags: u32| -> Result<(), u32> {
+        unsafe {
+            (*(buf_ptr as *mut FileRenameInfoRaw)).Flags = flags;
+            if SetFileInformationByHandle(handle, info_class, buf_ptr as *const _, struct_size) != 0
+            {
+                Ok(())
+            } else {
+                Err(GetLastError())
+            }
+        }
+    };
+
+    let mut created_parent = false;
+    let mut cleared_ro = false;
+    loop {
+        let res = match try_rename(
+            FILE_RENAME_INFO_EX,
+            FILE_RENAME_FLAG_REPLACE_IF_EXISTS | FILE_RENAME_FLAG_POSIX_SEMANTICS,
+        ) {
+            Ok(()) => Ok(()),
+            Err(ERROR_INVALID_PARAMETER | ERROR_NOT_SUPPORTED) => try_rename(FILE_RENAME_INFO, 1),
+            Err(e) => Err(e),
+        };
+        match res {
+            Ok(()) => return Ok(()),
+            Err(ERROR_PATH_NOT_FOUND) if !created_parent => {
+                created_parent = true;
+                if let Some(parent) = target_hint.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+            }
+            Err(ERROR_ACCESS_DENIED) if !cleared_ro => {
+                cleared_ro = true;
+                unsafe {
+                    SetFileAttributesW(wide_target_null.as_ptr(), FILE_ATTRIBUTE_NORMAL);
+                }
+            }
+            Err(e) => return Err(std::io::Error::from_raw_os_error(e as i32)),
+        }
+    }
+}
+
+#[cfg(windows)]
+pub(crate) fn write_and_rename_atomic_wide(
+    wide_tmp_null: &[u16],
+    wide_target_null: &[u16],
+    tmp_hint: &Path,
+    target_hint: &Path,
+    data: &[u8],
+) -> std::io::Result<()> {
+    extern "system" {
+        fn CreateFileW(
+            lpFileName: *const u16,
+            dwDesiredAccess: u32,
+            dwShareMode: u32,
+            lpSecurityAttributes: *mut std::ffi::c_void,
+            dwCreationDisposition: u32,
+            dwFlagsAndAttributes: u32,
+            hTemplateFile: *mut std::ffi::c_void,
+        ) -> *mut std::ffi::c_void;
+        fn WriteFile(
+            hFile: *mut std::ffi::c_void,
+            lpBuffer: *const std::ffi::c_void,
+            nNumberOfBytesToWrite: u32,
+            lpNumberOfBytesWritten: *mut u32,
+            lpOverlapped: *mut std::ffi::c_void,
+        ) -> i32;
+        fn SetFileInformationByHandle(
+            hFile: *mut std::ffi::c_void,
+            FileInformationClass: i32,
+            lpFileInformation: *const std::ffi::c_void,
+            dwBufferSize: u32,
+        ) -> i32;
+        fn CloseHandle(hObject: *mut std::ffi::c_void) -> i32;
+        fn GetLastError() -> u32;
+    }
+    const GENERIC_WRITE: u32 = 0x4000_0000;
+    const DELETE_ACCESS: u32 = 0x0001_0000;
+    const FILE_SHARE_ALL: u32 = 1 | 2 | 4;
+    const CREATE_NEW: u32 = 1;
+    const FILE_ATTRIBUTE_NORMAL: u32 = 0x80;
+    const FILE_DISPOSITION_INFO: i32 = 4;
+    const ERROR_PATH_NOT_FOUND: u32 = 3;
+    const INVALID_HANDLE_VALUE: *mut std::ffi::c_void = -1isize as *mut std::ffi::c_void;
+
+    let mut handle = unsafe {
+        CreateFileW(
+            wide_tmp_null.as_ptr(),
+            GENERIC_WRITE | DELETE_ACCESS,
+            FILE_SHARE_ALL,
+            std::ptr::null_mut(),
+            CREATE_NEW,
+            FILE_ATTRIBUTE_NORMAL,
+            std::ptr::null_mut(),
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        let err = unsafe { GetLastError() };
+        if err == ERROR_PATH_NOT_FOUND {
+            if let Some(parent) = tmp_hint.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            handle = unsafe {
+                CreateFileW(
+                    wide_tmp_null.as_ptr(),
+                    GENERIC_WRITE | DELETE_ACCESS,
+                    FILE_SHARE_ALL,
+                    std::ptr::null_mut(),
+                    CREATE_NEW,
+                    FILE_ATTRIBUTE_NORMAL,
+                    std::ptr::null_mut(),
+                )
+            };
+        }
+        if handle == INVALID_HANDLE_VALUE {
+            return Err(std::io::Error::from_raw_os_error(unsafe { GetLastError() } as i32));
+        }
+    }
+
+    let cleanup_and_close = |h: *mut std::ffi::c_void| unsafe {
+        let del: u8 = 1;
+        SetFileInformationByHandle(h, FILE_DISPOSITION_INFO, &del as *const u8 as *const _, 1);
+        CloseHandle(h);
+    };
+
+    let mut offset = 0usize;
+    while offset < data.len() {
+        let chunk = ((data.len() - offset).min(u32::MAX as usize)) as u32;
+        let mut written = 0u32;
+        let ok = unsafe {
+            WriteFile(
+                handle,
+                data[offset..].as_ptr() as *const _,
+                chunk,
+                &mut written,
+                std::ptr::null_mut(),
+            )
+        };
+        if ok == 0 {
+            let err = unsafe { GetLastError() };
+            cleanup_and_close(handle);
+            return Err(std::io::Error::from_raw_os_error(err as i32));
+        }
+        if written == 0 {
+            cleanup_and_close(handle);
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WriteZero,
+                "WriteFile returned 0 bytes written",
+            ));
+        }
+        offset += written as usize;
+    }
+
+    if let Err(e) = rename_handle_win32(handle, wide_target_null, target_hint) {
+        cleanup_and_close(handle);
+        return Err(e);
+    }
+
+    unsafe {
+        CloseHandle(handle);
+    }
+    Ok(())
+}
+
+pub(crate) fn write_and_rename_atomic(
+    temp_path: &Path,
+    target_path: &Path,
+    data: &[u8],
+) -> std::io::Result<()> {
+    #[cfg(windows)]
+    {
+        let mut wide_tmp = Vec::with_capacity(260);
+        let mut wide_target = Vec::with_capacity(260);
+        encode_verbatim_wide_into(temp_path, &mut wide_tmp);
+        encode_verbatim_wide_into(target_path, &mut wide_target);
+        write_and_rename_atomic_wide(&wide_tmp, &wide_target, temp_path, target_path, data)
+    }
+    #[cfg(not(windows))]
+    {
+        let mut file = match OpenOptions::new().write(true).create_new(true).open(temp_path) {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                if let Some(parent) = temp_path.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                OpenOptions::new().write(true).create_new(true).open(temp_path)?
+            }
+            Err(e) => return Err(e),
+        };
+        if let Err(e) = file.write_all(data) {
+            drop(file);
+            let _ = fs::remove_file(temp_path);
+            return Err(e);
+        }
+        drop(file);
+        match fs::rename(temp_path, target_path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                if let Some(parent) = target_path.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                match fs::rename(temp_path, target_path) {
+                    Ok(()) => Ok(()),
+                    Err(e2) => {
+                        let _ = fs::remove_file(temp_path);
+                        Err(e2)
+                    }
+                }
+            }
+            Err(e) => {
+                let _ = fs::remove_file(temp_path);
+                Err(e)
+            }
+        }
+    }
+}
+
 /// Helper to reliably read a file with retries on Windows transient file sharing locks.
 fn read_file_with_retries(path: &Path) -> std::io::Result<Vec<u8>> {
-    let mut attempts = 0u32;
+    match fs::read(path) {
+        Ok(bytes) => return Ok(bytes),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(e),
+        Err(_) => {}
+    }
+    let mut attempts = 1u32;
     let mut delay = Duration::from_micros(500);
     loop {
+        retry_backoff(attempts, &mut delay, Duration::from_millis(100));
         attempts += 1;
         match fs::read(path) {
             Ok(bytes) => return Ok(bytes),
@@ -376,7 +704,6 @@ fn read_file_with_retries(path: &Path) -> std::io::Result<Vec<u8>> {
                 if attempts >= 10 {
                     return Err(e);
                 }
-                retry_backoff(attempts, &mut delay, Duration::from_millis(100));
             }
         }
     }
@@ -392,16 +719,34 @@ fn parse_metadata_bytes(metadata: Option<&[u8]>) -> Option<serde_json::Value> {
     })
 }
 
-fn parse_index_line(trimmed: &str, expected_key: Option<&str>) -> Option<(IndexEntry, Integrity)> {
-    let json_str = match trimmed.find('\t') {
-        Some(tab_pos) => &trimmed[tab_pos + 1..],
-        None => trimmed,
-    };
-    let mut entry = serde_json::from_str::<IndexEntry>(json_str).ok()?;
-    if let Some(k) = expected_key {
-        if entry.key != k {
-            return None;
+enum ParsedIntegrity {
+    Sha512([u8; 64]),
+    Full(Integrity),
+}
+
+#[inline]
+fn fast_parse_sha512_sri(s: &str) -> Option<[u8; 64]> {
+    let trimmed = s.trim();
+    let b64 = trimmed.strip_prefix("sha512-")?;
+    if b64.len() != 88 || b64.as_bytes().iter().any(|b| b.is_ascii_whitespace()) {
+        return None;
+    }
+    let mut decoded = [0u8; 66];
+    if BASE64.decode_mut(b64.as_bytes(), &mut decoded).ok()? != 64 {
+        return None;
+    }
+    let mut out = [0u8; 64];
+    out.copy_from_slice(&decoded[..64]);
+    Some(out)
+}
+
+fn parse_index_integrity(entry: &mut IndexEntry) -> Option<ParsedIntegrity> {
+    if let Some(digest) = fast_parse_sha512_sri(&entry.integrity) {
+        if entry.sha512_hex.is_empty() {
+            let mut hex_buf = [0u8; 128];
+            entry.sha512_hex = encode_hex_lower(&digest, &mut hex_buf).to_string();
         }
+        return Some(ParsedIntegrity::Sha512(digest));
     }
     let parsed = Integrity::parse(&entry.integrity).ok()?;
     if entry.sha512_hex.is_empty() {
@@ -418,6 +763,21 @@ fn parse_index_line(trimmed: &str, expected_key: Option<&str>) -> Option<(IndexE
             }
         }
     }
+    Some(ParsedIntegrity::Full(parsed))
+}
+
+fn parse_index_line(trimmed: &str, expected_key: Option<&str>) -> Option<(IndexEntry, ParsedIntegrity)> {
+    let json_str = match trimmed.find('\t') {
+        Some(tab_pos) => &trimmed[tab_pos + 1..],
+        None => trimmed,
+    };
+    let mut entry = serde_json::from_str::<IndexEntry>(json_str).ok()?;
+    if let Some(k) = expected_key {
+        if entry.key != k {
+            return None;
+        }
+    }
+    let parsed = parse_index_integrity(&mut entry)?;
     Some((entry, parsed))
 }
 
@@ -425,9 +785,9 @@ fn parse_index_entry_slice(
     content: &str,
     expected_key: Option<&str>,
     strict_all_lines: bool,
-) -> Option<(IndexEntry, Integrity)> {
+) -> Option<(IndexEntry, ParsedIntegrity)> {
     if strict_all_lines {
-        let mut last: Option<(IndexEntry, Integrity)> = None;
+        let mut last: Option<(IndexEntry, ParsedIntegrity)> = None;
         for line in content.lines() {
             let trimmed = line.trim();
             if trimmed.is_empty() {
@@ -457,7 +817,7 @@ fn parse_index_content(
     content: &str,
     expected_key: Option<&str>,
     strict_all_lines: bool,
-) -> Option<(IndexEntry, Integrity)> {
+) -> Option<(IndexEntry, ParsedIntegrity)> {
     if let Some(pair) = parse_index_entry_slice(content, expected_key, strict_all_lines) {
         return Some(pair);
     }
@@ -468,22 +828,7 @@ fn parse_index_content(
                     return None;
                 }
             }
-            if let Ok(parsed) = Integrity::parse(&entry.integrity) {
-                if entry.sha512_hex.is_empty() {
-                    if let Some(sha512) = parsed
-                        .entries
-                        .iter()
-                        .find(|e| e.algorithm == Algorithm::Sha512)
-                    {
-                        let mut hex_buf = [0u8; 128];
-                        if sha512.digest.len() == 64 {
-                            entry.sha512_hex =
-                                encode_hex_lower(&sha512.digest, &mut hex_buf).to_string();
-                        } else {
-                            entry.sha512_hex = HEXLOWER.encode(&sha512.digest);
-                        }
-                    }
-                }
+            if let Some(parsed) = parse_index_integrity(&mut entry) {
                 return Some((entry, parsed));
             }
         }
@@ -850,10 +1195,6 @@ impl Cache {
             }
         }
 
-        // Staging step: Write to temporary file on the SAME filesystem/volume
-        let temp_path = self.write_temp_file("blob", data)?;
-
-        // Fast lock-free atomic rename only when target does not yet exist
         if npm_definitely_missing || fs::symlink_metadata(&npm_path).is_err() {
             if !prefix_bitset_has(&self.blob_prefix_dirs, sha512_hex) {
                 if let Some(parent) = npm_path.parent() {
@@ -861,30 +1202,25 @@ impl Cache {
                 }
                 prefix_bitset_set(&self.blob_prefix_dirs, sha512_hex);
             }
-            match fs::rename(&temp_path, &npm_path) {
+            let temp_path = self.create_temp_path("blob");
+            match write_and_rename_atomic(&temp_path, &npm_path, data) {
                 Ok(()) => {
                     prefix_bitset_set(&self.blob_prefix_dirs, sha512_hex);
                     debug!("Atomically stored blob {}", npm_path.display());
                     return Ok(());
                 }
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    if let Some(parent) = npm_path.parent() {
-                        fs::create_dir_all(parent)?;
-                    }
-                    if fs::rename(&temp_path, &npm_path).is_ok() {
-                        prefix_bitset_set(&self.blob_prefix_dirs, sha512_hex);
-                        debug!("Atomically stored blob {}", npm_path.display());
-                        return Ok(());
-                    }
+                Err(_) if npm_path.is_dir() => {
+                    return Err(CacheError::Io(std::io::Error::new(
+                        std::io::ErrorKind::AlreadyExists,
+                        format!("Blob path is a directory: {}", npm_path.display()),
+                    )));
                 }
-                Err(e) => {
-                    if npm_path.is_dir() {
-                        let _ = remove_file_with_retries(&temp_path);
-                        return Err(CacheError::Io(e));
-                    }
-                }
+                Err(_) => {}
             }
         }
+
+        // Fallback staging step: Write to temporary file on the SAME filesystem/volume
+        let temp_path = self.write_temp_file("blob", data)?;
 
         // Serialize in-process writers on the same shard before touching the lockfile.
         let _shard_guard = self.lock_shards[shard_index_for_str(sha512_hex)]
@@ -1001,7 +1337,7 @@ impl Cache {
     fn get_index_entry_with_parsed(
         &self,
         key: &str,
-    ) -> Result<Option<(IndexEntry, Integrity)>, CacheError> {
+    ) -> Result<Option<(IndexEntry, ParsedIntegrity)>, CacheError> {
         // First try exact key
         if let Some(pair) = self.get_index_entry_internal(key)? {
             return Ok(Some(pair));
@@ -1054,7 +1390,7 @@ impl Cache {
     fn get_index_entry_internal(
         &self,
         key: &str,
-    ) -> Result<Option<(IndexEntry, Integrity)>, CacheError> {
+    ) -> Result<Option<(IndexEntry, ParsedIntegrity)>, CacheError> {
         let mut hex_buf = [0u8; 64];
         let hash = sha256_hex_stack(key.as_bytes(), &mut hex_buf);
         let npm_path = npm_index_path_from_hash(&self.root, hash);
@@ -1125,7 +1461,7 @@ impl Cache {
         buf[40] = b'\t';
         buf.push(b'\n');
 
-        let temp_path = self.write_temp_file("index", &buf)?;
+        let temp_path = self.create_temp_path("index");
 
         let _shard_guard = self.lock_shards[shard_index_for_str(hash)]
             .lock()
@@ -1138,26 +1474,18 @@ impl Cache {
             prefix_bitset_set(&self.index_prefix_dirs, hash);
         }
 
-        match fs::rename(&temp_path, &npm_path) {
-            Ok(()) => return Ok(()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                if let Some(parent) = npm_path.parent() {
-                    fs::create_dir_all(parent)?;
-                }
-                if fs::rename(&temp_path, &npm_path).is_ok() {
-                    return Ok(());
-                }
-            }
-            Err(_) => {}
+        if write_and_rename_atomic(&temp_path, &npm_path, &buf).is_ok() {
+            return Ok(());
         }
 
+        let staged = self.write_temp_file("index", &buf)?;
         let _key_lock = self.lock_key_by_hash_with_options(
             hash,
             self.lock_timeout,
             self.stale_threshold,
         )?;
-        if let Err(err) = rename_with_retries(&temp_path, &npm_path) {
-            let _ = remove_file_with_retries(&temp_path);
+        if let Err(err) = rename_with_retries(&staged, &npm_path) {
+            let _ = remove_file_with_retries(&staged);
             return Err(CacheError::Io(err));
         }
         Ok(())
@@ -1247,13 +1575,20 @@ impl Cache {
     fn get_with_entry_and_parsed(
         &self,
         entry: IndexEntry,
-        parsed_integrity: Integrity,
+        parsed_integrity: ParsedIntegrity,
     ) -> Result<Option<(IndexEntry, Vec<u8>)>, CacheError> {
         if !entry.sha512_hex.is_empty() {
             if let Some((bytes, actual_digest)) = self.read_and_verify_sha512(&entry.sha512_hex)? {
-                let valid = match sha512_matches_integrity(&actual_digest, &parsed_integrity) {
-                    Some(ok) => ok,
-                    None => parsed_integrity.verify(&bytes).is_ok(),
+                let valid = match &parsed_integrity {
+                    ParsedIntegrity::Sha512(expected_digest) => {
+                        constant_time_eq_64(&actual_digest, expected_digest)
+                    }
+                    ParsedIntegrity::Full(parsed) => {
+                        match sha512_matches_integrity(&actual_digest, parsed) {
+                            Some(ok) => ok,
+                            None => parsed.verify(&bytes).is_ok(),
+                        }
+                    }
                 };
                 if !valid {
                     warn!(
@@ -1268,7 +1603,17 @@ impl Cache {
             }
         }
 
-        if let Some(bytes) = self.get_by_integrity(&parsed_integrity)? {
+        let parsed = match parsed_integrity {
+            ParsedIntegrity::Full(p) => p,
+            ParsedIntegrity::Sha512(_) => match Integrity::parse(&entry.integrity) {
+                Ok(p) => p,
+                Err(_) => {
+                    self.purge_key_index_files(&entry.key);
+                    return Ok(None);
+                }
+            },
+        };
+        if let Some(bytes) = self.get_by_integrity(&parsed)? {
             return Ok(Some((entry, bytes)));
         }
 
@@ -1317,7 +1662,10 @@ impl Cache {
             }
         }
 
-        let mut sorted_entries = parsed_integrity.entries;
+        let mut sorted_entries = match parsed_integrity {
+            ParsedIntegrity::Full(p) => p.entries,
+            ParsedIntegrity::Sha512(_) => return Ok(None),
+        };
         if sorted_entries.len() > 1 {
             sorted_entries.sort_by_key(|a| std::cmp::Reverse(a.algorithm));
         }
@@ -2267,5 +2615,56 @@ pub fn packument_key(registry: &str, name: &str, accept: Option<&str>) -> String
     match accept {
         Some(a) if !a.is_empty() => format!("pacote:packument:{reg}:{name}:{a}"),
         _ => format!("pacote:packument:{reg}:{name}"),
+    }
+}
+
+#[cfg(test)]
+mod atomic_win_tests {
+    use super::*;
+
+    #[test]
+    fn write_and_rename_atomic_creates_and_replaces_while_reading() {
+        let dir = tempfile::tempdir().unwrap();
+        let tmp = dir.path().join("tmp1.tmp");
+        let target = dir.path().join("sub").join("target.txt");
+        write_and_rename_atomic(&tmp, &target, b"hello").unwrap();
+        assert_eq!(fs::read(&target).unwrap(), b"hello");
+        assert!(!tmp.exists());
+
+        // Hold reader open while replacing target atomically
+        let _reader = fs::File::open(&target).unwrap();
+        let tmp2 = dir.path().join("tmp2.tmp");
+        write_and_rename_atomic(&tmp2, &target, b"world").unwrap();
+        assert_eq!(fs::read(&target).unwrap(), b"world");
+        assert!(!tmp2.exists());
+    }
+
+    #[test]
+    fn multi_hash_sri_and_corrupt_index_blob_auto_repair() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::new(dir.path()).unwrap();
+        let payload = b"multi-hash integrity test payload";
+        let s512 = Integrity::from_bytes(payload, Algorithm::Sha512);
+        let s256 = Integrity::from_bytes(payload, Algorithm::Sha256);
+        let combined: Integrity = format!("{s256} {s512}").parse().unwrap();
+
+        let key = "https://registry.npmjs.org/multi-sri/-/m-1.0.0.tgz";
+        let entry = cache.put_with_integrity(key, payload, Some(&combined), None).unwrap();
+        let (got_entry, got_bytes) = cache.get(key).unwrap().unwrap();
+        assert_eq!(got_entry.sha512_hex, entry.sha512_hex);
+        assert_eq!(got_bytes, payload);
+
+        // Corrupt the blob -> cache.get must auto-purge and return Ok(None)
+        let blob_path = cache.blob_path(&entry.sha512_hex);
+        fs::write(&blob_path, b"corrupted payload bytes").unwrap();
+        assert!(cache.get(key).unwrap().is_none());
+        assert!(!blob_path.exists());
+
+        // Re-put and corrupt the index file -> cache.get must purge and return Ok(None)
+        cache.put_with_integrity(key, payload, Some(&combined), None).unwrap();
+        let idx_path = IndexEntry::path_for_key(cache.root(), key);
+        fs::write(&idx_path, [0xffu8, 0xfe, 0x00]).unwrap();
+        assert!(cache.get(key).unwrap().is_none());
+        assert!(!idx_path.exists());
     }
 }

@@ -1892,3 +1892,133 @@ fn test_caret_wildcard_cascade_parity() {
         parsed.satisfies(&v)
     );
 }
+
+#[test]
+fn test_manifest_edge_cases_unicode_surrogates_bom_bundled_bin_platform_parity() {
+    use crate::{BundledDependencies, PackageBin};
+    let raw = "\u{feff}{\n  \"name\": \"edge-\\u0061\\uD83D\\uDE00\",\n  \"name\": \"edge-final\",\n  \"description\": \"quote:\\\" slash:\\\\ ctrl:\\t\",\n  \"bin\": [\"./cli/one.js\", \"./cli/two.js\"],\n  \"bundleDependencies\": {\"pkg-a\": true, \"pkg-b\": false},\n  \"os\": [\"!win32\", \"linux\"],\n  \"cpu\": \"!ia32\",\n  \"libc\": [\"glibc\", \"!musl\"],\n  \"dependencies\": {\n    \"foo\": \"^1.0.0\",\n    \"bar\": \">=1.0.0 <2.0.0\"\n  },\n  \"funding\": {\"type\": \"individual\", \"url\": \"https://example.com\"},\n  \"negZero\": -0\n}\n";
+
+    let m = Manifest::from_str(raw).unwrap();
+    let ro = Manifest::from_str_readonly(raw).unwrap();
+
+    assert!(m.format.has_bom);
+    assert!(m.raw_json.is_some());
+    assert_eq!(m.name.as_deref(), Some("edge-final"));
+    assert_eq!(ro.name, m.name);
+    assert_eq!(m.description, ro.description);
+    assert_eq!(
+        m.description.as_deref(),
+        Some("quote:\" slash:\\ ctrl:\t")
+    );
+    assert_eq!(m.bin, ro.bin);
+    assert!(matches!(m.bin, Some(PackageBin::Map(_))));
+    assert_eq!(m.bundled_dependencies, ro.bundled_dependencies);
+    assert_eq!(
+        m.bundled_dependencies,
+        Some(BundledDependencies::List(vec![
+            "pkg-a".to_string(),
+            "pkg-b".to_string()
+        ]))
+    );
+    assert_eq!(m.os, ro.os);
+    assert_eq!(m.cpu, ro.cpu);
+    assert_eq!(m.libc, ro.libc);
+    assert_eq!(m.dependencies, ro.dependencies);
+    assert_eq!(m.dependency_order, ro.dependency_order);
+    assert_eq!(m.extra.get("negZero"), ro.extra.get("negZero"));
+
+    let written = m.to_json_string().unwrap();
+    assert!(written.starts_with('\u{feff}'));
+    let reparsed = Manifest::from_str(&written).unwrap();
+    assert_eq!(reparsed.name, m.name);
+    assert_eq!(reparsed.description, m.description);
+    assert_eq!(reparsed.dependencies, m.dependencies);
+    assert_eq!(reparsed.os, m.os);
+    assert_eq!(reparsed.cpu, m.cpu);
+    assert_eq!(reparsed.libc, m.libc);
+}
+
+#[test]
+fn test_manifest_bundled_dependencies_bool_and_array_and_bin_string_map() {
+    use crate::{BundledDependencies, PackageBin};
+    let raw_bool = r#"{"name": "b1", "bin": "./index.js", "bundledDependencies": true}"#;
+    let m1 = Manifest::from_str(raw_bool).unwrap();
+    let r1 = Manifest::from_str_readonly(raw_bool).unwrap();
+    assert_eq!(m1.bin, Some(PackageBin::Single("./index.js".to_string())));
+    assert_eq!(m1.bin, r1.bin);
+    assert_eq!(
+        m1.bundled_dependencies,
+        Some(BundledDependencies::Boolean(true))
+    );
+    assert_eq!(m1.bundled_dependencies, r1.bundled_dependencies);
+
+    let raw_map =
+        r#"{"name": "b2", "bin": {"a": "./a.js", "b": "./b.js"}, "bundleDependencies": ["x"]}"#;
+    let m2 = Manifest::from_str(raw_map).unwrap();
+    let r2 = Manifest::from_str_readonly(raw_map).unwrap();
+    assert_eq!(m2.bin, r2.bin);
+    assert_eq!(
+        m2.bundled_dependencies,
+        Some(BundledDependencies::List(vec!["x".to_string()]))
+    );
+    assert_eq!(m2.bundled_dependencies, r2.bundled_dependencies);
+}
+
+#[test]
+fn test_overrides_helpers_and_ref_shadowing_and_compound_range_fast_path() {
+    use crate::overrides::Overrides;
+    use crate::semver::{Range, Version};
+    use std::collections::BTreeMap;
+
+    let mut root_deps = BTreeMap::new();
+    root_deps.insert("bar".to_string(), "^2.3.4".to_string());
+    let json = serde_json::json!({
+        "bar": "1.0.0",
+        "foo": {
+            "bar": "$bar"
+        }
+    });
+    let ov = Overrides::from_json_value(Some(&json), root_deps);
+    assert!(ov.has_target("bar"));
+    assert!(ov.has_nested_target("bar"));
+    assert!(ov.has_references());
+    assert!(!ov.has_nested_target("foo"));
+    assert!(!ov.has_target("missing"));
+
+    assert_eq!(
+        ov.resolve_override_precompiled_in_context(
+            "bar",
+            "^1.0.0",
+            &["foo"],
+            &ov.root_dependencies,
+            None,
+        )
+        .unwrap(),
+        Some("^2.3.4".to_string())
+    );
+    assert_eq!(
+        ov.resolve_override_precompiled_in_context(
+            "bar",
+            "^1.0.0",
+            &["other"],
+            &ov.root_dependencies,
+            None,
+        )
+        .unwrap(),
+        Some("1.0.0".to_string())
+    );
+
+    // Compound & hyphen range fast path parity
+    for expr in &[
+        ">=1.0.0 <2.0.0",
+        "1.0.0 - 2.0.0",
+        "1.0 - 2.0",
+        "^1.0.0 || >=2.0.0 <3.0.0",
+    ] {
+        let r = Range::parse(expr).unwrap();
+        let v15 = Version::parse("1.5.0").unwrap();
+        let v25 = Version::parse("2.5.0").unwrap();
+        assert_eq!(r.satisfies(&v15), Range::satisfies_str(expr, &v15).unwrap());
+        assert_eq!(r.satisfies(&v25), Range::satisfies_str(expr, &v25).unwrap());
+    }
+}

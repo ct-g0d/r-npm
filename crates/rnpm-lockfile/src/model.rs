@@ -3776,6 +3776,7 @@ impl LockfileV3 {
     /// Load and parse a v3 lockfile from a string, normalizing all package keys to POSIX paths.
     /// Preserves untouched `raw_value` JSON values on packages for 100% round-trip fidelity.
     pub fn from_json_str(s: &str) -> Result<Self, LockfileError> {
+        let s = s.strip_prefix('\u{feff}').unwrap_or(s);
         if let Some(lockfile) = crate::fast_parse::try_parse_lockfile_v3_fast(s, true) {
             return Ok(lockfile);
         }
@@ -3793,6 +3794,7 @@ impl LockfileV3 {
     /// Parse a v3 lockfile in a single serde pass without building `serde_json::Value`
     /// or populating `raw_value`. Zero extra DOM allocations (ideal for `ci` / `fast_path` / `ls`).
     pub fn from_json_str_readonly(content: &str) -> Result<Self, LockfileError> {
+        let content = content.strip_prefix('\u{feff}').unwrap_or(content);
         if let Some(lockfile) = crate::fast_parse::try_parse_lockfile_v3_fast(content, false) {
             return Ok(lockfile);
         }
@@ -3947,14 +3949,60 @@ fn sw_key_rank(k: &str) -> u8 {
     }
 }
 
+/// Finds the index of the first byte requiring JSON escaping (`< 0x20`, `"`, or `\`).
+#[inline]
+pub(crate) fn find_first_json_escape(bytes: &[u8]) -> Option<usize> {
+    const LO: u64 = 0x0101_0101_0101_0101;
+    const HI: u64 = 0x8080_8080_8080_8080;
+    const QUOTE_MASK: u64 = (b'"' as u64) * LO;
+    const BACKSLASH_MASK: u64 = (b'\\' as u64) * LO;
+
+    let len = bytes.len();
+    let mut i = 0usize;
+    if len >= 8 {
+        let ptr = bytes.as_ptr();
+        while i + 8 <= len {
+            // SAFETY: `i + 8 <= len` guarantees 8 readable bytes within `bytes`.
+            let w = unsafe { ptr.add(i).cast::<u64>().read_unaligned() };
+            let has_ctrl = !(w | ((w & 0x7f7f_7f7f_7f7f_7f7f) + 0x6060_6060_6060_6060)) & HI;
+            let xq = w ^ QUOTE_MASK;
+            let has_quote = xq.wrapping_sub(LO) & !xq & HI;
+            let xb = w ^ BACKSLASH_MASK;
+            let has_bs = xb.wrapping_sub(LO) & !xb & HI;
+            let hit = has_ctrl | has_quote | has_bs;
+            if hit != 0 {
+                #[cfg(target_endian = "little")]
+                {
+                    return Some(i + (hit.trailing_zeros() >> 3) as usize);
+                }
+                #[cfg(not(target_endian = "little"))]
+                {
+                    for j in 0..8 {
+                        let b = bytes[i + j];
+                        if b < 0x20 || b == b'"' || b == b'\\' {
+                            return Some(i + j);
+                        }
+                    }
+                }
+            }
+            i += 8;
+        }
+    }
+    while i < len {
+        let b = bytes[i];
+        if b < 0x20 || b == b'"' || b == b'\\' {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
+}
+
 #[inline]
 pub(crate) fn write_json_str(s: &str, out: &mut String) {
     out.push('"');
     let bytes = s.as_bytes();
-    let Some(first_esc) = bytes
-        .iter()
-        .position(|&b| b < 0x20 || b == b'"' || b == b'\\')
-    else {
+    let Some(first_esc) = find_first_json_escape(bytes) else {
         out.push_str(s);
         out.push('"');
         return;
@@ -4184,6 +4232,7 @@ fn collect_pkg_fields<'p>(
 pub struct LockfileWriter<'a> {
     indent: &'a str,
     indent_buf: String,
+    nl_indent: [String; 8],
     newline: &'a str,
     compact: bool,
     root_metadata: bool,
@@ -4201,12 +4250,37 @@ impl<'a> LockfileWriter<'a> {
         } else {
             String::new()
         };
+        let nl_indent = std::array::from_fn(|level| {
+            if compact {
+                String::new()
+            } else {
+                let mut s = String::with_capacity(newline.len() + level * indent.len());
+                s.push_str(newline);
+                for _ in 0..level {
+                    s.push_str(indent);
+                }
+                s
+            }
+        });
         Self {
             indent,
             indent_buf,
+            nl_indent,
             newline,
             compact,
             root_metadata,
+        }
+    }
+
+    #[inline]
+    fn write_nl_indent(&self, out: &mut String, level: usize) {
+        if !self.compact {
+            if level < 8 {
+                out.push_str(&self.nl_indent[level]);
+            } else {
+                out.push_str(self.newline);
+                self.write_indent(out, level);
+            }
         }
     }
 
@@ -4296,19 +4370,17 @@ impl<'a> LockfileWriter<'a> {
                         out.push('}');
                     } else {
                         out.push('{');
-                        out.push_str(self.newline);
                         for i in base..slice_len {
                             let (k, v) = scratch[i];
-                            self.write_indent(out, level + 1);
+                            if i > base {
+                                out.push(',');
+                            }
+                            self.write_nl_indent(out, level + 1);
                             write_json_str(k, out);
                             out.push_str(": ");
                             self.write_value_inner(v, level + 1, out, scratch);
-                            if i + 1 < slice_len {
-                                out.push(',');
-                            }
-                            out.push_str(self.newline);
                         }
-                        self.write_indent(out, level);
+                        self.write_nl_indent(out, level);
                         out.push('}');
                     }
                     scratch.truncate(base);
@@ -4390,6 +4462,22 @@ impl<'a> LockfileWriter<'a> {
             out.push_str("{}");
             return;
         }
+        if map.len() == 1 {
+            if let Some((k, v)) = map.iter().next() {
+                out.push('{');
+                if !self.compact {
+                    self.write_nl_indent(out, level + 1);
+                }
+                write_json_str(k, out);
+                out.push_str(self.colon_sep());
+                write_json_str(v, out);
+                if !self.compact {
+                    self.write_nl_indent(out, level);
+                }
+                out.push('}');
+                return;
+            }
+        }
         str_scratch.clear();
         str_scratch.extend(map.iter().map(|(k, v)| (k.as_str(), v.as_str())));
         if str_scratch.len() > 1
@@ -4420,18 +4508,16 @@ impl<'a> LockfileWriter<'a> {
             out.push('}');
         } else {
             out.push('{');
-            out.push_str(self.newline);
             for (i, &(k, v)) in str_scratch.iter().enumerate() {
-                self.write_indent(out, level + 1);
+                if i > 0 {
+                    out.push(',');
+                }
+                self.write_nl_indent(out, level + 1);
                 write_json_str(k, out);
                 out.push_str(": ");
                 write_json_str(v, out);
-                if i + 1 < len {
-                    out.push(',');
-                }
-                out.push_str(self.newline);
             }
-            self.write_indent(out, level);
+            self.write_nl_indent(out, level);
             out.push('}');
         }
     }
@@ -4564,18 +4650,16 @@ impl<'a> LockfileWriter<'a> {
             out.push('}');
         } else {
             out.push('{');
-            out.push_str(self.newline);
             for (i, &(k, _, v)) in pkg_scratch.iter().enumerate() {
-                self.write_indent(out, level + 1);
+                if i > 0 {
+                    out.push(',');
+                }
+                self.write_nl_indent(out, level + 1);
                 write_json_str(k, out);
                 out.push_str(": ");
                 self.write_pkg_field_val(v, level + 1, out, val_scratch, str_scratch);
-                if i + 1 < len {
-                    out.push(',');
-                }
-                out.push_str(self.newline);
             }
-            self.write_indent(out, level);
+            self.write_nl_indent(out, level);
             out.push('}');
         }
     }

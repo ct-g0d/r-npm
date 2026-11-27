@@ -6298,3 +6298,18 @@ fn test_installer_returns_storage_setup_errors() {
         assert_eq!(error.to_string(), expected);
     }
 }
+
+#[test]
+fn test_installer_rejects_invalid_proxy_without_panicking() {
+    let tmp = tempdir().unwrap();
+    let mut cfg = rnpm_config::Config::new();
+    cfg.npmrc
+        .settings
+        .insert("proxy".to_string(), "http://[::invalid".to_string());
+    let result = Installer::new(InstallOptions {
+        project_dir: tmp.path().to_path_buf(),
+        config_override: Some(cfg),
+        ..Default::default()
+    });
+    assert!(result.is_err());
+}

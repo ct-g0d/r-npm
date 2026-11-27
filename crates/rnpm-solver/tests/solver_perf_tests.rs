@@ -580,3 +580,62 @@ fn bench_solver_workloads() {
         norm_flags_med.as_secs_f64() * 1000.0
     );
 }
+
+#[test]
+fn bench_solver_overrides_and_prefer_dedupe() {
+    let (mut med_m, med_p) = build_medium_workload();
+    med_m.extra.insert(
+        "overrides".to_string(),
+        serde_json::json!({
+            "ms": "^2.0.0",
+            "chalk > supports-color": "^2.0.0",
+            "med-pkg-001": "$med-pkg-001"
+        }),
+    );
+
+    let options_ov = ResolverOptions {
+        platform: Platform::new("win32", "x64"),
+        ..Default::default()
+    };
+    let ov_warmup = resolve_dependency_graph(&med_m, &med_p, &options_ov).unwrap();
+    let rounds = if cfg!(debug_assertions) { 3 } else { 25 };
+    let mut ov_samples = Vec::with_capacity(rounds);
+    for _ in 0..rounds {
+        let t0 = Instant::now();
+        let g = resolve_dependency_graph(&med_m, &med_p, &options_ov).unwrap();
+        ov_samples.push(t0.elapsed());
+        std::hint::black_box(g.nodes.len());
+    }
+    let ov_med = median_duration(ov_samples);
+
+    let (lg_m, lg_p) = build_large_workload();
+    let options_dedupe = ResolverOptions {
+        platform: Platform::new("win32", "x64"),
+        prefer_dedupe: true,
+        ..Default::default()
+    };
+    let dedupe_warmup = resolve_dependency_graph(&lg_m, &lg_p, &options_dedupe).unwrap();
+    let dedupe_rounds = if cfg!(debug_assertions) { 1 } else { 7 };
+    let mut dedupe_samples = Vec::with_capacity(dedupe_rounds);
+    for _ in 0..dedupe_rounds {
+        let t0 = Instant::now();
+        let g = resolve_dependency_graph(&lg_m, &lg_p, &options_dedupe).unwrap();
+        dedupe_samples.push(t0.elapsed());
+        std::hint::black_box(g.nodes.len());
+    }
+    let dedupe_med = median_duration(dedupe_samples);
+
+    println!("=== RNPM-SOLVER OVERRIDES & PREFER_DEDUPE BENCHMARK (median) ===");
+    println!(
+        "medium+overrides (nodes={:4}, edges={:4}): {:>8.3} ms",
+        ov_warmup.nodes.len(),
+        ov_warmup.edges.len(),
+        ov_med.as_secs_f64() * 1000.0
+    );
+    println!(
+        "large+dedupe     (nodes={:4}, edges={:4}): {:>8.3} ms",
+        dedupe_warmup.nodes.len(),
+        dedupe_warmup.edges.len(),
+        dedupe_med.as_secs_f64() * 1000.0
+    );
+}

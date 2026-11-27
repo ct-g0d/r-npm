@@ -382,7 +382,7 @@ pub fn load_actual(
     }
     if hidden_valid {
         if let Ok(hidden) =
-            rnpm_lockfile::LockfileV3::load_from_file(&node_modules.join(".package-lock.json"))
+            rnpm_lockfile::LockfileV3::load_from_file_readonly(&node_modules.join(".package-lock.json"))
         {
             return hidden.packages;
         }

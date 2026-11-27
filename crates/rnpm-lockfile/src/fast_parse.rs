@@ -11,7 +11,9 @@ struct FastLockfileScanner<'a> {
 impl<'a> FastLockfileScanner<'a> {
     #[inline]
     fn skip_ws(&mut self) {
-        while let Some(&b) = self.bytes.get(self.pos) {
+        let len = self.bytes.len();
+        while self.pos < len {
+            let b = self.bytes[self.pos];
             if b == b' ' || matches!(b, b'\n' | b'\r' | b'\t') {
                 self.pos += 1;
             } else {
@@ -46,7 +48,24 @@ impl<'a> FastLockfileScanner<'a> {
         self.pos += 1;
         let start = self.pos;
         let rest = &self.bytes[start..];
-        let idx = rest.iter().position(|&b| b == b'"' || b == b'\\' || b < 0x20)?;
+        let mut i = 0usize;
+        let quick = rest.len().min(8);
+        while i < quick {
+            let b = rest[i];
+            if b == b'"' {
+                self.pos = start + i + 1;
+                // SAFETY: `self.bytes` originates from a valid `&str`, and both boundaries are ASCII `"`.
+                return Some(unsafe {
+                    std::str::from_utf8_unchecked(&self.bytes[start..start + i])
+                });
+            }
+            if b == b'\\' || b < 0x20 {
+                return None;
+            }
+            i += 1;
+        }
+        let rel = crate::model::find_first_json_escape(&rest[i..])?;
+        let idx = i + rel;
         if rest[idx] != b'"' {
             return None;
         }
@@ -715,9 +734,166 @@ impl<'a> FastLockfileScanner<'a> {
             }
         }
     }
+    fn enrich_v2_deps_map(
+        &mut self,
+        path_buf: &mut String,
+        packages: &mut BTreeMap<String, LockfilePackage>,
+    ) -> Option<()> {
+        self.expect_byte(b'{')?;
+        if self.peek()? == b'}' {
+            self.pos += 1;
+            return Some(());
+        }
+        loop {
+            let dep_name = self.read_plain_str()?;
+            self.expect_byte(b':')?;
+            self.expect_byte(b'{')?;
+
+            let prev_len = path_buf.len();
+            if prev_len == 0 {
+                path_buf.push_str("node_modules/");
+            } else {
+                path_buf.push_str("/node_modules/");
+            }
+            path_buf.push_str(dep_name);
+
+            let mut explicit_name: Option<&str> = None;
+            let mut dep_version: &str = "";
+            let mut dev = false;
+            let mut optional = false;
+            let mut dev_optional = false;
+            let mut peer = false;
+            let mut peer_optional = false;
+            let mut bundled = false;
+            let mut has_install_script = false;
+            let mut has_shrinkwrap = false;
+
+            if self.peek()? != b'}' {
+                loop {
+                    let fk = self.read_plain_str()?;
+                    self.expect_byte(b':')?;
+                    match fk {
+                        "version" => {
+                            dep_version = self.read_plain_str()?;
+                            if dep_version.starts_with("file:")
+                                && !dep_version.ends_with(".tgz")
+                                && !dep_version.ends_with(".tar.gz")
+                                && !dep_version.ends_with(".tar")
+                            {
+                                path_buf.truncate(prev_len);
+                                return None;
+                            }
+                        }
+                        "name" => explicit_name = Some(self.read_plain_str()?),
+                        "dev" => dev = self.read_bool()?,
+                        "optional" => optional = self.read_bool()?,
+                        "devOptional" => dev_optional = self.read_bool()?,
+                        "peer" => peer = self.read_bool()?,
+                        "peerOptional" => peer_optional = self.read_bool()?,
+                        "bundled" | "inBundle" => bundled = self.read_bool()?,
+                        "hasInstallScript" => has_install_script = self.read_bool()?,
+                        "hasShrinkwrap" => has_shrinkwrap = self.read_bool()?,
+                        "dependencies" => {
+                            self.enrich_v2_deps_map(path_buf, packages)?;
+                        }
+                        _ => self.skip_plain_value(0)?,
+                    }
+                    match self.peek()? {
+                        b',' => self.pos += 1,
+                        b'}' => break,
+                        _ => {
+                            path_buf.truncate(prev_len);
+                            return None;
+                        }
+                    }
+                }
+            }
+            self.pos += 1;
+
+            let Some(pkg) = packages.get_mut(path_buf.as_str()) else {
+                path_buf.truncate(prev_len);
+                return None;
+            };
+            if pkg.name.is_none() {
+                if let Some(alias_part) = dep_version.strip_prefix("npm:") {
+                    let name = match alias_part.rfind('@') {
+                        Some(at_idx) if at_idx > 0 => &alias_part[..at_idx],
+                        _ => alias_part,
+                    };
+                    if name != dep_name {
+                        pkg.name = Some(name.to_owned());
+                    }
+                } else if let Some(n) = explicit_name {
+                    if n != dep_name {
+                        pkg.name = Some(n.to_owned());
+                    }
+                }
+            }
+            if pkg.dev.is_none() && dev {
+                pkg.dev = Some(true);
+            }
+            if pkg.optional.is_none() && optional {
+                pkg.optional = Some(true);
+            }
+            if pkg.dev_optional.is_none() && dev_optional {
+                pkg.dev_optional = Some(true);
+            }
+            if pkg.peer.is_none() && peer {
+                pkg.peer = Some(true);
+            }
+            if pkg.peer_optional.is_none() && peer_optional {
+                pkg.peer_optional = Some(true);
+            }
+            if pkg.in_bundle.is_none() && bundled {
+                pkg.in_bundle = Some(true);
+            }
+            if pkg.has_install_script.is_none() && has_install_script {
+                pkg.has_install_script = Some(true);
+            }
+            if pkg.has_shrinkwrap.is_none() && has_shrinkwrap {
+                pkg.has_shrinkwrap = Some(true);
+            }
+            pkg.normalize_flags();
+            path_buf.truncate(prev_len);
+
+            match self.peek()? {
+                b',' => self.pos += 1,
+                b'}' => {
+                    self.pos += 1;
+                    return Some(());
+                }
+                _ => return None,
+            }
+        }
+    }
+}
+
+#[inline]
+fn insert_normalized_pkg(
+    pkgs: &mut BTreeMap<String, LockfilePackage>,
+    pkg_key: &str,
+    pkg: LockfilePackage,
+) {
+    if pkg_key.as_bytes().contains(&b'\\') {
+        pkgs.insert(rnpm_core::to_posix_path(pkg_key), pkg);
+    } else {
+        pkgs.insert(pkg_key.to_owned(), pkg);
+    }
 }
 
 pub(crate) fn try_parse_lockfile_v3_fast(content: &str, capture_raw: bool) -> Option<LockfileV3> {
+    try_parse_lockfile_fast_impl(content, capture_raw, false)
+}
+
+pub(crate) fn try_parse_and_migrate_readonly_fast(content: &str) -> Option<LockfileV3> {
+    try_parse_lockfile_fast_impl(content, false, true)
+}
+
+fn try_parse_lockfile_fast_impl(
+    content: &str,
+    capture_raw: bool,
+    migrate_v2: bool,
+) -> Option<LockfileV3> {
     let mut r = FastLockfileScanner {
         bytes: content.as_bytes(),
         pos: 0,
@@ -728,11 +904,15 @@ pub(crate) fn try_parse_lockfile_v3_fast(content: &str, capture_raw: bool) -> Op
     let mut lockfile_version: Option<u32> = None;
     let mut requires: Option<Option<bool>> = None;
     let mut packages: Option<BTreeMap<String, LockfilePackage>> = None;
+    let mut deps_start: Option<usize> = None;
 
     if r.peek()? == b'}' {
         r.pos += 1;
         r.skip_ws();
         if r.pos != r.bytes.len() {
+            return None;
+        }
+        if migrate_v2 {
             return None;
         }
         return Some(LockfileV3 {
@@ -796,7 +976,7 @@ pub(crate) fn try_parse_lockfile_v3_fast(content: &str, capture_raw: bool) -> Op
                             let pkg_key = r.read_plain_str()?;
                             r.expect_byte(b':')?;
                             let pkg = r.read_package::<true>()?;
-                            pkgs.insert(pkg_key.to_owned(), pkg);
+                            insert_normalized_pkg(&mut pkgs, pkg_key, pkg);
                             match r.peek()? {
                                 b',' => r.pos += 1,
                                 b'}' => break,
@@ -808,7 +988,7 @@ pub(crate) fn try_parse_lockfile_v3_fast(content: &str, capture_raw: bool) -> Op
                             let pkg_key = r.read_plain_str()?;
                             r.expect_byte(b':')?;
                             let pkg = r.read_package::<false>()?;
-                            pkgs.insert(pkg_key.to_owned(), pkg);
+                            insert_normalized_pkg(&mut pkgs, pkg_key, pkg);
                             match r.peek()? {
                                 b',' => r.pos += 1,
                                 b'}' => break,
@@ -819,6 +999,14 @@ pub(crate) fn try_parse_lockfile_v3_fast(content: &str, capture_raw: bool) -> Op
                 }
                 r.pos += 1;
                 packages = Some(pkgs);
+            }
+            "dependencies" => {
+                if deps_start.is_some() {
+                    return None;
+                }
+                r.skip_ws();
+                deps_start = Some(r.pos);
+                r.skip_plain_value(0)?;
             }
             _ => r.skip_plain_value(0)?,
         }
@@ -831,11 +1019,54 @@ pub(crate) fn try_parse_lockfile_v3_fast(content: &str, capture_raw: bool) -> Op
                 if r.pos != r.bytes.len() {
                     return None;
                 }
+                let eff_ver = lockfile_version
+                    .unwrap_or_else(crate::migration::default_lockfile_version);
+                if migrate_v2 {
+                    if eff_ver == 3 {
+                        let pkgs = packages?;
+                        if pkgs.is_empty() {
+                            return None;
+                        }
+                        return Some(LockfileV3 {
+                            name: name.unwrap_or_default(),
+                            version: version.unwrap_or(None),
+                            lockfile_version: 3,
+                            requires: requires.unwrap_or(None),
+                            packages: pkgs,
+                        });
+                    }
+                    if eff_ver == 2 {
+                        let mut pkgs = packages?;
+                        if pkgs.is_empty()
+                            || !pkgs.get("").is_some_and(|root| root.dependencies.is_some())
+                        {
+                            return None;
+                        }
+                        if let Some(ds) = deps_start {
+                            let mut deps_scanner = FastLockfileScanner {
+                                bytes: content.as_bytes(),
+                                pos: ds,
+                            };
+                            let mut path_buf = String::with_capacity(64);
+                            deps_scanner.enrich_v2_deps_map(&mut path_buf, &mut pkgs)?;
+                        }
+                        if let Some(root) = pkgs.get_mut("") {
+                            root.normalize_flags();
+                        }
+                        return Some(LockfileV3 {
+                            name: name.unwrap_or_default(),
+                            version: version.unwrap_or(None),
+                            lockfile_version: 3,
+                            requires: requires.unwrap_or(None).or(Some(true)),
+                            packages: pkgs,
+                        });
+                    }
+                    return None;
+                }
                 return Some(LockfileV3 {
                     name: name.unwrap_or_default(),
                     version: version.unwrap_or(None),
-                    lockfile_version: lockfile_version
-                        .unwrap_or_else(crate::migration::default_lockfile_version),
+                    lockfile_version: eff_ver,
                     requires: requires.unwrap_or(None),
                     packages: packages.unwrap_or_default(),
                 });

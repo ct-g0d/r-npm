@@ -7438,3 +7438,334 @@ fn test_pkg_cache_partial_equal_len_and_latest_tag_bypass() {
         "2.0.0"
     );
 }
+
+#[test]
+fn test_solver_edge_cases_aliased_peers_diamond_conflict_ref_overrides_dedupe_roundtrip() {
+    use crate::graph::DependencyGraph;
+    use crate::solver::{resolve_dependency_graph, ResolverOptions};
+    use crate::types::InMemoryPackageProvider;
+
+    let mut provider = InMemoryPackageProvider::new();
+    // Deprecated 2.0.0 vs undeprecated 1.5.0 and 1.2.0
+    provider.add_version("shared-lib", "1.2.0", |_| {});
+    provider.add_version("shared-lib", "1.5.0", |_| {});
+    provider.add_version("shared-lib", "2.0.0", |v| {
+        v.deprecated = Some("old major".into());
+    });
+    provider.add_version("real-peer", "1.4.0", |_| {});
+    provider.add_version("real-peer", "2.0.0", |_| {});
+    provider.add_version("peer-consumer", "1.0.0", |v| {
+        v.peer_dependencies
+            .insert("peer-alias".into(), "npm:real-peer@^1.0.0".into());
+    });
+    provider.add_version("peer-conflict-a", "1.0.0", |v| {
+        v.peer_dependencies
+            .insert("real-peer".into(), "^1.0.0".into());
+    });
+    provider.add_version("peer-conflict-b", "1.0.0", |v| {
+        v.peer_dependencies
+            .insert("real-peer".into(), "^2.0.0".into());
+    });
+    provider.add_version("holder-low", "1.0.0", |v| {
+        v.dependencies
+            .insert("shared-lib".into(), "1.2.0".into());
+    });
+    provider.add_version("holder-high", "1.0.0", |v| {
+        v.dependencies
+            .insert("shared-lib".into(), "1.5.0".into());
+    });
+    provider.add_version("consumer-dedupe", "1.0.0", |v| {
+        v.dependencies
+            .insert("shared-lib".into(), "^1.0.0".into());
+    });
+    provider.add_version("parent-ov", "1.0.0", |v| {
+        v.dependencies
+            .insert("shared-lib".into(), "1.2.0".into());
+    });
+
+    // 1. Aliased peer dependency (`npm:real-peer@^1.0.0`)
+    let mut alias_manifest = Manifest {
+        name: Some("alias-peer-app".into()),
+        version: Some("1.0.0".into()),
+        ..Default::default()
+    };
+    alias_manifest
+        .dependencies
+        .insert("peer-consumer".into(), "1.0.0".into());
+    let alias_graph =
+        resolve_dependency_graph(&alias_manifest, &provider, &ResolverOptions::default())
+            .expect("aliased peer must resolve");
+    assert_eq!(alias_graph.nodes["node_modules/peer-alias"].name, "real-peer");
+    assert_eq!(alias_graph.nodes["node_modules/peer-alias"].version, "1.4.0");
+
+    // Lockfile v3 round-trip fidelity for aliased peer
+    let lock_v3 = alias_graph.to_lockfile_v3("alias-peer-app", Some("1.0.0"));
+    let round_tripped = DependencyGraph::from_lockfile_v3(&lock_v3);
+    assert_eq!(round_tripped.nodes["node_modules/peer-alias"].name, "real-peer");
+    assert_eq!(round_tripped.nodes["node_modules/peer-alias"].version, "1.4.0");
+    assert_eq!(round_tripped.edges.len(), alias_graph.edges.len());
+
+    // 2. Diamond peer conflict fails strict mode
+    let mut conflict_manifest = Manifest {
+        name: Some("diamond-peer-conflict".into()),
+        version: Some("1.0.0".into()),
+        ..Default::default()
+    };
+    conflict_manifest
+        .dependencies
+        .insert("peer-conflict-a".into(), "1.0.0".into());
+    conflict_manifest
+        .dependencies
+        .insert("peer-conflict-b".into(), "1.0.0".into());
+    assert!(resolve_dependency_graph(
+        &conflict_manifest,
+        &provider,
+        &ResolverOptions {
+            strict_peer_deps: true,
+            ..Default::default()
+        }
+    )
+    .is_err());
+
+    // 3. $ref override shadowing in nested parent
+    let mut ov_manifest = Manifest {
+        name: Some("ref-shadow-app".into()),
+        version: Some("1.0.0".into()),
+        ..Default::default()
+    };
+    ov_manifest
+        .dependencies
+        .insert("shared-lib".into(), "1.5.0".into());
+    ov_manifest
+        .dependencies
+        .insert("parent-ov".into(), "1.0.0".into());
+    ov_manifest.extra.insert(
+        "overrides".into(),
+        serde_json::json!({
+            "shared-lib": "1.2.0",
+            "parent-ov": {
+                "shared-lib": "$shared-lib"
+            }
+        }),
+    );
+    let ov_graph = resolve_dependency_graph(&ov_manifest, &provider, &ResolverOptions::default())
+        .expect("ref override shadowing");
+    assert_eq!(
+        ov_graph.nodes["node_modules/parent-ov/node_modules/shared-lib"].version,
+        "1.5.0"
+    );
+
+    // 4. prefer_dedupe selects highest undeprecated placed version (1.5.0)
+    let mut dedupe_manifest = Manifest {
+        name: Some("dedupe-app".into()),
+        version: Some("1.0.0".into()),
+        ..Default::default()
+    };
+    dedupe_manifest
+        .dependencies
+        .insert("holder-low".into(), "1.0.0".into());
+    dedupe_manifest
+        .dependencies
+        .insert("holder-high".into(), "1.0.0".into());
+    dedupe_manifest
+        .dependencies
+        .insert("consumer-dedupe".into(), "1.0.0".into());
+    let dedupe_graph = resolve_dependency_graph(
+        &dedupe_manifest,
+        &provider,
+        &ResolverOptions {
+            prefer_dedupe: true,
+            ..Default::default()
+        },
+    )
+    .expect("prefer_dedupe must succeed");
+    assert_eq!(dedupe_graph.nodes["node_modules/shared-lib"].version, "1.5.0");
+}
+
+#[test]
+fn test_workspace_protocols_star_caret_tilde_edge_cases() {
+    use crate::solver::ResolverOptions;
+    use crate::types::InMemoryPackageProvider;
+    use crate::workspace::resolve_workspace_graph;
+    use rnpm_core::workspace::WorkspaceMember;
+
+    let root_manifest = Manifest {
+        name: Some("ws-root".into()),
+        version: Some("1.0.0".into()),
+        ..Default::default()
+    };
+    let pkg_a = Manifest {
+        name: Some("pkg-a".into()),
+        version: Some("1.2.3".into()),
+        ..Default::default()
+    };
+    let mut pkg_b = Manifest {
+        name: Some("pkg-b".into()),
+        version: Some("2.0.0".into()),
+        ..Default::default()
+    };
+    pkg_b.dependencies.insert("pkg-a".into(), "workspace:^".into());
+    let mut pkg_c = Manifest {
+        name: Some("pkg-c".into()),
+        version: Some("3.0.0".into()),
+        ..Default::default()
+    };
+    pkg_c.dependencies.insert("pkg-a".into(), "workspace:~".into());
+    let mut pkg_d = Manifest {
+        name: Some("pkg-d".into()),
+        version: Some("4.0.0".into()),
+        ..Default::default()
+    };
+    pkg_d.dependencies.insert("pkg-a".into(), "workspace:*".into());
+
+    let members = vec![
+        WorkspaceMember {
+            name: "pkg-a".into(),
+            version: Some("1.2.3".into()),
+            path: std::path::PathBuf::from("packages/a"),
+            relative_path: "packages/a".into(),
+            manifest: pkg_a,
+        },
+        WorkspaceMember {
+            name: "pkg-b".into(),
+            version: Some("2.0.0".into()),
+            path: std::path::PathBuf::from("packages/b"),
+            relative_path: "packages/b".into(),
+            manifest: pkg_b,
+        },
+        WorkspaceMember {
+            name: "pkg-c".into(),
+            version: Some("3.0.0".into()),
+            path: std::path::PathBuf::from("packages/c"),
+            relative_path: "packages/c".into(),
+            manifest: pkg_c,
+        },
+        WorkspaceMember {
+            name: "pkg-d".into(),
+            version: Some("4.0.0".into()),
+            path: std::path::PathBuf::from("packages/d"),
+            relative_path: "packages/d".into(),
+            manifest: pkg_d,
+        },
+    ];
+
+    let graph = resolve_workspace_graph(
+        &root_manifest,
+        &members,
+        &InMemoryPackageProvider::new(),
+        &ResolverOptions::default(),
+    )
+    .expect("workspace protocols must resolve cleanly");
+    assert!(graph.nodes.contains_key("node_modules/pkg-a"));
+    // 4 root -> member link edges + 3 member -> pkg-a workspace protocol edges
+    assert_eq!(graph.edges.len(), 7);
+    assert_eq!(
+        graph
+            .edges
+            .iter()
+            .filter(|e| e.to_location == "node_modules/pkg-a" && !e.from_location.is_empty())
+            .count(),
+        3
+    );
+}
+
+#[test]
+fn test_alias_real_pkg_override_falls_through_on_non_matching_install_name_rule() {
+    use crate::overrides::Overrides;
+    use crate::solver::{ResolverOptions, Solver};
+    use crate::types::InMemoryPackageProvider;
+
+    let mut provider = InMemoryPackageProvider::new();
+    provider.add_version("lodash", "4.17.15", |_| {});
+    provider.add_version("lodash", "4.17.21", |_| {});
+
+    let mut manifest = Manifest {
+        name: Some("alias-override-app".into()),
+        version: Some("1.0.0".into()),
+        ..Default::default()
+    };
+    manifest
+        .dependencies
+        .insert("my-alias".into(), "npm:lodash@4.17.15".into());
+    manifest.extra.insert(
+        "overrides".into(),
+        serde_json::json!({
+            "my-alias@1.0.0": "2.0.0",
+            "lodash": "4.17.21"
+        }),
+    );
+
+    let overrides = Overrides::from_json_value(
+        manifest.extra.get("overrides"),
+        Overrides::reference_specs(&manifest),
+    );
+    let solver = Solver::new(&provider, ResolverOptions::default(), overrides);
+    let graph = solver.resolve(&manifest).expect("alias override resolution");
+    assert_eq!(graph.nodes["node_modules/my-alias"].name, "lodash");
+    assert_eq!(graph.nodes["node_modules/my-alias"].version, "4.17.21");
+}
+
+#[test]
+fn test_prefer_dedupe_unrecords_overwritten_occupied_node() {
+    use crate::graph::{DependencyGraph, Node};
+    use crate::overrides::Overrides;
+    use crate::solver::{ResolverOptions, Solver};
+    use crate::types::InMemoryPackageProvider;
+
+    let mut provider = InMemoryPackageProvider::new();
+    provider.add_version("target-pkg", "1.0.0", |_| {});
+    provider.add_version("target-pkg", "1.4.0", |_| {});
+    provider.add_version("target-pkg", "2.0.0", |_| {});
+    provider.add_version("consumer", "1.0.0", |v| {
+        v.dependencies.insert("target-pkg".into(), "^1.0.0".into());
+    });
+
+    // Seed a graph whose root has a stale 1.0.0 entry that gets overwritten before consumer resolves.
+    let mut base_graph = DependencyGraph::new();
+    base_graph.add_node(
+        "".into(),
+        Node {
+            location: "".into(),
+            install_name: "app".into(),
+            name: "app".into(),
+            version: "1.0.0".into(),
+            ..Default::default()
+        },
+    );
+    base_graph.add_node(
+        "node_modules/target-pkg".into(),
+        Node {
+            location: "node_modules/target-pkg".into(),
+            install_name: "target-pkg".into(),
+            name: "target-pkg".into(),
+            version: "1.0.0".into(),
+            ..Default::default()
+        },
+    );
+
+    let mut manifest = Manifest {
+        name: Some("app".into()),
+        version: Some("1.0.0".into()),
+        ..Default::default()
+    };
+    // Overwrite `node_modules/target-pkg` directly with 2.0.0 first, then ask `consumer` for `^1.0.0`.
+    manifest.dependencies.insert("target-pkg".into(), "2.0.0".into());
+    manifest.dependencies.insert("consumer".into(), "1.0.0".into());
+
+    let solver = Solver::new(
+        &provider,
+        ResolverOptions {
+            prefer_dedupe: true,
+            ..Default::default()
+        },
+        Overrides::default(),
+    )
+    .with_graph(base_graph);
+    let graph = solver.resolve(&manifest).expect("prefer_dedupe overwrite test");
+    assert_eq!(graph.nodes["node_modules/target-pkg"].version, "2.0.0");
+    // Must pick 1.4.0 (latest compatible) rather than phantom evicted 1.0.0.
+    assert_eq!(
+        graph.nodes["node_modules/consumer/node_modules/target-pkg"].version,
+        "1.4.0"
+    );
+}

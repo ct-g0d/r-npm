@@ -161,7 +161,7 @@ fn parse_prerelease_list(
     }
     let bytes = pre_str.as_bytes();
     let len = bytes.len();
-    let mut pres = Vec::new();
+    let mut pres = Vec::with_capacity(2);
     let mut start = 0usize;
 
     loop {
@@ -241,7 +241,7 @@ fn parse_strict_build_list(b_str: &str, orig_input: &str) -> Result<Vec<String>,
     }
     let bytes = b_str.as_bytes();
     let len = bytes.len();
-    let mut builds = Vec::new();
+    let mut builds = Vec::with_capacity(1);
     let mut start = 0usize;
 
     loop {

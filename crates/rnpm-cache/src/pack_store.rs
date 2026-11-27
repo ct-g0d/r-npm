@@ -34,8 +34,12 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256, Sha512};
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, OpenOptions};
-use std::io::{BufReader, Read, Write};
+#[cfg(windows)]
+use std::io::Write;
+use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
+#[cfg(windows)]
+use std::sync::atomic::AtomicU8;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread::{sleep, yield_now};
@@ -1073,7 +1077,7 @@ impl PackagePack {
         // 2. Direct materialization straight from memory mapping (or ReFS block cloning).
         let files = &self.index.files;
         if !can_block_clone && files.len() >= 8 {
-            let num_threads = 16.min(files.len() / 2).max(2).min(files.len());
+            let num_threads = 24.min(files.len() / 2).max(2).min(files.len());
             let next_idx = AtomicUsize::new(0);
             let has_err = AtomicBool::new(false);
             let first_err: Mutex<Option<CacheError>> = Mutex::new(None);
@@ -1082,6 +1086,8 @@ impl PackagePack {
             rnpm_fs::run_parallel(num_threads, &|| {
                 #[cfg(windows)]
                 let mut wide_buf: Vec<u16> = Vec::with_capacity(260);
+                let mut local_files = 0u64;
+                let mut local_bytes = 0u64;
                 loop {
                     if has_err.load(Ordering::Relaxed) {
                         break;
@@ -1109,21 +1115,21 @@ impl PackagePack {
                         }
                     }
 
-                    let write_res = {
+                    let write_res: std::io::Result<bool> = {
                         #[cfg(windows)]
                         {
                             if is_clean_rel_ascii_path(&entry.path) {
                                 append_ascii_rel_wide(&mut wide_buf, prefix_ref, &entry.path);
-                                rnpm_fs::writer::write_file_fast_wide_raw(
+                                match rnpm_fs::writer::write_file_fast_wide_raw(
                                     &wide_buf,
                                     target_dir,
                                     slice,
                                     entry.mode,
                                     prealloc_thresh,
-                                    true,
-                                )
-                                .or_else(|_| {
-                                    clone_or_write_pack_file(
+                                    false,
+                                ) {
+                                    Ok(()) => Ok(true),
+                                    Err(_) => clone_or_write_pack_file(
                                         None,
                                         &target_dir.join(&entry.path),
                                         slice,
@@ -1132,8 +1138,8 @@ impl PackagePack {
                                         entry.mode,
                                         prealloc_thresh,
                                     )
-                                    .map(|_| ())
-                                })
+                                    .map(|_| false),
+                                }
                             } else {
                                 clone_or_write_pack_file(
                                     None,
@@ -1144,7 +1150,7 @@ impl PackagePack {
                                     entry.mode,
                                     prealloc_thresh,
                                 )
-                                .map(|_| ())
+                                .map(|_| false)
                             }
                         }
                         #[cfg(not(windows))]
@@ -1158,17 +1164,30 @@ impl PackagePack {
                                 entry.mode,
                                 prealloc_thresh,
                             )
-                            .map(|_| ())
+                            .map(|_| false)
                         }
                     };
-                    if let Err(e) = write_res {
-                        has_err.store(true, Ordering::Relaxed);
-                        let mut guard = first_err.lock().unwrap();
-                        if guard.is_none() {
-                            *guard = Some(CacheError::Io(e));
+                    match write_res {
+                        Err(e) => {
+                            if local_files > 0 {
+                                rnpm_fs::record_files_created_batch(local_files, local_bytes);
+                            }
+                            has_err.store(true, Ordering::Relaxed);
+                            let mut guard = first_err.lock().unwrap();
+                            if guard.is_none() {
+                                *guard = Some(CacheError::Io(e));
+                            }
+                            return;
                         }
-                        break;
+                        Ok(true) => {
+                            local_files += 1;
+                            local_bytes += slice.len() as u64;
+                        }
+                        Ok(false) => {}
                     }
+                }
+                if local_files > 0 {
+                    rnpm_fs::record_files_created_batch(local_files, local_bytes);
                 }
             });
             if let Some(err) = first_err.into_inner().unwrap() {
@@ -1269,6 +1288,8 @@ pub struct PackStore {
     root: PathBuf,
     mmap_cache: Arc<RwLock<HashMap<String, PackagePack>>>,
     block_clone_cache: Arc<RwLock<HashMap<PathBuf, bool>>>,
+    #[cfg(windows)]
+    block_clone_drive_cache: Arc<[AtomicU8; 26]>,
     cas_stamp_cache: Arc<RwLock<HashMap<PathBuf, (u64, u64)>>>,
     has_cas_files: Arc<AtomicBool>,
     created_prefixes: Arc<RwLock<std::collections::HashSet<String>>>,
@@ -1296,6 +1317,8 @@ impl PackStore {
             root,
             mmap_cache: Arc::new(RwLock::new(HashMap::new())),
             block_clone_cache: Arc::new(RwLock::new(HashMap::new())),
+            #[cfg(windows)]
+            block_clone_drive_cache: Arc::new([const { AtomicU8::new(0) }; 26]),
             cas_stamp_cache: Arc::new(RwLock::new(HashMap::new())),
             has_cas_files: Arc::new(AtomicBool::new(has_cas)),
             created_prefixes: Arc::new(RwLock::new(std::collections::HashSet::new())),
@@ -1436,87 +1459,103 @@ impl PackStore {
         parent_created: bool,
         cas_may_exist: bool,
     ) -> std::io::Result<Option<u64>> {
-        if cas_may_exist {
-            if let Some((sz, mt)) = fast_size_and_mtime(cas_path) {
-                if sz == data.len() as u64 {
-                    if let Ok(existing) = fs::read(cas_path) {
-                        if existing == data {
-                            return Ok(mt);
-                        }
-                    }
-                }
-            }
-        }
-        if !parent_created {
-            if let Some(parent) = cas_path.parent() {
-                let _ = fs::create_dir_all(parent);
-            }
-        }
-        let count = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let pid = std::process::id();
-        let tmp_path = cas_path.with_extension(format!("tmp_{pid}_{count}"));
-
+        #[cfg(windows)]
         {
-            let mut f = match OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .open(&tmp_path)
-            {
-                Ok(f) => f,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    if let Some(parent) = cas_path.parent() {
-                        fs::create_dir_all(parent)?;
-                    }
-                    OpenOptions::new()
-                        .write(true)
-                        .create(true)
-                        .truncate(true)
-                        .open(&tmp_path)?
-                }
-                Err(e) => return Err(e),
-            };
-            f.write_all(data)?;
-        }
-
-        match fs::rename(&tmp_path, cas_path) {
-            Ok(()) => Ok(fast_size_and_mtime(cas_path).and_then(|(_, mt)| mt)),
-            Err(_) => {
-                if let Some((sz, mt)) = fast_size_and_mtime(cas_path) {
-                    if sz == data.len() as u64
-                        && fs::read(cas_path).is_ok_and(|existing| existing == data)
-                    {
-                        let _ = fs::remove_file(&tmp_path);
+            let mut wide_cas = Vec::with_capacity(260);
+            crate::storage::encode_verbatim_wide_into(cas_path, &mut wide_cas);
+            if cas_may_exist {
+                if let Some((sz, mt)) = fast_size_and_mtime_wide(&wide_cas) {
+                    if sz == data.len() as u64 && fs::read(cas_path).is_ok_and(|e| e == data) {
                         return Ok(mt);
                     }
                 }
-                #[cfg(windows)]
-                {
-                    if let Ok(meta) = fs::symlink_metadata(cas_path) {
-                        let mut perms = meta.permissions();
-                        if perms.readonly() {
-                            perms.set_readonly(false);
-                            let _ = fs::set_permissions(cas_path, perms);
-                        }
+            }
+
+            if !parent_created {
+                if let Some(parent) = cas_path.parent() {
+                    let _ = fs::create_dir_all(parent);
+                }
+            }
+            let count = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+            let pid = std::process::id();
+            let mut wide_tmp = Vec::with_capacity(wide_cas.len() + 32);
+            wide_tmp.extend_from_slice(&wide_cas[..wide_cas.len().saturating_sub(1)]);
+            let suffix = format!(".tmp_{pid}_{count}");
+            wide_tmp.extend(suffix.encode_utf16());
+            wide_tmp.push(0);
+
+            if crate::storage::write_and_rename_atomic_wide(
+                &wide_tmp,
+                &wide_cas,
+                cas_path,
+                cas_path,
+                data,
+            )
+            .is_ok()
+            {
+                return Ok(fast_size_and_mtime_wide(&wide_cas).and_then(|(_, mt)| mt));
+            }
+            if let Some((sz, mt)) = fast_size_and_mtime_wide(&wide_cas) {
+                if sz == data.len() as u64 && fs::read(cas_path).is_ok_and(|e| e == data) {
+                    return Ok(mt);
+                }
+            }
+            let tmp_path = cas_path.with_extension(format!("tmp_{pid}_{count}"));
+            let mut f = OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&tmp_path)?;
+            if let Err(e) = f.write_all(data) {
+                drop(f);
+                let _ = fs::remove_file(&tmp_path);
+                return Err(e);
+            }
+            drop(f);
+            if let Err(e) = fs::rename(&tmp_path, cas_path) {
+                if let Ok(meta) = fs::symlink_metadata(cas_path) {
+                    let mut perms = meta.permissions();
+                    if perms.readonly() {
+                        perms.set_readonly(false);
+                        let _ = fs::set_permissions(cas_path, perms);
                     }
                 }
                 let _ = fs::remove_file(cas_path);
-                let res = fs::rename(&tmp_path, cas_path);
-                if res.is_err() {
-                    if let Some((sz, mt)) = fast_size_and_mtime(cas_path) {
-                        if sz == data.len() as u64
-                            && fs::read(cas_path).is_ok_and(|existing| existing == data)
-                        {
-                            let _ = fs::remove_file(&tmp_path);
-                            return Ok(mt);
+                if let Err(e2) = fs::rename(&tmp_path, cas_path) {
+                    let _ = fs::remove_file(&tmp_path);
+                    return Err(if e2.kind() != std::io::ErrorKind::NotFound {
+                        e2
+                    } else {
+                        e
+                    });
+                }
+            }
+            Ok(fast_size_and_mtime_wide(&wide_cas).and_then(|(_, mt)| mt))
+        }
+
+        #[cfg(not(windows))]
+        {
+            if cas_may_exist {
+                if let Some((sz, mt)) = fast_size_and_mtime(cas_path) {
+                    if sz == data.len() as u64 {
+                        if let Ok(existing) = fs::read(cas_path) {
+                            if existing == data {
+                                return Ok(mt);
+                            }
                         }
                     }
-                    let _ = fs::remove_file(&tmp_path);
-                    res?;
                 }
-                let _ = fs::remove_file(&tmp_path);
-                Ok(fast_size_and_mtime(cas_path).and_then(|(_, mt)| mt))
             }
+            if !parent_created {
+                if let Some(parent) = cas_path.parent() {
+                    let _ = fs::create_dir_all(parent);
+                }
+            }
+            let count = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+            let pid = std::process::id();
+            let tmp_path = cas_path.with_extension(format!("tmp_{pid}_{count}"));
+            crate::storage::write_and_rename_atomic(&tmp_path, cas_path, data)?;
+            Ok(fast_size_and_mtime(cas_path).and_then(|(_, mt)| mt))
         }
     }
 
@@ -1923,79 +1962,91 @@ impl PackStore {
         }
 
         if has_cas {
-            let verify_cas_entry = |entry: &mut PackFileEntry| -> bool {
-                let Some(ref sha) = entry.sha256 else {
-                    return false;
-                };
-                let cas_file = match entry.cas_path.as_ref() {
-                    Some(p) => p,
-                    None => return false,
-                };
+            let verify_cas_entry =
+                |entry: &mut PackFileEntry, cas_wide_buf: &mut Vec<u16>| -> bool {
+                    let Some(ref sha) = entry.sha256 else {
+                        return false;
+                    };
+                    let cas_file = match entry.cas_path.as_ref() {
+                        Some(p) => p,
+                        None => return false,
+                    };
 
-                let start = entry.offset as usize;
-                let end = start.saturating_add(entry.size as usize);
-                let slice = if end <= buf_data.len() {
-                    Some(&buf_data[start..end])
-                } else {
-                    None
-                };
-
-                if let Some((current_size, current_mtime)) = fast_size_and_mtime(cas_file) {
-                    let recorded_mtime = entry
-                        .cas_mtime
-                        .or_else(|| self.get_cas_stamp(cas_file).map(|(_s, m)| m));
-                    let stamp_match = current_size == entry.size
-                        && recorded_mtime.is_some()
-                        && current_mtime == recorded_mtime;
-
-                    if stamp_match {
-                        entry.cas_verified = true;
-                        false
+                    let start = entry.offset as usize;
+                    let end = start.saturating_add(entry.size as usize);
+                    let slice = if end <= buf_data.len() {
+                        Some(&buf_data[start..end])
                     } else {
-                        let hash_valid = if current_size == entry.size {
-                            if let Ok(bytes) = fs::read(cas_file) {
-                                let digest = Sha256::digest(&bytes);
-                                let mut hex_buf = [0u8; 64];
-                                encode_hex_lower(&digest, &mut hex_buf).eq_ignore_ascii_case(sha)
-                            } else {
-                                false
-                            }
-                        } else {
-                            false
-                        };
+                        None
+                    };
 
-                        if hash_valid {
-                            entry.cas_mtime = current_mtime;
+                    #[cfg(windows)]
+                    let stat_opt = {
+                        crate::storage::encode_verbatim_wide_into(cas_file, cas_wide_buf);
+                        fast_size_and_mtime_wide(cas_wide_buf)
+                    };
+                    #[cfg(not(windows))]
+                    let stat_opt = {
+                        let _ = cas_wide_buf;
+                        fast_size_and_mtime(cas_file)
+                    };
+
+                    if let Some((current_size, current_mtime)) = stat_opt {
+                        let recorded_mtime = entry
+                            .cas_mtime
+                            .or_else(|| self.get_cas_stamp(cas_file).map(|(_s, m)| m));
+                        let stamp_match = current_size == entry.size
+                            && recorded_mtime.is_some()
+                            && current_mtime == recorded_mtime;
+
+                        if stamp_match {
                             entry.cas_verified = true;
-                            if let Some(m) = current_mtime {
-                                self.set_cas_stamp(cas_file, current_size, m);
-                            }
-                            true
-                        } else if let Some(slice) = slice {
-                            match Self::write_cas_file_with_mtime(cas_file, slice, false) {
-                                Ok(new_mt) => {
-                                    if let Some(m) = new_mt {
-                                        entry.cas_mtime = Some(m);
-                                        self.set_cas_stamp(cas_file, slice.len() as u64, m);
-                                    }
-                                    entry.cas_verified = true;
-                                    true
-                                }
-                                Err(_) => {
-                                    entry.cas_verified = false;
+                            false
+                        } else {
+                            let hash_valid = if current_size == entry.size {
+                                if let Ok(bytes) = fs::read(cas_file) {
+                                    let digest = Sha256::digest(&bytes);
+                                    let mut hex_buf = [0u8; 64];
+                                    encode_hex_lower(&digest, &mut hex_buf).eq_ignore_ascii_case(sha)
+                                } else {
                                     false
                                 }
+                            } else {
+                                false
+                            };
+
+                            if hash_valid {
+                                entry.cas_mtime = current_mtime;
+                                entry.cas_verified = true;
+                                if let Some(m) = current_mtime {
+                                    self.set_cas_stamp(cas_file, current_size, m);
+                                }
+                                true
+                            } else if let Some(slice) = slice {
+                                match Self::write_cas_file_with_mtime(cas_file, slice, false) {
+                                    Ok(new_mt) => {
+                                        if let Some(m) = new_mt {
+                                            entry.cas_mtime = Some(m);
+                                            self.set_cas_stamp(cas_file, slice.len() as u64, m);
+                                        }
+                                        entry.cas_verified = true;
+                                        true
+                                    }
+                                    Err(_) => {
+                                        entry.cas_verified = false;
+                                        false
+                                    }
+                                }
+                            } else {
+                                entry.cas_verified = false;
+                                false
                             }
-                        } else {
-                            entry.cas_verified = false;
-                            false
                         }
+                    } else {
+                        entry.cas_verified = false;
+                        false
                     }
-                } else {
-                    entry.cas_verified = false;
-                    false
-                }
-            };
+                };
 
             if index.files.len() >= 12 {
                 struct EntrySlot(std::cell::UnsafeCell<PackFileEntry>);
@@ -2011,6 +2062,7 @@ impl PackStore {
                 let workers = 12.min(slots.len());
                 rnpm_fs::run_parallel(workers, &|| {
                     let mut local_updated = false;
+                    let mut cas_wide_buf = Vec::with_capacity(260);
                     loop {
                         let idx = next_idx.fetch_add(1, Ordering::Relaxed);
                         if idx >= slots.len() {
@@ -2018,7 +2070,7 @@ impl PackStore {
                         }
                         // SAFETY: `fetch_add` assigns each `idx < slots.len()` to at most one worker.
                         let entry = unsafe { &mut *slots[idx].0.get() };
-                        if verify_cas_entry(entry) {
+                        if verify_cas_entry(entry, &mut cas_wide_buf) {
                             local_updated = true;
                         }
                     }
@@ -2031,8 +2083,9 @@ impl PackStore {
                 }
                 index.files = slots.into_iter().map(|s| s.0.into_inner()).collect();
             } else {
+                let mut cas_wide_buf = Vec::with_capacity(260);
                 for entry in &mut index.files {
-                    if verify_cas_entry(entry) {
+                    if verify_cas_entry(entry, &mut cas_wide_buf) {
                         index_updated = true;
                     }
                 }
@@ -2393,38 +2446,18 @@ impl PackStore {
         let final_idx = prefix_dir.join(format!("{safe_stem}.idx"));
 
         let idx_bytes = if write_files {
-            // Atomic write via temp directory on same filesystem (Lane 5)
             let tmp_dir = self.tmp_dir();
             let count = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
             let pid = std::process::id();
             let tmp_pack = tmp_dir.join(format!("pack_{pid}_{count}.tmp"));
             let tmp_idx = tmp_dir.join(format!("idx_{pid}_{count}.tmp"));
 
-            {
-                let mut f_pack = OpenOptions::new()
-                    .write(true)
-                    .create_new(true)
-                    .open(&tmp_pack)?;
-                f_pack.write_all(&pack_bytes)?;
-            }
-            // Windows can move the write time when the handle closes, so
-            // read it from the closed file; a stale stamp makes the first
-            // load re-verify the whole pack and rewrite the index.
-            index.pack_mtime = fs::metadata(&tmp_pack)
-                .ok()
-                .and_then(|m| mtime_to_timestamp(&m));
+            crate::storage::write_and_rename_atomic(&tmp_pack, &final_pack, &pack_bytes)?;
+            // Windows can move the write time when the handle closes, so read it from
+            // the final closed file so subsequent loads match `meta` mtime cleanly.
+            index.pack_mtime = fast_size_and_mtime(&final_pack).and_then(|(_, mt)| mt);
             let serialized = index.to_bytes().map_err(CacheError::Json)?;
-
-            {
-                let mut f_idx = OpenOptions::new()
-                    .write(true)
-                    .create_new(true)
-                    .open(&tmp_idx)?;
-                f_idx.write_all(&serialized)?;
-            }
-
-            rename_atomic(&tmp_pack, &final_pack)?;
-            rename_atomic(&tmp_idx, &final_idx)?;
+            crate::storage::write_and_rename_atomic(&tmp_idx, &final_idx, &serialized)?;
             serialized
         } else {
             index.to_bytes().map_err(CacheError::Json)?
@@ -2556,7 +2589,7 @@ impl PackStore {
             .map(|_| AtomicBool::new(false))
             .collect();
         let next_idx = AtomicUsize::new(0);
-        let num_workers = 24.min(unique_jobs.len());
+        let num_workers = 32.min(unique_jobs.len());
         rnpm_fs::run_parallel(num_workers, &|| loop {
             let idx = next_idx.fetch_add(1, Ordering::Relaxed);
             if idx >= unique_jobs.len() {
@@ -2763,6 +2796,40 @@ impl PackStore {
             if entry_type == tar::EntryType::XGlobalHeader || entry_type.as_byte() == b'g' {
                 continue;
             }
+            let mode = entry.header().mode().unwrap_or(0);
+            if mode & 0o4000 != 0 || mode & 0o2000 != 0 {
+                return Err(CacheError::Fs(rnpm_fs::FsError::ForbiddenModeBits {
+                    mode,
+                    path: entry.path().unwrap_or_default().to_path_buf(),
+                }));
+            }
+            let path_check_bytes = entry.path_bytes();
+            if path_check_bytes.contains(&0) {
+                return Err(CacheError::Fs(rnpm_fs::FsError::PathTraversal {
+                    path: PathBuf::from(String::from_utf8_lossy(&path_check_bytes).into_owned()),
+                }));
+            }
+            if std::str::from_utf8(&path_check_bytes).is_err() {
+                return Err(CacheError::Fs(rnpm_fs::FsError::InvalidUtf8Path {
+                    path: PathBuf::from(String::from_utf8_lossy(&path_check_bytes).into_owned()),
+                }));
+            }
+            let is_sparse = entry_type.as_byte() == b'S' || entry_type.is_gnu_sparse();
+            let has_pax_sparse = if let Ok(Some(extensions)) = entry.pax_extensions() {
+                extensions.filter_map(|e| e.ok()).any(|ext| {
+                    ext.key()
+                        .map(|k| k.starts_with("GNU.sparse."))
+                        .unwrap_or(false)
+                        || ext.key_bytes().starts_with(b"GNU.sparse.")
+                })
+            } else {
+                false
+            };
+            if is_sparse || has_pax_sparse {
+                return Err(CacheError::Fs(rnpm_fs::FsError::ForbiddenSparseFile {
+                    path: entry.path().unwrap_or_default().to_path_buf(),
+                }));
+            }
             if entry_type.is_block_special()
                 || entry_type.is_character_special()
                 || entry_type.is_fifo()
@@ -2859,10 +2926,14 @@ impl PackStore {
                 }));
             }
 
-            let mode = entry
-                .header()
-                .mode()
-                .unwrap_or(rnpm_fs::NPM_DEFAULT_FILE_MODE);
+            let file_mode = if mode != 0 {
+                mode
+            } else {
+                entry
+                    .header()
+                    .mode()
+                    .unwrap_or(rnpm_fs::NPM_DEFAULT_FILE_MODE)
+            };
 
             if build_pack {
                 let curr_offset = pack_bytes.len();
@@ -2874,11 +2945,24 @@ impl PackStore {
                     pack_bytes.resize(padded, 0u8);
                     padded
                 };
-                if entry_size > 0 && entry_size <= 4 * 1024 * 1024 {
-                    pack_bytes.reserve(entry_size as usize + 1);
+                if entry_size > limits.max_single_entry_size {
+                    return Err(CacheError::Fs(rnpm_fs::FsError::TarBombLimitExceeded {
+                        limit_type: "entry size".to_string(),
+                        detail: format!("Entry '{}' exceeded single file limit", norm_path),
+                    }));
                 }
-                let mut take_reader = (&mut entry).take(limits.max_single_entry_size + 1);
-                take_reader.read_to_end(&mut pack_bytes).map_err(CacheError::Io)?;
+                if entry_size <= 4 * 1024 * 1024 {
+                    let sz = entry_size as usize;
+                    if sz > 0 {
+                        pack_bytes.resize(aligned_offset + sz, 0u8);
+                        entry
+                            .read_exact(&mut pack_bytes[aligned_offset..aligned_offset + sz])
+                            .map_err(CacheError::Io)?;
+                    }
+                } else {
+                    let mut take_reader = (&mut entry).take(limits.max_single_entry_size + 1);
+                    take_reader.read_to_end(&mut pack_bytes).map_err(CacheError::Io)?;
+                }
                 let data_len = pack_bytes.len() - aligned_offset;
                 if data_len as u64 > limits.max_single_entry_size {
                     return Err(CacheError::Fs(rnpm_fs::FsError::TarBombLimitExceeded {
@@ -2918,22 +3002,17 @@ impl PackStore {
                             }
                         }
                     }
-                    let _ = rnpm_fs::write_file_fast(&full, slice, mode, 64 * 1024);
+                    let _ = rnpm_fs::write_file_fast(&full, slice, file_mode, 64 * 1024);
                 }
 
-                let sha = sha256_hex_string(slice);
-                let cas_path = cas_dir.as_ref().map(|d| {
-                    let p = if sha.len() >= 2 { &sha[0..2] } else { "00" };
-                    d.join(p).join(&sha)
-                });
                 let new_entry = PackFileEntry {
                     path: norm_path.clone(),
-                    mode,
+                    mode: file_mode,
                     size: data_len as u64,
                     offset: aligned_offset as u64,
                     aligned_offset: aligned_offset as u64,
-                    sha256: Some(sha),
-                    cas_path,
+                    sha256: None,
+                    cas_path: None,
                     cas_verified: false,
                     cas_mtime: None,
                 };
@@ -2947,12 +3026,21 @@ impl PackStore {
                     index_files.push(new_entry);
                 }
             } else {
+                if entry_size > limits.max_single_entry_size {
+                    return Err(CacheError::Fs(rnpm_fs::FsError::TarBombLimitExceeded {
+                        limit_type: "entry size".to_string(),
+                        detail: format!("Entry '{}' exceeded single file limit", norm_path),
+                    }));
+                }
                 scratch.clear();
                 if entry_size > 0 && entry_size <= 4 * 1024 * 1024 {
-                    scratch.reserve(entry_size as usize + 1);
+                    let sz = entry_size as usize;
+                    scratch.resize(sz, 0u8);
+                    entry.read_exact(&mut scratch).map_err(CacheError::Io)?;
+                } else {
+                    let mut take_reader = (&mut entry).take(limits.max_single_entry_size + 1);
+                    take_reader.read_to_end(&mut scratch).map_err(CacheError::Io)?;
                 }
-                let mut take_reader = (&mut entry).take(limits.max_single_entry_size + 1);
-                take_reader.read_to_end(&mut scratch).map_err(CacheError::Io)?;
                 if scratch.len() as u64 > limits.max_single_entry_size {
                     return Err(CacheError::Fs(rnpm_fs::FsError::TarBombLimitExceeded {
                         limit_type: "entry size".to_string(),
@@ -2989,7 +3077,7 @@ impl PackStore {
                             }
                         }
                     }
-                    let _ = rnpm_fs::write_file_fast(&full, &scratch, mode, 64 * 1024);
+                    let _ = rnpm_fs::write_file_fast(&full, &scratch, file_mode, 64 * 1024);
                 }
             }
         }
@@ -3030,7 +3118,7 @@ impl PackStore {
         }
 
         if had_duplicates {
-            // S9: Allocate only the space needed for retained live entries + 4 KiB alignment,
+            // Allocate only the space needed for retained live entries + 4 KiB alignment,
             // freeing any oversized pre-compaction buffer immediately.
             let retained_size: usize = index_files
                 .iter()
@@ -3072,6 +3160,49 @@ impl PackStore {
                     limits.max_uncompressed_size
                 ),
             }));
+        }
+
+        // Compute per-file SHA-256 digests and derived CAS paths after dedup/compaction
+        // (in parallel for large packages).
+        if index_files.len() >= 32 {
+            struct HashSlot(std::cell::UnsafeCell<PackFileEntry>);
+            // SAFETY: Each index is claimed at most once via `next_hash_idx.fetch_add(1)`.
+            unsafe impl Sync for HashSlot {}
+            let slots: Vec<HashSlot> = std::mem::take(&mut index_files)
+                .into_iter()
+                .map(|e| HashSlot(std::cell::UnsafeCell::new(e)))
+                .collect();
+            let next_hash_idx = AtomicUsize::new(0);
+            let workers = 16.min(slots.len());
+            let pack_slice = &pack_bytes[..];
+            let cas_dir_ref = cas_dir.as_ref();
+            rnpm_fs::run_parallel(workers, &|| loop {
+                let idx = next_hash_idx.fetch_add(1, Ordering::Relaxed);
+                if idx >= slots.len() {
+                    break;
+                }
+                let entry = unsafe { &mut *slots[idx].0.get() };
+                let start = entry.offset as usize;
+                let end = start + entry.size as usize;
+                let sha = sha256_hex_string(&pack_slice[start..end]);
+                entry.cas_path = cas_dir_ref.map(|d| {
+                    let p = if sha.len() >= 2 { &sha[0..2] } else { "00" };
+                    d.join(p).join(&sha)
+                });
+                entry.sha256 = Some(sha);
+            });
+            index_files = slots.into_iter().map(|s| s.0.into_inner()).collect();
+        } else {
+            for entry in &mut index_files {
+                let start = entry.offset as usize;
+                let end = start + entry.size as usize;
+                let sha = sha256_hex_string(&pack_bytes[start..end]);
+                entry.cas_path = cas_dir.as_ref().map(|d| {
+                    let p = if sha.len() >= 2 { &sha[0..2] } else { "00" };
+                    d.join(p).join(&sha)
+                });
+                entry.sha256 = Some(sha);
+            }
         }
 
         self.finalize_pack_and_write(
@@ -3719,6 +3850,38 @@ impl PackStore {
     /// avoiding redundant Win32 volume detection queries across thousands of packages
     /// by caching results keyed by destination directory / volume root in a thread-safe cache.
     pub fn is_block_cloning_eligible(&self, target_dir: &Path) -> bool {
+        #[cfg(windows)]
+        {
+            let b = target_dir.as_os_str().as_encoded_bytes();
+            let drive_byte = if b.len() >= 3 && b[1] == b':' && b[2] == b'\\' && b[0].is_ascii_alphabetic() {
+                Some(b[0])
+            } else if b.len() >= 7
+                && b.starts_with(br"\\?\")
+                && b[5] == b':'
+                && b[6] == b'\\'
+                && b[4].is_ascii_alphabetic()
+            {
+                Some(b[4])
+            } else {
+                None
+            };
+            if let Some(d) = drive_byte {
+                let idx = (d.to_ascii_uppercase() - b'A') as usize;
+                let cached = self.block_clone_drive_cache[idx].load(Ordering::Relaxed);
+                if cached != 0 {
+                    return cached == 2;
+                }
+                let eligible = is_same_volume(&self.root, target_dir)
+                    && (is_block_cloning_supported(target_dir) || is_refs_volume(target_dir));
+                {
+                    let mut cache = self.block_clone_cache.write().unwrap();
+                    cache.insert(volume_root_key(target_dir), eligible);
+                }
+                self.block_clone_drive_cache[idx].store(if eligible { 2 } else { 1 }, Ordering::Relaxed);
+                return eligible;
+            }
+        }
+
         let key = volume_root_key(target_dir);
         {
             let cache = self.block_clone_cache.read().unwrap();
@@ -3743,6 +3906,10 @@ impl PackStore {
     /// Clear cached volume block-clone eligibility states.
     pub fn clear_block_clone_cache(&self) {
         self.block_clone_cache.write().unwrap().clear();
+        #[cfg(windows)]
+        for slot in self.block_clone_drive_cache.iter() {
+            slot.store(0, Ordering::Relaxed);
+        }
     }
 
     /// Materialize a package from its memory-mapped pack directly into `target_dir`.
@@ -5728,5 +5895,115 @@ mod tests {
             std::fs::read(out.join("nested").join("b.js")).unwrap(),
             b"export const b = 2;\n"
         );
+    }
+
+    #[test]
+    fn test_put_package_from_tarball_hardens_suid_sparse_invalid_utf8_and_tampered_idx() {
+        let dir = tempdir().unwrap();
+        let store = PackStore::new(dir.path().join("store")).unwrap();
+
+        // 1. SUID on directory entry must fail ForbiddenModeBits
+        let tgz_suid = {
+            let mut gz = GzEncoder::new(Vec::new(), Compression::fast());
+            {
+                let mut tar = tar::Builder::new(&mut gz);
+                let mut hd = tar::Header::new_gnu();
+                hd.set_entry_type(tar::EntryType::Directory);
+                hd.set_size(0);
+                hd.set_mode(0o4755);
+                hd.set_cksum();
+                tar.append_data(&mut hd, "package/bin/", &[][..]).unwrap();
+                tar.finish().unwrap();
+            }
+            gz.finish().unwrap()
+        };
+        let integ_suid =
+            rnpm_core::Integrity::from_bytes(&tgz_suid, Algorithm::Sha512).to_string();
+        let res_suid = store.put_package_from_tarball(&integ_suid, &tgz_suid);
+        assert!(
+            matches!(
+                res_suid,
+                Err(CacheError::Fs(rnpm_fs::FsError::ForbiddenModeBits { .. }))
+            ),
+            "Expected ForbiddenModeBits, got: {res_suid:?}"
+        );
+
+        // 2. Sparse entry with invalid UTF-8 path must report InvalidUtf8Path before ForbiddenSparseFile
+        let tgz_sparse_invalid = {
+            let mut header = tar::Header::new_gnu();
+            header.set_entry_type(tar::EntryType::GNUSparse);
+            header.set_size(0);
+            header.set_mode(0o644);
+            header.as_gnu_mut().unwrap().set_real_size(0);
+            let bad = [b'p', b'a', b'c', b'k', b'a', b'g', b'e', b'/', 0xfe, b'b', b'i', b'n'];
+            header.as_mut_bytes()[..bad.len()].copy_from_slice(&bad);
+            header.set_cksum();
+            let mut gz = GzEncoder::new(Vec::new(), Compression::fast());
+            {
+                let mut builder = tar::Builder::new(&mut gz);
+                builder.append(&header, std::io::Cursor::new(&[])).unwrap();
+                builder.finish().unwrap();
+            }
+            gz.finish().unwrap()
+        };
+        let integ_sp = rnpm_core::Integrity::from_bytes(&tgz_sparse_invalid, Algorithm::Sha512)
+            .to_string();
+        let res_sp = store.put_package_from_tarball(&integ_sp, &tgz_sparse_invalid);
+        assert!(
+            matches!(
+                res_sp,
+                Err(CacheError::Fs(rnpm_fs::FsError::InvalidUtf8Path { .. }))
+            ),
+            "Expected InvalidUtf8Path, got: {res_sp:?}"
+        );
+
+        // 2b. Sparse entry with valid UTF-8 path must report ForbiddenSparseFile
+        let tgz_sparse_ok = {
+            let mut header = tar::Header::new_gnu();
+            header.set_entry_type(tar::EntryType::GNUSparse);
+            header.set_size(0);
+            header.set_mode(0o644);
+            header.as_gnu_mut().unwrap().set_real_size(0);
+            let name = b"package/sparse.bin";
+            header.as_mut_bytes()[..name.len()].copy_from_slice(name);
+            header.set_cksum();
+            let mut gz = GzEncoder::new(Vec::new(), Compression::fast());
+            {
+                let mut builder = tar::Builder::new(&mut gz);
+                builder.append(&header, std::io::Cursor::new(&[])).unwrap();
+                builder.finish().unwrap();
+            }
+            gz.finish().unwrap()
+        };
+        let integ_sp_ok =
+            rnpm_core::Integrity::from_bytes(&tgz_sparse_ok, Algorithm::Sha512).to_string();
+        assert!(matches!(
+            store.put_package_from_tarball(&integ_sp_ok, &tgz_sparse_ok),
+            Err(CacheError::Fs(rnpm_fs::FsError::ForbiddenSparseFile { .. }))
+        ));
+
+        // 3. Tampered .idx cas_path is ignored & derived inside store cas_dir; tampered entry path purges pack
+        let integ_ok = "sha512-tampertest000000000000000000000000000000000000000000000000000000000000000000000000000000==";
+        let files = [PackInputFile::new("index.js", 0o644, b"console.log(1);")];
+        store.put_package_pack(integ_ok, &files).unwrap();
+        store.clear_mmap_cache();
+
+        let idx_path = store.idx_path(integ_ok);
+        let idx_raw = fs::read_to_string(&idx_path).unwrap();
+        let mut parsed: PackIndex = serde_json::from_str(&idx_raw).unwrap();
+        let rogue_cas = dir.path().join("outside_cas_target");
+        parsed.files[0].cas_path = Some(rogue_cas.clone());
+        fs::write(&idx_path, parsed.to_bytes().unwrap()).unwrap();
+
+        let loaded = store.get_package_pack(integ_ok).unwrap().unwrap();
+        assert!(!rogue_cas.exists());
+        assert_ne!(loaded.index.files[0].cas_path.as_deref(), Some(rogue_cas.as_path()));
+
+        // Now tamper entry.path to traversal path -> get_package_pack must purge and return Ok(None)
+        store.clear_mmap_cache();
+        parsed.files[0].path = "../escape.js".to_string();
+        fs::write(&idx_path, parsed.to_bytes().unwrap()).unwrap();
+        assert!(store.get_package_pack(integ_ok).unwrap().is_none());
+        assert!(!idx_path.exists());
     }
 }

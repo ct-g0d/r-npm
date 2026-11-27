@@ -4791,3 +4791,58 @@ fn test_try_split_simple_args_and_ssh_auth_sock_parity() {
     }
     assert!(is_sensitive_credential_key("ssh_auth_sock_author"));
 }
+
+#[cfg(windows)]
+#[test]
+fn test_try_unwrap_node_cmd_shim_and_fallback() {
+    let dir = tempfile::tempdir().unwrap();
+    let bin_dir = dir.path().join("node_modules").join(".bin");
+    let pkg_bin = dir.path().join("node_modules").join("my-cli").join("bin");
+    std::fs::create_dir_all(&bin_dir).unwrap();
+    std::fs::create_dir_all(&pkg_bin).unwrap();
+    let script_path = pkg_bin.join("cli.js");
+    std::fs::write(&script_path, "console.log(process.argv.slice(2).join(','));\n").unwrap();
+
+    let cmd_path = bin_dir.join("my-cli.cmd");
+    let shim_content = "@ECHO off\r\nGOTO start\r\n:find_dp0\r\nSET dp0=%~dp0\r\nEXIT /b\r\n:start\r\nSETLOCAL\r\nCALL :find_dp0\r\n\r\nIF EXIST \"%dp0%\\node.exe\" (\r\n  SET \"_prog=%dp0%\\node.exe\"\r\n) ELSE (\r\n  SET \"_prog=node\"\r\n  SET PATHEXT=%PATHEXT:;.JS;=;%\r\n)\r\n\r\nendLocal & goto #_undefined_# 2>NUL || title %COMSPEC% & \"%_prog%\"  \"%dp0%\\..\\my-cli\\bin\\cli.js\" %*\r\n";
+    std::fs::write(&cmd_path, shim_content).unwrap();
+
+    let mut env = HashMap::new();
+    if let Ok(p) = std::env::var("PATH") {
+        env.insert("PATH".to_string(), p);
+    }
+    let rest = vec!["--flag".to_string(), "value".to_string()];
+    let mut cmd = try_unwrap_node_cmd_shim(&cmd_path, &rest, dir.path(), &env)
+        .expect("standard node .cmd shim must unwrap to direct node invocation");
+    let out = cmd.output().expect("direct node invocation must run");
+    assert!(out.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "--flag,value"
+    );
+
+    // Custom non-cmd-shim .cmd files must fall back cleanly to None (cmd.exe)
+    let custom_cmd = bin_dir.join("custom.cmd");
+    std::fs::write(&custom_cmd, "@echo off\r\necho custom %*\r\n").unwrap();
+    assert!(try_unwrap_node_cmd_shim(&custom_cmd, &rest, dir.path(), &env).is_none());
+
+    // Canonical template with an extra SET line or inline pre-command must also fall back cleanly
+    let custom_env_cmd = bin_dir.join("custom-env.cmd");
+    let modified_header = shim_content.replace(":start\r\n", ":start\r\nSET CUSTOM_VAR=1\r\n");
+    std::fs::write(&custom_env_cmd, modified_header).unwrap();
+    assert!(try_unwrap_node_cmd_shim(&custom_env_cmd, &rest, dir.path(), &env).is_none());
+
+    let inline_cmd = bin_dir.join("inline-cmd.cmd");
+    let modified_invoke = shim_content.replace("title %COMSPEC% &", "title %COMSPEC% & SET FOO=bar &");
+    std::fs::write(&inline_cmd, modified_invoke).unwrap();
+    assert!(try_unwrap_node_cmd_shim(&inline_cmd, &rest, dir.path(), &env).is_none());
+
+    // Shims with interpreter arguments (e.g. `--require="path with spaces"`) must fall back to cmd.exe
+    let interp_args_cmd = bin_dir.join("interp-args.cmd");
+    let modified_interp = shim_content.replace(
+        "\"%_prog%\"  \"%dp0%",
+        "\"%_prog%\"  --require=\"path with spaces\" \"%dp0%",
+    );
+    std::fs::write(&interp_args_cmd, modified_interp).unwrap();
+    assert!(try_unwrap_node_cmd_shim(&interp_args_cmd, &rest, dir.path(), &env).is_none());
+}

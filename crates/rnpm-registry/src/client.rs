@@ -4,8 +4,9 @@ use crate::metadata::{
     parse_packument_with_mode, AbbreviatedPackageMetadata, PackumentParseMode,
 };
 use reqwest::header::{
-    HeaderMap, HeaderValue, ACCEPT, AUTHORIZATION, CONNECTION, CONTENT_LENGTH, CONTENT_TYPE, ETAG,
-    IF_NONE_MATCH, LOCATION, RETRY_AFTER, USER_AGENT,
+    HeaderMap, HeaderName, HeaderValue, ACCEPT, AGE, AUTHORIZATION, CACHE_CONTROL, CONNECTION,
+    CONTENT_LENGTH, CONTENT_TYPE, DATE, ETAG, IF_NONE_MATCH, LOCATION, RETRY_AFTER, USER_AGENT,
+    VARY,
 };
 use reqwest::{Client, Method, Response, StatusCode};
 use std::borrow::Cow;
@@ -78,16 +79,22 @@ pub fn set_cli_request_context(command: String, user_agent: String) {
 }
 
 fn packument_cache_metadata(headers: &HeaderMap) -> serde_json::Value {
-    const KEYS: [&str; 5] = ["cache-control", "date", "age", "content-type", "vary"];
+    const HEADERS: [(&str, &HeaderName); 5] = [
+        ("cache-control", &CACHE_CONTROL),
+        ("date", &DATE),
+        ("age", &AGE),
+        ("content-type", &CONTENT_TYPE),
+        ("vary", &VARY),
+    ];
     let mut map: Option<serde_json::Map<String, serde_json::Value>> = None;
-    for key in KEYS {
-        if let Some(val) = headers.get(key).and_then(|v| v.to_str().ok()) {
-            let m = map.get_or_insert_with(serde_json::Map::new);
-            m.insert(key.into(), serde_json::Value::String(val.to_owned()));
+    for &(name, header_name) in &HEADERS {
+        if let Some(val) = headers.get(header_name).and_then(|v| v.to_str().ok()) {
+            let m = map.get_or_insert_with(|| serde_json::Map::with_capacity(4));
+            m.insert(name.into(), serde_json::Value::String(val.to_owned()));
         }
     }
-    let mut outer = serde_json::Map::new();
-    let mut resp_map = serde_json::Map::new();
+    let mut outer = serde_json::Map::with_capacity(1);
+    let mut resp_map = serde_json::Map::with_capacity(1);
     resp_map.insert(
         "headers".into(),
         serde_json::Value::Object(map.unwrap_or_default()),
@@ -215,7 +222,7 @@ struct PackumentCacheKey {
 #[derive(Clone)]
 struct CachedPackumentEntry {
     etag: Option<String>,
-    metadata: AbbreviatedPackageMetadata,
+    metadata: Arc<AbbreviatedPackageMetadata>,
     cache_metadata: serde_json::Value,
 }
 
@@ -359,7 +366,7 @@ fn append_encoded_package_name(out: &mut String, name: &str) {
 async fn next_chunk_with_idle_timeout(
     resp: &mut Response,
     idle_timeout: Duration,
-    idle_sleep: &mut Pin<&mut tokio::time::Sleep>,
+    idle_sleep: &mut Option<Pin<Box<tokio::time::Sleep>>>,
 ) -> Result<Option<bytes::Bytes>, RegistryError> {
     let mut deadline_set = false;
     let mut fut = std::pin::pin!(resp.chunk());
@@ -367,13 +374,21 @@ async fn next_chunk_with_idle_timeout(
         Poll::Ready(Ok(opt)) => Poll::Ready(Ok(opt)),
         Poll::Ready(Err(err)) => Poll::Ready(Err(RegistryError::Http(err))),
         Poll::Pending => {
-            if !deadline_set {
-                idle_sleep
-                    .as_mut()
-                    .reset(tokio::time::Instant::now() + idle_timeout);
-                deadline_set = true;
-            }
-            match idle_sleep.as_mut().poll(cx) {
+            let sleep = match idle_sleep {
+                Some(s) => {
+                    if !deadline_set {
+                        s.as_mut()
+                            .reset(tokio::time::Instant::now() + idle_timeout);
+                        deadline_set = true;
+                    }
+                    s
+                }
+                None => {
+                    deadline_set = true;
+                    idle_sleep.insert(Box::pin(tokio::time::sleep(idle_timeout)))
+                }
+            };
+            match sleep.as_mut().poll(cx) {
                 Poll::Ready(()) => Poll::Ready(Err(RegistryError::SlowlorisTimeout(idle_timeout))),
                 Poll::Pending => Poll::Pending,
             }
@@ -1697,12 +1712,12 @@ fn validate_proxy_and_ca_config(config: &RegistryClientConfig) -> Result<(), Reg
 pub struct RegistryClient {
     base_client: Arc<LazyHttpClient>,
     default_headers: Arc<HeaderMap>,
-    config: RegistryClientConfig,
+    config: Arc<RegistryClientConfig>,
     semaphore: std::sync::Arc<tokio::sync::Semaphore>,
     circuit_breaker: CircuitBreaker,
     http_requests: std::sync::Arc<std::sync::atomic::AtomicU64>,
     http_304s: std::sync::Arc<std::sync::atomic::AtomicU64>,
-    scoped_clients: std::collections::BTreeMap<String, Arc<LazyHttpClient>>,
+    scoped_clients: Arc<std::collections::BTreeMap<String, Arc<LazyHttpClient>>>,
     global_client: Option<Arc<LazyHttpClient>>,
     has_scoped_auth: bool,
     has_any_auth: bool,
@@ -1897,12 +1912,12 @@ impl RegistryClient {
         Ok(Self {
             base_client,
             default_headers,
-            config,
+            config: Arc::new(config),
             semaphore,
             circuit_breaker,
             http_requests: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             http_304s: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            scoped_clients,
+            scoped_clients: Arc::new(scoped_clients),
             global_client,
             has_scoped_auth,
             has_any_auth,
@@ -2541,7 +2556,15 @@ impl RegistryClient {
                 let mut req = client.request(current_method.clone(), current_url.clone());
 
                 if let Some(accept) = accept_header {
-                    req = req.header(ACCEPT, accept);
+                    if accept == NPM_INSTALL_ACCEPT {
+                        req = req.header(ACCEPT, HeaderValue::from_static(NPM_INSTALL_ACCEPT));
+                    } else if accept == "application/json" {
+                        req = req.header(ACCEPT, HeaderValue::from_static("application/json"));
+                    } else if accept == NPM_INSTALL_V1_JSON {
+                        req = req.header(ACCEPT, HeaderValue::from_static(NPM_INSTALL_V1_JSON));
+                    } else {
+                        req = req.header(ACCEPT, accept);
+                    }
                 }
 
                 if let Some(etag) = if_none_match {
@@ -3278,13 +3301,16 @@ impl RegistryClient {
             url: url.as_str().to_owned(),
             representation,
         };
-        let guard = self
-            .packument_cache
-            .read()
-            .unwrap_or_else(|e| e.into_inner());
-        guard
-            .get(&key)
-            .map(|e| (e.etag.clone(), e.metadata.clone()))
+        let entry = {
+            let guard = self
+                .packument_cache
+                .read()
+                .unwrap_or_else(|e| e.into_inner());
+            guard
+                .get(&key)
+                .map(|e| (e.etag.clone(), Arc::clone(&e.metadata)))
+        };
+        entry.map(|(etag, meta)| (etag, (*meta).clone()))
     }
 
     fn store_cached_packument(
@@ -3310,6 +3336,7 @@ impl RegistryClient {
             url: url.as_str().to_owned(),
             representation,
         };
+        let metadata_arc = Arc::new(metadata.clone());
         let mut guard = self
             .packument_cache
             .write()
@@ -3323,7 +3350,7 @@ impl RegistryClient {
             key,
             CachedPackumentEntry {
                 etag: etag.map(str::to_owned),
-                metadata: metadata.clone(),
+                metadata: metadata_arc,
                 cache_metadata: cache_metadata.clone(),
             },
         );
@@ -3388,11 +3415,11 @@ impl RegistryClient {
                             entry.etag = etag;
                         }
                         entry.cache_metadata = cache_metadata;
-                        entry.metadata.clone()
+                        Arc::clone(&entry.metadata)
                     })
                 };
                 if let Some(metadata) = cached_meta {
-                    Ok(metadata)
+                    Ok((*metadata).clone())
                 } else {
                     match self
                         .get_package_metadata_negotiated_conditional_at_url(
@@ -3553,12 +3580,12 @@ impl RegistryClient {
                                 entry.etag = etag.clone();
                             }
                             entry.cache_metadata = cache_metadata.clone();
-                            (entry.etag.clone(), entry.metadata.clone())
+                            (entry.etag.clone(), Arc::clone(&entry.metadata))
                         })
                     };
                     if let Some((cached_etag, cached_meta)) = cached_full {
                         return Ok(MetadataFetchResult::Fresh {
-                            metadata: cached_meta,
+                            metadata: (*cached_meta).clone(),
                             etag: cached_etag,
                             cache_metadata,
                         });
@@ -3737,7 +3764,7 @@ impl RegistryClient {
             .then(|| url_host_key(url));
 
         let mut stream_attempt = 0;
-        let mut idle_sleep = std::pin::pin!(tokio::time::sleep(Duration::ZERO));
+        let mut idle_sleep: Option<Pin<Box<tokio::time::Sleep>>> = None;
         loop {
             let (mut resp, permit) = self
                 .execute_with_borrowed_permit(
@@ -4416,7 +4443,7 @@ impl RegistryClient {
             .then(|| url_host_key(url));
 
         let mut stream_attempt = 0;
-        let mut idle_sleep = std::pin::pin!(tokio::time::sleep(Duration::ZERO));
+        let mut idle_sleep: Option<Pin<Box<tokio::time::Sleep>>> = None;
         loop {
             let (mut resp, _permit) = self
                 .execute_with_borrowed_permit(Method::GET, url.clone(), None, if_none_match)
@@ -4505,8 +4532,7 @@ impl RegistryClient {
             }
 
             let mut bytes = Vec::new();
-            let mut hasher =
-                compute_sha512.then(|| ring::digest::Context::new(&ring::digest::SHA512));
+            let mut hasher = compute_sha512.then(|| ring::digest::Context::new(&ring::digest::SHA512));
             let mut stream_err = None;
 
             loop {
@@ -4713,7 +4739,7 @@ impl RegistryClient {
         };
 
         let mut stream_attempt = 0;
-        let mut idle_sleep = std::pin::pin!(tokio::time::sleep(Duration::ZERO));
+        let mut idle_sleep: Option<Pin<Box<tokio::time::Sleep>>> = None;
         loop {
             let (mut resp, permit) = self
                 .execute_with_borrowed_permit(Method::GET, url.clone(), None, None)
@@ -7772,6 +7798,61 @@ nB99xJBcpcklOhB/x8L3Vb9kw8ZPzUvYKI7lj0+yjYJannulkI7H7LB4hxKnVKp5\n\
         assert!(results[0].is_err(), "invalid parent must fail its own item");
         assert!(results[1].is_ok(), "sibling item with valid parent must succeed");
         assert_eq!(std::fs::read(&good_dest).unwrap(), b"tarball-ok");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn test_scoped_auth_token_sent_on_initial_external_url() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let captured_auth = Arc::new(Mutex::new(None::<String>));
+        let captured_clone = Arc::clone(&captured_auth);
+
+        let server = tokio::spawn(async move {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                let mut buf = [0u8; 4096];
+                let n = stream.read(&mut buf).await.unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]);
+                for line in req.lines() {
+                    if line.to_ascii_lowercase().starts_with("authorization:") {
+                        *captured_clone.lock().unwrap() = Some(line.trim().to_string());
+                    }
+                }
+                let body = b"ok";
+                let hdr = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(hdr.as_bytes()).await;
+                let _ = stream.write_all(body).await;
+            }
+        });
+
+        let mut auth_tokens = std::collections::BTreeMap::new();
+        auth_tokens.insert(
+            format!("//127.0.0.1:{}/", addr.port()),
+            "cdn-secret-token".to_string(),
+        );
+        let client = RegistryClient::with_config(RegistryClientConfig {
+            default_registry: Url::parse("https://registry.npmjs.org/").unwrap(),
+            auth_tokens,
+            ..Default::default()
+        })
+        .unwrap();
+
+        let bytes = client
+            .download_tarball_bytes(&format!("http://127.0.0.1:{}/pkg.tgz", addr.port()))
+            .await
+            .unwrap();
+        assert_eq!(bytes, b"ok");
+        assert_eq!(
+            captured_auth.lock().unwrap().as_deref(),
+            Some("authorization: Bearer cdn-secret-token"),
+            "explicit auth_tokens entry must be attached on redirect_count == 0 even if not in trusted_hosts"
+        );
         server.abort();
     }
 }
