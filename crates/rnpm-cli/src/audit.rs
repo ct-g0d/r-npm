@@ -599,6 +599,8 @@ struct FastHttpScanState {
     hdr_scan_offset: usize,
     headers: Option<(usize, FastHeaderDecision)>,
     chunk_pos: usize,
+    chunk_line_scan: usize,
+    chunk_data_end: Option<usize>,
     chunk_in_trailers: bool,
 }
 
@@ -613,6 +615,7 @@ impl FastHttpScanState {
                     Err(_) => FastHeaderDecision::Fallback,
                 };
                 self.chunk_pos = hdr_end + 4;
+                self.chunk_line_scan = self.chunk_pos;
                 self.headers = Some((hdr_end, decision));
             } else {
                 self.hdr_scan_offset = raw.len();
@@ -648,6 +651,22 @@ impl FastHttpScanState {
 
     fn advance_chunked(&mut self, raw: &[u8]) -> bool {
         loop {
+            if let Some(data_end) = self.chunk_data_end {
+                let Some(next_pos) = data_end.checked_add(2) else {
+                    return true;
+                };
+                if next_pos > raw.len() {
+                    return false;
+                }
+                if &raw[data_end..next_pos] != b"\r\n" {
+                    return true;
+                }
+                self.chunk_data_end = None;
+                self.chunk_pos = next_pos;
+                self.chunk_line_scan = next_pos;
+                continue;
+            }
+
             if self.chunk_in_trailers {
                 if raw.len() < self.chunk_pos + 2 {
                     return false;
@@ -655,23 +674,23 @@ impl FastHttpScanState {
                 if &raw[self.chunk_pos..self.chunk_pos + 2] == b"\r\n" {
                     return true;
                 }
-                let Some(rel_end) = raw[self.chunk_pos..]
-                    .windows(2)
-                    .position(|w| w == b"\r\n")
-                else {
+                let scan_start = self.chunk_line_scan.saturating_sub(1).max(self.chunk_pos);
+                let Some(rel_end) = raw[scan_start..].windows(2).position(|w| w == b"\r\n") else {
+                    self.chunk_line_scan = raw.len();
                     return false;
                 };
-                self.chunk_pos += rel_end + 2;
+                self.chunk_pos = scan_start + rel_end + 2;
+                self.chunk_line_scan = self.chunk_pos;
                 continue;
             }
 
-            let Some(rel_crlf) = raw[self.chunk_pos..]
-                .windows(2)
-                .position(|w| w == b"\r\n")
-            else {
+            let scan_start = self.chunk_line_scan.saturating_sub(1).max(self.chunk_pos);
+            let Some(rel_crlf) = raw[scan_start..].windows(2).position(|w| w == b"\r\n") else {
+                self.chunk_line_scan = raw.len();
                 return false;
             };
-            let line = &raw[self.chunk_pos..self.chunk_pos + rel_crlf];
+            let line_end = scan_start + rel_crlf;
+            let line = &raw[self.chunk_pos..line_end];
             let Ok(line_str) = std::str::from_utf8(line) else {
                 // Malformed framing; stop reading so parse_fast_http_response falls back.
                 return true;
@@ -683,25 +702,17 @@ impl FastHttpScanState {
             let Ok(chunk_size) = usize::from_str_radix(size_hex, 16) else {
                 return true;
             };
-            let data_start = self.chunk_pos + rel_crlf + 2;
+            let data_start = line_end + 2;
             if chunk_size == 0 {
                 self.chunk_pos = data_start;
+                self.chunk_line_scan = data_start;
                 self.chunk_in_trailers = true;
                 continue;
             }
             let Some(data_end) = data_start.checked_add(chunk_size) else {
                 return true;
             };
-            let Some(next_pos) = data_end.checked_add(2) else {
-                return true;
-            };
-            if next_pos > raw.len() {
-                return false;
-            }
-            if &raw[data_end..next_pos] != b"\r\n" {
-                return true;
-            }
-            self.chunk_pos = next_pos;
+            self.chunk_data_end = Some(data_end);
         }
     }
 }
