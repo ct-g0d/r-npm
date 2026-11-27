@@ -625,7 +625,7 @@ fn bytes_contain(hay: &[u8], needle: &[u8]) -> bool {
 }
 
 #[inline]
-fn may_have_install_scripts(bytes: &[u8], is_registry: bool) -> bool {
+pub(crate) fn may_have_install_scripts(bytes: &[u8], is_registry: bool) -> bool {
     bytes_contain(bytes, b"preinstall")
         || bytes_contain(bytes, b"\"install\"")
         || bytes_contain(bytes, b"postinstall")
@@ -648,6 +648,44 @@ pub fn unreviewed_scripts_warning(
     workspace_paths: &HashSet<String>,
     policy: &ScriptPolicy,
     is_global: bool,
+) -> Option<String> {
+    unreviewed_scripts_warning_with_manifests(
+        lockfile,
+        base_dir,
+        workspace_paths,
+        policy,
+        is_global,
+        None,
+    )
+}
+
+pub fn unreviewed_scripts_warning_with_manifests(
+    lockfile: &LockfileV3,
+    base_dir: &Path,
+    workspace_paths: &HashSet<String>,
+    policy: &ScriptPolicy,
+    is_global: bool,
+    known_manifests: Option<&std::collections::HashMap<String, Manifest>>,
+) -> Option<String> {
+    unreviewed_scripts_warning_with_hints(
+        lockfile,
+        base_dir,
+        workspace_paths,
+        policy,
+        is_global,
+        known_manifests,
+        None,
+    )
+}
+
+pub fn unreviewed_scripts_warning_with_hints(
+    lockfile: &LockfileV3,
+    base_dir: &Path,
+    workspace_paths: &HashSet<String>,
+    policy: &ScriptPolicy,
+    is_global: bool,
+    known_manifests: Option<&std::collections::HashMap<String, Manifest>>,
+    no_script_locations: Option<&HashSet<String>>,
 ) -> Option<String> {
     if policy.allow_all {
         return None;
@@ -683,7 +721,10 @@ pub fn unreviewed_scripts_warning(
             base_dir.join(location)
         };
         let ident = node_for(location, Some(pkg), base_dir);
-        if ident.in_bundle || policy.verdict(&ident).is_some() {
+        if ident.in_bundle
+            || no_script_locations.is_some_and(|s| s.contains(location))
+            || policy.verdict(&ident).is_some()
+        {
             continue;
         }
         let is_reg = ident.is_registry();
@@ -701,6 +742,37 @@ pub fn unreviewed_scripts_warning(
     }
 
     let inspect_candidate = |c: &UnreviewedCandidate<'_>| -> Option<(String, String, String)> {
+        let format_entry = |manifest: &Manifest, scripts: Vec<(String, String)>| -> Option<(String, String, String)> {
+            if scripts.is_empty() {
+                return None;
+            }
+            let (name, version) = c
+                .reg_id
+                .clone()
+                .filter(|_| c.is_reg)
+                .map(|(n, v)| (n, v.or_else(|| manifest.version.clone())))
+                .unwrap_or_else(|| {
+                    (
+                        manifest
+                            .name
+                            .clone()
+                            .unwrap_or_else(|| c.location.to_string()),
+                        manifest.version.clone(),
+                    )
+                });
+            let ver = version.map(|v| format!("@{v}")).unwrap_or_default();
+            Some((
+                c.location.to_string(),
+                name.clone(),
+                format!("  {name}{ver} ({})", describe(&scripts)),
+            ))
+        };
+
+        if let Some(manifest) = known_manifests.and_then(|m| m.get(c.location)) {
+            let scripts = install_scripts(manifest, &c.dir, c.is_reg);
+            return format_entry(manifest, scripts);
+        }
+
         let bytes = std::fs::read(c.dir.join("package.json")).ok()?;
         let has_script_keys = may_have_install_scripts(&bytes, c.is_reg);
         if !has_script_keys && !c.dir.join("binding.gyp").is_file() {
@@ -708,29 +780,7 @@ pub fn unreviewed_scripts_warning(
         }
         let manifest = Manifest::from_slice_readonly(&bytes).ok()?;
         let scripts = install_scripts(&manifest, &c.dir, c.is_reg);
-        if scripts.is_empty() {
-            return None;
-        }
-        let (name, version) = c
-            .reg_id
-            .clone()
-            .filter(|_| c.is_reg)
-            .map(|(n, v)| (n, v.or_else(|| manifest.version.clone())))
-            .unwrap_or_else(|| {
-                (
-                    manifest
-                        .name
-                        .clone()
-                        .unwrap_or_else(|| c.location.to_string()),
-                    manifest.version.clone(),
-                )
-            });
-        let ver = version.map(|v| format!("@{v}")).unwrap_or_default();
-        Some((
-            c.location.to_string(),
-            name.clone(),
-            format!("  {name}{ver} ({})", describe(&scripts)),
-        ))
+        format_entry(&manifest, scripts)
     };
 
     let mut matches: Vec<(String, String, String)> = if candidates.len() <= 16 {

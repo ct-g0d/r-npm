@@ -1,4 +1,4 @@
-use crate::inspect_tree::{build_dependency_tree, InspectedNode, TreeOptions};
+use crate::inspect_tree::{build_dependency_tree_with_raw, InspectedNode, TreeOptions};
 use serde::Serialize;
 use std::path::Path;
 
@@ -149,7 +149,7 @@ fn dependents<'a>(
 }
 
 pub fn run_explain(project_dir: &Path, package: &str, json: bool) -> anyhow::Result<()> {
-    let root = build_dependency_tree(project_dir, &TreeOptions::default())?;
+    let root = build_dependency_tree_with_raw(project_dir, &TreeOptions::default(), false)?;
     let nodes = root.collect_all_nodes();
     let root_path = project_dir.to_string_lossy();
     let matches: Vec<_> = nodes

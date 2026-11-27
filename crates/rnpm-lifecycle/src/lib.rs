@@ -3042,39 +3042,84 @@ pub fn execute_lifecycle_script(ctx: &LifecycleContext) -> Result<ExitStatus> {
 
     let effective_timeout = ctx.timeout.or(ctx.sandbox_policy.max_execution_time);
     let status = if let Some(timeout) = effective_timeout {
-        let start = std::time::Instant::now();
-        let poll_interval = std::time::Duration::from_millis(10);
-        loop {
-            match child.try_wait().with_context(|| {
-                format!("Failed to poll lifecycle script for {}", ctx.package_name)
-            })? {
-                Some(status) => break status,
-                None => {
-                    if start.elapsed() >= timeout {
-                        warn!(
-                            "Lifecycle script '{}' timed out after {:?}; terminating process tree for {}",
-                            ctx.event, timeout, ctx.package_name
-                        );
-                        if let Some(ref g) = guard {
-                            g.terminate(124);
+        #[cfg(windows)]
+        {
+            use std::os::windows::io::AsRawHandle;
+            extern "system" {
+                fn WaitForSingleObject(hHandle: *mut std::ffi::c_void, dwMilliseconds: u32) -> u32;
+            }
+            const WAIT_TIMEOUT: u32 = 0x0000_0102;
+            let timeout_ms = timeout.as_millis().min((u32::MAX - 1) as u128) as u32;
+            let wait_res = unsafe { WaitForSingleObject(child.as_raw_handle(), timeout_ms) };
+            if wait_res == WAIT_TIMEOUT {
+                warn!(
+                    "Lifecycle script '{}' timed out after {:?}; terminating process tree for {}",
+                    ctx.event, timeout, ctx.package_name
+                );
+                if let Some(ref g) = guard {
+                    g.terminate(124);
+                }
+                let _ = child.kill();
+                let _ = child.wait();
+                if let Some(handle) = stdout_handle {
+                    let _ = handle.join();
+                }
+                if let Some(handle) = stderr_handle {
+                    let _ = handle.join();
+                }
+                return Err(anyhow::Error::from(ScriptExitError {
+                    exit_code: 124,
+                    message: format!(
+                        "Lifecycle script '{}' timed out after {:?}",
+                        ctx.event, timeout
+                    ),
+                }));
+            }
+            child.wait().with_context(|| {
+                format!(
+                    "Failed to wait for lifecycle script for {}",
+                    ctx.package_name
+                )
+            })?
+        }
+        #[cfg(not(windows))]
+        {
+            let start = std::time::Instant::now();
+            let mut poll_interval = std::time::Duration::from_millis(1);
+            loop {
+                match child.try_wait().with_context(|| {
+                    format!("Failed to poll lifecycle script for {}", ctx.package_name)
+                })? {
+                    Some(status) => break status,
+                    None => {
+                        if start.elapsed() >= timeout {
+                            warn!(
+                                "Lifecycle script '{}' timed out after {:?}; terminating process tree for {}",
+                                ctx.event, timeout, ctx.package_name
+                            );
+                            if let Some(ref g) = guard {
+                                g.terminate(124);
+                            }
+                            let _ = child.kill();
+                            let _ = child.wait();
+                            if let Some(handle) = stdout_handle {
+                                let _ = handle.join();
+                            }
+                            if let Some(handle) = stderr_handle {
+                                let _ = handle.join();
+                            }
+                            return Err(anyhow::Error::from(ScriptExitError {
+                                exit_code: 124,
+                                message: format!(
+                                    "Lifecycle script '{}' timed out after {:?}",
+                                    ctx.event, timeout
+                                ),
+                            }));
                         }
-                        let _ = child.kill();
-                        let _ = child.wait();
-                        if let Some(handle) = stdout_handle {
-                            let _ = handle.join();
-                        }
-                        if let Some(handle) = stderr_handle {
-                            let _ = handle.join();
-                        }
-                        return Err(anyhow::Error::from(ScriptExitError {
-                            exit_code: 124,
-                            message: format!(
-                                "Lifecycle script '{}' timed out after {:?}",
-                                ctx.event, timeout
-                            ),
-                        }));
+                        let remaining = timeout.saturating_sub(start.elapsed());
+                        std::thread::sleep(poll_interval.min(remaining));
+                        poll_interval = (poll_interval * 2).min(std::time::Duration::from_millis(10));
                     }
-                    std::thread::sleep(poll_interval);
                 }
             }
         }
@@ -3682,6 +3727,67 @@ pub fn collect_ancestor_bin_dirs(start_dir: &Path) -> Vec<PathBuf> {
     entries
 }
 
+#[cfg(windows)]
+fn build_binary_command_windows(
+    binary_path: &Path,
+    args: &[String],
+    current_dir: &Path,
+    env: &HashMap<String, String>,
+) -> Command {
+    use std::io::Read;
+    let ext = binary_path
+        .extension()
+        .and_then(|s| s.to_str())
+        .unwrap_or("");
+    if ext.eq_ignore_ascii_case("cmd") || ext.eq_ignore_ascii_case("bat") {
+        if ext.eq_ignore_ascii_case("cmd") {
+            if let Some(cmd) = try_unwrap_node_cmd_shim(binary_path, args, current_dir, env) {
+                return cmd;
+            }
+        }
+        let mut c = Command::new("cmd.exe");
+        c.arg("/c").arg(binary_path);
+        c.args(args);
+        return c;
+    }
+    if ext.eq_ignore_ascii_case("ps1") {
+        let mut c = Command::new("powershell.exe");
+        c.args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"]);
+        c.arg(binary_path);
+        c.args(args);
+        return c;
+    }
+    let is_js = ext.eq_ignore_ascii_case("js")
+        || ext.eq_ignore_ascii_case("cjs")
+        || ext.eq_ignore_ascii_case("mjs");
+    let has_shebang = if !is_js
+        && !ext.eq_ignore_ascii_case("exe")
+        && !ext.eq_ignore_ascii_case("com")
+    {
+        if let Ok(mut f) = std::fs::File::open(binary_path) {
+            let mut prefix = [0u8; 5];
+            let n = f.read(&mut prefix).unwrap_or(0);
+            let head = &prefix[..n];
+            head.starts_with(b"#!") || head.starts_with(b"\xEF\xBB\xBF#!")
+        } else {
+            false
+        }
+    } else {
+        false
+    };
+
+    if is_js || has_shebang {
+        let mut c = Command::new("node");
+        c.arg(binary_path);
+        c.args(args);
+        c
+    } else {
+        let mut c = Command::new(binary_path);
+        c.args(args);
+        c
+    }
+}
+
 /// Spawns and executes a standalone binary or command with full TTY stdin/stdout forwarding,
 /// process tree guard containment (Windows Job Object or Unix process group),
 /// signal propagation, and non-zero exit code fidelity.
@@ -3741,48 +3847,7 @@ pub fn execute_binary(
     );
 
     #[cfg(windows)]
-    let mut cmd = {
-        let ext = binary_path
-            .extension()
-            .and_then(|s| s.to_str())
-            .unwrap_or("");
-        if ext.eq_ignore_ascii_case("cmd") || ext.eq_ignore_ascii_case("bat") {
-            let mut c = Command::new("cmd.exe");
-            c.arg("/c").arg(binary_path);
-            c.args(args);
-            c
-        } else if ext.eq_ignore_ascii_case("ps1") {
-            let mut c = Command::new("powershell.exe");
-            c.args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"]);
-            c.arg(binary_path);
-            c.args(args);
-            c
-        } else {
-            let is_js = ext.eq_ignore_ascii_case("js")
-                || ext.eq_ignore_ascii_case("cjs")
-                || ext.eq_ignore_ascii_case("mjs");
-            let has_shebang = if binary_path.exists() {
-                if let Ok(bytes) = std::fs::read(binary_path) {
-                    bytes.starts_with(b"#!") || bytes.starts_with(b"\xEF\xBB\xBF#!")
-                } else {
-                    false
-                }
-            } else {
-                false
-            };
-
-            if is_js || has_shebang {
-                let mut c = Command::new("node");
-                c.arg(binary_path);
-                c.args(args);
-                c
-            } else {
-                let mut c = Command::new(binary_path);
-                c.args(args);
-                c
-            }
-        }
-    };
+    let mut cmd = build_binary_command_windows(binary_path, args, current_dir, &env);
 
     #[cfg(not(windows))]
     let mut cmd = {
@@ -3895,48 +3960,7 @@ where
     );
 
     #[cfg(windows)]
-    let mut cmd = {
-        let ext = binary_path
-            .extension()
-            .and_then(|s| s.to_str())
-            .unwrap_or("");
-        if ext.eq_ignore_ascii_case("cmd") || ext.eq_ignore_ascii_case("bat") {
-            let mut c = Command::new("cmd.exe");
-            c.arg("/c").arg(binary_path);
-            c.args(args);
-            c
-        } else if ext.eq_ignore_ascii_case("ps1") {
-            let mut c = Command::new("powershell.exe");
-            c.args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"]);
-            c.arg(binary_path);
-            c.args(args);
-            c
-        } else {
-            let is_js = ext.eq_ignore_ascii_case("js")
-                || ext.eq_ignore_ascii_case("cjs")
-                || ext.eq_ignore_ascii_case("mjs");
-            let has_shebang = if binary_path.exists() {
-                if let Ok(bytes) = std::fs::read(binary_path) {
-                    bytes.starts_with(b"#!") || bytes.starts_with(b"\xEF\xBB\xBF#!")
-                } else {
-                    false
-                }
-            } else {
-                false
-            };
-
-            if is_js || has_shebang {
-                let mut c = Command::new("node");
-                c.arg(binary_path);
-                c.args(args);
-                c
-            } else {
-                let mut c = Command::new(binary_path);
-                c.args(args);
-                c
-            }
-        }
-    };
+    let mut cmd = build_binary_command_windows(binary_path, args, current_dir, &env);
 
     #[cfg(not(windows))]
     let mut cmd = {

@@ -4000,6 +4000,242 @@ pub(crate) async fn execute_exec(
     banner: bool,
     consent: Option<bool>,
 ) -> anyhow::Result<()> {
+    execute_exec_with_config(
+        current_dir,
+        command,
+        package_specs,
+        args,
+        registry,
+        cache,
+        offline,
+        banner,
+        consent,
+        None,
+    )
+    .await
+}
+
+fn find_system_binary(command: &str) -> Option<PathBuf> {
+    let path_var = std::env::var_os("PATH")?;
+    for p in std::env::split_paths(&path_var) {
+        let direct = p.join(command);
+        if direct.is_file() {
+            return Some(direct);
+        }
+        #[cfg(windows)]
+        {
+            for ext in &[".cmd", ".exe", ".bat", ".ps1"] {
+                let with_ext = p.join(format!("{command}{ext}"));
+                if with_ext.is_file() {
+                    return Some(with_ext);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn resolve_exec_cache_path(
+    current_dir: &std::path::Path,
+    cache: Option<&PathBuf>,
+    preloaded_config: Option<&rnpm_config::Config>,
+) -> PathBuf {
+    cache
+        .cloned()
+        .or_else(|| {
+            preloaded_config
+                .and_then(|c| c.get("cache"))
+                .map(PathBuf::from)
+        })
+        .or_else(|| {
+            if preloaded_config.is_none() {
+                rnpm_config::Config::load(Some(current_dir))
+                    .ok()?
+                    .get("cache")
+                    .map(PathBuf::from)
+            } else {
+                None
+            }
+        })
+        .unwrap_or_else(|| {
+            if let Ok(appdata) = std::env::var("LOCALAPPDATA") {
+                PathBuf::from(appdata).join("rnpm").join("cache")
+            } else {
+                std::env::temp_dir().join(".rnpm-cache")
+            }
+        })
+}
+
+fn resolve_local_or_system_exec_bin(
+    dir: &std::path::Path,
+    cmd_pkg_name: &str,
+    cmd_bin_name: &str,
+    command: &str,
+    check_system: bool,
+) -> Option<PathBuf> {
+    rnpm_lifecycle::find_local_binary(dir, cmd_pkg_name)
+        .or_else(|| {
+            (cmd_bin_name != cmd_pkg_name)
+                .then(|| rnpm_lifecycle::find_local_binary(dir, cmd_bin_name))
+                .flatten()
+        })
+        .or_else(|| {
+            (command != cmd_pkg_name && command != cmd_bin_name)
+                .then(|| rnpm_lifecycle::find_local_binary(dir, command))
+                .flatten()
+        })
+        .or_else(|| {
+            if check_system {
+                find_system_binary(command)
+            } else {
+                None
+            }
+        })
+}
+
+fn try_execute_sync_exec_with_config(
+    current_dir: &std::path::Path,
+    call: Option<&str>,
+    package: &str,
+    args: &[String],
+    packages: &[String],
+    cache: Option<&PathBuf>,
+    config: &rnpm_config::Config,
+) -> Option<anyhow::Result<()>> {
+    if !packages.is_empty() {
+        return None;
+    }
+    if let Some(cmd_str) = call {
+        let full_cmd = if args.is_empty() {
+            cmd_str.to_string()
+        } else {
+            let formatted_args: Vec<String> = args
+                .iter()
+                .map(|a| {
+                    if a.contains(' ') || a.contains('\t') || a.contains('"') {
+                        format!("\"{}\"", a.replace('"', "\\\""))
+                    } else {
+                        a.clone()
+                    }
+                })
+                .collect();
+            format!("{cmd_str} {}", formatted_args.join(" "))
+        };
+        let manifest = Manifest::from_file(current_dir.join("package.json")).unwrap_or_default();
+        let mut ctx = LifecycleContext::new_with_config(
+            current_dir,
+            current_dir,
+            manifest.name.as_deref().unwrap_or(""),
+            "npx",
+            &full_cmd,
+            config.clone(),
+        );
+        ctx.package_version = manifest.version;
+        ctx.extra_env = lifecycle_config_env_from_config(current_dir, config);
+        ctx.extra_env.insert("npm_command".into(), "exec".into());
+        return Some(execute_lifecycle_script(&ctx).and_then(|status| {
+            if !status.success() {
+                let code = rnpm_lifecycle::extract_exit_status_code(&status);
+                return Err(anyhow::Error::from(rnpm_lifecycle::ScriptExitError {
+                    exit_code: code,
+                    message: format!("Process exited with status code: {}", code),
+                }));
+            }
+            Ok(())
+        }));
+    }
+
+    let (target_command, target_args): (&str, &[String]) = if package.is_empty() {
+        if let Some((first, rest)) = args.split_first() {
+            (first.as_str(), rest)
+        } else {
+            ("", &[])
+        }
+    } else {
+        (package, args)
+    };
+    if target_command.is_empty() {
+        return Some(Ok(()));
+    }
+
+    let (cmd_pkg_name, _) = parse_package_spec(target_command);
+    let cmd_bin_name = cmd_pkg_name
+        .find('/')
+        .map_or(cmd_pkg_name.as_str(), |s| &cmd_pkg_name[s + 1..]);
+
+    let binary_to_run = if let Some(bin) = resolve_local_or_system_exec_bin(
+        current_dir,
+        &cmd_pkg_name,
+        cmd_bin_name,
+        target_command,
+        true,
+    ) {
+        bin
+    } else {
+        let cache_path = resolve_exec_cache_path(current_dir, cache, Some(config));
+        let safe_spec: String = target_command
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+        let npx_env_dir = cache_path.join("_npx").join(&safe_spec);
+        resolve_local_or_system_exec_bin(
+            &npx_env_dir,
+            &cmd_pkg_name,
+            cmd_bin_name,
+            target_command,
+            false,
+        )?
+    };
+
+    let mut path_entries = rnpm_lifecycle::collect_ancestor_bin_dirs(current_dir);
+    if let Some(parent_bin) = binary_to_run.parent() {
+        if !path_entries.contains(&parent_bin.to_path_buf()) {
+            path_entries.insert(0, parent_bin.to_path_buf());
+        }
+    }
+
+    let mut env = lifecycle_config_env_from_config(current_dir, config);
+    env.insert("npm_lifecycle_event".into(), "npx".into());
+    env.insert("npm_command".into(), "exec".into());
+    let status = match rnpm_lifecycle::execute_binary(
+        &binary_to_run,
+        target_args,
+        current_dir,
+        &path_entries,
+        &env,
+    ) {
+        Ok(s) => s,
+        Err(e) => return Some(Err(e)),
+    };
+    if !status.success() {
+        let code = rnpm_lifecycle::extract_exit_status_code(&status);
+        return Some(Err(anyhow::Error::from(rnpm_lifecycle::ScriptExitError {
+            exit_code: code,
+            message: format!("Process exited with status code: {}", code),
+        })));
+    }
+    Some(Ok(()))
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn execute_exec_with_config(
+    current_dir: &std::path::Path,
+    command: &str,
+    package_specs: &[String],
+    args: &[String],
+    registry: Option<String>,
+    cache: Option<PathBuf>,
+    offline: bool,
+    banner: bool,
+    consent: Option<bool>,
+    preloaded_config: Option<&rnpm_config::Config>,
+) -> anyhow::Result<()> {
     if command.is_empty() && package_specs.is_empty() {
         return Ok(());
     }
@@ -4010,49 +4246,26 @@ pub(crate) async fn execute_exec(
         &cmd_pkg_name
     };
 
-    let cache_path = cache
-        .clone()
-        .or_else(|| {
-            rnpm_config::Config::load(Some(current_dir))
-                .ok()?
-                .get("cache")
-                .map(PathBuf::from)
-        })
-        .unwrap_or_else(|| {
-            if let Ok(appdata) = std::env::var("LOCALAPPDATA") {
-                PathBuf::from(appdata).join("rnpm").join("cache")
-            } else {
-                std::env::temp_dir().join(".rnpm-cache")
-            }
-        });
-
-    fn find_system_binary(command: &str) -> Option<PathBuf> {
-        let path_var = std::env::var_os("PATH")?;
-        for p in std::env::split_paths(&path_var) {
-            let direct = p.join(command);
-            if direct.is_file() {
-                return Some(direct);
-            }
-            #[cfg(windows)]
-            {
-                for ext in &[".cmd", ".exe", ".bat", ".ps1"] {
-                    let with_ext = p.join(format!("{command}{ext}"));
-                    if with_ext.is_file() {
-                        return Some(with_ext);
-                    }
-                }
-            }
+    let owned_cfg;
+    let config_ref = match preloaded_config {
+        Some(cfg) => Some(cfg),
+        None => {
+            owned_cfg = rnpm_config::Config::load(Some(current_dir)).ok();
+            owned_cfg.as_ref()
         }
-        None
-    }
+    };
+    let cache_path = resolve_exec_cache_path(current_dir, cache.as_ref(), config_ref);
 
     let binary_to_run = if package_specs.is_empty() {
         // When -p is NOT provided:
         // 1. Check local node_modules/.bin first, or system PATH
-        let local_bin = rnpm_lifecycle::find_local_binary(current_dir, &cmd_pkg_name)
-            .or_else(|| rnpm_lifecycle::find_local_binary(current_dir, cmd_bin_name))
-            .or_else(|| rnpm_lifecycle::find_local_binary(current_dir, command))
-            .or_else(|| find_system_binary(command));
+        let local_bin = resolve_local_or_system_exec_bin(
+            current_dir,
+            &cmd_pkg_name,
+            cmd_bin_name,
+            command,
+            true,
+        );
 
         if let Some(bin_path) = local_bin {
             bin_path
@@ -4239,7 +4452,7 @@ pub(crate) async fn execute_exec(
         }
     };
 
-    if banner && !is_loglevel_silent(current_dir) {
+    if banner && !config_ref.is_some_and(is_loglevel_silent_with_config) {
         let manifest = Manifest::from_file(current_dir.join("package.json")).unwrap_or_default();
         let id = manifest
             .name
@@ -4270,7 +4483,10 @@ pub(crate) async fn execute_exec(
         }
     }
 
-    let mut env = lifecycle_config_env(current_dir);
+    let mut env = match config_ref {
+        Some(cfg) => lifecycle_config_env_from_config(current_dir, cfg),
+        None => lifecycle_config_env(current_dir),
+    };
     env.insert("npm_lifecycle_event".into(), "npx".into());
     env.insert("npm_command".into(), "exec".into());
     let status = rnpm_lifecycle::execute_binary_async(
@@ -5803,11 +6019,24 @@ async fn finish_install_or_ci_output(
     timing_val: bool,
     elapsed: std::time::Duration,
     preloaded_lockfile: Option<&rnpm_lockfile::LockfileV3>,
+    speculative_audit: Option<audit::SpeculativeAuditHandle>,
 ) -> anyhow::Result<()> {
     let elapsed_str = format_duration(elapsed);
 
+    let (spec_lock_owned, spec_report) = match speculative_audit {
+        Some(handle) => match handle.finish(config).await {
+            Some((lf, rep)) => (Some(lf), Some(rep)),
+            None => (None, None),
+        },
+        None => (None, None),
+    };
+
     if let Some(report) = summary.reify.as_ref() {
-        let owned_lock = if preloaded_lockfile.is_none() && !dry_run && (audit_val || fund_val) {
+        let owned_lock = if preloaded_lockfile.is_none()
+            && spec_lock_owned.is_none()
+            && !dry_run
+            && (audit_val || fund_val)
+        {
             let (lock_path, _) = rnpm_install::resolve_lockfile_path(report_dir);
             if lock_path.exists() {
                 rnpm_lockfile::load_and_migrate_readonly(&lock_path).ok()
@@ -5817,17 +6046,49 @@ async fn finish_install_or_ci_output(
         } else {
             None
         };
-        let lock_ref = preloaded_lockfile.or(owned_lock.as_ref());
-        let audit_report = if audit_val && !dry_run {
-            resolve_post_install_audit(report_dir, registry, config, lock_ref).await
+        let lock_ref = preloaded_lockfile
+            .or(spec_lock_owned.as_ref())
+            .or(owned_lock.as_ref());
+        let fund_lock_owned = if fund_val && !dry_run {
+            let from_mem = lock_ref.and_then(|lf| {
+                let c = lf
+                    .packages
+                    .iter()
+                    .filter(|(k, p)| !k.is_empty() && p.extra.contains_key("funding"))
+                    .count();
+                (c > 0).then_some(c)
+            });
+            Some((from_mem, lock_ref.is_some(), report_dir.to_path_buf()))
         } else {
             None
         };
-        let funding = if fund_val && !dry_run {
-            audit::count_funding_packages_with_lockfile(report_dir, lock_ref)
-        } else {
-            0
-        };
+        let (audit_report, funding) = tokio::join!(
+            async {
+                if let Some(rep) = spec_report {
+                    Some(rep)
+                } else if audit_val && !dry_run {
+                    resolve_post_install_audit(report_dir, registry, config, lock_ref).await
+                } else {
+                    None
+                }
+            },
+            async {
+                match fund_lock_owned {
+                    None => 0,
+                    Some((Some(c), _, _)) => c,
+                    Some((None, true, dir)) => tokio::task::spawn_blocking(move || {
+                        audit::count_funding_packages_in_node_modules(&dir)
+                    })
+                    .await
+                    .unwrap_or(0),
+                    Some((None, false, dir)) => tokio::task::spawn_blocking(move || {
+                        audit::count_funding_packages_with_lockfile(&dir, None)
+                    })
+                    .await
+                    .unwrap_or(0),
+                }
+            }
+        );
         let mut out =
             reify_output::ReifyOutputOptions::from_config_loaded(config, json, dry_run, fund_val);
         out.silent |= silent;
@@ -5858,7 +6119,10 @@ async fn finish_install_or_ci_output(
             summary.packages_installed
         );
     } else if !dry_run {
-        let owned_lock = if preloaded_lockfile.is_none() && (audit_val || (!silent && fund_val)) {
+        let owned_lock = if preloaded_lockfile.is_none()
+            && spec_lock_owned.is_none()
+            && (audit_val || (!silent && fund_val))
+        {
             let (lock_path, _) = rnpm_install::resolve_lockfile_path(report_dir);
             if lock_path.exists() {
                 rnpm_lockfile::load_and_migrate_readonly(&lock_path).ok()
@@ -5868,7 +6132,50 @@ async fn finish_install_or_ci_output(
         } else {
             None
         };
-        let lock_ref = preloaded_lockfile.or(owned_lock.as_ref());
+        let lock_ref = preloaded_lockfile
+            .or(spec_lock_owned.as_ref())
+            .or(owned_lock.as_ref());
+        let fund_lock_owned = if !silent && fund_val {
+            let from_mem = lock_ref.and_then(|lf| {
+                let c = lf
+                    .packages
+                    .iter()
+                    .filter(|(k, p)| !k.is_empty() && p.extra.contains_key("funding"))
+                    .count();
+                (c > 0).then_some(c)
+            });
+            Some((from_mem, lock_ref.is_some(), report_dir.to_path_buf()))
+        } else {
+            None
+        };
+        let (audit_report, funding_count) = tokio::join!(
+            async {
+                if let Some(rep) = spec_report {
+                    Some(rep)
+                } else if audit_val {
+                    resolve_post_install_audit(report_dir, registry, config, lock_ref).await
+                } else {
+                    None
+                }
+            },
+            async {
+                match fund_lock_owned {
+                    None => 0,
+                    Some((Some(c), _, _)) => c,
+                    Some((None, true, dir)) => tokio::task::spawn_blocking(move || {
+                        audit::count_funding_packages_in_node_modules(&dir)
+                    })
+                    .await
+                    .unwrap_or(0),
+                    Some((None, false, dir)) => tokio::task::spawn_blocking(move || {
+                        audit::count_funding_packages_with_lockfile(&dir, None)
+                    })
+                    .await
+                    .unwrap_or(0),
+                }
+            }
+        );
+
         if !silent {
             if summary.packages_installed > 0 {
                 let pkg_str = if summary.packages_installed == 1 {
@@ -5884,24 +6191,17 @@ async fn finish_install_or_ci_output(
                 println!("\nup to date in {}", elapsed_str);
             }
 
-            if fund_val {
-                let count = audit::count_funding_packages_with_lockfile(report_dir, lock_ref);
-                if count > 0 {
-                    println!(
-                        "\n{} packages are looking for funding\n  run `npm fund` for details",
-                        count
-                    );
-                }
+            if fund_val && funding_count > 0 {
+                println!(
+                    "\n{} packages are looking for funding\n  run `npm fund` for details",
+                    funding_count
+                );
             }
         }
 
-        if audit_val {
-            if let Some(report) =
-                resolve_post_install_audit(report_dir, registry, config, lock_ref).await
-            {
-                if config.get("loglevel") != Some("silent") {
-                    audit::print_concise_audit_summary(&report);
-                }
+        if let Some(report) = audit_report {
+            if config.get("loglevel") != Some("silent") {
+                audit::print_concise_audit_summary(&report);
             }
         }
     }
@@ -6194,8 +6494,19 @@ pub(crate) async fn run_cli_with_config(
             };
 
             let start_time = std::time::Instant::now();
+            let speculative_audit = if options.packages.is_empty() && !dry_run && audit_val {
+                audit::spawn_speculative_post_install_audit(
+                    &report_dir,
+                    registry.as_deref(),
+                    effective_config,
+                )
+            } else {
+                None
+            };
             let mut installer = Installer::new(options)?;
             let summary = installer.run().await?;
+            let valid_speculative = speculative_audit
+                .filter(|h| summary.packages_installed == 0 || h.is_lockfile_unchanged());
             finish_install_or_ci_output(
                 &report_dir,
                 &summary,
@@ -6209,6 +6520,7 @@ pub(crate) async fn run_cli_with_config(
                 timing_val,
                 start_time.elapsed(),
                 installer.last_lockfile(),
+                valid_speculative,
             )
             .await?;
         }
@@ -6357,6 +6669,15 @@ pub(crate) async fn run_cli_with_config(
             };
 
             let start_time = std::time::Instant::now();
+            let speculative_audit = if !dry_run && audit_val {
+                audit::spawn_speculative_post_install_audit(
+                    &current_dir,
+                    registry.as_deref(),
+                    &config,
+                )
+            } else {
+                None
+            };
             let mut installer = Installer::new(options)?;
             let summary = installer.run_ci().await?;
             finish_install_or_ci_output(
@@ -6372,6 +6693,7 @@ pub(crate) async fn run_cli_with_config(
                 timing_val,
                 start_time.elapsed(),
                 installer.last_lockfile(),
+                speculative_audit,
             )
             .await?;
         }
@@ -6473,7 +6795,7 @@ pub(crate) async fn run_cli_with_config(
                     } else {
                         (package.clone(), args.clone())
                     };
-                    execute_exec(
+                    execute_exec_with_config(
                         &target_dir,
                         &target_command,
                         &packages,
@@ -6483,6 +6805,7 @@ pub(crate) async fn run_cli_with_config(
                         offline,
                         false,
                         consent,
+                        Some(&config),
                     )
                     .await?;
                 }
@@ -8918,6 +9241,24 @@ fn execute_sync_command_inner(
             *workspace_root,
             Some(config),
         )),
+        Commands::Exec {
+            call,
+            package,
+            args,
+            packages,
+            cache,
+            workspace,
+            workspaces,
+            ..
+        } if !*workspaces && workspace.is_empty() => try_execute_sync_exec_with_config(
+            current_dir,
+            call.as_deref(),
+            package,
+            args,
+            packages,
+            cache.as_ref(),
+            config,
+        ),
         _ => None,
     }
 }
@@ -9731,6 +10072,226 @@ fn try_parse_fast_command_with_overrides(
             };
             Some((Cli { command }, overrides))
         }
+        "test" | "tst" | "t" | "start" | "stop" | "restart" => {
+            let mut script_args = Vec::new();
+            let mut workspaces = false;
+            let mut workspace = Vec::new();
+            let mut if_present = false;
+            let mut ignore_scripts = false;
+            let mut foreground_scripts = false;
+            let mut strict_sandbox = false;
+            let mut workspace_root = false;
+            let mut in_dashdash = false;
+            let mut i = 0;
+            while i < rest.len() {
+                let tok = rest[i].as_str();
+                if in_dashdash {
+                    script_args.push(rest[i].clone());
+                } else if tok == "--" {
+                    in_dashdash = true;
+                } else if tok == "--workspaces" {
+                    workspaces = true;
+                } else if let Some(val) = tok.strip_prefix("--workspace=") {
+                    workspace.push(val.to_string());
+                } else if tok == "-w" || tok == "--workspace" {
+                    i += 1;
+                    let val = rest.get(i)?;
+                    if val.starts_with('-') {
+                        return None;
+                    }
+                    workspace.push(val.clone());
+                } else if tok == "--if-present" {
+                    if_present = true;
+                } else if tok == "--ignore-scripts" {
+                    ignore_scripts = true;
+                } else if tok == "--foreground-scripts" {
+                    foreground_scripts = true;
+                } else if tok == "--strict-sandbox" {
+                    strict_sandbox = true;
+                } else if tok == "--workspace-root" || tok == "--include-workspace-root" {
+                    workspace_root = true;
+                } else if tok == "-s" || tok == "--silent" {
+                    overrides.insert("loglevel".to_string(), "silent".to_string());
+                } else if tok.starts_with('-') && script_args.is_empty() {
+                    return None;
+                } else {
+                    script_args.push(rest[i].clone());
+                }
+                i += 1;
+            }
+            let command = match cmd_name {
+                "start" => Commands::Start {
+                    args: script_args,
+                    workspaces,
+                    workspace,
+                    if_present,
+                    ignore_scripts,
+                    foreground_scripts,
+                    strict_sandbox,
+                    workspace_root,
+                },
+                "restart" => Commands::Restart {
+                    args: script_args,
+                    workspaces,
+                    workspace,
+                    if_present,
+                    ignore_scripts,
+                    foreground_scripts,
+                    strict_sandbox,
+                    workspace_root,
+                },
+                "stop" => Commands::Stop {
+                    args: script_args,
+                    workspaces,
+                    workspace,
+                    if_present,
+                    ignore_scripts,
+                    foreground_scripts,
+                    strict_sandbox,
+                    workspace_root,
+                },
+                _ => Commands::Test {
+                    args: script_args,
+                    workspaces,
+                    workspace,
+                    if_present,
+                    ignore_scripts,
+                    foreground_scripts,
+                    strict_sandbox,
+                    workspace_root,
+                },
+            };
+            Some((Cli { command }, overrides))
+        }
+        "exec" | "x" => {
+            let mut call = None;
+            let mut package = String::new();
+            let mut exec_args = Vec::new();
+            let mut yes = false;
+            let mut no_yes = false;
+            let mut packages = Vec::new();
+            let mut registry = None;
+            let mut cache = None;
+            let mut offline = false;
+            let mut workspace = Vec::new();
+            let mut workspaces = false;
+            let mut workspace_root = false;
+            let mut has_positional = false;
+            let mut i = 0;
+            while i < rest.len() {
+                let tok = rest[i].as_str();
+                if has_positional {
+                    exec_args.push(rest[i].clone());
+                } else if tok == "--" {
+                    i += 1;
+                    if call.is_some() {
+                        exec_args.extend(rest[i..].iter().cloned());
+                    } else if i < rest.len() {
+                        package = rest[i].clone();
+                        exec_args.extend(rest[i + 1..].iter().cloned());
+                    }
+                    break;
+                } else if let Some(val) = tok.strip_prefix("--call=") {
+                    if call.is_some() {
+                        return None;
+                    }
+                    call = Some(val.to_string());
+                } else if tok == "-c" || tok == "--call" {
+                    if call.is_some() {
+                        return None;
+                    }
+                    i += 1;
+                    call = Some(rest.get(i)?.clone());
+                } else if let Some(val) = tok.strip_prefix("--package=") {
+                    packages.push(val.to_string());
+                } else if tok == "-p" || tok == "--package" {
+                    i += 1;
+                    let val = rest.get(i)?;
+                    if val.starts_with('-') {
+                        return None;
+                    }
+                    packages.push(val.clone());
+                } else if let Some(val) = tok.strip_prefix("--registry=") {
+                    if registry.is_some() {
+                        return None;
+                    }
+                    registry = Some(val.to_string());
+                } else if tok == "--registry" {
+                    if registry.is_some() {
+                        return None;
+                    }
+                    i += 1;
+                    let val = rest.get(i)?;
+                    if val.starts_with('-') {
+                        return None;
+                    }
+                    registry = Some(val.clone());
+                } else if let Some(val) = tok.strip_prefix("--cache=") {
+                    if cache.is_some() || val.is_empty() {
+                        return None;
+                    }
+                    cache = Some(PathBuf::from(val));
+                } else if tok == "--cache" {
+                    if cache.is_some() {
+                        return None;
+                    }
+                    i += 1;
+                    let val = rest.get(i)?;
+                    if val.is_empty() || val.starts_with('-') {
+                        return None;
+                    }
+                    cache = Some(PathBuf::from(val));
+                } else if let Some(val) = tok.strip_prefix("--workspace=") {
+                    workspace.push(val.to_string());
+                } else if tok == "-w" || tok == "--workspace" {
+                    i += 1;
+                    let val = rest.get(i)?;
+                    if val.starts_with('-') {
+                        return None;
+                    }
+                    workspace.push(val.clone());
+                } else {
+                    match tok {
+                        "-y" | "--yes" => yes = true,
+                        "--no-yes" => no_yes = true,
+                        "--offline" => offline = true,
+                        "--workspaces" => workspaces = true,
+                        "--workspace-root" | "--include-workspace-root" => workspace_root = true,
+                        "-s" | "--silent" => {
+                            overrides.insert("loglevel".to_string(), "silent".to_string());
+                        }
+                        t if !t.starts_with('-') => {
+                            if call.is_some() {
+                                return None;
+                            }
+                            has_positional = true;
+                            package = t.to_string();
+                        }
+                        _ => return None,
+                    }
+                }
+                i += 1;
+            }
+            Some((
+                Cli {
+                    command: Commands::Exec {
+                        call,
+                        package,
+                        args: exec_args,
+                        yes,
+                        no_yes,
+                        packages,
+                        registry,
+                        cache,
+                        offline,
+                        workspace,
+                        workspaces,
+                        workspace_root,
+                    },
+                },
+                overrides,
+            ))
+        }
         _ => None,
     }
 }
@@ -10002,14 +10563,36 @@ fn main() {
 
     init_cli_request_context(cli.command.command_name(), &effective_config);
 
-    let worker_threads = std::thread::available_parallelism()
-        .map(|n| n.get().clamp(2, 4))
-        .unwrap_or(4);
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(worker_threads)
-        .enable_all()
-        .build()
-        .expect("Failed to initialize async runtime");
+    let use_current_thread_rt = match &cli.command {
+        Commands::Install {
+            packages,
+            offline,
+            force,
+            ..
+        } => {
+            packages.is_empty()
+                && (*offline
+                    || (!*force && current_dir.join("node_modules/.package-lock.json").is_file()))
+        }
+        Commands::Ci { offline, .. } => *offline,
+        _ => false,
+    };
+
+    let rt = if use_current_thread_rt {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("Failed to initialize async runtime")
+    } else {
+        let worker_threads = std::thread::available_parallelism()
+            .map(|n| n.get().clamp(2, 4))
+            .unwrap_or(4);
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(worker_threads)
+            .enable_all()
+            .build()
+            .expect("Failed to initialize async runtime")
+    };
 
     if let Err(err) = rt.block_on(run_cli_with_config(cli, None, Some(effective_config))) {
         if err.is::<audit::AuditThresholdError>() {

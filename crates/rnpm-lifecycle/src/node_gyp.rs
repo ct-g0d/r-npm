@@ -1276,34 +1276,34 @@ pub fn create_private_node_gyp_shim(dir: &Path) -> std::io::Result<PathBuf> {
 /// Prepares and returns a dedicated privately-owned directory containing standalone `node-gyp` shims
 /// (`node-gyp.cmd` on Windows and `node-gyp` on Unix) that forward to `%npm_config_node_gyp%`.
 pub fn node_gyp_bin_dir() -> Option<PathBuf> {
-    struct CachedBinDir {
-        path: PathBuf,
-        _temp: tempfile::TempDir,
-    }
-    static BIN_DIR: std::sync::OnceLock<Option<CachedBinDir>> = std::sync::OnceLock::new();
+    static BIN_DIR: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
     BIN_DIR
         .get_or_init(|| {
-            let tmp_dir = match tempfile::Builder::new()
-                .prefix("rnpm-node-gyp-bin-")
-                .tempdir()
-            {
-                Ok(d) => d,
-                Err(e) => {
-                    warn!("Failed to create private node-gyp-bin directory: {}", e);
-                    return None;
-                }
+            #[cfg(unix)]
+            let dir_name = format!("rnpm-node-gyp-bin-{}", unsafe { libc::geteuid() });
+            #[cfg(not(unix))]
+            let dir_name = "rnpm-node-gyp-bin-v1".to_string();
+
+            let dir = std::env::temp_dir().join(dir_name);
+            let expected_shim = if cfg!(windows) {
+                dir.join("node-gyp.cmd")
+            } else {
+                dir.join("node-gyp")
             };
-            let dir = tmp_dir.path().to_path_buf();
+            if expected_shim.is_file() {
+                return Some(dir);
+            }
+
+            if let Err(e) = std::fs::create_dir_all(&dir) {
+                warn!("Failed to create private node-gyp-bin directory: {}", e);
+                return None;
+            }
             if let Err(e) = create_private_node_gyp_shim(&dir) {
                 warn!("Failed to populate private node-gyp-bin directory: {}", e);
                 return None;
             }
 
-            Some(CachedBinDir {
-                path: dir,
-                _temp: tmp_dir,
-            })
+            Some(dir)
         })
-        .as_ref()
-        .map(|d| d.path.clone())
+        .clone()
 }
