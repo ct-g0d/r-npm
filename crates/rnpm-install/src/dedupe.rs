@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use crate::prune::{extract_package_name_from_path, scan_node_modules};
@@ -294,8 +294,8 @@ pub fn execute_dedupe(options: &DedupeOptions) -> Result<DedupeSummary> {
         );
     }
 
-    // 4. Group packages by package_name to find duplicates across nesting levels
-    let mut by_name: HashMap<String, Vec<InstalledPackage>> = HashMap::new();
+    // 4. Group packages by package_name to find duplicates across nesting levels (deterministic order)
+    let mut by_name: BTreeMap<String, Vec<InstalledPackage>> = BTreeMap::new();
     for pkg in installed_map.values() {
         // Skip symlinks / workspace junctions AND aliased installs (folder name != package name)
         if pkg.is_link || extract_package_name_from_path(&pkg.path) != pkg.name {
@@ -441,9 +441,11 @@ pub fn execute_dedupe(options: &DedupeOptions) -> Result<DedupeSummary> {
             }
         } else {
             // Scenario 2: Root node_modules/<pkg> is VACANT.
-            // Skip hoisting if something else (e.g. a symlink or alias) already occupies `root_install_path`.
+            // Skip hoisting if something else (e.g. a symlink/junction or alias) already occupies `root_install_path`.
+            let root_target_disk = project_dir.join(&root_install_path);
             if installed_map.contains_key(&root_install_path)
-                || project_dir.join(&root_install_path).exists()
+                || root_target_disk.exists()
+                || is_junction(&root_target_disk).unwrap_or(false)
             {
                 continue;
             }
@@ -570,39 +572,45 @@ pub fn execute_dedupe(options: &DedupeOptions) -> Result<DedupeSummary> {
     }
 
     // Never delete a nested package in `DeleteDuplicate` if it still hosts surviving
-    // nested `node_modules` children that were not themselves deleted or hoisted away.
+    // nested `node_modules` children that were not themselves deleted or hoisted away,
+    // and drop any deeper `DeleteDuplicate` that becomes shadowed by a retained parent.
     loop {
-        let mut dropped_any = false;
-        let blocked_prefixes: Vec<String> = actions
+        let mut to_drop: HashSet<String> = HashSet::new();
+        for a in actions
             .iter()
             .filter(|a| a.action_type == DedupeActionType::DeleteDuplicate)
-            .filter(|a| {
-                let child_prefix = format!("{}/node_modules/", a.original_path);
-                installed_map.keys().any(|k| {
-                    k.starts_with(&child_prefix)
-                        && !already_removed.contains(k)
-                        && !actions.iter().any(|h| {
-                            h.action_type == DedupeActionType::HoistAndDedupe
-                                && (k == &h.original_path
-                                    || k.starts_with(&format!("{}/", h.original_path)))
-                        })
-                })
-            })
-            .map(|a| a.original_path.clone())
-            .collect();
-        if blocked_prefixes.is_empty() {
-            break;
-        }
-        for blocked in blocked_prefixes {
-            already_removed.remove(&blocked);
-            actions.retain(|a| {
-                !(a.action_type == DedupeActionType::DeleteDuplicate && a.original_path == blocked)
+        {
+            let child_prefix = format!("{}/node_modules/", a.original_path);
+            let has_surviving_child = installed_map.keys().any(|k| {
+                k.starts_with(&child_prefix)
+                    && !already_removed.contains(k)
+                    && !actions.iter().any(|h| {
+                        h.action_type == DedupeActionType::HoistAndDedupe
+                            && (k == &h.original_path
+                                || k.starts_with(&format!("{}/", h.original_path)))
+                    })
             });
-            dropped_any = true;
+            let parent_path = get_parent_location(&a.original_path);
+            let shadowed_after_drop = is_shadowed_by_ancestor(
+                &parent_path,
+                &a.package_name,
+                &installed_map,
+                &already_removed,
+            );
+            if has_surviving_child || shadowed_after_drop {
+                to_drop.insert(a.original_path.clone());
+            }
         }
-        if !dropped_any {
+        if to_drop.is_empty() {
             break;
         }
+        for dropped in &to_drop {
+            already_removed.remove(dropped);
+        }
+        actions.retain(|a| {
+            !(a.action_type == DedupeActionType::DeleteDuplicate
+                && to_drop.contains(&a.original_path))
+        });
     }
 
     // 6. Apply actions to filesystem and lockfile (unless dry-run)
@@ -613,13 +621,35 @@ pub fn execute_dedupe(options: &DedupeOptions) -> Result<DedupeSummary> {
     };
 
     if !options.dry_run {
-        // Apply HoistAndDedupe moves before DeleteDuplicate so nested hoisted subtrees
-        // are re-homed before outer redundant parents might be pruned.
-        for action in actions
+        // Apply HoistAndDedupe deepest-first so nested children are re-homed before
+        // outer ancestor directories move, and record path remaps for subsequent moves/deletes.
+        let mut hoist_actions: Vec<&DedupeAction> = actions
             .iter()
             .filter(|a| a.action_type == DedupeActionType::HoistAndDedupe)
-        {
-            let src_full = project_dir.join(&action.original_path);
+            .collect();
+        hoist_actions.sort_by(|a, b| {
+            b.original_path
+                .len()
+                .cmp(&a.original_path.len())
+                .then_with(|| a.original_path.cmp(&b.original_path))
+        });
+
+        let remap_path = |orig: &str, remaps: &[(String, String)]| -> String {
+            let mut cur = orig.to_string();
+            for (old_p, new_p) in remaps {
+                if cur == *old_p {
+                    cur = new_p.clone();
+                } else if let Some(suffix) = cur.strip_prefix(&format!("{old_p}/")) {
+                    cur = format!("{new_p}/{suffix}");
+                }
+            }
+            cur
+        };
+
+        let mut hoist_remaps: Vec<(String, String)> = Vec::new();
+        for action in hoist_actions {
+            let effective_src = remap_path(&action.original_path, &hoist_remaps);
+            let src_full = project_dir.join(&effective_src);
             let dst_full = project_dir.join(&action.target_path);
 
             if dst_full.exists() || is_junction(&dst_full).unwrap_or(false) {
@@ -636,19 +666,19 @@ pub fn execute_dedupe(options: &DedupeOptions) -> Result<DedupeSummary> {
 
             // Update lockfile: move the hoisted entry AND all nested sub-entries under its prefix
             if let Some(ref mut l) = lockfile {
-                let prefix = format!("{}/", action.original_path);
+                let prefix = format!("{effective_src}/");
                 let keys_to_move: Vec<String> = l
                     .packages
                     .keys()
-                    .filter(|k| *k == &action.original_path || k.starts_with(&prefix))
+                    .filter(|k| *k == &effective_src || k.starts_with(&prefix))
                     .cloned()
                     .collect();
                 for old_key in keys_to_move {
                     if let Some(pkg_meta) = l.remove_package(&old_key) {
-                        let new_key = if old_key == action.original_path {
+                        let new_key = if old_key == effective_src {
                             action.target_path.clone()
                         } else {
-                            let suffix = &old_key[action.original_path.len()..];
+                            let suffix = &old_key[effective_src.len()..];
                             format!("{}{}", action.target_path, suffix)
                         };
                         l.insert_package(&new_key, pkg_meta);
@@ -656,16 +686,26 @@ pub fn execute_dedupe(options: &DedupeOptions) -> Result<DedupeSummary> {
                 }
             }
 
+            hoist_remaps.push((effective_src, action.target_path.clone()));
             summary
                 .hoisted_packages
                 .push((action.original_path.clone(), action.target_path.clone()));
         }
 
-        for action in actions
+        let mut delete_actions: Vec<&DedupeAction> = actions
             .iter()
             .filter(|a| a.action_type == DedupeActionType::DeleteDuplicate)
-        {
-            let src_full = project_dir.join(&action.original_path);
+            .collect();
+        delete_actions.sort_by(|a, b| {
+            b.original_path
+                .len()
+                .cmp(&a.original_path.len())
+                .then_with(|| a.original_path.cmp(&b.original_path))
+        });
+
+        for action in delete_actions {
+            let effective_src = remap_path(&action.original_path, &hoist_remaps);
+            let src_full = project_dir.join(&effective_src);
             // Defense-in-depth: skip deletion if any surviving child directory remains inside `node_modules`
             let nested_nm = src_full.join("node_modules");
             let has_live_disk_child = nested_nm.is_dir()
@@ -691,7 +731,7 @@ pub fn execute_dedupe(options: &DedupeOptions) -> Result<DedupeSummary> {
 
             // Update lockfile: remove nested entry
             if let Some(ref mut l) = lockfile {
-                l.remove_package(&action.original_path);
+                l.remove_package(&effective_src);
             }
 
             summary.removed_packages.push(action.original_path.clone());

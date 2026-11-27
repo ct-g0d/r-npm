@@ -219,23 +219,9 @@ pub async fn run(project_dir: &Path, json_output: bool) -> anyhow::Result<()> {
                 Ok::<_, anyhow::Error>((name, packument))
             });
         }
-        let mut results: HashMap<String, anyhow::Result<AbbreviatedPackageMetadata>> =
-            HashMap::new();
         while let Some(res) = fetch_tasks.join_next().await {
-            match res {
-                Ok(Ok((name, packument))) => {
-                    results.insert(name, Ok(packument));
-                }
-                Ok(Err(err)) => {
-                    // Return the first error in package iteration order below once joined,
-                    // or bail immediately if none earlier succeed/fail.
-                    return Err(err);
-                }
-                Err(e) => return Err(anyhow!("Packument fetch task panicked: {e}")),
-            }
-        }
-        for (name, res) in results {
-            packuments.insert(name, res?);
+            let (name, packument) = res.map_err(|e| anyhow!("Packument fetch task panicked: {e}"))??;
+            packuments.insert(name, packument);
         }
     }
     for pkg in &packages {

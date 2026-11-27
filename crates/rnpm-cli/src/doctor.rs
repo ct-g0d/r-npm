@@ -282,10 +282,12 @@ pub fn query_is_dev_drive(volume_path: &str) -> bool {
     // Fallback: check via fsutil devdrv query <drive> or PowerShell (Get-Volume -DriveLetter <x>).DevDrive
     if let Some(drive_letter) = trimmed.chars().next() {
         if trimmed.chars().nth(1) == Some(':') {
-            if let Ok(output) = std::process::Command::new("fsutil")
+            use std::os::windows::process::CommandExt;
+            let mut fsutil_cmd = std::process::Command::new("fsutil");
+            fsutil_cmd
                 .args(["devdrv", "query", &format!("{drive_letter}:")])
-                .output()
-            {
+                .creation_flags(0x0800_0000);
+            if let Ok(output) = fsutil_cmd.output() {
                 if output.status.success() {
                     let text = String::from_utf8_lossy(&output.stdout).to_lowercase();
                     if text.contains("developer volume: yes")
@@ -302,10 +304,10 @@ pub fn query_is_dev_drive(volume_path: &str) -> bool {
             let ps_cmd = format!(
                 "& {{ try {{ $v = Get-Volume -DriveLetter {drive_letter} -ErrorAction Stop; [bool]$v.DevDrive }} catch {{ $false }} }}"
             );
-            if let Ok(output) = std::process::Command::new("powershell.exe")
-                .args(["-NoProfile", "-NonInteractive", "-Command", &ps_cmd])
-                .output()
-            {
+            let mut ps = std::process::Command::new("powershell.exe");
+            ps.args(["-NoProfile", "-NonInteractive", "-Command", &ps_cmd])
+                .creation_flags(0x0800_0000);
+            if let Ok(output) = ps.output() {
                 let text = String::from_utf8_lossy(&output.stdout);
                 if text.trim().eq_ignore_ascii_case("true") {
                     return true;
@@ -397,10 +399,12 @@ pub fn query_defender_info() -> DefenderInfo {
     {
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
+            use std::os::windows::process::CommandExt;
             let cmd = "& { try { $s = Get-MpComputerStatus; $p = Get-MpPreference; $excl = if ($p.ExclusionPath) { @($p.ExclusionPath) } else { @() }; @{ RealTime = [bool]$s.RealTimeProtectionEnabled; PerfMode = [int]$p.PerformanceModeStatus; Excl = $excl } | ConvertTo-Json -Compress } catch { @{ Error = 'unavailable' } | ConvertTo-Json -Compress } }";
-            let res = std::process::Command::new("powershell.exe")
-                .args(["-NoProfile", "-NonInteractive", "-Command", cmd])
-                .output();
+            let mut ps = std::process::Command::new("powershell.exe");
+            ps.args(["-NoProfile", "-NonInteractive", "-Command", cmd])
+                .creation_flags(0x0800_0000);
+            let res = ps.output();
             let _ = tx.send(res);
         });
 

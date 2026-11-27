@@ -6922,3 +6922,170 @@ async fn test_isolated_strategy_enforces_engines_and_allow_scripts() {
         "Isolated mode must enforce allowScripts policy and block disallowed postinstall"
     );
 }
+
+#[tokio::test]
+async fn test_incremental_install_reextracts_without_hidden_lockfile_and_cleans_stale_shims() {
+    let tmp = tempdir().unwrap();
+    let project_dir = tmp.path();
+
+    let pkg_tar = make_tarball("pkg-a", "1.0.0", &[]);
+    let pkg_int = Integrity::from_bytes(&pkg_tar, Algorithm::Sha512).to_string();
+
+    let vendor_dir = project_dir.join("vendor");
+    fs::create_dir_all(&vendor_dir).unwrap();
+    fs::write(vendor_dir.join("pkg-a.tgz"), &pkg_tar).unwrap();
+
+    let mut manifest = Manifest::default();
+    manifest.name = Some("no-hidden-inc".to_string());
+    manifest.version = Some("1.0.0".to_string());
+    manifest
+        .dependencies
+        .insert("pkg-a".to_string(), "file:./vendor/pkg-a.tgz".to_string());
+    manifest
+        .save_to_file(project_dir.join("package.json"))
+        .unwrap();
+
+    let mut lock = LockfileV3::new("no-hidden-inc", Some("1.0.0".to_string()));
+    lock.root_package_mut().unwrap().dependencies = Some(manifest.dependencies.clone());
+    lock.insert_package(
+        "node_modules/pkg-a",
+        LockfilePackage {
+            version: Some("1.0.0".to_string()),
+            resolved: Some("file:./vendor/pkg-a.tgz".to_string()),
+            integrity: Some(pkg_int),
+            ..Default::default()
+        },
+    );
+    lock.save_to_file(&project_dir.join("package-lock.json"))
+        .unwrap();
+
+    // Seed pkg-a@1.0.0 on disk WITHOUT a hidden .package-lock.json (`hidden_valid == false`)
+    // plus a stale marker and a stale shim in `.bin`.
+    let pkg_dir = project_dir.join("node_modules").join("pkg-a");
+    let bin_dir = project_dir.join("node_modules").join(".bin");
+    fs::create_dir_all(&pkg_dir).unwrap();
+    fs::create_dir_all(&bin_dir).unwrap();
+    fs::write(
+        pkg_dir.join("package.json"),
+        r#"{"name":"pkg-a","version":"1.0.0"}"#,
+    )
+    .unwrap();
+    fs::write(pkg_dir.join("stale-marker.txt"), "stale").unwrap();
+    fs::write(bin_dir.join("stale-bin"), "stale-shim").unwrap();
+
+    let cache_dir = tmp.path().join("cache");
+    let mut installer = Installer::new(InstallOptions {
+        project_dir: project_dir.to_path_buf(),
+        cache_dir: Some(cache_dir),
+        offline: true,
+        ..Default::default()
+    })
+    .unwrap();
+    installer.run().await.unwrap();
+
+    assert!(
+        !pkg_dir.join("stale-marker.txt").exists(),
+        "When hidden_valid == false, pkg-a integrity is unverified and must be re-materialized"
+    );
+    assert!(pkg_dir.join("package.json").is_file());
+    assert!(
+        !bin_dir.join("stale-bin").exists(),
+        "Incremental install must clean up stale .bin shims"
+    );
+}
+
+#[test]
+fn test_uninstall_prunes_workspace_nested_node_modules_and_keeps_ws_dev_deps() {
+    let tmp = tempdir().unwrap();
+    let project_dir = tmp.path();
+
+    fs::write(
+        project_dir.join("package.json"),
+        r#"{"name":"ws-root","version":"1.0.0","workspaces":["packages/*"]}"#,
+    )
+    .unwrap();
+
+    let ws_a = project_dir.join("packages").join("ws-a");
+    fs::create_dir_all(&ws_a).unwrap();
+    fs::write(
+        ws_a.join("package.json"),
+        r#"{"name":"ws-a","version":"1.0.0","dependencies":{"ws-only-dep":"^1.0.0"},"devDependencies":{"ws-dev-dep":"^1.0.0"}}"#,
+    )
+    .unwrap();
+
+    let ws_only_dir = ws_a.join("node_modules").join("ws-only-dep");
+    let ws_dev_dir = project_dir.join("node_modules").join("ws-dev-dep");
+    fs::create_dir_all(&ws_only_dir).unwrap();
+    fs::create_dir_all(&ws_dev_dir).unwrap();
+    fs::write(
+        ws_only_dir.join("package.json"),
+        r#"{"name":"ws-only-dep","version":"1.0.0"}"#,
+    )
+    .unwrap();
+    fs::write(
+        ws_dev_dir.join("package.json"),
+        r#"{"name":"ws-dev-dep","version":"1.0.0"}"#,
+    )
+    .unwrap();
+
+    let mut lock = LockfileV3::new("ws-root", Some("1.0.0".to_string()));
+    lock.insert_package(
+        "packages/ws-a",
+        LockfilePackage {
+            version: Some("1.0.0".to_string()),
+            dependencies: Some(BTreeMap::from([(
+                "ws-only-dep".to_string(),
+                "^1.0.0".to_string(),
+            )])),
+            dev_dependencies: Some(BTreeMap::from([(
+                "ws-dev-dep".to_string(),
+                "^1.0.0".to_string(),
+            )])),
+            ..Default::default()
+        },
+    );
+    lock.insert_package(
+        "packages/ws-a/node_modules/ws-only-dep",
+        LockfilePackage {
+            version: Some("1.0.0".to_string()),
+            ..Default::default()
+        },
+    );
+    lock.insert_package(
+        "node_modules/ws-dev-dep",
+        LockfilePackage {
+            version: Some("1.0.0".to_string()),
+            dev: Some(true),
+            ..Default::default()
+        },
+    );
+    lock.save_to_file(&project_dir.join("package-lock.json"))
+        .unwrap();
+
+    let installer = Installer::new(InstallOptions {
+        project_dir: project_dir.to_path_buf(),
+        ..Default::default()
+    })
+    .unwrap();
+    installer
+        .uninstall(&UninstallOptions {
+            packages: vec!["ws-only-dep".to_string()],
+            workspace: vec!["ws-a".to_string()],
+            ..Default::default()
+        })
+        .unwrap();
+
+    assert!(
+        !ws_only_dir.exists(),
+        "Workspace-nested node_modules/ws-only-dep must be removed on uninstall"
+    );
+    assert!(
+        ws_dev_dir.exists(),
+        "Workspace devDependency node_modules/ws-dev-dep must NOT be pruned"
+    );
+    let updated_lock = LockfileV3::load_from_file(&project_dir.join("package-lock.json")).unwrap();
+    assert!(!updated_lock
+        .packages
+        .contains_key("packages/ws-a/node_modules/ws-only-dep"));
+    assert!(updated_lock.packages.contains_key("node_modules/ws-dev-dep"));
+}

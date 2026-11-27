@@ -5008,7 +5008,9 @@ async fn test_topological_execution_handles_nested_duplicate_without_corrupting_
     foo_top_manifest.name = Some("foo".into());
     foo_top_manifest.scripts.insert(
         "postinstall".into(),
-        format!("node -e \"require('fs').appendFileSync('{order_path}','foo-top\\n')\""),
+        format!(
+            "node -e \"setTimeout(()=>require('fs').appendFileSync('{order_path}','foo-top\\n'),120)\""
+        ),
     );
 
     let mut bar_manifest = rnpm_core::manifest::Manifest::default();
@@ -5026,15 +5028,14 @@ async fn test_topological_execution_handles_nested_duplicate_without_corrupting_
     );
 
     // Nested foo appears AFTER top-level foo and has its own postinstall.
-    // `bar` depends on `foo` -> MUST wait for `foo-top` (`node_modules/foo`), NOT `foo-nested`!
+    // `foo-top` sleeps 120ms while `foo-nested` finishes immediately: if `bar` mistakenly
+    // resolved to `foo-nested`, `bar` would finish before `foo-top`!
     // `baz` depends on `foo` -> resolves to its nested `node_modules/baz/node_modules/foo` FIRST!
     let mut foo_nested_manifest = rnpm_core::manifest::Manifest::default();
     foo_nested_manifest.name = Some("foo".into());
     foo_nested_manifest.scripts.insert(
         "postinstall".into(),
-        format!(
-            "node -e \"setTimeout(()=>require('fs').appendFileSync('{order_path}','foo-nested\\n'),120)\""
-        ),
+        format!("node -e \"require('fs').appendFileSync('{order_path}','foo-nested\\n')\""),
     );
 
     for rel in [

@@ -4128,6 +4128,13 @@ fn installed_pkg_version_in_nm(nm_dir: &Path, pkg_name: &str) -> Option<String> 
 }
 
 fn bin_path_satisfies_spec(bin_path: &Path, pkg_name: &str, version_req: &str) -> bool {
+    let trimmed_req = version_req.trim();
+    if trimmed_req.eq_ignore_ascii_case("latest")
+        || (rnpm_core::semver::Range::parse(trimmed_req).is_err()
+            && rnpm_core::semver::Version::parse(trimmed_req).is_err())
+    {
+        return false;
+    }
     let Some(bin_dir) = bin_path.parent() else {
         return false;
     };
@@ -4140,7 +4147,7 @@ fn bin_path_satisfies_spec(bin_path: &Path, pkg_name: &str, version_req: &str) -
     let Some(installed_ver) = installed_pkg_version_in_nm(nm_dir, pkg_name) else {
         return false;
     };
-    rnpm_install::version_matches_range(&installed_ver, version_req)
+    rnpm_install::version_matches_range(&installed_ver, trimmed_req)
 }
 
 fn resolve_local_or_system_exec_bin(

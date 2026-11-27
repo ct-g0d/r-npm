@@ -4837,10 +4837,27 @@ async fn test_npx_explicit_version_spec_ignores_mismatched_local_and_rejects_mis
         }
     });
 
-    // 1. Explicit spec `versioned-tool@2.0.0` must NOT reuse local 1.0.0; it must fetch & run 2.0.0
+    // 1. Explicit spec `versioned-tool@2.0.0` AND dist-tag `versioned-tool@latest` must NOT reuse local 1.0.0
     execute_exec_with_config(
         project_dir.path(),
         "versioned-tool@2.0.0",
+        &[],
+        &[],
+        Some(server_url.clone()),
+        Some(cache_dir.path().to_path_buf()),
+        false,
+        false,
+        Some(true),
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(std::fs::read_to_string(&marker).unwrap().trim(), "v2.0.0");
+
+    std::fs::remove_file(&marker).unwrap();
+    execute_exec_with_config(
+        project_dir.path(),
+        "versioned-tool@latest",
         &[],
         &[],
         Some(server_url.clone()),

@@ -7436,12 +7436,24 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
             && node_modules_dir.exists()
             && !rnpm_fs::is_junction(&node_modules_dir).unwrap_or(false)
         {
-            let hidden_valid =
-                validate_hidden_lockfile(&self.options.project_dir, Some(&self.options));
+            let hidden_path = self.options.project_dir.join(LockfileV3::HIDDEN_LOCKFILE_PATH);
+            let hidden_matches_disk = std::fs::symlink_metadata(&hidden_path)
+                .ok()
+                .and_then(|hm| hm.modified().ok())
+                .is_some_and(|hm| {
+                    std::fs::symlink_metadata(&node_modules_dir)
+                        .ok()
+                        .and_then(|nm| nm.modified().ok())
+                        .is_none_or(|nm| nm <= hm)
+                })
+                && LockfileV3::load_from_file_readonly(&hidden_path).is_ok();
+            // Do not backfill `resolved`/`integrity` from `lockfile.packages` when the
+            // hidden lockfile is absent or stale vs `node_modules`, or `pkg_matches_on_disk`
+            // would compare desired lockfile metadata against itself.
             let actual_packages = reify_report::load_actual(
                 &self.options.project_dir,
-                hidden_valid,
-                Some(&lockfile.packages),
+                hidden_matches_disk,
+                None,
             );
             let mut desired_packages: HashMap<&str, &rnpm_lockfile::LockfilePackage> =
                 HashMap::new();
@@ -7470,12 +7482,10 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                         (Some(_), None) | (None, Some(_)) => return false,
                         _ => {}
                     }
-                    if let (Some(dr), Some(ar)) =
-                        (desired.resolved.as_deref(), actual.resolved.as_deref())
-                    {
-                        if dr != ar {
-                            return false;
-                        }
+                    match (desired.resolved.as_deref(), actual.resolved.as_deref()) {
+                        (Some(dr), Some(ar)) if dr != ar => return false,
+                        (Some(_), None) | (None, Some(_)) => return false,
+                        _ => {}
                     }
                     let target = loc_base_dir.join(pkg_key);
                     if desired.link == Some(true) {
@@ -7490,9 +7500,10 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                 if !actual_key.starts_with("node_modules/") {
                     continue;
                 }
-                let keep = desired_packages
-                    .get(actual_key.as_str())
-                    .is_some_and(|desired| pkg_matches_on_disk(actual_key, desired, actual_pkg));
+                let keep = hidden_matches_disk
+                    && desired_packages
+                        .get(actual_key.as_str())
+                        .is_some_and(|desired| pkg_matches_on_disk(actual_key, desired, actual_pkg));
                 if !keep {
                     to_remove.push(actual_key.clone());
                     removed_set.insert(actual_key.clone());
@@ -7518,10 +7529,12 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                 };
                 if has_removed_ancestor {
                     removed_set.insert((*desired_key).to_string());
-                } else if let Some(actual_pkg) = actual_packages.get(*desired_key) {
-                    let desired_pkg = desired_packages[desired_key];
-                    if pkg_matches_on_disk(desired_key, desired_pkg, actual_pkg) {
-                        incremental_skip_packages.insert((*desired_key).to_string());
+                } else if hidden_matches_disk {
+                    if let Some(actual_pkg) = actual_packages.get(*desired_key) {
+                        let desired_pkg = desired_packages[desired_key];
+                        if pkg_matches_on_disk(desired_key, desired_pkg, actual_pkg) {
+                            incremental_skip_packages.insert((*desired_key).to_string());
+                        }
                     }
                 }
             }
@@ -8999,7 +9012,7 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                                 loc_base_ref,
                                 bin_dir_ref,
                                 nm_dir_ref,
-                                true,
+                                from_scratch,
                                 None,
                                 self.options.force,
                                 (!bin_headers.is_empty()).then_some(&bin_headers),
@@ -9519,7 +9532,7 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                     &loc_base_dir,
                     &bin_dir,
                     &node_modules_dir,
-                    true,
+                    from_scratch,
                     Some(&collector),
                     self.options.force,
                 )?;
@@ -11296,15 +11309,22 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
         let mut dirs_to_remove = HashSet::new();
         if has_lockfile {
             for pruned in &pruned_nodes {
-                if pruned.starts_with("node_modules/") && !remaining_lockfile_keys.contains(pruned)
-                {
+                if pruned.contains("node_modules/") && !remaining_lockfile_keys.contains(pruned) {
                     dirs_to_remove.insert(pruned.clone());
                 }
             }
             for pkg in &removed_packages {
-                let top_key = format!("node_modules/{pkg}");
-                if !remaining_lockfile_keys.contains(&top_key) {
-                    dirs_to_remove.insert(top_key);
+                if target_root {
+                    let top_key = format!("node_modules/{pkg}");
+                    if !remaining_lockfile_keys.contains(&top_key) {
+                        dirs_to_remove.insert(top_key);
+                    }
+                }
+                for &idx in &targeted_workspace_indices {
+                    let ws_key = format!("{}/node_modules/{pkg}", workspace_members[idx].relative_path);
+                    if !remaining_lockfile_keys.contains(&ws_key) {
+                        dirs_to_remove.insert(ws_key);
+                    }
                 }
             }
         } else {
@@ -11349,7 +11369,10 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
         sorted_dirs.sort_by_key(|b| std::cmp::Reverse(b.len()));
 
         for rel_dir in sorted_dirs {
-            if !rel_dir.starts_with("node_modules/") {
+            if !rel_dir.contains("node_modules/")
+                || rel_dir.starts_with('/')
+                || rel_dir.split(['/', '\\']).any(|seg| seg == "..")
+            {
                 continue;
             }
             let target_path = loc_base_dir.join(&rel_dir);
@@ -11884,9 +11907,9 @@ pub fn prune_lockfile(lockfile: &mut LockfileV3, manifest: &Manifest) -> HashSet
     for (key, pkg) in &lockfile.packages {
         let is_workspace_link = pkg.link == Some(true)
             && pkg.resolved.as_deref().is_some_and(|target| {
-                !target.starts_with("node_modules/") && lockfile.packages.contains_key(target)
+                !target.contains("node_modules/") && lockfile.packages.contains_key(target)
             });
-        if !key.starts_with("node_modules/") || is_workspace_link {
+        if !key.contains("node_modules/") || is_workspace_link {
             reachable_keys.insert(key.clone());
             queue.push_back(key.clone());
         }
@@ -11905,6 +11928,11 @@ pub fn prune_lockfile(lockfile: &mut LockfileV3, manifest: &Manifest) -> HashSet
             let mut all_deps = Vec::new();
             if let Some(deps) = &pkg.dependencies {
                 all_deps.extend(deps.keys().cloned());
+            }
+            if !current_key.contains("node_modules/") {
+                if let Some(dev_deps) = &pkg.dev_dependencies {
+                    all_deps.extend(dev_deps.keys().cloned());
+                }
             }
             if let Some(opt_deps) = &pkg.optional_dependencies {
                 all_deps.extend(opt_deps.keys().cloned());
@@ -11926,12 +11954,12 @@ pub fn prune_lockfile(lockfile: &mut LockfileV3, manifest: &Manifest) -> HashSet
         }
     }
 
-    // 3. Remove all unreachable keys (excluding "")
+    // 3. Remove all unreachable keys (excluding "" and workspace package entries)
     let mut pruned = HashSet::new();
     let all_keys: Vec<String> = lockfile.packages.keys().cloned().collect();
 
     for key in all_keys {
-        if !key.is_empty() && key.starts_with("node_modules/") && !reachable_keys.contains(&key) {
+        if !key.is_empty() && key.contains("node_modules/") && !reachable_keys.contains(&key) {
             lockfile.packages.remove(&key);
             pruned.insert(key);
         }
