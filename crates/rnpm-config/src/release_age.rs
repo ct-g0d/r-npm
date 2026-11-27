@@ -266,16 +266,100 @@ pub fn is_release_age_excluded<S: AsRef<str>>(name: &str, patterns: &[S]) -> boo
 }
 
 fn match_segments(pat: &[&str], txt: &[&str]) -> bool {
-    match pat.first() {
-        None => txt.is_empty(),
-        Some(&"**") => {
-            match_segments(&pat[1..], txt)
-                || (!txt.is_empty() && match_segments(pat, &txt[1..]))
+    let n = txt.len();
+    // Linear-space DP over (pattern segment, text segment): O(|pat| * |txt|), no exponential backtracking.
+    let mut prev = vec![false; n + 1];
+    prev[0] = true;
+    for &seg in pat {
+        let mut curr = vec![false; n + 1];
+        if seg == "**" {
+            let mut matched = false;
+            for j in 0..=n {
+                matched |= prev[j];
+                curr[j] = matched;
+            }
+        } else {
+            for j in 0..n {
+                if prev[j] && match_segment(seg, txt[j]) {
+                    curr[j + 1] = true;
+                }
+            }
         }
-        Some(seg) => {
-            !txt.is_empty() && match_segment(seg, txt[0]) && match_segments(&pat[1..], &txt[1..])
+        prev = curr;
+    }
+    prev[n]
+}
+
+#[derive(Debug, Clone)]
+enum SegToken {
+    Star,
+    Any,
+    Char(char),
+    Class {
+        negate: bool,
+        ranges: Vec<(char, char)>,
+        singles: Vec<char>,
+    },
+}
+
+fn compile_segment(p: &[char]) -> Vec<SegToken> {
+    let mut tokens = Vec::with_capacity(p.len());
+    let mut i = 0;
+    while i < p.len() {
+        match p[i] {
+            '*' => {
+                // Coalesce consecutive `*` to prevent redundant work.
+                if !matches!(tokens.last(), Some(SegToken::Star)) {
+                    tokens.push(SegToken::Star);
+                }
+                i += 1;
+            }
+            '?' => {
+                tokens.push(SegToken::Any);
+                i += 1;
+            }
+            '[' => {
+                if let Some(rel_end) = p[i + 1..].iter().position(|&c| c == ']') {
+                    let end = i + 1 + rel_end;
+                    let mut class = &p[i + 1..end];
+                    let negate = matches!(class.first(), Some('!') | Some('^'));
+                    if negate {
+                        class = &class[1..];
+                    }
+                    let mut ranges = Vec::new();
+                    let mut singles = Vec::new();
+                    let mut k = 0;
+                    while k < class.len() {
+                        if k + 2 < class.len() && class[k + 1] == '-' {
+                            ranges.push((class[k], class[k + 2]));
+                            k += 3;
+                        } else {
+                            singles.push(class[k]);
+                            k += 1;
+                        }
+                    }
+                    tokens.push(SegToken::Class {
+                        negate,
+                        ranges,
+                        singles,
+                    });
+                    i = end + 1;
+                } else {
+                    tokens.push(SegToken::Char('['));
+                    i += 1;
+                }
+            }
+            '\\' if i + 1 < p.len() => {
+                tokens.push(SegToken::Char(p[i + 1]));
+                i += 2;
+            }
+            c => {
+                tokens.push(SegToken::Char(c));
+                i += 1;
+            }
         }
     }
+    tokens
 }
 
 fn match_segment(pattern: &str, text: &str) -> bool {
@@ -284,40 +368,54 @@ fn match_segment(pattern: &str, text: &str) -> bool {
     if t.first() == Some(&'.') && matches!(p.first(), Some('*') | Some('?') | Some('[')) {
         return false;
     }
-    go(&p, &t)
-}
-
-fn go(p: &[char], t: &[char]) -> bool {
-    match p.first() {
-        None => t.is_empty(),
-        Some('*') => (0..=t.len()).any(|i| go(&p[1..], &t[i..])),
-        Some('?') => !t.is_empty() && go(&p[1..], &t[1..]),
-        Some('[') => {
-            let Some(end) = p.iter().skip(1).position(|c| *c == ']').map(|i| i + 1) else {
-                return !t.is_empty() && t[0] == '[' && go(&p[1..], &t[1..]);
-            };
-            let Some(&c) = t.first() else { return false };
-            let mut class = &p[1..end];
-            let negate = matches!(class.first(), Some('!') | Some('^'));
-            if negate {
-                class = &class[1..];
-            }
-            let mut hit = false;
-            let mut i = 0;
-            while i < class.len() {
-                if i + 2 < class.len() && class[i + 1] == '-' {
-                    hit |= class[i] <= c && c <= class[i + 2];
-                    i += 3;
-                } else {
-                    hit |= class[i] == c;
-                    i += 1;
+    let tokens = compile_segment(&p);
+    let n = t.len();
+    let mut prev = vec![false; n + 1];
+    prev[0] = true;
+    for tok in &tokens {
+        let mut curr = vec![false; n + 1];
+        match tok {
+            SegToken::Star => {
+                let mut matched = false;
+                for j in 0..=n {
+                    matched |= prev[j];
+                    curr[j] = matched;
                 }
             }
-            hit != negate && go(&p[end + 1..], &t[1..])
+            SegToken::Any => {
+                for j in 0..n {
+                    if prev[j] {
+                        curr[j + 1] = true;
+                    }
+                }
+            }
+            SegToken::Char(ch) => {
+                for j in 0..n {
+                    if prev[j] && t[j] == *ch {
+                        curr[j + 1] = true;
+                    }
+                }
+            }
+            SegToken::Class {
+                negate,
+                ranges,
+                singles,
+            } => {
+                for j in 0..n {
+                    if prev[j] {
+                        let c = t[j];
+                        let hit = singles.contains(&c)
+                            || ranges.iter().any(|&(lo, hi)| lo <= c && c <= hi);
+                        if hit != *negate {
+                            curr[j + 1] = true;
+                        }
+                    }
+                }
+            }
         }
-        Some('\\') if p.len() > 1 => !t.is_empty() && t[0] == p[1] && go(&p[2..], &t[1..]),
-        Some(&c) => !t.is_empty() && t[0] == c && go(&p[1..], &t[1..]),
+        prev = curr;
     }
+    prev[n]
 }
 
 #[cfg(test)]

@@ -70,14 +70,52 @@ pub fn normalize_shebang_str(content: &str) -> (String, bool) {
     (content.to_string(), false)
 }
 
+/// Reads remaining bytes of the first line after a 512-byte header using buffered I/O
+/// (avoiding per-byte read syscalls). Appends bytes before `\n` into `line_bytes` and returns
+/// `(buf_reader, saw_newline, last_byte_before_newline)`.
+pub(crate) fn read_line_tail_buffered(
+    file: std::fs::File,
+    line_bytes: &mut Vec<u8>,
+    initial_prev: u8,
+) -> Result<(std::io::BufReader<std::fs::File>, bool, u8), ShimError> {
+    use std::io::BufRead;
+
+    let mut reader = std::io::BufReader::new(file);
+    let mut prev_byte = initial_prev;
+    let mut saw_newline = false;
+    loop {
+        let buf = reader.fill_buf().map_err(|e| ShimError::Io {
+            path: std::path::PathBuf::new(),
+            source: e,
+        })?;
+        if buf.is_empty() {
+            break;
+        }
+        if let Some(nl_pos) = buf.iter().position(|&b| b == b'\n') {
+            if nl_pos > 0 {
+                line_bytes.extend_from_slice(&buf[..nl_pos]);
+                prev_byte = buf[nl_pos - 1];
+            }
+            reader.consume(nl_pos + 1);
+            saw_newline = true;
+            break;
+        }
+        line_bytes.extend_from_slice(buf);
+        prev_byte = *buf.last().unwrap();
+        let consumed = buf.len();
+        reader.consume(consumed);
+    }
+    Ok((reader, saw_newline, prev_byte))
+}
+
 /// Reads the target script file from disk, normalizes any CRLF shebang line,
-/// and writes the file back if modified.
+/// and writes the file back if modified (using copy-on-write so hardlinked CAS files are never mutated in place).
 /// Reads at most the first 512 bytes first: if it does NOT start with `#!` (or UTF-8 BOM `\xEF\xBB\xBF#!`),
 /// returns immediately without reading or rewriting the rest of the file.
 /// ONLY reads/rewrites the full file when line 1 actually contains `\r\n`.
 /// Returns `Ok(true)` if the file was modified, `Ok(false)` otherwise.
 pub fn normalize_shebang_file(file_path: &Path) -> Result<bool, ShimError> {
-    use std::io::{Read, Seek, SeekFrom};
+    use std::io::Read;
 
     #[cfg(unix)]
     if std::fs::metadata(file_path).is_ok_and(|m| !m.is_file()) {
@@ -110,38 +148,37 @@ pub fn normalize_shebang_file(file_path: &Path) -> Result<bool, ShimError> {
     };
 
     // Check if line 1 contains \r\n
-    let has_crlf = if let Some(nl_pos) = clean.iter().position(|&b| b == b'\n') {
-        nl_pos > 0 && clean[nl_pos - 1] == b'\r'
-    } else if n == 512 {
-        // Line 1 is longer than 512 bytes, scan forward until newline
-        let mut prev_byte = header_slice[511];
-        let mut found_crlf = false;
-        let mut byte = [0u8; 1];
-        while let Ok(1) = file.read(&mut byte) {
-            if byte[0] == b'\n' {
-                found_crlf = prev_byte == b'\r';
-                break;
-            }
-            prev_byte = byte[0];
+    if let Some(nl_pos) = clean.iter().position(|&b| b == b'\n') {
+        let has_crlf = nl_pos > 0 && clean[nl_pos - 1] == b'\r';
+        if !has_crlf {
+            return Ok(false);
         }
-        found_crlf
-    } else {
-        // Reached EOF before any newline
-        false
-    };
+        return normalize_crlf_from_reader(file_path, file, header_slice, n < 512);
+    }
 
-    if !has_crlf {
+    if n < 512 {
         return Ok(false);
     }
 
-    if n == header.len() && !header_slice.contains(&b'\n') {
-        file.seek(SeekFrom::Start(n as u64))
-            .map_err(|source| ShimError::Io {
+    // Line 1 is longer than 512 bytes: scan forward with buffered I/O until newline
+    let mut line_tail = Vec::new();
+    let (reader, saw_newline, prev_byte) =
+        read_line_tail_buffered(file, &mut line_tail, header_slice[511]).map_err(|e| match e {
+            ShimError::Io { source, .. } => ShimError::Io {
                 path: file_path.to_path_buf(),
                 source,
-            })?;
+            },
+            other => other,
+        })?;
+    if !saw_newline || prev_byte != b'\r' {
+        return Ok(false);
     }
-    normalize_crlf_from_open_file(file_path, file, header_slice, n < 512)
+
+    let mut prefix = Vec::with_capacity(header_slice.len() + line_tail.len() + 1);
+    prefix.extend_from_slice(header_slice);
+    prefix.extend_from_slice(&line_tail);
+    prefix.push(b'\n');
+    normalize_crlf_from_reader(file_path, reader, &prefix, false)
 }
 
 /// Splits a shebang line into tokens respecting quotes and backslash escaping.
@@ -286,15 +323,17 @@ pub fn read_shebang_from_file(file_path: &Path) -> Result<Option<ShebangInfo>, S
         return Ok(parse_shebang(&content));
     }
 
-    // Shebang line exceeds 512 bytes: read remainder of the line
+    // Shebang line exceeds 512 bytes: read remainder of the line with buffered I/O
     let mut line_bytes = clean.to_vec();
-    let mut byte = [0u8; 1];
-    while let Ok(1) = file.read(&mut byte) {
-        if byte[0] == b'\n' {
-            break;
+    let _ = read_line_tail_buffered(file, &mut line_bytes, header_slice[511]).map_err(|e| {
+        match e {
+            ShimError::Io { source, .. } => ShimError::Io {
+                path: file_path.to_path_buf(),
+                source,
+            },
+            other => other,
         }
-        line_bytes.push(byte[0]);
-    }
+    })?;
     let content = String::from_utf8_lossy(&line_bytes);
     Ok(parse_shebang(&content))
 }
@@ -361,34 +400,32 @@ pub fn normalize_and_read_shebang_line(file_path: &Path) -> Result<ShebangRead, 
             ));
         } else {
             let mut line_bytes = clean.to_vec();
-            let mut prev_byte = header_slice[511];
-            let mut crlf = false;
-            let mut byte = [0u8; 1];
-            while let Ok(1) = file.read(&mut byte) {
-                if byte[0] == b'\n' {
-                    crlf = prev_byte == b'\r';
-                    break;
-                }
-                prev_byte = byte[0];
-                line_bytes.push(byte[0]);
-            }
+            let (reader, saw_newline, prev_byte) =
+                read_line_tail_buffered(file, &mut line_bytes, header_slice[511]).map_err(|e| {
+                    match e {
+                        ShimError::Io { source, .. } => ShimError::Io {
+                            path: file_path.to_path_buf(),
+                            source,
+                        },
+                        other => other,
+                    }
+                })?;
             let line_str = String::from_utf8_lossy(&line_bytes).into_owned();
-            if crlf {
-                // `file` was already read past header; append line_bytes tail + rest
-                let mut full = Vec::with_capacity(header.len() + line_bytes.len());
+            if saw_newline && prev_byte == b'\r' {
+                let mut full = Vec::with_capacity(header.len() + line_bytes.len() + 1);
                 if header_slice.starts_with(b"\xEF\xBB\xBF#!") {
                     full.extend_from_slice(&header_slice[..3]);
                 }
                 full.extend_from_slice(&line_bytes);
                 full.push(b'\n');
-                normalize_crlf_from_open_file(file_path, file, &full, false)?;
+                normalize_crlf_from_reader(file_path, reader, &full, false)?;
             }
             return Ok(ShebangRead::Line(line_str));
         };
 
     let line_str = String::from_utf8_lossy(first_line_bytes).into_owned();
     if has_crlf {
-        normalize_crlf_from_open_file(file_path, file, header_slice, eof_in_header)?;
+        normalize_crlf_from_reader(file_path, file, header_slice, eof_in_header)?;
     }
     Ok(ShebangRead::Line(line_str))
 }
@@ -404,72 +441,142 @@ pub fn normalize_and_read_shebang_info(
     }
 }
 
-fn normalize_crlf_from_open_file(
+fn write_cow_normalized_file(
     file_path: &Path,
-    mut file: std::fs::File,
+    normalized: &[u8],
+    meta_opt: Option<&std::fs::Metadata>,
+) -> Result<(), ShimError> {
+    use std::io::Write;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    let parent = file_path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let base_name = file_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("shim-target");
+    let pid = std::process::id();
+
+    let (tmp_path, mut tmp_file) = loop {
+        let seq = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let candidate = parent.join(format!(".{base_name}.rnpm-tmp-{pid}-{seq}"));
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(f) => break (candidate, f),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => {
+                return Err(ShimError::Io {
+                    path: file_path.to_path_buf(),
+                    source: e,
+                });
+            }
+        }
+    };
+
+    struct TempGuard<'a>(&'a Path, bool);
+    impl Drop for TempGuard<'_> {
+        fn drop(&mut self) {
+            if !self.1 {
+                let _ = std::fs::remove_file(self.0);
+            }
+        }
+    }
+    let mut guard = TempGuard(&tmp_path, false);
+
+    if let Err(e) = tmp_file.write_all(normalized) {
+        drop(tmp_file);
+        return Err(ShimError::Io {
+            path: file_path.to_path_buf(),
+            source: e,
+        });
+    }
+    drop(tmp_file);
+
+    #[cfg(unix)]
+    if let Some(metadata) = meta_opt {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = metadata.permissions().mode();
+        let _ = std::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(mode));
+    }
+
+    #[cfg(windows)]
+    let orig_readonly = meta_opt.is_some_and(|m| m.permissions().readonly());
+
+    // Atomically replace `file_path` with the newly created temp file so any
+    // hardlinked CAS store entry sharing the old inode is never mutated in place.
+    match std::fs::rename(&tmp_path, file_path) {
+        Ok(()) => {
+            guard.1 = true;
+        }
+        Err(err) => {
+            #[cfg(windows)]
+            let replaced = {
+                let _ = err;
+                if orig_readonly {
+                    if let Ok(meta) = std::fs::metadata(file_path) {
+                        let mut perms = meta.permissions();
+                        perms.set_readonly(false);
+                        let _ = std::fs::set_permissions(file_path, perms);
+                    }
+                }
+                let _ = std::fs::remove_file(file_path);
+                std::fs::rename(&tmp_path, file_path)
+            };
+            #[cfg(not(windows))]
+            let replaced: Result<(), std::io::Error> = Err(err);
+
+            if let Err(e2) = replaced {
+                return Err(ShimError::Io {
+                    path: file_path.to_path_buf(),
+                    source: e2,
+                });
+            }
+            guard.1 = true;
+        }
+    }
+
+    #[cfg(windows)]
+    if orig_readonly {
+        if let Ok(meta) = std::fs::metadata(file_path) {
+            let mut perms = meta.permissions();
+            perms.set_readonly(true);
+            let _ = std::fs::set_permissions(file_path, perms);
+        }
+    }
+
+    Ok(())
+}
+
+fn normalize_crlf_from_reader<R: std::io::Read>(
+    file_path: &Path,
+    mut reader: R,
     prefix: &[u8],
     eof_reached: bool,
 ) -> Result<bool, ShimError> {
-    use std::io::Read;
-
     let bytes = if eof_reached {
         prefix.to_vec()
     } else {
         let mut buf = Vec::with_capacity(prefix.len() + 4096);
         buf.extend_from_slice(prefix);
-        file.read_to_end(&mut buf).map_err(|e| ShimError::Io {
+        reader.read_to_end(&mut buf).map_err(|e| ShimError::Io {
             path: file_path.to_path_buf(),
             source: e,
         })?;
         buf
     };
-    let meta_opt = file.metadata().ok();
-    drop(file);
+    drop(reader);
+    let meta_opt = std::fs::metadata(file_path).ok();
 
     let (normalized, changed) = normalize_shebang_bytes(&bytes);
     if changed {
-        #[cfg(unix)]
-        let mut orig_unix_mode: Option<u32> = None;
-        #[cfg(windows)]
-        let mut orig_readonly = false;
-
-        if let Some(metadata) = meta_opt {
-            let mut perms = metadata.permissions();
-            if perms.readonly() {
-                #[cfg(windows)]
-                {
-                    orig_readonly = true;
-                    perms.set_readonly(false);
-                    let _ = std::fs::set_permissions(file_path, perms);
-                }
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    let mode = perms.mode();
-                    orig_unix_mode = Some(mode);
-                    perms.set_mode(mode | 0o200);
-                    let _ = std::fs::set_permissions(file_path, perms);
-                }
-            }
-        }
-        let write_res = std::fs::write(file_path, &normalized).map_err(|e| ShimError::Io {
-            path: file_path.to_path_buf(),
-            source: e,
-        });
-        #[cfg(unix)]
-        if let Some(mode) = orig_unix_mode {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(file_path, std::fs::Permissions::from_mode(mode));
-        }
-        #[cfg(windows)]
-        if orig_readonly {
-            if let Ok(meta) = std::fs::metadata(file_path) {
-                let mut perms = meta.permissions();
-                perms.set_readonly(true);
-                let _ = std::fs::set_permissions(file_path, perms);
-            }
-        }
-        write_res?;
+        write_cow_normalized_file(file_path, &normalized, meta_opt.as_ref())?;
     }
     Ok(changed)
 }

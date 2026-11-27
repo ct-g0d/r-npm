@@ -2179,7 +2179,8 @@ impl Manifest {
     /// Streams directly from `&self` and `&self.raw_json` without cloning the JSON DOM.
     pub fn to_json_string(&self) -> Result<String, ManifestError> {
         use crate::ordered_json::{
-            push_indent, write_json_str, write_ordered_json_value, OrderedJsonValue,
+            ordered_json_eq_serde_value, push_indent, write_json_str, write_ordered_json_value,
+            write_serde_json_value, OrderedJsonValue,
         };
 
         let parsed_fallback;
@@ -2486,6 +2487,40 @@ impl Manifest {
             }
         };
 
+        let write_str_array = |out: &mut String, list: &[String]| {
+            if list.is_empty() {
+                out.push_str("[]");
+                return;
+            }
+            out.push('[');
+            for (idx, item) in list.iter().enumerate() {
+                if idx > 0 {
+                    out.push(',');
+                }
+                if pretty {
+                    out.push_str(&nl_indent_2);
+                }
+                write_json_str(item, out);
+            }
+            if pretty {
+                out.push_str(&nl_indent_1);
+            }
+            out.push(']');
+        };
+
+        let write_bin = |out: &mut String, bin: &PackageBin| match bin {
+            PackageBin::Single(s) => write_json_str(s, out),
+            PackageBin::Map(map) => write_str_map(out, map),
+        };
+
+        let write_platform_list = |out: &mut String, pl: &PlatformList| {
+            if pl.is_scalar() && pl.len() == 1 {
+                write_json_str(&pl[0], out);
+            } else {
+                write_str_array(out, pl.as_slice());
+            }
+        };
+
         out.push('{');
         let mut first = true;
         // Track which synthesized fields existed in raw_map so missing active ones are appended in order
@@ -2493,6 +2528,8 @@ impl Manifest {
         let mut seen_version = false;
         let mut seen_description = false;
         let mut seen_main = false;
+        let mut seen_bin = false;
+        let mut seen_files = false;
         let mut seen_scripts = false;
         let mut seen_deps = false;
         let mut seen_dev_deps = false;
@@ -2501,52 +2538,60 @@ impl Manifest {
         let mut seen_bundle_deps = false;
         let mut seen_peer_meta = false;
         let mut seen_workspaces = false;
+        let mut seen_os = false;
+        let mut seen_cpu = false;
+        let mut seen_libc = false;
+        let mut seen_engines = false;
 
         for (k, raw_v) in raw_map {
             match k.as_str() {
                 "name" => {
                     seen_name = true;
-                    write_entry_prefix(&mut out, &mut first, "name");
                     if let Some(ref name) = self.name {
+                        write_entry_prefix(&mut out, &mut first, "name");
                         write_json_str(name, &mut out);
-                    } else {
-                        write_ordered_json_value(raw_v, indent, newline, 1, &mut out);
                     }
                 }
                 "version" => {
                     seen_version = true;
-                    write_entry_prefix(&mut out, &mut first, "version");
                     if let Some(ref version) = self.version {
+                        write_entry_prefix(&mut out, &mut first, "version");
                         write_json_str(version, &mut out);
-                    } else {
-                        write_ordered_json_value(raw_v, indent, newline, 1, &mut out);
                     }
                 }
                 "description" => {
                     seen_description = true;
-                    write_entry_prefix(&mut out, &mut first, "description");
                     if let Some(ref desc) = self.description {
+                        write_entry_prefix(&mut out, &mut first, "description");
                         write_json_str(desc, &mut out);
-                    } else {
-                        write_ordered_json_value(raw_v, indent, newline, 1, &mut out);
                     }
                 }
                 "main" => {
                     seen_main = true;
-                    write_entry_prefix(&mut out, &mut first, "main");
                     if let Some(ref main) = self.main {
+                        write_entry_prefix(&mut out, &mut first, "main");
                         write_json_str(main, &mut out);
-                    } else {
-                        write_ordered_json_value(raw_v, indent, newline, 1, &mut out);
+                    }
+                }
+                "bin" => {
+                    seen_bin = true;
+                    if let Some(ref bin) = self.bin {
+                        write_entry_prefix(&mut out, &mut first, "bin");
+                        write_bin(&mut out, bin);
+                    }
+                }
+                "files" => {
+                    seen_files = true;
+                    if let Some(ref files) = self.files {
+                        write_entry_prefix(&mut out, &mut first, "files");
+                        write_str_array(&mut out, files);
                     }
                 }
                 "scripts" => {
                     seen_scripts = true;
-                    write_entry_prefix(&mut out, &mut first, "scripts");
                     if !self.scripts.is_empty() {
+                        write_entry_prefix(&mut out, &mut first, "scripts");
                         write_str_map(&mut out, &self.scripts);
-                    } else {
-                        write_ordered_json_value(raw_v, indent, newline, 1, &mut out);
                     }
                 }
                 "dependencies" => {
@@ -2626,16 +2671,48 @@ impl Manifest {
                 }
                 "workspaces" => {
                     seen_workspaces = true;
-                    write_entry_prefix(&mut out, &mut first, "workspaces");
                     if let Some(ref ws) = self.workspaces {
+                        write_entry_prefix(&mut out, &mut first, "workspaces");
                         write_workspaces(&mut out, ws);
-                    } else {
-                        write_ordered_json_value(raw_v, indent, newline, 1, &mut out);
+                    }
+                }
+                "os" => {
+                    seen_os = true;
+                    if let Some(ref os) = self.os {
+                        write_entry_prefix(&mut out, &mut first, "os");
+                        write_platform_list(&mut out, os);
+                    }
+                }
+                "cpu" => {
+                    seen_cpu = true;
+                    if let Some(ref cpu) = self.cpu {
+                        write_entry_prefix(&mut out, &mut first, "cpu");
+                        write_platform_list(&mut out, cpu);
+                    }
+                }
+                "libc" => {
+                    seen_libc = true;
+                    if let Some(ref libc) = self.libc {
+                        write_entry_prefix(&mut out, &mut first, "libc");
+                        write_platform_list(&mut out, libc);
+                    }
+                }
+                "engines" => {
+                    seen_engines = true;
+                    if !self.engines.is_empty() {
+                        write_entry_prefix(&mut out, &mut first, "engines");
+                        write_str_map(&mut out, &self.engines);
                     }
                 }
                 other_key => {
-                    write_entry_prefix(&mut out, &mut first, other_key);
-                    write_ordered_json_value(raw_v, indent, newline, 1, &mut out);
+                    if let Some(extra_val) = self.extra.get(other_key) {
+                        write_entry_prefix(&mut out, &mut first, other_key);
+                        if ordered_json_eq_serde_value(raw_v, extra_val) {
+                            write_ordered_json_value(raw_v, indent, newline, 1, &mut out);
+                        } else {
+                            write_serde_json_value(extra_val, indent, newline, 1, &mut out);
+                        }
+                    }
                 }
             }
         }
@@ -2662,6 +2739,18 @@ impl Manifest {
             if let Some(ref main) = self.main {
                 write_entry_prefix(&mut out, &mut first, "main");
                 write_json_str(main, &mut out);
+            }
+        }
+        if !seen_bin {
+            if let Some(ref bin) = self.bin {
+                write_entry_prefix(&mut out, &mut first, "bin");
+                write_bin(&mut out, bin);
+            }
+        }
+        if !seen_files {
+            if let Some(ref files) = self.files {
+                write_entry_prefix(&mut out, &mut first, "files");
+                write_str_array(&mut out, files);
             }
         }
         if !seen_scripts && !self.scripts.is_empty() {
@@ -2730,6 +2819,57 @@ impl Manifest {
             if let Some(ref ws) = self.workspaces {
                 write_entry_prefix(&mut out, &mut first, "workspaces");
                 write_workspaces(&mut out, ws);
+            }
+        }
+        if !seen_os {
+            if let Some(ref os) = self.os {
+                write_entry_prefix(&mut out, &mut first, "os");
+                write_platform_list(&mut out, os);
+            }
+        }
+        if !seen_cpu {
+            if let Some(ref cpu) = self.cpu {
+                write_entry_prefix(&mut out, &mut first, "cpu");
+                write_platform_list(&mut out, cpu);
+            }
+        }
+        if !seen_libc {
+            if let Some(ref libc) = self.libc {
+                write_entry_prefix(&mut out, &mut first, "libc");
+                write_platform_list(&mut out, libc);
+            }
+        }
+        if !seen_engines && !self.engines.is_empty() {
+            write_entry_prefix(&mut out, &mut first, "engines");
+            write_str_map(&mut out, &self.engines);
+        }
+        for (extra_key, extra_val) in &self.extra {
+            if !raw_map.contains_key(extra_key.as_str())
+                && !matches!(
+                    extra_key.as_str(),
+                    "name"
+                        | "version"
+                        | "description"
+                        | "main"
+                        | "bin"
+                        | "files"
+                        | "scripts"
+                        | "dependencies"
+                        | "devDependencies"
+                        | "peerDependencies"
+                        | "optionalDependencies"
+                        | "bundleDependencies"
+                        | "bundledDependencies"
+                        | "peerDependenciesMeta"
+                        | "workspaces"
+                        | "os"
+                        | "cpu"
+                        | "libc"
+                        | "engines"
+                )
+            {
+                write_entry_prefix(&mut out, &mut first, extra_key);
+                write_serde_json_value(extra_val, indent, newline, 1, &mut out);
             }
         }
 

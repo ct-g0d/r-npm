@@ -801,7 +801,10 @@ async fn test_cli_exec_dynamic_ephemeral_install_and_run() {
     assert_eq!(marker_content.trim(), "dynamic-exec-ok");
 
     // Verify that the ephemeral cache directory was populated
-    let npx_dir = cache_dir.path().join("_npx").join("mock-cli-tool");
+    let npx_dir = cache_dir
+        .path()
+        .join("_npx")
+        .join(crate::npx_cache_dir_name(&["mock-cli-tool".to_string()]));
     assert!(npx_dir.exists(), "Ephemeral cache directory must exist");
     assert!(
         npx_dir.join("package.json").exists(),
@@ -985,7 +988,10 @@ async fn test_cli_exec_package_flag_installs_package_and_runs_command() {
     let marker_content = std::fs::read_to_string(&marker_file).unwrap();
     assert_eq!(marker_content.trim(), "test-arg");
 
-    let npx_dir = cache_dir.path().join("_npx").join("custom-tool-pkg_1.0.0");
+    let npx_dir = cache_dir
+        .path()
+        .join("_npx")
+        .join(crate::npx_cache_dir_name(&["custom-tool-pkg@1.0.0".to_string()]));
     assert!(npx_dir.exists(), "Ephemeral cache directory must exist");
     let manifest_str = std::fs::read_to_string(npx_dir.join("package.json")).unwrap();
     assert!(
@@ -1133,7 +1139,10 @@ async fn test_cli_exec_multiple_package_flags_installs_all_packages() {
     let npx_dir = cache_dir
         .path()
         .join("_npx")
-        .join("pkg-data_1.0.0_pkg-runner_1.0.0");
+        .join(crate::npx_cache_dir_name(&[
+            "pkg-data@1.0.0".to_string(),
+            "pkg-runner@1.0.0".to_string(),
+        ]));
     assert!(npx_dir.exists(), "Ephemeral cache directory must exist");
     let manifest_str = std::fs::read_to_string(npx_dir.join("package.json")).unwrap();
     assert!(
@@ -4671,4 +4680,226 @@ fn test_fast_parse_install_ci_prune_explain_parity() {
         "--yes".into(),
     ])
     .is_none());
+}
+
+#[test]
+fn test_scoped_registries_wired_into_config_overrides() {
+    let raw_args = vec![
+        "rnpm".to_string(),
+        "install".to_string(),
+        "--@myorg:registry=https://custom.myorg.test".to_string(),
+        "@myorg/lib".to_string(),
+        "--".to_string(),
+        "--@ignored:registry=https://ignored.test".to_string(),
+    ];
+    let (filtered, scoped) = extract_scoped_registries(raw_args);
+    assert_eq!(
+        filtered,
+        vec![
+            "rnpm",
+            "install",
+            "@myorg/lib",
+            "--",
+            "--@ignored:registry=https://ignored.test"
+        ]
+    );
+    assert_eq!(scoped.len(), 1);
+    let mut overrides = std::collections::BTreeMap::new();
+    crate::merge_scoped_registries_into_overrides(&scoped, &mut overrides);
+
+    let cfg = rnpm_config::Config::load_with_options(
+        rnpm_config::ConfigOptions::new()
+            .userconfig(std::path::PathBuf::from("false"))
+            .globalconfig(std::path::PathBuf::from("false"))
+            .builtin_config(std::path::PathBuf::from("false"))
+            .cli_overrides(overrides)
+            .env_vars(std::collections::BTreeMap::new()),
+    )
+    .unwrap();
+    assert_eq!(
+        cfg.registry_for_package("@myorg/lib").as_str(),
+        "https://custom.myorg.test/"
+    );
+}
+
+#[test]
+fn test_normalize_failure_exit_code_prevents_modulo_256_zero() {
+    for code in [0, 256, 404, 500, 512, -1, -2, -4058] {
+        assert_eq!(
+            crate::normalize_failure_exit_code(code),
+            1,
+            "Code {code} must normalize to 1 so POSIX never wraps it to 0 or leaks raw errnos"
+        );
+    }
+    for script_code in [1, 7, 42, 53, 128, 254, 255] {
+        assert_eq!(
+            crate::normalize_failure_exit_code(script_code),
+            script_code
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_npx_explicit_version_spec_ignores_mismatched_local_and_rejects_missing_p_bin() {
+    let project_dir = tempdir().unwrap();
+    let cache_dir = tempdir().unwrap();
+
+    // Seed local node_modules/versioned-tool@1.0.0
+    let local_pkg = project_dir
+        .path()
+        .join("node_modules")
+        .join("versioned-tool");
+    std::fs::create_dir_all(local_pkg.join("bin")).unwrap();
+    std::fs::write(
+        local_pkg.join("package.json"),
+        r#"{"name":"versioned-tool","version":"1.0.0","bin":{"versioned-tool":"bin/cli.js"}}"#,
+    )
+    .unwrap();
+    let marker = project_dir.path().join("ver_marker.txt");
+    let escaped_marker = marker.to_string_lossy().replace('\\', "/");
+    std::fs::write(
+        local_pkg.join("bin/cli.js"),
+        format!("#!/usr/bin/env node\nrequire('fs').writeFileSync('{escaped_marker}', 'v1.0.0');\n"),
+    )
+    .unwrap();
+    let local_bin_dir = project_dir.path().join("node_modules").join(".bin");
+    rnpm_shim::create_shims(
+        &local_bin_dir,
+        "versioned-tool",
+        "../versioned-tool/bin/cli.js",
+    )
+    .unwrap();
+
+    // Mock registry serving versioned-tool@2.0.0
+    let v2_script = format!("require('fs').writeFileSync('{escaped_marker}', 'v2.0.0');\n");
+    let pkg_tar = make_tarball_with_bin("versioned-tool", "2.0.0", "versioned-tool", &v2_script);
+    let pkg_int = Integrity::from_bytes(&pkg_tar, Algorithm::Sha512).to_string();
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let local_addr = listener.local_addr().unwrap();
+    let server_url = format!("http://{local_addr}/");
+    let su = server_url.clone();
+    let (tx, mut rx) = tokio::sync::oneshot::channel::<()>();
+
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = &mut rx => break,
+                accept_res = listener.accept() => {
+                    if let Ok((mut stream, _)) = accept_res {
+                        let pkg_int_c = pkg_int.clone();
+                        let pkg_tar_c = pkg_tar.clone();
+                        let su_c = su.clone();
+                        tokio::spawn(async move {
+                            let mut buf = vec![0u8; 4096];
+                            let n = stream.read(&mut buf).await.unwrap_or(0);
+                            if n > 0 {
+                                let req_str = String::from_utf8_lossy(&buf[..n]).to_string();
+                                let (status, headers, body) = if req_str.contains("GET /versioned-tool") {
+                                    let json = serde_json::json!({
+                                        "name": "versioned-tool",
+                                        "dist-tags": { "latest": "2.0.0" },
+                                        "versions": {
+                                            "2.0.0": {
+                                                "name": "versioned-tool",
+                                                "version": "2.0.0",
+                                                "bin": { "versioned-tool": "bin/versioned-tool.js" },
+                                                "dist": {
+                                                    "tarball": format!("{su_c}tarballs/versioned-tool-2.0.0.tgz"),
+                                                    "integrity": pkg_int_c
+                                                }
+                                            }
+                                        }
+                                    });
+                                    (200, vec![("Content-Type", String::from("application/json"))], serde_json::to_vec(&json).unwrap())
+                                } else if req_str.contains("GET /tarballs/versioned-tool-2.0.0.tgz") {
+                                    (200, vec![("Content-Type", String::from("application/octet-stream"))], pkg_tar_c)
+                                } else {
+                                    (404, vec![], b"Not Found".to_vec())
+                                };
+                                let status_text = if status == 200 { "OK" } else { "Not Found" };
+                                let mut response = format!(
+                                    "HTTP/1.1 {status} {status_text}\r\nContent-Length: {}\r\nConnection: close\r\n",
+                                    body.len()
+                                );
+                                for (k, v) in headers {
+                                    response.push_str(&format!("{k}: {v}\r\n"));
+                                }
+                                response.push_str("\r\n");
+                                let _ = stream.write_all(response.as_bytes()).await;
+                                let _ = stream.write_all(&body).await;
+                                let _ = stream.flush().await;
+                            }
+                        });
+                    }
+                }
+            }
+        }
+    });
+
+    // 1. Explicit spec `versioned-tool@2.0.0` AND dist-tag `versioned-tool@latest` must NOT reuse local 1.0.0
+    execute_exec_with_config(
+        project_dir.path(),
+        "versioned-tool@2.0.0",
+        &[],
+        &[],
+        Some(server_url.clone()),
+        Some(cache_dir.path().to_path_buf()),
+        false,
+        false,
+        Some(true),
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(std::fs::read_to_string(&marker).unwrap().trim(), "v2.0.0");
+
+    std::fs::remove_file(&marker).unwrap();
+    execute_exec_with_config(
+        project_dir.path(),
+        "versioned-tool@latest",
+        &[],
+        &[],
+        Some(server_url.clone()),
+        Some(cache_dir.path().to_path_buf()),
+        false,
+        false,
+        Some(true),
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(std::fs::read_to_string(&marker).unwrap().trim(), "v2.0.0");
+
+    // 2. `-p versioned-tool@2.0.0 nonexistent-cmd` must fail clearly and NEVER execute `versioned-tool`!
+    std::fs::remove_file(&marker).unwrap();
+    let bad_p = execute_exec_with_config(
+        project_dir.path(),
+        "definitely-missing-cmd-xyz",
+        &["versioned-tool@2.0.0".to_string()],
+        &[],
+        Some(server_url),
+        Some(cache_dir.path().to_path_buf()),
+        false,
+        false,
+        Some(true),
+        None,
+    )
+    .await;
+    assert!(
+        bad_p.is_err(),
+        "npx -p pkg missing-cmd must error instead of running arbitrary bin"
+    );
+    assert!(
+        !marker.exists(),
+        "Unrelated bin in _npx/.bin must NOT have executed"
+    );
+
+    // 3. Distinct package specs that previously collided in `safe_spec` get distinct hashed dirs
+    assert_ne!(
+        crate::npx_cache_dir_name(&["@foo/bar".to_string()]),
+        crate::npx_cache_dir_name(&["foo_bar".to_string()])
+    );
+
+    let _ = tx.send(());
 }

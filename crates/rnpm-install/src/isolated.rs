@@ -797,8 +797,10 @@ pub fn unpack_store_package(
 }
 
 /// Tarball bytes for a store package: the cache first, then the registry.
-async fn fetch_tarball(
-    installer: &crate::Installer,
+async fn fetch_tarball_parts(
+    cache: &rnpm_cache::Cache,
+    registry_client: &rnpm_registry::client::RegistryClient,
+    offline: bool,
     project_dir: &Path,
     location: &str,
     pkg: &LockfilePackage,
@@ -813,22 +815,21 @@ async fn fetch_tarball(
         return Ok(std::fs::read(project_dir.join(rel))?);
     }
     if let Some(exp) = &expected {
-        if let Ok(Some(data)) = installer.cache().get_by_integrity(exp) {
+        if let Ok(Some(data)) = cache.get_by_integrity(exp) {
             return Ok(data);
         }
     }
-    if let Ok(Some((_, data))) = installer.cache().get(resolved) {
+    if let Ok(Some((_, data))) = cache.get(resolved) {
         if expected.as_ref().is_none_or(|e| e.verify(&data).is_ok()) {
             return Ok(data);
         }
     }
-    if installer.options.offline {
+    if offline {
         return Err(anyhow!(
             "npm error code ENOTCACHED\nnpm error request to {resolved} failed: cache mode is 'only-if-cached' but no cached response is available."
         ));
     }
-    let data = installer
-        .registry_client()
+    let data = registry_client
         .download_tarball_bytes(resolved)
         .await
         .map_err(|e| anyhow!("Failed to download tarball from {resolved}: {e}"))?;
@@ -836,9 +837,7 @@ async fn fetch_tarball(
         exp.verify(&data)
             .map_err(|e| anyhow!("Integrity verification failed for {location}: {e}"))?;
     }
-    let _ = installer
-        .cache()
-        .put_with_integrity(resolved, &data, expected.as_ref(), None);
+    let _ = cache.put_with_integrity(resolved, &data, expected.as_ref(), None);
     Ok(data)
 }
 
@@ -869,8 +868,18 @@ impl crate::Installer {
         // (sorted) lockfile for a node it loaded from one. So read manifests
         // only for nodes the previous lockfile did not already hold.
         let skipped = crate::lockfile_platform_skipped_packages(lock, &self.options.platform());
+        if !self.options.force {
+            crate::policy::check_engines(
+                lock,
+                &project,
+                self.engine_strict,
+                self.options.silent,
+                &self.options.platform(),
+            )?;
+        }
         let mut manifests: HashMap<String, Value> = HashMap::new();
         let mut tarballs: HashMap<String, Vec<u8>> = HashMap::new();
+        let mut to_fetch: Vec<(String, LockfilePackage)> = Vec::new();
         for (loc, pkg) in &lock.packages {
             if pkg.link == Some(true) {
                 continue;
@@ -892,17 +901,53 @@ impl crate::Installer {
             if loaded {
                 continue;
             }
-            let bytes = match fetch_tarball(self, &project, loc, pkg).await {
-                Ok(bytes) => bytes,
-                Err(_) if pkg.optional == Some(true) => continue,
-                Err(e) => return Err(e),
-            };
-            if let Some(value) = rnpm_fs::read_tarball_text(&bytes, "package.json")
-                .and_then(|t| serde_json::from_str(&t).ok())
-            {
-                manifests.insert(loc.clone(), value);
+            to_fetch.push((loc.clone(), pkg.clone()));
+        }
+
+        if !to_fetch.is_empty() {
+            let sem = std::sync::Arc::clone(&self.io_semaphore);
+            let cache = self.cache().clone();
+            let registry_client = self.registry_client().clone();
+            let offline = self.options.offline;
+            let mut join_set = tokio::task::JoinSet::new();
+
+            for (loc, pkg) in to_fetch {
+                let sem = std::sync::Arc::clone(&sem);
+                let cache = cache.clone();
+                let registry_client = registry_client.clone();
+                let proj = project.clone();
+                join_set.spawn(async move {
+                    let _permit = sem.acquire().await.map_err(|e| anyhow!("{e}"))?;
+                    let bytes = match fetch_tarball_parts(
+                        &cache,
+                        &registry_client,
+                        offline,
+                        &proj,
+                        &loc,
+                        &pkg,
+                    )
+                    .await
+                    {
+                        Ok(bytes) => bytes,
+                        Err(_) if pkg.optional == Some(true) => return Ok::<_, anyhow::Error>(None),
+                        Err(e) => return Err(e),
+                    };
+                    let manifest_val = rnpm_fs::read_tarball_text(&bytes, "package.json")
+                        .and_then(|t| serde_json::from_str::<Value>(&t).ok());
+                    Ok(Some((loc, bytes, manifest_val)))
+                });
             }
-            tarballs.insert(loc.clone(), bytes);
+
+            while let Some(res) = join_set.join_next().await {
+                if let Some((loc, bytes, manifest_val)) =
+                    res.map_err(|e| anyhow!("Isolated tarball fetch worker panicked: {e}"))??
+                {
+                    if let Some(value) = manifest_val {
+                        manifests.insert(loc.clone(), value);
+                    }
+                    tarballs.insert(loc, bytes);
+                }
+            }
         }
         let plan = plan(
             lock,
@@ -915,6 +960,12 @@ impl crate::Installer {
             &manifests,
         );
         let nm = project.join("node_modules");
+        if !self.options.is_global
+            && (rnpm_fs::junction::is_junction(&nm).unwrap_or(false)
+                || std::fs::symlink_metadata(&nm).is_ok_and(|m| m.file_type().is_symlink()))
+        {
+            rnpm_fs::junction::remove_junction(&nm)?;
+        }
         std::fs::create_dir_all(&nm)?;
 
         // Remove what the isolated tree does not hold: a hoisted layout left
@@ -972,50 +1023,108 @@ impl crate::Installer {
             }
         }
 
-        // Unpack the store.
-        let writer_cfg = rnpm_fs::determine_writer_config(&project, None);
+        // Unpack the store in parallel.
+        let writer_cfg = std::sync::Arc::new(rnpm_fs::determine_writer_config(&project, None));
         let mut added = 0usize;
         let mut lifecycle_nodes = Vec::new();
-        for entry in &plan.store {
-            let dest = project.join(&entry.location);
-            if !dest.join("package.json").is_file() {
-                let bytes = match tarballs.remove(&entry.hoisted) {
-                    Some(bytes) => bytes,
-                    None => match fetch_tarball(self, &project, &entry.hoisted, &lock.packages[&entry.hoisted]).await {
-                        Ok(bytes) => bytes,
-                        Err(_) if entry.optional => continue,
-                        Err(e) => return Err(e),
-                    },
-                };
-                match unpack_store_package(&dest, &bytes, Some(&writer_cfg)) {
-                    Ok(()) => {
+        {
+            let sem = std::sync::Arc::clone(&self.io_semaphore);
+            let cache = self.cache().clone();
+            let registry_client = self.registry_client().clone();
+            let offline = self.options.offline;
+            let mut join_set = tokio::task::JoinSet::new();
+
+            for entry in &plan.store {
+                let pkg = lock.packages[&entry.hoisted].clone();
+                let preloaded_bytes = tarballs.remove(&entry.hoisted);
+                let dest = project.join(&entry.location);
+                let entry_hoisted = entry.hoisted.clone();
+                let entry_optional = entry.optional;
+                let sem = std::sync::Arc::clone(&sem);
+                let cache = cache.clone();
+                let registry_client = registry_client.clone();
+                let writer_cfg = std::sync::Arc::clone(&writer_cfg);
+                let proj = project.clone();
+
+                join_set.spawn(async move {
+                    let _permit = sem.acquire().await.map_err(|e| anyhow!("{e}"))?;
+                    let mut was_added = false;
+                    if !dest.join("package.json").is_file() {
+                        let bytes = match preloaded_bytes {
+                            Some(b) => b,
+                            None => match fetch_tarball_parts(
+                                &cache,
+                                &registry_client,
+                                offline,
+                                &proj,
+                                &entry_hoisted,
+                                &pkg,
+                            )
+                            .await
+                            {
+                                Ok(b) => b,
+                                Err(_) if entry_optional => return Ok::<_, anyhow::Error>(None),
+                                Err(e) => return Err(e),
+                            },
+                        };
+                        let dest_clone = dest.clone();
+                        let cfg_clone = std::sync::Arc::clone(&writer_cfg);
+                        let unpack_res = tokio::task::spawn_blocking(move || {
+                            unpack_store_package(&dest_clone, &bytes, Some(&cfg_clone))
+                        })
+                        .await
+                        .map_err(|e| anyhow!("Isolated store unpack panicked: {e}"))?;
+                        match unpack_res {
+                            Ok(()) => {
+                                was_added = true;
+                            }
+                            Err(e) if entry_optional => {
+                                tracing::warn!(
+                                    "Failed to extract optional store package {}: {e}; skipping",
+                                    entry_hoisted
+                                );
+                                return Ok(None);
+                            }
+                            Err(e) => return Err(anyhow!("Failed to extract {}: {e}", entry_hoisted)),
+                        }
+                    }
+
+                    let lifecycle_node = if pkg.has_install_script == Some(true) {
+                        rnpm_core::manifest::Manifest::from_file(dest.join("package.json"))
+                            .ok()
+                            .map(|manifest| rnpm_lifecycle::LifecyclePackageNode {
+                                // Use the original hoisted lockfile key so `policy::apply_script_policy`
+                                // finds the lockfile entry (URL/Git/registry rules) while keeping
+                                // `disk_path` pointed at the isolated `.store` directory for execution.
+                                package_path: entry_hoisted.clone(),
+                                disk_path: dest,
+                                manifest,
+                                source: rnpm_lifecycle::PackageSource::Registry,
+                                dependencies: pkg
+                                    .dependencies
+                                    .as_ref()
+                                    .map(|d| d.keys().cloned().collect())
+                                    .unwrap_or_default(),
+                                optional: entry_optional,
+                            })
+                    } else {
+                        None
+                    };
+
+                    Ok(Some((was_added, lifecycle_node)))
+                });
+            }
+
+            while let Some(res) = join_set.join_next().await {
+                if let Some((was_added, node_opt)) =
+                    res.map_err(|e| anyhow!("Isolated store unpack task panicked: {e}"))??
+                {
+                    if was_added {
                         added += 1;
                     }
-                    Err(e) if entry.optional => {
-                        tracing::warn!(
-                            "Failed to extract optional store package {}: {e}; skipping",
-                            entry.hoisted
-                        );
-                        continue;
+                    if let Some(node) = node_opt {
+                        lifecycle_nodes.push(node);
                     }
-                    Err(e) => return Err(anyhow!("Failed to extract {}: {e}", entry.hoisted)),
-                }
-            }
-            let pkg = &lock.packages[&entry.hoisted];
-            if pkg.has_install_script == Some(true) {
-                if let Ok(manifest) = rnpm_core::manifest::Manifest::from_file(dest.join("package.json")) {
-                    lifecycle_nodes.push(rnpm_lifecycle::LifecyclePackageNode {
-                        package_path: entry.location.clone(),
-                        disk_path: dest.clone(),
-                        manifest,
-                        source: rnpm_lifecycle::PackageSource::Registry,
-                        dependencies: pkg
-                            .dependencies
-                            .as_ref()
-                            .map(|d| d.keys().cloned().collect())
-                            .unwrap_or_default(),
-                        optional: entry.optional,
-                    });
                 }
             }
         }
@@ -1090,6 +1199,12 @@ impl crate::Installer {
         }
 
         if !self.options.ignore_scripts && !lifecycle_nodes.is_empty() {
+            let lifecycle_nodes = crate::policy::apply_script_policy(
+                lifecycle_nodes,
+                lock,
+                &project,
+                &self.script_policy,
+            )?;
             let opts = self.lifecycle_options();
             rnpm_lifecycle::execute_dependency_hooks(&lifecycle_nodes, &opts).await?;
         }

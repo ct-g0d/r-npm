@@ -247,11 +247,7 @@ fn traverse_segments(
 }
 
 fn should_skip_dir(name: &str) -> bool {
-    name.starts_with('.')
-        || name == "node_modules"
-        || name == "target"
-        || name == "dist"
-        || name == "build"
+    name.starts_with('.') || name == "node_modules"
 }
 
 /// Simple glob wildcard matching for segments with '*' and '?'.
@@ -406,7 +402,7 @@ fn match_segments(pat_segs: &[&str], path_segs: &[&str]) -> bool {
             return false;
         }
         let seg = path_segs[0];
-        if should_skip_dir(seg) {
+        if seg == "node_modules" {
             return false;
         }
         if segment == seg {
@@ -433,7 +429,7 @@ pub fn path_matches_workspace_patterns(path: &str, patterns: &[String]) -> bool 
     }
 
     let path_segs: Vec<&str> = clean_path.split('/').filter(|s| !s.is_empty()).collect();
-    if path_segs.is_empty() || path_segs.iter().any(|s| should_skip_dir(s)) {
+    if path_segs.is_empty() || path_segs.contains(&"node_modules") {
         return false;
     }
 

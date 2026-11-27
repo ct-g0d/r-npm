@@ -202,12 +202,108 @@ pub fn escape_cmd_arg(arg: &str) -> String {
     out
 }
 
+/// Escapes an argument for placement inside a `.cmd` batch file invoked by `cmd.exe`.
+/// Prevents `"` / `\"` quote breakout in `cmd.exe` while preserving exact `CommandLineToArgvW` decoding.
+#[inline]
+pub(crate) fn push_escaped_cmd_batch_arg(out: &mut String, arg: &str) {
+    let mut non_empty = false;
+    let mut needs_quotes = false;
+    for b in arg.bytes() {
+        if matches!(b, 0 | b'\r' | b'\n') {
+            continue;
+        }
+        non_empty = true;
+        if matches!(
+            b,
+            b' ' | b'\t'
+                | b'\x0B'
+                | b'\"'
+                | b'&'
+                | b'|'
+                | b'<'
+                | b'>'
+                | b'^'
+                | b'('
+                | b')'
+                | b'%'
+                | b'!'
+                | b','
+                | b';'
+                | b'='
+        ) {
+            needs_quotes = true;
+        }
+    }
+    if !non_empty {
+        out.push_str("\"\"");
+        return;
+    }
+    if !needs_quotes {
+        out.reserve(arg.len());
+        for c in arg.chars() {
+            if !matches!(c, '\0' | '\r' | '\n') {
+                out.push(c);
+            }
+        }
+        return;
+    }
+
+    out.reserve(arg.len() + 8);
+    out.push('\"');
+    let mut backslashes = 0usize;
+    for c in arg.chars() {
+        match c {
+            '\0' | '\r' | '\n' => {}
+            '\\' => backslashes += 1,
+            '\"' => {
+                // Close batch quote, emit 2*N+1 backslashes + `^"` (cmd.exe passes `"`
+                // without toggling quote mode; CommandLineToArgvW reads N backslashes + literal `"`),
+                // then reopen batch quote.
+                out.push('\"');
+                for _ in 0..backslashes * 2 + 1 {
+                    out.push('\\');
+                }
+                out.push_str("^\"\"");
+                backslashes = 0;
+            }
+            '%' => {
+                for _ in 0..backslashes {
+                    out.push('\\');
+                }
+                backslashes = 0;
+                out.push_str("%%");
+            }
+            _ => {
+                for _ in 0..backslashes {
+                    out.push('\\');
+                }
+                backslashes = 0;
+                out.push(c);
+            }
+        }
+    }
+    for _ in 0..backslashes * 2 {
+        out.push('\\');
+    }
+    out.push('\"');
+}
+
+#[inline]
+pub(crate) fn is_ps1_smart_double_quote(c: char) -> bool {
+    matches!(c, '\u{201C}' | '\u{201D}' | '\u{201E}' | '\u{201F}')
+}
+
+#[inline]
+pub(crate) fn is_ps1_smart_single_quote(c: char) -> bool {
+    matches!(c, '\u{2018}' | '\u{2019}' | '\u{201A}' | '\u{201B}')
+}
+
 #[inline]
 pub(crate) fn push_escaped_ps1_path(out: &mut String, path: &str) {
-    if !path
-        .bytes()
-        .any(|b| matches!(b, b'\\' | b'\0' | b'`' | b'\"' | b'$' | b'\r' | b'\n'))
-    {
+    let has_special = path.bytes().any(|b| {
+        matches!(b, b'\\' | b'\0' | b'`' | b'\"' | b'$' | b'\r' | b'\n')
+    }) || (!path.is_ascii() && path.chars().any(is_ps1_smart_double_quote));
+    if !has_special {
         out.push_str(path);
         return;
     }
@@ -218,6 +314,10 @@ pub(crate) fn push_escaped_ps1_path(out: &mut String, path: &str) {
             '\0' => {}
             '`' => out.push_str("``"),
             '\"' => out.push_str("`\""),
+            c if is_ps1_smart_double_quote(c) => {
+                out.push('`');
+                out.push(c);
+            }
             '$' => out.push_str("`$"),
             '\r' => out.push_str("`r"),
             '\n' => out.push_str("`n"),
@@ -227,7 +327,7 @@ pub(crate) fn push_escaped_ps1_path(out: &mut String, path: &str) {
 }
 
 /// Escapes a path for PowerShell double quotes.
-/// Strips null bytes and escapes backticks, double quotes, dollar signs, and newlines.
+/// Strips null bytes and escapes backticks, double quotes, Unicode smart double quotes, dollar signs, and newlines.
 pub fn escape_ps1_path(path: &str) -> String {
     let mut out = String::with_capacity(path.len() + 4);
     push_escaped_ps1_path(&mut out, path);
@@ -265,6 +365,10 @@ pub(crate) fn push_escaped_ps1_arg(out: &mut String, arg: &str) {
             match c {
                 '\0' => {}
                 '\'' => out.push_str("''"),
+                c if is_ps1_smart_single_quote(c) => {
+                    out.push(c);
+                    out.push(c);
+                }
                 _ => out.push(c),
             }
         }
@@ -334,10 +438,11 @@ pub fn generate_cmd_shim(target_rel_from_node_modules: &str) -> String {
 
 #[inline]
 pub(crate) fn escape_ps1_path_cow(path: &str) -> std::borrow::Cow<'_, str> {
-    if !path
+    let has_special = path
         .bytes()
         .any(|b| matches!(b, b'\\' | b'\0' | b'`' | b'\"' | b'$' | b'\r' | b'\n'))
-    {
+        || (!path.is_ascii() && path.chars().any(is_ps1_smart_double_quote));
+    if !has_special {
         std::borrow::Cow::Borrowed(path)
     } else {
         let mut out = String::with_capacity(path.len() + 4);
@@ -438,13 +543,7 @@ fn cmd_shim_shebang(target: &Path) -> Option<(String, String, String)> {
         clean_bytes
     } else {
         let mut line_vec = clean_bytes.to_vec();
-        let mut byte = [0u8; 1];
-        while let Ok(1) = file.read(&mut byte) {
-            if byte[0] == b'\n' {
-                break;
-            }
-            line_vec.push(byte[0]);
-        }
+        let _ = shebang::read_line_tail_buffered(file, &mut line_vec, header[n - 1]);
         return parse_cmd_shim_shebang_line(&String::from_utf8_lossy(&line_vec));
     };
     let text = String::from_utf8_lossy(line_bytes);
@@ -524,93 +623,152 @@ const PS1_HEAD: &str = concat!(
     "}\n",
 );
 
-/// Shim trio for a target whose shebang names `prog` (other than plain node),
-/// as cmd-shim writes it: the program and its args are copied verbatim.
-pub fn generate_program_shims(
-    target_rel_from_node_modules: &str,
-    prog: &str,
-    args: &str,
-) -> (String, String, String) {
-    let sh_target = escape_posix_path_cow(target_rel_from_node_modules);
-    let ps1_target = escape_ps1_path_cow(target_rel_from_node_modules);
-    let win_target = escape_cmd_path_cow(target_rel_from_node_modules);
+#[inline]
+pub(crate) fn sanitize_shebang_program(prog: &str) -> std::borrow::Cow<'_, str> {
+    if !prog.bytes().any(|b| matches!(b, 0 | b'\r' | b'\n')) {
+        std::borrow::Cow::Borrowed(prog)
+    } else {
+        std::borrow::Cow::Owned(
+            prog.chars()
+                .filter(|&c| !matches!(c, '\0' | '\r' | '\n'))
+                .collect(),
+        )
+    }
+}
+
+/// Escapes a shebang program for POSIX `exec <prog>` (leaves safe bare names unquoted).
+#[inline]
+pub(crate) fn push_escaped_posix_prog_unquoted(out: &mut String, prog: &str) {
     let sh_prog: std::borrow::Cow<'_, str> = if prog.contains('\\') {
         std::borrow::Cow::Owned(prog.replace('\\', "/"))
     } else {
         std::borrow::Cow::Borrowed(prog)
     };
+    push_escaped_posix_arg(out, &sh_prog);
+}
+
+/// Escapes a shebang program for Windows `.cmd` (`%dp0%\<prog>.exe` or `SET "_prog=<prog>"`).
+#[inline]
+pub(crate) fn push_escaped_cmd_prog(out: &mut String, prog: &str, escape_trailing_backslash: bool) {
+    push_escaped_cmd_path(out, prog);
+    if escape_trailing_backslash && out.ends_with('\\') {
+        out.push('\\');
+    }
+}
+
+/// Shim trio for a target whose shebang names `prog` (other than plain node),
+/// safely escaping `prog` and `args` across `.sh`, `.cmd`, and `.ps1`.
+pub fn generate_program_shims(
+    target_rel_from_node_modules: &str,
+    prog: &str,
+    args: &str,
+) -> (String, String, String) {
+    let clean_prog = sanitize_shebang_program(prog);
+    let prog = clean_prog.as_ref();
+    let sh_target = escape_posix_path_cow(target_rel_from_node_modules);
+    let ps1_target = escape_ps1_path_cow(target_rel_from_node_modules);
+    let win_target = escape_cmd_path_cow(target_rel_from_node_modules);
+    let sh_prog_quoted = escape_posix_path_cow(prog);
+    let ps1_prog = escape_ps1_path_cow(prog);
+
+    let parsed_args = if args.trim().is_empty() {
+        Vec::new()
+    } else {
+        shebang::split_shebang_tokens(args)
+    };
+
+    let mut sh_args_buf = String::new();
+    let mut cmd_args_buf = String::new();
+    let mut ps1_args_buf = String::new();
+    for (i, a) in parsed_args.iter().enumerate() {
+        if i > 0 {
+            sh_args_buf.push(' ');
+            cmd_args_buf.push(' ');
+            ps1_args_buf.push(' ');
+        }
+        push_escaped_posix_arg(&mut sh_args_buf, a);
+        push_escaped_cmd_batch_arg(&mut cmd_args_buf, a);
+        push_escaped_ps1_arg(&mut ps1_args_buf, a);
+    }
 
     let mut sh = String::with_capacity(
-        SH_HEAD.len() + 64 + prog.len() + sh_prog.len() + args.len() * 2 + sh_target.len() * 2,
+        SH_HEAD.len()
+            + 64
+            + sh_prog_quoted.len() * 2
+            + sh_args_buf.len() * 2
+            + sh_target.len() * 2,
     );
     sh.push_str(SH_HEAD);
     sh.push_str("if [ -x \"$basedir/");
-    sh.push_str(prog);
+    sh.push_str(&sh_prog_quoted);
     sh.push_str("\" ]; then\n  exec \"$basedir/");
-    sh.push_str(prog);
+    sh.push_str(&sh_prog_quoted);
     sh.push_str("\" ");
-    sh.push_str(args);
+    sh.push_str(&sh_args_buf);
     sh.push_str(" \"$basedir/../");
     sh.push_str(&sh_target);
     sh.push_str("\" \"$@\"\nelse \n  exec ");
-    sh.push_str(&sh_prog);
+    push_escaped_posix_prog_unquoted(&mut sh, prog);
     sh.push(' ');
-    sh.push_str(args);
+    sh.push_str(&sh_args_buf);
     sh.push_str(" \"$basedir/../");
     sh.push_str(&sh_target);
     sh.push_str("\" \"$@\"\nfi\n");
 
     let mut cmd = String::with_capacity(
-        CMD_HEAD.len() + 140 + prog.len() * 3 + args.len() + win_target.len(),
+        CMD_HEAD.len() + 140 + prog.len() * 3 + cmd_args_buf.len() + win_target.len(),
     );
     cmd.push_str(CMD_HEAD);
     cmd.push_str("\r\nIF EXIST \"%dp0%\\");
-    cmd.push_str(prog);
+    push_escaped_cmd_prog(&mut cmd, prog, false);
     cmd.push_str(".exe\" (\r\n  SET \"_prog=%dp0%\\");
-    cmd.push_str(prog);
+    push_escaped_cmd_prog(&mut cmd, prog, false);
     cmd.push_str(".exe\"\r\n) ELSE (\r\n  SET \"_prog=");
-    cmd.push_str(prog);
+    push_escaped_cmd_prog(&mut cmd, prog, true);
     cmd.push_str(
         "\"\r\n  SET PATHEXT=%PATHEXT:;.JS;=;%\r\n)\r\n\r\n\
          endLocal & goto #_undefined_# 2>NUL || title %COMSPEC% & \"%_prog%\" ",
     );
-    cmd.push_str(args);
+    cmd.push_str(&cmd_args_buf);
     cmd.push_str(" \"%dp0%\\..\\");
     cmd.push_str(&win_target);
+    if win_target.ends_with('\\') {
+        cmd.push('\\');
+    }
     cmd.push_str("\" %*\r\n");
 
     let mut ps1 = String::with_capacity(
-        PS1_HEAD.len() + 340 + prog.len() * 3 + sh_prog.len() * 2 + args.len() * 4 + ps1_target.len() * 4,
+        PS1_HEAD.len() + 340 + ps1_prog.len() * 4 + ps1_args_buf.len() * 4 + ps1_target.len() * 4,
     );
     ps1.push_str(PS1_HEAD);
     ps1.push_str("$ret=0\nif (Test-Path \"$basedir/");
-    ps1.push_str(prog);
+    ps1.push_str(&ps1_prog);
     ps1.push_str(
         "$exe\") {\n  # Support pipeline input\n  if ($MyInvocation.ExpectingInput) {\n    $input | & \"$basedir/",
     );
-    ps1.push_str(prog);
+    ps1.push_str(&ps1_prog);
     ps1.push_str("$exe\" ");
-    ps1.push_str(args);
+    ps1.push_str(&ps1_args_buf);
     ps1.push_str(" \"$basedir/../");
     ps1.push_str(&ps1_target);
     ps1.push_str("\" $args\n  } else {\n    & \"$basedir/");
-    ps1.push_str(prog);
+    ps1.push_str(&ps1_prog);
     ps1.push_str("$exe\" ");
-    ps1.push_str(args);
+    ps1.push_str(&ps1_args_buf);
     ps1.push_str(" \"$basedir/../");
     ps1.push_str(&ps1_target);
     ps1.push_str(
         "\" $args\n  }\n  $ret=$LASTEXITCODE\n} else {\n  # Support pipeline input\n  if ($MyInvocation.ExpectingInput) {\n    $input | & \"",
     );
-    ps1.push_str(&sh_prog);
+    ps1.push_str(&ps1_prog);
     ps1.push_str("$exe\" ");
-    ps1.push_str(args);
+    ps1.push_str(&ps1_args_buf);
     ps1.push_str(" \"$basedir/../");
     ps1.push_str(&ps1_target);
     ps1.push_str("\" $args\n  } else {\n    & \"");
-    ps1.push_str(&sh_prog);
+    ps1.push_str(&ps1_prog);
     ps1.push_str("$exe\" ");
-    ps1.push_str(args);
+    ps1.push_str(&ps1_args_buf);
     ps1.push_str(" \"$basedir/../");
     ps1.push_str(&ps1_target);
     ps1.push_str("\" $args\n  }\n  $ret=$LASTEXITCODE\n}\nexit $ret\n");
@@ -1346,13 +1504,11 @@ pub fn create_shims_with_preloaded_header(
                                 )
                             } else {
                                 let mut line_vec = clean_bytes.to_vec();
-                                let mut byte = [0u8; 1];
-                                while let Ok(1) = file.read(&mut byte) {
-                                    if byte[0] == b'\n' {
-                                        break;
-                                    }
-                                    line_vec.push(byte[0]);
-                                }
+                                let _ = shebang::read_line_tail_buffered(
+                                    file,
+                                    &mut line_vec,
+                                    header[n - 1],
+                                );
                                 shebang::ShebangRead::Line(
                                     String::from_utf8_lossy(&line_vec).into_owned(),
                                 )
@@ -1382,13 +1538,11 @@ pub fn create_shims_with_preloaded_header(
                                 )
                             } else {
                                 let mut line_vec = clean_bytes.to_vec();
-                                let mut byte = [0u8; 1];
-                                while let Ok(1) = file.read(&mut byte) {
-                                    if byte[0] == b'\n' {
-                                        break;
-                                    }
-                                    line_vec.push(byte[0]);
-                                }
+                                let _ = shebang::read_line_tail_buffered(
+                                    file,
+                                    &mut line_vec,
+                                    header[n - 1],
+                                );
                                 shebang::ShebangRead::Line(
                                     String::from_utf8_lossy(&line_vec).into_owned(),
                                 )

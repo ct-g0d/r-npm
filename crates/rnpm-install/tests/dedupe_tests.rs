@@ -416,3 +416,377 @@ fn test_dedupe_scoped_packages() {
     assert!(!nested_scoped.exists());
     assert!(root_scoped.exists());
 }
+
+#[test]
+fn test_dedupe_preserves_nested_children_and_updates_nested_lockfile_keys() {
+    // Part A: DeleteDuplicate must NOT delete a nested copy that still hosts surviving nested children
+    let tmp_a = tempdir().unwrap();
+    let root_a = tmp_a.path();
+    let root_shared = root_a.join("node_modules").join("shared");
+    let parent_a = root_a.join("node_modules").join("parent-a");
+    let nested_shared = parent_a.join("node_modules").join("shared");
+    let surviving_child = nested_shared.join("node_modules").join("unique-child");
+    fs::create_dir_all(&root_shared).unwrap();
+    fs::create_dir_all(&surviving_child).unwrap();
+    fs::write(
+        root_a.join("package.json"),
+        r#"{"name":"dedupe-child-keep","version":"1.0.0","dependencies":{"parent-a":"^1.0.0","shared":"^1.0.0"}}"#,
+    )
+    .unwrap();
+    fs::write(
+        root_shared.join("package.json"),
+        r#"{"name":"shared","version":"1.1.0"}"#,
+    )
+    .unwrap();
+    fs::write(
+        parent_a.join("package.json"),
+        r#"{"name":"parent-a","version":"1.0.0","dependencies":{"shared":"^1.0.0"}}"#,
+    )
+    .unwrap();
+    fs::write(
+        nested_shared.join("package.json"),
+        r#"{"name":"shared","version":"1.0.0","dependencies":{"unique-child":"^1.0.0"}}"#,
+    )
+    .unwrap();
+    fs::write(
+        surviving_child.join("package.json"),
+        r#"{"name":"unique-child","version":"1.0.0"}"#,
+    )
+    .unwrap();
+
+    let mut lock_a = LockfileV3::new("dedupe-child-keep", Some("1.0.0".to_string()));
+    lock_a.insert_package(
+        "node_modules/parent-a",
+        LockfilePackage {
+            version: Some("1.0.0".to_string()),
+            dependencies: Some(BTreeMap::from([("shared".to_string(), "^1.0.0".to_string())])),
+            ..Default::default()
+        },
+    );
+    lock_a.insert_package(
+        "node_modules/shared",
+        LockfilePackage {
+            version: Some("1.1.0".to_string()),
+            ..Default::default()
+        },
+    );
+    lock_a.insert_package(
+        "node_modules/parent-a/node_modules/shared",
+        LockfilePackage {
+            version: Some("1.0.0".to_string()),
+            dependencies: Some(BTreeMap::from([(
+                "unique-child".to_string(),
+                "^1.0.0".to_string(),
+            )])),
+            ..Default::default()
+        },
+    );
+    lock_a.insert_package(
+        "node_modules/parent-a/node_modules/shared/node_modules/unique-child",
+        LockfilePackage {
+            version: Some("1.0.0".to_string()),
+            ..Default::default()
+        },
+    );
+    lock_a.save_to_file(&root_a.join("package-lock.json")).unwrap();
+
+    let summary_a = execute_dedupe(&DedupeOptions {
+        project_dir: root_a.to_path_buf(),
+        dry_run: false,
+        packages: vec![],
+    })
+    .unwrap();
+    assert!(
+        summary_a.actions.is_empty(),
+        "Nested package with surviving child must not be deleted"
+    );
+    assert!(
+        surviving_child.join("package.json").exists(),
+        "Surviving nested child must remain intact on disk"
+    );
+
+    // Part B: HoistAndDedupe must move all nested lockfile keys under the hoisted prefix
+    let tmp_b = tempdir().unwrap();
+    let root_b = tmp_b.path();
+    let pa = root_b.join("node_modules").join("pa");
+    let pb = root_b.join("node_modules").join("pb");
+    let hoist_src = pa.join("node_modules").join("hoist-me");
+    let hoist_child = hoist_src.join("node_modules").join("inner-dep");
+    let other_src = pb.join("node_modules").join("hoist-me");
+    fs::create_dir_all(&hoist_child).unwrap();
+    fs::create_dir_all(&other_src).unwrap();
+    fs::write(
+        root_b.join("package.json"),
+        r#"{"name":"dedupe-hoist-nested","version":"1.0.0","dependencies":{"pa":"^1.0.0","pb":"^1.0.0"}}"#,
+    )
+    .unwrap();
+    fs::write(
+        pa.join("package.json"),
+        r#"{"name":"pa","version":"1.0.0","dependencies":{"hoist-me":"^1.0.0"}}"#,
+    )
+    .unwrap();
+    fs::write(
+        pb.join("package.json"),
+        r#"{"name":"pb","version":"1.0.0","dependencies":{"hoist-me":"^1.0.0"}}"#,
+    )
+    .unwrap();
+    fs::write(
+        hoist_src.join("package.json"),
+        r#"{"name":"hoist-me","version":"1.2.0","dependencies":{"inner-dep":"^1.0.0"}}"#,
+    )
+    .unwrap();
+    fs::write(
+        hoist_child.join("package.json"),
+        r#"{"name":"inner-dep","version":"1.0.0"}"#,
+    )
+    .unwrap();
+    fs::write(
+        other_src.join("package.json"),
+        r#"{"name":"hoist-me","version":"1.0.0"}"#,
+    )
+    .unwrap();
+
+    let mut lock_b = LockfileV3::new("dedupe-hoist-nested", Some("1.0.0".to_string()));
+    lock_b.insert_package(
+        "node_modules/pa",
+        LockfilePackage {
+            version: Some("1.0.0".to_string()),
+            dependencies: Some(BTreeMap::from([("hoist-me".to_string(), "^1.0.0".to_string())])),
+            ..Default::default()
+        },
+    );
+    lock_b.insert_package(
+        "node_modules/pb",
+        LockfilePackage {
+            version: Some("1.0.0".to_string()),
+            dependencies: Some(BTreeMap::from([("hoist-me".to_string(), "^1.0.0".to_string())])),
+            ..Default::default()
+        },
+    );
+    lock_b.insert_package(
+        "node_modules/pa/node_modules/hoist-me",
+        LockfilePackage {
+            version: Some("1.2.0".to_string()),
+            dependencies: Some(BTreeMap::from([(
+                "inner-dep".to_string(),
+                "^1.0.0".to_string(),
+            )])),
+            ..Default::default()
+        },
+    );
+    lock_b.insert_package(
+        "node_modules/pa/node_modules/hoist-me/node_modules/inner-dep",
+        LockfilePackage {
+            version: Some("1.0.0".to_string()),
+            ..Default::default()
+        },
+    );
+    lock_b.insert_package(
+        "node_modules/pb/node_modules/hoist-me",
+        LockfilePackage {
+            version: Some("1.0.0".to_string()),
+            ..Default::default()
+        },
+    );
+    lock_b.save_to_file(&root_b.join("package-lock.json")).unwrap();
+
+    let summary_b = execute_dedupe(&DedupeOptions {
+        project_dir: root_b.to_path_buf(),
+        dry_run: false,
+        packages: vec![],
+    })
+    .unwrap();
+    assert!(summary_b
+        .actions
+        .iter()
+        .any(|a| a.action_type == DedupeActionType::HoistAndDedupe));
+    assert!(root_b
+        .join("node_modules/hoist-me/node_modules/inner-dep/package.json")
+        .exists());
+
+    let updated_lock = LockfileV3::load_from_file(&root_b.join("package-lock.json")).unwrap();
+    assert!(updated_lock.packages.contains_key("node_modules/hoist-me"));
+    assert!(updated_lock
+        .packages
+        .contains_key("node_modules/hoist-me/node_modules/inner-dep"));
+    assert!(!updated_lock
+        .packages
+        .contains_key("node_modules/pa/node_modules/hoist-me"));
+    assert!(!updated_lock
+        .packages
+        .contains_key("node_modules/pa/node_modules/hoist-me/node_modules/inner-dep"));
+}
+
+#[test]
+fn test_dedupe_deepest_first_hoisting_and_nested_delete_remap() {
+    let tmp = tempdir().unwrap();
+    let root = tmp.path();
+
+    // `pa` and `pb` both need `outer-a@^1.0.0`; `outer-a` contains:
+    // 1) `inner-hoist@^1.0.0` (also needed by `pb`, root vacant -> HoistAndDedupe)
+    // 2) `inner-dup@^1.0.0` (root already has `inner-dup@1.1.0` -> DeleteDuplicate)
+    let pa = root.join("node_modules").join("pa");
+    let pb = root.join("node_modules").join("pb");
+    let outer_a = pa.join("node_modules").join("outer-a");
+    let inner_hoist_a = outer_a.join("node_modules").join("inner-hoist");
+    let inner_dup_a = outer_a.join("node_modules").join("inner-dup");
+    let outer_b = pb.join("node_modules").join("outer-a");
+    let inner_hoist_b = pb.join("node_modules").join("inner-hoist");
+    let root_inner_dup = root.join("node_modules").join("inner-dup");
+
+    for dir in [
+        &pa,
+        &pb,
+        &outer_a,
+        &inner_hoist_a,
+        &inner_dup_a,
+        &outer_b,
+        &inner_hoist_b,
+        &root_inner_dup,
+    ] {
+        fs::create_dir_all(dir).unwrap();
+    }
+
+    fs::write(
+        root.join("package.json"),
+        r#"{"name":"deep-dedupe","version":"1.0.0","dependencies":{"pa":"^1.0.0","pb":"^1.0.0","inner-dup":"^1.0.0"}}"#,
+    )
+    .unwrap();
+    fs::write(
+        pa.join("package.json"),
+        r#"{"name":"pa","version":"1.0.0","dependencies":{"outer-a":"^1.0.0"}}"#,
+    )
+    .unwrap();
+    fs::write(
+        pb.join("package.json"),
+        r#"{"name":"pb","version":"1.0.0","dependencies":{"outer-a":"^1.0.0","inner-hoist":"^1.0.0"}}"#,
+    )
+    .unwrap();
+    fs::write(
+        outer_a.join("package.json"),
+        r#"{"name":"outer-a","version":"1.2.0","dependencies":{"inner-hoist":"^1.0.0","inner-dup":"^1.0.0"}}"#,
+    )
+    .unwrap();
+    fs::write(
+        outer_b.join("package.json"),
+        r#"{"name":"outer-a","version":"1.0.0"}"#,
+    )
+    .unwrap();
+    fs::write(
+        inner_hoist_a.join("package.json"),
+        r#"{"name":"inner-hoist","version":"1.2.0"}"#,
+    )
+    .unwrap();
+    fs::write(
+        inner_hoist_b.join("package.json"),
+        r#"{"name":"inner-hoist","version":"1.0.0"}"#,
+    )
+    .unwrap();
+    fs::write(
+        inner_dup_a.join("package.json"),
+        r#"{"name":"inner-dup","version":"1.0.0"}"#,
+    )
+    .unwrap();
+    fs::write(
+        root_inner_dup.join("package.json"),
+        r#"{"name":"inner-dup","version":"1.1.0"}"#,
+    )
+    .unwrap();
+
+    let mut lock = LockfileV3::new("deep-dedupe", Some("1.0.0".to_string()));
+    lock.insert_package(
+        "node_modules/pa",
+        LockfilePackage {
+            version: Some("1.0.0".to_string()),
+            dependencies: Some(BTreeMap::from([("outer-a".to_string(), "^1.0.0".to_string())])),
+            ..Default::default()
+        },
+    );
+    lock.insert_package(
+        "node_modules/pb",
+        LockfilePackage {
+            version: Some("1.0.0".to_string()),
+            dependencies: Some(BTreeMap::from([
+                ("outer-a".to_string(), "^1.0.0".to_string()),
+                ("inner-hoist".to_string(), "^1.0.0".to_string()),
+            ])),
+            ..Default::default()
+        },
+    );
+    lock.insert_package(
+        "node_modules/pa/node_modules/outer-a",
+        LockfilePackage {
+            version: Some("1.2.0".to_string()),
+            dependencies: Some(BTreeMap::from([
+                ("inner-hoist".to_string(), "^1.0.0".to_string()),
+                ("inner-dup".to_string(), "^1.0.0".to_string()),
+            ])),
+            ..Default::default()
+        },
+    );
+    lock.insert_package(
+        "node_modules/pa/node_modules/outer-a/node_modules/inner-hoist",
+        LockfilePackage {
+            version: Some("1.2.0".to_string()),
+            ..Default::default()
+        },
+    );
+    lock.insert_package(
+        "node_modules/pa/node_modules/outer-a/node_modules/inner-dup",
+        LockfilePackage {
+            version: Some("1.0.0".to_string()),
+            ..Default::default()
+        },
+    );
+    lock.insert_package(
+        "node_modules/pb/node_modules/outer-a",
+        LockfilePackage {
+            version: Some("1.0.0".to_string()),
+            ..Default::default()
+        },
+    );
+    lock.insert_package(
+        "node_modules/pb/node_modules/inner-hoist",
+        LockfilePackage {
+            version: Some("1.0.0".to_string()),
+            ..Default::default()
+        },
+    );
+    lock.insert_package(
+        "node_modules/inner-dup",
+        LockfilePackage {
+            version: Some("1.1.0".to_string()),
+            ..Default::default()
+        },
+    );
+    lock.save_to_file(&root.join("package-lock.json")).unwrap();
+
+    execute_dedupe(&DedupeOptions {
+        project_dir: root.to_path_buf(),
+        dry_run: false,
+        packages: vec![],
+    })
+    .unwrap();
+
+    assert!(root.join("node_modules/outer-a/package.json").exists());
+    assert!(root.join("node_modules/inner-hoist/package.json").exists());
+    assert!(!root
+        .join("node_modules/outer-a/node_modules/inner-hoist")
+        .exists());
+    assert!(!root
+        .join("node_modules/outer-a/node_modules/inner-dup")
+        .exists());
+    assert!(!outer_a.exists());
+
+    let updated_lock = LockfileV3::load_from_file(&root.join("package-lock.json")).unwrap();
+    assert!(updated_lock.packages.contains_key("node_modules/outer-a"));
+    assert!(updated_lock
+        .packages
+        .contains_key("node_modules/inner-hoist"));
+    assert!(!updated_lock
+        .packages
+        .contains_key("node_modules/outer-a/node_modules/inner-hoist"));
+    assert!(!updated_lock
+        .packages
+        .contains_key("node_modules/outer-a/node_modules/inner-dup"));
+}

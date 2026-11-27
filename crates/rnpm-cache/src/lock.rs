@@ -201,12 +201,11 @@ impl CacheLock {
         None
     }
 
-    /// Check whether a lock file exists and is older than the stale threshold or belongs to a dead process.
+    /// Check whether a lock file exists and belongs to a dead process or is older than the stale threshold.
     pub fn is_lock_stale(path: &Path, threshold: Duration) -> bool {
         if let Some(pid) = Self::read_lock_pid(path) {
-            if !is_process_alive(pid) {
-                return true;
-            }
+            // Never unlink a lock file belonging to a live holder process even if mtime is old.
+            return !is_process_alive(pid);
         }
         if let Ok(meta) = std::fs::metadata(path) {
             if let Ok(mtime) = meta.modified() {
@@ -218,7 +217,11 @@ impl CacheLock {
         false
     }
 
-    /// Attempt to recover a stale lock by reclaiming or removing an abandoned lock file.
+    /// Attempt to recover a stale lock by reclaiming an abandoned lock file in place.
+    ///
+    /// Never unlinks the lock path on failure: both Unix `flock` and Windows `LockFileEx`
+    /// automatically release locks when a dead owner process exits, whereas unlinking a
+    /// live lock path on Unix splits lock coordination across two different inodes.
     pub fn force_recover_stale_lock(path: &Path) -> Result<Option<Self>, std::io::Error> {
         #[cfg(windows)]
         if let Ok(meta) = std::fs::metadata(path) {
@@ -229,11 +232,6 @@ impl CacheLock {
             }
         }
 
-        if let Some(lock) = Self::try_acquire_exclusive(path)? {
-            return Ok(Some(lock));
-        }
-
-        let _ = std::fs::remove_file(path);
         Self::try_acquire_exclusive(path)
     }
 
@@ -366,5 +364,43 @@ pub fn is_process_alive(pid: u32) -> bool {
             // EPERM (code 1) means process exists but owned by someone else
             err.raw_os_error() == Some(1)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{Duration, SystemTime};
+
+    #[test]
+    fn live_pid_lock_not_considered_stale_even_when_mtime_is_old() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock_path = dir.path().join("live.lock");
+        let file = std::fs::File::create(&lock_path).unwrap();
+        std::io::Write::write_all(
+            &mut &file,
+            format!("pid={} time=0\n", std::process::id()).as_bytes(),
+        )
+        .unwrap();
+        let old_time = SystemTime::now() - Duration::from_secs(3600);
+        file.set_modified(old_time).unwrap();
+        drop(file);
+
+        assert!(
+            !CacheLock::is_lock_stale(&lock_path, Duration::from_secs(1)),
+            "Lock held by live PID must NEVER be treated as stale even with old mtime"
+        );
+    }
+
+    #[test]
+    fn dead_or_missing_pid_stale_check_behaves_correctly() {
+        let dir = tempfile::tempdir().unwrap();
+        let no_pid_path = dir.path().join("nopid.lock");
+        let file = std::fs::File::create(&no_pid_path).unwrap();
+        assert!(!CacheLock::is_lock_stale(&no_pid_path, Duration::from_secs(60)));
+
+        let old_time = SystemTime::now() - Duration::from_secs(3600);
+        file.set_modified(old_time).unwrap();
+        assert!(CacheLock::is_lock_stale(&no_pid_path, Duration::from_secs(1)));
     }
 }

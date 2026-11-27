@@ -93,6 +93,19 @@ struct Cause {
     severity: String,
 }
 
+async fn fetch_packument_value(
+    client: &rnpm_registry::RegistryClient,
+    name: &str,
+) -> anyhow::Result<Value> {
+    let url = client
+        .registry_for_package(name)
+        .join(&rnpm_registry::client::encode_package_name(name))?;
+    let (response, _permit) = client
+        .execute_with_permit(reqwest::Method::GET, url, Some("application/json"), None)
+        .await?;
+    Ok(response.error_for_status()?.json::<Value>().await?)
+}
+
 async fn load_packument(
     client: &rnpm_registry::RegistryClient,
     name: &str,
@@ -101,15 +114,44 @@ async fn load_packument(
     if let Some(value) = cache.get(name) {
         return Ok(value.clone());
     }
-    let url = client
-        .registry_for_package(name)
-        .join(&rnpm_registry::client::encode_package_name(name))?;
-    let (response, _permit) = client
-        .execute_with_permit(reqwest::Method::GET, url, Some("application/json"), None)
-        .await?;
-    let value = response.error_for_status()?.json::<Value>().await?;
+    let value = fetch_packument_value(client, name).await?;
     cache.insert(name.to_string(), value.clone());
     Ok(value)
+}
+
+async fn prefetch_packuments<'a>(
+    client: &rnpm_registry::RegistryClient,
+    names: impl IntoIterator<Item = &'a str>,
+    cache: &mut BTreeMap<String, Value>,
+) -> anyhow::Result<()> {
+    let missing: BTreeSet<String> = names
+        .into_iter()
+        .filter(|name| !cache.contains_key(*name))
+        .map(str::to_string)
+        .collect();
+    if missing.is_empty() {
+        return Ok(());
+    }
+    let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(16));
+    let mut tasks = tokio::task::JoinSet::new();
+    for name in missing {
+        let client_c = client.clone();
+        let sem_c = std::sync::Arc::clone(&sem);
+        tasks.spawn(async move {
+            let _permit = sem_c
+                .acquire_owned()
+                .await
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            let value = fetch_packument_value(&client_c, &name).await?;
+            Ok::<_, anyhow::Error>((name, value))
+        });
+    }
+    while let Some(res) = tasks.join_next().await {
+        let (name, value) =
+            res.map_err(|e| anyhow::anyhow!("Audit packument prefetch panicked: {e}"))??;
+        cache.insert(name, value);
+    }
+    Ok(())
 }
 
 pub(super) async fn complete_graph(
@@ -162,6 +204,7 @@ pub(super) async fn complete_graph(
             }
         }
     }
+    prefetch_packuments(&client, causes.iter().map(|c| c.name.as_str()), &mut packuments).await?;
     let mut seen = BTreeSet::new();
     let mut traversed_nodes = BTreeSet::new();
     while let Some(cause) = causes.pop_front() {
@@ -204,6 +247,15 @@ pub(super) async fn complete_graph(
             });
             dependents.entry(name).or_default().push(loc.clone());
         }
+        prefetch_packuments(
+            &client,
+            dependents
+                .keys()
+                .filter(|name| *name != &cause.name)
+                .map(String::as_str),
+            &mut packuments,
+        )
+        .await?;
         for (name, locations) in dependents {
             if name == cause.name {
                 continue;
@@ -294,6 +346,12 @@ pub(super) async fn complete_graph(
             });
         }
     }
+    prefetch_packuments(
+        &client,
+        vulnerabilities.keys().map(String::as_str),
+        &mut packuments,
+    )
+    .await?;
     for (name, vuln) in vulnerabilities.iter_mut() {
         let packument = load_packument(&client, name, &mut packuments).await?;
         let published = versions(&packument);

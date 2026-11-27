@@ -1931,3 +1931,241 @@ async fn test_get_package_metadata_install_fallback_on_406_and_415() {
 
     server.stop();
 }
+
+#[tokio::test]
+async fn test_concurrency_permit_dropped_during_retry_sleep() {
+    let first_failed_notify = Arc::new(tokio::sync::Notify::new());
+    let first_failed_notify_srv = first_failed_notify.clone();
+    let slow_hits = Arc::new(AtomicUsize::new(0));
+    let slow_hits_srv = slow_hits.clone();
+
+    let server = MockHttpServer::start(move |req| {
+        let path = req
+            .lines()
+            .next()
+            .and_then(|l| l.split_whitespace().nth(1))
+            .unwrap_or("/")
+            .to_string();
+        if path == "/slow-retry" {
+            let n = slow_hits_srv.fetch_add(1, Ordering::SeqCst);
+            if n == 0 {
+                first_failed_notify_srv.notify_one();
+                return (503, vec![], b"temporarily unavailable".to_vec());
+            }
+            let ok = br#"{"name":"slow-retry","dist-tags":{},"versions":{}}"#.to_vec();
+            (
+                200,
+                vec![
+                    ("Content-Type", "application/json".to_string()),
+                    ("Content-Length", ok.len().to_string()),
+                ],
+                ok,
+            )
+        } else {
+            let ok = br#"{"name":"fast","dist-tags":{},"versions":{}}"#.to_vec();
+            (
+                200,
+                vec![
+                    ("Content-Type", "application/json".to_string()),
+                    ("Content-Length", ok.len().to_string()),
+                ],
+                ok,
+            )
+        }
+    })
+    .await;
+
+    let config = RegistryClientConfig {
+        default_registry: server.url(),
+        max_concurrent_requests: 1,
+        max_retries: 2,
+        initial_retry_backoff: Duration::from_millis(350),
+        timeout: Duration::from_secs(5),
+        circuit_breaker_enabled: false,
+        ..Default::default()
+    };
+    let client = Arc::new(RegistryClient::with_config(config).unwrap());
+
+    let client1 = client.clone();
+    let h1 = tokio::spawn(async move { client1.get_package_metadata("slow-retry").await });
+
+    // Wait until /slow-retry attempt #1 returns 503 and enters retry sleep.
+    first_failed_notify.notified().await;
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    // With permit dropped before sleep, /fast MUST acquire the single slot and finish while /slow-retry sleeps.
+    let fast_res = tokio::time::timeout(
+        Duration::from_millis(250),
+        client.get_package_metadata("fast"),
+    )
+    .await
+    .expect("/fast was starved by /slow-retry holding semaphore during retry sleep");
+    assert_eq!(fast_res.unwrap().name, "fast");
+
+    assert_eq!(h1.await.unwrap().unwrap().name, "slow-retry");
+    let recorded = server.received_requests.lock().await;
+    let first_fast = recorded.iter().position(|r| r.contains("GET /fast ")).unwrap();
+    let second_slow = recorded
+        .iter()
+        .rposition(|r| r.contains("GET /slow-retry "))
+        .unwrap();
+    assert!(
+        first_fast < second_slow,
+        "Expected /fast to run during /slow-retry sleep; requests were: {recorded:?}"
+    );
+    drop(recorded);
+    server.stop();
+}
+
+#[tokio::test]
+async fn test_circuit_breaker_half_open_single_probe_guard() {
+    let cb = rnpm_registry::CircuitBreaker::new(1, Duration::from_millis(30));
+    let state = cb.record_failure("host.test").await;
+    assert_eq!(state, CircuitBreakerState::Open);
+
+    tokio::time::sleep(Duration::from_millis(45)).await;
+    assert_eq!(cb.check_state("host.test").await, CircuitBreakerState::HalfOpen);
+
+    let guard1 = cb
+        .try_acquire_request("host.test")
+        .await
+        .expect("First HalfOpen probe must acquire")
+        .expect("HalfOpen acquisition must yield probe guard");
+
+    // Second concurrent probe MUST be rejected while guard1 is active.
+    assert_eq!(
+        cb.try_acquire_request("host.test").await.unwrap_err(),
+        CircuitBreakerState::HalfOpen
+    );
+
+    // Dropping guard1 without recording success/failure frees the probe slot cleanly.
+    drop(guard1);
+    let mut guard2 = cb
+        .try_acquire_request("host.test")
+        .await
+        .expect("Next probe after dropped probe must acquire")
+        .unwrap();
+    guard2.disarm();
+    cb.record_success("host.test").await;
+    assert_eq!(cb.check_state("host.test").await, CircuitBreakerState::Closed);
+}
+
+#[tokio::test]
+async fn test_auth_token_does_not_leak_across_ports_and_matches_subpaths() {
+    let server = MockHttpServer::start(move |req| {
+        let auth_line = req
+            .lines()
+            .find(|l| l.to_ascii_lowercase().starts_with("authorization:"));
+        let body = if let Some(auth_line) = auth_line {
+            format!(
+                r#"{{"name":"{}","dist-tags":{{"latest":"1.0.0"}},"versions":{{}}}}"#,
+                auth_line.replace('"', "")
+            )
+            .into_bytes()
+        } else {
+            br#"{"name":"no-auth","dist-tags":{},"versions":{}}"#.to_vec()
+        };
+        (
+            200,
+            vec![
+                ("Content-Type", "application/json".to_string()),
+                ("Content-Length", body.len().to_string()),
+            ],
+            body,
+        )
+    })
+    .await;
+
+    let host_port = server.addr.to_string();
+    let host_only = server.addr.ip().to_string();
+    let mut auth_tokens = std::collections::BTreeMap::new();
+    // Portless entry must NOT match explicit non-default mock server port.
+    auth_tokens.insert(format!("//{host_only}/"), "portless_leak_token".to_string());
+    // Port-scoped subpath entries match longest prefix first.
+    auth_tokens.insert(
+        format!("//{host_port}/gitlab/group/"),
+        "group_token".to_string(),
+    );
+    auth_tokens.insert(
+        format!("//{host_port}/gitlab/group/sub/"),
+        "sub_token".to_string(),
+    );
+
+    let mut trusted_hosts = HashSet::new();
+    trusted_hosts.insert(host_port.clone());
+
+    let client = RegistryClient::with_config(RegistryClientConfig {
+        default_registry: server.url(),
+        auth_tokens,
+        trusted_hosts,
+        timeout: Duration::from_secs(5),
+        ..Default::default()
+    })
+    .unwrap();
+
+    let other_url = Url::parse(&format!("{}other-pkg", server.url())).unwrap();
+    let group_url = Url::parse(&format!("{}gitlab/group/pkg", server.url())).unwrap();
+    let sub_url = Url::parse(&format!("{}gitlab/group/sub/pkg", server.url())).unwrap();
+
+    let meta_other = client
+        .get_package_metadata_from_url("pkg", other_url)
+        .await
+        .unwrap();
+    assert_eq!(meta_other.name, "no-auth");
+
+    let meta_group = client
+        .get_package_metadata_from_url("pkg", group_url)
+        .await
+        .unwrap();
+    assert!(meta_group.name.contains("group_token"), "got {}", meta_group.name);
+
+    let meta_sub = client
+        .get_package_metadata_from_url("pkg", sub_url)
+        .await
+        .unwrap();
+    assert!(meta_sub.name.contains("sub_token"), "got {}", meta_sub.name);
+
+    server.stop();
+}
+
+#[tokio::test]
+async fn test_content_length_4mib_cap_no_oom_on_truncated_stream() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let srv = tokio::spawn(async move {
+        if let Ok((mut stream, _)) = listener.accept().await {
+            let mut buf = [0u8; 1024];
+            let _ = stream.read(&mut buf).await;
+            let _ = stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 500000000\r\nConnection: close\r\n\r\n",
+                )
+                .await;
+            let _ = stream.shutdown().await;
+        }
+    });
+
+    let client = RegistryClient::with_config(RegistryClientConfig {
+        default_registry: Url::parse(&format!("http://{addr}/")).unwrap(),
+        max_package_size: 600 * 1024 * 1024,
+        max_retries: 0,
+        timeout: Duration::from_secs(5),
+        ..Default::default()
+    })
+    .unwrap();
+
+    let err = client
+        .download_tarball_bytes(&format!("http://{addr}/huge.tgz"))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            RegistryError::ContentLengthMismatch { .. }
+                | RegistryError::Http(_)
+                | RegistryError::Transport(_)
+        ),
+        "Expected stream truncation error without OOM, got {err:?}"
+    );
+    let _ = srv.await;
+}

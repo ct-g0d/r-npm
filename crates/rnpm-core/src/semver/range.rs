@@ -695,7 +695,8 @@ impl Range {
             sets.push(ComparatorSet { comparators });
         }
 
-        // If any set in the || union is a wildcard (>=0.0.0), node-semver collapses to a single wildcard set
+        // Match npm 11.20.0 / node-semver: any `||` union containing a wildcard (`*` / `>=0.0.0`)
+        // collapses to the single wildcard comparator set (excluding prereleases unless includePrerelease).
         if has_wildcard_set && sets.len() > 1 {
             sets = vec![ComparatorSet {
                 comparators: vec![Comparator::new(Op::Gte, Version::new(0, 0, 0))],

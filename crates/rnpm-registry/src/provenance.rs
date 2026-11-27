@@ -57,7 +57,7 @@ pub fn test_mock_fulcio_root_cert() -> Vec<u8> {
         &rng,
     )
     .expect("parse mock CA keypair");
-    crate::asn1::create_test_x509_certificate(
+    crate::asn1::create_test_ca_x509_certificate(
         "sigstore",
         "sigstore",
         key_pair.public_key().as_ref(),
@@ -1132,9 +1132,34 @@ pub fn verify_fulcio_certificate_chain(
         return Ok(leaf.clone());
     }
 
-    // Verify chain from leaf upwards
+    if leaf.basic_constraints_ca == Some(true) {
+        return Err(RegistryError::InvalidSigstoreBundle(
+            "End-entity leaf certificate must not assert BasicConstraints isCA=true".into(),
+        ));
+    }
+
+    // Verify chain from leaf upwards, enforcing RFC 5280 BasicConstraints (isCA + pathLenConstraint)
+    // and KeyUsage (keyCertSign).
     let mut current = leaf;
+    let mut intermediate_ca_count: u32 = 0;
     for parent in &parsed_chain[1..] {
+        if parent.basic_constraints_ca != Some(true) {
+            return Err(RegistryError::InvalidSigstoreBundle(
+                "Intermediate CA certificate missing BasicConstraints isCA=true".into(),
+            ));
+        }
+        if let Some(max_path_len) = parent.basic_constraints_path_len {
+            if intermediate_ca_count > max_path_len {
+                return Err(RegistryError::InvalidSigstoreBundle(format!(
+                    "Certificate chain exceeds BasicConstraints pathLenConstraint ({intermediate_ca_count} > {max_path_len})"
+                )));
+            }
+        }
+        if parent.key_usage_cert_sign == Some(false) {
+            return Err(RegistryError::InvalidSigstoreBundle(
+                "Intermediate CA certificate KeyUsage lacks keyCertSign".into(),
+            ));
+        }
         if current.issuer_raw != parent.subject_raw {
             return Err(RegistryError::InvalidSigstoreBundle(
                 "Certificate chain issuer/subject mismatch".into(),
@@ -1144,6 +1169,9 @@ pub fn verify_fulcio_certificate_chain(
             return Err(RegistryError::InvalidSigstoreBundle(
                 "Certificate cryptographic signature verification failed along the chain".into(),
             ));
+        }
+        if parent.subject_raw != parent.issuer_raw {
+            intermediate_ca_count = intermediate_ca_count.saturating_add(1);
         }
         current = parent;
     }
@@ -1160,7 +1188,12 @@ pub fn verify_fulcio_certificate_chain(
             trusted = true;
             break;
         }
-        if current.issuer_raw == root.subject_raw
+        if root.basic_constraints_ca == Some(true)
+            && root.key_usage_cert_sign != Some(false)
+            && root
+                .basic_constraints_path_len
+                .is_none_or(|max_len| intermediate_ca_count <= max_len)
+            && current.issuer_raw == root.subject_raw
             && verify_signature(&root.spki_bytes, &current.tbs_bytes, &current.signature_value).is_ok()
         {
             trusted = true;
@@ -1779,7 +1812,7 @@ impl ProvenanceVerifier {
             rekor_public_keys.push(k);
         }
 
-        let mut verifier = Self {
+        let verifier = Self {
             policy,
             fulcio_root_certs,
             rekor_public_keys,
@@ -1787,9 +1820,19 @@ impl ProvenanceVerifier {
             registry_key_expiries: HashMap::new(),
         };
 
-        if cfg!(test) || std::env::var_os("RNPM_TEST_MOCK_ROOTS").is_some() {
-            verifier = verifier.with_test_mock_roots();
-        }
+        // In `cfg(test)`, always include mock roots for unit tests.
+        // In debug builds (`cfg(debug_assertions)`), honor `RNPM_TEST_MOCK_ROOTS` so workspace
+        // integration tests (`cargo test --workspace`, notably `rnpm-cli`'s `provenance_cli_test`)
+        // can exercise signed bundles without compiling a production backdoor into release binaries.
+        // Release builds (`!debug_assertions`) compile this env-var branch out completely.
+        #[cfg(test)]
+        let verifier = verifier.with_test_mock_roots();
+        #[cfg(all(not(test), debug_assertions))]
+        let verifier = if std::env::var_os("RNPM_TEST_MOCK_ROOTS").is_some() {
+            verifier.with_test_mock_roots()
+        } else {
+            verifier
+        };
 
         verifier
     }
@@ -2135,19 +2178,25 @@ fn current_time_ms() -> i64 {
         // 8. Verify tarball integrity digest against subject.digest
         Self::verify_subject_digest(matched_subject, tarball_integrity, tarball_bytes)?;
 
-        // 9. Extract build provenance details
-        let mut source_repository = statement.predicate.source_repository();
+        // 9. Extract build provenance details (preferring cryptographically authenticated Fulcio OIDC claims
+        // over self-asserted SLSA predicate fields).
+        let cert_source_repository = parsed_leaf_cert.as_ref().and_then(|cert| {
+            cert.fulcio_extensions
+                .get(crate::asn1::OID_FULCIO_GITHUB_WORKFLOW_REPOSITORY)
+                .or_else(|| {
+                    cert.fulcio_extensions
+                        .get(crate::asn1::OID_FULCIO_SOURCE_REPOSITORY_URI)
+                })
+                .map(|r| r.trim())
+                .filter(|r| !r.is_empty())
+                .map(normalize_repository_url)
+        });
+        let source_repository = cert_source_repository.or_else(|| statement.predicate.source_repository());
         let mut commit_sha = statement.predicate.commit_sha();
         let mut workflow_path = statement.predicate.workflow_path();
         let mut issuer = None;
 
         if let Some(cert) = &parsed_leaf_cert {
-            if source_repository.is_none() {
-                source_repository = cert
-                    .fulcio_extensions
-                    .get(crate::asn1::OID_FULCIO_GITHUB_WORKFLOW_REPOSITORY)
-                    .map(|r| normalize_repository_url(r));
-            }
             if commit_sha.is_none() {
                 commit_sha = cert
                     .fulcio_extensions
@@ -3916,7 +3965,7 @@ pub(crate) mod tests {
         );
 
         // Intermediate certificate is EXPIRED at integrated_time
-        let inter_der = crate::asn1::create_test_x509_certificate(
+        let inter_der = crate::asn1::create_test_ca_x509_certificate(
             "inter-ca",
             "sigstore",
             inter_signer.public_key_uncompressed(),

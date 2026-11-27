@@ -958,13 +958,9 @@ pub fn extract_tar_gz<R: Read>(
             }
 
             if let Some(link_target) = entry.link_name().map_err(FsError::Io)? {
-                // For hardlinks, the target is often archived as package/...
-                let normalized_target =
-                    strip_package_prefix(&link_target).unwrap_or_else(|| link_target.to_path_buf());
-
                 if entry_type.is_symlink() {
                     let cleaned_rel =
-                        validate_link_target(&relative_path, &normalized_target, destination)?;
+                        validate_link_target(&relative_path, &link_target, destination)?;
 
                     if let Some(parent) = target_path.parent() {
                         ensure_dir_created(
@@ -994,6 +990,9 @@ pub fn extract_tar_gz<R: Read>(
                         }
                     }
                 } else if entry_type.is_hard_link() {
+                    // For hardlinks, the target is often archived as package/...
+                    let normalized_target =
+                        strip_package_prefix(&link_target).unwrap_or_else(|| link_target.to_path_buf());
                     // Hardlinks in tar are relative to archive root (destination), NOT relative to link_dir!
                     if normalized_target.is_absolute() || normalized_target.has_root() {
                         return Err(FsError::AbsolutePath {
@@ -1505,6 +1504,15 @@ pub fn extract_tar_gz<R: Read>(
                             ),
                         });
                     }
+                }
+            }
+            #[cfg(unix)]
+            if mode & 0o111 != 0 {
+                use std::os::unix::fs::PermissionsExt;
+                if let Ok(meta) = raw_file.metadata() {
+                    let mut perms = meta.permissions();
+                    perms.set_mode(perms.mode() | (mode & 0o111));
+                    let _ = raw_file.set_permissions(perms);
                 }
             }
             drop(raw_file);

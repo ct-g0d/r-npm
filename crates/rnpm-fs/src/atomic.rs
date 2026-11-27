@@ -56,13 +56,27 @@ pub fn extract_and_replace<R: Read>(
     Ok(summary)
 }
 
+fn destination_replace_lock(destination: &Path) -> &'static std::sync::Mutex<()> {
+    use std::hash::{Hash, Hasher};
+    use std::sync::{Mutex, OnceLock};
+    static STRIPES: OnceLock<Vec<Mutex<()>>> = OnceLock::new();
+    let stripes = STRIPES.get_or_init(|| (0..64).map(|_| Mutex::new(())).collect());
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    path_clean::clean(destination).hash(&mut hasher);
+    &stripes[(hasher.finish() as usize) % stripes.len()]
+}
+
 /// Replaces `destination` with `staging` using atomic directory rename with exponential backoff.
-/// Handles Windows EBUSY / EPERM / AccessDenied retries.
+/// Handles Windows EBUSY / EPERM / AccessDenied retries and serializes concurrent replacements
+/// at the same destination path so rollback cannot clobber a concurrent replacement.
 pub fn replace_dir_with_retries(
     staging: &Path,
     destination: &Path,
     max_retries: usize,
 ) -> Result<(), FsError> {
+    let _guard = destination_replace_lock(destination)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     let staging_v = crate::path::to_verbatim_path(staging);
     let destination_v = crate::path::to_verbatim_path(destination);
     let parent = destination_v.parent().unwrap_or_else(|| Path::new("."));
@@ -112,9 +126,6 @@ fn try_replace_dir(staging: &Path, destination: &Path, parent: &Path) -> std::io
         }
     }
 
-    // Opportunistically cleanup any abandoned .rnpm-trash directories in parent
-    cleanup_stale_trash(parent);
-
     // If destination already exists:
     // Move existing destination to a unique trash path (that does NOT yet exist) on the same filesystem
     let trash_path = generate_unique_path(parent, ".rnpm-trash");
@@ -133,9 +144,46 @@ fn try_replace_dir(staging: &Path, destination: &Path, parent: &Path) -> std::io
         Ok(()) => {
             // Rename staging -> destination
             if let Err(rename_err) = fs::rename(staging, destination) {
-                // Attempt rollback if staging -> destination failed
-                // Attempt rollback if staging -> destination failed, with exponential backoff retries
-                let _ = replace_dir_with_retries(&trash_path, destination, 5);
+                // Safe rollback: serialize via destination lock and re-verify destination absence
+                // on every retry attempt. Only delete the backup if a valid replacement is
+                // confirmed to exist at `destination`; preserve the backup on any metadata error
+                // or failed restore.
+                let mut rollback_delay = Duration::from_millis(5);
+                for attempt in 0..6 {
+                    match fs::symlink_metadata(destination) {
+                        Ok(_) => {
+                            let _ = crate::junction::remove_dir_all_safe(&trash_path);
+                            break;
+                        }
+                        Err(ref e) if e.kind() == std::io::ErrorKind::NotFound => {
+                            match fs::rename(&trash_path, destination) {
+                                Ok(()) => break,
+                                Err(ref re) if attempt < 5 && is_retryable_error(re) => {
+                                    std::thread::sleep(rollback_delay);
+                                    rollback_delay = rollback_delay.saturating_mul(2);
+                                }
+                                Err(ref re) => {
+                                    tracing::warn!(
+                                        "Failed to restore backup '{}' to '{}' after staging failure: {}; preserving backup on disk",
+                                        trash_path.display(),
+                                        destination.display(),
+                                        re
+                                    );
+                                    break;
+                                }
+                            }
+                        }
+                        Err(ref meta_err) => {
+                            tracing::warn!(
+                                "Could not verify destination '{}' during rollback ({}); preserving backup '{}'",
+                                destination.display(),
+                                meta_err,
+                                trash_path.display()
+                            );
+                            break;
+                        }
+                    }
+                }
                 return Err(rename_err);
             }
 
@@ -149,36 +197,6 @@ fn try_replace_dir(staging: &Path, destination: &Path, parent: &Path) -> std::io
             fs::rename(staging, destination)
         }
         Err(e) => Err(e),
-    }
-}
-
-/// Opportunistic cleanup of any leftover .rnpm-trash-* and .rnpm-staging-* directories in parent.
-fn cleanup_stale_trash(parent: &Path) {
-    let now = SystemTime::now();
-    if let Ok(entries) = fs::read_dir(parent) {
-        for entry in entries.flatten() {
-            let file_name = entry.file_name();
-            let name_str = file_name.to_string_lossy();
-            if name_str.starts_with(".rnpm-trash-") || name_str.starts_with(".rnpm-staging-") {
-                // Only clean staging or trash dirs older than 30 seconds to avoid deleting in-flight extractions or rollbacks
-                let should_clean = if let Ok(meta) = entry.metadata() {
-                    if let Ok(mtime) = meta.modified() {
-                        if let Ok(age) = now.duration_since(mtime) {
-                            age >= Duration::from_secs(30)
-                        } else {
-                            false
-                        }
-                    } else {
-                        false
-                    }
-                } else {
-                    false
-                };
-                if should_clean {
-                    let _ = crate::junction::remove_dir_all_safe(&entry.path());
-                }
-            }
-        }
     }
 }
 

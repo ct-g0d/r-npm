@@ -4160,8 +4160,11 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                                 Ok(summary) => return Ok(summary),
                                 Err(err) => {
                                     let err_msg = err.to_string();
-                                    if err_msg.contains("ELOCKFILE_DRIFT") {
-                                        warn!("Lockfile drift detected during fast path; falling back to full solver: {err_msg}");
+                                    if err_msg.contains("ELOCKFILE_DRIFT")
+                                        || (err_msg.contains("EUSAGE")
+                                            && err_msg.contains("Missing:"))
+                                    {
+                                        warn!("Lockfile drift or missing entries detected during fast path; falling back to full solver: {err_msg}");
                                     } else {
                                         return Err(err);
                                     }
@@ -5103,6 +5106,12 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
             let base = self.options.project_dir.clone();
             (nm, bin, base)
         };
+        if !self.options.is_global {
+            unlink_symlinked_dir(&node_modules_dir)?;
+            if self.options.bin_links {
+                unlink_symlinked_dir(&root_bin_dir)?;
+            }
+        }
         std::fs::create_dir_all(&node_modules_dir).context("Failed to create node_modules")?;
         if self.options.bin_links {
             std::fs::create_dir_all(&root_bin_dir).context("Failed to create bin dir")?;
@@ -7414,14 +7423,136 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
             let base = self.options.project_dir.clone();
             (nm, bin, base)
         };
-        // An install that reuses the lockfile keeps a linked tree: its store
-        // folders are reconciled in place, as arborist's reify diff does.
-        let keeps_linked_tree =
-            !from_scratch && self.options.install_strategy == InstallStrategy::Linked;
-        if !keeps_linked_tree
-            && (node_modules_dir.exists() || rnpm_fs::is_junction(&node_modules_dir).unwrap_or(false))
+        // Never write package files or shims through a symlinked/junctioned
+        // `node_modules` (or `.bin`) directory into an external target.
+        if !self.options.is_global {
+            unlink_symlinked_dir(&node_modules_dir)?;
+            if self.options.bin_links {
+                unlink_symlinked_dir(&bin_dir)?;
+            }
+        }
+        // `rnpm ci` (`from_scratch == true`) performs a clean wipe of `node_modules`.
+        // Incremental `rnpm install` (`from_scratch == false`) preserves `node_modules`
+        // and only removes extraneous/mismatched packages in place.
+        let mut incremental_skip_packages: HashSet<String> = HashSet::new();
+        let mut deferred_incremental_removals: Vec<String> = Vec::new();
+        if from_scratch {
+            if node_modules_dir.exists()
+                || rnpm_fs::is_junction(&node_modules_dir).unwrap_or(false)
+            {
+                fast_trash_wipe_dir(&node_modules_dir)?;
+            }
+        } else if self.options.install_strategy != InstallStrategy::Linked
+            && node_modules_dir.exists()
+            && !rnpm_fs::is_junction(&node_modules_dir).unwrap_or(false)
         {
-            fast_trash_wipe_dir(&node_modules_dir)?;
+            let hidden_path = self.options.project_dir.join(LockfileV3::HIDDEN_LOCKFILE_PATH);
+            let hidden_matches_disk = std::fs::symlink_metadata(&hidden_path)
+                .ok()
+                .and_then(|hm| hm.modified().ok())
+                .is_some_and(|hm| {
+                    std::fs::symlink_metadata(&node_modules_dir)
+                        .ok()
+                        .and_then(|nm| nm.modified().ok())
+                        .is_none_or(|nm| nm <= hm)
+                })
+                && LockfileV3::load_from_file_readonly(&hidden_path).is_ok();
+            // Do not backfill `resolved`/`integrity` from `lockfile.packages` when the
+            // hidden lockfile is absent or stale vs `node_modules`, or `pkg_matches_on_disk`
+            // would compare desired lockfile metadata against itself.
+            let actual_packages = reify_report::load_actual(
+                &self.options.project_dir,
+                hidden_matches_disk,
+                None,
+            );
+            let mut desired_packages: HashMap<&str, &rnpm_lockfile::LockfilePackage> =
+                HashMap::new();
+            for (pkg_key, pkg_info) in &lockfile.packages {
+                if pkg_key.is_empty()
+                    || platform_skipped_packages.contains(pkg_key)
+                    || pkg_info.is_extraneous()
+                    || lockfile_entry_omitted(&self.options, &lockfile, pkg_key, pkg_info)
+                {
+                    continue;
+                }
+                if pkg_key.contains("node_modules/") || pkg_info.link == Some(true) {
+                    desired_packages.insert(pkg_key.as_str(), pkg_info);
+                }
+            }
+
+            let pkg_matches_on_disk =
+                |pkg_key: &str,
+                 desired: &rnpm_lockfile::LockfilePackage,
+                 actual: &rnpm_lockfile::LockfilePackage| {
+                    if desired.link != actual.link || desired.version != actual.version {
+                        return false;
+                    }
+                    match (desired.integrity.as_deref(), actual.integrity.as_deref()) {
+                        (Some(di), Some(ai)) if di != ai => return false,
+                        (Some(_), None) | (None, Some(_)) => return false,
+                        _ => {}
+                    }
+                    match (desired.resolved.as_deref(), actual.resolved.as_deref()) {
+                        (Some(dr), Some(ar)) if dr != ar => return false,
+                        (Some(_), None) | (None, Some(_)) => return false,
+                        _ => {}
+                    }
+                    let target = loc_base_dir.join(pkg_key);
+                    if desired.link == Some(true) {
+                        return rnpm_fs::is_junction(&target).unwrap_or(false) || target.is_dir();
+                    }
+                    target.join("package.json").is_file()
+                };
+
+            let mut pending_incremental_removals: Vec<String> = Vec::new();
+            let mut removed_set: HashSet<String> = HashSet::new();
+            for (actual_key, actual_pkg) in &actual_packages {
+                if !actual_key.starts_with("node_modules/") {
+                    continue;
+                }
+                let keep = hidden_matches_disk
+                    && desired_packages
+                        .get(actual_key.as_str())
+                        .is_some_and(|desired| pkg_matches_on_disk(actual_key, desired, actual_pkg));
+                if !keep {
+                    pending_incremental_removals.push(actual_key.clone());
+                    removed_set.insert(actual_key.clone());
+                }
+            }
+            // Also check for desired packages that changed (might differ even if an ancestor didn't)
+            for desired_key in desired_packages.keys() {
+                if !desired_key.starts_with("node_modules/") {
+                    continue;
+                }
+                let has_removed_ancestor = {
+                    let mut p = *desired_key;
+                    let mut hit = false;
+                    while let Some(idx) = p.rfind("/node_modules/") {
+                        let parent = &p[..idx];
+                        if removed_set.contains(parent) {
+                            hit = true;
+                            break;
+                        }
+                        p = parent;
+                    }
+                    hit
+                };
+                if has_removed_ancestor {
+                    removed_set.insert((*desired_key).to_string());
+                } else if hidden_matches_disk {
+                    if let Some(actual_pkg) = actual_packages.get(*desired_key) {
+                        let desired_pkg = desired_packages[desired_key];
+                        if pkg_matches_on_disk(desired_key, desired_pkg, actual_pkg) {
+                            incremental_skip_packages.insert((*desired_key).to_string());
+                        }
+                    }
+                }
+            }
+
+            // Defer actual deletion of `pending_incremental_removals` until all remote fetches
+            // and integrity checks succeed so a failed fetch leaves the existing tree usable.
+            pending_incremental_removals.sort_by_key(|p| std::cmp::Reverse(p.len()));
+            deferred_incremental_removals = pending_incremental_removals;
         }
         std::fs::create_dir_all(&node_modules_dir)?;
 
@@ -7562,6 +7693,11 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
         }
 
         let mut packages_to_process: Vec<CiPackage> = Vec::new();
+        let stage_non_pack_mutations = !from_scratch && !deferred_incremental_removals.is_empty();
+        let mut pending_links: Vec<(PathBuf, PathBuf, String)> = Vec::new();
+        let mut pending_packed_dirs: Vec<(PathBuf, PathBuf, String)> = Vec::new();
+        type PendingGitMaterialization = (PathBuf, PathBuf, String, bool, Option<Vec<String>>);
+        let mut pending_git_materializations: Vec<PendingGitMaterialization> = Vec::new();
 
         for (pkg_key, pkg_info) in &lockfile.packages {
             if pkg_key.is_empty() || pkg_info.is_extraneous() {
@@ -7580,35 +7716,28 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
 
             // Handle workspace links
             if pkg_info.link == Some(true) {
-                // Path containment defense: ensure pkg_key has no traversal, device names, or escapes
-                if pkg_key.contains("..")
-                    || pkg_key.contains(':')
-                    || pkg_key.contains('\\')
-                    || pkg_key.contains('\0')
-                {
-                    return Err(anyhow!(
-                        "Package lock entry '{pkg_key}' contains illegal path characters"
-                    ));
-                }
-                rnpm_fs::validate_entry_path(Path::new(pkg_key))
-                    .map_err(|e| anyhow!("Invalid package path in lockfile '{pkg_key}': {e}"))?;
-
-                let full_target = self.options.project_dir.join(pkg_key);
-                let cleaned = path_clean::clean(&full_target);
-                if !cleaned.starts_with(&self.options.project_dir) {
-                    return Err(anyhow!(
-                        "Package path '{cleaned:?}' escapes project boundary"
-                    ));
-                }
-                if pkg_key.starts_with("node_modules/") && !cleaned.starts_with(&node_modules_dir) {
-                    return Err(anyhow!(
-                        "Package path '{cleaned:?}' escapes node_modules boundary"
-                    ));
-                }
+                // Path containment defense (S14): ensure `pkg_key` is a valid package slot under
+                // `project_dir` with no traversal, illegal characters, or symlink/junction ancestors
+                // before creating parent directories or replacing any existing entry.
+                let link_path = validate_safe_nm_removal_path(
+                    &self.options.project_dir,
+                    pkg_key,
+                    false,
+                )
+                .ok_or_else(|| {
+                    anyhow!(
+                        "Security error: lockfile link destination '{pkg_key}' is not a valid package slot with safe ancestors"
+                    )
+                })?;
 
                 let target_rel = pkg_info.resolved.as_ref().ok_or_else(|| {
                     anyhow!("Workspace link {pkg_key} missing resolved target in lockfile")
                 })?;
+                if target_rel.contains('\0') {
+                    return Err(anyhow!(
+                        "Security error: lockfile link entry '{pkg_key}' has illegal resolved target '{target_rel}'"
+                    ));
+                }
                 // A self link's target is the root itself; joining "" would
                 // leave a trailing separator in the junction.
                 let target_dir = if target_rel.is_empty() {
@@ -7616,24 +7745,42 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                 } else {
                     self.options.project_dir.join(target_rel)
                 };
-                let link_path = self.options.project_dir.join(pkg_key);
-                if let Some(parent) = link_path.parent() {
-                    std::fs::create_dir_all(parent)?;
+                if !is_trusted_link_target(
+                    &self.options.project_dir,
+                    &manifest,
+                    &workspace_members,
+                    &lockfile,
+                    pkg_key,
+                    target_rel,
+                    &target_dir,
+                ) {
+                    return Err(anyhow!(
+                        "Security error: lockfile link entry '{pkg_key}' -> '{target_rel}' is not a trusted workspace member or declared local dependency"
+                    ));
                 }
-                if link_path.exists() || rnpm_fs::is_junction(&link_path).unwrap_or(false) {
-                    let _ = rnpm_fs::remove_junction(&link_path);
-                    if link_path.exists() && !rnpm_fs::is_junction(&link_path).unwrap_or(false) {
-                        let _ = rnpm_fs::remove_dir_all_safe(&link_path);
-                    }
-                }
-                rnpm_fs::junction::create_directory_link(&link_path, &target_dir).map_err(|e| {
-                    anyhow!(
-                        "Failed to link workspace package at '{}': {e}",
-                        link_path.display()
-                    )
-                })?;
 
-                packages_installed += 1;
+                if incremental_skip_packages.contains(pkg_key) {
+                    packages_installed += 1;
+                } else if stage_non_pack_mutations {
+                    pending_links.push((link_path, target_dir.clone(), pkg_key.clone()));
+                } else {
+                    if let Some(parent) = link_path.parent() {
+                        std::fs::create_dir_all(parent)?;
+                    }
+                    if link_path.exists() || rnpm_fs::is_junction(&link_path).unwrap_or(false) {
+                        let _ = rnpm_fs::remove_junction(&link_path);
+                        if link_path.exists() && !rnpm_fs::is_junction(&link_path).unwrap_or(false) {
+                            let _ = rnpm_fs::remove_dir_all_safe(&link_path);
+                        }
+                    }
+                    rnpm_fs::junction::create_directory_link(&link_path, &target_dir).map_err(|e| {
+                        anyhow!(
+                            "Failed to link workspace package at '{}': {e}",
+                            link_path.display()
+                        )
+                    })?;
+                    packages_installed += 1;
+                }
 
                 let pkg_manifest_path = target_dir.join("package.json");
                 if pkg_manifest_path.exists() {
@@ -7779,11 +7926,18 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
             if let Some(rel) = resolved_url.strip_prefix("file:") {
                 let src = self.options.project_dir.join(rel);
                 if pkg_info.link != Some(true) && src.is_dir() {
-                    if full_target.exists() {
-                        let _ = rnpm_fs::remove_dir_all_safe(&full_target);
+                    if incremental_skip_packages.contains(pkg_key) {
+                        continue;
                     }
-                    copy_packed_directory(&src, &full_target)?;
-                    packages_installed += 1;
+                    if stage_non_pack_mutations {
+                        pending_packed_dirs.push((src, full_target, pkg_key.clone()));
+                    } else {
+                        if full_target.exists() {
+                            let _ = rnpm_fs::remove_dir_all_safe(&full_target);
+                        }
+                        copy_packed_directory(&src, &full_target)?;
+                        packages_installed += 1;
+                    }
                     continue;
                 }
             }
@@ -7795,6 +7949,9 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                     .unwrap_or(false);
 
             if is_git {
+                if incremental_skip_packages.contains(pkg_key) {
+                    continue;
+                }
                 let git_fetcher = crate::git::GitFetcher::new(self.cache().root());
                 let target = PackageTarget::parse(resolved_url)
                     .map_err(|e| anyhow!("Failed to parse git target in lockfile: {e}"))?;
@@ -7817,6 +7974,21 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                 };
                 drop(_f_span);
                 collector.record_phase(Phase::Fetch, t_fetch.elapsed());
+
+                if stage_non_pack_mutations {
+                    let lock_deps = pkg_info
+                        .dependencies
+                        .as_ref()
+                        .map(|d| d.keys().cloned().collect());
+                    pending_git_materializations.push((
+                        checkout_dir,
+                        full_target,
+                        pkg_key.clone(),
+                        is_opt,
+                        lock_deps,
+                    ));
+                    continue;
+                }
 
                 let t_mat = std::time::Instant::now();
                 let _mat_span = tracing::info_span!("materialize", package = %pkg_key).entered();
@@ -7913,6 +8085,10 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                 .map(|d| d.keys().cloned().collect())
                 .unwrap_or_default();
 
+            if incremental_skip_packages.contains(pkg_key) {
+                continue;
+            }
+
             let has_scripts = pkg_info.has_install_script.unwrap_or(false);
             let has_bins_or_scripts = has_scripts;
 
@@ -7983,6 +8159,30 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
         }
         let ci_writer_cfg = Arc::new(custom_cfg);
 
+        // S15: When incremental removals are deferred, pre-validate every existing warm pack
+        // before computing `missing_packs`. Corrupt packs are purged immediately so `missing_packs`
+        // re-fetches and rebuilds them BEFORE any live package in `node_modules` is removed.
+        let stage_into_pack_store_only =
+            !from_scratch && !deferred_incremental_removals.is_empty();
+        if stage_into_pack_store_only {
+            for (_, _, integrity_str, _, _, _) in &packages_to_process {
+                if !integrity_str.is_empty() && self.pack_store().has_package_pack(integrity_str) {
+                    if let Ok(Some(pack)) = self.pack_store().get_package_pack(integrity_str) {
+                        let slices_ok = pack
+                            .index
+                            .files
+                            .iter()
+                            .all(|entry| pack.get_entry_slice(entry).is_some());
+                        if !slices_ok {
+                            let _ = self.pack_store().purge(integrity_str);
+                        }
+                    } else {
+                        let _ = self.pack_store().purge(integrity_str);
+                    }
+                }
+            }
+        }
+
         // Concurrently fetch tarballs and populate pack_store for any packages missing a pack
         let missing_packs: Vec<(usize, String, String, String, bool, bool)> = packages_to_process
             .iter()
@@ -8012,29 +8212,31 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
         let mut deferred_pack_tasks = AbortTasksOnDrop::new();
         let ci_pack_cancel = deferred_pack_tasks.cancel_flag();
 
-        if !missing_packs.is_empty() {
+        let already_materialized_keys: HashSet<String> = if !missing_packs.is_empty() {
             let t_missing_start = std::time::Instant::now();
             let node_modules_dir_v = rnpm_fs::to_verbatim_path(&node_modules_dir);
             let mut dirs_to_precreate = Vec::with_capacity(missing_packs.len() * 2 + 1);
-            dirs_to_precreate.push(node_modules_dir_v.clone());
             let loc_base_dir_v = rnpm_fs::to_verbatim_path(&loc_base_dir);
-            for (_, pkg_key, _, _, is_optional, _) in &missing_packs {
-                if *is_optional {
-                    continue;
+            if !stage_into_pack_store_only {
+                dirs_to_precreate.push(node_modules_dir_v.clone());
+                for (_, pkg_key, _, _, is_optional, _) in &missing_packs {
+                    if *is_optional {
+                        continue;
+                    }
+                    let pkg_key_clean = if cfg!(windows) && pkg_key.contains('/') {
+                        pkg_key.replace('/', "\\")
+                    } else {
+                        pkg_key.clone()
+                    };
+                    let target = loc_base_dir_v.join(pkg_key_clean);
+                    if let Some(parent) = target.parent() {
+                        dirs_to_precreate.push(parent.to_path_buf());
+                    }
+                    dirs_to_precreate.push(target);
                 }
-                let pkg_key_clean = if cfg!(windows) && pkg_key.contains('/') {
-                    pkg_key.replace('/', "\\")
-                } else {
-                    pkg_key.clone()
-                };
-                let target = loc_base_dir_v.join(pkg_key_clean);
-                if let Some(parent) = target.parent() {
-                    dirs_to_precreate.push(parent.to_path_buf());
-                }
-                dirs_to_precreate.push(target);
+                let dir_refs: Vec<&Path> = dirs_to_precreate.iter().map(|p| p.as_path()).collect();
+                let _ = precreate_directories(dir_refs);
             }
-            let dir_refs: Vec<&Path> = dirs_to_precreate.iter().map(|p| p.as_path()).collect();
-            let _ = precreate_directories(dir_refs);
 
             let timing_debug = std::env::var_os("RNPM_TIMING_DEBUG").is_some();
             let tm_nm_count = Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -8051,7 +8253,11 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
             let seen_dirs = Arc::new(std::sync::RwLock::new(init_dirs));
             let mut join_set = tokio::task::JoinSet::new();
 
-            let mut async_writer = rnpm_fs::AsyncFileWriter::spawn().ok();
+            let mut async_writer = if stage_into_pack_store_only {
+                None
+            } else {
+                rnpm_fs::AsyncFileWriter::spawn().ok()
+            };
             let writer_sender = async_writer.as_ref().map(|w| w.sender());
 
             for (idx, pkg_key, resolved_url, integrity_str, is_optional, has_bins_or_scripts) in
@@ -8272,28 +8478,31 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                             let decoded = rnpm_cache::PackStore::decode_package_tarball(&bytes, &pkg_target, &pkg_key_for_pack)
                                 .map_err(|e| anyhow!("{e}"))?;
 
-                            for d in &decoded.dirs {
-                                let already_created = {
-                                    let guard = seen_dirs.read().unwrap();
-                                    guard.contains(d)
-                                };
-                                if !already_created {
-                                    // Safely create directory without holding the global lock during I/O
-                                    std::fs::create_dir_all(d)
-                                        .map_err(|e| anyhow!("Failed to create directory '{}': {e}", d.display()))?;
+                            if !stage_into_pack_store_only {
+                                for d in &decoded.dirs {
+                                    let already_created = {
+                                        let guard = seen_dirs.read().unwrap();
+                                        guard.contains(d)
+                                    };
+                                    if !already_created {
+                                        // Safely create directory without holding the global lock during I/O
+                                        std::fs::create_dir_all(d).map_err(|e| {
+                                            anyhow!("Failed to create directory '{}': {e}", d.display())
+                                        })?;
 
-                                    // Mark as created only after successful create_dir_all
-                                    let mut guard = seen_dirs.write().unwrap();
-                                    guard.insert(d.clone());
-                                    let mut curr = d.as_path();
-                                    while let Some(parent) = curr.parent() {
-                                        if parent == project_dir || parent.as_os_str().is_empty() {
-                                            break;
+                                        // Mark as created only after successful create_dir_all
+                                        let mut guard = seen_dirs.write().unwrap();
+                                        guard.insert(d.clone());
+                                        let mut curr = d.as_path();
+                                        while let Some(parent) = curr.parent() {
+                                            if parent == project_dir || parent.as_os_str().is_empty() {
+                                                break;
+                                            }
+                                            if !guard.insert(parent.to_path_buf()) {
+                                                break;
+                                            }
+                                            curr = parent;
                                         }
-                                        if !guard.insert(parent.to_path_buf()) {
-                                            break;
-                                        }
-                                        curr = parent;
                                     }
                                 }
                             }
@@ -8328,28 +8537,30 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                                 None
                             };
 
-                            if let Some(ref sender) = writer_sender_clone {
-                                if timing_debug {
-                                    let now_ms = t_missing_start.elapsed().as_millis() as u64;
-                                    tm_first_enqueue.fetch_min(now_ms, std::sync::atomic::Ordering::Relaxed);
-                                    tm_last_enqueue.fetch_max(now_ms, std::sync::atomic::Ordering::Relaxed);
-                                    tm_nm_count.fetch_add(decoded.files.len() as u64, std::sync::atomic::Ordering::Relaxed);
-                                    let b_sum: u64 = decoded.files.iter().map(|f| f.data.len() as u64).sum();
-                                    tm_nm_bytes.fetch_add(b_sum, std::sync::atomic::Ordering::Relaxed);
-                                }
-                                for file in &decoded.files {
-                                    sender
-                                        .send_arc(file.path.clone(), Arc::clone(&file.data), file.mode)
-                                        .map_err(|e| anyhow!("{e}"))?;
-                                }
-                                if timing_debug {
-                                    let now_ms = t_missing_start.elapsed().as_millis() as u64;
-                                    tm_last_enqueue.fetch_max(now_ms, std::sync::atomic::Ordering::Relaxed);
-                                }
-                            } else {
-                                for file in &decoded.files {
-                                    rnpm_fs::writer::write_file_fast(&file.path, &file.data, file.mode, 65536)
-                                        .map_err(|e| anyhow!("Failed to write file '{}': {e}", file.path.display()))?;
+                            if !stage_into_pack_store_only {
+                                if let Some(ref sender) = writer_sender_clone {
+                                    if timing_debug {
+                                        let now_ms = t_missing_start.elapsed().as_millis() as u64;
+                                        tm_first_enqueue.fetch_min(now_ms, std::sync::atomic::Ordering::Relaxed);
+                                        tm_last_enqueue.fetch_max(now_ms, std::sync::atomic::Ordering::Relaxed);
+                                        tm_nm_count.fetch_add(decoded.files.len() as u64, std::sync::atomic::Ordering::Relaxed);
+                                        let b_sum: u64 = decoded.files.iter().map(|f| f.data.len() as u64).sum();
+                                        tm_nm_bytes.fetch_add(b_sum, std::sync::atomic::Ordering::Relaxed);
+                                    }
+                                    for file in &decoded.files {
+                                        sender
+                                            .send_arc(file.path.clone(), Arc::clone(&file.data), file.mode)
+                                            .map_err(|e| anyhow!("{e}"))?;
+                                    }
+                                    if timing_debug {
+                                        let now_ms = t_missing_start.elapsed().as_millis() as u64;
+                                        tm_last_enqueue.fetch_max(now_ms, std::sync::atomic::Ordering::Relaxed);
+                                    }
+                                } else {
+                                    for file in &decoded.files {
+                                        rnpm_fs::writer::write_file_fast(&file.path, &file.data, file.mode, 65536)
+                                            .map_err(|e| anyhow!("Failed to write file '{}': {e}", file.path.display()))?;
+                                    }
                                 }
                             }
 
@@ -8476,7 +8687,21 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                 }
             }
             let t_producer_done = t_missing_start.elapsed();
-            deferred_pack_tasks.extend(all_pack_tasks);
+            if stage_into_pack_store_only {
+                if let Some(err) = first_producer_err {
+                    for handle in all_pack_tasks {
+                        handle.abort();
+                    }
+                    return Err(err);
+                }
+                for handle in all_pack_tasks {
+                    handle
+                        .await
+                        .map_err(|e| anyhow!("Staged pack persistence task panicked: {e}"))??;
+                }
+            } else {
+                deferred_pack_tasks.extend(all_pack_tasks);
+            }
 
             if let Some(ref mut w) = async_writer {
                 w.close_input();
@@ -8527,14 +8752,16 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                 return Err(err);
             }
 
-            for (link_path, target_path) in all_pending_symlinks {
-                rnpm_fs::create_link_or_copy(&link_path, &target_path).with_context(|| {
-                    format!(
-                        "Failed to materialize package link '{}' to '{}'",
-                        link_path.display(),
-                        target_path.display()
-                    )
-                })?;
+            if !stage_into_pack_store_only {
+                for (link_path, target_path) in all_pending_symlinks {
+                    rnpm_fs::create_link_or_copy(&link_path, &target_path).with_context(|| {
+                        format!(
+                            "Failed to materialize package link '{}' to '{}'",
+                            link_path.display(),
+                            target_path.display()
+                        )
+                    })?;
+                }
             }
 
             if std::env::var_os("RNPM_TIMING_DEBUG").is_some() {
@@ -8552,6 +8779,17 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                 }
             }
 
+            let mut already_materialized_keys: HashSet<String> = HashSet::new();
+            if !stage_into_pack_store_only {
+                for &idx in missing_pack_results.keys() {
+                    if !failed_optional_indices.contains(&idx) {
+                        if let Some((pkg_key, ..)) = packages_to_process.get(idx) {
+                            already_materialized_keys.insert(pkg_key.clone());
+                        }
+                    }
+                }
+            }
+
             if !failed_optional_indices.is_empty() {
                 let mut kept = Vec::new();
                 for (i, pkg) in packages_to_process.into_iter().enumerate() {
@@ -8561,31 +8799,15 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                 }
                 packages_to_process = kept;
             }
-        }
 
-        let all_direct_materialized = !missing_pack_results.is_empty()
-            && missing_pack_results.len() == packages_to_process.len();
+            already_materialized_keys
+        } else {
+            HashSet::new()
+        };
 
-        let all_packs_available = !all_direct_materialized
-            && !packages_to_process.is_empty()
-            && if missing_packs.is_empty() {
-                packages_to_process
-                    .iter()
-                    .all(|(_, _, integrity_str, _, _, _)| !integrity_str.is_empty())
-            } else {
-                packages_to_process
-                    .iter()
-                    .all(|(_, _, integrity_str, _, _, _)| {
-                        !integrity_str.is_empty()
-                            && self.pack_store().has_package_pack(integrity_str)
-                    })
-            };
-
-        let mut used_fast_path = false;
-        let mut bin_packages = packages_to_process.clone();
-        sort_packages_for_bin_linking(&mut bin_packages);
-
-        if all_direct_materialized {
+        // Account stats and lifecycle metadata ONCE for packages directly materialized by
+        // `missing_packs`, even when other packages still come from `pack_store` or fallback.
+        if !already_materialized_keys.is_empty() {
             for (
                 pkg_key,
                 resolved_url,
@@ -8593,8 +8815,11 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                 is_optional,
                 declared_dependencies,
                 has_bins_or_scripts,
-            ) in &bin_packages
+            ) in &packages_to_process
             {
+                if !already_materialized_keys.contains(pkg_key) {
+                    continue;
+                }
                 let target_path = loc_base_dir.join(pkg_key);
                 if *has_bins_or_scripts {
                     let found_node = if let Some(pkg_manifest) = in_memory_manifests.get(pkg_key) {
@@ -8621,7 +8846,6 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                 }
                 packages_installed += 1;
             }
-
             for was_hit in missing_pack_results.values() {
                 if *was_hit {
                     cache_hits += 1;
@@ -8631,12 +8855,163 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                     collector.record_cache_miss();
                 }
             }
-        } else if all_packs_available {
+        }
+
+        let remaining_to_materialize: Vec<_> = if already_materialized_keys.is_empty() {
+            packages_to_process.clone()
+        } else {
+            packages_to_process
+                .iter()
+                .filter(|(pkg_key, ..)| !already_materialized_keys.contains(pkg_key))
+                .cloned()
+                .collect()
+        };
+
+        let all_direct_materialized =
+            !already_materialized_keys.is_empty() && remaining_to_materialize.is_empty();
+
+        let all_packs_available = !all_direct_materialized
+            && !remaining_to_materialize.is_empty()
+            && if missing_packs.is_empty() {
+                remaining_to_materialize
+                    .iter()
+                    .all(|(_, _, integrity_str, _, _, _)| !integrity_str.is_empty())
+            } else {
+                remaining_to_materialize
+                    .iter()
+                    .all(|(_, _, integrity_str, _, _, _)| {
+                        !integrity_str.is_empty()
+                            && self.pack_store().has_package_pack(integrity_str)
+                    })
+            };
+
+        // S15: Preload and verify warm packs BEFORE running deferred incremental removals so
+        // any corrupt pack falls back cleanly without having deleted live packages first.
+        let mut preloaded_warm: Option<Vec<(String, PathBuf, rnpm_cache::PackagePack)>> = None;
+        let warm_packs_verified = if all_packs_available {
+            let (loaded_packs, load_success) = crate::fast_path::parallel_load_packs(
+                &self.pack_store,
+                &loc_base_dir,
+                &remaining_to_materialize,
+            );
+            let slices_ok = load_success
+                && loaded_packs.iter().all(|(_, _, pack)| {
+                    pack.index
+                        .files
+                        .iter()
+                        .all(|entry| pack.get_entry_slice(entry).is_some())
+                });
+            if slices_ok {
+                preloaded_warm = Some(loaded_packs);
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+
+        let mut removals_and_staged_applied = false;
+        let ready_to_commit_live =
+            all_direct_materialized || remaining_to_materialize.is_empty() || warm_packs_verified;
+        if ready_to_commit_live {
+            for rel_dir in &deferred_incremental_removals {
+                remove_validated_nm_package(
+                    &loc_base_dir,
+                    &node_modules_dir,
+                    &bin_dir,
+                    rel_dir,
+                    true,
+                );
+            }
+            for (link_path, target_dir, _) in &pending_links {
+                if let Some(parent) = link_path.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                if link_path.exists() || rnpm_fs::is_junction(link_path).unwrap_or(false) {
+                    let _ = rnpm_fs::remove_junction(link_path);
+                    if link_path.exists() && !rnpm_fs::is_junction(link_path).unwrap_or(false) {
+                        let _ = rnpm_fs::remove_dir_all_safe(link_path);
+                    }
+                }
+                rnpm_fs::junction::create_directory_link(link_path, target_dir).map_err(|e| {
+                    anyhow!(
+                        "Failed to link workspace package at '{}': {e}",
+                        link_path.display()
+                    )
+                })?;
+                packages_installed += 1;
+            }
+            for (src, full_target, _) in &pending_packed_dirs {
+                if full_target.exists() {
+                    let _ = rnpm_fs::remove_dir_all_safe(full_target);
+                }
+                copy_packed_directory(src, full_target)?;
+                packages_installed += 1;
+            }
+            for (checkout_dir, full_target, pkg_key, is_opt, lock_deps) in
+                &pending_git_materializations
+            {
+                let t_mat = std::time::Instant::now();
+                let mat_opts = self.options.git_materialize_options();
+                if let Err(e) = crate::git::materialize_git_dependency_with_options(
+                    checkout_dir,
+                    full_target,
+                    &mat_opts,
+                )
+                .await
+                {
+                    if *is_opt {
+                        warn!(
+                            "Failed to materialize optional git dependency '{}': {e}; skipping",
+                            pkg_key
+                        );
+                        let _ = rnpm_fs::remove_dir_all_safe(full_target);
+                        continue;
+                    }
+                    return Err(e);
+                }
+                collector.record_phase(Phase::Materialize, t_mat.elapsed());
+                packages_installed += 1;
+                cache_hits += 1;
+                collector.record_cache_hit();
+                let pkg_manifest_path = full_target.join("package.json");
+                if pkg_manifest_path.exists() {
+                    if let Ok(pkg_manifest) = Manifest::from_file_readonly(&pkg_manifest_path) {
+                        let has_scripts = pkg_manifest.scripts.contains_key("preinstall")
+                            || pkg_manifest.scripts.contains_key("install")
+                            || pkg_manifest.scripts.contains_key("postinstall");
+                        if has_scripts {
+                            let deps = lock_deps.clone().unwrap_or_else(|| {
+                                pkg_manifest.dependencies.keys().cloned().collect()
+                            });
+                            lifecycle_nodes.push(LifecyclePackageNode {
+                                package_path: pkg_key.clone(),
+                                disk_path: full_target.clone(),
+                                manifest: pkg_manifest,
+                                source: PackageSource::Registry,
+                                dependencies: deps,
+                                optional: *is_opt,
+                            });
+                        }
+                    }
+                }
+            }
+            removals_and_staged_applied = true;
+        }
+
+        let mut used_fast_path = false;
+        let mut bin_packages = packages_to_process.clone();
+        sort_packages_for_bin_linking(&mut bin_packages);
+
+        if all_direct_materialized {
+            // Stats and lifecycle nodes were already recorded above.
+        } else if let Some(loaded_packs) = preloaded_warm {
             let t_mat = std::time::Instant::now();
             let mut all_dirs = std::collections::BTreeSet::new();
             all_dirs.insert(rnpm_fs::to_verbatim_path(&node_modules_dir));
 
-            for (pkg_key, _, _, _, _, _) in &packages_to_process {
+            for (pkg_key, _, _, _, _, _) in &remaining_to_materialize {
                 let pkg_target = loc_base_dir.join(pkg_key);
                 if !(from_scratch && pkg_key.starts_with("node_modules/"))
                     && rnpm_fs::is_junction(&pkg_target).unwrap_or(false)
@@ -8649,11 +9024,7 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                 }
             }
 
-            let (loaded_packs, mut load_success) = crate::fast_path::parallel_load_packs(
-                &self.pack_store,
-                &loc_base_dir,
-                &packages_to_process,
-            );
+            let mut load_success = true;
 
             if load_success {
                 let block_cloning = self.pack_store().is_block_cloning_eligible(&loc_base_dir);
@@ -8829,7 +9200,7 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                                 loc_base_ref,
                                 bin_dir_ref,
                                 nm_dir_ref,
-                                true,
+                                from_scratch,
                                 None,
                                 self.options.force,
                                 (!bin_headers.is_empty()).then_some(&bin_headers),
@@ -8870,6 +9241,9 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                         has_bins_or_scripts,
                     ) in &bin_packages
                     {
+                        if already_materialized_keys.contains(pkg_key) {
+                            continue;
+                        }
                         let target_path = loc_base_dir.join(pkg_key);
                         let is_top_pkg = is_top_level_nm_pkg(pkg_key);
                         if *has_bins_or_scripts {
@@ -8982,7 +9356,7 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                 is_optional,
                 declared_dependencies,
                 has_bins_or_scripts,
-            ) in &packages_to_process
+            ) in &remaining_to_materialize
             {
                 let sem = Arc::clone(&semaphore);
                 let cache = self.cache().clone();
@@ -9306,6 +9680,103 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                     cas_pkgs,
                 );
             }
+
+            // S5 + S15: Fallback fetches have all succeeded; now safely remove remaining
+            // extraneous packages and apply any staged links, packed dirs, or git checkouts.
+            if !removals_and_staged_applied {
+                let fallback_written: HashSet<&str> = remaining_to_materialize
+                    .iter()
+                    .map(|(k, ..)| k.as_str())
+                    .collect();
+                for rel_dir in &deferred_incremental_removals {
+                    if fallback_written.contains(rel_dir.as_str()) {
+                        continue;
+                    }
+                    remove_validated_nm_package(
+                        &loc_base_dir,
+                        &node_modules_dir,
+                        &bin_dir,
+                        rel_dir,
+                        true,
+                    );
+                }
+                for (link_path, target_dir, _) in &pending_links {
+                    if let Some(parent) = link_path.parent() {
+                        std::fs::create_dir_all(parent)?;
+                    }
+                    if link_path.exists() || rnpm_fs::is_junction(link_path).unwrap_or(false) {
+                        let _ = rnpm_fs::remove_junction(link_path);
+                        if link_path.exists() && !rnpm_fs::is_junction(link_path).unwrap_or(false)
+                        {
+                            let _ = rnpm_fs::remove_dir_all_safe(link_path);
+                        }
+                    }
+                    rnpm_fs::junction::create_directory_link(link_path, target_dir).map_err(
+                        |e| {
+                            anyhow!(
+                                "Failed to link workspace package at '{}': {e}",
+                                link_path.display()
+                            )
+                        },
+                    )?;
+                    packages_installed += 1;
+                }
+                for (src, full_target, _) in &pending_packed_dirs {
+                    if full_target.exists() {
+                        let _ = rnpm_fs::remove_dir_all_safe(full_target);
+                    }
+                    copy_packed_directory(src, full_target)?;
+                    packages_installed += 1;
+                }
+                for (checkout_dir, full_target, pkg_key, is_opt, lock_deps) in
+                    &pending_git_materializations
+                {
+                    let t_mat = std::time::Instant::now();
+                    let mat_opts = self.options.git_materialize_options();
+                    if let Err(e) = crate::git::materialize_git_dependency_with_options(
+                        checkout_dir,
+                        full_target,
+                        &mat_opts,
+                    )
+                    .await
+                    {
+                        if *is_opt {
+                            warn!(
+                                "Failed to materialize optional git dependency '{}': {e}; skipping",
+                                pkg_key
+                            );
+                            let _ = rnpm_fs::remove_dir_all_safe(full_target);
+                            continue;
+                        }
+                        return Err(e);
+                    }
+                    collector.record_phase(Phase::Materialize, t_mat.elapsed());
+                    packages_installed += 1;
+                    cache_hits += 1;
+                    collector.record_cache_hit();
+                    let pkg_manifest_path = full_target.join("package.json");
+                    if pkg_manifest_path.exists() {
+                        if let Ok(pkg_manifest) = Manifest::from_file_readonly(&pkg_manifest_path) {
+                            let has_scripts = pkg_manifest.scripts.contains_key("preinstall")
+                                || pkg_manifest.scripts.contains_key("install")
+                                || pkg_manifest.scripts.contains_key("postinstall");
+                            if has_scripts {
+                                let deps = lock_deps.clone().unwrap_or_else(|| {
+                                    pkg_manifest.dependencies.keys().cloned().collect()
+                                });
+                                lifecycle_nodes.push(LifecyclePackageNode {
+                                    package_path: pkg_key.clone(),
+                                    disk_path: full_target.clone(),
+                                    manifest: pkg_manifest,
+                                    source: PackageSource::Registry,
+                                    dependencies: deps,
+                                    optional: *is_opt,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
         }
 
         if !used_fast_path {
@@ -9346,7 +9817,7 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                     &loc_base_dir,
                     &bin_dir,
                     &node_modules_dir,
-                    true,
+                    from_scratch,
                     Some(&collector),
                     self.options.force,
                 )?;
@@ -11034,8 +11505,10 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
 
         let lockfile_path = project_lockfile_path(&self.options.project_dir);
         let mut pruned_nodes: HashSet<String> = HashSet::new();
+        let has_lockfile = lockfile_path.exists();
+        let mut remaining_lockfile_keys: HashSet<String> = HashSet::new();
 
-        if lockfile_path.exists() {
+        if has_lockfile {
             let lockfile_str = std::fs::read_to_string(&lockfile_path)
                 .with_context(|| format!("Failed to read {}", lockfile_path.display()))?;
             let mut lockfile = LockfileV3::from_json_str(&lockfile_str)
@@ -11071,6 +11544,7 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
             // Prune unreferenced dependencies using reachability graph
             pruned_nodes = prune_lockfile(&mut lockfile, &manifest);
             pruned_nodes.extend(graph_pruned);
+            remaining_lockfile_keys = lockfile.packages.keys().cloned().collect();
 
             // Write updated deterministic lockfile
             lockfile
@@ -11116,14 +11590,95 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                 (nm, bin, base)
             };
 
-        // Clean direct removed packages and all pruned lockfile nodes
+        // Only remove uninstalled packages if no lockfile / remaining dependency still requires them.
         let mut dirs_to_remove = HashSet::new();
-        for pkg in &removed_packages {
-            dirs_to_remove.insert(format!("node_modules/{pkg}"));
-        }
-        for pruned in &pruned_nodes {
-            if pruned.starts_with("node_modules/") {
-                dirs_to_remove.insert(pruned.clone());
+        if has_lockfile {
+            for pruned in &pruned_nodes {
+                if pruned.contains("node_modules/") && !remaining_lockfile_keys.contains(pruned) {
+                    dirs_to_remove.insert(pruned.clone());
+                }
+            }
+            for pkg in &removed_packages {
+                if target_root {
+                    let top_key = format!("node_modules/{pkg}");
+                    if !remaining_lockfile_keys.contains(&top_key) {
+                        dirs_to_remove.insert(top_key);
+                    }
+                }
+                for &idx in &targeted_workspace_indices {
+                    let ws_key = format!("{}/node_modules/{pkg}", workspace_members[idx].relative_path);
+                    if !remaining_lockfile_keys.contains(&ws_key) {
+                        dirs_to_remove.insert(ws_key);
+                    }
+                }
+            }
+        } else {
+            // No lockfile: build removal candidates per selected scope and compute full
+            // transitive BFS reachability from retained roots/packages so dependencies of
+            // retained candidates (e.g. retained C -> candidate B -> candidate A) survive.
+            let candidate_pkg_names: HashSet<String> = removed_packages.iter().cloned().collect();
+
+            if target_root {
+                let mut root_seeds: Vec<String> = manifest
+                    .dependencies
+                    .keys()
+                    .chain(manifest.dev_dependencies.keys())
+                    .chain(manifest.optional_dependencies.keys())
+                    .chain(manifest.peer_dependencies.keys())
+                    .cloned()
+                    .collect();
+                for ws in &workspace_members {
+                    if let Ok(ws_manifest) =
+                        Manifest::from_file_readonly(ws.path.join("package.json"))
+                    {
+                        root_seeds.extend(
+                            ws_manifest
+                                .dependencies
+                                .keys()
+                                .chain(ws_manifest.dev_dependencies.keys())
+                                .chain(ws_manifest.optional_dependencies.keys())
+                                .chain(ws_manifest.peer_dependencies.keys())
+                                .cloned(),
+                        );
+                    }
+                }
+                let root_reachable = collect_reachable_packages_in_scope(
+                    &self.options.project_dir,
+                    &root_seeds,
+                    &candidate_pkg_names,
+                );
+                for pkg in &removed_packages {
+                    if !root_reachable.contains(pkg) {
+                        dirs_to_remove.insert(format!("node_modules/{pkg}"));
+                    }
+                }
+            }
+
+            for &idx in &targeted_workspace_indices {
+                let ws = &workspace_members[idx];
+                let ws_seeds: Vec<String> =
+                    Manifest::from_file_readonly(ws.path.join("package.json"))
+                        .map(|ws_manifest| {
+                            ws_manifest
+                                .dependencies
+                                .keys()
+                                .chain(ws_manifest.dev_dependencies.keys())
+                                .chain(ws_manifest.optional_dependencies.keys())
+                                .chain(ws_manifest.peer_dependencies.keys())
+                                .cloned()
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                let ws_reachable = collect_reachable_packages_in_scope(
+                    &ws.path,
+                    &ws_seeds,
+                    &candidate_pkg_names,
+                );
+                for pkg in &removed_packages {
+                    if !ws_reachable.contains(pkg) {
+                        dirs_to_remove.insert(format!("{}/node_modules/{pkg}", ws.relative_path));
+                    }
+                }
             }
         }
 
@@ -11132,47 +11687,13 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
         sorted_dirs.sort_by_key(|b| std::cmp::Reverse(b.len()));
 
         for rel_dir in sorted_dirs {
-            if !rel_dir.starts_with("node_modules/") {
-                continue;
-            }
-            let target_path = loc_base_dir.join(&rel_dir);
-            let is_junc = is_junction(&target_path).unwrap_or(false);
-            if target_path.exists() || is_junc {
-                // Remove shims from .bin if package had bin entries
-                let pkg_manifest_path = target_path.join("package.json");
-                if let Ok(pkg_manifest) = Manifest::from_file_readonly(&pkg_manifest_path) {
-                    for (bin_name, _) in pkg_manifest.bin_entries() {
-                        let shim_path = bin_dir.join(&bin_name);
-                        let _ = std::fs::remove_file(&shim_path);
-                        #[cfg(windows)]
-                        {
-                            let _ = std::fs::remove_file(bin_dir.join(format!("{bin_name}.cmd")));
-                            let _ = std::fs::remove_file(bin_dir.join(format!("{bin_name}.ps1")));
-                        }
-                    }
-                }
-
-                if is_junc {
-                    let _ = remove_junction(&target_path);
-                } else if target_path.is_dir() {
-                    let _ = rnpm_fs::remove_dir_all_safe(&target_path);
-                } else {
-                    let _ = std::fs::remove_file(&target_path);
-                }
-
-                // If parent is a scoped directory (e.g. @scope) and empty, remove it
-                if let Some(parent) = target_path.parent() {
-                    if let Some(parent_name) = parent.file_name().and_then(|n| n.to_str()) {
-                        if parent_name.starts_with('@') && parent.is_dir() {
-                            if let Ok(mut entries) = std::fs::read_dir(parent) {
-                                if entries.next().is_none() {
-                                    let _ = std::fs::remove_dir(parent);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
+            remove_validated_nm_package(
+                &loc_base_dir,
+                &node_modules_dir,
+                &bin_dir,
+                &rel_dir,
+                false,
+            );
         }
 
         // Clean up .bin if empty
@@ -11661,9 +12182,15 @@ pub fn prune_lockfile(lockfile: &mut LockfileV3, manifest: &Manifest) -> HashSet
         }
     }
 
-    // Workspace packages and links are entry points
+    // Workspace packages and workspace links are entry points; external file links
+    // (`node_modules/foo` with `link: true` not pointing at a workspace package)
+    // must remain reachable from a manifest dependency to survive pruning.
     for (key, pkg) in &lockfile.packages {
-        if !key.starts_with("node_modules/") || pkg.link == Some(true) {
+        let is_workspace_link = pkg.link == Some(true)
+            && pkg.resolved.as_deref().is_some_and(|target| {
+                !target.contains("node_modules/") && lockfile.packages.contains_key(target)
+            });
+        if !key.contains("node_modules/") || is_workspace_link {
             reachable_keys.insert(key.clone());
             queue.push_back(key.clone());
         }
@@ -11682,6 +12209,11 @@ pub fn prune_lockfile(lockfile: &mut LockfileV3, manifest: &Manifest) -> HashSet
             let mut all_deps = Vec::new();
             if let Some(deps) = &pkg.dependencies {
                 all_deps.extend(deps.keys().cloned());
+            }
+            if !current_key.contains("node_modules/") {
+                if let Some(dev_deps) = &pkg.dev_dependencies {
+                    all_deps.extend(dev_deps.keys().cloned());
+                }
             }
             if let Some(opt_deps) = &pkg.optional_dependencies {
                 all_deps.extend(opt_deps.keys().cloned());
@@ -11703,18 +12235,447 @@ pub fn prune_lockfile(lockfile: &mut LockfileV3, manifest: &Manifest) -> HashSet
         }
     }
 
-    // 3. Remove all unreachable keys (excluding "")
+    // 3. Remove all unreachable keys (excluding "" and workspace package entries)
     let mut pruned = HashSet::new();
     let all_keys: Vec<String> = lockfile.packages.keys().cloned().collect();
 
     for key in all_keys {
-        if !key.is_empty() && key.starts_with("node_modules/") && !reachable_keys.contains(&key) {
+        if !key.is_empty() && key.contains("node_modules/") && !reachable_keys.contains(&key) {
             lockfile.packages.remove(&key);
             pruned.insert(key);
         }
     }
 
     pruned
+}
+
+fn is_safe_bin_filename(bin_name: &str) -> bool {
+    !bin_name.is_empty()
+        && bin_name != "."
+        && bin_name != ".."
+        && !bin_name.contains('/')
+        && !bin_name.contains('\\')
+        && !bin_name.contains("..")
+        && !bin_name.contains(':')
+        && !bin_name.contains('\0')
+}
+
+/// Strictly verify that `rel_dir` refers to an exact package installation slot under a
+/// `node_modules` directory (e.g. `node_modules/pkg`, `node_modules/@scope/pkg`,
+/// `packages/ws/node_modules/pkg`, or nested `.../node_modules/a/node_modules/b`),
+/// rejecting substring matches (`foo_node_modules/bar`), `.bin`, or arbitrary paths.
+fn is_valid_package_slot(rel_dir: &str, require_root_nm: bool) -> bool {
+    if rel_dir.is_empty()
+        || rel_dir.starts_with('/')
+        || rel_dir.ends_with('/')
+        || rel_dir.contains("..")
+        || rel_dir.contains(':')
+        || rel_dir.contains('\\')
+        || rel_dir.contains('\0')
+    {
+        return false;
+    }
+    let segs: Vec<&str> = rel_dir.split('/').collect();
+    if segs.iter().any(|s| s.is_empty() || *s == "." || *s == "..") {
+        return false;
+    }
+    let Some(first_nm) = segs.iter().position(|&s| s == "node_modules") else {
+        return false;
+    };
+    if require_root_nm && first_nm != 0 {
+        return false;
+    }
+    let mut i = first_nm;
+    while i < segs.len() {
+        if segs[i] != "node_modules" {
+            return false;
+        }
+        i += 1;
+        if i >= segs.len() {
+            return false;
+        }
+        let first = segs[i];
+        if first.starts_with('@') {
+            if first.len() <= 1 || i + 1 >= segs.len() {
+                return false;
+            }
+            let pkg = segs[i + 1];
+            if pkg.is_empty() || pkg.starts_with('.') || pkg == "node_modules" {
+                return false;
+            }
+            i += 2;
+        } else {
+            if first.starts_with('.') || first == "node_modules" {
+                return false;
+            }
+            i += 1;
+        }
+    }
+    true
+}
+
+/// Return true iff no existing path component from `base` down through `path` (inclusive,
+/// or exclusive of the leaf when `include_leaf == false`) is a symlink or NTFS junction.
+fn has_no_symlink_components(base: &Path, path: &Path, include_leaf: bool) -> bool {
+    let clean_base = path_clean::clean(base);
+    let clean_path = path_clean::clean(path);
+    let Ok(rel) = clean_path.strip_prefix(&clean_base) else {
+        return false;
+    };
+    let comps: Vec<_> = rel.components().collect();
+    let check_len = if include_leaf {
+        comps.len()
+    } else {
+        comps.len().saturating_sub(1)
+    };
+    let mut cursor = clean_base;
+    for comp in &comps[..check_len] {
+        cursor.push(comp.as_os_str());
+        if let Ok(meta) = std::fs::symlink_metadata(&cursor) {
+            if meta.file_type().is_symlink() || is_junction(&cursor).unwrap_or(false) {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// Verify that `target_bin_dir` lies under `loc_base_dir` and neither `target_bin_dir`
+/// itself nor any ancestor between `loc_base_dir` and `target_bin_dir` is a symlink/junction.
+fn validate_safe_bin_dir(loc_base_dir: &Path, target_bin_dir: &Path) -> bool {
+    let clean_base = path_clean::clean(loc_base_dir);
+    let clean_bin = path_clean::clean(target_bin_dir);
+    clean_bin.starts_with(&clean_base)
+        && clean_bin != clean_base
+        && has_no_symlink_components(&clean_base, &clean_bin, true)
+}
+
+/// Validate that a relative package removal/link path is a genuine package slot strictly
+/// under `loc_base_dir`, contains no traversal/illegal path components, and traverses no
+/// symlink or NTFS junction ancestors that could redirect operations outside.
+fn validate_safe_nm_removal_path(
+    loc_base_dir: &Path,
+    rel_dir: &str,
+    require_root_nm: bool,
+) -> Option<PathBuf> {
+    if !is_valid_package_slot(rel_dir, require_root_nm) {
+        return None;
+    }
+    if rnpm_fs::validate_entry_path(Path::new(rel_dir)).is_err() {
+        return None;
+    }
+    let clean_base = path_clean::clean(loc_base_dir);
+    let target_path = path_clean::clean(clean_base.join(rel_dir));
+    if !target_path.starts_with(&clean_base) || target_path == clean_base {
+        return None;
+    }
+    if require_root_nm {
+        let clean_nm = clean_base.join("node_modules");
+        if !target_path.starts_with(&clean_nm) || target_path == clean_nm {
+            return None;
+        }
+    }
+    if !has_no_symlink_components(&clean_base, &target_path, false) {
+        return None;
+    }
+    Some(target_path)
+}
+
+fn manifest_declares_file_target(
+    manifest_dir: &Path,
+    manifest: &Manifest,
+    cleaned_target: &Path,
+) -> Option<PathBuf> {
+    let clean_base = path_clean::clean(manifest_dir);
+    manifest
+        .dependencies
+        .values()
+        .chain(manifest.dev_dependencies.values())
+        .chain(manifest.optional_dependencies.values())
+        .chain(manifest.peer_dependencies.values())
+        .filter_map(|spec| spec.strip_prefix("file:"))
+        .find_map(|rel| {
+            let rel_trimmed = rel.trim();
+            if rel_trimmed.contains('\0') {
+                return None;
+            }
+            let authorized = path_clean::clean(clean_base.join(rel_trimmed));
+            (authorized == cleaned_target).then_some(authorized)
+        })
+}
+
+/// Verify that if `target_dir` exists on disk, its canonical target matches `authorized_path`
+/// (or stays inside `canon_bound` with no symlink escapes when verifying an in-project path).
+fn verify_canonical_link_target(target_dir: &Path, authorized_path: &Path) -> bool {
+    match (target_dir.canonicalize(), authorized_path.canonicalize()) {
+        (Ok(ct), Ok(ca)) => ct == ca,
+        (Err(e1), Err(e2))
+            if e1.kind() == std::io::ErrorKind::NotFound
+                && e2.kind() == std::io::ErrorKind::NotFound =>
+        {
+            true
+        }
+        _ => false,
+    }
+}
+
+fn is_trusted_link_target(
+    project_dir: &Path,
+    root_manifest: &Manifest,
+    workspace_members: &[rnpm_core::workspace::WorkspaceMember],
+    lockfile: &LockfileV3,
+    pkg_key: &str,
+    target_rel: &str,
+    target_dir: &Path,
+) -> bool {
+    let clean_proj = path_clean::clean(project_dir);
+    let cleaned_target = path_clean::clean(target_dir);
+
+    // 1. Self-link pointing at the root project itself.
+    if target_rel.is_empty() || cleaned_target == clean_proj {
+        let expected_name = root_manifest
+            .name
+            .as_deref()
+            .or((!lockfile.name.is_empty()).then_some(lockfile.name.as_str()));
+        let link_name = pkg_key
+            .rsplit_once("node_modules/")
+            .map(|(_, name)| name)
+            .unwrap_or(pkg_key);
+        if expected_name.is_some_and(|n| n == link_name)
+            && verify_canonical_link_target(target_dir, &clean_proj)
+        {
+            return true;
+        }
+    }
+
+    // 2. Discovered workspace member or path matching declared root `workspaces` patterns
+    //    (npm 11.20.0 allows absent workspace folders declared in `package-lock.json`),
+    //    rejecting any symlink/junction component that redirects outside `project_dir`.
+    if let Some(ws_member) = workspace_members
+        .iter()
+        .find(|m| path_clean::clean(&m.path) == cleaned_target)
+    {
+        if has_no_symlink_components(&clean_proj, &cleaned_target, true)
+            && verify_canonical_link_target(target_dir, &ws_member.path)
+        {
+            return true;
+        }
+    }
+    if cleaned_target.starts_with(&clean_proj)
+        && cleaned_target != clean_proj
+        && has_no_symlink_components(&clean_proj, &cleaned_target, true)
+        && root_manifest.workspaces.as_ref().is_some_and(|ws| {
+            let patterns = match ws {
+                rnpm_core::manifest::PackageWorkspaces::List(p) => p.as_slice(),
+                rnpm_core::manifest::PackageWorkspaces::Config { packages } => packages.as_slice(),
+            };
+            rnpm_core::workspace::path_matches_workspace_patterns(target_rel, patterns)
+        })
+    {
+        if let Ok(canon_proj) = clean_proj.canonicalize() {
+            let canon_ok = match target_dir.canonicalize() {
+                Ok(ct) => ct.starts_with(&canon_proj),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
+                Err(_) => false,
+            };
+            if canon_ok {
+                return true;
+            }
+        }
+    }
+
+    // 3. Explicitly declared `file:` dependency in the root manifest or a workspace manifest.
+    if let Some(auth) = manifest_declares_file_target(&clean_proj, root_manifest, &cleaned_target) {
+        if verify_canonical_link_target(target_dir, &auth) {
+            return true;
+        }
+    }
+    for ws in workspace_members {
+        if let Some(auth) = manifest_declares_file_target(&ws.path, &ws.manifest, &cleaned_target) {
+            if verify_canonical_link_target(target_dir, &auth) {
+                return true;
+            }
+        }
+    }
+
+    // 4. Transitive in-project `file:` dependency verified against the parent package's actual
+    //    on-disk `package.json` manifest (never trusting lockfile self-authorization) with
+    //    no symlink/junction escapes outside `project_dir`.
+    if cleaned_target.starts_with(&clean_proj)
+        && cleaned_target != clean_proj
+        && has_no_symlink_components(&clean_proj, &cleaned_target, true)
+    {
+        if let Ok(canon_proj) = clean_proj.canonicalize() {
+            let target_canon_ok = match target_dir.canonicalize() {
+                Ok(ct) => ct.starts_with(&canon_proj),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
+                Err(_) => false,
+            };
+            if target_canon_ok {
+                for (entry_key, entry_pkg) in &lockfile.packages {
+                    if entry_key.is_empty()
+                        || entry_pkg.link == Some(true)
+                        || entry_key.contains("..")
+                        || entry_key.contains('\0')
+                    {
+                        continue;
+                    }
+                    let entry_base = path_clean::clean(clean_proj.join(entry_key));
+                    if !entry_base.starts_with(&clean_proj)
+                        || !has_no_symlink_components(&clean_proj, &entry_base, true)
+                    {
+                        continue;
+                    }
+                    let parent_manifest_path = entry_base.join("package.json");
+                    if let Ok(parent_manifest) =
+                        Manifest::from_file_readonly(&parent_manifest_path)
+                    {
+                        if let Some(auth) = manifest_declares_file_target(
+                            &entry_base,
+                            &parent_manifest,
+                            &cleaned_target,
+                        ) {
+                            if verify_canonical_link_target(target_dir, &auth) {
+                                return true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    false
+}
+
+/// BFS reachability over `scope_dir/node_modules` for lockfile-less `rnpm uninstall`:
+/// starts from `root_seeds` plus every retained non-candidate package and traverses
+/// through any reached candidate packages' own manifests so transitive deps of retained
+/// packages (e.g. retained C -> candidate B -> candidate A) are preserved.
+fn collect_reachable_packages_in_scope(
+    scope_dir: &Path,
+    root_seeds: &[String],
+    candidate_pkg_names: &HashSet<String>,
+) -> HashSet<String> {
+    let mut pkg_dirs_by_name: HashMap<String, Vec<PathBuf>> = HashMap::new();
+    let mut retained_top_level: Vec<String> = Vec::new();
+    for rel_path in crate::prune::scan_node_modules(scope_dir).unwrap_or_default() {
+        let Some(pkg_name) = rel_path
+            .rsplit_once("node_modules/")
+            .map(|(_, name)| name.to_string())
+        else {
+            continue;
+        };
+        let is_top_level = rel_path == format!("node_modules/{pkg_name}");
+        if is_top_level && !candidate_pkg_names.contains(&pkg_name) {
+            retained_top_level.push(pkg_name.clone());
+        }
+        pkg_dirs_by_name
+            .entry(pkg_name)
+            .or_default()
+            .push(scope_dir.join(&rel_path));
+    }
+
+    let mut reachable: HashSet<String> = HashSet::new();
+    let mut queue: VecDeque<String> = VecDeque::new();
+    for seed in root_seeds.iter().chain(retained_top_level.iter()) {
+        if reachable.insert(seed.clone()) {
+            queue.push_back(seed.clone());
+        }
+    }
+
+    while let Some(current_pkg) = queue.pop_front() {
+        if let Some(dirs) = pkg_dirs_by_name.get(&current_pkg) {
+            for dir in dirs {
+                if let Ok(dep_manifest) = Manifest::from_file_readonly(dir.join("package.json")) {
+                    for dep in dep_manifest
+                        .dependencies
+                        .keys()
+                        .chain(dep_manifest.optional_dependencies.keys())
+                        .chain(dep_manifest.peer_dependencies.keys())
+                    {
+                        if reachable.insert(dep.clone()) {
+                            queue.push_back(dep.clone());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    reachable
+}
+
+/// Remove a validated package directory and its shims from its enclosing `.bin` directory,
+/// never following symlinks or junctions on either the package ancestors or `.bin`.
+fn remove_validated_nm_package(
+    loc_base_dir: &Path,
+    node_modules_dir: &Path,
+    root_bin_dir: &Path,
+    rel_dir: &str,
+    require_root_nm: bool,
+) {
+    let Some(target_path) = validate_safe_nm_removal_path(loc_base_dir, rel_dir, require_root_nm)
+    else {
+        warn!("Skipping unsafe package removal path '{rel_dir}'");
+        return;
+    };
+    let is_junc = is_junction(&target_path).unwrap_or(false);
+    if target_path.exists() || is_junc {
+        let pkg_bin_dir =
+            crate::link::find_enclosing_bin_dir(&target_path, root_bin_dir, node_modules_dir);
+        if validate_safe_bin_dir(loc_base_dir, &pkg_bin_dir) {
+            if let Ok(pkg_manifest) =
+                Manifest::from_file_readonly(target_path.join("package.json"))
+            {
+                for (bin_name, _) in pkg_manifest.bin_entries() {
+                    if !is_safe_bin_filename(&bin_name) {
+                        continue;
+                    }
+                    let _ = std::fs::remove_file(pkg_bin_dir.join(&bin_name));
+                    #[cfg(windows)]
+                    {
+                        let _ = std::fs::remove_file(pkg_bin_dir.join(format!("{bin_name}.cmd")));
+                        let _ = std::fs::remove_file(pkg_bin_dir.join(format!("{bin_name}.ps1")));
+                    }
+                }
+            }
+        }
+        if is_junc {
+            let _ = remove_junction(&target_path);
+        } else if target_path.is_dir() {
+            let _ = rnpm_fs::remove_dir_all_safe(&target_path);
+        } else {
+            let _ = std::fs::remove_file(&target_path);
+        }
+        // Clean up empty parent `@scope` directory if applicable.
+        if let Some(parent) = target_path.parent() {
+            if let Some(parent_name) = parent.file_name().and_then(|n| n.to_str()) {
+                if parent_name.starts_with('@') && parent.is_dir() {
+                    if let Ok(mut entries) = std::fs::read_dir(parent) {
+                        if entries.next().is_none() {
+                            let _ = std::fs::remove_dir(parent);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Unlinks `path` if it is a symlink or NTFS junction without touching its target.
+fn unlink_symlinked_dir(path: &Path) -> Result<()> {
+    if rnpm_fs::is_junction(path).unwrap_or(false)
+        || std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink())
+    {
+        rnpm_fs::remove_junction(path).with_context(|| {
+            format!(
+                "Failed to unlink symlinked directory at {}",
+                path.display()
+            )
+        })?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]

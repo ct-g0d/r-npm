@@ -997,7 +997,9 @@ impl<'a> BodySink<'a> {
                 max_size,
             })
         } else {
-            let cap = expected_len.map(|l| l as usize).unwrap_or(0);
+            let cap = expected_len
+                .map(|l| (l as usize).min(4 * 1024 * 1024))
+                .unwrap_or(0);
             Ok(Self {
                 mem: Some(Vec::with_capacity(cap)),
                 file: None,

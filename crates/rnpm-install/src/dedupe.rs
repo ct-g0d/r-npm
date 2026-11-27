@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use crate::prune::{extract_package_name_from_path, scan_node_modules};
@@ -265,13 +265,23 @@ pub fn execute_dedupe(options: &DedupeOptions) -> Result<DedupeSummary> {
                 deps.insert(d.clone(), r.clone());
                 req_entry.insert(d.clone(), r.clone());
             }
+            for (d, r) in &m.peer_dependencies {
+                deps.entry(d.clone()).or_insert_with(|| r.clone());
+                req_entry.entry(d.clone()).or_insert_with(|| r.clone());
+            }
         } else if let Some(ref l) = lockfile {
             if let Some(lp) = l.get_package(pkg_rel_path) {
+                let req_entry = requirements_map.entry(pkg_rel_path.clone()).or_default();
                 if let Some(ref d_map) = lp.dependencies {
-                    let req_entry = requirements_map.entry(pkg_rel_path.clone()).or_default();
                     for (d, r) in d_map {
                         deps.insert(d.clone(), r.clone());
                         req_entry.insert(d.clone(), r.clone());
+                    }
+                }
+                if let Some(ref p_map) = lp.peer_dependencies {
+                    for (d, r) in p_map {
+                        deps.entry(d.clone()).or_insert_with(|| r.clone());
+                        req_entry.entry(d.clone()).or_insert_with(|| r.clone());
                     }
                 }
             }
@@ -294,11 +304,11 @@ pub fn execute_dedupe(options: &DedupeOptions) -> Result<DedupeSummary> {
         );
     }
 
-    // 4. Group packages by package_name to find duplicates across nesting levels
-    let mut by_name: HashMap<String, Vec<InstalledPackage>> = HashMap::new();
+    // 4. Group packages by package_name to find duplicates across nesting levels (deterministic order)
+    let mut by_name: BTreeMap<String, Vec<InstalledPackage>> = BTreeMap::new();
     for pkg in installed_map.values() {
-        // Skip symlinks / workspace junctions from deduplication
-        if pkg.is_link {
+        // Skip symlinks / workspace junctions AND aliased installs (folder name != package name)
+        if pkg.is_link || extract_package_name_from_path(&pkg.path) != pkg.name {
             continue;
         }
 
@@ -323,6 +333,24 @@ pub fn execute_dedupe(options: &DedupeOptions) -> Result<DedupeSummary> {
 
     let mut actions = Vec::new();
     let mut already_removed: HashSet<String> = HashSet::new();
+
+    // Check whether an intermediate ancestor package between `parent_path` and root `""`
+    // holds a different, unremoved copy of `pkg_name` that would shadow root `node_modules/<pkg>`.
+    let is_shadowed_by_ancestor =
+        |parent_path: &str,
+         pkg_name: &str,
+         installed: &HashMap<String, InstalledPackage>,
+         removed: &HashSet<String>| {
+            let mut cur = get_parent_location(parent_path);
+            while !cur.is_empty() {
+                let candidate = format!("{cur}/node_modules/{pkg_name}");
+                if installed.contains_key(&candidate) && !removed.contains(&candidate) {
+                    return true;
+                }
+                cur = get_parent_location(&cur);
+            }
+            false
+        };
 
     let dep_graph = lockfile
         .as_ref()
@@ -399,7 +427,14 @@ pub fn execute_dedupe(options: &DedupeOptions) -> Result<DedupeSummary> {
                     false
                 };
 
-                if satisfies {
+                if satisfies
+                    && !is_shadowed_by_ancestor(
+                        &nested.parent_path,
+                        &pkg_name,
+                        &installed_map,
+                        &already_removed,
+                    )
+                {
                     actions.push(DedupeAction {
                         package_name: pkg_name.clone(),
                         original_path: nested.path.clone(),
@@ -416,6 +451,14 @@ pub fn execute_dedupe(options: &DedupeOptions) -> Result<DedupeSummary> {
             }
         } else {
             // Scenario 2: Root node_modules/<pkg> is VACANT.
+            // Skip hoisting if something else (e.g. a symlink/junction or alias) already occupies `root_install_path`.
+            let root_target_disk = project_dir.join(&root_install_path);
+            if installed_map.contains_key(&root_install_path)
+                || root_target_disk.exists()
+                || is_junction(&root_target_disk).unwrap_or(false)
+            {
+                continue;
+            }
             // Multiple nested copies exist. Find if a satisfying version can be hoisted
             // to the shallowest level (root node_modules/<pkg>).
             // First collect all requirements that would look up root_install_path:
@@ -445,43 +488,114 @@ pub fn execute_dedupe(options: &DedupeOptions) -> Result<DedupeSummary> {
                 v_b.cmp(&v_a)
             });
 
-            if let Some(best_candidate) = candidates.first() {
-                let best_ver = best_candidate.version.clone().unwrap_or_default();
-                if best_ver.is_empty() {
-                    continue;
-                }
+            // Verify every outgoing dependency of a hoist candidate will still resolve to a
+            // compatible version once the candidate moves from its nested parent to root.
+            let outgoing_deps_safe_at_root = |cand: &InstalledPackage| -> bool {
+                for (dep_name, dep_range) in &cand.dependencies {
+                    // Own nested dependency moves along with `cand` when hoisted.
+                    let own_nested = format!("{}/node_modules/{dep_name}", cand.path);
+                    if installed_map.contains_key(&own_nested)
+                        && !already_removed.contains(&own_nested)
+                    {
+                        continue;
+                    }
 
-                // Check if best_ver satisfies all other nested instances' consumers
-                let all_satisfied = if let Some(ref incoming_map) = incoming_edges_by_target {
+                    // Check whether `dep_name` was resolvable in `cand`'s original ancestor chain.
+                    let mut resolved_originally = false;
+                    let mut scope = cand.parent_path.clone();
+                    loop {
+                        let probe = if scope.is_empty() {
+                            format!("node_modules/{dep_name}")
+                        } else {
+                            format!("{scope}/node_modules/{dep_name}")
+                        };
+                        if installed_map.contains_key(&probe) {
+                            resolved_originally = true;
+                            break;
+                        }
+                        if scope.is_empty() {
+                            break;
+                        }
+                        scope = get_parent_location(&scope);
+                    }
+                    if !resolved_originally {
+                        // Uninstalled optional dependency; hoisting cannot regress it.
+                        continue;
+                    }
+
+                    // At root `node_modules/<pkg>`, Node only resolves from root `node_modules/<dep>`.
+                    let root_dep_key = format!("node_modules/{dep_name}");
+                    let root_dep_ver = installed_map
+                        .get(&root_dep_key)
+                        .filter(|_| !already_removed.contains(&root_dep_key))
+                        .and_then(|p| p.version.as_deref())
+                        .or_else(|| {
+                            actions.iter().find_map(|a| {
+                                (a.action_type == DedupeActionType::HoistAndDedupe
+                                    && a.target_path == root_dep_key)
+                                    .then_some(a.version.as_str())
+                            })
+                        });
+                    let Some(ver) = root_dep_ver else {
+                        return false;
+                    };
+                    if !version_matches_range(ver, dep_range) {
+                        return false;
+                    }
+                }
+                true
+            };
+
+            let chosen = candidates.into_iter().find(|cand| {
+                let Some(ref cand_ver) = cand.version else {
+                    return false;
+                };
+                if cand_ver.is_empty() {
+                    return false;
+                }
+                if is_shadowed_by_ancestor(
+                    &cand.parent_path,
+                    &pkg_name,
+                    &installed_map,
+                    &already_removed,
+                ) {
+                    return false;
+                }
+                if !outgoing_deps_safe_at_root(cand) {
+                    return false;
+                }
+                if let Some(ref incoming_map) = incoming_edges_by_target {
                     instances.iter().all(|nested| {
                         let incoming = incoming_map
                             .get(nested.path.as_str())
                             .map(|v| v.as_slice())
                             .unwrap_or(&[]);
                         if incoming.is_empty() {
-                            if let Some(req_range) = get_req_range(&nested.parent_path, &pkg_name)
-                            {
-                                version_matches_range(&best_ver, req_range)
+                            if let Some(req_range) = get_req_range(&nested.parent_path, &pkg_name) {
+                                version_matches_range(cand_ver, req_range)
                             } else {
                                 false
                             }
                         } else {
                             incoming
                                 .iter()
-                                .all(|e| version_matches_range(&best_ver, &e.spec))
+                                .all(|e| version_matches_range(cand_ver, &e.spec))
                         }
                     })
                 } else {
                     instances.iter().all(|nested| {
                         if let Some(req_range) = get_req_range(&nested.parent_path, &pkg_name) {
-                            version_matches_range(&best_ver, req_range)
+                            version_matches_range(cand_ver, req_range)
                         } else {
                             false
                         }
                     })
-                };
+                }
+            });
 
-                if all_satisfied {
+            if let Some(best_candidate) = chosen {
+                let best_ver = best_candidate.version.clone().unwrap_or_default();
+                {
                     // Hoist best_candidate to root
                     actions.push(DedupeAction {
                         package_name: pkg_name.clone(),
@@ -496,12 +610,20 @@ pub fn execute_dedupe(options: &DedupeOptions) -> Result<DedupeSummary> {
                     });
                     already_removed.insert(best_candidate.path.clone());
 
-                    // Delete other redundant nested copies
+                    // Delete other redundant nested copies (unless shadowed by an intermediate copy)
                     for other in &instances {
                         if other.path == best_candidate.path {
                             continue;
                         }
                         if already_removed.contains(&other.path) {
+                            continue;
+                        }
+                        if is_shadowed_by_ancestor(
+                            &other.parent_path,
+                            &pkg_name,
+                            &installed_map,
+                            &already_removed,
+                        ) {
                             continue;
                         }
 
@@ -523,6 +645,48 @@ pub fn execute_dedupe(options: &DedupeOptions) -> Result<DedupeSummary> {
         }
     }
 
+    // Never delete a nested package in `DeleteDuplicate` if it still hosts surviving
+    // nested `node_modules` children that were not themselves deleted or hoisted away,
+    // and drop any deeper `DeleteDuplicate` that becomes shadowed by a retained parent.
+    loop {
+        let mut to_drop: HashSet<String> = HashSet::new();
+        for a in actions
+            .iter()
+            .filter(|a| a.action_type == DedupeActionType::DeleteDuplicate)
+        {
+            let child_prefix = format!("{}/node_modules/", a.original_path);
+            let has_surviving_child = installed_map.keys().any(|k| {
+                k.starts_with(&child_prefix)
+                    && !already_removed.contains(k)
+                    && !actions.iter().any(|h| {
+                        h.action_type == DedupeActionType::HoistAndDedupe
+                            && (k == &h.original_path
+                                || k.starts_with(&format!("{}/", h.original_path)))
+                    })
+            });
+            let parent_path = get_parent_location(&a.original_path);
+            let shadowed_after_drop = is_shadowed_by_ancestor(
+                &parent_path,
+                &a.package_name,
+                &installed_map,
+                &already_removed,
+            );
+            if has_surviving_child || shadowed_after_drop {
+                to_drop.insert(a.original_path.clone());
+            }
+        }
+        if to_drop.is_empty() {
+            break;
+        }
+        for dropped in &to_drop {
+            already_removed.remove(dropped);
+        }
+        actions.retain(|a| {
+            !(a.action_type == DedupeActionType::DeleteDuplicate
+                && to_drop.contains(&a.original_path))
+        });
+    }
+
     // 6. Apply actions to filesystem and lockfile (unless dry-run)
     let mut summary = DedupeSummary {
         removed_packages: Vec::new(),
@@ -531,49 +695,120 @@ pub fn execute_dedupe(options: &DedupeOptions) -> Result<DedupeSummary> {
     };
 
     if !options.dry_run {
-        for action in &actions {
-            match action.action_type {
-                DedupeActionType::HoistAndDedupe => {
-                    let src_full = project_dir.join(&action.original_path);
-                    let dst_full = project_dir.join(&action.target_path);
+        // Apply HoistAndDedupe deepest-first so nested children are re-homed before
+        // outer ancestor directories move, and record path remaps for subsequent moves/deletes.
+        let mut hoist_actions: Vec<&DedupeAction> = actions
+            .iter()
+            .filter(|a| a.action_type == DedupeActionType::HoistAndDedupe)
+            .collect();
+        hoist_actions.sort_by(|a, b| {
+            b.original_path
+                .len()
+                .cmp(&a.original_path.len())
+                .then_with(|| a.original_path.cmp(&b.original_path))
+        });
 
-                    if src_full.exists() {
-                        move_or_copy_directory(&src_full, &dst_full)?;
-                        clean_empty_ancestor_dirs(
-                            src_full.parent().unwrap_or(&src_full).to_path_buf(),
-                            &node_modules_dir,
-                        );
-                    }
-
-                    // Update lockfile: move entry to hoisted location
-                    if let Some(ref mut l) = lockfile {
-                        if let Some(pkg_meta) = l.remove_package(&action.original_path) {
-                            l.insert_package(&action.target_path, pkg_meta);
-                        }
-                    }
-
-                    summary
-                        .hoisted_packages
-                        .push((action.original_path.clone(), action.target_path.clone()));
-                }
-                DedupeActionType::DeleteDuplicate => {
-                    let src_full = project_dir.join(&action.original_path);
-                    if src_full.exists() || is_junction(&src_full).unwrap_or(false) {
-                        remove_dir_all_safe(&src_full)?;
-                        clean_empty_ancestor_dirs(
-                            src_full.parent().unwrap_or(&src_full).to_path_buf(),
-                            &node_modules_dir,
-                        );
-                    }
-
-                    // Update lockfile: remove nested entry
-                    if let Some(ref mut l) = lockfile {
-                        l.remove_package(&action.original_path);
-                    }
-
-                    summary.removed_packages.push(action.original_path.clone());
+        let remap_path = |orig: &str, remaps: &[(String, String)]| -> String {
+            let mut cur = orig.to_string();
+            for (old_p, new_p) in remaps {
+                if cur == *old_p {
+                    cur = new_p.clone();
+                } else if let Some(suffix) = cur.strip_prefix(&format!("{old_p}/")) {
+                    cur = format!("{new_p}/{suffix}");
                 }
             }
+            cur
+        };
+
+        let mut hoist_remaps: Vec<(String, String)> = Vec::new();
+        for action in hoist_actions {
+            let effective_src = remap_path(&action.original_path, &hoist_remaps);
+            let src_full = project_dir.join(&effective_src);
+            let dst_full = project_dir.join(&action.target_path);
+
+            if dst_full.exists() || is_junction(&dst_full).unwrap_or(false) {
+                continue;
+            }
+
+            if src_full.exists() {
+                move_or_copy_directory(&src_full, &dst_full)?;
+                clean_empty_ancestor_dirs(
+                    src_full.parent().unwrap_or(&src_full).to_path_buf(),
+                    &node_modules_dir,
+                );
+            }
+
+            // Update lockfile: move the hoisted entry AND all nested sub-entries under its prefix
+            if let Some(ref mut l) = lockfile {
+                let prefix = format!("{effective_src}/");
+                let keys_to_move: Vec<String> = l
+                    .packages
+                    .keys()
+                    .filter(|k| *k == &effective_src || k.starts_with(&prefix))
+                    .cloned()
+                    .collect();
+                for old_key in keys_to_move {
+                    if let Some(pkg_meta) = l.remove_package(&old_key) {
+                        let new_key = if old_key == effective_src {
+                            action.target_path.clone()
+                        } else {
+                            let suffix = &old_key[effective_src.len()..];
+                            format!("{}{}", action.target_path, suffix)
+                        };
+                        l.insert_package(&new_key, pkg_meta);
+                    }
+                }
+            }
+
+            hoist_remaps.push((effective_src, action.target_path.clone()));
+            summary
+                .hoisted_packages
+                .push((action.original_path.clone(), action.target_path.clone()));
+        }
+
+        let mut delete_actions: Vec<&DedupeAction> = actions
+            .iter()
+            .filter(|a| a.action_type == DedupeActionType::DeleteDuplicate)
+            .collect();
+        delete_actions.sort_by(|a, b| {
+            b.original_path
+                .len()
+                .cmp(&a.original_path.len())
+                .then_with(|| a.original_path.cmp(&b.original_path))
+        });
+
+        for action in delete_actions {
+            let effective_src = remap_path(&action.original_path, &hoist_remaps);
+            let src_full = project_dir.join(&effective_src);
+            // Defense-in-depth: skip deletion if any surviving child directory remains inside `node_modules`
+            let nested_nm = src_full.join("node_modules");
+            let has_live_disk_child = nested_nm.is_dir()
+                && std::fs::read_dir(&nested_nm)
+                    .into_iter()
+                    .flatten()
+                    .flatten()
+                    .any(|e| {
+                        let name = e.file_name();
+                        let name_str = name.to_string_lossy();
+                        name_str != ".bin" && (e.path().is_dir() || is_junction(&e.path()).unwrap_or(false))
+                    });
+            if has_live_disk_child {
+                continue;
+            }
+            if src_full.exists() || is_junction(&src_full).unwrap_or(false) {
+                remove_dir_all_safe(&src_full)?;
+                clean_empty_ancestor_dirs(
+                    src_full.parent().unwrap_or(&src_full).to_path_buf(),
+                    &node_modules_dir,
+                );
+            }
+
+            // Update lockfile: remove nested entry
+            if let Some(ref mut l) = lockfile {
+                l.remove_package(&effective_src);
+            }
+
+            summary.removed_packages.push(action.original_path.clone());
         }
 
         // Persist updated lockfiles

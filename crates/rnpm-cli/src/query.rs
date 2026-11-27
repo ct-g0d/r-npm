@@ -233,11 +233,36 @@ fn tokenize_selector(s: &str) -> Result<Vec<String>, String> {
                 tokens.push(std::mem::take(&mut current));
             }
             let mut bracket = String::new();
+            let mut quote: Option<char> = None;
+            let mut escaped = false;
+            let mut closed = false;
             for b in chars.by_ref() {
                 bracket.push(b);
-                if b == ']' {
-                    break;
+                if escaped {
+                    escaped = false;
+                    continue;
                 }
+                if quote.is_some() && b == '\\' {
+                    escaped = true;
+                    continue;
+                }
+                if let Some(q) = quote {
+                    if b == q {
+                        quote = None;
+                    }
+                    continue;
+                }
+                match b {
+                    '"' | '\'' => quote = Some(b),
+                    ']' => {
+                        closed = true;
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            if !closed || quote.is_some() {
+                return Err(format!("Unclosed attribute selector: {bracket}"));
             }
             tokens.push(bracket);
         } else if ch == ':' {
@@ -267,18 +292,28 @@ fn tokenize_selector(s: &str) -> Result<Vec<String>, String> {
             }
             tokens.push(pseudo);
         } else if ch == '.' {
-            if !current.is_empty() {
-                tokens.push(std::mem::take(&mut current));
-            }
             chars.next(); // consume '.'
-            let mut class_name = String::from(".");
+            let mut seg = String::new();
             while let Some(&c) = chars.peek() {
                 if c == ' ' || c == '>' || c == '~' || c == '+' || c == '[' || c == ':' || c == '.' {
                     break;
                 }
-                class_name.push(chars.next().unwrap());
+                seg.push(chars.next().unwrap());
             }
-            tokens.push(class_name);
+            let is_dep_class = matches!(
+                seg.as_str(),
+                "dev" | "optional" | "peer" | "prod" | "workspace"
+            );
+            if !current.is_empty() && !seg.is_empty() && !is_dep_class {
+                // Dotted package names such as `lodash.debounce` or `#socket.io`
+                current.push('.');
+                current.push_str(&seg);
+            } else {
+                if !current.is_empty() {
+                    tokens.push(std::mem::take(&mut current));
+                }
+                tokens.push(format!(".{seg}"));
+            }
         } else if ch == '>' {
             if !current.is_empty() {
                 tokens.push(std::mem::take(&mut current));
@@ -379,10 +414,13 @@ fn parse_attribute_selector(s: &str) -> Result<SimpleSelector, String> {
                 _ => (value, false),
             };
             let mut val = value.to_string();
-            if (val.starts_with('"') && val.ends_with('"'))
-                || (val.starts_with('\'') && val.ends_with('\''))
+            if val.len() >= 2
+                && ((val.starts_with('"') && val.ends_with('"'))
+                    || (val.starts_with('\'') && val.ends_with('\'')))
             {
                 val = val[1..val.len() - 1].to_string();
+            } else if val.starts_with('"') || val.starts_with('\'') {
+                return Err(format!("Unclosed quote in attribute selector: {s}"));
             }
             return Ok(SimpleSelector::Attribute {
                 name,
@@ -930,5 +968,49 @@ mod tests {
         let q_plus = QuerySelector::parse("[name=a] + [name=b]").unwrap();
         assert!(matches_query(&q_plus, &b, &map));
         assert!(!matches_query(&q_plus, &a, &map));
+    }
+
+    #[test]
+    fn test_query_unclosed_quote_no_panic_and_dotted_package_names() {
+        // Must return Err rather than panicking on `[a="]` or unclosed brackets/quotes
+        assert!(QuerySelector::parse(r#"[a="]"#).is_err());
+        assert!(QuerySelector::parse(r#"[a=']"#).is_err());
+        assert!(QuerySelector::parse(r#"[a="#).is_err());
+        assert!(parse_attribute_selector(r#"a=""#).is_err());
+
+        // Escaped / bracketed quoted values still parse cleanly
+        let q_bracket = QuerySelector::parse(r#"[name="a]b"]"#).unwrap();
+        assert_eq!(
+            q_bracket.selectors[0].head.simple[0],
+            SimpleSelector::Attribute {
+                name: "name".to_string(),
+                op: Some(AttrOp::Exact),
+                val: Some("a]b".to_string()),
+                insensitive: false,
+            }
+        );
+
+        // Dotted package names must not be split into invalid Class selectors
+        let q_dotted = QuerySelector::parse("lodash.debounce").unwrap();
+        assert_eq!(
+            q_dotted.selectors[0].head.simple[0],
+            SimpleSelector::Type("lodash.debounce".to_string())
+        );
+
+        let q_hash_dotted = QuerySelector::parse("#socket.io").unwrap();
+        assert_eq!(
+            q_hash_dotted.selectors[0].head.simple[0],
+            SimpleSelector::Type("socket.io".to_string())
+        );
+
+        // Dependency-type classes like `.dev` on a package selector still split cleanly
+        let q_dep_class = QuerySelector::parse("react.dev").unwrap();
+        assert_eq!(
+            q_dep_class.selectors[0].head.simple,
+            vec![
+                SimpleSelector::Type("react".to_string()),
+                SimpleSelector::Class("dev".to_string()),
+            ]
+        );
     }
 }

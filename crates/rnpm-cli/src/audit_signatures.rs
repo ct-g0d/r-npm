@@ -175,6 +175,7 @@ pub async fn run(project_dir: &Path, json_output: bool) -> anyhow::Result<()> {
 
     let warn = !matches!(config.get("loglevel"), Some("silent" | "error"));
     let mut keys: HashMap<String, Vec<RegistryKey>> = HashMap::new();
+    let mut key_tasks = tokio::task::JoinSet::new();
     for registry in &registries {
         // npm reads registry.npmjs.org's keys from Sigstore's TUF repository
         // and any other registry's from its keys endpoint.
@@ -184,8 +185,17 @@ pub async fn run(project_dir: &Path, json_output: bool) -> anyhow::Result<()> {
                 "npm warn Fetching verification keys using TUF failed.  Fetching directly from {registry}."
             );
         }
-        if let Some(found) = fetch_keys(&client, &url).await? {
-            keys.insert(registry.clone(), found);
+        let client_c = client.clone();
+        let reg_c = registry.clone();
+        key_tasks.spawn(async move {
+            let found = fetch_keys(&client_c, &url).await?;
+            Ok::<_, anyhow::Error>((reg_c, found))
+        });
+    }
+    while let Some(res) = key_tasks.join_next().await {
+        let (registry, found) = res.map_err(|e| anyhow!("Signature key fetch panicked: {e}"))??;
+        if let Some(found) = found {
+            keys.insert(registry, found);
         }
     }
 
@@ -196,6 +206,24 @@ pub async fn run(project_dir: &Path, json_output: bool) -> anyhow::Result<()> {
     let mut invalid: Vec<Value> = Vec::new();
     let mut missing: Vec<Value> = Vec::new();
     let mut packuments: HashMap<String, AbbreviatedPackageMetadata> = HashMap::new();
+    let unique_names: BTreeSet<String> = packages.iter().map(|p| p.name.clone()).collect();
+    if !unique_names.is_empty() {
+        let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(16));
+        let mut fetch_tasks = tokio::task::JoinSet::new();
+        for name in unique_names {
+            let client_c = client.clone();
+            let sem_c = std::sync::Arc::clone(&sem);
+            fetch_tasks.spawn(async move {
+                let _permit = sem_c.acquire_owned().await.map_err(|e| anyhow!("{e}"))?;
+                let packument = client_c.get_package_metadata_full(&name).await?;
+                Ok::<_, anyhow::Error>((name, packument))
+            });
+        }
+        while let Some(res) = fetch_tasks.join_next().await {
+            let (name, packument) = res.map_err(|e| anyhow!("Packument fetch task panicked: {e}"))??;
+            packuments.insert(name, packument);
+        }
+    }
     for pkg in &packages {
         if !packuments.contains_key(&pkg.name) {
             let packument = client.get_package_metadata_full(&pkg.name).await?;

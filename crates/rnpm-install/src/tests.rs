@@ -6429,3 +6429,732 @@ fn test_manifest_has_warnable_scripts_handles_non_registry_prepare() {
     assert!(!manifest_has_warnable_scripts(&m, true));
     assert!(manifest_has_warnable_scripts(&m, false));
 }
+
+#[tokio::test]
+async fn test_incremental_install_preserves_untouched_packages_and_removes_extraneous() {
+    let tmp = tempdir().unwrap();
+    let project_dir = tmp.path();
+
+    let keep_tar = make_tarball("pkg-keep", "1.0.0", &[]);
+    let keep_int = Integrity::from_bytes(&keep_tar, Algorithm::Sha512).to_string();
+    let add_tar = make_tarball("pkg-add", "1.0.0", &[]);
+    let add_int = Integrity::from_bytes(&add_tar, Algorithm::Sha512).to_string();
+
+    let vendor_dir = project_dir.join("vendor");
+    fs::create_dir_all(&vendor_dir).unwrap();
+    fs::write(vendor_dir.join("pkg-keep.tgz"), &keep_tar).unwrap();
+    fs::write(vendor_dir.join("pkg-add.tgz"), &add_tar).unwrap();
+
+    let mut manifest = Manifest::default();
+    manifest.name = Some("inc-install-app".to_string());
+    manifest.version = Some("1.0.0".to_string());
+    manifest
+        .dependencies
+        .insert("pkg-keep".to_string(), "file:./vendor/pkg-keep.tgz".to_string());
+    manifest
+        .dependencies
+        .insert("pkg-add".to_string(), "file:./vendor/pkg-add.tgz".to_string());
+    manifest
+        .save_to_file(project_dir.join("package.json"))
+        .unwrap();
+
+    let mut lock = LockfileV3::new("inc-install-app", Some("1.0.0".to_string()));
+    lock.root_package_mut().unwrap().dependencies = Some(manifest.dependencies.clone());
+    lock.insert_package(
+        "node_modules/pkg-keep",
+        LockfilePackage {
+            version: Some("1.0.0".to_string()),
+            resolved: Some("file:./vendor/pkg-keep.tgz".to_string()),
+            integrity: Some(keep_int.clone()),
+            ..Default::default()
+        },
+    );
+    lock.insert_package(
+        "node_modules/pkg-add",
+        LockfilePackage {
+            version: Some("1.0.0".to_string()),
+            resolved: Some("file:./vendor/pkg-add.tgz".to_string()),
+            integrity: Some(add_int.clone()),
+            ..Default::default()
+        },
+    );
+    lock.save_to_file(&project_dir.join("package-lock.json"))
+        .unwrap();
+
+    // Seed node_modules with pkg-keep (matching lockfile + untouched marker) and extraneous pkg-old
+    let keep_dir = project_dir.join("node_modules").join("pkg-keep");
+    fs::create_dir_all(&keep_dir).unwrap();
+    fs::write(
+        keep_dir.join("package.json"),
+        r#"{"name":"pkg-keep","version":"1.0.0"}"#,
+    )
+    .unwrap();
+    fs::write(keep_dir.join("untouched.txt"), "keep-me").unwrap();
+
+    let old_dir = project_dir.join("node_modules").join("pkg-old");
+    fs::create_dir_all(&old_dir).unwrap();
+    fs::write(
+        old_dir.join("package.json"),
+        r#"{"name":"pkg-old","version":"1.0.0"}"#,
+    )
+    .unwrap();
+
+    // Seed hidden lockfile matching pkg-keep + pkg-old so actual tree is known
+    let mut hidden = LockfileV3::new("inc-install-app", Some("1.0.0".to_string()));
+    hidden.insert_package(
+        "node_modules/pkg-keep",
+        LockfilePackage {
+            version: Some("1.0.0".to_string()),
+            resolved: Some("file:./vendor/pkg-keep.tgz".to_string()),
+            integrity: Some(keep_int),
+            ..Default::default()
+        },
+    );
+    hidden.insert_package(
+        "node_modules/pkg-old",
+        LockfilePackage {
+            version: Some("1.0.0".to_string()),
+            ..Default::default()
+        },
+    );
+    hidden.save_hidden(project_dir).unwrap();
+
+    let cache_dir = tmp.path().join("cache");
+    let mut installer = Installer::new(InstallOptions {
+        project_dir: project_dir.to_path_buf(),
+        cache_dir: Some(cache_dir.clone()),
+        offline: true,
+        ..Default::default()
+    })
+    .unwrap();
+    installer.run().await.unwrap();
+
+    assert!(
+        keep_dir.join("untouched.txt").exists(),
+        "Incremental rnpm install must NOT wipe untouched node_modules packages"
+    );
+    assert!(
+        !old_dir.exists(),
+        "Incremental rnpm install must remove extraneous packages"
+    );
+    assert!(
+        project_dir.join("node_modules/pkg-add/package.json").is_file(),
+        "Incremental rnpm install must install missing packages"
+    );
+
+    // By contrast, rnpm ci (`from_scratch == true`) must perform a clean wipe
+    let mut ci_installer = Installer::new(InstallOptions {
+        project_dir: project_dir.to_path_buf(),
+        cache_dir: Some(cache_dir),
+        offline: true,
+        ..Default::default()
+    })
+    .unwrap();
+    ci_installer.run_ci().await.unwrap();
+    assert!(
+        !keep_dir.join("untouched.txt").exists(),
+        "rnpm ci must wipe and cleanly re-materialize node_modules"
+    );
+    assert!(keep_dir.join("package.json").is_file());
+}
+
+#[tokio::test]
+async fn test_install_fast_path_eusage_missing_falls_back_to_solver() {
+    let tmp = tempdir().unwrap();
+    let project_dir = tmp.path();
+
+    let local_pkg = project_dir.join("local-pkg");
+    fs::create_dir_all(&local_pkg).unwrap();
+    fs::write(
+        local_pkg.join("package.json"),
+        r#"{"name":"local-pkg","version":"1.0.0"}"#,
+    )
+    .unwrap();
+
+    let mut manifest = Manifest::default();
+    manifest.name = Some("eusage-fallback-app".to_string());
+    manifest.version = Some("1.0.0".to_string());
+    manifest
+        .dependencies
+        .insert("local-pkg".to_string(), "file:./local-pkg".to_string());
+    manifest
+        .save_to_file(project_dir.join("package.json"))
+        .unwrap();
+
+    // Lockfile root matches manifest, so step 4 passes, but node_modules/local-pkg declares
+    // an unsatisfied child dependency `missing-child@^2.0.0` -> step 5 emits `EUSAGE Missing:`.
+    let mut stale_lock = LockfileV3::new("eusage-fallback-app", Some("1.0.0".to_string()));
+    stale_lock.root_package_mut().unwrap().dependencies = Some(manifest.dependencies.clone());
+    stale_lock.insert_package(
+        "node_modules/local-pkg",
+        LockfilePackage {
+            version: Some("1.0.0".to_string()),
+            link: Some(true),
+            resolved: Some("local-pkg".to_string()),
+            dependencies: Some(BTreeMap::from([(
+                "missing-child".to_string(),
+                "^2.0.0".to_string(),
+            )])),
+            ..Default::default()
+        },
+    );
+    stale_lock
+        .save_to_file(&project_dir.join("package-lock.json"))
+        .unwrap();
+
+    let cache_dir = tmp.path().join("cache");
+    // run_ci must still reject stale lockfile with EUSAGE Missing:
+    let mut ci_installer = Installer::new(InstallOptions {
+        project_dir: project_dir.to_path_buf(),
+        cache_dir: Some(cache_dir.clone()),
+        offline: true,
+        ..Default::default()
+    })
+    .unwrap();
+    let ci_err = ci_installer.run_ci().await.unwrap_err().to_string();
+    assert!(
+        ci_err.contains("EUSAGE") && ci_err.contains("Missing:"),
+        "expected EUSAGE Missing: from run_ci, got: {ci_err}"
+    );
+
+    // `rnpm install` (`run`) must fall back cleanly to the solver and succeed
+    let mut installer = Installer::new(InstallOptions {
+        project_dir: project_dir.to_path_buf(),
+        cache_dir: Some(cache_dir),
+        offline: true,
+        ..Default::default()
+    })
+    .unwrap();
+    installer.run().await.unwrap();
+    assert!(project_dir.join("node_modules/local-pkg/package.json").exists());
+}
+
+#[tokio::test]
+async fn test_partial_pack_store_hit_no_double_count() {
+    let tmp = tempdir().unwrap();
+    let project_dir = tmp.path();
+
+    let tar_a = make_tarball("pack-a", "1.0.0", &[]);
+    let int_a = Integrity::from_bytes(&tar_a, Algorithm::Sha512).to_string();
+    let tar_b = make_tarball("pack-b", "1.0.0", &[]);
+    let int_b = Integrity::from_bytes(&tar_b, Algorithm::Sha512).to_string();
+
+    let vendor_dir = project_dir.join("vendor");
+    fs::create_dir_all(&vendor_dir).unwrap();
+    fs::write(vendor_dir.join("pack-a.tgz"), &tar_a).unwrap();
+    fs::write(vendor_dir.join("pack-b.tgz"), &tar_b).unwrap();
+
+    let mut manifest = Manifest::default();
+    manifest.name = Some("partial-pack-app".to_string());
+    manifest.version = Some("1.0.0".to_string());
+    manifest
+        .dependencies
+        .insert("pack-a".to_string(), "file:./vendor/pack-a.tgz".to_string());
+    manifest
+        .dependencies
+        .insert("pack-b".to_string(), "file:./vendor/pack-b.tgz".to_string());
+    manifest
+        .save_to_file(project_dir.join("package.json"))
+        .unwrap();
+
+    let mut lock = LockfileV3::new("partial-pack-app", Some("1.0.0".to_string()));
+    lock.root_package_mut().unwrap().dependencies = Some(manifest.dependencies.clone());
+    lock.insert_package(
+        "node_modules/pack-a",
+        LockfilePackage {
+            version: Some("1.0.0".to_string()),
+            resolved: Some("file:./vendor/pack-a.tgz".to_string()),
+            integrity: Some(int_a.clone()),
+            ..Default::default()
+        },
+    );
+    lock.insert_package(
+        "node_modules/pack-b",
+        LockfilePackage {
+            version: Some("1.0.0".to_string()),
+            resolved: Some("file:./vendor/pack-b.tgz".to_string()),
+            integrity: Some(int_b),
+            ..Default::default()
+        },
+    );
+    lock.save_to_file(&project_dir.join("package-lock.json"))
+        .unwrap();
+
+    let cache_dir = tmp.path().join("cache");
+    let store_dir = tmp.path().join("store");
+    let installer = Installer::new(InstallOptions {
+        project_dir: project_dir.to_path_buf(),
+        cache_dir: Some(cache_dir.clone()),
+        store_dir: Some(store_dir.clone()),
+        offline: true,
+        ..Default::default()
+    })
+    .unwrap();
+    // Pre-populate ONLY pack-a in pack_store so pack-b is a missing_pack
+    installer
+        .pack_store()
+        .put_package_from_tarball(&int_a, &tar_a)
+        .unwrap();
+    drop(installer);
+
+    let mut ci_installer = Installer::new(InstallOptions {
+        project_dir: project_dir.to_path_buf(),
+        cache_dir: Some(cache_dir),
+        store_dir: Some(store_dir),
+        offline: true,
+        ..Default::default()
+    })
+    .unwrap();
+    let summary = ci_installer.run_ci().await.unwrap();
+    assert_eq!(
+        summary.packages_installed, 2,
+        "Partial pack_store hit must count each package exactly once"
+    );
+    assert!(project_dir.join("node_modules/pack-a/package.json").is_file());
+    assert!(project_dir.join("node_modules/pack-b/package.json").is_file());
+}
+
+#[test]
+fn test_uninstall_preserves_transitively_required_direct_dep() {
+    let tmp = tempdir().unwrap();
+    let project_dir = tmp.path();
+
+    let mut manifest = Manifest::default();
+    manifest.name = Some("transitive-uninstall".to_string());
+    manifest.version = Some("1.0.0".to_string());
+    manifest
+        .dependencies
+        .insert("app-a".to_string(), "^1.0.0".to_string());
+    manifest
+        .dependencies
+        .insert("shared-dep".to_string(), "^1.0.0".to_string());
+    manifest
+        .save_to_file(project_dir.join("package.json"))
+        .unwrap();
+
+    let app_a_dir = project_dir.join("node_modules").join("app-a");
+    let shared_dir = project_dir.join("node_modules").join("shared-dep");
+    fs::create_dir_all(&app_a_dir).unwrap();
+    fs::create_dir_all(&shared_dir).unwrap();
+    fs::write(
+        app_a_dir.join("package.json"),
+        r#"{"name":"app-a","version":"1.0.0","dependencies":{"shared-dep":"^1.0.0"}}"#,
+    )
+    .unwrap();
+    fs::write(
+        shared_dir.join("package.json"),
+        r#"{"name":"shared-dep","version":"1.0.0"}"#,
+    )
+    .unwrap();
+
+    let mut lock = LockfileV3::new("transitive-uninstall", Some("1.0.0".to_string()));
+    lock.root_package_mut().unwrap().dependencies = Some(manifest.dependencies.clone());
+    lock.insert_package(
+        "node_modules/app-a",
+        LockfilePackage {
+            version: Some("1.0.0".to_string()),
+            dependencies: Some(BTreeMap::from([("shared-dep".to_string(), "^1.0.0".to_string())])),
+            ..Default::default()
+        },
+    );
+    lock.insert_package(
+        "node_modules/shared-dep",
+        LockfilePackage {
+            version: Some("1.0.0".to_string()),
+            ..Default::default()
+        },
+    );
+    lock.save_to_file(&project_dir.join("package-lock.json"))
+        .unwrap();
+
+    let installer = Installer::new(InstallOptions {
+        project_dir: project_dir.to_path_buf(),
+        ..Default::default()
+    })
+    .unwrap();
+    installer
+        .uninstall(&UninstallOptions {
+            packages: vec!["shared-dep".to_string()],
+            ..Default::default()
+        })
+        .unwrap();
+
+    let updated_manifest = Manifest::from_file(project_dir.join("package.json")).unwrap();
+    assert!(!updated_manifest.dependencies.contains_key("shared-dep"));
+    assert!(
+        shared_dir.exists(),
+        "node_modules/shared-dep must NOT be deleted when still transitively required by app-a"
+    );
+    let updated_lock = LockfileV3::load_from_file(&project_dir.join("package-lock.json")).unwrap();
+    assert!(updated_lock.packages.contains_key("node_modules/shared-dep"));
+}
+
+#[tokio::test]
+async fn test_isolated_strategy_enforces_engines_and_allow_scripts() {
+    let tmp = tempdir().unwrap();
+    let project_dir = tmp.path();
+
+    // 1. Engine check in isolated mode rejects incompatible engines when engine_strict = true
+    let bad_eng_tar = {
+        let mut buf = Vec::new();
+        {
+            let enc = flate2::write::GzEncoder::new(&mut buf, flate2::Compression::default());
+            let mut tar = tar::Builder::new(enc);
+            let pkg_json = br#"{"name":"eng-pkg","version":"1.0.0","engines":{"node":">=999.0.0"}}"#;
+            let mut header = tar::Header::new_gnu();
+            header.set_size(pkg_json.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            tar.append_data(&mut header, "package/package.json", &pkg_json[..])
+                .unwrap();
+            tar.finish().unwrap();
+        }
+        buf
+    };
+    let bad_eng_int = Integrity::from_bytes(&bad_eng_tar, Algorithm::Sha512).to_string();
+    let vendor_dir = project_dir.join("vendor");
+    fs::create_dir_all(&vendor_dir).unwrap();
+    fs::write(vendor_dir.join("eng-pkg.tgz"), &bad_eng_tar).unwrap();
+
+    fs::write(
+        project_dir.join(".npmrc"),
+        "engine-strict=true\n",
+    )
+    .unwrap();
+    fs::write(
+        project_dir.join("package.json"),
+        r#"{"name":"iso-policy-app","version":"1.0.0","dependencies":{"eng-pkg":"file:./vendor/eng-pkg.tgz"}}"#,
+    )
+    .unwrap();
+    let mut lock = LockfileV3::new("iso-policy-app", Some("1.0.0".to_string()));
+    lock.root_package_mut().unwrap().dependencies = Some(BTreeMap::from([(
+        "eng-pkg".to_string(),
+        "file:./vendor/eng-pkg.tgz".to_string(),
+    )]));
+    lock.insert_package(
+        "node_modules/eng-pkg",
+        LockfilePackage {
+            version: Some("1.0.0".to_string()),
+            resolved: Some("file:./vendor/eng-pkg.tgz".to_string()),
+            integrity: Some(bad_eng_int),
+            engines: Some(rnpm_lockfile::PackageEngines::Map(BTreeMap::from([(
+                "node".to_string(),
+                ">=999.0.0".to_string(),
+            )]))),
+            ..Default::default()
+        },
+    );
+    lock.save_to_file(&project_dir.join("package-lock.json"))
+        .unwrap();
+
+    let mut eng_installer = Installer::new(InstallOptions {
+        project_dir: project_dir.to_path_buf(),
+        install_strategy: crate::InstallStrategy::Linked,
+        offline: true,
+        ..Default::default()
+    })
+    .unwrap();
+    let eng_err = eng_installer.run_ci().await.unwrap_err().to_string();
+    assert!(
+        eng_err.contains("EBADENGINE") || eng_err.contains("engine"),
+        "Isolated mode must enforce check_engines when engine_strict=true, got: {eng_err}"
+    );
+
+    // 2. allowScripts blocks disallowed postinstall script in isolated mode
+    let tmp2 = tempdir().unwrap();
+    let proj2 = tmp2.path();
+    let marker = proj2.join("should_not_exist.txt");
+    let escaped_marker = marker.to_string_lossy().replace('\\', "/");
+    let script_tar = {
+        let mut buf = Vec::new();
+        {
+            let enc = flate2::write::GzEncoder::new(&mut buf, flate2::Compression::default());
+            let mut tar = tar::Builder::new(enc);
+            let pkg_json = format!(
+                r#"{{"name":"scripted-pkg","version":"1.0.0","scripts":{{"postinstall":"node -e \"require('fs').writeFileSync('{escaped_marker}','RAN')\""}}}}"#
+            );
+            let bytes = pkg_json.as_bytes();
+            let mut header = tar::Header::new_gnu();
+            header.set_size(bytes.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            tar.append_data(&mut header, "package/package.json", bytes)
+                .unwrap();
+            tar.finish().unwrap();
+        }
+        buf
+    };
+    let script_int = Integrity::from_bytes(&script_tar, Algorithm::Sha512).to_string();
+    fs::create_dir_all(proj2.join("vendor")).unwrap();
+    fs::write(proj2.join("vendor/scripted-pkg.tgz"), &script_tar).unwrap();
+    fs::write(
+        proj2.join("package.json"),
+        r#"{"name":"iso-allow-scripts","version":"1.0.0","dependencies":{"scripted-pkg":"file:./vendor/scripted-pkg.tgz"},"allowScripts":{"file:./vendor/scripted-pkg.tgz":false}}"#,
+    )
+    .unwrap();
+    let mut lock2 = LockfileV3::new("iso-allow-scripts", Some("1.0.0".to_string()));
+    lock2.root_package_mut().unwrap().dependencies = Some(BTreeMap::from([(
+        "scripted-pkg".to_string(),
+        "file:./vendor/scripted-pkg.tgz".to_string(),
+    )]));
+    lock2.insert_package(
+        "node_modules/scripted-pkg",
+        LockfilePackage {
+            version: Some("1.0.0".to_string()),
+            resolved: Some("file:./vendor/scripted-pkg.tgz".to_string()),
+            integrity: Some(script_int),
+            has_install_script: Some(true),
+            ..Default::default()
+        },
+    );
+    lock2.save_to_file(&proj2.join("package-lock.json")).unwrap();
+
+    let mut iso_installer = Installer::new(InstallOptions {
+        project_dir: proj2.to_path_buf(),
+        install_strategy: crate::InstallStrategy::Linked,
+        offline: true,
+        ..Default::default()
+    })
+    .unwrap();
+    iso_installer.run_ci().await.unwrap();
+    assert!(
+        !marker.exists(),
+        "Isolated mode must enforce allowScripts policy and block disallowed postinstall"
+    );
+}
+
+#[tokio::test]
+async fn test_incremental_install_reextracts_without_hidden_lockfile_and_cleans_stale_shims() {
+    let tmp = tempdir().unwrap();
+    let project_dir = tmp.path();
+
+    let pkg_tar = make_tarball("pkg-a", "1.0.0", &[]);
+    let pkg_int = Integrity::from_bytes(&pkg_tar, Algorithm::Sha512).to_string();
+
+    let vendor_dir = project_dir.join("vendor");
+    fs::create_dir_all(&vendor_dir).unwrap();
+    fs::write(vendor_dir.join("pkg-a.tgz"), &pkg_tar).unwrap();
+
+    let mut manifest = Manifest::default();
+    manifest.name = Some("no-hidden-inc".to_string());
+    manifest.version = Some("1.0.0".to_string());
+    manifest
+        .dependencies
+        .insert("pkg-a".to_string(), "file:./vendor/pkg-a.tgz".to_string());
+    manifest
+        .save_to_file(project_dir.join("package.json"))
+        .unwrap();
+
+    let mut lock = LockfileV3::new("no-hidden-inc", Some("1.0.0".to_string()));
+    lock.root_package_mut().unwrap().dependencies = Some(manifest.dependencies.clone());
+    lock.insert_package(
+        "node_modules/pkg-a",
+        LockfilePackage {
+            version: Some("1.0.0".to_string()),
+            resolved: Some("file:./vendor/pkg-a.tgz".to_string()),
+            integrity: Some(pkg_int),
+            ..Default::default()
+        },
+    );
+    lock.save_to_file(&project_dir.join("package-lock.json"))
+        .unwrap();
+
+    // Seed pkg-a@1.0.0 on disk WITHOUT a hidden .package-lock.json (`hidden_valid == false`)
+    // plus a stale marker and a stale shim in `.bin`.
+    let pkg_dir = project_dir.join("node_modules").join("pkg-a");
+    let bin_dir = project_dir.join("node_modules").join(".bin");
+    fs::create_dir_all(&pkg_dir).unwrap();
+    fs::create_dir_all(&bin_dir).unwrap();
+    fs::write(
+        pkg_dir.join("package.json"),
+        r#"{"name":"pkg-a","version":"1.0.0"}"#,
+    )
+    .unwrap();
+    fs::write(pkg_dir.join("stale-marker.txt"), "stale").unwrap();
+    fs::write(bin_dir.join("stale-bin"), "stale-shim").unwrap();
+
+    let cache_dir = tmp.path().join("cache");
+    let mut installer = Installer::new(InstallOptions {
+        project_dir: project_dir.to_path_buf(),
+        cache_dir: Some(cache_dir),
+        offline: true,
+        ..Default::default()
+    })
+    .unwrap();
+    installer.run().await.unwrap();
+
+    assert!(
+        !pkg_dir.join("stale-marker.txt").exists(),
+        "When hidden_valid == false, pkg-a integrity is unverified and must be re-materialized"
+    );
+    assert!(pkg_dir.join("package.json").is_file());
+    assert!(
+        !bin_dir.join("stale-bin").exists(),
+        "Incremental install must clean up stale .bin shims"
+    );
+}
+
+#[test]
+fn test_uninstall_prunes_workspace_nested_node_modules_and_keeps_ws_dev_deps() {
+    let tmp = tempdir().unwrap();
+    let project_dir = tmp.path();
+
+    fs::write(
+        project_dir.join("package.json"),
+        r#"{"name":"ws-root","version":"1.0.0","workspaces":["packages/*"]}"#,
+    )
+    .unwrap();
+
+    let ws_a = project_dir.join("packages").join("ws-a");
+    fs::create_dir_all(&ws_a).unwrap();
+    fs::write(
+        ws_a.join("package.json"),
+        r#"{"name":"ws-a","version":"1.0.0","dependencies":{"ws-only-dep":"^1.0.0"},"devDependencies":{"ws-dev-dep":"^1.0.0"}}"#,
+    )
+    .unwrap();
+
+    let ws_only_dir = ws_a.join("node_modules").join("ws-only-dep");
+    let ws_dev_dir = project_dir.join("node_modules").join("ws-dev-dep");
+    fs::create_dir_all(&ws_only_dir).unwrap();
+    fs::create_dir_all(&ws_dev_dir).unwrap();
+    fs::write(
+        ws_only_dir.join("package.json"),
+        r#"{"name":"ws-only-dep","version":"1.0.0"}"#,
+    )
+    .unwrap();
+    fs::write(
+        ws_dev_dir.join("package.json"),
+        r#"{"name":"ws-dev-dep","version":"1.0.0"}"#,
+    )
+    .unwrap();
+
+    let mut lock = LockfileV3::new("ws-root", Some("1.0.0".to_string()));
+    lock.insert_package(
+        "packages/ws-a",
+        LockfilePackage {
+            version: Some("1.0.0".to_string()),
+            dependencies: Some(BTreeMap::from([(
+                "ws-only-dep".to_string(),
+                "^1.0.0".to_string(),
+            )])),
+            dev_dependencies: Some(BTreeMap::from([(
+                "ws-dev-dep".to_string(),
+                "^1.0.0".to_string(),
+            )])),
+            ..Default::default()
+        },
+    );
+    lock.insert_package(
+        "packages/ws-a/node_modules/ws-only-dep",
+        LockfilePackage {
+            version: Some("1.0.0".to_string()),
+            ..Default::default()
+        },
+    );
+    lock.insert_package(
+        "node_modules/ws-dev-dep",
+        LockfilePackage {
+            version: Some("1.0.0".to_string()),
+            dev: Some(true),
+            ..Default::default()
+        },
+    );
+    lock.save_to_file(&project_dir.join("package-lock.json"))
+        .unwrap();
+
+    let installer = Installer::new(InstallOptions {
+        project_dir: project_dir.to_path_buf(),
+        ..Default::default()
+    })
+    .unwrap();
+    installer
+        .uninstall(&UninstallOptions {
+            packages: vec!["ws-only-dep".to_string()],
+            workspace: vec!["ws-a".to_string()],
+            ..Default::default()
+        })
+        .unwrap();
+
+    assert!(
+        !ws_only_dir.exists(),
+        "Workspace-nested node_modules/ws-only-dep must be removed on uninstall"
+    );
+    assert!(
+        ws_dev_dir.exists(),
+        "Workspace devDependency node_modules/ws-dev-dep must NOT be pruned"
+    );
+    let updated_lock = LockfileV3::load_from_file(&project_dir.join("package-lock.json")).unwrap();
+    assert!(!updated_lock
+        .packages
+        .contains_key("packages/ws-a/node_modules/ws-only-dep"));
+    assert!(updated_lock.packages.contains_key("node_modules/ws-dev-dep"));
+}
+
+#[tokio::test]
+async fn test_incremental_install_unlinks_symlinked_node_modules_without_touching_target() {
+    let tmp = tempdir().unwrap();
+    let project_dir = tmp.path().join("project");
+    let outside_dir = tmp.path().join("outside-target");
+    fs::create_dir_all(&project_dir).unwrap();
+    fs::create_dir_all(&outside_dir).unwrap();
+    let sentinel = outside_dir.join("sentinel.txt");
+    fs::write(&sentinel, "do-not-touch").unwrap();
+
+    // Create a local tarball dependency so install runs offline with a real package write.
+    let tarball_bytes = create_test_bin_tarball("local-pkg", "1.0.0", "local-cli");
+    let tgz_path = project_dir.join("local-pkg-1.0.0.tgz");
+    fs::write(&tgz_path, &tarball_bytes).unwrap();
+    fs::write(
+        project_dir.join("package.json"),
+        serde_json::json!({
+            "name": "symlink-nm-app",
+            "version": "1.0.0",
+            "dependencies": {
+                "local-pkg": "file:./local-pkg-1.0.0.tgz"
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    // First generate package-lock.json, then replace node_modules with a junction/symlink to outside_dir.
+    let mut setup_installer = Installer::new(InstallOptions {
+        project_dir: project_dir.clone(),
+        package_lock_only: true,
+        offline: true,
+        ..Default::default()
+    })
+    .unwrap();
+    setup_installer.install().await.unwrap();
+
+    let nm = project_dir.join("node_modules");
+    rnpm_fs::create_junction(&nm, &outside_dir).unwrap();
+    assert!(rnpm_fs::is_junction(&nm).unwrap());
+
+    // Incremental install (from_scratch = false) must unlink the symlink/junction and install locally.
+    let mut installer = Installer::new(InstallOptions {
+        project_dir: project_dir.clone(),
+        offline: true,
+        ..Default::default()
+    })
+    .unwrap();
+    installer.install().await.unwrap();
+
+    assert!(
+        !rnpm_fs::is_junction(&nm).unwrap(),
+        "node_modules must be replaced by a real local directory"
+    );
+    assert!(
+        nm.join("local-pkg/package.json").is_file(),
+        "local-pkg must be installed into local node_modules"
+    );
+    assert_eq!(
+        fs::read_to_string(&sentinel).unwrap(),
+        "do-not-touch",
+        "external symlink target contents must be untouched"
+    );
+    assert!(
+        !outside_dir.join("local-pkg").exists(),
+        "install must never write packages into the external symlink target"
+    );
+}
