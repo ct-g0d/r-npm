@@ -216,6 +216,7 @@ pub(crate) const NO_ANCESTOR: u32 = u32::MAX;
 struct AncestorEntry {
     parent: u32,
     name: SymId,
+    spec: SymId,
 }
 
 /// Arena-backed ancestor chain eliminating `Vec<String>` clones on every placed package.
@@ -233,8 +234,13 @@ impl AncestorArena {
 
     #[inline]
     pub(crate) fn push(&mut self, parent: u32, name: SymId) -> u32 {
+        self.push_with_spec(parent, name, name)
+    }
+
+    #[inline]
+    pub(crate) fn push_with_spec(&mut self, parent: u32, name: SymId, spec: SymId) -> u32 {
         let id = self.entries.len() as u32;
-        self.entries.push(AncestorEntry { parent, name });
+        self.entries.push(AncestorEntry { parent, name, spec });
         id
     }
 
@@ -295,7 +301,7 @@ impl AncestorArena {
     }
 
     #[inline]
-    pub(crate) fn to_str_vec_into<'a>(
+    pub(crate) fn to_override_str_vec_into<'a>(
         &self,
         mut head: u32,
         interner: &'a StringInterner,
@@ -304,7 +310,7 @@ impl AncestorArena {
         out.clear();
         while head != NO_ANCESTOR {
             let e = self.entries[head as usize];
-            out.push(interner.get(e.name));
+            out.push(interner.get(e.spec));
             head = e.parent;
         }
         out.reverse();

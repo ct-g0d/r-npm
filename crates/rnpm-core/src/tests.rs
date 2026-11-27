@@ -728,10 +728,14 @@ fn test_path_matches_workspace_patterns_semantics() {
     assert!(!path_matches_workspace_patterns("packages/ignored", &patterns));
     assert!(!path_matches_workspace_patterns("apps/ignored-app/sub", &patterns));
 
-    // Disallowed directory segments (should_skip_dir: node_modules, target, etc.)
+    // Disallowed directory segments (node_modules, dot-dirs under wildcards),
+    // while build/dist/target remain valid workspace package names.
     assert!(!path_matches_workspace_patterns("packages/pkg-a/node_modules/dep", &patterns));
     assert!(!path_matches_workspace_patterns("node_modules/pkg-a", &patterns));
-    assert!(!path_matches_workspace_patterns("apps/target/client", &patterns));
+    assert!(!path_matches_workspace_patterns("apps/.hidden/client", &patterns));
+    assert!(path_matches_workspace_patterns("apps/target/client", &patterns));
+    assert!(path_matches_workspace_patterns("packages/build", &patterns));
+    assert!(path_matches_workspace_patterns("packages/dist", &patterns));
 
     // Path normalization
     assert!(path_matches_workspace_patterns("./packages/pkg-a", &patterns));
@@ -1849,7 +1853,7 @@ fn test_manifest_engines_float_formatting_parity() {
 }
 
 #[test]
-fn test_overrides_nested_without_dot_blocks_global_fallback_parity() {
+fn test_overrides_nested_without_dot_falls_back_to_global_parity() {
     use crate::overrides::Overrides;
     use std::collections::BTreeMap;
     let json = serde_json::json!({
@@ -1861,11 +1865,14 @@ fn test_overrides_nested_without_dot_blocks_global_fallback_parity() {
         }
     });
     let ov = Overrides::from_json_value(Some(&json), BTreeMap::new());
-    assert_eq!(ov.resolve_override("foo", "^1.0.0", &["a"]).unwrap(), None);
+    assert_eq!(
+        ov.resolve_override("foo", "^1.0.0", &["a"]).unwrap(),
+        Some("1.0.0".to_string())
+    );
     assert_eq!(
         ov.resolve_override_precompiled_with_caller("foo", "^1.0.0", &["a"], None)
             .unwrap(),
-        None
+        Some("1.0.0".to_string())
     );
     assert_eq!(
         ov.resolve_override_precompiled_with_caller("bar", "^2.0.0", &["a", "foo"], None)
@@ -2021,4 +2028,299 @@ fn test_overrides_helpers_and_ref_shadowing_and_compound_range_fast_path() {
         assert_eq!(r.satisfies(&v15), Range::satisfies_str(expr, &v15).unwrap());
         assert_eq!(r.satisfies(&v25), Range::satisfies_str(expr, &v25).unwrap());
     }
+}
+
+#[test]
+fn test_manifest_to_json_string_reflects_mutations_and_clears() {
+    use crate::manifest::{Manifest, PackageBin, PackageWorkspaces};
+    use crate::PlatformList;
+
+    let raw = r#"{
+  "name": "orig-pkg",
+  "version": "1.0.0",
+  "description": "old desc",
+  "main": "old.js",
+  "bin": { "cli": "./old-cli.js" },
+  "files": ["old-dist"],
+  "scripts": { "test": "vitest" },
+  "workspaces": ["packages/*"],
+  "os": ["linux"],
+  "cpu": ["x64"],
+  "libc": ["glibc"],
+  "engines": { "node": ">=18" },
+  "overrides": { "foo": "1.0.0" },
+  "license": "MIT"
+}
+"#;
+    let mut m = Manifest::from_str(raw).unwrap();
+
+    // Mutate bin, files, os, cpu, libc, engines, extra (overrides + new exports), and delete license
+    m.bin = Some(PackageBin::Single("./new-bin.js".to_string()));
+    m.files = Some(vec!["dist".to_string(), "README.md".to_string()]);
+    m.os = Some(PlatformList::from(vec!["darwin".to_string(), "linux".to_string()]));
+    m.cpu = Some(PlatformList::from("arm64".to_string()));
+    m.libc = None;
+    m.engines.insert("node".to_string(), ">=20".to_string());
+    m.engines.insert("npm".to_string(), ">=10".to_string());
+    m.extra.insert(
+        "overrides".to_string(),
+        serde_json::json!({ "foo": "2.0.0" }),
+    );
+    m.extra
+        .insert("exports".to_string(), serde_json::json!({ ".": "./dist/index.js" }));
+    m.extra.remove("license");
+
+    // Clear name, version, description, main, scripts, workspaces
+    m.name = None;
+    m.version = None;
+    m.description = None;
+    m.main = None;
+    m.scripts.clear();
+    m.workspaces = None;
+
+    let serialized = m.to_json_string().unwrap();
+    let reparsed = Manifest::from_str_readonly(&serialized).unwrap();
+    assert_eq!(reparsed.name, None);
+    assert_eq!(reparsed.version, None);
+    assert_eq!(reparsed.description, None);
+    assert_eq!(reparsed.main, None);
+    assert!(reparsed.scripts.is_empty());
+    assert_eq!(reparsed.workspaces, None);
+    assert_eq!(reparsed.libc, None);
+    assert_eq!(reparsed.bin, Some(PackageBin::Single("./new-bin.js".to_string())));
+    assert_eq!(
+        reparsed.files,
+        Some(vec!["dist".to_string(), "README.md".to_string()])
+    );
+    assert_eq!(
+        reparsed.os.as_deref(),
+        Some(&["darwin".to_string(), "linux".to_string()][..])
+    );
+    assert_eq!(reparsed.cpu.as_deref(), Some(&["arm64".to_string()][..]));
+    assert_eq!(reparsed.engines.get("node").map(String::as_str), Some(">=20"));
+    assert_eq!(reparsed.engines.get("npm").map(String::as_str), Some(">=10"));
+    assert_eq!(
+        reparsed.extra.get("overrides"),
+        Some(&serde_json::json!({ "foo": "2.0.0" }))
+    );
+    assert_eq!(
+        reparsed.extra.get("exports"),
+        Some(&serde_json::json!({ ".": "./dist/index.js" }))
+    );
+    assert!(!reparsed.extra.contains_key("license"));
+
+    // Also verify adding previously absent optional fields on a minimal manifest
+    let mut minimal = Manifest::from_str("{\"name\":\"min\"}\n").unwrap();
+    minimal.bin = Some(PackageBin::Single("./cli.js".to_string()));
+    minimal.files = Some(vec!["dist".to_string()]);
+    minimal.os = Some(PlatformList::from(vec!["linux".to_string()]));
+    minimal.cpu = Some(PlatformList::from(vec!["x64".to_string()]));
+    minimal.libc = Some(PlatformList::from(vec!["glibc".to_string()]));
+    minimal.engines.insert("node".to_string(), ">=18".to_string());
+    minimal.workspaces = Some(PackageWorkspaces::List(vec!["pkgs/*".to_string()]));
+    let min_out = minimal.to_json_string().unwrap();
+    let min_reparsed = Manifest::from_str_readonly(&min_out).unwrap();
+    assert_eq!(min_reparsed.bin, minimal.bin);
+    assert_eq!(min_reparsed.files, minimal.files);
+    assert_eq!(min_reparsed.os, minimal.os);
+    assert_eq!(min_reparsed.cpu, minimal.cpu);
+    assert_eq!(min_reparsed.libc, minimal.libc);
+    assert_eq!(min_reparsed.engines, minimal.engines);
+    assert_eq!(min_reparsed.workspaces, minimal.workspaces);
+}
+
+#[test]
+fn test_pkg_delete_interleaved_array_indices_and_nested_no_panic() {
+    use crate::pkg::pkg_delete;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let manifest_path = tmp.path().join("package.json");
+    std::fs::write(
+        &manifest_path,
+        r#"{
+  "name": "pkg-delete-order",
+  "keywords": ["k0", "k1", "k2", "k3"],
+  "matrix": [["a0", "a1"], ["b0", "b1"]]
+}
+"#,
+    )
+    .unwrap();
+
+    // Interleaved paths previously panicked due to non-transitive sort_by comparator
+    pkg_delete(
+        &manifest_path,
+        &[
+            "keywords[0]".to_string(),
+            "name".to_string(),
+            "keywords[2]".to_string(),
+            "keywords[0]".to_string(),
+            "matrix[0]".to_string(),
+            "matrix[0][0]".to_string(),
+        ],
+    )
+    .unwrap();
+
+    let updated: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&manifest_path).unwrap()).unwrap();
+    assert!(updated.get("name").is_none());
+    assert_eq!(updated["keywords"], serde_json::json!(["k1", "k3"]));
+    assert_eq!(updated["matrix"], serde_json::json!([["b0", "b1"]]));
+}
+
+#[test]
+fn test_overrides_versioned_ancestors_closer_precedence_and_global_fallback() {
+    use crate::overrides::{OverrideValue, Overrides};
+    use std::collections::BTreeMap;
+
+    let json = serde_json::json!({
+        "bar": "9.0.0",
+        "foo@1.0.0": {
+            "bar": "2.0.0"
+        },
+        "outer": {
+            "baz": "1.0.0",
+            "bar": {
+                "qux": "3.0.0"
+            }
+        },
+        "inner": {
+            "baz": "4.0.0"
+        }
+    });
+    let mut ov = Overrides::from_json_value(Some(&json), BTreeMap::new());
+
+    // 1. Version-scoped ancestor: foo@1.0.0 matches bar->2.0.0, foo@2.0.0 falls back to global 9.0.0
+    assert_eq!(
+        ov.resolve_override("bar", "^1.0.0", &["foo@1.0.0"]).unwrap(),
+        Some("2.0.0".to_string())
+    );
+    assert_eq!(
+        ov.resolve_override("bar", "^1.0.0", &["foo@2.0.0"]).unwrap(),
+        Some("9.0.0".to_string())
+    );
+
+    // 2. Closer parent takes precedence over outer ancestor
+    assert_eq!(
+        ov.resolve_override("baz", "^1.0.0", &["outer@1.0.0", "inner@1.0.0"])
+            .unwrap(),
+        Some("4.0.0".to_string())
+    );
+
+    // 3. Nested map lacking "." does NOT block global fallback
+    assert_eq!(
+        ov.resolve_override("bar", "^1.0.0", &["outer@1.0.0"]).unwrap(),
+        Some("9.0.0".to_string())
+    );
+    assert_eq!(
+        ov.resolve_override("qux", "^1.0.0", &["outer@1.0.0", "bar@1.0.0"])
+            .unwrap(),
+        Some("3.0.0".to_string())
+    );
+
+    // 4. Direct in-place mutation of existing key invalidates fast index via generation counter
+    ov.rules
+        .insert("bar".to_string(), OverrideValue::Exact("8.0.0".to_string()));
+    assert_eq!(
+        ov.resolve_override("bar", "^1.0.0", &["foo@2.0.0"]).unwrap(),
+        Some("8.0.0".to_string())
+    );
+}
+
+#[test]
+fn test_range_or_wildcard_preserves_prerelease_set() {
+    use crate::semver::{Range, Version};
+
+    let range = Range::parse("1.0.0-alpha.1 || *").unwrap();
+    let alpha1 = Version::parse("1.0.0-alpha.1").unwrap();
+    let alpha2 = Version::parse("1.0.0-alpha.2").unwrap();
+    let stable = Version::parse("2.0.0").unwrap();
+
+    assert!(range.satisfies(&alpha1));
+    assert!(!range.satisfies(&alpha2));
+    assert!(range.satisfies(&stable));
+    assert!(Range::satisfies_str("1.0.0-alpha.1 || *", &alpha1).unwrap());
+    assert!(!Range::satisfies_str("1.0.0-alpha.1 || *", &alpha2).unwrap());
+}
+
+#[test]
+fn test_workspace_discovery_includes_build_dist_target_dirs() {
+    use crate::workspace::{discover_workspaces, path_matches_workspace_patterns};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    std::fs::write(
+        root.join("package.json"),
+        r#"{"name": "root", "workspaces": ["packages/*"]}"#,
+    )
+    .unwrap();
+    for dir in ["build", "dist", "target"] {
+        let pkg_dir = root.join("packages").join(dir);
+        std::fs::create_dir_all(&pkg_dir).unwrap();
+        std::fs::write(
+            pkg_dir.join("package.json"),
+            format!(r#"{{"name": "@repo/{dir}", "version": "1.0.0"}}"#),
+        )
+        .unwrap();
+    }
+
+    let members = discover_workspaces(root).unwrap();
+    let rels: Vec<&str> = members.iter().map(|m| m.relative_path.as_str()).collect();
+    assert_eq!(rels, vec!["packages/build", "packages/dist", "packages/target"]);
+
+    let explicit = vec!["packages/build".to_string()];
+    assert!(path_matches_workspace_patterns("packages/build", &explicit));
+}
+
+#[test]
+fn test_overrides_deeper_chain_beats_shallower_rule_at_same_parent() {
+    use crate::overrides::Overrides;
+    use std::collections::BTreeMap;
+
+    let json = serde_json::json!({
+        "inner": { "leaf": "2.0.0" },
+        "outer": {
+            "inner": { "leaf": "3.0.0" },
+            "mid": {
+                "inner": { "leaf": "4.0.0" }
+            }
+        }
+    });
+    let ov = Overrides::from_json_value(Some(&json), BTreeMap::new());
+    let empty_refs = BTreeMap::new();
+
+    // `outer > inner` (depth 2) must beat shallower `inner` (depth 1) for `["outer@1.0.0", "inner@1.0.0"]`
+    assert_eq!(
+        ov.resolve_override_precompiled_with_caller(
+            "leaf",
+            "^1.0.0",
+            &["outer@1.0.0", "inner@1.0.0"],
+            Some(&empty_refs),
+        )
+        .unwrap(),
+        Some("3.0.0".to_string())
+    );
+
+    // `outer > mid > inner` (depth 3) must beat `outer > inner` (depth 2) and `inner` (depth 1)
+    assert_eq!(
+        ov.resolve_override_precompiled_with_caller(
+            "leaf",
+            "^1.0.0",
+            &["outer@1.0.0", "mid@1.0.0", "inner@1.0.0"],
+            Some(&empty_refs),
+        )
+        .unwrap(),
+        Some("4.0.0".to_string())
+    );
+
+    // Standalone `inner` still wins when outer is absent
+    assert_eq!(
+        ov.resolve_override_precompiled_with_caller(
+            "leaf",
+            "^1.0.0",
+            &["other@1.0.0", "inner@1.0.0"],
+            Some(&empty_refs),
+        )
+        .unwrap(),
+        Some("2.0.0".to_string())
+    );
 }

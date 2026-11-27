@@ -1972,6 +1972,7 @@ impl LockfileV3 {
         self.version = manifest.version.clone();
 
         let root = self.packages.entry("".to_string()).or_default();
+        root.raw_value = None;
         root.name = manifest.name.clone();
         root.version = manifest.version.clone();
         root.dependencies = if manifest.dependencies.is_empty() {
@@ -2310,13 +2311,13 @@ impl LockfileV3 {
                 }
 
                 if let Some(raw_target) = target_opt {
-                    let clean = raw_target
-                        .strip_prefix("./")
-                        .unwrap_or(raw_target)
-                        .strip_prefix(".\\")
-                        .unwrap_or(raw_target);
+                    let clean = raw_target.strip_prefix("file:").unwrap_or(raw_target);
                     let posix = clean.replace('\\', "/");
-                    let posix = posix.trim_end_matches('/').to_string();
+                    let posix = posix
+                        .strip_prefix("./")
+                        .unwrap_or(&posix)
+                        .trim_end_matches('/')
+                        .to_string();
                     available_link_targets.insert(posix);
                     if let Some(name) = loc.strip_prefix("node_modules/") {
                         available_link_names.insert(name.to_string());
@@ -2486,7 +2487,14 @@ impl LockfileV3 {
                 key_buf.push_str(&dep_name);
                 if let Some(pkg) = self.packages.get(key_buf.as_str()) {
                     let req_spec = pkg.version.as_deref().unwrap_or("*");
-                    if let Ok(Some(eff_spec)) = ov.resolve_override(&dep_name, req_spec, &[]) {
+                    if let Ok(Some(eff_spec)) =
+                        ov.resolve_override_precompiled_with_caller::<&str>(
+                            &dep_name,
+                            req_spec,
+                            &[],
+                            None,
+                        )
+                    {
                         if !Self::package_satisfies_spec(&dep_name, pkg, &eff_spec) {
                             return false;
                         }
@@ -2581,11 +2589,52 @@ impl LockfileV3 {
             return false;
         }
         let eff_spec: std::borrow::Cow<'_, str> = if let Some(ov) = overrides {
-            ov.resolve_override(dep, spec, &[])
+            let direct = ov
+                .resolve_override_precompiled_with_caller::<&str>(dep, spec, &[], None)
                 .ok()
-                .flatten()
-                .map(std::borrow::Cow::Owned)
-                .unwrap_or(std::borrow::Cow::Borrowed(spec))
+                .flatten();
+            if let Some(found) = direct {
+                std::borrow::Cow::Owned(found)
+            } else if let Some(alias_rest) = spec.trim().strip_prefix("npm:") {
+                let (real_pkg, inner_spec) = if let Some(after_scope) = alias_rest.strip_prefix('@')
+                {
+                    match after_scope.find('@') {
+                        Some(idx) => (&alias_rest[..idx + 1], &after_scope[idx + 1..]),
+                        None => (alias_rest, "*"),
+                    }
+                } else {
+                    match alias_rest.find('@') {
+                        Some(idx) => (&alias_rest[..idx], &alias_rest[idx + 1..]),
+                        None => (alias_rest, "*"),
+                    }
+                };
+                if let Ok(Some(overridden)) =
+                    ov.resolve_override_precompiled_with_caller::<&str>(real_pkg, inner_spec, &[], None)
+                {
+                    let ov_t = overridden.trim();
+                    let full = if ov_t.starts_with("npm:")
+                        || ov_t.starts_with("workspace:")
+                        || ov_t.starts_with("file:")
+                        || ov_t.starts_with("git:")
+                        || ov_t.starts_with("git+")
+                        || ov_t.starts_with("github:")
+                        || ov_t.starts_with("gitlab:")
+                        || ov_t.starts_with("bitbucket:")
+                        || ov_t.starts_with("gist:")
+                        || ov_t.starts_with("http://")
+                        || ov_t.starts_with("https://")
+                    {
+                        overridden
+                    } else {
+                        format!("npm:{real_pkg}@{overridden}")
+                    };
+                    std::borrow::Cow::Owned(full)
+                } else {
+                    std::borrow::Cow::Borrowed(spec)
+                }
+            } else {
+                std::borrow::Cow::Borrowed(spec)
+            }
         } else {
             std::borrow::Cow::Borrowed(spec)
         };

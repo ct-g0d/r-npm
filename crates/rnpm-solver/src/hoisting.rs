@@ -139,11 +139,16 @@ pub(crate) fn parsed_version_satisfies_target(
                 (None, None) => url.clone(),
             };
             vs == expected
-                || git_target_matches_resolved(url, committish.as_deref(), vs)
-                || committish
-                    .as_ref()
-                    .map(|c| c.trim_start_matches('v') == vs)
-                    .unwrap_or(false)
+                || git_target_matches_resolved_with_subdir(
+                    url,
+                    committish.as_deref(),
+                    subdir.as_deref(),
+                    vs,
+                )
+                || (subdir.is_none()
+                    && committish
+                        .as_ref()
+                        .is_some_and(|c| c.trim_start_matches('v') == vs))
         }),
         PackageTarget::Url(u) => version_str.is_some_and(|vs| vs == u.as_str()),
         PackageTarget::Workspace(ws_spec) => {
@@ -201,15 +206,38 @@ fn git_url_repo_key(url: &str) -> Option<(String, String)> {
         let repo = rest.trim_end_matches(".git").trim_matches('/');
         return Some(("bitbucket.org".to_string(), repo.to_string()));
     }
-    let clean = clean
+    if let Some(rest) = clean.strip_prefix("gist:") {
+        let repo = rest.trim_end_matches(".git").trim_matches('/');
+        return Some(("gist.github.com".to_string(), repo.to_string()));
+    }
+
+    let (has_authority, mut clean) = if let Some(rest) = clean
         .strip_prefix("ssh://")
         .or_else(|| clean.strip_prefix("https://"))
         .or_else(|| clean.strip_prefix("http://"))
         .or_else(|| clean.strip_prefix("file://"))
         .or_else(|| clean.strip_prefix("git://"))
-        .unwrap_or(clean);
-    let clean = clean.strip_prefix("git@").unwrap_or(clean);
-    let (host, path) = if let Some((h, p)) = clean.split_once(':') {
+    {
+        (true, rest)
+    } else {
+        (false, clean)
+    };
+
+    // Strip userinfo (e.g. git@, user:pass@, token@) from authority portion
+    if let Some(at_pos) = clean.find('@') {
+        let auth_end = if has_authority {
+            clean.find('/')
+        } else {
+            clean.find([':', '/'])
+        };
+        if auth_end.is_none_or(|end| at_pos < end) {
+            clean = &clean[at_pos + 1..];
+        }
+    }
+
+    let (host, path) = if has_authority {
+        clean.split_once('/')?
+    } else if let Some((h, p)) = clean.split_once(':') {
         (h, p)
     } else if let Some((h, p)) = clean.split_once('/') {
         (h, p)
@@ -245,31 +273,70 @@ pub fn git_urls_match_repo(url_a: &str, url_b: &str) -> bool {
     }
 }
 
+#[inline]
+fn norm_git_subdir(s: &str) -> &str {
+    s.trim().trim_start_matches("./").trim_matches('/')
+}
+
+#[inline]
+pub(crate) fn is_git_hex_hash(s: &str, min_len: usize) -> bool {
+    s.len() >= min_len && s.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// Checks if a resolved git URL matches a target Git specification (including `#path:` subdir).
+pub fn git_target_matches_resolved_with_subdir(
+    target_url: &str,
+    committish: Option<&str>,
+    subdir: Option<&str>,
+    resolved: &str,
+) -> bool {
+    if !git_urls_match_repo(target_url, resolved) {
+        return false;
+    }
+
+    let (resolved_commit, resolved_subdir) = resolved
+        .split_once('#')
+        .map(|(_, frag)| rnpm_core::spec::parse_git_fragment(frag))
+        .unwrap_or((None, None));
+
+    let expected_sub = subdir.map(norm_git_subdir).filter(|s| !s.is_empty());
+    let actual_sub = resolved_subdir
+        .as_deref()
+        .map(norm_git_subdir)
+        .filter(|s| !s.is_empty());
+    if expected_sub != actual_sub {
+        return false;
+    }
+
+    let Some(c) = committish.map(str::trim).filter(|c| !c.is_empty()) else {
+        return true;
+    };
+    let Some(rc) = resolved_commit.as_deref().map(str::trim).filter(|r| !r.is_empty()) else {
+        return false;
+    };
+    if rc == c {
+        return true;
+    }
+
+    // Only allow prefix matching when both refs are hexadecimal commit hashes.
+    if is_git_hex_hash(c, 4) && is_git_hex_hash(rc, 4) {
+        return (rc.len() >= c.len() && rc[..c.len()].eq_ignore_ascii_case(c))
+            || (c.len() >= rc.len() && c[..rc.len()].eq_ignore_ascii_case(rc));
+    }
+
+    false
+}
+
 /// Checks if a resolved git URL matches a target Git specification.
 pub fn git_target_matches_resolved(
     target_url: &str,
     committish: Option<&str>,
     resolved: &str,
 ) -> bool {
-    let expected = format!(
-        "{}{}",
-        target_url,
-        committish.map(|c| format!("#{c}")).unwrap_or_default()
-    );
-    if resolved == expected || resolved.starts_with(target_url) {
-        return true;
-    }
-    if !git_urls_match_repo(target_url, resolved) {
-        return false;
-    }
-    if let Some(c) = committish {
-        if let Some(resolved_hash) = resolved.split('#').nth(1) {
-            if resolved_hash == c || resolved_hash.starts_with(c) || c.starts_with(resolved_hash) {
-                return true;
-            }
-        }
-    }
-    true
+    let target_sub = target_url
+        .split_once('#')
+        .and_then(|(_, frag)| rnpm_core::spec::parse_git_fragment(frag).1);
+    git_target_matches_resolved_with_subdir(target_url, committish, target_sub.as_deref(), resolved)
 }
 
 /// Fast check if a node satisfies target constraint, leveraging cached parsed_version.
@@ -286,12 +353,18 @@ pub fn node_satisfies_target(node: &crate::graph::Node, target: &PackageTarget) 
                 .is_some_and(|resolved| file_target_matches_resolved(p, resolved));
         }
         PackageTarget::Git {
-            url, committish, ..
+            url,
+            committish,
+            subdir,
         } => {
-            return node
-                .resolved
-                .as_deref()
-                .is_some_and(|r| git_target_matches_resolved(url, committish.as_deref(), r));
+            return node.resolved.as_deref().is_some_and(|r| {
+                git_target_matches_resolved_with_subdir(
+                    url,
+                    committish.as_deref(),
+                    subdir.as_deref(),
+                    r,
+                )
+            });
         }
         _ => {}
     }

@@ -695,11 +695,28 @@ impl Range {
             sets.push(ComparatorSet { comparators });
         }
 
-        // If any set in the || union is a wildcard (>=0.0.0), node-semver collapses to a single wildcard set
+        // If any set in the || union is a wildcard (>=0.0.0), collapse non-prerelease sets
+        // into a single wildcard while preserving sets that can actually match prereleases
+        // (excluding synthetic `<X.Y.Z-0` upper-bound sentinels) so `1.0.0-alpha.1 || *`
+        // still matches `1.0.0-alpha.1` while `^1.0.0 || *` still collapses to `*`.
         if has_wildcard_set && sets.len() > 1 {
-            sets = vec![ComparatorSet {
+            let mut collapsed: Vec<ComparatorSet> = sets
+                .into_iter()
+                .filter(|s| {
+                    s.comparators.iter().any(|c| {
+                        !c.version.prerelease.is_empty()
+                            && !(c.op == Op::Lt
+                                && matches!(
+                                    c.version.prerelease.as_slice(),
+                                    [PrereleaseId::Numeric(0)]
+                                ))
+                    })
+                })
+                .collect();
+            collapsed.push(ComparatorSet {
                 comparators: vec![Comparator::new(Op::Gte, Version::new(0, 0, 0))],
-            }];
+            });
+            sets = collapsed;
         }
 
         Ok(Self { raw, sets })

@@ -1351,6 +1351,7 @@ impl DependencyGraph {
         }
 
         let root_loc = self.root_location.as_str();
+        let mut active_names: std::collections::HashSet<&str> = std::collections::HashSet::new();
         for (idx, (location, node)) in self.nodes.iter_mut().enumerate() {
             if location.as_str() == root_loc {
                 continue;
@@ -1387,7 +1388,14 @@ impl DependencyGraph {
             if node.flags.skipped {
                 self.skipped.insert(node.name.clone());
                 self.skipped.insert(node.install_name.clone());
+            } else {
+                active_names.insert(node.name.as_str());
+                active_names.insert(node.install_name.as_str());
             }
+        }
+        if !active_names.is_empty() && !self.skipped.is_empty() {
+            self.skipped
+                .retain(|name| !active_names.contains(name.as_str()));
         }
     }
 

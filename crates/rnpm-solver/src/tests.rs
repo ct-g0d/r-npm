@@ -1681,8 +1681,18 @@ fn test_fast_path_detects_overrides_drift() {
         // Lockfile has no overrides in extra
     }
 
+    let mut pkg_a_deps = BTreeMap::new();
+    pkg_a_deps.insert("dep-b".to_string(), "^1.0.0".to_string());
     lockfile.insert_package(
         "node_modules/pkg-a",
+        LockfilePackage {
+            version: Some("1.0.0".to_string()),
+            dependencies: Some(pkg_a_deps),
+            ..Default::default()
+        },
+    );
+    lockfile.insert_package(
+        "node_modules/dep-b",
         LockfilePackage {
             version: Some("1.0.0".to_string()),
             ..Default::default()
@@ -1690,8 +1700,18 @@ fn test_fast_path_detects_overrides_drift() {
     );
 
     let options = ResolverOptions::default();
-    // Fast path must detect overrides drift and return None
+    // Fast path must detect overrides drift (locked dep-b@1.0.0 != override 2.5.0) and return None
     assert!(resolve_fast_path(&manifest, &lockfile, &options).is_none());
+
+    // Once lockfile has dep-b@2.5.0, fast path succeeds even without lockfile root.extra["overrides"]
+    lockfile.insert_package(
+        "node_modules/dep-b",
+        LockfilePackage {
+            version: Some("2.5.0".to_string()),
+            ..Default::default()
+        },
+    );
+    assert!(resolve_fast_path(&manifest, &lockfile, &options).is_some());
 }
 
 #[test]
@@ -6933,7 +6953,7 @@ fn test_large_graph_resolution_benchmark() {
 fn test_workspace_member_never_deleted_by_dedupe_nested_compatible_nodes() {
     use crate::graph::{DependencyEdge, DependencyGraph, DependencyType, Node};
     use crate::overrides::Overrides;
-    use crate::solver::{ResolverOptions, Solver};
+    use crate::solver::ResolverOptions;
     use rnpm_core::semver::Range;
     use rnpm_core::spec::PackageTarget;
 
@@ -7013,7 +7033,7 @@ fn test_workspace_member_never_deleted_by_dedupe_nested_compatible_nodes() {
         dep_type: DependencyType::Prod,
     });
 
-    let mut solver = Solver::new(
+    let mut solver = crate::solver::Solver::new(
         &provider,
         ResolverOptions::default(),
         Overrides::new(Default::default(), Default::default()),
@@ -7148,14 +7168,13 @@ fn test_dedupe_multi_candidate_preserves_incoming_edge_order_and_eresolve() {
     use crate::error::SolverError;
     use crate::graph::{DependencyEdge, Node};
     use crate::overrides::Overrides;
-    use crate::solver::Solver;
     use rnpm_core::spec::PackageTarget;
 
     // 1. Direct multi-candidate dedupe edge-order test:
     // Create two nested compatible copies of `shared@1.0.0` whose incoming edges appear in
     // reverse candidate discovery order, then dedupe into `node_modules/shared`.
     let provider = InMemoryPackageProvider::new();
-    let mut solver = Solver::new(&provider, ResolverOptions::default(), Overrides::default());
+    let mut solver = crate::solver::Solver::new(&provider, ResolverOptions::default(), Overrides::default());
     {
         let g = solver.graph_mut();
         for (loc, name, ver) in [
@@ -7767,5 +7786,465 @@ fn test_prefer_dedupe_unrecords_overwritten_occupied_node() {
     assert_eq!(
         graph.nodes["node_modules/consumer/node_modules/target-pkg"].version,
         "1.4.0"
+    );
+}
+
+#[test]
+fn test_version_scoped_ancestor_overrides_in_solver() {
+    let mut provider = InMemoryPackageProvider::new();
+    provider.add_version("parent-a", "1.0.0", |v| {
+        v.dependencies.insert("leaf".into(), "^1.0.0".into());
+    });
+    provider.add_version("parent-a", "2.0.0", |v| {
+        v.dependencies.insert("leaf".into(), "^1.0.0".into());
+    });
+    provider.add_version("outer", "1.0.0", |v| {
+        v.dependencies.insert("inner".into(), "^1.0.0".into());
+    });
+    provider.add_version("inner", "1.0.0", |v| {
+        v.dependencies.insert("leaf".into(), "^1.0.0".into());
+    });
+    provider.add_version("leaf", "1.0.0", |_| {});
+    provider.add_version("leaf", "2.0.0", |_| {});
+    provider.add_version("leaf", "3.0.0", |_| {});
+
+    let mut manifest = Manifest {
+        name: Some("ver-override-app".into()),
+        version: Some("1.0.0".into()),
+        ..Default::default()
+    };
+    manifest.dependencies.insert("parent-a".into(), "npm:parent-a@1.0.0".into());
+    manifest.dependencies.insert("parent-a-v2".into(), "npm:parent-a@2.0.0".into());
+    manifest.dependencies.insert("outer".into(), "1.0.0".into());
+    manifest.extra.insert(
+        "overrides".to_string(),
+        serde_json::json!({
+            "leaf": "1.0.0",
+            "parent-a@1.0.0": {
+                "leaf": "2.0.0"
+            },
+            "outer@1.0.0": {
+                "leaf": "2.0.0",
+                "inner": {
+                    "leaf": "3.0.0"
+                }
+            }
+        }),
+    );
+
+    let graph =
+        resolve_dependency_graph(&manifest, &provider, &ResolverOptions::default()).unwrap();
+    let resolved_leaf = |from_loc: &str| -> &str {
+        let edge = graph
+            .edges
+            .iter()
+            .find(|e| e.from_location == from_loc && e.install_name == "leaf")
+            .unwrap_or_else(|| panic!("missing leaf edge from {from_loc}"));
+        graph.nodes[&edge.to_location].version.as_str()
+    };
+    // parent-a@1.0.0 gets overridden leaf@2.0.0; parent-a@2.0.0 must NOT match parent-a@1.0.0 and falls back to leaf@1.0.0!
+    assert_eq!(resolved_leaf("node_modules/parent-a"), "2.0.0");
+    assert_eq!(resolved_leaf("node_modules/parent-a-v2"), "1.0.0");
+    // Closer parent `inner` inside `outer@1.0.0` takes precedence -> 3.0.0
+    assert_eq!(resolved_leaf("node_modules/inner"), "3.0.0");
+}
+
+#[test]
+fn test_dedupe_nested_compatible_nodes_validates_incoming_edges_and_cleans_outgoing() {
+    use crate::graph::{DependencyEdge, DependencyGraph, Node};
+
+    let provider = InMemoryPackageProvider::new();
+    let mut graph = DependencyGraph::new();
+    graph.add_node(
+        "".into(),
+        Node {
+            location: "".into(),
+            install_name: "app".into(),
+            name: "app".into(),
+            version: "1.0.0".into(),
+            ..Default::default()
+        },
+    );
+    graph.add_node(
+        "node_modules/wrapper".into(),
+        Node {
+            location: "node_modules/wrapper".into(),
+            install_name: "wrapper".into(),
+            name: "wrapper".into(),
+            version: "1.0.0".into(),
+            ..Default::default()
+        },
+    );
+    graph.add_node(
+        "node_modules/wrapper/node_modules/helper".into(),
+        Node {
+            location: "node_modules/wrapper/node_modules/helper".into(),
+            install_name: "helper".into(),
+            name: "helper".into(),
+            version: "1.0.0".into(),
+            ..Default::default()
+        },
+    );
+    // Nested copy 1: wrapper/shared@1.5.0 has an incoming ~1.5.0 edge from wrapper/helper
+    graph.add_node(
+        "node_modules/wrapper/node_modules/shared".into(),
+        Node {
+            location: "node_modules/wrapper/node_modules/shared".into(),
+            install_name: "shared".into(),
+            name: "shared".into(),
+            version: "1.5.0".into(),
+            parsed_version: Some(rnpm_core::semver::Version::parse("1.5.0").unwrap()),
+            ..Default::default()
+        },
+    );
+    graph.add_edge(DependencyEdge {
+        from_location: "node_modules/wrapper".into(),
+        to_location: "node_modules/wrapper/node_modules/shared".into(),
+        install_name: "shared".into(),
+        package_name: "shared".into(),
+        spec: "^1.0.0".into(),
+        dep_type: DependencyType::Prod,
+    });
+    graph.add_edge(DependencyEdge {
+        from_location: "node_modules/wrapper/node_modules/helper".into(),
+        to_location: "node_modules/wrapper/node_modules/shared".into(),
+        install_name: "shared".into(),
+        package_name: "shared".into(),
+        spec: "~1.5.0".into(),
+        dep_type: DependencyType::Prod,
+    });
+
+    // Nested copy 2: consumer/shared@1.2.0 only has ^1.0.0 incoming edge + an outgoing edge
+    graph.add_node(
+        "node_modules/consumer".into(),
+        Node {
+            location: "node_modules/consumer".into(),
+            install_name: "consumer".into(),
+            name: "consumer".into(),
+            version: "1.0.0".into(),
+            ..Default::default()
+        },
+    );
+    graph.add_node(
+        "node_modules/consumer/node_modules/shared".into(),
+        Node {
+            location: "node_modules/consumer/node_modules/shared".into(),
+            install_name: "shared".into(),
+            name: "shared".into(),
+            version: "1.2.0".into(),
+            parsed_version: Some(rnpm_core::semver::Version::parse("1.2.0").unwrap()),
+            ..Default::default()
+        },
+    );
+    graph.add_node(
+        "node_modules/leaf-x".into(),
+        Node {
+            location: "node_modules/leaf-x".into(),
+            install_name: "leaf-x".into(),
+            name: "leaf-x".into(),
+            version: "1.0.0".into(),
+            ..Default::default()
+        },
+    );
+    graph.add_edge(DependencyEdge {
+        from_location: "node_modules/consumer".into(),
+        to_location: "node_modules/consumer/node_modules/shared".into(),
+        install_name: "shared".into(),
+        package_name: "shared".into(),
+        spec: "^1.0.0".into(),
+        dep_type: DependencyType::Prod,
+    });
+    graph.add_edge(DependencyEdge {
+        from_location: "node_modules/consumer/node_modules/shared".into(),
+        to_location: "node_modules/leaf-x".into(),
+        install_name: "leaf-x".into(),
+        package_name: "leaf-x".into(),
+        spec: "^1.0.0".into(),
+        dep_type: DependencyType::Prod,
+    });
+
+    // Place root shared@1.2.0
+    graph.add_node(
+        "node_modules/shared".into(),
+        Node {
+            location: "node_modules/shared".into(),
+            install_name: "shared".into(),
+            name: "shared".into(),
+            version: "1.2.0".into(),
+            parsed_version: Some(rnpm_core::semver::Version::parse("1.2.0").unwrap()),
+            ..Default::default()
+        },
+    );
+
+    let mut solver = crate::solver::Solver::new(
+        &provider,
+        ResolverOptions::default(),
+        crate::overrides::Overrides::default(),
+    )
+    .with_graph(graph);
+    let target = rnpm_core::spec::PackageTarget::Range(
+        rnpm_core::semver::Range::parse("^1.0.0").unwrap(),
+    );
+    solver.dedupe_nested_compatible_nodes("node_modules/shared", "shared", "shared", &target);
+    let result = solver.graph();
+
+    // wrapper/node_modules/shared@1.5.0 MUST NOT be deleted because root@1.2.0 violates ~1.5.0!
+    assert!(
+        result
+            .nodes
+            .contains_key("node_modules/wrapper/node_modules/shared"),
+        "nested node with incompatible incoming edge must be preserved"
+    );
+    // consumer/node_modules/shared@1.2.0 IS safely deduped and its outgoing edge to leaf-x removed!
+    assert!(
+        !result
+            .nodes
+            .contains_key("node_modules/consumer/node_modules/shared"),
+        "compatible unshadowed nested node should be deduped"
+    );
+    assert!(
+        !result
+            .edges
+            .iter()
+            .any(|e| e.from_location == "node_modules/consumer/node_modules/shared"),
+        "dangling outgoing edges from deduped node must be removed"
+    );
+    assert!(
+        result
+            .edges
+            .iter()
+            .any(|e| e.from_location == "node_modules/consumer" && e.to_location == "node_modules/shared"),
+        "incoming edge from consumer must be retargeted to root shared"
+    );
+}
+
+#[test]
+fn test_git_target_matches_resolved_fixes_prefix_committish_and_subdir() {
+    use crate::hoisting::{git_target_matches_resolved, git_target_matches_resolved_with_subdir};
+
+    // Prefix collision: foo/bar-baz must not match foo/bar
+    assert!(!git_target_matches_resolved(
+        "https://github.com/foo/bar",
+        None,
+        "https://github.com/foo/bar-baz.git#abcdef1234",
+    ));
+    assert!(git_target_matches_resolved(
+        "https://github.com/foo/bar",
+        None,
+        "git+https://github.com/foo/bar.git#abcdef1234",
+    ));
+
+    // Committish mismatch must return false (never fall through to true)
+    assert!(!git_target_matches_resolved(
+        "https://github.com/foo/bar",
+        Some("v1.0.0"),
+        "https://github.com/foo/bar.git#v2.0.0",
+    ));
+    assert!(!git_target_matches_resolved(
+        "https://github.com/foo/bar",
+        Some("v1"),
+        "https://github.com/foo/bar.git#v10",
+    ));
+    assert!(!git_target_matches_resolved(
+        "https://github.com/foo/bar",
+        Some("v1.0.0"),
+        "https://github.com/foo/bar.git",
+    ));
+    assert!(!git_target_matches_resolved(
+        "https://github.com/foo/bar",
+        Some("deadbeef"),
+        "https://github.com/foo/bar.git#cafebabe",
+    ));
+    assert!(git_target_matches_resolved(
+        "https://github.com/foo/bar",
+        Some("deadbeef"),
+        "git+ssh://git@github.com/foo/bar.git#deadbeef1234567890",
+    ));
+
+    // Subdir (#path:) parity
+    assert!(!git_target_matches_resolved_with_subdir(
+        "https://github.com/foo/mono",
+        Some("v1.0.0"),
+        Some("packages/a"),
+        "https://github.com/foo/mono.git#v1.0.0::path:packages/b",
+    ));
+    assert!(!git_target_matches_resolved_with_subdir(
+        "https://github.com/foo/mono",
+        Some("v1.0.0"),
+        Some("packages/a"),
+        "https://github.com/foo/mono.git#v1.0.0",
+    ));
+    assert!(!git_target_matches_resolved_with_subdir(
+        "https://github.com/foo/mono",
+        Some("v1.0.0"),
+        None,
+        "https://github.com/foo/mono.git#v1.0.0::path:packages/a",
+    ));
+    assert!(git_target_matches_resolved_with_subdir(
+        "https://github.com/foo/mono",
+        Some("v1.0.0"),
+        Some("packages/a"),
+        "git+https://github.com/foo/mono.git#v1.0.0::path:./packages/a/",
+    ));
+}
+
+#[test]
+fn test_fast_path_allows_omitted_optional_peers_and_reuse_clears_skipped_poisoning() {
+    use crate::solver::resolve_fast_path;
+    use rnpm_lockfile::{LockfilePackage, LockfileV3};
+
+    // 1. Omitted optional peer must allow resolve_fast_path even under strict peers
+    let mut manifest = Manifest::default();
+    manifest.name = Some("opt-peer-app".to_string());
+    manifest
+        .dependencies
+        .insert("host".to_string(), "^1.0.0".to_string());
+
+    let mut lockfile = LockfileV3::new("opt-peer-app", Some("1.0.0".to_string()));
+    if let Some(root) = lockfile.root_package_mut() {
+        root.dependencies = Some(BTreeMap::from([("host".to_string(), "^1.0.0".to_string())]));
+    }
+    lockfile.insert_package(
+        "node_modules/host",
+        LockfilePackage {
+            version: Some("1.0.0".to_string()),
+            peer_dependencies: Some(BTreeMap::from([(
+                "missing-opt-peer".to_string(),
+                "^1.0.0".to_string(),
+            )])),
+            peer_dependencies_meta: Some(BTreeMap::from([(
+                "missing-opt-peer".to_string(),
+                serde_json::json!({ "optional": true }),
+            )])),
+            ..Default::default()
+        },
+    );
+    let options = ResolverOptions::default();
+    assert!(resolve_fast_path(&manifest, &lockfile, &options).is_some());
+
+    // 2. PlacementDecision::Reuse + normalize_dependency_flags must not poison active nodes or graph.skipped
+    let mut provider = InMemoryPackageProvider::new();
+    provider.add_version("opt-parent", "1.0.0", |v| {
+        v.os = Some(vec!["never-matches-os".to_string()].into());
+        v.dependencies.insert("shared".into(), "1.0.0".into());
+    });
+    provider.add_version("req-parent", "1.0.0", |v| {
+        v.dependencies.insert("shared".into(), "1.0.0".into());
+    });
+    provider.add_version("shared", "1.0.0", |_| {});
+
+    let mut reuse_manifest = Manifest {
+        name: Some("reuse-skip-app".into()),
+        version: Some("1.0.0".into()),
+        ..Default::default()
+    };
+    reuse_manifest
+        .optional_dependencies
+        .insert("opt-parent".into(), "1.0.0".into());
+    reuse_manifest
+        .dependencies
+        .insert("req-parent".into(), "1.0.0".into());
+
+    let graph = resolve_dependency_graph(&reuse_manifest, &provider, &options).unwrap();
+    assert!(!graph.nodes["node_modules/shared"].flags.skipped);
+    assert!(!graph.skipped.contains("shared"));
+    assert!(graph.nodes["node_modules/opt-parent"].flags.skipped);
+    assert!(graph.skipped.contains("opt-parent"));
+}
+
+#[test]
+fn test_fast_path_alias_override_fallback_and_git_semver_range_check() {
+    use crate::solver::resolve_fast_path;
+    use rnpm_lockfile::{LockfilePackage, LockfileV3};
+
+    let options = ResolverOptions::default();
+
+    // Finding 3: unmatched rule on alias `dep_name` must still fall back to `real_pkg` override
+    let mut alias_manifest = Manifest::default();
+    alias_manifest.name = Some("alias-fallback-app".to_string());
+    alias_manifest
+        .dependencies
+        .insert("my-alias".to_string(), "npm:lodash@4.17.15".to_string());
+    alias_manifest.extra.insert(
+        "overrides".to_string(),
+        serde_json::json!({
+            "my-alias@1.0.0": "2.0.0",
+            "lodash": "4.17.21"
+        }),
+    );
+
+    let mut alias_lockfile = LockfileV3::new("alias-fallback-app", Some("1.0.0".to_string()));
+    if let Some(root) = alias_lockfile.root_package_mut() {
+        root.dependencies = Some(BTreeMap::from([(
+            "my-alias".to_string(),
+            "npm:lodash@4.17.15".to_string(),
+        )]));
+    }
+    alias_lockfile.insert_package(
+        "node_modules/my-alias",
+        LockfilePackage {
+            name: Some("lodash".to_string()),
+            version: Some("4.17.15".to_string()),
+            ..Default::default()
+        },
+    );
+    // Locked 4.17.15 violates fallen-through `lodash: 4.17.21` override -> fast path rejects
+    assert!(resolve_fast_path(&alias_manifest, &alias_lockfile, &options).is_none());
+
+    alias_lockfile.insert_package(
+        "node_modules/my-alias",
+        LockfilePackage {
+            name: Some("lodash".to_string()),
+            version: Some("4.17.21".to_string()),
+            ..Default::default()
+        },
+    );
+    assert!(resolve_fast_path(&alias_manifest, &alias_lockfile, &options).is_some());
+
+    // Finding 4: `#semver:<range>` with locked 40-char git SHA must enforce range against node.version
+    let mut git_manifest = Manifest::default();
+    git_manifest.name = Some("git-semver-app".to_string());
+    git_manifest.dependencies.insert(
+        "git-pkg".to_string(),
+        "github:foo/bar#semver:^2.0.0".to_string(),
+    );
+
+    let mut git_lockfile = LockfileV3::new("git-semver-app", Some("1.0.0".to_string()));
+    if let Some(root) = git_lockfile.root_package_mut() {
+        root.dependencies = Some(BTreeMap::from([(
+            "git-pkg".to_string(),
+            "github:foo/bar#semver:^2.0.0".to_string(),
+        )]));
+    }
+    git_lockfile.insert_package(
+        "node_modules/git-pkg",
+        LockfilePackage {
+            version: Some("1.5.0".to_string()),
+            resolved: Some(
+                "git+https://github.com/foo/bar.git#0123456789abcdef0123456789abcdef01234567"
+                    .to_string(),
+            ),
+            ..Default::default()
+        },
+    );
+    assert!(
+        resolve_fast_path(&git_manifest, &git_lockfile, &options).is_none(),
+        "locked 1.5.0 must not satisfy #semver:^2.0.0 even with valid 40-char SHA"
+    );
+
+    git_lockfile.insert_package(
+        "node_modules/git-pkg",
+        LockfilePackage {
+            version: Some("2.1.0".to_string()),
+            resolved: Some(
+                "git+https://github.com/foo/bar.git#0123456789abcdef0123456789abcdef01234567"
+                    .to_string(),
+            ),
+            ..Default::default()
+        },
+    );
+    assert!(
+        resolve_fast_path(&git_manifest, &git_lockfile, &options).is_some(),
+        "locked 2.1.0 satisfies #semver:^2.0.0 with valid 40-char SHA"
     );
 }

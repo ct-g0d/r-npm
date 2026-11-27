@@ -403,6 +403,64 @@ fn enrich_packages_from_legacy_buf(
     }
 }
 
+fn populate_root_deps_from_legacy(
+    deps: &BTreeMap<String, LegacyDependency>,
+    root: &mut LockfilePackage,
+) {
+    let mut root_deps = BTreeMap::new();
+    let mut root_dev_deps = BTreeMap::new();
+    let mut root_opt_deps = BTreeMap::new();
+    let mut root_peer_deps = BTreeMap::new();
+    let mut root_peer_meta = BTreeMap::new();
+    let mut root_bundled = Vec::new();
+
+    for (name, dep) in deps {
+        let is_peer = dep.peer == Some(true);
+        let is_dev_opt = dep.dev_optional == Some(true);
+        let is_dev = dep.dev == Some(true);
+        let is_opt = dep.optional == Some(true);
+
+        if is_peer {
+            root_peer_deps.insert(name.clone(), dep.version.clone());
+            if dep.peer_optional == Some(true) {
+                root_peer_meta.insert(name.clone(), serde_json::json!({ "optional": true }));
+            }
+        }
+        if is_dev_opt || is_dev {
+            root_dev_deps.insert(name.clone(), dep.version.clone());
+        }
+        if is_dev_opt || is_opt {
+            root_opt_deps.insert(name.clone(), dep.version.clone());
+        }
+        if !is_peer && !is_dev_opt && !is_dev && !is_opt {
+            root_deps.insert(name.clone(), dep.version.clone());
+        }
+
+        if dep.bundled == Some(true) {
+            root_bundled.push(name.clone());
+        }
+    }
+
+    if !root_deps.is_empty() {
+        root.dependencies = Some(root_deps);
+    }
+    if !root_dev_deps.is_empty() {
+        root.dev_dependencies = Some(root_dev_deps);
+    }
+    if !root_opt_deps.is_empty() {
+        root.optional_dependencies = Some(root_opt_deps);
+    }
+    if !root_peer_deps.is_empty() {
+        root.peer_dependencies = Some(root_peer_deps);
+    }
+    if !root_peer_meta.is_empty() {
+        root.peer_dependencies_meta = Some(root_peer_meta);
+    }
+    if !root_bundled.is_empty() {
+        root.bundle_dependencies = Some(BundledDependencies::List(root_bundled));
+    }
+}
+
 /// Migrates any parsed lockfile (v1, v2, or v3) to standard lockfile v3 format.
 pub fn migrate_to_v3(raw: AnyLockfile) -> Result<LockfileV3, LockfileError> {
     match raw.lockfile_version {
@@ -410,73 +468,15 @@ pub fn migrate_to_v3(raw: AnyLockfile) -> Result<LockfileV3, LockfileError> {
             let mut packages = BTreeMap::new();
 
             // Create root package `""`
-            let mut root_deps = BTreeMap::new();
-            let mut root_dev_deps = BTreeMap::new();
-            let mut root_opt_deps = BTreeMap::new();
-            let mut root_peer_deps = BTreeMap::new();
-            let mut root_peer_meta = BTreeMap::new();
-            let mut root_bundled = Vec::new();
-
+            let mut root_pkg = LockfilePackage {
+                name: Some(raw.name.clone()),
+                version: raw.version.clone(),
+                ..Default::default()
+            };
             if let Some(deps) = &raw.dependencies {
-                for (name, dep) in deps {
-                    root_deps.insert(name.clone(), dep.version.clone());
-                    if dep.dev == Some(true) {
-                        root_dev_deps.insert(name.clone(), dep.version.clone());
-                    }
-                    if dep.optional == Some(true) {
-                        root_opt_deps.insert(name.clone(), dep.version.clone());
-                    }
-                    if dep.peer == Some(true) {
-                        root_peer_deps.insert(name.clone(), dep.version.clone());
-                        if dep.peer_optional == Some(true) {
-                            root_peer_meta
-                                .insert(name.clone(), serde_json::json!({ "optional": true }));
-                        }
-                    }
-                    if dep.bundled == Some(true) {
-                        root_bundled.push(name.clone());
-                    }
-                }
+                populate_root_deps_from_legacy(deps, &mut root_pkg);
             }
-
-            packages.insert(
-                "".to_string(),
-                LockfilePackage {
-                    name: Some(raw.name.clone()),
-                    version: raw.version.clone(),
-                    dependencies: if root_deps.is_empty() {
-                        None
-                    } else {
-                        Some(root_deps)
-                    },
-                    dev_dependencies: if root_dev_deps.is_empty() {
-                        None
-                    } else {
-                        Some(root_dev_deps)
-                    },
-                    optional_dependencies: if root_opt_deps.is_empty() {
-                        None
-                    } else {
-                        Some(root_opt_deps)
-                    },
-                    peer_dependencies: if root_peer_deps.is_empty() {
-                        None
-                    } else {
-                        Some(root_peer_deps)
-                    },
-                    peer_dependencies_meta: if root_peer_meta.is_empty() {
-                        None
-                    } else {
-                        Some(root_peer_meta)
-                    },
-                    bundle_dependencies: if root_bundled.is_empty() {
-                        None
-                    } else {
-                        Some(BundledDependencies::List(root_bundled))
-                    },
-                    ..Default::default()
-                },
-            );
+            packages.insert("".to_string(), root_pkg);
 
             // Flatten legacy dependencies tree
             if let Some(deps) = &raw.dependencies {
@@ -537,53 +537,14 @@ pub fn migrate_to_v3(raw: AnyLockfile) -> Result<LockfileV3, LockfileError> {
                     ..Default::default()
                 });
 
-            // If root package dependencies are missing, reconstruct from raw.dependencies
-            if root.dependencies.is_none() {
-                let mut root_deps = BTreeMap::new();
-                let mut root_dev_deps = BTreeMap::new();
-                let mut root_opt_deps = BTreeMap::new();
-                let mut root_peer_deps = BTreeMap::new();
-                let mut root_peer_meta = BTreeMap::new();
-                let mut root_bundled = Vec::new();
-
+            // If root package has no dependency maps at all, reconstruct from raw.dependencies
+            if root.dependencies.is_none()
+                && root.dev_dependencies.is_none()
+                && root.optional_dependencies.is_none()
+                && root.peer_dependencies.is_none()
+            {
                 if let Some(deps) = &raw.dependencies {
-                    for (name, dep) in deps {
-                        root_deps.insert(name.clone(), dep.version.clone());
-                        if dep.dev == Some(true) {
-                            root_dev_deps.insert(name.clone(), dep.version.clone());
-                        }
-                        if dep.optional == Some(true) {
-                            root_opt_deps.insert(name.clone(), dep.version.clone());
-                        }
-                        if dep.peer == Some(true) {
-                            root_peer_deps.insert(name.clone(), dep.version.clone());
-                            if dep.peer_optional == Some(true) {
-                                root_peer_meta
-                                    .insert(name.clone(), serde_json::json!({ "optional": true }));
-                            }
-                        }
-                        if dep.bundled == Some(true) {
-                            root_bundled.push(name.clone());
-                        }
-                    }
-                }
-                if !root_deps.is_empty() {
-                    root.dependencies = Some(root_deps);
-                }
-                if !root_dev_deps.is_empty() {
-                    root.dev_dependencies = Some(root_dev_deps);
-                }
-                if !root_opt_deps.is_empty() {
-                    root.optional_dependencies = Some(root_opt_deps);
-                }
-                if !root_peer_deps.is_empty() {
-                    root.peer_dependencies = Some(root_peer_deps);
-                }
-                if !root_peer_meta.is_empty() {
-                    root.peer_dependencies_meta = Some(root_peer_meta);
-                }
-                if !root_bundled.is_empty() {
-                    root.bundle_dependencies = Some(BundledDependencies::List(root_bundled));
+                    populate_root_deps_from_legacy(deps, root);
                 }
             }
 

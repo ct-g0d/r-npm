@@ -951,7 +951,8 @@ pub fn resolve_workspace_graph<P: PackageMetadataProvider>(
     };
     let mut solver = Solver::new(provider, options.clone(), overrides).with_graph_defer_indices(graph);
 
-    let root_ancestor_head = solver.intern_ancestor_chain(&[&root_name]);
+    let root_ancestor_head = solver
+        .intern_ancestor_chain_with_versions(&[(&root_name, root_manifest.version.as_deref())]);
 
     // Enqueue root external dependencies borrowing manifest strings in sorted order
     let mut root_deps: BTreeMap<&str, (&str, DependencyType)> = BTreeMap::new();
@@ -1016,7 +1017,10 @@ pub fn resolve_workspace_graph<P: PackageMetadataProvider>(
     };
     let mut member_deps: BTreeMap<&str, (&str, DependencyType)> = BTreeMap::new();
     for member in members {
-        let member_ancestor_head = solver.intern_ancestor_chain(&[&root_name, &member.name]);
+        let member_ancestor_head = solver.intern_ancestor_chain_with_versions(&[
+            (&root_name, root_manifest.version.as_deref()),
+            (&member.name, member.version.as_deref()),
+        ]);
         member_deps.clear();
 
         if options.dev {
