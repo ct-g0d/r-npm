@@ -4577,4 +4577,67 @@ fn test_fast_parse_install_ci_prune_explain_parity() {
     assert!(crate::try_parse_fast_command_with_overrides(&ws_legacy).is_none());
     let help_args = vec!["rnpm".into(), "install".into(), "--help".into()];
     assert!(crate::try_parse_fast_command_with_overrides(&help_args).is_none());
+
+    // Space-separated optional bools (--audit false), required-value --detached-trash,
+    // duplicate single-value flags, List --prefix non-pollution, and --save-prefix -D.
+    let space_bools = vec![
+        "rnpm".into(),
+        "install".into(),
+        "--audit".into(),
+        "false".into(),
+        "--fund".into(),
+        "false".into(),
+        "--detached-trash".into(),
+        "false".into(),
+    ];
+    let (fast_space, _) = crate::try_parse_fast_command_with_overrides(&space_bools)
+        .expect("space-separated bool flags must hit fast parser accurately");
+    assert!(matches!(
+        fast_space.command,
+        crate::Commands::Install {
+            ref packages,
+            audit: Some(false),
+            fund: Some(false),
+            detached_trash: false,
+            ..
+        } if packages.is_empty()
+    ));
+
+    assert!(crate::try_parse_fast_command_with_overrides(&[
+        "rnpm".into(),
+        "install".into(),
+        "--detached-trash".into(),
+    ])
+    .is_none());
+    assert!(crate::try_parse_fast_command_with_overrides(&[
+        "rnpm".into(),
+        "install".into(),
+        "--audit=TRUE".into(),
+    ])
+    .is_none());
+    assert!(crate::try_parse_fast_command_with_overrides(&[
+        "rnpm".into(),
+        "install".into(),
+        "--registry".into(),
+        "https://a.test".into(),
+        "--registry".into(),
+        "https://b.test".into(),
+    ])
+    .is_none());
+    assert!(crate::try_parse_fast_command_with_overrides(&[
+        "rnpm".into(),
+        "install".into(),
+        "--save-prefix".into(),
+        "-D".into(),
+    ])
+    .is_none());
+
+    let (_, ls_overrides) = crate::try_parse_fast_command_with_overrides(&[
+        "rnpm".into(),
+        "ls".into(),
+        "--prefix".into(),
+        "subpkg".into(),
+    ])
+    .expect("ls --prefix must fast parse");
+    assert!(!ls_overrides.contains_key("prefix"));
 }

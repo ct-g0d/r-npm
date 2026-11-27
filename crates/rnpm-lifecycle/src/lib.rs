@@ -2759,15 +2759,53 @@ fn try_unwrap_node_cmd_shim(
         return None;
     }
     let content = std::fs::read_to_string(cmd_path).ok()?;
-    if !content.contains("SET \"_prog=node\"")
-        || !content.contains("IF EXIST \"%dp0%\\node.exe\"")
+    let mut lines = content
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty());
+
+    // Strictly match the entire canonical npm/rnpm cmd-shim template so custom
+    // `.cmd` wrappers (e.g. `SET FOO=bar` or extra commands) always use cmd.exe.
+    if !lines.next()?.eq_ignore_ascii_case("@ECHO off")
+        || !lines.next()?.eq_ignore_ascii_case("GOTO start")
+        || !lines.next()?.eq_ignore_ascii_case(":find_dp0")
+        || !lines
+            .next()
+            .is_some_and(|l| l.eq_ignore_ascii_case("SET dp0=%~dp0") || l.eq_ignore_ascii_case("SET \"dp0=%~dp0\""))
+        || !lines.next()?.eq_ignore_ascii_case("EXIT /b")
+        || !lines.next()?.eq_ignore_ascii_case(":start")
+        || !lines.next()?.eq_ignore_ascii_case("SETLOCAL")
+        || !lines.next()?.eq_ignore_ascii_case("CALL :find_dp0")
+        || !lines.next()?.eq_ignore_ascii_case("IF EXIST \"%dp0%\\node.exe\" (")
+        || !lines.next()?.eq_ignore_ascii_case("SET \"_prog=%dp0%\\node.exe\"")
+        || !lines.next()?.eq_ignore_ascii_case(") ELSE (")
+        || !lines.next()?.eq_ignore_ascii_case("SET \"_prog=node\"")
     {
         return None;
     }
+
+    let maybe_pathext = lines.next()?;
+    let invoke_line = if maybe_pathext.eq_ignore_ascii_case("SET PATHEXT=%PATHEXT:;.JS;=;%") {
+        if lines.next() != Some(")") {
+            return None;
+        }
+        lines.next()?
+    } else if maybe_pathext == ")" {
+        lines.next()?
+    } else {
+        return None;
+    };
+    if lines.next().is_some() {
+        return None;
+    }
+
     let bin_dir = cmd_path.parent()?;
-    let invoke_idx = content.rfind("\"%_prog%\"")?;
-    let tail = content[invoke_idx + "\"%_prog%\"".len()..].trim();
-    let tail_before_args = tail.strip_suffix("%*").map(str::trim)?;
+    let tail = invoke_line
+        .strip_prefix("endLocal & goto #_undefined_# 2>NUL || title %COMSPEC% & \"%_prog%\"")?;
+    if !tail.starts_with([' ', '\t']) {
+        return None;
+    }
+    let tail_before_args = tail.trim().strip_suffix("%*").map(str::trim)?;
 
     // Parse quoted tokens cleanly: optional shim args followed by `"%dp0%\<rel_path>"`.
     let mut quoted_tokens = Vec::new();

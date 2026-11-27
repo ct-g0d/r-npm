@@ -1283,14 +1283,17 @@ pub fn node_gyp_bin_dir() -> Option<PathBuf> {
     static BIN_DIR: std::sync::OnceLock<Option<CachedBinDir>> = std::sync::OnceLock::new();
     BIN_DIR
         .get_or_init(|| {
-            let stable_dir = std::env::temp_dir().join("rnpm").join("node-gyp-bin");
-            if std::fs::create_dir_all(&stable_dir).is_ok()
-                && create_private_node_gyp_shim(&stable_dir).is_ok()
+            #[cfg(windows)]
             {
-                return Some(CachedBinDir {
-                    path: stable_dir,
-                    _temp: None,
-                });
+                let stable_dir = std::env::temp_dir().join("rnpm").join("node-gyp-bin");
+                if std::fs::create_dir_all(&stable_dir).is_ok()
+                    && create_private_node_gyp_shim(&stable_dir).is_ok()
+                {
+                    return Some(CachedBinDir {
+                        path: stable_dir,
+                        _temp: None,
+                    });
+                }
             }
 
             let tmp_dir = match tempfile::Builder::new()

@@ -4825,4 +4825,15 @@ fn test_try_unwrap_node_cmd_shim_and_fallback() {
     let custom_cmd = bin_dir.join("custom.cmd");
     std::fs::write(&custom_cmd, "@echo off\r\necho custom %*\r\n").unwrap();
     assert!(try_unwrap_node_cmd_shim(&custom_cmd, &rest, dir.path(), &env).is_none());
+
+    // Canonical template with an extra SET line or inline pre-command must also fall back cleanly
+    let custom_env_cmd = bin_dir.join("custom-env.cmd");
+    let modified_header = shim_content.replace(":start\r\n", ":start\r\nSET CUSTOM_VAR=1\r\n");
+    std::fs::write(&custom_env_cmd, modified_header).unwrap();
+    assert!(try_unwrap_node_cmd_shim(&custom_env_cmd, &rest, dir.path(), &env).is_none());
+
+    let inline_cmd = bin_dir.join("inline-cmd.cmd");
+    let modified_invoke = shim_content.replace("title %COMSPEC% &", "title %COMSPEC% & SET FOO=bar &");
+    std::fs::write(&inline_cmd, modified_invoke).unwrap();
+    assert!(try_unwrap_node_cmd_shim(&inline_cmd, &rest, dir.path(), &env).is_none());
 }

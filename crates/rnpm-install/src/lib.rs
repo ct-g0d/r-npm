@@ -2901,13 +2901,18 @@ impl Installer {
         let pack_store =
             Arc::new(PackStore::new(&pack_store_path).context("Failed to initialize pack store")?);
         let registry_client = std::sync::OnceLock::new();
-        let has_custom_tls = client_config.ca.is_some()
+        let must_validate_eagerly = client_config.ca.is_some()
             || client_config.cafile.is_some()
             || client_config.cert.is_some()
             || client_config.certfile.is_some()
             || client_config.key.is_some()
-            || client_config.keyfile.is_some();
-        if has_custom_tls {
+            || client_config.keyfile.is_some()
+            || client_config.proxy.is_some()
+            || client_config.http_proxy.is_some()
+            || client_config.https_proxy.is_some()
+            || config.npmrc.settings.contains_key("user-agent")
+            || !client_config.scoped_tls.is_empty();
+        if must_validate_eagerly {
             let client = RegistryClient::with_config(client_config.clone())
                 .context("Failed to initialize registry client")?;
             let _ = registry_client.set(client);
@@ -3264,7 +3269,15 @@ impl Installer {
     pub fn with_concurrency(mut self, concurrency: usize) -> Result<Self> {
         self.registry_client_config.max_concurrent_requests = concurrency;
         self.registry_client_config.pool_max_idle_per_host = concurrency;
-        self.registry_client = std::sync::OnceLock::new();
+        if self.registry_client.get().is_some() {
+            let client = RegistryClient::with_config(self.registry_client_config.clone())
+                .context("Failed to reconfigure registry client with concurrency")?;
+            let cell = std::sync::OnceLock::new();
+            let _ = cell.set(client);
+            self.registry_client = cell;
+        } else {
+            self.registry_client = std::sync::OnceLock::new();
+        }
         self.writer_concurrency = Some(concurrency);
         self.writer_cfg = std::sync::OnceLock::new();
         let io_concurrency = concurrency.clamp(32, 128);

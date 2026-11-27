@@ -26,89 +26,141 @@ fn header(raw: &str) -> Option<Header> {
     serde_json::from_str(raw).ok()
 }
 
-fn scan_top_level_lockfile_version(raw: &str) -> Option<u32> {
-    let bytes = raw.strip_prefix('\u{feff}').unwrap_or(raw).as_bytes();
-    let mut i = 0;
+fn skip_ws(bytes: &[u8], mut i: usize) -> usize {
     while i < bytes.len() && bytes[i].is_ascii_whitespace() {
         i += 1;
     }
+    i
+}
+
+fn parse_json_string_end(bytes: &[u8], quote_idx: usize) -> Option<usize> {
+    let mut i = quote_idx + 1;
+    let mut escaped = false;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if escaped {
+            escaped = false;
+        } else if b == b'\\' {
+            escaped = true;
+        } else if b == b'"' {
+            return Some(i + 1);
+        } else if b < 0x20 {
+            return None;
+        }
+        i += 1;
+    }
+    None
+}
+
+fn skip_json_value(bytes: &[u8], start: usize) -> Option<usize> {
+    let i = skip_ws(bytes, start);
+    let &first = bytes.get(i)?;
+    match first {
+        b'"' => parse_json_string_end(bytes, i),
+        b'{' | b'[' => {
+            let mut depth = 1usize;
+            let mut j = i + 1;
+            while j < bytes.len() {
+                match bytes[j] {
+                    b'"' => j = parse_json_string_end(bytes, j)?,
+                    b'{' | b'[' => {
+                        depth += 1;
+                        j += 1;
+                    }
+                    b'}' | b']' => {
+                        depth -= 1;
+                        j += 1;
+                        if depth == 0 {
+                            return Some(j);
+                        }
+                    }
+                    b'/' => return None,
+                    _ => j += 1,
+                }
+            }
+            None
+        }
+        b't' => bytes[i..].starts_with(b"true").then_some(i + 4),
+        b'f' => bytes[i..].starts_with(b"false").then_some(i + 5),
+        b'n' => bytes[i..].starts_with(b"null").then_some(i + 4),
+        b'-' | b'0'..=b'9' => {
+            let mut j = i + 1;
+            while j < bytes.len()
+                && (bytes[j].is_ascii_digit()
+                    || matches!(bytes[j], b'.' | b'e' | b'E' | b'+' | b'-'))
+            {
+                j += 1;
+            }
+            Some(j)
+        }
+        _ => None,
+    }
+}
+
+fn scan_top_level_lockfile_version(raw: &str) -> Option<u32> {
+    let bytes = raw.strip_prefix('\u{feff}').unwrap_or(raw).as_bytes();
+    let mut i = skip_ws(bytes, 0);
     if bytes.get(i) != Some(&b'{') {
         return None;
     }
-    i += 1;
-    let mut depth = 1usize;
-    let limit = bytes.len().min(8192);
-    while i < limit {
-        match bytes[i] {
-            b'"' => {
-                let start = i + 1;
-                i += 1;
-                let mut escaped = false;
-                while i < limit {
-                    let b = bytes[i];
-                    if escaped {
-                        escaped = false;
-                    } else if b == b'\\' {
-                        escaped = true;
-                    } else if b == b'"' {
-                        break;
-                    }
+    i = skip_ws(bytes, i + 1);
+    if bytes.get(i) == Some(&b'}') {
+        return None;
+    }
+
+    let mut found_version: Option<u32> = None;
+    loop {
+        if bytes.get(i) != Some(&b'"') {
+            return None;
+        }
+        let key_start = i + 1;
+        let after_key = parse_json_string_end(bytes, i)?;
+        let key = &bytes[key_start..after_key - 1];
+        i = skip_ws(bytes, after_key);
+        if bytes.get(i) != Some(&b':') {
+            return None;
+        }
+        i = skip_ws(bytes, i + 1);
+
+        if key == b"lockfileVersion" {
+            if bytes.get(i) == Some(&b'"') {
+                let end = parse_json_string_end(bytes, i)?;
+                let inner = &bytes[i + 1..end - 1];
+                if inner.is_empty() || !inner.iter().all(|b| b.is_ascii_digit()) {
+                    return None;
+                }
+                found_version = std::str::from_utf8(inner).ok()?.parse::<u32>().ok();
+                i = end;
+            } else {
+                let vs = i;
+                while i < bytes.len() && bytes[i].is_ascii_digit() {
                     i += 1;
                 }
-                if i >= limit {
+                if i == vs {
                     return None;
                 }
-                let key = &bytes[start..i];
-                i += 1;
-                if depth == 1 && key == b"lockfileVersion" {
-                    let mut k = i;
-                    while k < bytes.len() && bytes[k].is_ascii_whitespace() {
-                        k += 1;
-                    }
-                    if bytes.get(k) != Some(&b':') {
-                        return None;
-                    }
-                    k += 1;
-                    while k < bytes.len() && bytes[k].is_ascii_whitespace() {
-                        k += 1;
-                    }
-                    if bytes.get(k) == Some(&b'"') {
-                        k += 1;
-                        let vs = k;
-                        while k < bytes.len() && bytes[k].is_ascii_digit() {
-                            k += 1;
-                        }
-                        if bytes.get(k) == Some(&b'"') && k > vs {
-                            return std::str::from_utf8(&bytes[vs..k]).ok()?.parse::<u32>().ok();
-                        }
-                        return None;
-                    } else {
-                        let vs = k;
-                        while k < bytes.len() && bytes[k].is_ascii_digit() {
-                            k += 1;
-                        }
-                        if k > vs && matches!(bytes.get(k), None | Some(b',') | Some(b'}') | Some(b' ') | Some(b'\t') | Some(b'\r') | Some(b'\n')) {
-                            return std::str::from_utf8(&bytes[vs..k]).ok()?.parse::<u32>().ok();
-                        }
-                        return None;
-                    }
-                }
+                found_version = std::str::from_utf8(&bytes[vs..i]).ok()?.parse::<u32>().ok();
             }
-            b'{' | b'[' => {
-                depth += 1;
-                i += 1;
+        } else {
+            i = skip_json_value(bytes, i)?;
+        }
+
+        i = skip_ws(bytes, i);
+        match bytes.get(i) {
+            Some(&b',') => {
+                i = skip_ws(bytes, i + 1);
             }
-            b'}' | b']' => {
-                depth = depth.saturating_sub(1);
-                if depth == 0 {
-                    return None;
-                }
-                i += 1;
+            Some(&b'}') => {
+                let tail = skip_ws(bytes, i + 1);
+                return if tail == bytes.len() {
+                    found_version
+                } else {
+                    None
+                };
             }
-            _ => i += 1,
+            _ => return None,
         }
     }
-    None
 }
 
 /// Extract `lockfileVersion` from raw lockfile JSON text.
@@ -449,5 +501,23 @@ npm warn old lockfile"
         assert_eq!(detect_lockfile_version(nested_first), Some(3));
         assert_eq!(detect_lockfile_version("\u{feff}{\"lockfileVersion\": \"2\"}"), Some(2));
         assert_eq!(detect_lockfile_version("not-json"), None);
+        // Truncated / malformed JSON must return None rather than a partial integer.
+        assert_eq!(detect_lockfile_version("{\"lockfileVersion\": 3"), None);
+        assert_eq!(detect_lockfile_version("{\"lockfileVersion\": 3, garbage"), None);
+        // JSONC comments must fall back cleanly and return None (not match inside comments).
+        assert_eq!(
+            detect_lockfile_version("{ /* \"lockfileVersion\": 1 */ \"lockfileVersion\": 3 }"),
+            None
+        );
+        // Duplicate top-level keys match serde_json (last wins).
+        assert_eq!(
+            detect_lockfile_version("{\"lockfileVersion\": 2, \"lockfileVersion\": 3}"),
+            Some(3)
+        );
+        // Top-level string value equal to key name still parses correctly.
+        assert_eq!(
+            detect_lockfile_version("{\"name\": \"lockfileVersion\", \"lockfileVersion\": 3}"),
+            Some(3)
+        );
     }
 }

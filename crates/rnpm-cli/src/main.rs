@@ -8525,6 +8525,7 @@ fn execute_sync_command_inner(
             if run_prechecks {
                 if !*dry_run {
                     rnpm_install::trash::cleanup_leftover_trash(current_dir);
+                    init_cli_request_context("prune", config);
                 }
                 if let Err(e) = enforce_dev_engines_with_config(current_dir, config) {
                     return Some(Err(e));
@@ -8930,9 +8931,9 @@ fn execute_sync_command_inner(
 }
 
 fn parse_opt_bool_val(val: &str) -> Option<bool> {
-    match val.trim().to_ascii_lowercase().as_str() {
-        "true" | "1" | "yes" | "on" => Some(true),
-        "false" | "0" | "no" | "off" => Some(false),
+    match val {
+        "true" => Some(true),
+        "false" => Some(false),
         _ => None,
     }
 }
@@ -8947,7 +8948,7 @@ fn try_parse_fast_command_with_overrides(
         .iter()
         .skip(1)
         .take_while(|a| a.as_str() != "--")
-        .any(|a| matches!(a.as_str(), "--help" | "-h" | "--version" | "-v" | "-V" | "--" | "-ws"))
+        .any(|a| matches!(a.as_str(), "--help" | "-h" | "--version" | "-v" | "-V" | "-ws"))
     {
         return None;
     }
@@ -9098,25 +9099,32 @@ fn try_parse_fast_command_with_overrides(
                     i += 1;
                     depth = Some(rest.get(i)?.parse::<usize>().ok()?);
                 } else if let Some(val) = tok.strip_prefix("--omit=") {
-                    omit.extend(val.split(',').filter(|s| !s.is_empty()).map(str::to_string));
+                    if val.is_empty() {
+                        return None;
+                    }
+                    omit.extend(val.split(',').map(str::to_string));
                 } else if tok == "--omit" {
                     i += 1;
                     let val = rest.get(i)?;
-                    if val.starts_with('-') {
+                    if val.is_empty() || val.starts_with('-') {
                         return None;
                     }
-                    omit.extend(val.split(',').filter(|s| !s.is_empty()).map(str::to_string));
+                    omit.extend(val.split(',').map(str::to_string));
                 } else if let Some(val) = tok.strip_prefix("--prefix=") {
+                    if prefix.is_some() {
+                        return None;
+                    }
                     prefix = Some(PathBuf::from(val));
-                    overrides.insert("prefix".to_string(), val.to_string());
                 } else if tok == "--prefix" {
+                    if prefix.is_some() {
+                        return None;
+                    }
                     i += 1;
                     let val = rest.get(i)?;
                     if val.starts_with('-') {
                         return None;
                     }
                     prefix = Some(PathBuf::from(val));
-                    overrides.insert("prefix".to_string(), val.clone());
                 } else if let Some(val) = tok.strip_prefix("--workspace=") {
                     workspace.push(val.to_string());
                 } else if tok == "-w" || tok == "--workspace" {
@@ -9285,6 +9293,9 @@ fn try_parse_fast_command_with_overrides(
             let mut install_strategy = None;
             let mut wait_for_trash = false;
             let mut detached_trash = true;
+            let mut seen_detached_trash = false;
+            let mut seen_prefix = false;
+            let mut seen_loglevel = false;
             let mut json = false;
             let mut no_bin_links = false;
             let mut bin_links = None;
@@ -9293,8 +9304,14 @@ fn try_parse_fast_command_with_overrides(
             while i < rest.len() {
                 let tok = rest[i].as_str();
                 if let Some(val) = tok.strip_prefix("--registry=") {
+                    if registry.is_some() {
+                        return None;
+                    }
                     registry = Some(val.to_string());
                 } else if tok == "--registry" {
+                    if registry.is_some() {
+                        return None;
+                    }
                     i += 1;
                     let val = rest.get(i)?;
                     if val.starts_with('-') {
@@ -9302,8 +9319,14 @@ fn try_parse_fast_command_with_overrides(
                     }
                     registry = Some(val.clone());
                 } else if let Some(val) = tok.strip_prefix("--cache=") {
+                    if cache.is_some() {
+                        return None;
+                    }
                     cache = Some(PathBuf::from(val));
                 } else if tok == "--cache" {
+                    if cache.is_some() {
+                        return None;
+                    }
                     i += 1;
                     let val = rest.get(i)?;
                     if val.starts_with('-') {
@@ -9311,12 +9334,20 @@ fn try_parse_fast_command_with_overrides(
                     }
                     cache = Some(PathBuf::from(val));
                 } else if let Some(val) = tok.strip_prefix("--prefix=") {
+                    if seen_prefix {
+                        return None;
+                    }
+                    seen_prefix = true;
                     if is_ci {
                         overrides.insert("prefix".to_string(), val.to_string());
                     } else {
                         prefix = Some(PathBuf::from(val));
                     }
                 } else if tok == "--prefix" {
+                    if seen_prefix {
+                        return None;
+                    }
+                    seen_prefix = true;
                     i += 1;
                     let val = rest.get(i)?;
                     if val.starts_with('-') {
@@ -9328,29 +9359,40 @@ fn try_parse_fast_command_with_overrides(
                         prefix = Some(PathBuf::from(val));
                     }
                 } else if let Some(val) = tok.strip_prefix("--omit=") {
-                    omit.extend(val.split(',').filter(|s| !s.is_empty()).map(str::to_string));
+                    if val.is_empty() {
+                        return None;
+                    }
+                    omit.extend(val.split(',').map(str::to_string));
                 } else if tok == "--omit" {
                     i += 1;
                     let val = rest.get(i)?;
-                    if val.starts_with('-') {
+                    if val.is_empty() || val.starts_with('-') {
                         return None;
                     }
-                    omit.extend(val.split(',').filter(|s| !s.is_empty()).map(str::to_string));
+                    omit.extend(val.split(',').map(str::to_string));
                 } else if let Some(val) = tok.strip_prefix("--include=") {
-                    include.extend(val.split(',').filter(|s| !s.is_empty()).map(str::to_string));
+                    if val.is_empty() {
+                        return None;
+                    }
+                    include.extend(val.split(',').map(str::to_string));
                 } else if tok == "--include" {
                     i += 1;
                     let val = rest.get(i)?;
-                    if val.starts_with('-') {
+                    if val.is_empty() || val.starts_with('-') {
                         return None;
                     }
-                    include.extend(val.split(',').filter(|s| !s.is_empty()).map(str::to_string));
+                    include.extend(val.split(',').map(str::to_string));
                 } else if let Some(val) = tok.strip_prefix("--install-strategy=") {
-                    if !matches!(val, "hoisted" | "linked" | "nested" | "shallow") {
+                    if install_strategy.is_some()
+                        || !matches!(val, "hoisted" | "linked" | "nested" | "shallow")
+                    {
                         return None;
                     }
                     install_strategy = Some(val.to_string());
                 } else if tok == "--install-strategy" {
+                    if install_strategy.is_some() {
+                        return None;
+                    }
                     i += 1;
                     let val = rest.get(i)?;
                     if !matches!(val.as_str(), "hoisted" | "linked" | "nested" | "shallow") {
@@ -9358,12 +9400,18 @@ fn try_parse_fast_command_with_overrides(
                     }
                     install_strategy = Some(val.clone());
                 } else if let Some(val) = tok.strip_prefix("--lockfile-version=") {
+                    if lockfile_version.is_some() {
+                        return None;
+                    }
                     let v = val.parse::<u32>().ok()?;
                     if !(1..=3).contains(&v) {
                         return None;
                     }
                     lockfile_version = Some(v);
                 } else if tok == "--lockfile-version" {
+                    if lockfile_version.is_some() {
+                        return None;
+                    }
                     i += 1;
                     let v = rest.get(i)?.parse::<u32>().ok()?;
                     if !(1..=3).contains(&v) {
@@ -9371,8 +9419,14 @@ fn try_parse_fast_command_with_overrides(
                     }
                     lockfile_version = Some(v);
                 } else if let Some(val) = tok.strip_prefix("--os=") {
+                    if os.is_some() {
+                        return None;
+                    }
                     os = Some(val.to_string());
                 } else if tok == "--os" {
+                    if os.is_some() {
+                        return None;
+                    }
                     i += 1;
                     let val = rest.get(i)?;
                     if val.starts_with('-') {
@@ -9380,8 +9434,14 @@ fn try_parse_fast_command_with_overrides(
                     }
                     os = Some(val.clone());
                 } else if let Some(val) = tok.strip_prefix("--cpu=") {
+                    if cpu.is_some() {
+                        return None;
+                    }
                     cpu = Some(val.to_string());
                 } else if tok == "--cpu" {
+                    if cpu.is_some() {
+                        return None;
+                    }
                     i += 1;
                     let val = rest.get(i)?;
                     if val.starts_with('-') {
@@ -9389,8 +9449,14 @@ fn try_parse_fast_command_with_overrides(
                     }
                     cpu = Some(val.clone());
                 } else if let Some(val) = tok.strip_prefix("--libc=") {
+                    if libc.is_some() {
+                        return None;
+                    }
                     libc = Some(val.to_string());
                 } else if tok == "--libc" {
+                    if libc.is_some() {
+                        return None;
+                    }
                     i += 1;
                     let val = rest.get(i)?;
                     if val.starts_with('-') {
@@ -9407,19 +9473,31 @@ fn try_parse_fast_command_with_overrides(
                     }
                     workspace.push(val.clone());
                 } else if let Some(val) = tok.strip_prefix("--save-prefix=") {
-                    if is_ci {
+                    if is_ci || save_prefix.is_some() {
                         return None;
                     }
                     save_prefix = Some(val.to_string());
                 } else if tok == "--save-prefix" {
-                    if is_ci {
+                    if is_ci || save_prefix.is_some() {
                         return None;
                     }
                     i += 1;
-                    save_prefix = Some(rest.get(i)?.clone());
+                    let val = rest.get(i)?;
+                    if val.starts_with('-') {
+                        return None;
+                    }
+                    save_prefix = Some(val.clone());
                 } else if let Some(val) = tok.strip_prefix("--loglevel=") {
+                    if seen_loglevel {
+                        return None;
+                    }
+                    seen_loglevel = true;
                     overrides.insert("loglevel".to_string(), val.to_string());
                 } else if tok == "--loglevel" {
+                    if seen_loglevel {
+                        return None;
+                    }
+                    seen_loglevel = true;
                     i += 1;
                     let val = rest.get(i)?;
                     if val.starts_with('-') {
@@ -9427,44 +9505,119 @@ fn try_parse_fast_command_with_overrides(
                     }
                     overrides.insert("loglevel".to_string(), val.clone());
                 } else if let Some(val) = tok.strip_prefix("--audit=") {
+                    if audit.is_some() || no_audit {
+                        return None;
+                    }
                     audit = Some(parse_opt_bool_val(val)?);
                 } else if let Some(val) = tok.strip_prefix("--fund=") {
+                    if fund.is_some() || no_fund {
+                        return None;
+                    }
                     fund = Some(parse_opt_bool_val(val)?);
                 } else if let Some(val) = tok.strip_prefix("--package-lock=") {
+                    if package_lock.is_some() || no_package_lock {
+                        return None;
+                    }
                     package_lock = Some(parse_opt_bool_val(val)?);
                 } else if let Some(val) = tok.strip_prefix("--format-package-lock=") {
+                    if format_package_lock.is_some() || no_format_package_lock {
+                        return None;
+                    }
                     format_package_lock = Some(parse_opt_bool_val(val)?);
                 } else if let Some(val) = tok.strip_prefix("--bin-links=") {
+                    if bin_links.is_some() || no_bin_links {
+                        return None;
+                    }
                     bin_links = Some(parse_opt_bool_val(val)?);
                 } else if let Some(val) = tok.strip_prefix("--detached-trash=") {
+                    if seen_detached_trash {
+                        return None;
+                    }
+                    seen_detached_trash = true;
+                    detached_trash = parse_opt_bool_val(val)?;
+                } else if tok == "--detached-trash" {
+                    if seen_detached_trash {
+                        return None;
+                    }
+                    seen_detached_trash = true;
+                    i += 1;
+                    let val = rest.get(i)?;
                     detached_trash = parse_opt_bool_val(val)?;
                 } else {
                     match tok {
-                        "--offline" => offline = true,
-                        "-f" | "--force" => force = true,
-                        "--ignore-scripts" => ignore_scripts = true,
-                        "--foreground-scripts" => foreground_scripts = true,
-                        "--strict-sandbox" => strict_sandbox = true,
-                        "--legacy-peer-deps" => legacy_peer_deps = true,
-                        "--strict-peer-deps" => strict_peer_deps = true,
-                        "--package-lock-only" => package_lock_only = true,
-                        "--no-package-lock" => no_package_lock = true,
-                        "--package-lock" => package_lock = Some(true),
-                        "--no-format-package-lock" => no_format_package_lock = true,
-                        "--format-package-lock" => format_package_lock = Some(true),
-                        "--dry-run" => dry_run = true,
-                        "--no-audit" => no_audit = true,
-                        "--audit" => audit = Some(true),
-                        "--no-fund" => no_fund = true,
-                        "--fund" => fund = Some(true),
-                        "--no-bin-links" => no_bin_links = true,
-                        "--bin-links" => bin_links = Some(true),
-                        "--workspace-root" | "--include-workspace-root" => workspace_root = true,
-                        "--workspaces" => workspaces = true,
-                        "--timing" => timing = true,
-                        "--wait-for-trash" | "--wait-trash" => wait_for_trash = true,
-                        "--detached-trash" => detached_trash = true,
-                        "--json" => json = true,
+                        "--offline" if !offline => offline = true,
+                        "-f" | "--force" if !force => force = true,
+                        "--ignore-scripts" if !ignore_scripts => ignore_scripts = true,
+                        "--foreground-scripts" if !foreground_scripts => foreground_scripts = true,
+                        "--strict-sandbox" if !strict_sandbox => strict_sandbox = true,
+                        "--legacy-peer-deps" if !legacy_peer_deps => legacy_peer_deps = true,
+                        "--strict-peer-deps" if !strict_peer_deps => strict_peer_deps = true,
+                        "--package-lock-only" if !package_lock_only => package_lock_only = true,
+                        "--no-package-lock" if !no_package_lock && package_lock.is_none() => {
+                            no_package_lock = true;
+                        }
+                        "--package-lock" if package_lock.is_none() && !no_package_lock => {
+                            if let Some(val) = rest.get(i + 1).and_then(|v| parse_opt_bool_val(v)) {
+                                i += 1;
+                                package_lock = Some(val);
+                            } else {
+                                package_lock = Some(true);
+                            }
+                        }
+                        "--no-format-package-lock"
+                            if !no_format_package_lock && format_package_lock.is_none() =>
+                        {
+                            no_format_package_lock = true;
+                        }
+                        "--format-package-lock"
+                            if format_package_lock.is_none() && !no_format_package_lock =>
+                        {
+                            if let Some(val) = rest.get(i + 1).and_then(|v| parse_opt_bool_val(v)) {
+                                i += 1;
+                                format_package_lock = Some(val);
+                            } else {
+                                format_package_lock = Some(true);
+                            }
+                        }
+                        "--dry-run" if !dry_run => dry_run = true,
+                        "--no-audit" if !no_audit && audit.is_none() => no_audit = true,
+                        "--audit" if audit.is_none() && !no_audit => {
+                            if let Some(val) = rest.get(i + 1).and_then(|v| parse_opt_bool_val(v)) {
+                                i += 1;
+                                audit = Some(val);
+                            } else {
+                                audit = Some(true);
+                            }
+                        }
+                        "--no-fund" if !no_fund && fund.is_none() => no_fund = true,
+                        "--fund" if fund.is_none() && !no_fund => {
+                            if let Some(val) = rest.get(i + 1).and_then(|v| parse_opt_bool_val(v)) {
+                                i += 1;
+                                fund = Some(val);
+                            } else {
+                                fund = Some(true);
+                            }
+                        }
+                        "--no-bin-links" if !no_bin_links && bin_links.is_none() => {
+                            no_bin_links = true;
+                        }
+                        "--bin-links" if bin_links.is_none() && !no_bin_links => {
+                            if let Some(val) = rest.get(i + 1).and_then(|v| parse_opt_bool_val(v)) {
+                                i += 1;
+                                bin_links = Some(val);
+                            } else {
+                                bin_links = Some(true);
+                            }
+                        }
+                        "--workspace-root" | "--include-workspace-root" if !workspace_root => {
+                            workspace_root = true;
+                        }
+                        "--workspaces" if !workspaces => workspaces = true,
+                        "--timing" if !timing => timing = true,
+                        "--wait-for-trash" | "--wait-trash" if !wait_for_trash => {
+                            wait_for_trash = true;
+                        }
+                        "--json" if !json => json = true,
                         "-s" | "--silent" => {
                             overrides.insert("loglevel".to_string(), "silent".to_string());
                         }
@@ -9480,13 +9633,17 @@ fn try_parse_fast_command_with_overrides(
                         "--install-links" => {
                             overrides.insert("install-links".to_string(), "true".to_string());
                         }
-                        "-D" | "--save-dev" if !is_ci => save_dev = true,
-                        "-E" | "--save-exact" if !is_ci => save_exact = true,
-                        "-P" | "-S" | "--save-prod" | "--save" if !is_ci => save_prod = true,
-                        "-O" | "--save-optional" if !is_ci => save_optional = true,
-                        "--save-peer" if !is_ci => save_peer = true,
-                        "--no-save" if !is_ci => no_save = true,
-                        "-g" | "--global" if !is_ci => global = true,
+                        "-D" | "--save-dev" if !is_ci && !save_dev => save_dev = true,
+                        "-E" | "--save-exact" if !is_ci && !save_exact => save_exact = true,
+                        "-P" | "-S" | "--save-prod" | "--save" if !is_ci && !save_prod => {
+                            save_prod = true;
+                        }
+                        "-O" | "--save-optional" if !is_ci && !save_optional => {
+                            save_optional = true;
+                        }
+                        "--save-peer" if !is_ci && !save_peer => save_peer = true,
+                        "--no-save" if !is_ci && !no_save => no_save = true,
+                        "-g" | "--global" if !is_ci && !global => global = true,
                         t if !t.starts_with('-') && !is_ci => packages.push(t.to_string()),
                         _ => return None,
                     }
@@ -9584,6 +9741,21 @@ fn try_parse_fast_command_with_overrides(
         }
         _ => None,
     }
+}
+
+fn init_cli_request_context(command_name: &str, config: &rnpm_config::Config) {
+    let mut agent = config
+        .npmrc
+        .settings
+        .get("user-agent")
+        .cloned()
+        .unwrap_or_else(crate::node_info::npm_user_agent);
+    if config.get_bool("workspaces") == Some(true)
+        || config.get("workspace").is_some_and(|v| !v.is_empty())
+    {
+        agent = agent.replace("workspaces/false", "workspaces/true");
+    }
+    rnpm_registry::client::set_cli_request_context(command_name.to_string(), agent);
 }
 
 fn main() {
@@ -9836,19 +10008,7 @@ fn main() {
         std::process::exit(0);
     }
 
-    let command_name = cli.command.command_name();
-    let mut agent = effective_config
-        .npmrc
-        .settings
-        .get("user-agent")
-        .cloned()
-        .unwrap_or_else(crate::node_info::npm_user_agent);
-    if effective_config.get_bool("workspaces") == Some(true)
-        || effective_config.get("workspace").is_some_and(|v| !v.is_empty())
-    {
-        agent = agent.replace("workspaces/false", "workspaces/true");
-    }
-    rnpm_registry::client::set_cli_request_context(command_name.to_string(), agent);
+    init_cli_request_context(cli.command.command_name(), &effective_config);
 
     let worker_threads = std::thread::available_parallelism()
         .map(|n| n.get().clamp(2, 4))
