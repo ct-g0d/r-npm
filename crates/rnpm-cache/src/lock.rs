@@ -217,7 +217,11 @@ impl CacheLock {
         false
     }
 
-    /// Attempt to recover a stale lock by reclaiming or removing an abandoned lock file.
+    /// Attempt to recover a stale lock by reclaiming an abandoned lock file in place.
+    ///
+    /// Never unlinks the lock path on failure: both Unix `flock` and Windows `LockFileEx`
+    /// automatically release locks when a dead owner process exits, whereas unlinking a
+    /// live lock path on Unix splits lock coordination across two different inodes.
     pub fn force_recover_stale_lock(path: &Path) -> Result<Option<Self>, std::io::Error> {
         #[cfg(windows)]
         if let Ok(meta) = std::fs::metadata(path) {
@@ -228,11 +232,6 @@ impl CacheLock {
             }
         }
 
-        if let Some(lock) = Self::try_acquire_exclusive(path)? {
-            return Ok(Some(lock));
-        }
-
-        let _ = std::fs::remove_file(path);
         Self::try_acquire_exclusive(path)
     }
 

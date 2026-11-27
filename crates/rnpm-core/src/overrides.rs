@@ -552,18 +552,44 @@ impl FastOverridesIndex {
     }
 }
 
+static NEXT_TRACKED_RULES_ID: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(1);
+
+#[inline]
+fn next_tracked_rules_id() -> u64 {
+    NEXT_TRACKED_RULES_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Mutation-tracked wrapper around `BTreeMap<String, OverrideValue>` that bumps a monotonic
-/// generation counter on mutable access so override lookups verify index freshness in O(1).
-#[derive(Debug, Clone, Default, Eq)]
+/// generation counter on mutable access and assigns a unique identity per instance so both
+/// in-place mutations and whole-map replacements invalidate cached indices in O(1).
+#[derive(Debug, Clone, Eq)]
 pub struct TrackedRules {
     inner: BTreeMap<String, OverrideValue>,
+    id: u64,
     generation: u64,
+}
+
+impl Default for TrackedRules {
+    #[inline]
+    fn default() -> Self {
+        Self {
+            inner: BTreeMap::new(),
+            id: next_tracked_rules_id(),
+            generation: 0,
+        }
+    }
 }
 
 impl TrackedRules {
     #[inline]
     pub fn generation(&self) -> u64 {
         self.generation
+    }
+
+    #[inline]
+    pub(crate) fn stamp(&self) -> (u64, u64) {
+        (self.id, self.generation)
     }
 }
 
@@ -572,6 +598,7 @@ impl From<BTreeMap<String, OverrideValue>> for TrackedRules {
     fn from(inner: BTreeMap<String, OverrideValue>) -> Self {
         Self {
             inner,
+            id: next_tracked_rules_id(),
             generation: 0,
         }
     }
@@ -647,13 +674,26 @@ impl IntoIterator for TrackedRules {
 }
 
 /// Overrides engine implementing npm RFC 36 package overrides.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct Overrides {
     pub rules: TrackedRules,
     /// Root dependencies map (for reference overrides like `"$foo"`).
     pub root_dependencies: BTreeMap<String, String>,
     fast_idx: FastOverridesIndex,
-    fast_idx_generation: u64,
+    fast_idx_stamp: (u64, u64),
+}
+
+impl Default for Overrides {
+    fn default() -> Self {
+        let rules = TrackedRules::default();
+        let fast_idx_stamp = rules.stamp();
+        Self {
+            rules,
+            root_dependencies: BTreeMap::new(),
+            fast_idx: FastOverridesIndex::default(),
+            fast_idx_stamp,
+        }
+    }
 }
 
 impl PartialEq for Overrides {
@@ -670,12 +710,13 @@ impl Overrides {
         root_dependencies: BTreeMap<String, String>,
     ) -> Self {
         let tracked = TrackedRules::from(rules);
+        let stamp = tracked.stamp();
         if tracked.is_empty() {
             return Self {
                 rules: tracked,
                 root_dependencies,
                 fast_idx: FastOverridesIndex::default(),
-                fast_idx_generation: 0,
+                fast_idx_stamp: stamp,
             };
         }
         let fast_idx = FastOverridesIndex::compile(&tracked);
@@ -683,7 +724,7 @@ impl Overrides {
             rules: tracked,
             root_dependencies,
             fast_idx,
-            fast_idx_generation: 0,
+            fast_idx_stamp: stamp,
         }
     }
 
@@ -797,7 +838,7 @@ impl Overrides {
         }
 
         let fallback_fast;
-        let fast = if self.fast_idx_generation == self.rules.generation() {
+        let fast = if self.fast_idx_stamp == self.rules.stamp() {
             &self.fast_idx
         } else {
             fallback_fast = FastOverridesIndex::compile(&self.rules);
@@ -814,12 +855,18 @@ impl Overrides {
         )
     }
 
-    /// Refresh compiled override indices if `self.rules` was mutated directly.
+    /// Replace all override rules and immediately recompile the lookup index.
+    pub fn set_rules(&mut self, rules: impl Into<TrackedRules>) {
+        self.rules = rules.into();
+        self.refresh_compiled();
+    }
+
+    /// Refresh compiled override indices if `self.rules` was mutated or replaced.
     pub fn refresh_compiled(&mut self) {
-        let current_gen = self.rules.generation();
-        if self.fast_idx_generation != current_gen {
+        let current_stamp = self.rules.stamp();
+        if self.fast_idx_stamp != current_stamp {
             self.fast_idx = FastOverridesIndex::compile(&self.rules);
-            self.fast_idx_generation = current_gen;
+            self.fast_idx_stamp = current_stamp;
         }
     }
 
@@ -1218,7 +1265,7 @@ impl Overrides {
         if self.rules.is_empty() {
             return false;
         }
-        if self.fast_idx_generation == self.rules.generation() {
+        if self.fast_idx_stamp == self.rules.stamp() {
             return self.fast_idx.all_target_names.contains(name);
         }
         fn walk(rules: &BTreeMap<String, OverrideValue>, name: &str) -> bool {

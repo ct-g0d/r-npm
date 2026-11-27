@@ -6889,7 +6889,7 @@ async fn test_isolated_strategy_enforces_engines_and_allow_scripts() {
     fs::write(proj2.join("vendor/scripted-pkg.tgz"), &script_tar).unwrap();
     fs::write(
         proj2.join("package.json"),
-        r#"{"name":"iso-allow-scripts","version":"1.0.0","dependencies":{"scripted-pkg":"file:./vendor/scripted-pkg.tgz"},"allowScripts":{"scripted-pkg":false}}"#,
+        r#"{"name":"iso-allow-scripts","version":"1.0.0","dependencies":{"scripted-pkg":"file:./vendor/scripted-pkg.tgz"},"allowScripts":{"file:./vendor/scripted-pkg.tgz":false}}"#,
     )
     .unwrap();
     let mut lock2 = LockfileV3::new("iso-allow-scripts", Some("1.0.0".to_string()));

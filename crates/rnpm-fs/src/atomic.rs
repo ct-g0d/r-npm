@@ -137,8 +137,25 @@ fn try_replace_dir(staging: &Path, destination: &Path, parent: &Path) -> std::io
                     Err(ref e) if e.kind() == std::io::ErrorKind::NotFound
                 );
                 if dest_absent {
-                    if fs::rename(&trash_path, destination).is_err() {
-                        let _ = crate::junction::remove_dir_all_safe(&trash_path);
+                    let mut rollback_delay = Duration::from_millis(5);
+                    for attempt in 0..6 {
+                        match fs::rename(&trash_path, destination) {
+                            Ok(()) => break,
+                            Err(ref e) if attempt < 5 && is_retryable_error(e) => {
+                                std::thread::sleep(rollback_delay);
+                                rollback_delay = rollback_delay.saturating_mul(2);
+                            }
+                            Err(ref e) => {
+                                // Preserve the backup at `trash_path` rather than destroying the only copy.
+                                tracing::warn!(
+                                    "Failed to restore backup '{}' to '{}' after staging failure: {}; preserving backup on disk",
+                                    trash_path.display(),
+                                    destination.display(),
+                                    e
+                                );
+                                break;
+                            }
+                        }
                     }
                 } else {
                     let _ = crate::junction::remove_dir_all_safe(&trash_path);

@@ -4455,10 +4455,23 @@ pub(crate) async fn execute_exec_with_config(
             }
         });
         let manifest_text = serde_json::to_string_pretty(&minimal_manifest)?;
-        let already_installed = npx_env_dir.join("node_modules").is_dir()
-            && (!npx_env_dir.join("package.json").is_file()
-                || std::fs::read_to_string(npx_env_dir.join("package.json"))
-                    .is_ok_and(|t| t == manifest_text));
+        let npx_nm_dir = npx_env_dir.join("node_modules");
+        let npx_pkg_json = npx_env_dir.join("package.json");
+        let all_requested_present = deps
+            .keys()
+            .all(|pkg_name| npx_nm_dir.join(pkg_name).join("package.json").is_file());
+        let already_installed = if npx_pkg_json.is_file() {
+            // Managed _npx env: require matching manifest, completed hidden lockfile, and every requested package.
+            npx_nm_dir.is_dir()
+                && npx_nm_dir.join(".package-lock.json").is_file()
+                && std::fs::read_to_string(&npx_pkg_json).is_ok_and(|t| t == manifest_text)
+                && all_requested_present
+        } else {
+            // Pre-seeded legacy _npx dir without package.json: require requested packages or target bin.
+            npx_nm_dir.is_dir()
+                && (all_requested_present
+                    || rnpm_lifecycle::find_local_binary(&npx_env_dir, command).is_some())
+        };
 
         if !already_installed {
             check_npx_consent(current_dir, package_specs, consent)?;

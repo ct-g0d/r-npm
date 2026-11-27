@@ -2235,11 +2235,13 @@ fn test_range_or_wildcard_preserves_prerelease_set() {
     let alpha2 = Version::parse("1.0.0-alpha.2").unwrap();
     let stable = Version::parse("2.0.0").unwrap();
 
-    assert!(range.satisfies(&alpha1));
+    // npm 11.20.0 / node-semver collapses `1.0.0-alpha.1 || *` to `*`, excluding prereleases.
+    assert!(!range.satisfies(&alpha1));
     assert!(!range.satisfies(&alpha2));
     assert!(range.satisfies(&stable));
-    assert!(Range::satisfies_str("1.0.0-alpha.1 || *", &alpha1).unwrap());
+    assert!(!Range::satisfies_str("1.0.0-alpha.1 || *", &alpha1).unwrap());
     assert!(!Range::satisfies_str("1.0.0-alpha.1 || *", &alpha2).unwrap());
+    assert!(Range::satisfies_str("1.0.0-alpha.1 || *", &stable).unwrap());
 }
 
 #[test]

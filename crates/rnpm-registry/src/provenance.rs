@@ -1138,13 +1138,22 @@ pub fn verify_fulcio_certificate_chain(
         ));
     }
 
-    // Verify chain from leaf upwards
+    // Verify chain from leaf upwards, enforcing RFC 5280 BasicConstraints (isCA + pathLenConstraint)
+    // and KeyUsage (keyCertSign).
     let mut current = leaf;
+    let mut intermediate_ca_count: u32 = 0;
     for parent in &parsed_chain[1..] {
         if parent.basic_constraints_ca != Some(true) {
             return Err(RegistryError::InvalidSigstoreBundle(
                 "Intermediate CA certificate missing BasicConstraints isCA=true".into(),
             ));
+        }
+        if let Some(max_path_len) = parent.basic_constraints_path_len {
+            if intermediate_ca_count > max_path_len {
+                return Err(RegistryError::InvalidSigstoreBundle(format!(
+                    "Certificate chain exceeds BasicConstraints pathLenConstraint ({intermediate_ca_count} > {max_path_len})"
+                )));
+            }
         }
         if parent.key_usage_cert_sign == Some(false) {
             return Err(RegistryError::InvalidSigstoreBundle(
@@ -1160,6 +1169,9 @@ pub fn verify_fulcio_certificate_chain(
             return Err(RegistryError::InvalidSigstoreBundle(
                 "Certificate cryptographic signature verification failed along the chain".into(),
             ));
+        }
+        if parent.subject_raw != parent.issuer_raw {
+            intermediate_ca_count = intermediate_ca_count.saturating_add(1);
         }
         current = parent;
     }
@@ -1178,6 +1190,9 @@ pub fn verify_fulcio_certificate_chain(
         }
         if root.basic_constraints_ca == Some(true)
             && root.key_usage_cert_sign != Some(false)
+            && root
+                .basic_constraints_path_len
+                .is_none_or(|max_len| intermediate_ca_count <= max_len)
             && current.issuer_raw == root.subject_raw
             && verify_signature(&root.spki_bytes, &current.tbs_bytes, &current.signature_value).is_ok()
         {

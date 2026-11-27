@@ -1032,7 +1032,6 @@ impl crate::Installer {
                 let pkg = lock.packages[&entry.hoisted].clone();
                 let preloaded_bytes = tarballs.remove(&entry.hoisted);
                 let dest = project.join(&entry.location);
-                let entry_location = entry.location.clone();
                 let entry_hoisted = entry.hoisted.clone();
                 let entry_optional = entry.optional;
                 let sem = std::sync::Arc::clone(&sem);
@@ -1088,7 +1087,10 @@ impl crate::Installer {
                         rnpm_core::manifest::Manifest::from_file(dest.join("package.json"))
                             .ok()
                             .map(|manifest| rnpm_lifecycle::LifecyclePackageNode {
-                                package_path: entry_location,
+                                // Use the original hoisted lockfile key so `policy::apply_script_policy`
+                                // finds the lockfile entry (URL/Git/registry rules) while keeping
+                                // `disk_path` pointed at the isolated `.store` directory for execution.
+                                package_path: entry_hoisted.clone(),
                                 disk_path: dest,
                                 manifest,
                                 source: rnpm_lifecycle::PackageSource::Registry,

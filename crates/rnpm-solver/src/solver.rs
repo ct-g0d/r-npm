@@ -3373,29 +3373,39 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
         let mut approved_candidates: Vec<String> = Vec::with_capacity(raw_candidates.len());
         for candidate in raw_candidates {
             let mut safe = true;
-            for edge in self.graph.edges.iter().filter(|e| e.to_location == candidate) {
-                let Ok(edge_spec) = DependencySpec::parse(&edge.install_name, &edge.spec) else {
-                    safe = false;
-                    break;
-                };
-                if edge_spec.package_name != root_snapshot.name
-                    || !crate::hoisting::node_satisfies_target(&root_snapshot, &edge_spec.target)
-                {
-                    safe = false;
-                    break;
-                }
-                for scope in crate::hoisting::iter_ancestor_scopes(&edge.from_location) {
-                    if scope.is_empty() {
-                        break;
+            if let Some(edge_indices) = self.graph.incoming_edges_for(&candidate) {
+                for &edge_idx in edge_indices {
+                    let edge = &self.graph.edges[edge_idx];
+                    if edge.to_location != candidate {
+                        continue;
                     }
-                    let at_scope = format!("{scope}/node_modules/{install_name}");
-                    if at_scope != candidate && self.graph.nodes.contains_key(&at_scope) {
+                    let Ok(edge_spec) = DependencySpec::parse(&edge.install_name, &edge.spec)
+                    else {
+                        safe = false;
+                        break;
+                    };
+                    if edge_spec.package_name != root_snapshot.name
+                        || !crate::hoisting::node_satisfies_target(
+                            &root_snapshot,
+                            &edge_spec.target,
+                        )
+                    {
                         safe = false;
                         break;
                     }
-                }
-                if !safe {
-                    break;
+                    for scope in crate::hoisting::iter_ancestor_scopes(&edge.from_location) {
+                        if scope.is_empty() {
+                            break;
+                        }
+                        let at_scope = format!("{scope}/node_modules/{install_name}");
+                        if at_scope != candidate && self.graph.nodes.contains_key(&at_scope) {
+                            safe = false;
+                            break;
+                        }
+                    }
+                    if !safe {
+                        break;
+                    }
                 }
             }
             if safe {

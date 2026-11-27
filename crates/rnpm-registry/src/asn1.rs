@@ -61,6 +61,7 @@ pub struct ParsedCertificate {
     pub san_uris: Vec<String>,
     pub fulcio_extensions: HashMap<String, String>,
     pub basic_constraints_ca: Option<bool>,
+    pub basic_constraints_path_len: Option<u32>,
     pub key_usage_cert_sign: Option<bool>,
 }
 
@@ -531,6 +532,7 @@ pub fn parse_x509_certificate(der: &[u8]) -> Result<ParsedCertificate, RegistryE
     let mut san_uris = Vec::new();
     let mut fulcio_extensions = HashMap::new();
     let mut basic_constraints_ca = None;
+    let mut basic_constraints_path_len = None;
     let mut key_usage_cert_sign = None;
 
     while cursor < tbs_elems.len() {
@@ -553,6 +555,7 @@ pub fn parse_x509_certificate(der: &[u8]) -> Result<ParsedCertificate, RegistryE
                                     &mut san_uris,
                                     &mut fulcio_extensions,
                                     &mut basic_constraints_ca,
+                                    &mut basic_constraints_path_len,
                                     &mut key_usage_cert_sign,
                                 );
                             }
@@ -581,6 +584,7 @@ pub fn parse_x509_certificate(der: &[u8]) -> Result<ParsedCertificate, RegistryE
         san_uris,
         fulcio_extensions,
         basic_constraints_ca,
+        basic_constraints_path_len,
         key_usage_cert_sign,
     })
 }
@@ -650,25 +654,46 @@ pub fn parse_spki(der: &[u8]) -> Result<(String, Option<String>, Vec<u8>), Regis
     parse_spki_internal(val)
 }
 
+fn parse_der_non_negative_u32(bytes: &[u8]) -> Option<u32> {
+    if bytes.is_empty() || (bytes[0] & 0x80) != 0 {
+        return None;
+    }
+    let mut val: u64 = 0;
+    for &b in bytes {
+        val = val.saturating_mul(256).saturating_add(b as u64);
+    }
+    Some(val.min(u32::MAX as u64) as u32)
+}
+
 fn parse_extension(
     oid: &str,
     extn_value: &[u8],
     san_uris: &mut Vec<String>,
     fulcio_extensions: &mut HashMap<String, String>,
     basic_constraints_ca: &mut Option<bool>,
+    basic_constraints_path_len: &mut Option<u32>,
     key_usage_cert_sign: &mut Option<bool>,
 ) {
     if oid == OID_BASIC_CONSTRAINTS {
-        let is_ca = match read_tlv(extn_value) {
-            Ok((TAG_SEQUENCE, bc_val, _)) => match parse_sequence(bc_val) {
-                Ok(elems) => elems
-                    .first()
-                    .is_some_and(|(tag, val)| *tag == TAG_BOOLEAN && !val.is_empty() && val[0] != 0),
-                Err(_) => false,
+        let (is_ca, path_len) = match read_tlv(extn_value) {
+            Ok((TAG_SEQUENCE, bc_val, [])) => match parse_sequence(bc_val) {
+                Ok(elems) => match elems.as_slice() {
+                    [] => (false, None),
+                    [(TAG_BOOLEAN, val)] if !val.is_empty() => (val[0] != 0, None),
+                    [(TAG_BOOLEAN, val), (TAG_INTEGER, plen)] if !val.is_empty() => {
+                        match parse_der_non_negative_u32(plen) {
+                            Some(n) => (val[0] != 0, Some(n)),
+                            None => (false, None),
+                        }
+                    }
+                    _ => (false, None),
+                },
+                Err(_) => (false, None),
             },
-            _ => false,
+            _ => (false, None),
         };
         *basic_constraints_ca = Some(is_ca);
+        *basic_constraints_path_len = path_len;
     } else if oid == OID_KEY_USAGE {
         // KeyUsage ::= BIT STRING; keyCertSign is bit 5 (0x04 in first content octet).
         let cert_sign = match read_tlv(extn_value) {

@@ -478,49 +478,113 @@ pub fn execute_dedupe(options: &DedupeOptions) -> Result<DedupeSummary> {
                 v_b.cmp(&v_a)
             });
 
-            if let Some(best_candidate) = candidates.first() {
-                let best_ver = best_candidate.version.clone().unwrap_or_default();
-                if best_ver.is_empty() {
-                    continue;
-                }
+            // Verify every outgoing dependency of a hoist candidate will still resolve to a
+            // compatible version once the candidate moves from its nested parent to root.
+            let outgoing_deps_safe_at_root = |cand: &InstalledPackage| -> bool {
+                for (dep_name, dep_range) in &cand.dependencies {
+                    // Own nested dependency moves along with `cand` when hoisted.
+                    let own_nested = format!("{}/node_modules/{dep_name}", cand.path);
+                    if installed_map.contains_key(&own_nested)
+                        && !already_removed.contains(&own_nested)
+                    {
+                        continue;
+                    }
 
-                // Check if best_ver satisfies all other nested instances' consumers
-                let all_satisfied = if let Some(ref incoming_map) = incoming_edges_by_target {
+                    // Check whether `dep_name` was resolvable in `cand`'s original ancestor chain.
+                    let mut resolved_originally = false;
+                    let mut scope = cand.parent_path.clone();
+                    loop {
+                        let probe = if scope.is_empty() {
+                            format!("node_modules/{dep_name}")
+                        } else {
+                            format!("{scope}/node_modules/{dep_name}")
+                        };
+                        if installed_map.contains_key(&probe) {
+                            resolved_originally = true;
+                            break;
+                        }
+                        if scope.is_empty() {
+                            break;
+                        }
+                        scope = get_parent_location(&scope);
+                    }
+                    if !resolved_originally {
+                        // Uninstalled optional dependency; hoisting cannot regress it.
+                        continue;
+                    }
+
+                    // At root `node_modules/<pkg>`, Node only resolves from root `node_modules/<dep>`.
+                    let root_dep_key = format!("node_modules/{dep_name}");
+                    let root_dep_ver = installed_map
+                        .get(&root_dep_key)
+                        .filter(|_| !already_removed.contains(&root_dep_key))
+                        .and_then(|p| p.version.as_deref())
+                        .or_else(|| {
+                            actions.iter().find_map(|a| {
+                                (a.action_type == DedupeActionType::HoistAndDedupe
+                                    && a.target_path == root_dep_key)
+                                    .then_some(a.version.as_str())
+                            })
+                        });
+                    let Some(ver) = root_dep_ver else {
+                        return false;
+                    };
+                    if !version_matches_range(ver, dep_range) {
+                        return false;
+                    }
+                }
+                true
+            };
+
+            let chosen = candidates.into_iter().find(|cand| {
+                let Some(ref cand_ver) = cand.version else {
+                    return false;
+                };
+                if cand_ver.is_empty() {
+                    return false;
+                }
+                if is_shadowed_by_ancestor(
+                    &cand.parent_path,
+                    &pkg_name,
+                    &installed_map,
+                    &already_removed,
+                ) {
+                    return false;
+                }
+                if !outgoing_deps_safe_at_root(cand) {
+                    return false;
+                }
+                if let Some(ref incoming_map) = incoming_edges_by_target {
                     instances.iter().all(|nested| {
                         let incoming = incoming_map
                             .get(nested.path.as_str())
                             .map(|v| v.as_slice())
                             .unwrap_or(&[]);
                         if incoming.is_empty() {
-                            if let Some(req_range) = get_req_range(&nested.parent_path, &pkg_name)
-                            {
-                                version_matches_range(&best_ver, req_range)
+                            if let Some(req_range) = get_req_range(&nested.parent_path, &pkg_name) {
+                                version_matches_range(cand_ver, req_range)
                             } else {
                                 false
                             }
                         } else {
                             incoming
                                 .iter()
-                                .all(|e| version_matches_range(&best_ver, &e.spec))
+                                .all(|e| version_matches_range(cand_ver, &e.spec))
                         }
                     })
                 } else {
                     instances.iter().all(|nested| {
                         if let Some(req_range) = get_req_range(&nested.parent_path, &pkg_name) {
-                            version_matches_range(&best_ver, req_range)
+                            version_matches_range(cand_ver, req_range)
                         } else {
                             false
                         }
                     })
-                };
+                }
+            });
 
-                if all_satisfied
-                    && !is_shadowed_by_ancestor(
-                        &best_candidate.parent_path,
-                        &pkg_name,
-                        &installed_map,
-                        &already_removed,
-                    )
+            if let Some(best_candidate) = chosen {
+                let best_ver = best_candidate.version.clone().unwrap_or_default();
                 {
                     // Hoist best_candidate to root
                     actions.push(DedupeAction {
