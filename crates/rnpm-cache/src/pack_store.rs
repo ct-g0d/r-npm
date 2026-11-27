@@ -522,7 +522,6 @@ fn ensure_dir_fast_win32(path: &Path, prefix_wide_with_slash: &[u16]) -> std::io
         fn GetLastError() -> u32;
     }
     const ERROR_ALREADY_EXISTS: u32 = 183;
-    const ERROR_PATH_NOT_FOUND: u32 = 3;
 
     let mut target_wide = Vec::with_capacity(prefix_wide_with_slash.len() + 1);
     let trimmed = if prefix_wide_with_slash.ends_with(&[b'\\' as u16])
@@ -541,10 +540,7 @@ fn ensure_dir_fast_win32(path: &Path, prefix_wide_with_slash: &[u16]) -> std::io
     if err == ERROR_ALREADY_EXISTS {
         return Ok(());
     }
-    if err == ERROR_PATH_NOT_FOUND {
-        return std::fs::create_dir_all(path);
-    }
-    std::fs::create_dir_all(path)
+    std::fs::create_dir_all(rnpm_fs::to_verbatim_path(path))
 }
 
 #[cfg(windows)]

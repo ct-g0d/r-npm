@@ -980,6 +980,7 @@ pub fn remove_dir_all_safe(path: &Path) -> Result<(), FsError> {
             let entries = match fs::read_dir(&current_dir) {
                 Ok(e) => e,
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                #[cfg(unix)]
                 Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
                     use std::os::unix::fs::PermissionsExt;
                     if let Ok(m) = fs::symlink_metadata(&current_dir) {

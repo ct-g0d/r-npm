@@ -1143,7 +1143,9 @@ mod parallel_versions {
             let k_start = p;
             let k_end = skip_json_string(bytes, k_start)?;
             let raw_key = &bytes[k_start + 1..k_end - 1];
-            if raw_key.contains(&b'\\') {
+            if raw_key.contains(&b'\\')
+                || (!raw_key.is_ascii() && std::str::from_utf8(raw_key).is_err())
+            {
                 return None;
             }
             p = skip_ws(bytes, k_end);
@@ -1366,13 +1368,6 @@ mod parallel_versions {
         }
 
         let pkg_name = name.unwrap_or_default();
-        if scanned.name_slice.is_none() && !pkg_name.is_empty() {
-            for ver in versions.values_mut() {
-                if ver.name.is_empty() {
-                    ver.name = pkg_name.clone();
-                }
-            }
-        }
 
         Some(Ok(AbbreviatedPackageMetadata {
             name: pkg_name,
@@ -3469,6 +3464,18 @@ mod tests {
         assert!(
             parse_install_packument(&dup_name).is_err(),
             "duplicate top-level name before and after versions must fail validation identically to sequential parser"
+        );
+    }
+
+    #[test]
+    fn test_parallel_packument_rejects_invalid_utf8_unknown_key() {
+        let mut bytes = build_large_packument_json("\"name\":\"pkg\",", "", 450);
+        // Pop closing `}` and append a non-UTF-8 top-level key before closing `}`.
+        assert_eq!(bytes.pop(), Some(b'}'));
+        bytes.extend_from_slice(b",\"bad\xFFkey\":1}");
+        assert!(
+            matches!(parse_install_packument(&bytes), Err(RegistryError::Json(_))),
+            "invalid UTF-8 in unknown top-level key must be rejected identically to sequential parser"
         );
     }
 }

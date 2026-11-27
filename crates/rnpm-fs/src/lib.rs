@@ -18,11 +18,32 @@ pub mod writer;
 #[doc(hidden)]
 pub mod fast_hash {
     use std::collections::{HashMap, HashSet};
-    use std::hash::{BuildHasherDefault, Hasher};
+    use std::hash::{BuildHasher, Hasher};
+    use std::sync::OnceLock;
 
-    #[derive(Default)]
+    fn process_hash_seed() -> u64 {
+        static SEED: OnceLock<u64> = OnceLock::new();
+        *SEED.get_or_init(|| {
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos() as u64)
+                .unwrap_or(0x9e37_79b9_7f4a_7c15);
+            let addr = (&SEED as *const OnceLock<u64>) as u64;
+            nanos ^ addr.rotate_left(17) ^ 0x517c_c1b7_2722_0a95
+        })
+    }
+
     pub struct FxHasher {
         hash: u64,
+    }
+
+    impl Default for FxHasher {
+        #[inline]
+        fn default() -> Self {
+            Self {
+                hash: process_hash_seed(),
+            }
+        }
     }
 
     const K: u64 = 0x517c_c1b7_2722_0a95;
@@ -84,18 +105,41 @@ pub mod fast_hash {
         }
     }
 
-    pub type FxBuildHasher = BuildHasherDefault<FxHasher>;
+    #[derive(Clone, Default)]
+    pub struct FxBuildHasher {
+        seed: u64,
+    }
+
+    impl BuildHasher for FxBuildHasher {
+        type Hasher = FxHasher;
+
+        #[inline]
+        fn build_hasher(&self) -> Self::Hasher {
+            FxHasher { hash: self.seed }
+        }
+    }
+
     pub type FxHashMap<K, V> = HashMap<K, V, FxBuildHasher>;
     pub type FxHashSet<K> = HashSet<K, FxBuildHasher>;
 
     #[inline]
     pub fn fx_map<K, V>(cap: usize) -> FxHashMap<K, V> {
-        HashMap::with_capacity_and_hasher(cap, FxBuildHasher::default())
+        HashMap::with_capacity_and_hasher(
+            cap,
+            FxBuildHasher {
+                seed: process_hash_seed(),
+            },
+        )
     }
 
     #[inline]
     pub fn fx_set<K>(cap: usize) -> FxHashSet<K> {
-        HashSet::with_capacity_and_hasher(cap, FxBuildHasher::default())
+        HashSet::with_capacity_and_hasher(
+            cap,
+            FxBuildHasher {
+                seed: process_hash_seed(),
+            },
+        )
     }
 }
 
