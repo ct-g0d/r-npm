@@ -218,6 +218,10 @@ pub fn parse_shebang(content: &str) -> Option<ShebangInfo> {
         while idx < tokens.len() && tokens[idx].contains('=') && !tokens[idx].starts_with('-') {
             idx += 1;
         }
+        // Skip optional end-of-options marker (`--`) before program name
+        if idx < tokens.len() && tokens[idx] == "--" {
+            idx += 1;
+        }
     }
 
     if idx >= tokens.len() {

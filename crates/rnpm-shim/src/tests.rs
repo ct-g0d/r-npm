@@ -1703,3 +1703,21 @@ fn test_check_existing_bin_collision_fast_path_dot_bin() {
     let res = check_existing_bin_collision(&bin_dir, &link_path, "../foo/cli.js", false);
     assert!(res.is_ok(), ".bin directory must fast-path collision check");
 }
+
+#[test]
+fn test_shebang_env_double_dash_and_unicode_space_paths() {
+    let parsed = shebang::parse_shebang("#!/usr/bin/env -- node --experimental-vm-modules")
+        .expect("must parse env -- form");
+    assert_eq!(parsed.program, "node");
+    assert_eq!(parsed.args, vec!["--experimental-vm-modules".to_string()]);
+
+    let parsed_s = shebang::parse_shebang("#!/usr/bin/env -S -- node --trace-warnings")
+        .expect("must parse env -S -- form");
+    assert_eq!(parsed_s.program, "node");
+    assert_eq!(parsed_s.args, vec!["--trace-warnings".to_string()]);
+
+    let content = generator::generate_shim_content("../sp ace/üñî/bin%dir/cli.js", None);
+    assert!(content.cmd.contains(r#""%dp0%\..\sp ace\üñî\bin%%dir\cli.js""#));
+    assert!(content.ps1.contains(r#""$basedir/../sp ace/üñî/bin%dir/cli.js""#));
+    assert!(content.sh.contains(r#""$basedir/../sp ace/üñî/bin%dir/cli.js""#));
+}

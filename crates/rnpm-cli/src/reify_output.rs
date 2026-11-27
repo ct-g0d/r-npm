@@ -121,7 +121,45 @@ pub(crate) fn install_audit_report(report: &AuditReport) -> String {
 /// npm warns once for every package it reifies whose metadata is deprecated
 /// (arborist reify.js, after extracting the node). The note is read from the
 /// lockfile written for the new tree.
-fn warn_deprecated(project_dir: &Path, report: &ReifyReport) {
+fn warn_deprecated(
+    project_dir: &Path,
+    report: &ReifyReport,
+    preloaded_lockfile: Option<&rnpm_lockfile::LockfileV3>,
+) {
+    let has_added_or_changed = report
+        .changes
+        .iter()
+        .any(|c| matches!(c, ReifyChange::Add(_) | ReifyChange::Change { .. }));
+    if !has_added_or_changed {
+        return;
+    }
+
+    if let Some(lock) = preloaded_lockfile {
+        for change in &report.changes {
+            let entry = match change {
+                ReifyChange::Add(entry) | ReifyChange::Change { to: entry, .. } => entry,
+                ReifyChange::Remove(_) => continue,
+            };
+            let Some(meta) = lock.packages.get(&entry.location) else {
+                continue;
+            };
+            let Some(message) = meta
+                .extra
+                .get("deprecated")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+            else {
+                continue;
+            };
+            let name = meta.name.as_deref().unwrap_or(&entry.name);
+            let text = format!("{name}@{}: {message}", entry.version);
+            for line in text.lines() {
+                eprintln!("{}", format!("npm warn deprecated {line}").trim_end());
+            }
+        }
+        return;
+    }
+
     let read = |file: &str| -> Option<Value> {
         serde_json::from_slice(&std::fs::read(project_dir.join(file)).ok()?).ok()
     };
@@ -169,6 +207,18 @@ pub(crate) fn print(
     opts: &ReifyOutputOptions,
     elapsed: std::time::Duration,
 ) -> anyhow::Result<()> {
+    print_with_lockfile(project_dir, report, audit, funding, opts, elapsed, None)
+}
+
+pub(crate) fn print_with_lockfile(
+    project_dir: &Path,
+    report: &ReifyReport,
+    audit: Option<&AuditReport>,
+    funding: usize,
+    opts: &ReifyOutputOptions,
+    elapsed: std::time::Duration,
+    preloaded_lockfile: Option<&rnpm_lockfile::LockfileV3>,
+) -> anyhow::Result<()> {
     if opts.warnings && !opts.silent {
         for warning in &report.peer_warnings {
             for line in warning.split('\n') {
@@ -177,7 +227,7 @@ pub(crate) fn print(
         }
     }
     if opts.warnings && !opts.silent && !opts.dry_run {
-        warn_deprecated(project_dir, report);
+        warn_deprecated(project_dir, report, preloaded_lockfile);
     }
     if opts.silent {
         return Ok(());
@@ -358,7 +408,7 @@ pub(crate) async fn finish_with_config(
     let parsed_lock = if !opts.dry_run && audit_enabled && fund_enabled {
         let (lock_path, _) = rnpm_install::resolve_lockfile_path(project_dir);
         if lock_path.exists() {
-            rnpm_lockfile::load_and_migrate(&lock_path).ok()
+            rnpm_lockfile::load_and_migrate_readonly(&lock_path).ok()
         } else {
             None
         }

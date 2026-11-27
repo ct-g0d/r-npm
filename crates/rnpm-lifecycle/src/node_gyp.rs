@@ -1249,14 +1249,19 @@ pub fn create_private_node_gyp_shim(dir: &Path) -> std::io::Result<PathBuf> {
 
     let cmd_path = dir.join("node-gyp.cmd");
     let cmd_script = "@ECHO off\r\nIF NOT DEFINED npm_config_node_gyp GOTO no_gyp\r\nSET \"GYP_PATH=%npm_config_node_gyp:\"=%\"\r\nIF /I \"%GYP_PATH:~-3%\"==\".js\" GOTO run_js\r\n\"%GYP_PATH%\" %*\r\nEXIT /B %ERRORLEVEL%\r\n:run_js\r\nnode \"%GYP_PATH%\" %*\r\nEXIT /B %ERRORLEVEL%\r\n:no_gyp\r\nnode \"%~dp0node-gyp.js\" %*\r\nEXIT /B %ERRORLEVEL%\r\n";
-    std::fs::write(&cmd_path, cmd_script)?;
+    if std::fs::read_to_string(&cmd_path).ok().as_deref() != Some(cmd_script) {
+        std::fs::write(&cmd_path, cmd_script)?;
+    }
 
     let sh_path = dir.join("node-gyp");
     let sh_script = "#!/usr/bin/env sh\nif [ -z \"$npm_config_node_gyp\" ]; then\n  exec node \"$(dirname \"$0\")/node-gyp.js\" \"$@\"\nelse\n  case \"$npm_config_node_gyp\" in\n    *.js) exec node \"$npm_config_node_gyp\" \"$@\" ;;\n    *) exec \"$npm_config_node_gyp\" \"$@\" ;;\n  esac\nfi\n";
-    std::fs::write(&sh_path, sh_script)?;
+    let sh_unchanged = std::fs::read_to_string(&sh_path).ok().as_deref() == Some(sh_script);
+    if !sh_unchanged {
+        std::fs::write(&sh_path, sh_script)?;
+    }
 
     #[cfg(unix)]
-    {
+    if !sh_unchanged {
         use std::os::unix::fs::PermissionsExt;
         let _ = std::fs::set_permissions(&sh_path, std::fs::Permissions::from_mode(0o755));
     }
@@ -1271,9 +1276,23 @@ pub fn create_private_node_gyp_shim(dir: &Path) -> std::io::Result<PathBuf> {
 /// Prepares and returns a dedicated privately-owned directory containing standalone `node-gyp` shims
 /// (`node-gyp.cmd` on Windows and `node-gyp` on Unix) that forward to `%npm_config_node_gyp%`.
 pub fn node_gyp_bin_dir() -> Option<PathBuf> {
-    static BIN_DIR: std::sync::OnceLock<Option<tempfile::TempDir>> = std::sync::OnceLock::new();
+    struct CachedBinDir {
+        path: PathBuf,
+        _temp: Option<tempfile::TempDir>,
+    }
+    static BIN_DIR: std::sync::OnceLock<Option<CachedBinDir>> = std::sync::OnceLock::new();
     BIN_DIR
         .get_or_init(|| {
+            let stable_dir = std::env::temp_dir().join("rnpm").join("node-gyp-bin");
+            if std::fs::create_dir_all(&stable_dir).is_ok()
+                && create_private_node_gyp_shim(&stable_dir).is_ok()
+            {
+                return Some(CachedBinDir {
+                    path: stable_dir,
+                    _temp: None,
+                });
+            }
+
             let tmp_dir = match tempfile::Builder::new()
                 .prefix("rnpm-node-gyp-bin-")
                 .tempdir()
@@ -1284,14 +1303,17 @@ pub fn node_gyp_bin_dir() -> Option<PathBuf> {
                     return None;
                 }
             };
-            let dir = tmp_dir.path();
-            if let Err(e) = create_private_node_gyp_shim(dir) {
+            let dir = tmp_dir.path().to_path_buf();
+            if let Err(e) = create_private_node_gyp_shim(&dir) {
                 warn!("Failed to populate private node-gyp-bin directory: {}", e);
                 return None;
             }
 
-            Some(tmp_dir)
+            Some(CachedBinDir {
+                path: dir,
+                _temp: Some(tmp_dir),
+            })
         })
         .as_ref()
-        .map(|d| d.path().to_path_buf())
+        .map(|d| d.path.clone())
 }

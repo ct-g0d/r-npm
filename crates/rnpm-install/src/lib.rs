@@ -2718,7 +2718,8 @@ pub struct Installer {
     options: InstallOptions,
     cache: Cache,
     pack_store: Arc<PackStore>,
-    registry_client: RegistryClient,
+    registry_client_config: RegistryClientConfig,
+    registry_client: std::sync::OnceLock<RegistryClient>,
     metadata_cache: HashMap<String, AbbreviatedPackageMetadata>,
     writer_concurrency: Option<usize>,
     writer_cfg: std::sync::OnceLock<Arc<rnpm_fs::ParallelWriterConfig>>,
@@ -2728,6 +2729,8 @@ pub struct Installer {
     engine_strict: bool,
     /// The ideal lockfile a --dry-run install planned but did not write.
     dry_run_ideal: Option<LockfileV3>,
+    /// The lockfile produced or validated by the most recent install/ci run.
+    last_lockfile: Option<LockfileV3>,
     /// package.json bytes from before this install saved new specs. npm saves
     /// them only after reify succeeds, so a failure before the lockfile is
     /// written puts them back.
@@ -2897,8 +2900,18 @@ impl Installer {
         let cache = Cache::new(&cache_path).context("Failed to initialize cache")?;
         let pack_store =
             Arc::new(PackStore::new(&pack_store_path).context("Failed to initialize pack store")?);
-        let registry_client = RegistryClient::with_config(client_config)
-            .context("Failed to initialize registry client")?;
+        let registry_client = std::sync::OnceLock::new();
+        let has_custom_tls = client_config.ca.is_some()
+            || client_config.cafile.is_some()
+            || client_config.cert.is_some()
+            || client_config.certfile.is_some()
+            || client_config.key.is_some()
+            || client_config.keyfile.is_some();
+        if has_custom_tls {
+            let client = RegistryClient::with_config(client_config.clone())
+                .context("Failed to initialize registry client")?;
+            let _ = registry_client.set(client);
+        }
 
         let io_concurrency = 64;
         let io_semaphore = Arc::new(tokio::sync::Semaphore::new(io_concurrency));
@@ -2935,6 +2948,7 @@ impl Installer {
             options,
             cache,
             pack_store,
+            registry_client_config: client_config,
             registry_client,
             metadata_cache: HashMap::new(),
             writer_concurrency: concurrency,
@@ -2944,6 +2958,7 @@ impl Installer {
             script_policy,
             engine_strict: config.get_bool("engine-strict").unwrap_or(false),
             dry_run_ideal: None,
+            last_lockfile: None,
             manifest_rollback: Vec::new(),
         })
     }
@@ -3206,21 +3221,19 @@ impl Installer {
 
     /// npm's post-reify advisory about install scripts the allowScripts
     /// policy does not cover.
-    fn warn_unreviewed_scripts(&self, lockfile: &LockfileV3, base_dir: &Path) {
+    fn warn_unreviewed_scripts_with_workspaces(
+        &self,
+        lockfile: &LockfileV3,
+        base_dir: &Path,
+        workspace_paths: &HashSet<String>,
+    ) {
         if self.options.ignore_scripts || self.options.silent {
             return;
         }
-        let workspace_paths: HashSet<String> = Manifest::from_file_readonly(base_dir.join("package.json"))
-            .ok()
-            .and_then(|m| discover_workspaces_from_manifest(base_dir, &m).ok())
-            .unwrap_or_default()
-            .into_iter()
-            .map(|m| m.relative_path)
-            .collect();
         if let Some(message) = policy::unreviewed_scripts_warning(
             lockfile,
             base_dir,
-            &workspace_paths,
+            workspace_paths,
             &self.script_policy,
             self.options.is_global,
         ) {
@@ -3249,10 +3262,9 @@ impl Installer {
 
     /// Reconfigure maximum network worker concurrency (bounded semaphore).
     pub fn with_concurrency(mut self, concurrency: usize) -> Result<Self> {
-        let mut cfg = self.registry_client.config().clone();
-        cfg.max_concurrent_requests = concurrency;
-        self.registry_client = RegistryClient::with_config(cfg)
-            .context("Failed to reconfigure registry client with concurrency")?;
+        self.registry_client_config.max_concurrent_requests = concurrency;
+        self.registry_client_config.pool_max_idle_per_host = concurrency;
+        self.registry_client = std::sync::OnceLock::new();
         self.writer_concurrency = Some(concurrency);
         self.writer_cfg = std::sync::OnceLock::new();
         let io_concurrency = concurrency.clamp(32, 128);
@@ -3279,6 +3291,11 @@ impl Installer {
     /// The ideal lockfile planned by the last --dry-run install, if any.
     pub fn dry_run_ideal(&self) -> Option<&LockfileV3> {
         self.dry_run_ideal.as_ref()
+    }
+
+    /// The lockfile validated or produced by the most recent `run()` / `run_ci()`.
+    pub fn last_lockfile(&self) -> Option<&LockfileV3> {
+        self.last_lockfile.as_ref()
     }
 
     async fn peer_conflict_warnings(
@@ -3409,7 +3426,18 @@ impl Installer {
     }
 
     pub fn registry_client(&self) -> &RegistryClient {
-        &self.registry_client
+        self.registry_client.get_or_init(|| {
+            RegistryClient::with_config(self.registry_client_config.clone())
+                .expect("Failed to initialize registry client")
+        })
+    }
+
+    fn finish_timing(&self, collector: &TimingCollector) -> timing::TimingMetrics {
+        if let Some(client) = self.registry_client.get() {
+            collector.finish_with_client(client)
+        } else {
+            collector.finish()
+        }
     }
 
     /// Alias for `run()`.
@@ -3430,6 +3458,7 @@ impl Installer {
 
     /// Run standard install workflow from project package.json.
     pub async fn run(&mut self) -> Result<InstallSummary> {
+        self.last_lockfile = None;
         let res = self.install_internal().await;
         let rollback = std::mem::take(&mut self.manifest_rollback);
         if res.is_err() {
@@ -3486,7 +3515,21 @@ impl Installer {
                             drop(_plan_span);
                             collector.record_phase(Phase::Plan, plan_start.elapsed());
                             if !self.options.ignore_scripts && !self.options.is_global {
-                                self.warn_unreviewed_scripts(&actual, &self.options.project_dir);
+                                let ws_paths = root_manifest
+                                    .as_ref()
+                                    .filter(|m| m.workspaces.is_some())
+                                    .and_then(|m| {
+                                        discover_workspaces_from_manifest(&self.options.project_dir, m).ok()
+                                    })
+                                    .unwrap_or_default()
+                                    .into_iter()
+                                    .map(|m| m.relative_path)
+                                    .collect();
+                                self.warn_unreviewed_scripts_with_workspaces(
+                                    &actual,
+                                    &self.options.project_dir,
+                                    &ws_paths,
+                                );
                                 let parsed_root = match root_manifest {
                                     Some(ref m) => m,
                                     None => {
@@ -3506,6 +3549,7 @@ impl Installer {
                             let inventory =
                                 actual.packages.len() + usize::from(!actual.packages.contains_key(""));
                             let mut peer_warnings = Vec::new();
+                            let mut loaded_project_lock = None;
                             if !self.options.legacy_peer_deps
                                 && actual.packages.values().any(|p| {
                                     p.peer_dependencies
@@ -3513,10 +3557,10 @@ impl Installer {
                                         .is_some_and(|peers| !peers.is_empty())
                                 })
                             {
-                                let project_lock =
+                                loaded_project_lock =
                                     LockfileV3::load_from_file_readonly(&lockfile_path).ok();
                                 let peer_lock = if self.options.package_lock_enabled() {
-                                    project_lock.as_ref().unwrap_or(&actual)
+                                    loaded_project_lock.as_ref().unwrap_or(&actual)
                                 } else {
                                     &actual
                                 };
@@ -3528,10 +3572,15 @@ impl Installer {
                                     peer_warnings = self
                                         .peer_conflict_warnings(
                                             &peer_graph_from_lockfile(peer_lock, &root),
-                                            project_lock.as_ref().or(Some(&actual)),
+                                            loaded_project_lock.as_ref().or(Some(&actual)),
                                         )
                                         .await;
                                 }
+                            }
+                            if let Some(proj_lock) = loaded_project_lock {
+                                self.last_lockfile = Some(proj_lock);
+                            } else if actual.packages.contains_key("") {
+                                self.last_lockfile = Some(actual);
                             }
                             return Ok(InstallSummary {
                                 reify: Some(ReifyReport {
@@ -3543,7 +3592,7 @@ impl Installer {
                                 cache_hits: 0,
                                 cache_misses: 0,
                                 lockfile_path,
-                                timing: Some(collector.finish_with_client(&self.registry_client)),
+                                timing: Some(self.finish_timing(&collector)),
                             });
                         }
                     }
@@ -3648,7 +3697,13 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                             info!(
                                 "Lockfile matches manifest: taking lockfile reification fast path"
                             );
-                            match self.run_ci_internal(false).await {
+                            match self
+                                .run_ci_internal_with_preloaded(
+                                    false,
+                                    Some((lockfile_str, existing_lockfile)),
+                                )
+                                .await
+                            {
                                 Ok(summary) => return Ok(summary),
                                 Err(err) => {
                                     let err_msg = err.to_string();
@@ -4454,7 +4509,7 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                 cache_hits: 0,
                 cache_misses: 0,
                 lockfile_path,
-                timing: Some(collector.finish_with_client(&self.registry_client)),
+                timing: Some(self.finish_timing(&collector)),
             });
         }
 
@@ -4573,7 +4628,7 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                 cache_hits: 0,
                 cache_misses: 0,
                 lockfile_path,
-                timing: Some(collector.finish_with_client(&self.registry_client)),
+                timing: Some(self.finish_timing(&collector)),
             });
         }
 
@@ -5519,7 +5574,9 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
             let unlocked_packages = self.options.unlocked_packages.clone();
             let active_semaphore = Arc::new(tokio::sync::Semaphore::new(48));
             let cpu_semaphore = Arc::new(tokio::sync::Semaphore::new(16));
-            let pack_persist_semaphore = Arc::new(tokio::sync::Semaphore::new(32));
+            let pack_persist_semaphore = Arc::new(tokio::sync::Semaphore::new(16));
+            let cache_has_entries = self.cache().root().join("index-v5").exists()
+                || self.cache().root().join("content-v2").exists();
 
             let mut pack_writer = rnpm_fs::AsyncFileWriter::spawn().ok();
             let pack_sender = pack_writer.as_ref().map(|w| w.sender());
@@ -5721,12 +5778,20 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
 
                     let t_fetch = std::time::Instant::now();
                     let _fetch_span = tracing::info_span!("fetch", package = %loc);
-                    let cached_blob = expected_integrity
-                        .as_ref()
-                        .and_then(|integrity| cache.get_by_integrity(integrity).ok().flatten());
+                    let cached_blob = if cache_has_entries {
+                        expected_integrity
+                            .as_ref()
+                            .and_then(|integrity| cache.get_by_integrity(integrity).ok().flatten())
+                    } else {
+                        None
+                    };
                     let (bytes, was_hit) = if let Some(data) = cached_blob {
                         (data, true)
-                    } else if let Ok(Some((_entry, data))) = cache.get(&resolved_url) {
+                    } else if let Some((_entry, data)) = if cache_has_entries {
+                        cache.get(&resolved_url).ok().flatten()
+                    } else {
+                        None
+                    } {
                         let t_v = std::time::Instant::now();
                         let is_valid = expected_integrity
                             .as_ref()
@@ -5852,30 +5917,13 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                     }
 
                     let bytes_arc = Arc::new(bytes);
-                    let cache_task = (!was_hit).then(|| {
-                        let blob_arc = Arc::clone(&bytes_arc);
-                        let cache_bg = cache.clone();
-                        let url_bg = resolved_url.clone();
-                        let exp_bg = expected_integrity.clone();
-                        let sem_bg = Arc::clone(&pack_persist_sem);
-                        let col_bg = worker_collector.clone();
-                        tokio::task::spawn(async move {
-                            let _permit = sem_bg.acquire_owned().await.map_err(|e| anyhow!("{e}"))?;
-                            tokio::task::spawn_blocking(move || {
-                                let _hold = _permit;
-                                let t_sw = std::time::Instant::now();
-                                let _ = cache_bg.put_with_integrity(
-                                    &url_bg,
-                                    &blob_arc,
-                                    exp_bg.as_ref(),
-                                    None,
-                                );
-                                col_bg.record_phase(Phase::StoreWrite, t_sw.elapsed());
-                                Ok::<(), anyhow::Error>(())
-                            })
-                            .await
-                            .map_err(|e| anyhow!("cache worker panicked: {e}"))?
-                        })
+                    let cache_persist = (!was_hit).then(|| {
+                        (
+                            Arc::clone(&bytes_arc),
+                            cache.clone(),
+                            resolved_url.clone(),
+                            expected_integrity.clone(),
+                        )
                     });
 
                     let decoded_res = {
@@ -6030,44 +6078,40 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                     let need_pack = integ_for_pack
                         .as_deref()
                         .is_some_and(|i| !i.is_empty());
-                    let pack_task = if need_pack || cache_task.is_some() {
+                    let pack_task = if need_pack || cache_persist.is_some() {
+                        let sem_bg = Arc::clone(&pack_persist_sem);
+                        let ps_bg = Arc::clone(&pack_store);
                         Some(tokio::task::spawn(async move {
-                            let pack_bg = need_pack.then(|| {
-                                let sem_bg = Arc::clone(&pack_persist_sem);
-                                let ps_bg = Arc::clone(&pack_store);
-                                let col_bg = collector_for_pack.clone();
-                                tokio::task::spawn(async move {
-                                    let _permit =
-                                        sem_bg.acquire_owned().await.map_err(|e| anyhow!("{e}"))?;
-                                    tokio::task::spawn_blocking(move || {
-                                        let _hold_permit = _permit;
-                                        let t_sw = std::time::Instant::now();
-                                        if let Some(ref integ_str) = integ_for_pack {
-                                            if !integ_str.is_empty()
-                                                && !ps_bg.has_package_pack(integ_str)
-                                            {
-                                                let _ = ps_bg.put_decoded_package(
-                                                    integ_str,
-                                                    &pkg_target,
-                                                    &decoded,
-                                                    false,
-                                                );
-                                            }
-                                        }
-                                        col_bg.record_phase(Phase::StoreWrite, t_sw.elapsed());
-                                        Ok::<(), anyhow::Error>(())
-                                    })
-                                    .await
-                                    .map_err(|e| anyhow!("pack worker panicked: {e}"))?
-                                })
-                            });
-                            if let Some(t) = pack_bg {
-                                t.await.map_err(|e| anyhow!("pack join error: {e}"))??;
-                            }
-                            if let Some(t) = cache_task {
-                                t.await.map_err(|e| anyhow!("cache join error: {e}"))??;
-                            }
-                            Ok::<(), anyhow::Error>(())
+                            let _permit =
+                                sem_bg.acquire_owned().await.map_err(|e| anyhow!("{e}"))?;
+                            tokio::task::spawn_blocking(move || {
+                                let _hold_permit = _permit;
+                                let t_sw = std::time::Instant::now();
+                                if let Some((blob_arc, cache_bg, url_bg, exp_bg)) = cache_persist {
+                                    let _ = cache_bg.put_with_integrity(
+                                        &url_bg,
+                                        &blob_arc,
+                                        exp_bg.as_ref(),
+                                        None,
+                                    );
+                                }
+                                if let Some(ref integ_str) = integ_for_pack {
+                                    if !integ_str.is_empty()
+                                        && !ps_bg.has_package_pack(integ_str)
+                                    {
+                                        let _ = ps_bg.put_decoded_package(
+                                            integ_str,
+                                            &pkg_target,
+                                            &decoded,
+                                            false,
+                                        );
+                                    }
+                                }
+                                collector_for_pack.record_phase(Phase::StoreWrite, t_sw.elapsed());
+                                Ok::<(), anyhow::Error>(())
+                            })
+                            .await
+                            .map_err(|e| anyhow!("pack worker panicked: {e}"))?
                         }))
                     } else {
                         None
@@ -6393,7 +6437,11 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
             }
         }
 
-        self.warn_unreviewed_scripts(&lockfile, &loc_base_dir);
+        let ws_paths: HashSet<String> = workspace_members
+            .iter()
+            .map(|m| m.relative_path.clone())
+            .collect();
+        self.warn_unreviewed_scripts_with_workspaces(&lockfile, &loc_base_dir, &ws_paths);
         if let Some(opts) = lifecycle_opts {
             let _life_guard = collector.enter_phase(Phase::Lifecycle);
             if self.options.packages.is_empty() && !self.options.is_global {
@@ -6412,6 +6460,7 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
         }
 
         remove_node_modules_if_empty(&node_modules_dir);
+        self.last_lockfile = Some(lockfile);
 
         Ok(InstallSummary {
             reify: reify_report,
@@ -6419,12 +6468,13 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
             cache_hits,
             cache_misses,
             lockfile_path,
-            timing: Some(collector.finish_with_client(&self.registry_client)),
+            timing: Some(self.finish_timing(&collector)),
         })
     }
 
     /// Run strict CI installation from committed package-lock.json.
     pub async fn run_ci(&mut self) -> Result<InstallSummary> {
+        self.last_lockfile = None;
         let t0 = std::time::Instant::now();
         let res = self.run_ci_internal(true).await;
         let t_internal = t0.elapsed();
@@ -6453,6 +6503,14 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
     /// `from_scratch` is true for `npm ci`, which removes node_modules first;
     /// the install fast path reifies against the existing tree instead.
     async fn run_ci_internal(&mut self, from_scratch: bool) -> Result<InstallSummary> {
+        self.run_ci_internal_with_preloaded(from_scratch, None).await
+    }
+
+    async fn run_ci_internal_with_preloaded(
+        &mut self,
+        from_scratch: bool,
+        preloaded_lockfile: Option<(String, LockfileV3)>,
+    ) -> Result<InstallSummary> {
         if from_scratch && !self.options.dry_run {
             crate::trash::cleanup_leftover_trash(&self.options.project_dir);
         }
@@ -6474,7 +6532,7 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                 self.options.project_dir.display()
             ));
         }
-        if !lockfile_path.exists() {
+        if preloaded_lockfile.is_none() && !lockfile_path.exists() {
             let _ = lockfile_name;
             return Err(anyhow!(
                 "npm error code EUSAGE\n{}",
@@ -6489,17 +6547,23 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
         let metadata_start = std::time::Instant::now();
         let _meta_span = tracing::info_span!("metadata").entered();
 
-        let lockfile_str = std::fs::read_to_string(&lockfile_path)?;
-        let mut lockfile = if let Ok(lf) = LockfileV3::from_json_str_readonly(&lockfile_str) {
-            if lf.lockfile_version == 3 && !lf.packages.is_empty() {
-                lf
-            } else {
-                rnpm_lockfile::parse_and_migrate(&lockfile_str)
-                    .with_context(|| format!("Failed to parse {lockfile_name}"))?
+        let (lockfile_str, mut lockfile) = match preloaded_lockfile {
+            Some((raw, lf)) => (raw, lf),
+            None => {
+                let raw = std::fs::read_to_string(&lockfile_path)?;
+                let lf = if let Ok(lf) = LockfileV3::from_json_str_readonly(&raw) {
+                    if lf.lockfile_version == 3 && !lf.packages.is_empty() {
+                        lf
+                    } else {
+                        rnpm_lockfile::parse_and_migrate(&raw)
+                            .with_context(|| format!("Failed to parse {lockfile_name}"))?
+                    }
+                } else {
+                    rnpm_lockfile::parse_and_migrate(&raw)
+                        .with_context(|| format!("Failed to parse {lockfile_name}"))?
+                };
+                (raw, lf)
             }
-        } else {
-            rnpm_lockfile::parse_and_migrate(&lockfile_str)
-                .with_context(|| format!("Failed to parse {lockfile_name}"))?
         };
         // 0. Discover workspace members (if any)
         let workspace_members =
@@ -6794,13 +6858,14 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                 }
                 packages_installed += 1;
             }
+            self.last_lockfile = Some(lockfile);
             return Ok(InstallSummary {
                 reify: reify_report.clone(),
                 packages_installed,
                 cache_hits: 0,
                 cache_misses: 0,
                 lockfile_path,
-                timing: Some(collector.finish_with_client(&self.registry_client)),
+                timing: Some(self.finish_timing(&collector)),
             });
         }
 
@@ -7452,7 +7517,9 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
             let semaphore = Arc::clone(&self.io_semaphore);
             let active_semaphore = Arc::new(tokio::sync::Semaphore::new(48));
             let cpu_semaphore = Arc::new(tokio::sync::Semaphore::new(16));
-            let pack_persist_semaphore = Arc::new(tokio::sync::Semaphore::new(32));
+            let pack_persist_semaphore = Arc::new(tokio::sync::Semaphore::new(16));
+            let cache_has_entries = self.cache().root().join("index-v5").exists()
+                || self.cache().root().join("content-v2").exists();
             let mut init_dirs = std::collections::HashSet::with_capacity(dirs_to_precreate.len());
             init_dirs.extend(dirs_to_precreate);
             let seen_dirs = Arc::new(std::sync::RwLock::new(init_dirs));
@@ -7564,9 +7631,17 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                             .map_err(|e| anyhow!("Invalid integrity hash: {e}"))?;
 
                         let t_fetch = std::time::Instant::now();
-                        let (data, was_hit, sha_hex) = if let Ok(Some(data)) = cache.get_by_integrity(&expected_integrity) {
+                        let (data, was_hit, sha_hex) = if let Some(data) = if cache_has_entries {
+                            cache.get_by_integrity(&expected_integrity).ok().flatten()
+                        } else {
+                            None
+                        } {
                             (data, true, None)
-                        } else if let Ok(Some((_entry, data))) = cache.get(&resolved_url) {
+                        } else if let Some((_entry, data)) = if cache_has_entries {
+                            cache.get(&resolved_url).ok().flatten()
+                        } else {
+                            None
+                        } {
                             if expected_integrity.verify(&data).is_ok() {
                                 (data, true, None)
                             } else {
@@ -8670,7 +8745,11 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                 .context("Failed to save hidden package-lock.json")?;
         }
 
-        self.warn_unreviewed_scripts(&lockfile, &self.options.project_dir);
+        let ws_paths: HashSet<String> = workspace_members
+            .iter()
+            .map(|m| m.relative_path.clone())
+            .collect();
+        self.warn_unreviewed_scripts_with_workspaces(&lockfile, &self.options.project_dir, &ws_paths);
         if let Some(opts) = lifecycle_opts {
             let _life_guard = collector.enter_phase(Phase::Lifecycle);
             self.run_lifecycle_hooks(rnpm_lifecycle::execute_root_hooks(&manifest, &opts)).await?;
@@ -8687,6 +8766,7 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
         }
 
         remove_node_modules_if_empty(&node_modules_dir);
+        self.last_lockfile = Some(lockfile);
 
         Ok(InstallSummary {
             reify: reify_report,
@@ -8694,7 +8774,7 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
             cache_hits,
             cache_misses,
             lockfile_path,
-            timing: Some(collector.finish_with_client(&self.registry_client)),
+            timing: Some(self.finish_timing(&collector)),
         })
     }
 
@@ -8804,16 +8884,19 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                 }
             }
 
-            // Always supplement full_packument_cache from npm_cacache if available
-            if let Some(ref c) = npm_cacache {
-                if let Some((_, full_bytes)) = c
-                    .get(&cacache_key_enc)
-                    .ok()
-                    .flatten()
-                    .or_else(|| c.get(&cacache_key_raw).ok().flatten())
-                {
-                    if let Ok(full_val) = serde_json::from_slice::<serde_json::Value>(&full_bytes) {
-                        full_packument_cache.insert(name.clone(), full_val);
+            // Supplement full_packument_cache from npm_cacache only if not already populated
+            if !full_packument_cache.contains_key(name) {
+                if let Some(ref c) = npm_cacache {
+                    if let Some((_, full_bytes)) = c
+                        .get(&cacache_key_enc)
+                        .ok()
+                        .flatten()
+                        .or_else(|| c.get(&cacache_key_raw).ok().flatten())
+                    {
+                        if let Ok(full_val) = serde_json::from_slice::<serde_json::Value>(&full_bytes)
+                        {
+                            full_packument_cache.insert(name.clone(), full_val);
+                        }
                     }
                 }
             }

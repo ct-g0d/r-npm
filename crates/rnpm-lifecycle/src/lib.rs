@@ -2706,6 +2706,14 @@ fn resolve_executable_in_env(
         return None;
     }
 
+    let is_node_lookup = prog.eq_ignore_ascii_case("node") || prog.eq_ignore_ascii_case("node.exe");
+    let cached_node = is_node_lookup.then(node_executable).flatten();
+
+    if let Some(ref node_path) = cached_node {
+        if node_path.parent().is_some_and(|p| p == base_dir.as_ref()) {
+            return Some(node_path.clone());
+        }
+    }
     if let Some(found) = probe_dir(&base_dir, prog) {
         return Some(found);
     }
@@ -2719,11 +2727,144 @@ fn resolve_executable_in_env(
         } else {
             base_dir.join(dir)
         };
+        if let Some(ref node_path) = cached_node {
+            if let Some(node_parent) = node_path.parent() {
+                if search_dir
+                    .to_string_lossy()
+                    .eq_ignore_ascii_case(&node_parent.to_string_lossy())
+                    && !search_dir.join("node.cmd").is_file()
+                    && !search_dir.join("node.bat").is_file()
+                    && !search_dir.join("node.com").is_file()
+                {
+                    return Some(node_path.clone());
+                }
+            }
+        }
         if let Some(found) = probe_dir(&search_dir, prog) {
             return Some(found);
         }
     }
     None
+}
+
+#[cfg(windows)]
+fn try_unwrap_node_cmd_shim(
+    cmd_path: &Path,
+    rest: &[String],
+    package_dir: &Path,
+    env: &HashMap<String, String>,
+) -> Option<Command> {
+    let meta = std::fs::metadata(cmd_path).ok()?;
+    if meta.len() > 4096 {
+        return None;
+    }
+    let content = std::fs::read_to_string(cmd_path).ok()?;
+    if !content.contains("SET \"_prog=node\"")
+        || !content.contains("IF EXIST \"%dp0%\\node.exe\"")
+    {
+        return None;
+    }
+    let bin_dir = cmd_path.parent()?;
+    let invoke_idx = content.rfind("\"%_prog%\"")?;
+    let tail = content[invoke_idx + "\"%_prog%\"".len()..].trim();
+    let tail_before_args = tail.strip_suffix("%*").map(str::trim)?;
+
+    // Parse quoted tokens cleanly: optional shim args followed by `"%dp0%\<rel_path>"`.
+    let mut quoted_tokens = Vec::new();
+    let mut chars = tail_before_args.chars().peekable();
+    while let Some(&c) = chars.peek() {
+        if c.is_ascii_whitespace() {
+            chars.next();
+            continue;
+        }
+        if c == '"' {
+            chars.next();
+            let mut tok = String::new();
+            let mut closed = false;
+            for ch in chars.by_ref() {
+                if ch == '"' {
+                    closed = true;
+                    break;
+                }
+                tok.push(ch);
+            }
+            if !closed {
+                return None;
+            }
+            quoted_tokens.push(tok);
+        } else {
+            let mut tok = String::new();
+            while let Some(&ch) = chars.peek() {
+                if ch.is_ascii_whitespace() || ch == '"' {
+                    break;
+                }
+                if matches!(ch, '%' | '!' | '&' | '|' | '<' | '>' | '^') {
+                    return None;
+                }
+                tok.push(ch);
+                chars.next();
+            }
+            quoted_tokens.push(tok);
+        }
+    }
+
+    let raw_target = quoted_tokens.pop()?;
+    let rel_after_dp0 = raw_target
+        .strip_prefix("%dp0%\\")
+        .or_else(|| raw_target.strip_prefix("%dp0%/"))?;
+    if rel_after_dp0.contains('%') && !rel_after_dp0.contains("%%") {
+        // Reject unescaped %VAR% expansions in target path, unescape %% -> %.
+        return None;
+    }
+    let rel_clean = if rel_after_dp0.contains("%%") {
+        // Ensure every single % was doubled %%
+        let mut s = String::with_capacity(rel_after_dp0.len());
+        let mut iter = rel_after_dp0.chars();
+        while let Some(ch) = iter.next() {
+            if ch == '%' {
+                if iter.next() != Some('%') {
+                    return None;
+                }
+                s.push('%');
+            } else {
+                s.push(ch);
+            }
+        }
+        s
+    } else {
+        rel_after_dp0.to_string()
+    };
+    if quoted_tokens.iter().any(|t| t.contains('%')) {
+        return None;
+    }
+
+    let target_script = bin_dir.join(&rel_clean);
+    if !target_script.is_file() {
+        return None;
+    }
+
+    let local_node = bin_dir.join("node.exe");
+    let node_exe = if local_node.is_file() {
+        local_node
+    } else {
+        let resolved = resolve_executable_in_env("node", package_dir, env)?;
+        if !resolved
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| e.eq_ignore_ascii_case("exe"))
+        {
+            return None;
+        }
+        resolved
+    };
+
+    let mut cmd = Command::new(node_exe);
+    for arg in &quoted_tokens {
+        cmd.arg(arg);
+    }
+    cmd.arg(target_script);
+    cmd.args(rest);
+    Some(cmd)
 }
 
 #[cfg(windows)]
@@ -2743,6 +2884,8 @@ fn try_create_direct_command(ctx: &LifecycleContext, env: &HashMap<String, Strin
         let mut cmd = Command::new(resolved);
         cmd.args(rest);
         Some(cmd)
+    } else if ext == "cmd" {
+        try_unwrap_node_cmd_shim(&resolved, rest, &ctx.package_dir, env)
     } else {
         None
     }
@@ -3077,20 +3220,12 @@ where
     let child_stdout = child.stdout.take();
     let child_stderr = child.stderr.take();
 
-    let mut stdout_task = tokio::task::spawn_blocking(move || {
-        if let Some(mut r) = child_stdout {
-            drain_and_scrub_reader(&mut r)
-        } else {
-            String::new()
-        }
+    let mut stdout_task = child_stdout.map(|mut r| {
+        tokio::task::spawn_blocking(move || drain_and_scrub_reader(&mut r))
     });
 
-    let mut stderr_task = tokio::task::spawn_blocking(move || {
-        if let Some(mut r) = child_stderr {
-            drain_and_scrub_reader(&mut r)
-        } else {
-            String::new()
-        }
+    let mut stderr_task = child_stderr.map(|mut r| {
+        tokio::task::spawn_blocking(move || drain_and_scrub_reader(&mut r))
     });
 
     let pkg_name = ctx.package_name.clone();
@@ -3168,8 +3303,12 @@ where
             }
             cancel_guard.completed = true;
             await_terminated_task(&mut wait_handle).await;
-            await_terminated_task(&mut stdout_task).await;
-            await_terminated_task(&mut stderr_task).await;
+            if let Some(ref mut t) = stdout_task {
+                await_terminated_task(t).await;
+            }
+            if let Some(ref mut t) = stderr_task {
+                await_terminated_task(t).await;
+            }
             return Err(anyhow::Error::from(ScriptExitError {
                 exit_code: 124,
                 message: format!("Lifecycle script '{}' timed out after {:?}", ctx.event, ctx.timeout.unwrap_or_default()),
@@ -3183,8 +3322,12 @@ where
             }
             cancel_guard.completed = true;
             await_terminated_task(&mut wait_handle).await;
-            await_terminated_task(&mut stdout_task).await;
-            await_terminated_task(&mut stderr_task).await;
+            if let Some(ref mut t) = stdout_task {
+                await_terminated_task(t).await;
+            }
+            if let Some(ref mut t) = stderr_task {
+                await_terminated_task(t).await;
+            }
             return Err(anyhow::Error::from(ScriptExitError {
                 exit_code: exit_code as i32,
                 message: format!("Lifecycle execution for {pkg_name} terminated by {sig}"),
@@ -3197,8 +3340,12 @@ where
             }
             cancel_guard.completed = true;
             await_terminated_task(&mut wait_handle).await;
-            await_terminated_task(&mut stdout_task).await;
-            await_terminated_task(&mut stderr_task).await;
+            if let Some(ref mut t) = stdout_task {
+                await_terminated_task(t).await;
+            }
+            if let Some(ref mut t) = stderr_task {
+                await_terminated_task(t).await;
+            }
             return Err(anyhow::Error::from(ScriptExitError {
                 exit_code: 143,
                 message: format!("Lifecycle execution for {pkg_name} aborted by signal"),
@@ -3218,8 +3365,14 @@ where
         )
     })?;
 
-    let stdout_str = stdout_task.await.unwrap_or_default();
-    let stderr_str = stderr_task.await.unwrap_or_default();
+    let stdout_str = match stdout_task {
+        Some(t) => t.await.unwrap_or_default(),
+        None => String::new(),
+    };
+    let stderr_str = match stderr_task {
+        Some(t) => t.await.unwrap_or_default(),
+        None => String::new(),
+    };
 
     if ctx.capture_output {
         *ctx.captured_output.lock().unwrap() = Some(ScriptOutput {
@@ -4377,13 +4530,14 @@ async fn execute_root_hooks_with_abort(
                 opts.init_cwd.to_string_lossy().to_string(),
             );
         }
-        Some(precompute_lifecycle_env(
+        Some(precompute_lifecycle_env_with_manifest(
             &opts.root_dir,
             &opts.root_dir,
             root_manifest.name.as_deref().unwrap_or("root"),
             root_manifest.version.as_deref(),
             &root_config,
             Some(&base_extra),
+            Some(root_manifest),
         ))
     } else {
         None

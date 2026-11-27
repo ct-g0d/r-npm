@@ -4466,3 +4466,115 @@ fn test_check_npx_consent_explicit_yes_and_no() {
         "npm error npx canceled due to missing packages and no YES option: [\"cowsay@1.5.0\"]"
     ));
 }
+
+#[test]
+fn test_fast_parse_install_ci_prune_explain_parity() {
+    let install_args = vec![
+        "rnpm".into(),
+        "install".into(),
+        "--registry".into(),
+        "http://127.0.0.1:4873".into(),
+        "--cache".into(),
+        "/tmp/cache".into(),
+        "--omit=dev,optional".into(),
+        "--include".into(),
+        "peer".into(),
+        "--install-strategy=linked".into(),
+        "--package-lock-only".into(),
+        "--no-audit".into(),
+        "--no-fund".into(),
+        "--dry-run".into(),
+        "--ignore-scripts".into(),
+        "-w".into(),
+        "pkg-a".into(),
+        "--include-workspace-root".into(),
+    ];
+    let (fast, _) = crate::try_parse_fast_command_with_overrides(&install_args)
+        .expect("install must hit fast parser");
+    match fast.command {
+        crate::Commands::Install {
+            registry,
+            omit,
+            include,
+            install_strategy,
+            package_lock_only,
+            no_audit,
+            no_fund,
+            dry_run,
+            ignore_scripts,
+            workspace,
+            workspace_root,
+            detached_trash,
+            ..
+        } => {
+            assert_eq!(registry.as_deref(), Some("http://127.0.0.1:4873"));
+            assert_eq!(omit, vec!["dev", "optional"]);
+            assert_eq!(include, vec!["peer"]);
+            assert_eq!(install_strategy.as_deref(), Some("linked"));
+            assert!(package_lock_only);
+            assert!(no_audit);
+            assert!(no_fund);
+            assert!(dry_run);
+            assert!(ignore_scripts);
+            assert_eq!(workspace, vec!["pkg-a"]);
+            assert!(workspace_root);
+            assert!(detached_trash);
+        }
+        other => panic!("unexpected command: {other:?}"),
+    }
+
+    let ci_args = vec![
+        "rnpm".into(),
+        "ci".into(),
+        "--registry".into(),
+        "http://127.0.0.1:4873".into(),
+        "--offline".into(),
+        "--json".into(),
+    ];
+    let (fast_ci, _) =
+        crate::try_parse_fast_command_with_overrides(&ci_args).expect("ci must hit fast parser");
+    assert!(matches!(
+        fast_ci.command,
+        crate::Commands::Ci {
+            offline: true,
+            json: true,
+            ..
+        }
+    ));
+
+    let prune_args = vec![
+        "rnpm".into(),
+        "prune".into(),
+        "--production".into(),
+        "--dry-run".into(),
+        "--json".into(),
+    ];
+    let (fast_prune, _) = crate::try_parse_fast_command_with_overrides(&prune_args)
+        .expect("prune must hit fast parser");
+    assert!(matches!(
+        fast_prune.command,
+        crate::Commands::Prune {
+            production: true,
+            dry_run: true,
+            json: true,
+            ..
+        }
+    ));
+
+    let explain_args = vec!["rnpm".into(), "explain".into(), "express".into(), "--json".into()];
+    let (fast_explain, _) = crate::try_parse_fast_command_with_overrides(&explain_args)
+        .expect("explain must hit fast parser");
+    match fast_explain.command {
+        crate::Commands::Explain { package, json } => {
+            assert_eq!(package, "express");
+            assert!(json);
+        }
+        other => panic!("unexpected explain command: {other:?}"),
+    }
+
+    // Legacy `-ws` and `--help` must fall back to full clap parser cleanly.
+    let ws_legacy = vec!["rnpm".into(), "install".into(), "-ws".into()];
+    assert!(crate::try_parse_fast_command_with_overrides(&ws_legacy).is_none());
+    let help_args = vec!["rnpm".into(), "install".into(), "--help".into()];
+    assert!(crate::try_parse_fast_command_with_overrides(&help_args).is_none());
+}

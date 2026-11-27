@@ -110,7 +110,7 @@ fn run_list_inner(
         let json_val = format_tree_json(&root_node, effective_depth, options.long);
         println!(
             "{}",
-            serde_json::to_string_pretty(&ordered_node_json(&json_val, &root_node))?
+            serde_json::to_string_pretty(&ordered_node_json(json_val, &root_node))?
         );
     } else if options.parseable {
         let mut paths = Vec::new();
@@ -147,77 +147,72 @@ fn run_list_inner(
 
 /// Preserve npm's field order without changing serde_json's workspace-wide map type.
 fn ordered_node_json(
-    value: &Value,
+    value: Value,
     node: &InspectedNode,
 ) -> rnpm_core::ordered_json::OrderedJsonValue {
     use rnpm_core::ordered_json::{OrderedJsonMap, OrderedJsonValue};
-    let Some(map) = value.as_object() else {
-        return value.clone().into();
+    let Value::Object(mut map) = value else {
+        return value.into();
     };
     let mut ordered = OrderedJsonMap::new();
-    let mut keys: Vec<String> = ["version", "resolved", "overridden", "name"]
-        .into_iter()
-        .map(str::to_string)
-        .collect();
-    if value.get("path").is_some() {
+    let mut keys: Vec<&str> = vec!["version", "resolved", "overridden", "name"];
+    let has_path = map.contains_key("path");
+    if has_path {
         if let Some(raw) = &node.raw_manifest {
-            keys.extend(
-                raw.as_object()
-                    .into_iter()
-                    .flatten()
-                    .filter(|(key, _)| key.as_str() != "dependencies")
-                    .map(|(key, _)| key.clone()),
-            );
+            if let Some(raw_obj) = raw.as_object() {
+                keys.extend(
+                    raw_obj
+                        .keys()
+                        .map(String::as_str)
+                        .filter(|key| *key != "dependencies"),
+                );
+            }
         }
-        keys.extend(
-            [
-                "_id",
-                "extraneous",
-                "path",
-                "_dependencies",
-                "devDependencies",
-                "peerDependencies",
-            ]
-            .into_iter()
-            .map(str::to_string),
-        );
-    }
-    keys.extend(
-        [
-            "required",
-            "missing",
+        keys.extend([
+            "_id",
             "extraneous",
-            "invalid",
-            "deduped",
-            "description",
-            "license",
-            "problems",
-            "dependencies",
-            "error",
-        ]
-        .into_iter()
-        .map(str::to_string),
-    );
+            "path",
+            "_dependencies",
+            "devDependencies",
+            "peerDependencies",
+        ]);
+    }
+    keys.extend([
+        "required",
+        "missing",
+        "extraneous",
+        "invalid",
+        "deduped",
+        "description",
+        "license",
+        "problems",
+        "dependencies",
+        "error",
+    ]);
     for key in keys {
-        if ordered.contains_key(&key) {
+        if ordered.contains_key(key) {
             continue;
         }
-        if let Some(value) = map.get(&key) {
+        if let Some(val) = map.remove(key) {
+            let owned_key = key.to_string();
             let value = if key == "dependencies" {
+                let Value::Object(mut deps_map) = val else {
+                    continue;
+                };
                 OrderedJsonValue::Object(
                     sorted_dependencies(node)
                         .into_iter()
                         .filter_map(|(name, child_node)| {
-                            value
-                                .get(name)
+                            deps_map
+                                .remove(name)
                                 .map(|child| (name.clone(), ordered_node_json(child, child_node)))
                         })
                         .collect(),
                 )
             } else {
-                value.clone().into()
+                val.into()
             };
-            ordered.insert(key, value);
+            ordered.insert(owned_key, value);
         }
     }
     OrderedJsonValue::Object(ordered)
