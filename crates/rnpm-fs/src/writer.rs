@@ -595,9 +595,17 @@ where
 
         if split_idx + 1 >= levels.len() {
             let level = &levels[split_idx];
-            let num_threads = 16.min(level.len());
+            // Single/leaf directory level often shares one parent (e.g. `node_modules`).
+            // Capping workers avoids NTFS `$I30` B-tree lock contention and pool wakeups.
+            if level.len() <= 24 {
+                for &slice in level {
+                    create_dir_bytes_wide_buf(slice, &mut scratch_wide)?;
+                }
+                return Ok(());
+            }
+            let num_threads = 6.min(level.len());
             let cursor = AtomicUsize::new(0);
-            let chunk = (level.len() / (num_threads * 2)).clamp(1, 8);
+            let chunk = (level.len() / (num_threads * 2)).clamp(2, 16);
             let has_err = AtomicBool::new(false);
             let first_err: Mutex<Option<std::io::Error>> = Mutex::new(None);
             crate::pool::run_parallel(num_threads, &|| {
@@ -1632,10 +1640,18 @@ fn materialize_items_slice<T: MatItem>(
     .min(total_files);
 
     if !config.is_hdd {
-        if total_files < 64 && num_threads > 12 {
-            let approx_bytes: usize = items.iter().map(|i| i.item_data().len()).sum();
+        if total_files > 1 && num_threads > 4 {
+            let mut approx_bytes = 0usize;
+            for item in &items {
+                approx_bytes = approx_bytes.saturating_add(item.item_data().len());
+                if approx_bytes >= 4 * 1024 * 1024 {
+                    break;
+                }
+            }
             if approx_bytes < 512 * 1024 {
-                num_threads = num_threads.min((total_files / 3).max(4)).min(12);
+                num_threads = num_threads.min((total_files / 20).max(4)).min(8);
+            } else if approx_bytes < 4 * 1024 * 1024 {
+                num_threads = num_threads.min(12);
             }
         }
         if total_files == 1 || num_threads <= 1 {
@@ -1676,7 +1692,7 @@ fn materialize_items_slice<T: MatItem>(
             }
         }
 
-        let chunk_size = (total_files / (num_threads * 4)).clamp(1, 16);
+        let chunk_size = (total_files / (num_threads * 2)).clamp(2, 16);
         let next_file = AtomicUsize::new(0);
         let has_err = AtomicBool::new(false);
         let first_err: Mutex<Option<FsError>> = Mutex::new(None);

@@ -11,7 +11,7 @@ use sha1::Digest as _;
 use std::collections::HashSet;
 use std::fmt::Write as _;
 use std::fs::{self, OpenOptions};
-use std::io::{Read, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -68,6 +68,41 @@ fn prefix_bitset_set(bits: &[AtomicU64; 1024], hex: &str) {
 }
 
 fn clear_prefix_bitset(bits: &[AtomicU64; 1024]) {
+    for slot in bits {
+        slot.store(0, Ordering::Relaxed);
+    }
+}
+
+#[cfg(windows)]
+#[inline]
+fn p1_index_and_mask(hex: &str) -> Option<(usize, u64)> {
+    let b = hex.as_bytes();
+    if b.len() < 2 {
+        return None;
+    }
+    let byte = ((hex_nibble(b[0])? as usize) << 4) | (hex_nibble(b[1])? as usize);
+    Some((byte >> 6, 1u64 << (byte & 63)))
+}
+
+#[cfg(windows)]
+#[inline]
+fn p1_bitset_has(bits: &[AtomicU64; 4], hex: &str) -> bool {
+    let Some((word, mask)) = p1_index_and_mask(hex) else {
+        return false;
+    };
+    (bits[word].load(Ordering::Relaxed) & mask) != 0
+}
+
+#[cfg(windows)]
+#[inline]
+fn p1_bitset_set(bits: &[AtomicU64; 4], hex: &str) {
+    if let Some((word, mask)) = p1_index_and_mask(hex) {
+        bits[word].fetch_or(mask, Ordering::Relaxed);
+    }
+}
+
+#[cfg(windows)]
+fn clear_p1_bitset(bits: &[AtomicU64; 4]) {
     for slot in bits {
         slot.store(0, Ordering::Relaxed);
     }
@@ -384,7 +419,7 @@ fn append_os_wide_fast(os: &std::ffi::OsStr, buf: &mut Vec<u16>) {
 
 #[cfg(windows)]
 #[inline]
-fn with_verbatim_wide_stack<R>(path: &Path, f: impl FnOnce(&[u16]) -> R) -> R {
+pub(crate) fn with_verbatim_wide_stack<R>(path: &Path, f: impl FnOnce(&[u16]) -> R) -> R {
     let os = path.as_os_str();
     let bytes = os.as_encoded_bytes();
     const STACK_CAP: usize = 320;
@@ -460,7 +495,13 @@ pub(crate) fn encode_verbatim_wide_into(path: &Path, buf: &mut Vec<u16>) {
 
 /// Fast parent-directory creator for two-level sharded cache paths (`.../<p1>/<p2>/<file>`).
 #[cfg(windows)]
-fn ensure_sharded_parent_win32(wide_file_null: &[u16], file_hint: &Path) -> std::io::Result<()> {
+fn ensure_sharded_parent_win32_cached(
+    wide_file_null: &[u16],
+    file_hint: &Path,
+    p1_bits: Option<&[AtomicU64; 4]>,
+    p12_bits: Option<&[AtomicU64; 1024]>,
+    hex_key: &str,
+) -> std::io::Result<()> {
     extern "system" {
         fn CreateDirectoryW(
             lpPathName: *const u16,
@@ -471,50 +512,260 @@ fn ensure_sharded_parent_win32(wide_file_null: &[u16], file_hint: &Path) -> std:
     const ERROR_ALREADY_EXISTS: u32 = 183;
     const ERROR_PATH_NOT_FOUND: u32 = 3;
 
+    if p12_bits.is_some_and(|b| prefix_bitset_has(b, hex_key)) {
+        return Ok(());
+    }
+
     // Strip trailing NUL and filename
     let without_null = &wide_file_null[..wide_file_null.len().saturating_sub(1)];
     let Some(last_sep) = without_null.iter().rposition(|&c| c == b'\\' as u16) else {
         return Ok(());
     };
     let parent = &without_null[..last_sep];
-    if let Some(grand_sep) = parent.iter().rposition(|&c| c == b'\\' as u16) {
-        let mut gp_buf = [0u16; 320];
-        let gp_len = grand_sep;
-        if gp_len < gp_buf.len() {
-            gp_buf[..gp_len].copy_from_slice(&parent[..gp_len]);
-            gp_buf[gp_len] = 0;
-            let ok_gp = unsafe { CreateDirectoryW(gp_buf.as_ptr(), std::ptr::null_mut()) };
-            if ok_gp == 0 {
-                let err = unsafe { GetLastError() };
-                if err != ERROR_ALREADY_EXISTS {
-                    if err == ERROR_PATH_NOT_FOUND {
-                        if let Some(p) = file_hint.parent() {
-                            return fs::create_dir_all(p);
+    let grand_sep_opt = parent.iter().rposition(|&c| c == b'\\' as u16);
+
+    let ensure_p1 = || -> std::io::Result<bool> {
+        if let Some(grand_sep) = grand_sep_opt {
+            let mut gp_buf = [0u16; 320];
+            if grand_sep < gp_buf.len() {
+                gp_buf[..grand_sep].copy_from_slice(&parent[..grand_sep]);
+                gp_buf[grand_sep] = 0;
+                let ok_gp = unsafe { CreateDirectoryW(gp_buf.as_ptr(), std::ptr::null_mut()) };
+                if ok_gp == 0 {
+                    let err = unsafe { GetLastError() };
+                    if err != ERROR_ALREADY_EXISTS {
+                        if err == ERROR_PATH_NOT_FOUND {
+                            return Ok(false);
                         }
-                    } else {
                         return Err(std::io::Error::from_raw_os_error(err as i32));
                     }
                 }
+                if let Some(bits) = p1_bits {
+                    p1_bitset_set(bits, hex_key);
+                }
+                return Ok(true);
             }
         }
+        Ok(false)
+    };
+
+    if !p1_bits.is_some_and(|b| p1_bitset_has(b, hex_key)) && !ensure_p1()? {
+        if let Some(p) = file_hint.parent() {
+            fs::create_dir_all(p)?;
+            if let Some(bits) = p1_bits {
+                p1_bitset_set(bits, hex_key);
+            }
+            if let Some(bits) = p12_bits {
+                prefix_bitset_set(bits, hex_key);
+            }
+            return Ok(());
+        }
     }
+
     let mut p_buf = [0u16; 320];
     if parent.len() < p_buf.len() {
         p_buf[..parent.len()].copy_from_slice(parent);
         p_buf[parent.len()] = 0;
         let ok = unsafe { CreateDirectoryW(p_buf.as_ptr(), std::ptr::null_mut()) };
         if ok != 0 {
+            if let Some(bits) = p12_bits {
+                prefix_bitset_set(bits, hex_key);
+            }
             return Ok(());
         }
         let err = unsafe { GetLastError() };
         if err == ERROR_ALREADY_EXISTS {
+            if let Some(bits) = p12_bits {
+                prefix_bitset_set(bits, hex_key);
+            }
             return Ok(());
+        }
+        if err == ERROR_PATH_NOT_FOUND && ensure_p1()? {
+            let ok2 = unsafe { CreateDirectoryW(p_buf.as_ptr(), std::ptr::null_mut()) };
+            if ok2 != 0 || unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
+                if let Some(bits) = p12_bits {
+                    prefix_bitset_set(bits, hex_key);
+                }
+                return Ok(());
+            }
         }
     }
     if let Some(p) = file_hint.parent() {
         fs::create_dir_all(p)?;
+        if let Some(bits) = p1_bits {
+            p1_bitset_set(bits, hex_key);
+        }
+        if let Some(bits) = p12_bits {
+            prefix_bitset_set(bits, hex_key);
+        }
     }
     Ok(())
+}
+
+#[cfg(windows)]
+#[allow(dead_code)]
+pub(crate) enum WinAttrStat {
+    File { size: u64, mtime: Option<u64> },
+    Dir,
+    NotFound { path_not_found: bool },
+    Error(u32),
+}
+
+#[cfg(windows)]
+#[inline]
+pub(crate) fn query_win_attr_wide(wide_null: &[u16]) -> WinAttrStat {
+    #[repr(C)]
+    #[allow(non_snake_case)]
+    struct FILETIME {
+        dwLowDateTime: u32,
+        dwHighDateTime: u32,
+    }
+    #[repr(C)]
+    #[allow(non_snake_case)]
+    struct WIN32_FILE_ATTRIBUTE_DATA {
+        dwFileAttributes: u32,
+        ftCreationTime: FILETIME,
+        ftLastAccessTime: FILETIME,
+        ftLastWriteTime: FILETIME,
+        nFileSizeHigh: u32,
+        nFileSizeLow: u32,
+    }
+    extern "system" {
+        fn GetFileAttributesExW(
+            lpFileName: *const u16,
+            fInfoLevelId: i32,
+            lpFileInformation: *mut std::ffi::c_void,
+        ) -> i32;
+        fn GetLastError() -> u32;
+    }
+    const GET_FILE_EX_INFO_STANDARD: i32 = 0;
+    const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x10;
+    const ERROR_FILE_NOT_FOUND: u32 = 2;
+    const ERROR_PATH_NOT_FOUND: u32 = 3;
+    const WINDOWS_EPOCH_OFFSET: u64 = 116_444_736_000_000_000;
+
+    let mut data = std::mem::MaybeUninit::<WIN32_FILE_ATTRIBUTE_DATA>::uninit();
+    let ok = unsafe {
+        GetFileAttributesExW(
+            wide_null.as_ptr(),
+            GET_FILE_EX_INFO_STANDARD,
+            data.as_mut_ptr() as *mut std::ffi::c_void,
+        )
+    };
+    if ok == 0 {
+        let err = unsafe { GetLastError() };
+        if err == ERROR_PATH_NOT_FOUND {
+            return WinAttrStat::NotFound {
+                path_not_found: true,
+            };
+        }
+        if err == ERROR_FILE_NOT_FOUND {
+            return WinAttrStat::NotFound {
+                path_not_found: false,
+            };
+        }
+        return WinAttrStat::Error(err);
+    }
+    let info = unsafe { data.assume_init() };
+    if (info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0 {
+        return WinAttrStat::Dir;
+    }
+    let size = ((info.nFileSizeHigh as u64) << 32) | (info.nFileSizeLow as u64);
+    let ft = ((info.ftLastWriteTime.dwHighDateTime as u64) << 32)
+        | (info.ftLastWriteTime.dwLowDateTime as u64);
+    let mtime = ft.checked_sub(WINDOWS_EPOCH_OFFSET).map(|t| t * 100);
+    WinAttrStat::File { size, mtime }
+}
+
+#[cfg(windows)]
+#[inline]
+fn push_u128_wide_slice(buf: &mut [u16], pos: &mut usize, mut val: u128) {
+    let mut digits = [0u16; 40];
+    let mut i = digits.len();
+    loop {
+        i -= 1;
+        digits[i] = (b'0' + (val % 10) as u8) as u16;
+        val /= 10;
+        if val == 0 {
+            break;
+        }
+    }
+    let len = digits.len() - i;
+    buf[*pos..*pos + len].copy_from_slice(&digits[i..]);
+    *pos += len;
+}
+
+#[cfg(windows)]
+#[inline]
+pub(crate) fn with_temp_wide_stack<R>(
+    root: &Path,
+    prefix: &str,
+    f: impl FnOnce(&[u16], Option<&Path>) -> R,
+) -> R {
+    let root_bytes = root.as_os_str().as_encoded_bytes();
+    let count = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let pid = std::process::id();
+    let now = process_start_nanos();
+    const STACK_CAP: usize = 320;
+    // "\\?\" (4) + root + "\tmp\" (5) + prefix + "_" + 10 + "_" + 39 + "_" + 20 + ".tmp\0" (77)
+    if prefix.is_ascii()
+        && root_bytes.is_ascii()
+        && root_bytes.len() >= 3
+        && root_bytes[0].is_ascii_alphabetic()
+        && root_bytes[1] == b':'
+        && root_bytes[2] == b'\\'
+        && root_bytes.len() + prefix.len() + 86 <= STACK_CAP
+        && !root_bytes.contains(&b'/')
+        && !root_bytes[3..].windows(2).any(|w| w == b"\\\\")
+        && !root_bytes.windows(3).any(|w| w == b"\\.\\")
+        && !root_bytes.windows(4).any(|w| w == b"\\..\\")
+        && !root_bytes.ends_with(br"\.")
+        && !root_bytes.ends_with(br"\..")
+        && !root_bytes.ends_with(b"\\")
+    {
+        let mut stack = [0u16; STACK_CAP];
+        stack[0] = b'\\' as u16;
+        stack[1] = b'\\' as u16;
+        stack[2] = b'?' as u16;
+        stack[3] = b'\\' as u16;
+        let mut pos = 4;
+        for &b in root_bytes {
+            stack[pos] = b as u16;
+            pos += 1;
+        }
+        for &b in br"\tmp\" {
+            stack[pos] = b as u16;
+            pos += 1;
+        }
+        for &b in prefix.as_bytes() {
+            stack[pos] = b as u16;
+            pos += 1;
+        }
+        stack[pos] = b'_' as u16;
+        pos += 1;
+        push_u128_wide_slice(&mut stack, &mut pos, pid as u128);
+        stack[pos] = b'_' as u16;
+        pos += 1;
+        push_u128_wide_slice(&mut stack, &mut pos, now);
+        stack[pos] = b'_' as u16;
+        pos += 1;
+        push_u128_wide_slice(&mut stack, &mut pos, count as u128);
+        for &b in b".tmp\0" {
+            stack[pos] = b as u16;
+            pos += 1;
+        }
+        return f(&stack[..pos], None);
+    }
+
+    let mut name = String::with_capacity(prefix.len() + 48);
+    let _ = write!(&mut name, "{prefix}_{pid}_{now}_{count}.tmp");
+    let mut path = PathBuf::with_capacity(root.as_os_str().len() + 8 + name.len());
+    path.push(root);
+    path.push("tmp");
+    path.push(&name);
+    let mut wide = Vec::with_capacity(260);
+    encode_verbatim_wide_into(&path, &mut wide);
+    f(&wide, Some(&path))
 }
 
 #[cfg(windows)]
@@ -613,7 +864,7 @@ fn rename_handle_win32(
             Ok(()) => return Ok(()),
             Err(ERROR_PATH_NOT_FOUND) if !created_parent => {
                 created_parent = true;
-                ensure_sharded_parent_win32(wide_target_null, target_hint)?;
+                ensure_sharded_parent_win32_cached(wide_target_null, target_hint, None, None, "")?;
             }
             Err(ERROR_ACCESS_DENIED) if !cleared_ro => {
                 cleared_ro = true;
@@ -638,7 +889,7 @@ fn rename_handle_win32(
 pub(crate) fn write_and_rename_atomic_wide(
     wide_tmp_null: &[u16],
     wide_target_null: &[u16],
-    tmp_hint: &Path,
+    tmp_hint: Option<&Path>,
     target_hint: &Path,
     data: &[u8],
 ) -> std::io::Result<()> {
@@ -649,6 +900,28 @@ pub(crate) fn write_and_rename_atomic_wide(
         target_hint,
         data,
         false,
+        None,
+    )
+    .map(|_| ())
+}
+
+#[cfg(windows)]
+pub(crate) fn write_and_rename_atomic_wide_set_mtime(
+    wide_tmp_null: &[u16],
+    wide_target_null: &[u16],
+    tmp_hint: Option<&Path>,
+    target_hint: &Path,
+    data: &[u8],
+    set_mtime_nanos: Option<u64>,
+) -> std::io::Result<()> {
+    write_and_rename_atomic_wide_impl(
+        wide_tmp_null,
+        wide_target_null,
+        tmp_hint,
+        target_hint,
+        data,
+        false,
+        set_mtime_nanos,
     )
     .map(|_| ())
 }
@@ -664,10 +937,11 @@ pub(crate) fn write_and_rename_atomic_wide_with_mtime(
     write_and_rename_atomic_wide_impl(
         wide_tmp_null,
         wide_target_null,
-        tmp_hint,
+        Some(tmp_hint),
         target_hint,
         data,
         true,
+        None,
     )
 }
 
@@ -675,10 +949,11 @@ pub(crate) fn write_and_rename_atomic_wide_with_mtime(
 fn write_and_rename_atomic_wide_impl(
     wide_tmp_null: &[u16],
     wide_target_null: &[u16],
-    tmp_hint: &Path,
+    tmp_hint: Option<&Path>,
     target_hint: &Path,
     data: &[u8],
     capture_mtime: bool,
+    set_mtime_nanos: Option<u64>,
 ) -> std::io::Result<Option<u64>> {
     #[repr(C)]
     #[allow(non_snake_case)]
@@ -696,6 +971,10 @@ fn write_and_rename_atomic_wide_impl(
             dwFlagsAndAttributes: u32,
             hTemplateFile: *mut std::ffi::c_void,
         ) -> *mut std::ffi::c_void;
+        fn CreateDirectoryW(
+            lpPathName: *const u16,
+            lpSecurityAttributes: *mut std::ffi::c_void,
+        ) -> i32;
         fn WriteFile(
             hFile: *mut std::ffi::c_void,
             lpBuffer: *const std::ffi::c_void,
@@ -708,6 +987,12 @@ fn write_and_rename_atomic_wide_impl(
             lpCreationTime: *mut FileTimeRaw,
             lpLastAccessTime: *mut FileTimeRaw,
             lpLastWriteTime: *mut FileTimeRaw,
+        ) -> i32;
+        fn SetFileTime(
+            hFile: *mut std::ffi::c_void,
+            lpCreationTime: *const FileTimeRaw,
+            lpLastAccessTime: *const FileTimeRaw,
+            lpLastWriteTime: *const FileTimeRaw,
         ) -> i32;
         fn SetFileInformationByHandle(
             hFile: *mut std::ffi::c_void,
@@ -726,6 +1011,7 @@ fn write_and_rename_atomic_wide_impl(
     const FILE_ATTRIBUTE_NORMAL: u32 = 0x80;
     const FILE_DISPOSITION_INFO: i32 = 4;
     const ERROR_PATH_NOT_FOUND: u32 = 3;
+    const ERROR_ALREADY_EXISTS: u32 = 183;
     const INVALID_HANDLE_VALUE: *mut std::ffi::c_void = -1isize as *mut std::ffi::c_void;
     const WINDOWS_EPOCH_OFFSET: u64 = 116_444_736_000_000_000;
 
@@ -749,8 +1035,25 @@ fn write_and_rename_atomic_wide_impl(
     if handle == INVALID_HANDLE_VALUE {
         let err = unsafe { GetLastError() };
         if err == ERROR_PATH_NOT_FOUND {
-            if let Some(parent) = tmp_hint.parent() {
-                fs::create_dir_all(parent)?;
+            if let Some(hint) = tmp_hint {
+                if let Some(parent) = hint.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+            } else {
+                let without_null = &wide_tmp_null[..wide_tmp_null.len().saturating_sub(1)];
+                if let Some(last_sep) = without_null.iter().rposition(|&c| c == b'\\' as u16) {
+                    let mut dir_buf = Vec::with_capacity(last_sep + 1);
+                    dir_buf.extend_from_slice(&without_null[..last_sep]);
+                    dir_buf.push(0);
+                    let ok = unsafe { CreateDirectoryW(dir_buf.as_ptr(), std::ptr::null_mut()) };
+                    if ok == 0 && unsafe { GetLastError() } != ERROR_ALREADY_EXISTS {
+                        use std::os::windows::ffi::OsStringExt;
+                        let p = PathBuf::from(std::ffi::OsString::from_wide(
+                            &dir_buf[..dir_buf.len() - 1],
+                        ));
+                        fs::create_dir_all(p)?;
+                    }
+                }
             }
             handle = unsafe {
                 CreateFileW(
@@ -803,6 +1106,17 @@ fn write_and_rename_atomic_wide_impl(
         offset += written as usize;
     }
 
+    if let Some(ns) = set_mtime_nanos {
+        let ft_100ns = (ns / 100).saturating_add(WINDOWS_EPOCH_OFFSET);
+        let ft = FileTimeRaw {
+            dwLowDateTime: ft_100ns as u32,
+            dwHighDateTime: (ft_100ns >> 32) as u32,
+        };
+        unsafe {
+            SetFileTime(handle, std::ptr::null(), std::ptr::null(), &ft);
+        }
+    }
+
     if let Err(e) = rename_handle_win32(handle, wide_target_null, target_hint) {
         cleanup_and_close(handle);
         return Err(e);
@@ -830,18 +1144,38 @@ fn write_and_rename_atomic_wide_impl(
     Ok(mtime)
 }
 
+#[cfg_attr(windows, allow(dead_code))]
 pub(crate) fn write_and_rename_atomic(
     temp_path: &Path,
     target_path: &Path,
     data: &[u8],
 ) -> std::io::Result<()> {
+    write_and_rename_atomic_with_set_mtime(temp_path, target_path, data, None)
+}
+
+#[cfg_attr(windows, allow(dead_code))]
+pub(crate) fn write_and_rename_atomic_with_set_mtime(
+    temp_path: &Path,
+    target_path: &Path,
+    data: &[u8],
+    set_mtime_nanos: Option<u64>,
+) -> std::io::Result<()> {
     #[cfg(windows)]
     {
-        let mut wide_tmp = Vec::with_capacity(260);
-        let mut wide_target = Vec::with_capacity(260);
-        encode_verbatim_wide_into(temp_path, &mut wide_tmp);
-        encode_verbatim_wide_into(target_path, &mut wide_target);
-        write_and_rename_atomic_wide(&wide_tmp, &wide_target, temp_path, target_path, data)
+        with_verbatim_wide_stack(temp_path, |wide_tmp| {
+            with_verbatim_wide_stack(target_path, |wide_target| {
+                write_and_rename_atomic_wide_impl(
+                    wide_tmp,
+                    wide_target,
+                    Some(temp_path),
+                    target_path,
+                    data,
+                    false,
+                    set_mtime_nanos,
+                )
+                .map(|_| ())
+            })
+        })
     }
     #[cfg(not(windows))]
     {
@@ -859,6 +1193,9 @@ pub(crate) fn write_and_rename_atomic(
             drop(file);
             let _ = fs::remove_file(temp_path);
             return Err(e);
+        }
+        if let Some(ns) = set_mtime_nanos {
+            let _ = file.set_modified(UNIX_EPOCH + Duration::from_nanos(ns));
         }
         drop(file);
         match fs::rename(temp_path, target_path) {
@@ -884,7 +1221,7 @@ pub(crate) fn write_and_rename_atomic(
 }
 
 #[cfg(windows)]
-fn read_file_win32_once(path: &Path) -> std::io::Result<Vec<u8>> {
+pub(crate) fn read_file_win32_once_wide(wide_null: &[u16]) -> std::io::Result<Vec<u8>> {
     extern "system" {
         fn CreateFileW(
             lpFileName: *const u16,
@@ -912,9 +1249,9 @@ fn read_file_win32_once(path: &Path) -> std::io::Result<Vec<u8>> {
     const FILE_FLAG_SEQUENTIAL_SCAN: u32 = 0x0800_0000;
     const INVALID_HANDLE_VALUE: *mut std::ffi::c_void = -1isize as *mut std::ffi::c_void;
 
-    let handle = with_verbatim_wide_stack(path, |wide| unsafe {
+    let handle = unsafe {
         CreateFileW(
-            wide.as_ptr(),
+            wide_null.as_ptr(),
             GENERIC_READ,
             FILE_SHARE_ALL,
             std::ptr::null_mut(),
@@ -922,7 +1259,7 @@ fn read_file_win32_once(path: &Path) -> std::io::Result<Vec<u8>> {
             FILE_FLAG_SEQUENTIAL_SCAN,
             std::ptr::null_mut(),
         )
-    });
+    };
     if handle == INVALID_HANDLE_VALUE {
         return Err(std::io::Error::from_raw_os_error(unsafe { GetLastError() } as i32));
     }
@@ -969,6 +1306,11 @@ fn read_file_win32_once(path: &Path) -> std::io::Result<Vec<u8>> {
         CloseHandle(handle);
     }
     Ok(out)
+}
+
+#[cfg(windows)]
+fn read_file_win32_once(path: &Path) -> std::io::Result<Vec<u8>> {
+    with_verbatim_wide_stack(path, read_file_win32_once_wide)
 }
 
 /// Helper to reliably read a file with retries on Windows transient file sharing locks.
@@ -1184,7 +1526,11 @@ pub struct Cache {
     root: PathBuf,
     lock_timeout: Duration,
     stale_threshold: Duration,
+    #[cfg(windows)]
+    blob_p1_dirs: Arc<[AtomicU64; 4]>,
     blob_prefix_dirs: Arc<[AtomicU64; 1024]>,
+    #[cfg(windows)]
+    index_p1_dirs: Arc<[AtomicU64; 4]>,
     index_prefix_dirs: Arc<[AtomicU64; 1024]>,
     lock_shards: Arc<[Mutex<()>; LOCK_SHARD_COUNT]>,
 }
@@ -1201,7 +1547,11 @@ impl Cache {
             root,
             lock_timeout: CacheLock::DEFAULT_TIMEOUT,
             stale_threshold: CacheLock::DEFAULT_STALE_THRESHOLD,
+            #[cfg(windows)]
+            blob_p1_dirs: Arc::new([const { AtomicU64::new(0) }; 4]),
             blob_prefix_dirs: Arc::new([const { AtomicU64::new(0) }; 1024]),
+            #[cfg(windows)]
+            index_p1_dirs: Arc::new([const { AtomicU64::new(0) }; 4]),
             index_prefix_dirs: Arc::new([const { AtomicU64::new(0) }; 1024]),
             lock_shards: Arc::new(std::array::from_fn(|_| Mutex::new(()))),
         })
@@ -1443,37 +1793,145 @@ impl Cache {
     pub fn put_blob_direct(&self, data: &[u8], sha512_hex: &str) -> Result<(), CacheError> {
         let npm_path = self.npm_blob_path_for_algo(Algorithm::Sha512, sha512_hex);
 
-        let mut npm_definitely_missing = false;
-        match fs::File::open(&npm_path) {
-            Ok(mut f) => {
-                if let Ok(meta) = f.metadata() {
-                    if meta.is_dir() {
-                        return Err(CacheError::Io(std::io::Error::new(
-                            std::io::ErrorKind::AlreadyExists,
-                            format!("Blob path is a directory: {}", npm_path.display()),
-                        )));
+        #[cfg(windows)]
+        {
+            let fast_res: Result<Option<()>, CacheError> =
+                with_verbatim_wide_stack(&npm_path, |wide_target| match query_win_attr_wide(
+                    wide_target,
+                ) {
+                    WinAttrStat::Dir => Err(CacheError::Io(std::io::Error::new(
+                        std::io::ErrorKind::AlreadyExists,
+                        format!("Blob path is a directory: {}", npm_path.display()),
+                    ))),
+                    WinAttrStat::File { size, .. } => {
+                        if size == data.len() as u64 {
+                            if let Ok(existing) = read_file_win32_once_wide(wide_target) {
+                                if existing.as_slice() == data {
+                                    p1_bitset_set(&self.blob_p1_dirs, sha512_hex);
+                                    prefix_bitset_set(&self.blob_prefix_dirs, sha512_hex);
+                                    return Ok(Some(()));
+                                }
+                            }
+                        }
+                        Ok(None)
                     }
-                    if meta.len() == data.len() as u64 {
-                        let mut existing = Vec::with_capacity(data.len());
-                        if f.read_to_end(&mut existing).is_ok() && existing.as_slice() == data {
-                            return Ok(());
+                    WinAttrStat::NotFound { path_not_found } => {
+                        if !path_not_found {
+                            p1_bitset_set(&self.blob_p1_dirs, sha512_hex);
+                            prefix_bitset_set(&self.blob_prefix_dirs, sha512_hex);
+                            let legacy_path =
+                                Self::legacy_blob_path_from_npm(&npm_path, sha512_hex);
+                            let legacy_match = with_verbatim_wide_stack(&legacy_path, |wide_leg| {
+                                match query_win_attr_wide(wide_leg) {
+                                    WinAttrStat::Dir => Err(CacheError::Io(std::io::Error::new(
+                                        std::io::ErrorKind::AlreadyExists,
+                                        format!(
+                                            "Blob path is a directory: {}",
+                                            legacy_path.display()
+                                        ),
+                                    ))),
+                                    WinAttrStat::File { size, .. } if size == data.len() as u64 => {
+                                        Ok(read_file_win32_once_wide(wide_leg)
+                                            .is_ok_and(|existing| existing.as_slice() == data))
+                                    }
+                                    _ => Ok(false),
+                                }
+                            })?;
+                            if legacy_match {
+                                return Ok(Some(()));
+                            }
+                        } else {
+                            ensure_sharded_parent_win32_cached(
+                                wide_target,
+                                &npm_path,
+                                Some(&self.blob_p1_dirs),
+                                Some(&self.blob_prefix_dirs),
+                                sha512_hex,
+                            )?;
+                        }
+
+                        let atomic_ok =
+                            with_temp_wide_stack(&self.root, "blob", |wide_tmp, tmp_hint| {
+                                write_and_rename_atomic_wide(
+                                    wide_tmp,
+                                    wide_target,
+                                    tmp_hint,
+                                    &npm_path,
+                                    data,
+                                )
+                            });
+                        match atomic_ok {
+                            Ok(()) => {
+                                p1_bitset_set(&self.blob_p1_dirs, sha512_hex);
+                                prefix_bitset_set(&self.blob_prefix_dirs, sha512_hex);
+                                debug!("Atomically stored blob {}", npm_path.display());
+                                Ok(Some(()))
+                            }
+                            Err(_) if npm_path.is_dir() => Err(CacheError::Io(std::io::Error::new(
+                                std::io::ErrorKind::AlreadyExists,
+                                format!("Blob path is a directory: {}", npm_path.display()),
+                            ))),
+                            Err(_) => Ok(None),
                         }
                     }
-                }
+                    WinAttrStat::Error(_) => Ok(None),
+                });
+            if let Some(()) = fast_res? {
+                return Ok(());
             }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                npm_definitely_missing = true;
-                if !is_path_not_found(&e) {
-                    let legacy_path = Self::legacy_blob_path_from_npm(&npm_path, sha512_hex);
-                    if let Ok(meta) = fs::metadata(&legacy_path) {
+        }
+
+        #[cfg(not(windows))]
+        {
+            let mut npm_definitely_missing = false;
+            match fs::File::open(&npm_path) {
+                Ok(mut f) => {
+                    if let Ok(meta) = f.metadata() {
                         if meta.is_dir() {
                             return Err(CacheError::Io(std::io::Error::new(
                                 std::io::ErrorKind::AlreadyExists,
-                                format!("Blob path is a directory: {}", legacy_path.display()),
+                                format!("Blob path is a directory: {}", npm_path.display()),
                             )));
                         }
                         if meta.len() == data.len() as u64 {
-                            if let Ok(existing) = read_file_with_retries(&legacy_path) {
+                            let mut existing = Vec::with_capacity(data.len());
+                            if f.read_to_end(&mut existing).is_ok() && existing.as_slice() == data {
+                                return Ok(());
+                            }
+                        }
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    npm_definitely_missing = true;
+                    if !is_path_not_found(&e) {
+                        let legacy_path = Self::legacy_blob_path_from_npm(&npm_path, sha512_hex);
+                        if let Ok(meta) = fs::metadata(&legacy_path) {
+                            if meta.is_dir() {
+                                return Err(CacheError::Io(std::io::Error::new(
+                                    std::io::ErrorKind::AlreadyExists,
+                                    format!("Blob path is a directory: {}", legacy_path.display()),
+                                )));
+                            }
+                            if meta.len() == data.len() as u64 {
+                                if let Ok(existing) = read_file_with_retries(&legacy_path) {
+                                    if existing.as_slice() == data {
+                                        return Ok(());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(_) => {
+                    if let Ok(meta) = fs::metadata(&npm_path) {
+                        if meta.is_dir() {
+                            return Err(CacheError::Io(std::io::Error::new(
+                                std::io::ErrorKind::AlreadyExists,
+                                format!("Blob path is a directory: {}", npm_path.display()),
+                            )));
+                        }
+                        if meta.len() == data.len() as u64 {
+                            if let Ok(existing) = read_file_with_retries(&npm_path) {
                                 if existing.as_slice() == data {
                                     return Ok(());
                                 }
@@ -1482,53 +1940,29 @@ impl Cache {
                     }
                 }
             }
-            Err(_) => {
-                if let Ok(meta) = fs::metadata(&npm_path) {
-                    if meta.is_dir() {
+
+            if npm_definitely_missing || fs::symlink_metadata(&npm_path).is_err() {
+                if !prefix_bitset_has(&self.blob_prefix_dirs, sha512_hex) {
+                    if let Some(parent) = npm_path.parent() {
+                        fs::create_dir_all(parent)?;
+                    }
+                    prefix_bitset_set(&self.blob_prefix_dirs, sha512_hex);
+                }
+                let temp_path = self.create_temp_path("blob");
+                match write_and_rename_atomic(&temp_path, &npm_path, data) {
+                    Ok(()) => {
+                        prefix_bitset_set(&self.blob_prefix_dirs, sha512_hex);
+                        debug!("Atomically stored blob {}", npm_path.display());
+                        return Ok(());
+                    }
+                    Err(_) if npm_path.is_dir() => {
                         return Err(CacheError::Io(std::io::Error::new(
                             std::io::ErrorKind::AlreadyExists,
                             format!("Blob path is a directory: {}", npm_path.display()),
                         )));
                     }
-                    if meta.len() == data.len() as u64 {
-                        if let Ok(existing) = read_file_with_retries(&npm_path) {
-                            if existing.as_slice() == data {
-                                return Ok(());
-                            }
-                        }
-                    }
+                    Err(_) => {}
                 }
-            }
-        }
-
-        if npm_definitely_missing || fs::symlink_metadata(&npm_path).is_err() {
-            if !prefix_bitset_has(&self.blob_prefix_dirs, sha512_hex) {
-                #[cfg(windows)]
-                {
-                    let mut wide = Vec::with_capacity(260);
-                    encode_verbatim_wide_into(&npm_path, &mut wide);
-                    ensure_sharded_parent_win32(&wide, &npm_path)?;
-                }
-                #[cfg(not(windows))]
-                if let Some(parent) = npm_path.parent() {
-                    fs::create_dir_all(parent)?;
-                }
-                prefix_bitset_set(&self.blob_prefix_dirs, sha512_hex);
-            }
-            let temp_path = self.create_temp_path("blob");
-            match write_and_rename_atomic(&temp_path, &npm_path, data) {
-                Ok(()) => {
-                    prefix_bitset_set(&self.blob_prefix_dirs, sha512_hex);
-                    debug!("Atomically stored blob {}", npm_path.display());
-                    return Ok(());
-                }
-                Err(_) if npm_path.is_dir() => {
-                    return Err(CacheError::Io(std::io::Error::new(
-                        std::io::ErrorKind::AlreadyExists,
-                        format!("Blob path is a directory: {}", npm_path.display()),
-                    )));
-                }
-                Err(_) => {}
             }
         }
 
@@ -1774,28 +2208,43 @@ impl Cache {
         buf[40] = b'\t';
         buf.push(b'\n');
 
-        let temp_path = self.create_temp_path("index");
-
         let _shard_guard = self.lock_shards[shard_index_for_str(hash)]
             .lock()
             .unwrap_or_else(|e| e.into_inner());
 
-        if !prefix_bitset_has(&self.index_prefix_dirs, hash) {
-            #[cfg(windows)]
-            {
-                let mut wide = Vec::with_capacity(260);
-                encode_verbatim_wide_into(&npm_path, &mut wide);
-                ensure_sharded_parent_win32(&wide, &npm_path)?;
+        #[cfg(windows)]
+        {
+            let res: Result<bool, CacheError> = with_verbatim_wide_stack(&npm_path, |wide_target| {
+                ensure_sharded_parent_win32_cached(
+                    wide_target,
+                    &npm_path,
+                    Some(&self.index_p1_dirs),
+                    Some(&self.index_prefix_dirs),
+                    hash,
+                )?;
+                let ok = with_temp_wide_stack(&self.root, "index", |wide_tmp, tmp_hint| {
+                    write_and_rename_atomic_wide(wide_tmp, wide_target, tmp_hint, &npm_path, &buf)
+                        .is_ok()
+                });
+                Ok(ok)
+            });
+            if res? {
+                return Ok(());
             }
-            #[cfg(not(windows))]
-            if let Some(parent) = npm_path.parent() {
-                fs::create_dir_all(parent)?;
-            }
-            prefix_bitset_set(&self.index_prefix_dirs, hash);
         }
 
-        if write_and_rename_atomic(&temp_path, &npm_path, &buf).is_ok() {
-            return Ok(());
+        #[cfg(not(windows))]
+        {
+            let temp_path = self.create_temp_path("index");
+            if !prefix_bitset_has(&self.index_prefix_dirs, hash) {
+                if let Some(parent) = npm_path.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                prefix_bitset_set(&self.index_prefix_dirs, hash);
+            }
+            if write_and_rename_atomic(&temp_path, &npm_path, &buf).is_ok() {
+                return Ok(());
+            }
         }
 
         let staged = self.write_temp_file("index", &buf)?;
@@ -2547,6 +2996,11 @@ impl Cache {
         }
 
         // Recreate essential cache directory layout
+        #[cfg(windows)]
+        {
+            clear_p1_bitset(&self.blob_p1_dirs);
+            clear_p1_bitset(&self.index_p1_dirs);
+        }
         clear_prefix_bitset(&self.blob_prefix_dirs);
         clear_prefix_bitset(&self.index_prefix_dirs);
         fs::create_dir_all(self.root.join("content-v2").join("sha512"))?;
