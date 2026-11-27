@@ -9,6 +9,7 @@ pub mod asn1;
 pub mod circuit_breaker;
 pub mod client;
 pub mod error;
+pub(crate) mod http1_pool;
 pub mod metadata;
 pub mod network_errors;
 pub mod not_found;
@@ -25,7 +26,7 @@ pub use client::{
     RegistryClientConfig, ScopedTlsConfig, ScopedTlsIdentity, TarballFetchResult, TarballStream,
     DEFAULT_RETRY_FACTOR, HTTP_REQUEST_COUNT, NPM_INSTALL_ACCEPT, NPM_INSTALL_V1_JSON,
 };
-pub use error::RegistryError;
+pub use error::{HttpTransportError, RegistryError};
 pub use metadata::{
     deserialize_dist_tags, deserialize_engines, deserialize_license, deserialize_platform_list,
     deserialize_publish_times, deserialize_unique_versions, deserialize_unique_versions_install,

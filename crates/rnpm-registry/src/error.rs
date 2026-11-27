@@ -1,9 +1,30 @@
 use thiserror::Error;
 
+/// Transport/socket error emitted by the direct HTTP/1.1 connection pool.
+#[derive(Debug, Clone)]
+pub struct HttpTransportError {
+    pub message: String,
+    pub is_connect: bool,
+    pub is_timeout: bool,
+    pub is_decode: bool,
+    pub is_transient: bool,
+}
+
+impl std::fmt::Display for HttpTransportError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for HttpTransportError {}
+
 #[derive(Debug, Error)]
 pub enum RegistryError {
     #[error("{}", crate::network_errors::format_http(.0))]
     Http(#[from] reqwest::Error),
+
+    #[error("{0}")]
+    Transport(#[from] HttpTransportError),
 
     #[error("URL parse error: {0}")]
     UrlParse(#[from] url::ParseError),
@@ -179,6 +200,7 @@ impl RegistryError {
         match self {
             Self::SlowlorisTimeout(_) => true,
             Self::Http(e) => e.is_timeout(),
+            Self::Transport(e) => e.is_timeout,
             _ => false,
         }
     }
@@ -207,6 +229,7 @@ impl RegistryError {
     pub fn is_connect(&self) -> bool {
         match self {
             Self::Http(e) => e.is_connect(),
+            Self::Transport(e) => e.is_connect,
             _ => false,
         }
     }
@@ -215,6 +238,8 @@ impl RegistryError {
     pub fn is_decode(&self) -> bool {
         match self {
             Self::Http(e) => e.is_decode() || e.is_body(),
+            Self::Transport(e) => e.is_decode,
+            Self::ContentLengthMismatch { .. } => true,
             _ => false,
         }
     }
@@ -257,6 +282,7 @@ impl RegistryError {
             Self::RateLimited { .. } => true,
             Self::SlowlorisTimeout(_) => true,
             Self::ContentLengthMismatch { .. } => true,
+            Self::Transport(e) => e.is_transient,
             Self::ServerError { status, .. } => {
                 *status == 429 || *status == 502 || *status == 503 || *status == 504
             }
