@@ -271,7 +271,13 @@ pub fn remove_junction(path: &Path) -> Result<(), FsError> {
 }
 
 /// Helper to unlink a single regular file, clearing read-only attributes and retrying on transient Windows locks.
-fn remove_file_safe(path: &Path, meta: Option<&fs::Metadata>) -> Result<(), FsError> {
+fn remove_file_safe(
+    path: &Path,
+    meta: Option<&fs::Metadata>,
+    repair_parent: bool,
+) -> Result<(), FsError> {
+    #[cfg(not(unix))]
+    let _ = repair_parent;
     #[cfg(windows)]
     {
         let is_ro = meta.map(|m| m.permissions().readonly()).unwrap_or_else(|| {
@@ -301,7 +307,10 @@ fn remove_file_safe(path: &Path, meta: Option<&fs::Metadata>) -> Result<(), FsEr
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
             Err(err) => {
                 #[cfg(unix)]
-                if !retried_writable_parent && err.kind() == std::io::ErrorKind::PermissionDenied {
+                if repair_parent
+                    && !retried_writable_parent
+                    && err.kind() == std::io::ErrorKind::PermissionDenied
+                {
                     use std::os::unix::fs::PermissionsExt;
                     retried_writable_parent = true;
                     if let Some(parent) = path.parent() {
@@ -330,7 +339,9 @@ fn remove_file_safe(path: &Path, meta: Option<&fs::Metadata>) -> Result<(), FsEr
 
 /// Helper to remove an empty directory on non-Windows targets, retrying on transient errors.
 #[cfg(not(windows))]
-fn remove_dir_safe(path: &Path) -> Result<(), FsError> {
+fn remove_dir_safe(path: &Path, repair_parent: bool) -> Result<(), FsError> {
+    #[cfg(not(unix))]
+    let _ = repair_parent;
     let mut attempts = 0;
     #[cfg(unix)]
     let mut retried_writable_parent = false;
@@ -342,7 +353,10 @@ fn remove_dir_safe(path: &Path) -> Result<(), FsError> {
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
             Err(err) => {
                 #[cfg(unix)]
-                if !retried_writable_parent && err.kind() == std::io::ErrorKind::PermissionDenied {
+                if repair_parent
+                    && !retried_writable_parent
+                    && err.kind() == std::io::ErrorKind::PermissionDenied
+                {
                     use std::os::unix::fs::PermissionsExt;
                     retried_writable_parent = true;
                     if let Some(parent) = path.parent() {
@@ -959,7 +973,7 @@ pub fn remove_dir_all_safe(path: &Path) -> Result<(), FsError> {
 
     // 3. Regular file: unlink directly
     if !meta.is_dir() {
-        return remove_file_safe(&path_v, Some(&meta));
+        return remove_file_safe(&path_v, Some(&meta), false);
     }
 
     #[cfg(windows)]
@@ -1032,7 +1046,7 @@ pub fn remove_dir_all_safe(path: &Path) -> Result<(), FsError> {
                         Err(e) => return Err(FsError::Io(e)),
                     }
                 } else {
-                    remove_file_safe(&p, None)?;
+                    remove_file_safe(&p, None, true)?;
                 }
             }
         } else {
@@ -1056,7 +1070,7 @@ pub fn remove_dir_all_safe(path: &Path) -> Result<(), FsError> {
                                     Err(e) => Err(FsError::Io(e)),
                                 }
                             } else {
-                                remove_file_safe(p, None)
+                                remove_file_safe(p, None, true)
                             };
                             if let Err(e) = res {
                                 let mut guard = err_ref.lock().unwrap();
@@ -1080,9 +1094,10 @@ pub fn remove_dir_all_safe(path: &Path) -> Result<(), FsError> {
         for (dir, depth) in dirs_collected {
             by_depth[depth].push(dir);
         }
-        for level in by_depth.into_iter().rev() {
+        for (depth, level) in by_depth.into_iter().enumerate().rev() {
+            let repair_parent = depth > 0;
             for dir in level {
-                remove_dir_safe(&dir)?;
+                remove_dir_safe(&dir, repair_parent)?;
             }
         }
 

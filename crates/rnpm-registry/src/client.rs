@@ -1770,7 +1770,7 @@ fn validate_proxy_and_ca_config(config: &RegistryClientConfig) -> Result<(), Reg
 #[derive(Clone)]
 pub struct RegistryClient {
     base_client: Arc<LazyHttpClient>,
-    default_headers: Arc<HeaderMap>,
+    default_headers: Arc<std::sync::OnceLock<(HeaderMap, Arc<[u8]>)>>,
     config: Arc<RegistryClientConfig>,
     semaphore: std::sync::Arc<tokio::sync::Semaphore>,
     circuit_breaker: CircuitBreaker,
@@ -1783,7 +1783,6 @@ pub struct RegistryClient {
     has_non_error_retry_status: bool,
     bearer_auth_header: Option<HeaderValue>,
     http1_pool: Arc<crate::http1_pool::Http1Pool>,
-    http1_static_headers: Arc<[u8]>,
     http1_max_idle_per_host: usize,
     may_use_http_proxy: bool,
     in_flight_metadata: Arc<InFlightGroup<MetadataInFlightKey, MetadataFetchResult>>,
@@ -1800,33 +1799,18 @@ impl RegistryClient {
     /// Create a new RegistryClient with custom configuration.
     /// Defers heavy `reqwest` / `rustls` / root CA initialization until the first network request.
     pub fn with_config(config: RegistryClientConfig) -> Result<Self, RegistryError> {
-        let mut headers = HeaderMap::with_capacity(4);
-        let cli_context = CLI_REQUEST_CONTEXT.get();
-        let user_agent = if let Some((command, cli_ua)) =
-            cli_context.filter(|_| config.user_agent == default_user_agent_str())
-        {
-            headers.insert(
-                "npm-command",
-                HeaderValue::from_str(command).map_err(|e| RegistryError::Other(e.to_string()))?,
-            );
-            HeaderValue::from_str(cli_ua).map_err(|e| RegistryError::Other(e.to_string()))?
-        } else {
-            if let Some((command, _)) = cli_context {
-                headers.insert(
-                    "npm-command",
-                    HeaderValue::from_str(command)
-                        .map_err(|e| RegistryError::Other(e.to_string()))?,
-                );
-            }
+        // Validate explicit user_agent eagerly; defer reading CLI_REQUEST_CONTEXT until
+        // the first network request so pre-context construction still picks up npm-command/UA.
+        if config.user_agent != default_user_agent_str() {
+            HeaderValue::from_str(&config.user_agent)
+                .map_err(|e| RegistryError::Other(e.to_string()))?;
+        }
+        if let Some((command, cli_ua)) = CLI_REQUEST_CONTEXT.get() {
+            HeaderValue::from_str(command).map_err(|e| RegistryError::Other(e.to_string()))?;
             if config.user_agent == default_user_agent_str() {
-                default_ua_header()
-            } else {
-                HeaderValue::from_str(&config.user_agent)
-                    .map_err(|e| RegistryError::Other(e.to_string()))?
+                HeaderValue::from_str(cli_ua).map_err(|e| RegistryError::Other(e.to_string()))?;
             }
-        };
-        headers.insert(USER_AGENT, user_agent);
-        headers.insert(CONNECTION, HeaderValue::from_static("keep-alive"));
+        }
 
         // Only validate proxy / CA / TLS files eagerly when configured;
         // defer reqwest/rustls ClientBuilder construction until the first actual request.
@@ -1941,7 +1925,7 @@ impl RegistryClient {
         }
 
         let base_client = LazyHttpClient::new(None);
-        let default_headers = Arc::new(headers);
+        let default_headers = Arc::new(std::sync::OnceLock::new());
 
         let max_concurrency = if let Some(sockets) = config.maxsockets {
             if sockets == 0 {
@@ -1972,8 +1956,6 @@ impl RegistryClient {
             .as_deref()
             .and_then(|token| HeaderValue::from_str(&format!("Bearer {token}")).ok());
 
-        let http1_static_headers: Arc<[u8]> =
-            crate::http1_pool::format_static_headers(&default_headers).into();
         let http1_max_idle_per_host = if let Some(sockets) = config.maxsockets {
             if sockets == 0 {
                 DEFAULT_POOL_MAX_IDLE_PER_HOST
@@ -2005,7 +1987,6 @@ impl RegistryClient {
             has_non_error_retry_status,
             bearer_auth_header,
             http1_pool: Arc::new(crate::http1_pool::Http1Pool::new()),
-            http1_static_headers,
             http1_max_idle_per_host,
             may_use_http_proxy,
             in_flight_metadata: Arc::new(InFlightGroup::new()),
@@ -2396,40 +2377,70 @@ impl RegistryClient {
         false
     }
 
+    #[inline]
+    fn resolved_headers(&self) -> &(HeaderMap, Arc<[u8]>) {
+        self.default_headers.get_or_init(|| {
+            let mut headers = HeaderMap::with_capacity(4);
+            let cli_context = CLI_REQUEST_CONTEXT.get();
+            let user_agent = if let Some((command, cli_ua)) =
+                cli_context.filter(|_| self.config.user_agent == default_user_agent_str())
+            {
+                if let Ok(cmd_val) = HeaderValue::from_str(command) {
+                    headers.insert("npm-command", cmd_val);
+                }
+                HeaderValue::from_str(cli_ua).unwrap_or_else(|_| default_ua_header())
+            } else {
+                if let Some((command, _)) = cli_context {
+                    if let Ok(cmd_val) = HeaderValue::from_str(command) {
+                        headers.insert("npm-command", cmd_val);
+                    }
+                }
+                if self.config.user_agent == default_user_agent_str() {
+                    default_ua_header()
+                } else {
+                    HeaderValue::from_str(&self.config.user_agent)
+                        .unwrap_or_else(|_| default_ua_header())
+                }
+            };
+            headers.insert(USER_AGENT, user_agent);
+            headers.insert(CONNECTION, HeaderValue::from_static("keep-alive"));
+            let static_bytes: Arc<[u8]> =
+                crate::http1_pool::format_static_headers(&headers).into();
+            (headers, static_bytes)
+        })
+    }
+
     #[cfg(test)]
     #[inline]
     fn base_client(&self) -> &Client {
+        let (headers, _) = self.resolved_headers();
         self.base_client
-            .get_or_init(&self.config, &self.default_headers)
+            .get_or_init(&self.config, headers)
             .expect("HTTP client initialization failed after config validation")
     }
 
     #[inline]
     fn try_client_for_url(&self, url: &Url) -> Result<&Client, RegistryError> {
+        let (headers, _) = self.resolved_headers();
         if url.scheme() != "https" {
-            return self
-                .base_client
-                .get_or_init(&self.config, &self.default_headers);
+            return self.base_client.get_or_init(&self.config, headers);
         }
 
         if self.scoped_clients.is_empty() && self.global_client.is_none() {
-            return self
-                .base_client
-                .get_or_init(&self.config, &self.default_headers);
+            return self.base_client.get_or_init(&self.config, headers);
         }
 
         if let Some(entry) = self.match_scoped_entry(url) {
-            return entry.get_or_init(&self.config, &self.default_headers);
+            return entry.get_or_init(&self.config, headers);
         }
 
         if let Some(ref entry) = self.global_client {
             if self.is_trusted_host(url) {
-                return entry.get_or_init(&self.config, &self.default_headers);
+                return entry.get_or_init(&self.config, headers);
             }
         }
 
-        self.base_client
-            .get_or_init(&self.config, &self.default_headers)
+        self.base_client.get_or_init(&self.config, headers)
     }
 
     /// Returns the appropriate `reqwest::Client` for a target URL:
@@ -2516,8 +2527,9 @@ impl RegistryClient {
     /// Match a target URL against scoped TLS identities using longest-prefix-first precedence.
     pub fn match_scoped_client(&self, url: &Url) -> Option<&Client> {
         self.match_scoped_entry(url).map(|entry| {
+            let (headers, _) = self.resolved_headers();
             entry
-                .get_or_init(&self.config, &self.default_headers)
+                .get_or_init(&self.config, headers)
                 .expect("Scoped HTTP client initialization failed after config validation")
         })
     }
@@ -2623,7 +2635,11 @@ impl RegistryClient {
 
     #[inline]
     fn can_use_http1_pool(&self, url: &Url) -> bool {
-        !self.may_use_http_proxy && !self.has_non_error_retry_status && url.scheme() == "http"
+        !self.may_use_http_proxy
+            && !self.has_non_error_retry_status
+            && url.scheme() == "http"
+            && url.username().is_empty()
+            && url.password().is_none()
     }
 
     async fn execute_http1_fast(
@@ -2707,7 +2723,7 @@ impl RegistryClient {
             let params = crate::http1_pool::Http1RequestParams {
                 method: &Method::GET,
                 url: initial_url,
-                static_headers: &self.http1_static_headers,
+                static_headers: &self.resolved_headers().1,
                 accept: accept_header,
                 accept_gzip,
                 if_none_match,

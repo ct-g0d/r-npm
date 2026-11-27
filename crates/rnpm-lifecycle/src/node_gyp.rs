@@ -1409,14 +1409,15 @@ pub fn node_gyp_bin_dir() -> Option<PathBuf> {
             }
             #[cfg(unix)]
             if !is_private_owned_dir(&dir) {
-                dir = std::env::temp_dir().join(format!(
-                    "rnpm-node-gyp-bin-v1-{}-{}",
-                    unsafe { libc::geteuid() },
-                    std::process::id()
-                ));
-                if let Err(e) = std::fs::create_dir_all(&dir) {
-                    warn!("Failed to create fallback node-gyp-bin directory: {}", e);
-                    return None;
+                let prefix = format!("rnpm-node-gyp-bin-v1-{}-", unsafe { libc::geteuid() });
+                match tempfile::Builder::new().prefix(&prefix).tempdir() {
+                    Ok(td) => {
+                        dir = td.keep();
+                    }
+                    Err(e) => {
+                        warn!("Failed to create fallback node-gyp-bin directory: {}", e);
+                        return None;
+                    }
                 }
             }
             if let Err(e) = create_private_node_gyp_shim(&dir) {

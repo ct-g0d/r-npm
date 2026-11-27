@@ -94,32 +94,57 @@ impl Http1Pool {
         max_idle_per_host: usize,
         idle_timeout: Duration,
     ) {
+        const MAX_SHARD_IDLE_CONNS: usize = 64;
         if max_idle_per_host == 0 || idle_timeout.is_zero() {
             return;
         }
+        let now = Instant::now();
         let shard = self.shard_for(key);
         let mut guard = shard.lock().unwrap_or_else(|e| e.into_inner());
+
+        // Proactively expire stale connections across the shard and drop empty buckets.
+        let mut total_idle = 0usize;
+        guard.retain(|_, list| {
+            list.retain(|c| now.saturating_duration_since(c.last_used) < idle_timeout);
+            total_idle += list.len();
+            !list.is_empty()
+        });
+
+        // Enforce a hard shard-wide socket cap by evicting the oldest idle socket first.
+        while total_idle >= MAX_SHARD_IDLE_CONNS {
+            let oldest_key = guard
+                .iter()
+                .filter_map(|(k, list)| {
+                    list.iter()
+                        .enumerate()
+                        .min_by_key(|(_, c)| c.last_used)
+                        .map(|(idx, c)| (k.clone(), idx, c.last_used))
+                })
+                .min_by_key(|(_, _, t)| *t);
+            let Some((evict_key, idx, _)) = oldest_key else {
+                break;
+            };
+            if let Some(list) = guard.get_mut(&evict_key) {
+                list.swap_remove(idx);
+                total_idle -= 1;
+                if list.is_empty() {
+                    guard.remove(&evict_key);
+                }
+            }
+        }
+
         if let Some(list) = guard.get_mut(key) {
             if list.len() < max_idle_per_host {
                 list.push(IdleConn {
                     stream,
-                    last_used: Instant::now(),
+                    last_used: now,
                 });
             }
         } else {
-            if guard.len() >= 256 {
-                if let Some(evict) = guard
-                    .iter()
-                    .find(|(_, v)| v.is_empty())
-                    .map(|(k, _)| k.clone())
-                {
-                    guard.remove(&evict);
-                }
-            }
             let mut list = Vec::with_capacity(max_idle_per_host.min(16));
             list.push(IdleConn {
                 stream,
-                last_used: Instant::now(),
+                last_used: now,
             });
             guard.insert(key.to_owned(), list);
         }
@@ -306,20 +331,31 @@ fn contains_token_ascii_ci(val: &str, token: &str) -> bool {
         .any(|part| trim_ascii_ows_str(part).eq_ignore_ascii_case(token))
 }
 
-fn parse_headers(raw: &[u8], collect_cache_metadata: bool) -> Result<ParsedHeaders, RegistryError> {
-    let text = std::str::from_utf8(raw).map_err(|_| {
-        RegistryError::Transport(HttpTransportError {
-            message: "HTTP response headers contain invalid UTF-8".into(),
-            is_connect: false,
-            is_timeout: false,
-            is_decode: true,
-            is_transient: false,
-        })
-    })?;
+fn split_crlf_lines(raw: &[u8]) -> impl Iterator<Item = &[u8]> {
+    struct CrlfLines<'a>(&'a [u8], bool);
+    impl<'a> Iterator for CrlfLines<'a> {
+        type Item = &'a [u8];
+        fn next(&mut self) -> Option<Self::Item> {
+            if self.1 {
+                return None;
+            }
+            if let Some(pos) = self.0.windows(2).position(|w| w == b"\r\n") {
+                let line = &self.0[..pos];
+                self.0 = &self.0[pos + 2..];
+                Some(line)
+            } else {
+                self.1 = true;
+                Some(self.0)
+            }
+        }
+    }
+    CrlfLines(raw, false)
+}
 
-    let mut lines = text.split("\r\n");
-    let status_line = lines.next().unwrap_or("");
-    if has_crlf_bytes(status_line.as_bytes()) {
+fn parse_headers(raw: &[u8], collect_cache_metadata: bool) -> Result<ParsedHeaders, RegistryError> {
+    let mut lines = split_crlf_lines(raw);
+    let status_line = lines.next().unwrap_or(b"");
+    if has_crlf_bytes(status_line) {
         return Err(RegistryError::Transport(HttpTransportError {
             message: "HTTP status line contains bare CR/LF".into(),
             is_connect: false,
@@ -328,13 +364,16 @@ fn parse_headers(raw: &[u8], collect_cache_metadata: bool) -> Result<ParsedHeade
             is_transient: false,
         }));
     }
-    let (is_http_11, status_rest) = if let Some(rest) = status_line.strip_prefix("HTTP/1.1 ") {
+    let (is_http_11, status_rest) = if let Some(rest) = status_line.strip_prefix(b"HTTP/1.1 ") {
         (true, rest)
-    } else if let Some(rest) = status_line.strip_prefix("HTTP/1.0 ") {
+    } else if let Some(rest) = status_line.strip_prefix(b"HTTP/1.0 ") {
         (false, rest)
     } else {
         return Err(RegistryError::Transport(HttpTransportError {
-            message: format!("Invalid HTTP status line: {status_line}"),
+            message: format!(
+                "Invalid HTTP status line: {}",
+                String::from_utf8_lossy(status_line)
+            ),
             is_connect: false,
             is_timeout: false,
             is_decode: true,
@@ -342,24 +381,21 @@ fn parse_headers(raw: &[u8], collect_cache_metadata: bool) -> Result<ParsedHeade
         }));
     };
 
-    if status_rest.len() < 3 || !status_rest.as_bytes()[..3].iter().all(|b| b.is_ascii_digit()) {
+    if status_rest.len() < 3 || !status_rest[..3].iter().all(|b| b.is_ascii_digit()) {
         return Err(RegistryError::Transport(HttpTransportError {
-            message: format!("Invalid HTTP status code in: {status_line}"),
+            message: format!(
+                "Invalid HTTP status code in: {}",
+                String::from_utf8_lossy(status_line)
+            ),
             is_connect: false,
             is_timeout: false,
             is_decode: true,
             is_transient: false,
         }));
     }
-    let code: u16 = status_rest[..3].parse().map_err(|_| {
-        RegistryError::Transport(HttpTransportError {
-            message: format!("Invalid HTTP status code in: {status_line}"),
-            is_connect: false,
-            is_timeout: false,
-            is_decode: true,
-            is_transient: false,
-        })
-    })?;
+    let code: u16 = ((status_rest[0] - b'0') as u16) * 100
+        + ((status_rest[1] - b'0') as u16) * 10
+        + ((status_rest[2] - b'0') as u16);
     let status = StatusCode::from_u16(code).map_err(|_| {
         RegistryError::Transport(HttpTransportError {
             message: format!("Invalid HTTP status code: {code}"),
@@ -386,7 +422,7 @@ fn parse_headers(raw: &[u8], collect_cache_metadata: bool) -> Result<ParsedHeade
         if line.is_empty() {
             continue;
         }
-        if has_crlf_bytes(line.as_bytes()) {
+        if has_crlf_bytes(line) {
             return Err(RegistryError::Transport(HttpTransportError {
                 message: "HTTP header line contains bare CR/LF".into(),
                 is_connect: false,
@@ -395,31 +431,47 @@ fn parse_headers(raw: &[u8], collect_cache_metadata: bool) -> Result<ParsedHeade
                 is_transient: false,
             }));
         }
-        let Some((name, val_raw)) = line.split_once(':') else {
+        let Some(colon_pos) = line.iter().position(|&b| b == b':') else {
             return Err(RegistryError::Transport(HttpTransportError {
-                message: format!("Malformed HTTP header line: {line}"),
+                message: format!(
+                    "Malformed HTTP header line: {}",
+                    String::from_utf8_lossy(line)
+                ),
                 is_connect: false,
                 is_timeout: false,
                 is_decode: true,
                 is_transient: false,
             }));
         };
+        let name = &line[..colon_pos];
+        let val_bytes = trim_ascii_ws(&line[colon_pos + 1..]);
         if name.is_empty()
             || name
-                .bytes()
-                .any(|b| b.is_ascii_whitespace() || b.is_ascii_control())
+                .iter()
+                .any(|&b| b.is_ascii_whitespace() || b.is_ascii_control() || !b.is_ascii())
         {
             return Err(RegistryError::Transport(HttpTransportError {
-                message: format!("Invalid HTTP header name: {name}"),
+                message: format!(
+                    "Invalid HTTP header name: {}",
+                    String::from_utf8_lossy(name)
+                ),
                 is_connect: false,
                 is_timeout: false,
                 is_decode: true,
                 is_transient: false,
             }));
         }
-        let val = trim_ascii_ows_str(val_raw);
 
-        if name.eq_ignore_ascii_case("content-length") {
+        if name.eq_ignore_ascii_case(b"content-length") {
+            let val = std::str::from_utf8(val_bytes).map_err(|_| {
+                RegistryError::Transport(HttpTransportError {
+                    message: "Invalid Content-Length header".into(),
+                    is_connect: false,
+                    is_timeout: false,
+                    is_decode: true,
+                    is_transient: false,
+                })
+            })?;
             if val.is_empty() || !val.bytes().all(|b| b.is_ascii_digit()) {
                 return Err(RegistryError::Transport(HttpTransportError {
                     message: format!("Invalid Content-Length header: {val}"),
@@ -450,7 +502,16 @@ fn parse_headers(raw: &[u8], collect_cache_metadata: bool) -> Result<ParsedHeade
                 }
             }
             content_length = Some(parsed);
-        } else if name.eq_ignore_ascii_case("transfer-encoding") {
+        } else if name.eq_ignore_ascii_case(b"transfer-encoding") {
+            let val = std::str::from_utf8(val_bytes).map_err(|_| {
+                RegistryError::Transport(HttpTransportError {
+                    message: "Invalid Transfer-Encoding header".into(),
+                    is_connect: false,
+                    is_timeout: false,
+                    is_decode: true,
+                    is_transient: false,
+                })
+            })?;
             for tok in val
                 .split(',')
                 .map(trim_ascii_ows_str)
@@ -462,14 +523,20 @@ fn parse_headers(raw: &[u8], collect_cache_metadata: bool) -> Result<ParsedHeade
                     unsupported_te = true;
                 }
             }
-        } else if name.eq_ignore_ascii_case("connection") {
-            if contains_token_ascii_ci(val, "close") {
-                conn_close = true;
+        } else if name.eq_ignore_ascii_case(b"connection") {
+            if let Ok(val) = std::str::from_utf8(val_bytes) {
+                if contains_token_ascii_ci(val, "close") {
+                    conn_close = true;
+                }
+                if contains_token_ascii_ci(val, "keep-alive") {
+                    conn_keep_alive = true;
+                }
             }
-            if contains_token_ascii_ci(val, "keep-alive") {
-                conn_keep_alive = true;
-            }
-        } else if name.eq_ignore_ascii_case("content-encoding") {
+        } else if name.eq_ignore_ascii_case(b"content-encoding") {
+            let Ok(val) = std::str::from_utf8(val_bytes) else {
+                content_encoding = ContentEncoding::Unsupported;
+                continue;
+            };
             for enc in val
                 .split(',')
                 .map(trim_ascii_ows_str)
@@ -488,43 +555,55 @@ fn parse_headers(raw: &[u8], collect_cache_metadata: bool) -> Result<ParsedHeade
                     break;
                 }
             }
-        } else if name.eq_ignore_ascii_case("etag") {
+        } else if name.eq_ignore_ascii_case(b"etag") {
             if etag.is_none() {
-                etag = Some(val.to_string());
+                if let Ok(val) = std::str::from_utf8(val_bytes) {
+                    etag = Some(val.to_string());
+                }
             }
-        } else if name.eq_ignore_ascii_case("location") {
+        } else if name.eq_ignore_ascii_case(b"location") {
             if location.is_none() {
-                if is_valid_header_str(val.as_bytes()) {
-                    location = Some(Ok(val.to_string()));
+                if is_valid_header_str(val_bytes) {
+                    if let Ok(val) = std::str::from_utf8(val_bytes) {
+                        location = Some(Ok(val.to_string()));
+                    } else {
+                        location = Some(Err(()));
+                    }
                 } else {
                     location = Some(Err(()));
                 }
             }
-        } else if name.eq_ignore_ascii_case("retry-after") {
+        } else if name.eq_ignore_ascii_case(b"retry-after") {
             if retry_after.is_none() {
-                retry_after = Some(val.to_string());
+                if let Ok(val) = std::str::from_utf8(val_bytes) {
+                    retry_after = Some(val.to_string());
+                }
             }
-        } else if name.eq_ignore_ascii_case("www-authenticate") {
-            if !val.is_empty() {
-                www_auth_parts.push(val.to_string());
+        } else if name.eq_ignore_ascii_case(b"www-authenticate") {
+            if !val_bytes.is_empty() {
+                if let Ok(val) = std::str::from_utf8(val_bytes) {
+                    www_auth_parts.push(val.to_string());
+                }
             }
         } else if collect_cache_metadata {
-            let cache_key = if name.eq_ignore_ascii_case("cache-control") {
+            let cache_key = if name.eq_ignore_ascii_case(b"cache-control") {
                 Some("cache-control")
-            } else if name.eq_ignore_ascii_case("date") {
+            } else if name.eq_ignore_ascii_case(b"date") {
                 Some("date")
-            } else if name.eq_ignore_ascii_case("age") {
+            } else if name.eq_ignore_ascii_case(b"age") {
                 Some("age")
-            } else if name.eq_ignore_ascii_case("content-type") {
+            } else if name.eq_ignore_ascii_case(b"content-type") {
                 Some("content-type")
-            } else if name.eq_ignore_ascii_case("vary") {
+            } else if name.eq_ignore_ascii_case(b"vary") {
                 Some("vary")
             } else {
                 None
             };
             if let Some(k) = cache_key {
-                let m = cache_map.get_or_insert_with(|| serde_json::Map::with_capacity(4));
-                m.insert(k.into(), serde_json::Value::String(val.to_owned()));
+                if let Ok(val) = std::str::from_utf8(val_bytes) {
+                    let m = cache_map.get_or_insert_with(|| serde_json::Map::with_capacity(4));
+                    m.insert(k.into(), serde_json::Value::String(val.to_owned()));
+                }
             }
         }
     }

@@ -717,16 +717,27 @@ fn try_fast_http_post_sync(
     use std::io::{Read, Write};
     let (addr, head) =
         build_fast_http_post_request(target_parsed, body_bytes, user_agent, auth_token)?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let remaining = |cap: std::time::Duration| -> Option<std::time::Duration> {
+        let rem = deadline.checked_duration_since(std::time::Instant::now())?;
+        if rem.is_zero() {
+            None
+        } else {
+            Some(rem.min(cap))
+        }
+    };
+    let connect_cap = std::time::Duration::from_secs(10);
     let stream = if let Ok(sa) = addr.parse::<std::net::SocketAddr>() {
-        std::net::TcpStream::connect_timeout(&sa, std::time::Duration::from_secs(10)).ok()
+        let to = remaining(connect_cap)?;
+        std::net::TcpStream::connect_timeout(&sa, to).ok()
     } else {
         let sock_addrs: Vec<std::net::SocketAddr> = std::net::ToSocketAddrs::to_socket_addrs(&*addr)
             .ok()?
             .collect();
         let mut connected = None;
         for sa in sock_addrs {
-            if let Ok(s) = std::net::TcpStream::connect_timeout(&sa, std::time::Duration::from_secs(10))
-            {
+            let to = remaining(connect_cap)?;
+            if let Ok(s) = std::net::TcpStream::connect_timeout(&sa, to) {
                 connected = Some(s);
                 break;
             }
@@ -735,8 +746,7 @@ fn try_fast_http_post_sync(
     };
     let mut stream = stream?;
     let _ = stream.set_nodelay(true);
-    let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(30)));
-    let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(10)));
+    let _ = stream.set_write_timeout(Some(remaining(std::time::Duration::from_secs(10))?));
     let mut req_buf = Vec::with_capacity(head.len() + body_bytes.len());
     req_buf.extend_from_slice(head.as_bytes());
     req_buf.extend_from_slice(body_bytes);
@@ -745,6 +755,8 @@ fn try_fast_http_post_sync(
     let mut raw = Vec::with_capacity(4096);
     let mut buf = [0u8; 8192];
     loop {
+        let read_to = remaining(std::time::Duration::from_secs(30))?;
+        let _ = stream.set_read_timeout(Some(read_to));
         let n = stream.read(&mut buf).ok()?;
         if n == 0 {
             break;

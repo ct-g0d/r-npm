@@ -6590,6 +6590,9 @@ fn prepare_install_execution(
         && !install_offline
         && package_lock_val
         && !no_save
+        && !omit_dev
+        && !omit_optional
+        && !omit_peer
     {
         audit::spawn_speculative_post_install_audit(
             &report_dir,

@@ -3890,21 +3890,16 @@ impl Installer {
         collector.record_phase(Phase::Plan, plan_start.elapsed());
 
         if !self.options.ignore_scripts {
+            // Root install hooks need the async executor's SIGINT/SIGTERM process-group
+            // handling; fall back to the async install path when hooks must execute.
+            if root_has_install_hooks(parsed_root) {
+                return Ok(None);
+            }
             self.warn_unreviewed_scripts_for_hot_noop(
                 &actual,
                 parsed_root,
                 cached_script_locs.as_ref(),
             );
-            if root_has_install_hooks(parsed_root) {
-                let opts = self.lifecycle_options();
-                let _life_guard = collector.enter_phase(Phase::Lifecycle);
-                let trusted_cfg = self.get_trusted_lifecycle_config();
-                rnpm_lifecycle::execute_root_hooks_sync_with_config(
-                    parsed_root,
-                    &opts,
-                    trusted_cfg.as_ref(),
-                )?;
-            }
         }
 
         let inventory = actual.packages.len() + usize::from(!actual.packages.contains_key(""));
