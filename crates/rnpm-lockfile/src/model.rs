@@ -3936,15 +3936,18 @@ pub const SW_KEY_ORDER: &[&str] = &[
 
 #[inline]
 fn sw_key_rank(k: &str) -> u8 {
-    match k {
-        "name" => 0,
-        "version" => 1,
-        "lockfileVersion" => 2,
-        "resolved" => 3,
-        "integrity" => 4,
-        "requires" => 5,
-        "packages" => 6,
-        "dependencies" => 7,
+    match k.len() {
+        4 if k == "name" => 0,
+        7 if k == "version" => 1,
+        15 if k == "lockfileVersion" => 2,
+        8 => match k {
+            "resolved" => 3,
+            "requires" => 5,
+            "packages" => 6,
+            _ => 8,
+        },
+        9 if k == "integrity" => 4,
+        12 if k == "dependencies" => 7,
         _ => 8,
     }
 }
@@ -4000,6 +4003,7 @@ pub(crate) fn find_first_json_escape(bytes: &[u8]) -> Option<usize> {
 
 #[inline]
 pub(crate) fn write_json_str(s: &str, out: &mut String) {
+    out.reserve(s.len() + 2);
     out.push('"');
     let bytes = s.as_bytes();
     let Some(first_esc) = find_first_json_escape(bytes) else {
@@ -4478,16 +4482,46 @@ impl<'a> LockfileWriter<'a> {
                 return;
             }
         }
+        // Fast path: BTreeMap keys are usually already in `(sw_key_rank, npm_key_compare)` order.
+        // Stream directly without copying into `str_scratch`, rolling back only if out of order.
+        let snap = out.len();
+        out.push('{');
+        let colon = self.colon_sep();
+        let mut prev_k: Option<&str> = None;
+        let mut in_order = true;
+        for (i, (k, v)) in map.iter().enumerate() {
+            if let Some(pk) = prev_k {
+                let ord = sw_key_rank(pk)
+                    .cmp(&sw_key_rank(k))
+                    .then_with(|| npm_key_compare(pk, k));
+                if ord.is_gt() {
+                    in_order = false;
+                    break;
+                }
+            }
+            prev_k = Some(k.as_str());
+            if i > 0 {
+                out.push(',');
+            }
+            if !self.compact {
+                self.write_nl_indent(out, level + 1);
+            }
+            write_json_str(k, out);
+            out.push_str(colon);
+            write_json_str(v, out);
+        }
+        if in_order {
+            if !self.compact {
+                self.write_nl_indent(out, level);
+            }
+            out.push('}');
+            return;
+        }
+        out.truncate(snap);
+
         str_scratch.clear();
         str_scratch.extend(map.iter().map(|(k, v)| (k.as_str(), v.as_str())));
-        if str_scratch.len() > 1
-            && str_scratch.windows(2).any(|w| {
-                sw_key_rank(w[0].0)
-                    .cmp(&sw_key_rank(w[1].0))
-                    .then_with(|| npm_key_compare(w[0].0, w[1].0))
-                    .is_gt()
-            })
-        {
+        if str_scratch.len() > 1 {
             str_scratch.sort_unstable_by(|(ak, _), (bk, _)| {
                 sw_key_rank(ak)
                     .cmp(&sw_key_rank(bk))
@@ -4932,13 +4966,15 @@ pub fn npm_key_compare(a: &str, b: &str) -> std::cmp::Ordering {
     let b_bytes = b.as_bytes();
     let n = a_bytes.len().min(b_bytes.len());
     let mut i = 0;
-    while i + 8 <= n {
-        let va = u64::from_ne_bytes(a_bytes[i..i + 8].try_into().unwrap());
-        let vb = u64::from_ne_bytes(b_bytes[i..i + 8].try_into().unwrap());
-        if va != vb {
-            break;
+    if n >= 8 && a_bytes[0] == b_bytes[0] {
+        while i + 8 <= n {
+            let va = u64::from_ne_bytes(a_bytes[i..i + 8].try_into().unwrap());
+            let vb = u64::from_ne_bytes(b_bytes[i..i + 8].try_into().unwrap());
+            if va != vb {
+                break;
+            }
+            i += 8;
         }
-        i += 8;
     }
     while i < n && a_bytes[i] == b_bytes[i] {
         i += 1;

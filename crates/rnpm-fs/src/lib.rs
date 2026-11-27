@@ -15,6 +15,134 @@ pub mod pool;
 pub mod tarball;
 pub mod writer;
 
+#[doc(hidden)]
+pub mod fast_hash {
+    use std::collections::{HashMap, HashSet};
+    use std::hash::{BuildHasher, Hasher};
+    use std::sync::OnceLock;
+
+    fn process_hash_seed() -> u64 {
+        static SEED: OnceLock<u64> = OnceLock::new();
+        *SEED.get_or_init(|| {
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos() as u64)
+                .unwrap_or(0x9e37_79b9_7f4a_7c15);
+            let addr = (&SEED as *const OnceLock<u64>) as u64;
+            nanos ^ addr.rotate_left(17) ^ 0x517c_c1b7_2722_0a95
+        })
+    }
+
+    pub struct FxHasher {
+        hash: u64,
+    }
+
+    impl Default for FxHasher {
+        #[inline]
+        fn default() -> Self {
+            Self {
+                hash: process_hash_seed(),
+            }
+        }
+    }
+
+    const K: u64 = 0x517c_c1b7_2722_0a95;
+
+    impl FxHasher {
+        #[inline]
+        fn add(&mut self, val: u64) {
+            self.hash = (self.hash.rotate_left(5) ^ val).wrapping_mul(K);
+        }
+    }
+
+    impl Hasher for FxHasher {
+        #[inline]
+        fn finish(&self) -> u64 {
+            self.hash
+        }
+
+        #[inline]
+        fn write(&mut self, mut bytes: &[u8]) {
+            while bytes.len() >= 8 {
+                let word = u64::from_ne_bytes(bytes[..8].try_into().unwrap());
+                self.add(word);
+                bytes = &bytes[8..];
+            }
+            if bytes.len() >= 4 {
+                let word = u32::from_ne_bytes(bytes[..4].try_into().unwrap()) as u64;
+                self.add(word);
+                bytes = &bytes[4..];
+            }
+            if bytes.len() >= 2 {
+                let word = u16::from_ne_bytes(bytes[..2].try_into().unwrap()) as u64;
+                self.add(word);
+                bytes = &bytes[2..];
+            }
+            if let Some(&b) = bytes.first() {
+                self.add(b as u64);
+            }
+        }
+
+        #[inline]
+        fn write_u8(&mut self, i: u8) {
+            self.add(i as u64);
+        }
+        #[inline]
+        fn write_u16(&mut self, i: u16) {
+            self.add(i as u64);
+        }
+        #[inline]
+        fn write_u32(&mut self, i: u32) {
+            self.add(i as u64);
+        }
+        #[inline]
+        fn write_u64(&mut self, i: u64) {
+            self.add(i);
+        }
+        #[inline]
+        fn write_usize(&mut self, i: usize) {
+            self.add(i as u64);
+        }
+    }
+
+    #[derive(Clone, Default)]
+    pub struct FxBuildHasher {
+        seed: u64,
+    }
+
+    impl BuildHasher for FxBuildHasher {
+        type Hasher = FxHasher;
+
+        #[inline]
+        fn build_hasher(&self) -> Self::Hasher {
+            FxHasher { hash: self.seed }
+        }
+    }
+
+    pub type FxHashMap<K, V> = HashMap<K, V, FxBuildHasher>;
+    pub type FxHashSet<K> = HashSet<K, FxBuildHasher>;
+
+    #[inline]
+    pub fn fx_map<K, V>(cap: usize) -> FxHashMap<K, V> {
+        HashMap::with_capacity_and_hasher(
+            cap,
+            FxBuildHasher {
+                seed: process_hash_seed(),
+            },
+        )
+    }
+
+    #[inline]
+    pub fn fx_set<K>(cap: usize) -> FxHashSet<K> {
+        HashSet::with_capacity_and_hasher(
+            cap,
+            FxBuildHasher {
+                seed: process_hash_seed(),
+            },
+        )
+    }
+}
+
 pub use node_writer::{
     AsyncFileWriter, AsyncFileWriterSender, NodeWriter, NodeWriterMsg, NodeWriterSender,
     RustWriterPool, WriteTask,

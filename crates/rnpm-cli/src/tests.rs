@@ -4640,4 +4640,35 @@ fn test_fast_parse_install_ci_prune_explain_parity() {
     ])
     .expect("ls --prefix must fast parse");
     assert!(!ls_overrides.contains_key("prefix"));
+
+    let (fast_exec, exec_overrides) = crate::try_parse_fast_command_with_overrides(&[
+        "rnpm".into(),
+        "exec".into(),
+        "--no-yes".into(),
+        "-y".into(),
+        "pkg".into(),
+    ])
+    .expect("exec -y must fast parse");
+    assert_eq!(exec_overrides.get("yes").map(String::as_str), Some("true"));
+    match fast_exec.command {
+        crate::Commands::Exec { yes, no_yes, .. } => {
+            assert!(yes && !no_yes);
+        }
+        other => panic!("unexpected command: {other:?}"),
+    }
+
+    assert!(crate::try_parse_fast_command_with_overrides(&[
+        "rnpm".into(),
+        "test".into(),
+        "foo".into(),
+        "--no-workspaces".into(),
+    ])
+    .is_none());
+    assert!(crate::try_parse_fast_command_with_overrides(&[
+        "rnpm".into(),
+        "exec".into(),
+        "pkg".into(),
+        "--yes".into(),
+    ])
+    .is_none());
 }

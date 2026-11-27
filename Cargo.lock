@@ -1076,6 +1076,7 @@ dependencies = [
  "fs4",
  "memmap2",
  "path-clean",
+ "ring",
  "rnpm-core",
  "rnpm-fs",
  "serde",

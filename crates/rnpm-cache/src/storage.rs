@@ -7,11 +7,13 @@ use crate::lock::CacheLock;
 use data_encoding::{BASE64, HEXLOWER};
 use rnpm_core::{Algorithm, Integrity, IntegrityError};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha512};
+use sha1::Digest as _;
 use std::collections::HashSet;
 use std::fmt::Write as _;
 use std::fs::{self, OpenOptions};
-use std::io::{Read, Write};
+#[cfg(not(windows))]
+use std::io::Read;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -22,6 +24,12 @@ use tracing::{debug, warn};
 static TMP_COUNTER: AtomicU64 = AtomicU64::new(1);
 static PROCESS_START_NANOS: OnceLock<u128> = OnceLock::new();
 const LOCK_SHARD_COUNT: usize = 64;
+
+#[inline]
+fn sha512_digest(data: &[u8]) -> [u8; 64] {
+    let d = ring::digest::digest(&ring::digest::SHA512, data);
+    d.as_ref().try_into().expect("SHA-512 digest is 64 bytes")
+}
 
 #[inline]
 fn process_start_nanos() -> u128 {
@@ -62,6 +70,41 @@ fn prefix_bitset_set(bits: &[AtomicU64; 1024], hex: &str) {
 }
 
 fn clear_prefix_bitset(bits: &[AtomicU64; 1024]) {
+    for slot in bits {
+        slot.store(0, Ordering::Relaxed);
+    }
+}
+
+#[cfg(windows)]
+#[inline]
+fn p1_index_and_mask(hex: &str) -> Option<(usize, u64)> {
+    let b = hex.as_bytes();
+    if b.len() < 2 {
+        return None;
+    }
+    let byte = ((hex_nibble(b[0])? as usize) << 4) | (hex_nibble(b[1])? as usize);
+    Some((byte >> 6, 1u64 << (byte & 63)))
+}
+
+#[cfg(windows)]
+#[inline]
+fn p1_bitset_has(bits: &[AtomicU64; 4], hex: &str) -> bool {
+    let Some((word, mask)) = p1_index_and_mask(hex) else {
+        return false;
+    };
+    (bits[word].load(Ordering::Relaxed) & mask) != 0
+}
+
+#[cfg(windows)]
+#[inline]
+fn p1_bitset_set(bits: &[AtomicU64; 4], hex: &str) {
+    if let Some((word, mask)) = p1_index_and_mask(hex) {
+        bits[word].fetch_or(mask, Ordering::Relaxed);
+    }
+}
+
+#[cfg(windows)]
+fn clear_p1_bitset(bits: &[AtomicU64; 4]) {
     for slot in bits {
         slot.store(0, Ordering::Relaxed);
     }
@@ -365,8 +408,58 @@ fn rename_with_retries(from: &Path, to: &Path) -> std::io::Result<()> {
 
 #[cfg(windows)]
 #[inline]
-pub(crate) fn encode_verbatim_wide_into(path: &Path, buf: &mut Vec<u16>) {
+fn append_os_wide_fast(os: &std::ffi::OsStr, buf: &mut Vec<u16>) {
     use std::os::windows::ffi::OsStrExt;
+    let b = os.as_encoded_bytes();
+    if b.is_ascii() {
+        buf.reserve(b.len() + 1);
+        buf.extend(b.iter().map(|&c| c as u16));
+    } else {
+        buf.extend(os.encode_wide());
+    }
+}
+
+#[cfg(windows)]
+#[inline]
+pub(crate) fn with_verbatim_wide_stack<R>(path: &Path, f: impl FnOnce(&[u16]) -> R) -> R {
+    let os = path.as_os_str();
+    let bytes = os.as_encoded_bytes();
+    const STACK_CAP: usize = 320;
+    if bytes.is_ascii()
+        && bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && bytes[2] == b'\\'
+        && bytes.len() + 6 <= STACK_CAP
+        && !bytes.contains(&b'/')
+        && !bytes[3..].windows(2).any(|w| w == b"\\\\")
+        && !bytes.windows(3).any(|w| w == b"\\.\\")
+        && !bytes.windows(4).any(|w| w == b"\\..\\")
+        && !bytes.ends_with(br"\.")
+        && !bytes.ends_with(br"\..")
+        && !bytes.ends_with(b"\\")
+    {
+        let mut stack = [0u16; STACK_CAP];
+        stack[0] = b'\\' as u16;
+        stack[1] = b'\\' as u16;
+        stack[2] = b'?' as u16;
+        stack[3] = b'\\' as u16;
+        let mut idx = 4;
+        for &b in bytes {
+            stack[idx] = b as u16;
+            idx += 1;
+        }
+        stack[idx] = 0;
+        return f(&stack[..=idx]);
+    }
+    let mut wide = Vec::with_capacity(260);
+    encode_verbatim_wide_into(path, &mut wide);
+    f(&wide)
+}
+
+#[cfg(windows)]
+#[inline]
+pub(crate) fn encode_verbatim_wide_into(path: &Path, buf: &mut Vec<u16>) {
     buf.clear();
     let os = path.as_os_str();
     let bytes = os.as_encoded_bytes();
@@ -376,7 +469,7 @@ pub(crate) fn encode_verbatim_wide_into(path: &Path, buf: &mut Vec<u16>) {
         && !bytes.windows(3).any(|w| w == b"\\.\\")
         && !bytes.windows(4).any(|w| w == b"\\..\\")
     {
-        buf.extend(os.encode_wide());
+        append_os_wide_fast(os, buf);
         buf.push(0);
         return;
     }
@@ -393,13 +486,288 @@ pub(crate) fn encode_verbatim_wide_into(path: &Path, buf: &mut Vec<u16>) {
         && !bytes.ends_with(b"\\")
     {
         buf.extend_from_slice(&[b'\\' as u16, b'\\' as u16, b'?' as u16, b'\\' as u16]);
-        buf.extend(os.encode_wide());
+        append_os_wide_fast(os, buf);
         buf.push(0);
         return;
     }
     let verb = rnpm_fs::to_verbatim_path(path);
-    buf.extend(verb.as_os_str().encode_wide());
+    append_os_wide_fast(verb.as_os_str(), buf);
     buf.push(0);
+}
+
+/// Fast parent-directory creator for two-level sharded cache paths (`.../<p1>/<p2>/<file>`).
+#[cfg(windows)]
+fn ensure_sharded_parent_win32_cached(
+    wide_file_null: &[u16],
+    file_hint: &Path,
+    p1_bits: Option<&[AtomicU64; 4]>,
+    p12_bits: Option<&[AtomicU64; 1024]>,
+    hex_key: &str,
+) -> std::io::Result<()> {
+    extern "system" {
+        fn CreateDirectoryW(
+            lpPathName: *const u16,
+            lpSecurityAttributes: *mut std::ffi::c_void,
+        ) -> i32;
+        fn GetLastError() -> u32;
+    }
+    const ERROR_ALREADY_EXISTS: u32 = 183;
+    const ERROR_PATH_NOT_FOUND: u32 = 3;
+
+    if p12_bits.is_some_and(|b| prefix_bitset_has(b, hex_key)) {
+        return Ok(());
+    }
+
+    // Strip trailing NUL and filename
+    let without_null = &wide_file_null[..wide_file_null.len().saturating_sub(1)];
+    let Some(last_sep) = without_null.iter().rposition(|&c| c == b'\\' as u16) else {
+        return Ok(());
+    };
+    let parent = &without_null[..last_sep];
+    let grand_sep_opt = parent.iter().rposition(|&c| c == b'\\' as u16);
+
+    let ensure_p1 = || -> std::io::Result<bool> {
+        if let Some(grand_sep) = grand_sep_opt {
+            let mut gp_buf = [0u16; 320];
+            if grand_sep < gp_buf.len() {
+                gp_buf[..grand_sep].copy_from_slice(&parent[..grand_sep]);
+                gp_buf[grand_sep] = 0;
+                let ok_gp = unsafe { CreateDirectoryW(gp_buf.as_ptr(), std::ptr::null_mut()) };
+                if ok_gp == 0 {
+                    let err = unsafe { GetLastError() };
+                    if err != ERROR_ALREADY_EXISTS {
+                        if err == ERROR_PATH_NOT_FOUND {
+                            return Ok(false);
+                        }
+                        return Err(std::io::Error::from_raw_os_error(err as i32));
+                    }
+                }
+                if let Some(bits) = p1_bits {
+                    p1_bitset_set(bits, hex_key);
+                }
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    };
+
+    if !p1_bits.is_some_and(|b| p1_bitset_has(b, hex_key)) && !ensure_p1()? {
+        if let Some(p) = file_hint.parent() {
+            fs::create_dir_all(p)?;
+            if let Some(bits) = p1_bits {
+                p1_bitset_set(bits, hex_key);
+            }
+            if let Some(bits) = p12_bits {
+                prefix_bitset_set(bits, hex_key);
+            }
+            return Ok(());
+        }
+    }
+
+    let mut p_buf = [0u16; 320];
+    if parent.len() < p_buf.len() {
+        p_buf[..parent.len()].copy_from_slice(parent);
+        p_buf[parent.len()] = 0;
+        let ok = unsafe { CreateDirectoryW(p_buf.as_ptr(), std::ptr::null_mut()) };
+        if ok != 0 {
+            if let Some(bits) = p12_bits {
+                prefix_bitset_set(bits, hex_key);
+            }
+            return Ok(());
+        }
+        let err = unsafe { GetLastError() };
+        if err == ERROR_ALREADY_EXISTS {
+            if let Some(bits) = p12_bits {
+                prefix_bitset_set(bits, hex_key);
+            }
+            return Ok(());
+        }
+        if err == ERROR_PATH_NOT_FOUND && ensure_p1()? {
+            let ok2 = unsafe { CreateDirectoryW(p_buf.as_ptr(), std::ptr::null_mut()) };
+            if ok2 != 0 || unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
+                if let Some(bits) = p12_bits {
+                    prefix_bitset_set(bits, hex_key);
+                }
+                return Ok(());
+            }
+        }
+    }
+    if let Some(p) = file_hint.parent() {
+        fs::create_dir_all(p)?;
+        if let Some(bits) = p1_bits {
+            p1_bitset_set(bits, hex_key);
+        }
+        if let Some(bits) = p12_bits {
+            prefix_bitset_set(bits, hex_key);
+        }
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+#[allow(dead_code)]
+pub(crate) enum WinAttrStat {
+    File { size: u64, mtime: Option<u64> },
+    Dir,
+    NotFound { path_not_found: bool },
+    Error(u32),
+}
+
+#[cfg(windows)]
+#[inline]
+pub(crate) fn query_win_attr_wide(wide_null: &[u16]) -> WinAttrStat {
+    #[repr(C)]
+    #[allow(non_snake_case)]
+    struct FILETIME {
+        dwLowDateTime: u32,
+        dwHighDateTime: u32,
+    }
+    #[repr(C)]
+    #[allow(non_snake_case)]
+    struct WIN32_FILE_ATTRIBUTE_DATA {
+        dwFileAttributes: u32,
+        ftCreationTime: FILETIME,
+        ftLastAccessTime: FILETIME,
+        ftLastWriteTime: FILETIME,
+        nFileSizeHigh: u32,
+        nFileSizeLow: u32,
+    }
+    extern "system" {
+        fn GetFileAttributesExW(
+            lpFileName: *const u16,
+            fInfoLevelId: i32,
+            lpFileInformation: *mut std::ffi::c_void,
+        ) -> i32;
+        fn GetLastError() -> u32;
+    }
+    const GET_FILE_EX_INFO_STANDARD: i32 = 0;
+    const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x10;
+    const ERROR_FILE_NOT_FOUND: u32 = 2;
+    const ERROR_PATH_NOT_FOUND: u32 = 3;
+    const WINDOWS_EPOCH_OFFSET: u64 = 116_444_736_000_000_000;
+
+    let mut data = std::mem::MaybeUninit::<WIN32_FILE_ATTRIBUTE_DATA>::uninit();
+    let ok = unsafe {
+        GetFileAttributesExW(
+            wide_null.as_ptr(),
+            GET_FILE_EX_INFO_STANDARD,
+            data.as_mut_ptr() as *mut std::ffi::c_void,
+        )
+    };
+    if ok == 0 {
+        let err = unsafe { GetLastError() };
+        if err == ERROR_PATH_NOT_FOUND {
+            return WinAttrStat::NotFound {
+                path_not_found: true,
+            };
+        }
+        if err == ERROR_FILE_NOT_FOUND {
+            return WinAttrStat::NotFound {
+                path_not_found: false,
+            };
+        }
+        return WinAttrStat::Error(err);
+    }
+    let info = unsafe { data.assume_init() };
+    if (info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0 {
+        return WinAttrStat::Dir;
+    }
+    let size = ((info.nFileSizeHigh as u64) << 32) | (info.nFileSizeLow as u64);
+    let ft = ((info.ftLastWriteTime.dwHighDateTime as u64) << 32)
+        | (info.ftLastWriteTime.dwLowDateTime as u64);
+    let mtime = ft.checked_sub(WINDOWS_EPOCH_OFFSET).map(|t| t * 100);
+    WinAttrStat::File { size, mtime }
+}
+
+#[cfg(windows)]
+#[inline]
+fn push_u128_wide_slice(buf: &mut [u16], pos: &mut usize, mut val: u128) {
+    let mut digits = [0u16; 40];
+    let mut i = digits.len();
+    loop {
+        i -= 1;
+        digits[i] = (b'0' + (val % 10) as u8) as u16;
+        val /= 10;
+        if val == 0 {
+            break;
+        }
+    }
+    let len = digits.len() - i;
+    buf[*pos..*pos + len].copy_from_slice(&digits[i..]);
+    *pos += len;
+}
+
+#[cfg(windows)]
+#[inline]
+pub(crate) fn with_temp_wide_stack<R>(
+    root: &Path,
+    prefix: &str,
+    f: impl FnOnce(&[u16], Option<&Path>) -> R,
+) -> R {
+    let root_bytes = root.as_os_str().as_encoded_bytes();
+    let count = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let pid = std::process::id();
+    let now = process_start_nanos();
+    const STACK_CAP: usize = 320;
+    // "\\?\" (4) + root + "\tmp\" (5) + prefix + "_" (1) + 10 + "_" (1) + 39 + "_" (1) + 20 + ".tmp\0" (5) = root + prefix + 87
+    if prefix.is_ascii()
+        && root_bytes.is_ascii()
+        && root_bytes.len() >= 3
+        && root_bytes[0].is_ascii_alphabetic()
+        && root_bytes[1] == b':'
+        && root_bytes[2] == b'\\'
+        && root_bytes.len() + prefix.len() + 87 <= STACK_CAP
+        && !root_bytes.contains(&b'/')
+        && !root_bytes[3..].windows(2).any(|w| w == b"\\\\")
+        && !root_bytes.windows(3).any(|w| w == b"\\.\\")
+        && !root_bytes.windows(4).any(|w| w == b"\\..\\")
+        && !root_bytes.ends_with(br"\.")
+        && !root_bytes.ends_with(br"\..")
+        && !root_bytes.ends_with(b"\\")
+    {
+        let mut stack = [0u16; STACK_CAP];
+        stack[0] = b'\\' as u16;
+        stack[1] = b'\\' as u16;
+        stack[2] = b'?' as u16;
+        stack[3] = b'\\' as u16;
+        let mut pos = 4;
+        for &b in root_bytes {
+            stack[pos] = b as u16;
+            pos += 1;
+        }
+        for &b in br"\tmp\" {
+            stack[pos] = b as u16;
+            pos += 1;
+        }
+        for &b in prefix.as_bytes() {
+            stack[pos] = b as u16;
+            pos += 1;
+        }
+        stack[pos] = b'_' as u16;
+        pos += 1;
+        push_u128_wide_slice(&mut stack, &mut pos, pid as u128);
+        stack[pos] = b'_' as u16;
+        pos += 1;
+        push_u128_wide_slice(&mut stack, &mut pos, now);
+        stack[pos] = b'_' as u16;
+        pos += 1;
+        push_u128_wide_slice(&mut stack, &mut pos, count as u128);
+        for &b in b".tmp\0" {
+            stack[pos] = b as u16;
+            pos += 1;
+        }
+        return f(&stack[..pos], None);
+    }
+
+    let mut name = String::with_capacity(prefix.len() + 48);
+    let _ = write!(&mut name, "{prefix}_{pid}_{now}_{count}.tmp");
+    let mut path = PathBuf::with_capacity(root.as_os_str().len() + 8 + name.len());
+    path.push(root);
+    path.push("tmp");
+    path.push(&name);
+    let mut wide = Vec::with_capacity(260);
+    encode_verbatim_wide_into(&path, &mut wide);
+    f(&wide, Some(&path))
 }
 
 #[cfg(windows)]
@@ -425,6 +793,7 @@ fn rename_handle_win32(
     const FILE_ATTRIBUTE_NORMAL: u32 = 0x80;
     const ERROR_PATH_NOT_FOUND: u32 = 3;
     const ERROR_ACCESS_DENIED: u32 = 5;
+    const ERROR_SHARING_VIOLATION: u32 = 32;
     const ERROR_NOT_SUPPORTED: u32 = 50;
     const ERROR_INVALID_PARAMETER: u32 = 87;
 
@@ -482,6 +851,8 @@ fn rename_handle_win32(
 
     let mut created_parent = false;
     let mut cleared_ro = false;
+    let mut yield_retries = 0u32;
+    let mut sleep_retries = 0u32;
     loop {
         let res = match try_rename(
             FILE_RENAME_INFO_EX,
@@ -495,15 +866,21 @@ fn rename_handle_win32(
             Ok(()) => return Ok(()),
             Err(ERROR_PATH_NOT_FOUND) if !created_parent => {
                 created_parent = true;
-                if let Some(parent) = target_hint.parent() {
-                    fs::create_dir_all(parent)?;
-                }
+                ensure_sharded_parent_win32_cached(wide_target_null, target_hint, None, None, "")?;
             }
             Err(ERROR_ACCESS_DENIED) if !cleared_ro => {
                 cleared_ro = true;
                 unsafe {
                     SetFileAttributesW(wide_target_null.as_ptr(), FILE_ATTRIBUTE_NORMAL);
                 }
+            }
+            Err(ERROR_ACCESS_DENIED | ERROR_SHARING_VIOLATION) if yield_retries < 8 => {
+                yield_retries += 1;
+                yield_now();
+            }
+            Err(ERROR_ACCESS_DENIED | ERROR_SHARING_VIOLATION) if sleep_retries < 6 => {
+                sleep(Duration::from_millis(1u64 << sleep_retries));
+                sleep_retries += 1;
             }
             Err(e) => return Err(std::io::Error::from_raw_os_error(e as i32)),
         }
@@ -514,10 +891,78 @@ fn rename_handle_win32(
 pub(crate) fn write_and_rename_atomic_wide(
     wide_tmp_null: &[u16],
     wide_target_null: &[u16],
-    tmp_hint: &Path,
+    tmp_hint: Option<&Path>,
     target_hint: &Path,
     data: &[u8],
 ) -> std::io::Result<()> {
+    write_and_rename_atomic_wide_impl(
+        wide_tmp_null,
+        wide_target_null,
+        tmp_hint,
+        target_hint,
+        data,
+        false,
+        None,
+    )
+    .map(|_| ())
+}
+
+#[cfg(windows)]
+pub(crate) fn write_and_rename_atomic_wide_set_mtime(
+    wide_tmp_null: &[u16],
+    wide_target_null: &[u16],
+    tmp_hint: Option<&Path>,
+    target_hint: &Path,
+    data: &[u8],
+    set_mtime_nanos: Option<u64>,
+) -> std::io::Result<()> {
+    write_and_rename_atomic_wide_impl(
+        wide_tmp_null,
+        wide_target_null,
+        tmp_hint,
+        target_hint,
+        data,
+        false,
+        set_mtime_nanos,
+    )
+    .map(|_| ())
+}
+
+#[cfg(windows)]
+pub(crate) fn write_and_rename_atomic_wide_with_mtime(
+    wide_tmp_null: &[u16],
+    wide_target_null: &[u16],
+    tmp_hint: &Path,
+    target_hint: &Path,
+    data: &[u8],
+) -> std::io::Result<Option<u64>> {
+    write_and_rename_atomic_wide_impl(
+        wide_tmp_null,
+        wide_target_null,
+        Some(tmp_hint),
+        target_hint,
+        data,
+        true,
+        None,
+    )
+}
+
+#[cfg(windows)]
+fn write_and_rename_atomic_wide_impl(
+    wide_tmp_null: &[u16],
+    wide_target_null: &[u16],
+    tmp_hint: Option<&Path>,
+    target_hint: &Path,
+    data: &[u8],
+    capture_mtime: bool,
+    set_mtime_nanos: Option<u64>,
+) -> std::io::Result<Option<u64>> {
+    #[repr(C)]
+    #[allow(non_snake_case)]
+    struct FileTimeRaw {
+        dwLowDateTime: u32,
+        dwHighDateTime: u32,
+    }
     extern "system" {
         fn CreateFileW(
             lpFileName: *const u16,
@@ -528,12 +973,28 @@ pub(crate) fn write_and_rename_atomic_wide(
             dwFlagsAndAttributes: u32,
             hTemplateFile: *mut std::ffi::c_void,
         ) -> *mut std::ffi::c_void;
+        fn CreateDirectoryW(
+            lpPathName: *const u16,
+            lpSecurityAttributes: *mut std::ffi::c_void,
+        ) -> i32;
         fn WriteFile(
             hFile: *mut std::ffi::c_void,
             lpBuffer: *const std::ffi::c_void,
             nNumberOfBytesToWrite: u32,
             lpNumberOfBytesWritten: *mut u32,
             lpOverlapped: *mut std::ffi::c_void,
+        ) -> i32;
+        fn GetFileTime(
+            hFile: *mut std::ffi::c_void,
+            lpCreationTime: *mut FileTimeRaw,
+            lpLastAccessTime: *mut FileTimeRaw,
+            lpLastWriteTime: *mut FileTimeRaw,
+        ) -> i32;
+        fn SetFileTime(
+            hFile: *mut std::ffi::c_void,
+            lpCreationTime: *const FileTimeRaw,
+            lpLastAccessTime: *const FileTimeRaw,
+            lpLastWriteTime: *const FileTimeRaw,
         ) -> i32;
         fn SetFileInformationByHandle(
             hFile: *mut std::ffi::c_void,
@@ -545,18 +1006,27 @@ pub(crate) fn write_and_rename_atomic_wide(
         fn GetLastError() -> u32;
     }
     const GENERIC_WRITE: u32 = 0x4000_0000;
+    const FILE_READ_ATTRIBUTES: u32 = 0x0080;
     const DELETE_ACCESS: u32 = 0x0001_0000;
     const FILE_SHARE_ALL: u32 = 1 | 2 | 4;
     const CREATE_NEW: u32 = 1;
     const FILE_ATTRIBUTE_NORMAL: u32 = 0x80;
     const FILE_DISPOSITION_INFO: i32 = 4;
     const ERROR_PATH_NOT_FOUND: u32 = 3;
+    const ERROR_ALREADY_EXISTS: u32 = 183;
     const INVALID_HANDLE_VALUE: *mut std::ffi::c_void = -1isize as *mut std::ffi::c_void;
+    const WINDOWS_EPOCH_OFFSET: u64 = 116_444_736_000_000_000;
+
+    let access = if capture_mtime {
+        GENERIC_WRITE | FILE_READ_ATTRIBUTES | DELETE_ACCESS
+    } else {
+        GENERIC_WRITE | DELETE_ACCESS
+    };
 
     let mut handle = unsafe {
         CreateFileW(
             wide_tmp_null.as_ptr(),
-            GENERIC_WRITE | DELETE_ACCESS,
+            access,
             FILE_SHARE_ALL,
             std::ptr::null_mut(),
             CREATE_NEW,
@@ -567,13 +1037,30 @@ pub(crate) fn write_and_rename_atomic_wide(
     if handle == INVALID_HANDLE_VALUE {
         let err = unsafe { GetLastError() };
         if err == ERROR_PATH_NOT_FOUND {
-            if let Some(parent) = tmp_hint.parent() {
-                fs::create_dir_all(parent)?;
+            if let Some(hint) = tmp_hint {
+                if let Some(parent) = hint.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+            } else {
+                let without_null = &wide_tmp_null[..wide_tmp_null.len().saturating_sub(1)];
+                if let Some(last_sep) = without_null.iter().rposition(|&c| c == b'\\' as u16) {
+                    let mut dir_buf = Vec::with_capacity(last_sep + 1);
+                    dir_buf.extend_from_slice(&without_null[..last_sep]);
+                    dir_buf.push(0);
+                    let ok = unsafe { CreateDirectoryW(dir_buf.as_ptr(), std::ptr::null_mut()) };
+                    if ok == 0 && unsafe { GetLastError() } != ERROR_ALREADY_EXISTS {
+                        use std::os::windows::ffi::OsStringExt;
+                        let p = PathBuf::from(std::ffi::OsString::from_wide(
+                            &dir_buf[..dir_buf.len() - 1],
+                        ));
+                        fs::create_dir_all(p)?;
+                    }
+                }
             }
             handle = unsafe {
                 CreateFileW(
                     wide_tmp_null.as_ptr(),
-                    GENERIC_WRITE | DELETE_ACCESS,
+                    access,
                     FILE_SHARE_ALL,
                     std::ptr::null_mut(),
                     CREATE_NEW,
@@ -621,29 +1108,76 @@ pub(crate) fn write_and_rename_atomic_wide(
         offset += written as usize;
     }
 
+    if let Some(ns) = set_mtime_nanos {
+        let ft_100ns = (ns / 100).saturating_add(WINDOWS_EPOCH_OFFSET);
+        let ft = FileTimeRaw {
+            dwLowDateTime: ft_100ns as u32,
+            dwHighDateTime: (ft_100ns >> 32) as u32,
+        };
+        unsafe {
+            SetFileTime(handle, std::ptr::null(), std::ptr::null(), &ft);
+        }
+    }
+
     if let Err(e) = rename_handle_win32(handle, wide_target_null, target_hint) {
         cleanup_and_close(handle);
         return Err(e);
     }
 
+    let mtime = if capture_mtime {
+        let mut lwt = FileTimeRaw {
+            dwLowDateTime: 0,
+            dwHighDateTime: 0,
+        };
+        if unsafe { GetFileTime(handle, std::ptr::null_mut(), std::ptr::null_mut(), &mut lwt) } != 0
+        {
+            let ft = ((lwt.dwHighDateTime as u64) << 32) | (lwt.dwLowDateTime as u64);
+            ft.checked_sub(WINDOWS_EPOCH_OFFSET).map(|t| t * 100)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
     unsafe {
         CloseHandle(handle);
     }
-    Ok(())
+    Ok(mtime)
 }
 
+#[cfg_attr(windows, allow(dead_code))]
 pub(crate) fn write_and_rename_atomic(
     temp_path: &Path,
     target_path: &Path,
     data: &[u8],
 ) -> std::io::Result<()> {
+    write_and_rename_atomic_with_set_mtime(temp_path, target_path, data, None)
+}
+
+#[cfg_attr(windows, allow(dead_code))]
+pub(crate) fn write_and_rename_atomic_with_set_mtime(
+    temp_path: &Path,
+    target_path: &Path,
+    data: &[u8],
+    set_mtime_nanos: Option<u64>,
+) -> std::io::Result<()> {
     #[cfg(windows)]
     {
-        let mut wide_tmp = Vec::with_capacity(260);
-        let mut wide_target = Vec::with_capacity(260);
-        encode_verbatim_wide_into(temp_path, &mut wide_tmp);
-        encode_verbatim_wide_into(target_path, &mut wide_target);
-        write_and_rename_atomic_wide(&wide_tmp, &wide_target, temp_path, target_path, data)
+        with_verbatim_wide_stack(temp_path, |wide_tmp| {
+            with_verbatim_wide_stack(target_path, |wide_target| {
+                write_and_rename_atomic_wide_impl(
+                    wide_tmp,
+                    wide_target,
+                    Some(temp_path),
+                    target_path,
+                    data,
+                    false,
+                    set_mtime_nanos,
+                )
+                .map(|_| ())
+            })
+        })
     }
     #[cfg(not(windows))]
     {
@@ -661,6 +1195,9 @@ pub(crate) fn write_and_rename_atomic(
             drop(file);
             let _ = fs::remove_file(temp_path);
             return Err(e);
+        }
+        if let Some(ns) = set_mtime_nanos {
+            let _ = file.set_modified(UNIX_EPOCH + Duration::from_nanos(ns));
         }
         drop(file);
         match fs::rename(temp_path, target_path) {
@@ -685,19 +1222,131 @@ pub(crate) fn write_and_rename_atomic(
     }
 }
 
+#[cfg(windows)]
+pub(crate) fn read_file_win32_once_wide(wide_null: &[u16]) -> std::io::Result<Vec<u8>> {
+    extern "system" {
+        fn CreateFileW(
+            lpFileName: *const u16,
+            dwDesiredAccess: u32,
+            dwShareMode: u32,
+            lpSecurityAttributes: *mut std::ffi::c_void,
+            dwCreationDisposition: u32,
+            dwFlagsAndAttributes: u32,
+            hTemplateFile: *mut std::ffi::c_void,
+        ) -> *mut std::ffi::c_void;
+        fn GetFileSizeEx(hFile: *mut std::ffi::c_void, lpFileSize: *mut i64) -> i32;
+        fn ReadFile(
+            hFile: *mut std::ffi::c_void,
+            lpBuffer: *mut std::ffi::c_void,
+            nNumberOfBytesToRead: u32,
+            lpNumberOfBytesRead: *mut u32,
+            lpOverlapped: *mut std::ffi::c_void,
+        ) -> i32;
+        fn CloseHandle(hObject: *mut std::ffi::c_void) -> i32;
+        fn GetLastError() -> u32;
+    }
+    const GENERIC_READ: u32 = 0x8000_0000;
+    const FILE_SHARE_ALL: u32 = 1 | 2 | 4;
+    const OPEN_EXISTING: u32 = 3;
+    const FILE_FLAG_SEQUENTIAL_SCAN: u32 = 0x0800_0000;
+    const INVALID_HANDLE_VALUE: *mut std::ffi::c_void = -1isize as *mut std::ffi::c_void;
+
+    let handle = unsafe {
+        CreateFileW(
+            wide_null.as_ptr(),
+            GENERIC_READ,
+            FILE_SHARE_ALL,
+            std::ptr::null_mut(),
+            OPEN_EXISTING,
+            FILE_FLAG_SEQUENTIAL_SCAN,
+            std::ptr::null_mut(),
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        return Err(std::io::Error::from_raw_os_error(unsafe { GetLastError() } as i32));
+    }
+
+    let mut file_size: i64 = 0;
+    if unsafe { GetFileSizeEx(handle, &mut file_size) } == 0 {
+        let err = unsafe { GetLastError() };
+        unsafe { CloseHandle(handle) };
+        return Err(std::io::Error::from_raw_os_error(err as i32));
+    }
+    let expected_len = usize::try_from(file_size.max(0)).unwrap_or(0);
+    let mut out = Vec::<u8>::with_capacity(expected_len);
+    let mut total_read = 0usize;
+
+    // Fast path: read the known exact size in a single ReadFile without an EOF probe.
+    while total_read < expected_len {
+        let remaining = expected_len - total_read;
+        let to_read = remaining.min(u32::MAX as usize) as u32;
+        let mut n_read = 0u32;
+        let ok = unsafe {
+            ReadFile(
+                handle,
+                out.as_mut_ptr().add(total_read) as *mut _,
+                to_read,
+                &mut n_read,
+                std::ptr::null_mut(),
+            )
+        };
+        if ok == 0 {
+            let err = unsafe { GetLastError() };
+            unsafe {
+                out.set_len(total_read);
+                CloseHandle(handle);
+            }
+            return Err(std::io::Error::from_raw_os_error(err as i32));
+        }
+        if n_read == 0 {
+            break;
+        }
+        total_read += n_read as usize;
+    }
+    unsafe {
+        out.set_len(total_read);
+        CloseHandle(handle);
+    }
+    Ok(out)
+}
+
+#[cfg(windows)]
+fn read_file_win32_once(path: &Path) -> std::io::Result<Vec<u8>> {
+    with_verbatim_wide_stack(path, read_file_win32_once_wide)
+}
+
 /// Helper to reliably read a file with retries on Windows transient file sharing locks.
 fn read_file_with_retries(path: &Path) -> std::io::Result<Vec<u8>> {
-    match fs::read(path) {
+    let read_once = |p: &Path| -> std::io::Result<Vec<u8>> {
+        #[cfg(windows)]
+        {
+            read_file_win32_once(p)
+        }
+        #[cfg(not(windows))]
+        {
+            fs::read(p)
+        }
+    };
+
+    match read_once(path) {
         Ok(bytes) => return Ok(bytes),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(e),
         Err(_) => {}
+    }
+    for _ in 0..8 {
+        yield_now();
+        match read_once(path) {
+            Ok(bytes) => return Ok(bytes),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(e),
+            Err(_) => {}
+        }
     }
     let mut attempts = 1u32;
     let mut delay = Duration::from_micros(500);
     loop {
         retry_backoff(attempts, &mut delay, Duration::from_millis(100));
         attempts += 1;
-        match fs::read(path) {
+        match read_once(path) {
             Ok(bytes) => return Ok(bytes),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(e),
             Err(e) => {
@@ -843,7 +1492,7 @@ fn verify_sha512_and_integrity(
     key_for_err: &str,
 ) -> Result<[u8; 64], CacheError> {
     if expected_integrity.strongest_algorithm() == Some(Algorithm::Sha512) {
-        let actual_digest: [u8; 64] = Sha512::digest(data).into();
+        let actual_digest = sha512_digest(data);
         if sha512_matches_integrity(&actual_digest, expected_integrity) == Some(true) {
             return Ok(actual_digest);
         }
@@ -870,7 +1519,7 @@ fn verify_sha512_and_integrity(
         },
         other => CacheError::Core(rnpm_core::CoreError::Integrity(other)),
     })?;
-    Ok(Sha512::digest(data).into())
+    Ok(sha512_digest(data))
 }
 
 /// Content-addressable cache manager.
@@ -879,7 +1528,11 @@ pub struct Cache {
     root: PathBuf,
     lock_timeout: Duration,
     stale_threshold: Duration,
+    #[cfg(windows)]
+    blob_p1_dirs: Arc<[AtomicU64; 4]>,
     blob_prefix_dirs: Arc<[AtomicU64; 1024]>,
+    #[cfg(windows)]
+    index_p1_dirs: Arc<[AtomicU64; 4]>,
     index_prefix_dirs: Arc<[AtomicU64; 1024]>,
     lock_shards: Arc<[Mutex<()>; LOCK_SHARD_COUNT]>,
 }
@@ -896,7 +1549,11 @@ impl Cache {
             root,
             lock_timeout: CacheLock::DEFAULT_TIMEOUT,
             stale_threshold: CacheLock::DEFAULT_STALE_THRESHOLD,
+            #[cfg(windows)]
+            blob_p1_dirs: Arc::new([const { AtomicU64::new(0) }; 4]),
             blob_prefix_dirs: Arc::new([const { AtomicU64::new(0) }; 1024]),
+            #[cfg(windows)]
+            index_p1_dirs: Arc::new([const { AtomicU64::new(0) }; 4]),
             index_prefix_dirs: Arc::new([const { AtomicU64::new(0) }; 1024]),
             lock_shards: Arc::new(std::array::from_fn(|_| Mutex::new(()))),
         })
@@ -1125,7 +1782,7 @@ impl Cache {
         let sha512_bytes: [u8; 64] = if let Some(expected) = expected_integrity {
             verify_sha512_and_integrity(data, expected, "blob")?
         } else {
-            Sha512::digest(data).into()
+            sha512_digest(data)
         };
         let mut hex_buf = [0u8; 128];
         let sha512_hex = encode_hex_lower(&sha512_bytes, &mut hex_buf).to_string();
@@ -1137,37 +1794,149 @@ impl Cache {
     /// Store a pre-verified blob atomically by its known SHA-512 hex digest.
     pub fn put_blob_direct(&self, data: &[u8], sha512_hex: &str) -> Result<(), CacheError> {
         let npm_path = self.npm_blob_path_for_algo(Algorithm::Sha512, sha512_hex);
-        let mut npm_definitely_missing = false;
-        match fs::File::open(&npm_path) {
-            Ok(mut f) => {
-                if let Ok(meta) = f.metadata() {
-                    if meta.is_dir() {
-                        return Err(CacheError::Io(std::io::Error::new(
-                            std::io::ErrorKind::AlreadyExists,
-                            format!("Blob path is a directory: {}", npm_path.display()),
-                        )));
+
+        #[cfg(windows)]
+        {
+            let fast_res: Result<Option<()>, CacheError> =
+                with_verbatim_wide_stack(&npm_path, |wide_target| match query_win_attr_wide(
+                    wide_target,
+                ) {
+                    WinAttrStat::Dir => Err(CacheError::Io(std::io::Error::new(
+                        std::io::ErrorKind::AlreadyExists,
+                        format!("Blob path is a directory: {}", npm_path.display()),
+                    ))),
+                    WinAttrStat::File { size, .. } => {
+                        if size == data.len() as u64 {
+                            if let Ok(existing) = read_file_win32_once_wide(wide_target) {
+                                if existing.as_slice() == data {
+                                    p1_bitset_set(&self.blob_p1_dirs, sha512_hex);
+                                    prefix_bitset_set(&self.blob_prefix_dirs, sha512_hex);
+                                    return Ok(Some(()));
+                                }
+                            }
+                        }
+                        Ok(None)
                     }
-                    if meta.len() == data.len() as u64 {
-                        let mut existing = Vec::with_capacity(data.len());
-                        if f.read_to_end(&mut existing).is_ok() && existing.as_slice() == data {
-                            return Ok(());
+                    WinAttrStat::NotFound { path_not_found } => {
+                        if !path_not_found {
+                            p1_bitset_set(&self.blob_p1_dirs, sha512_hex);
+                            prefix_bitset_set(&self.blob_prefix_dirs, sha512_hex);
+                            let legacy_path =
+                                Self::legacy_blob_path_from_npm(&npm_path, sha512_hex);
+                            let legacy_match = with_verbatim_wide_stack(&legacy_path, |wide_leg| {
+                                match query_win_attr_wide(wide_leg) {
+                                    WinAttrStat::Dir => Err(CacheError::Io(std::io::Error::new(
+                                        std::io::ErrorKind::AlreadyExists,
+                                        format!(
+                                            "Blob path is a directory: {}",
+                                            legacy_path.display()
+                                        ),
+                                    ))),
+                                    WinAttrStat::File { size, .. } if size == data.len() as u64 => {
+                                        Ok(read_file_win32_once_wide(wide_leg)
+                                            .is_ok_and(|existing| existing.as_slice() == data))
+                                    }
+                                    _ => Ok(false),
+                                }
+                            })?;
+                            if legacy_match {
+                                return Ok(Some(()));
+                            }
+                        } else {
+                            // `GetFileAttributesExW` reported `ERROR_PATH_NOT_FOUND`, so pass `None`
+                            // for cached bitsets to bypass any stale directory-existence bits and
+                            // recreate `<p1>/<p2>` before staging the temp file.
+                            ensure_sharded_parent_win32_cached(
+                                wide_target,
+                                &npm_path,
+                                None,
+                                None,
+                                sha512_hex,
+                            )?;
+                        }
+
+                        let atomic_ok =
+                            with_temp_wide_stack(&self.root, "blob", |wide_tmp, tmp_hint| {
+                                write_and_rename_atomic_wide(
+                                    wide_tmp,
+                                    wide_target,
+                                    tmp_hint,
+                                    &npm_path,
+                                    data,
+                                )
+                            });
+                        match atomic_ok {
+                            Ok(()) => {
+                                p1_bitset_set(&self.blob_p1_dirs, sha512_hex);
+                                prefix_bitset_set(&self.blob_prefix_dirs, sha512_hex);
+                                debug!("Atomically stored blob {}", npm_path.display());
+                                Ok(Some(()))
+                            }
+                            Err(_) if npm_path.is_dir() => Err(CacheError::Io(std::io::Error::new(
+                                std::io::ErrorKind::AlreadyExists,
+                                format!("Blob path is a directory: {}", npm_path.display()),
+                            ))),
+                            Err(_) => Ok(None),
                         }
                     }
-                }
+                    WinAttrStat::Error(_) => Ok(None),
+                });
+            if let Some(()) = fast_res? {
+                return Ok(());
             }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                npm_definitely_missing = true;
-                if !is_path_not_found(&e) {
-                    let legacy_path = Self::legacy_blob_path_from_npm(&npm_path, sha512_hex);
-                    if let Ok(meta) = fs::metadata(&legacy_path) {
+        }
+
+        #[cfg(not(windows))]
+        {
+            let mut npm_definitely_missing = false;
+            match fs::File::open(&npm_path) {
+                Ok(mut f) => {
+                    if let Ok(meta) = f.metadata() {
                         if meta.is_dir() {
                             return Err(CacheError::Io(std::io::Error::new(
                                 std::io::ErrorKind::AlreadyExists,
-                                format!("Blob path is a directory: {}", legacy_path.display()),
+                                format!("Blob path is a directory: {}", npm_path.display()),
                             )));
                         }
                         if meta.len() == data.len() as u64 {
-                            if let Ok(existing) = read_file_with_retries(&legacy_path) {
+                            let mut existing = Vec::with_capacity(data.len());
+                            if f.read_to_end(&mut existing).is_ok() && existing.as_slice() == data {
+                                return Ok(());
+                            }
+                        }
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    npm_definitely_missing = true;
+                    if !is_path_not_found(&e) {
+                        let legacy_path = Self::legacy_blob_path_from_npm(&npm_path, sha512_hex);
+                        if let Ok(meta) = fs::metadata(&legacy_path) {
+                            if meta.is_dir() {
+                                return Err(CacheError::Io(std::io::Error::new(
+                                    std::io::ErrorKind::AlreadyExists,
+                                    format!("Blob path is a directory: {}", legacy_path.display()),
+                                )));
+                            }
+                            if meta.len() == data.len() as u64 {
+                                if let Ok(existing) = read_file_with_retries(&legacy_path) {
+                                    if existing.as_slice() == data {
+                                        return Ok(());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(_) => {
+                    if let Ok(meta) = fs::metadata(&npm_path) {
+                        if meta.is_dir() {
+                            return Err(CacheError::Io(std::io::Error::new(
+                                std::io::ErrorKind::AlreadyExists,
+                                format!("Blob path is a directory: {}", npm_path.display()),
+                            )));
+                        }
+                        if meta.len() == data.len() as u64 {
+                            if let Ok(existing) = read_file_with_retries(&npm_path) {
                                 if existing.as_slice() == data {
                                     return Ok(());
                                 }
@@ -1176,46 +1945,29 @@ impl Cache {
                     }
                 }
             }
-            Err(_) => {
-                if let Ok(meta) = fs::metadata(&npm_path) {
-                    if meta.is_dir() {
+
+            if npm_definitely_missing || fs::symlink_metadata(&npm_path).is_err() {
+                if !prefix_bitset_has(&self.blob_prefix_dirs, sha512_hex) {
+                    if let Some(parent) = npm_path.parent() {
+                        fs::create_dir_all(parent)?;
+                    }
+                    prefix_bitset_set(&self.blob_prefix_dirs, sha512_hex);
+                }
+                let temp_path = self.create_temp_path("blob");
+                match write_and_rename_atomic(&temp_path, &npm_path, data) {
+                    Ok(()) => {
+                        prefix_bitset_set(&self.blob_prefix_dirs, sha512_hex);
+                        debug!("Atomically stored blob {}", npm_path.display());
+                        return Ok(());
+                    }
+                    Err(_) if npm_path.is_dir() => {
                         return Err(CacheError::Io(std::io::Error::new(
                             std::io::ErrorKind::AlreadyExists,
                             format!("Blob path is a directory: {}", npm_path.display()),
                         )));
                     }
-                    if meta.len() == data.len() as u64 {
-                        if let Ok(existing) = read_file_with_retries(&npm_path) {
-                            if existing.as_slice() == data {
-                                return Ok(());
-                            }
-                        }
-                    }
+                    Err(_) => {}
                 }
-            }
-        }
-
-        if npm_definitely_missing || fs::symlink_metadata(&npm_path).is_err() {
-            if !prefix_bitset_has(&self.blob_prefix_dirs, sha512_hex) {
-                if let Some(parent) = npm_path.parent() {
-                    fs::create_dir_all(parent)?;
-                }
-                prefix_bitset_set(&self.blob_prefix_dirs, sha512_hex);
-            }
-            let temp_path = self.create_temp_path("blob");
-            match write_and_rename_atomic(&temp_path, &npm_path, data) {
-                Ok(()) => {
-                    prefix_bitset_set(&self.blob_prefix_dirs, sha512_hex);
-                    debug!("Atomically stored blob {}", npm_path.display());
-                    return Ok(());
-                }
-                Err(_) if npm_path.is_dir() => {
-                    return Err(CacheError::Io(std::io::Error::new(
-                        std::io::ErrorKind::AlreadyExists,
-                        format!("Blob path is a directory: {}", npm_path.display()),
-                    )));
-                }
-                Err(_) => {}
             }
         }
 
@@ -1293,7 +2045,7 @@ impl Cache {
             }
         };
 
-        let actual_digest: [u8; 64] = Sha512::digest(&bytes).into();
+        let actual_digest = sha512_digest(&bytes);
         let matches = match decode_sha512_hex_stack(sha512_hex) {
             Some(expected) => actual_digest == expected,
             None => {
@@ -1461,21 +2213,43 @@ impl Cache {
         buf[40] = b'\t';
         buf.push(b'\n');
 
-        let temp_path = self.create_temp_path("index");
-
         let _shard_guard = self.lock_shards[shard_index_for_str(hash)]
             .lock()
             .unwrap_or_else(|e| e.into_inner());
 
-        if !prefix_bitset_has(&self.index_prefix_dirs, hash) {
-            if let Some(parent) = npm_path.parent() {
-                fs::create_dir_all(parent)?;
+        #[cfg(windows)]
+        {
+            let res: Result<bool, CacheError> = with_verbatim_wide_stack(&npm_path, |wide_target| {
+                ensure_sharded_parent_win32_cached(
+                    wide_target,
+                    &npm_path,
+                    Some(&self.index_p1_dirs),
+                    Some(&self.index_prefix_dirs),
+                    hash,
+                )?;
+                let ok = with_temp_wide_stack(&self.root, "index", |wide_tmp, tmp_hint| {
+                    write_and_rename_atomic_wide(wide_tmp, wide_target, tmp_hint, &npm_path, &buf)
+                        .is_ok()
+                });
+                Ok(ok)
+            });
+            if res? {
+                return Ok(());
             }
-            prefix_bitset_set(&self.index_prefix_dirs, hash);
         }
 
-        if write_and_rename_atomic(&temp_path, &npm_path, &buf).is_ok() {
-            return Ok(());
+        #[cfg(not(windows))]
+        {
+            let temp_path = self.create_temp_path("index");
+            if !prefix_bitset_has(&self.index_prefix_dirs, hash) {
+                if let Some(parent) = npm_path.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                prefix_bitset_set(&self.index_prefix_dirs, hash);
+            }
+            if write_and_rename_atomic(&temp_path, &npm_path, &buf).is_ok() {
+                return Ok(());
+            }
         }
 
         let staged = self.write_temp_file("index", &buf)?;
@@ -1506,7 +2280,7 @@ impl Cache {
             let bytes = verify_sha512_and_integrity(data, expected, key)?;
             (bytes, expected.to_string())
         } else {
-            let bytes: [u8; 64] = Sha512::digest(data).into();
+            let bytes = sha512_digest(data);
             let integ = format!("sha512-{}", BASE64.encode(&bytes));
             (bytes, integ)
         };
@@ -1535,7 +2309,7 @@ impl Cache {
         data: &[u8],
         metadata: Option<serde_json::Value>,
     ) -> Result<IndexEntry, CacheError> {
-        let sha512_bytes: [u8; 64] = Sha512::digest(data).into();
+        let sha512_bytes = sha512_digest(data);
         let mut hex_buf = [0u8; 128];
         let sha512_hex = encode_hex_lower(&sha512_bytes, &mut hex_buf).to_string();
         let integrity = format!("sha512-{}", BASE64.encode(&sha512_bytes));
@@ -1714,7 +2488,7 @@ impl Cache {
             Err(e) => return Err(CacheError::Io(e)),
         };
 
-        let mut hasher = Sha512::new();
+        let mut hasher = ring::digest::Context::new(&ring::digest::SHA512);
         let mut buffer = [0u8; 131072];
         let mut total_size = 0u64;
 
@@ -1737,7 +2511,11 @@ impl Cache {
             return Err(err);
         }
 
-        let sha512_bytes: [u8; 64] = hasher.finalize().into();
+        let digest = hasher.finish();
+        let sha512_bytes: [u8; 64] = digest
+            .as_ref()
+            .try_into()
+            .expect("SHA-512 digest is 64 bytes");
         let mut hex_buf = [0u8; 128];
         let sha512_hex = encode_hex_lower(&sha512_bytes, &mut hex_buf).to_string();
 
@@ -1835,7 +2613,7 @@ impl Cache {
                 Ok(meta) => {
                     let ok = meta.len() == total_size
                         && read_file_with_retries(&npm_path)
-                            .is_ok_and(|b| Sha512::digest(&b).as_slice() == sha512_bytes.as_slice());
+                            .is_ok_and(|b| sha512_digest(&b).as_slice() == sha512_bytes.as_slice());
                     if !ok {
                         let _ = remove_file_with_retries(&npm_path);
                     }
@@ -2223,6 +3001,11 @@ impl Cache {
         }
 
         // Recreate essential cache directory layout
+        #[cfg(windows)]
+        {
+            clear_p1_bitset(&self.blob_p1_dirs);
+            clear_p1_bitset(&self.index_p1_dirs);
+        }
         clear_prefix_bitset(&self.blob_prefix_dirs);
         clear_prefix_bitset(&self.index_prefix_dirs);
         fs::create_dir_all(self.root.join("content-v2").join("sha512"))?;
@@ -2266,7 +3049,7 @@ impl Cache {
 
         match read_file_with_retries(path) {
             Ok(bytes) => {
-                let actual: [u8; 64] = Sha512::digest(&bytes).into();
+                let actual = sha512_digest(&bytes);
                 if actual == expected {
                     (1, 0, bytes.len() as u64, Some(actual))
                 } else {
@@ -2347,7 +3130,7 @@ impl Cache {
                 Err(e) => Err(e),
             };
             if let Ok(blob_bytes) = bytes_res {
-                let actual: [u8; 64] = Sha512::digest(&blob_bytes).into();
+                let actual = sha512_digest(&blob_bytes);
                 if actual == digest {
                     return (1, 0, 0, Some(digest));
                 }
@@ -2511,7 +3294,7 @@ impl Cache {
                     if is_blob {
                         if let Some(expected) = Self::expected_blob_digest(&path) {
                             if let Ok(bytes) = fs::read(&path) {
-                                let actual: [u8; 64] = Sha512::digest(&bytes).into();
+                                let actual = sha512_digest(&bytes);
                                 if actual != expected {
                                     let _ = remove_file_with_retries(&path);
                                     count += 1;
@@ -2666,5 +3449,25 @@ mod atomic_win_tests {
         fs::write(&idx_path, [0xffu8, 0xfe, 0x00]).unwrap();
         assert!(cache.get(key).unwrap().is_none());
         assert!(!idx_path.exists());
+    }
+
+    #[test]
+    fn put_blob_recovers_after_external_shard_dir_deletion() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::new(dir.path()).unwrap();
+        let payload1 = b"first blob payload in shard";
+        let sha1 = cache.put_blob(payload1, None).unwrap();
+        let blob1 = cache.blob_path(&sha1);
+        assert!(blob1.is_file());
+
+        // Delete the `<p1>` parent shard externally while in-process bitsets still think it exists.
+        let p2_dir = blob1.parent().unwrap().to_path_buf();
+        let p1_dir = p2_dir.parent().unwrap().to_path_buf();
+        fs::remove_dir_all(&p1_dir).unwrap();
+        assert!(!p1_dir.exists());
+
+        // Putting another blob with the same `<p1>`/`<p2>` prefix must succeed cleanly.
+        cache.put_blob_direct(payload1, &sha1).unwrap();
+        assert_eq!(fs::read(&blob1).unwrap(), payload1);
     }
 }

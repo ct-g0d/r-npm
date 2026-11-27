@@ -89,6 +89,44 @@ async fn finish_pack_tasks(tasks: Vec<tokio::task::JoinHandle<Result<()>>>) -> R
     first_error.map_or(Ok(()), Err)
 }
 
+struct AbortTasksOnDrop {
+    tasks: Vec<tokio::task::JoinHandle<Result<()>>>,
+    cancelled: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl AbortTasksOnDrop {
+    fn new() -> Self {
+        Self {
+            tasks: Vec::new(),
+            cancelled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }
+    }
+
+    fn cancel_flag(&self) -> Arc<std::sync::atomic::AtomicBool> {
+        Arc::clone(&self.cancelled)
+    }
+
+    fn extend(&mut self, tasks: Vec<tokio::task::JoinHandle<Result<()>>>) {
+        self.tasks.extend(tasks);
+    }
+
+    fn take(&mut self) -> Vec<tokio::task::JoinHandle<Result<()>>> {
+        std::mem::take(&mut self.tasks)
+    }
+}
+
+impl Drop for AbortTasksOnDrop {
+    fn drop(&mut self) {
+        if !self.tasks.is_empty() {
+            self.cancelled
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            for task in self.tasks.drain(..) {
+                task.abort();
+            }
+        }
+    }
+}
+
 /// Writes warm-store files. Files with a verified CAS blob are copied; small and
 /// large installs materialize slice references zero-copy in parallel without
 /// paying external `node.exe` process startup or per-file `.to_vec()` clones.
@@ -2118,6 +2156,206 @@ pub struct InstallSummary {
     pub cache_misses: usize,
     pub lockfile_path: PathBuf,
     pub timing: Option<TimingMetrics>,
+    /// Exact count of top-level packages declaring `funding` when already computed in-memory or cached.
+    pub funding_count: Option<usize>,
+}
+
+fn parse_stored_fingerprint(stored: &str) -> (&str, Option<usize>, Option<Option<Vec<String>>>) {
+    let mut parts = stored.split('|');
+    let base_fp = parts.next().unwrap_or(stored);
+    let mut funding = None;
+    let mut script_locs = None;
+    for part in parts {
+        if let Some(n) = part.strip_prefix("f=").and_then(|s| s.parse::<usize>().ok()) {
+            funding = Some(n);
+        } else if let Some(s) = part.strip_prefix("s=") {
+            script_locs = Some(match s {
+                "0" => Some(Vec::new()),
+                "*" => None,
+                other => Some(
+                    other
+                        .split(',')
+                        .filter(|x| !x.is_empty())
+                        .map(str::to_string)
+                        .collect(),
+                ),
+            });
+        }
+    }
+    (base_fp, funding, script_locs)
+}
+
+fn format_stored_fingerprint(
+    base_fp: &str,
+    funding: Option<usize>,
+    script_locs: Option<&[String]>,
+) -> String {
+    let mut out = base_fp.to_string();
+    if let Some(n) = funding {
+        out.push_str(&format!("|f={n}"));
+    }
+    if let Some(locs) = script_locs {
+        if locs.is_empty() {
+            out.push_str("|s=0");
+        } else if locs.len() <= 16
+            && locs.iter().all(|l| !l.contains('|') && !l.contains(','))
+        {
+            out.push_str("|s=");
+            out.push_str(&locs.join(","));
+        } else {
+            out.push_str("|s=*");
+        }
+    }
+    out
+}
+
+fn is_top_level_nm_pkg(loc: &str) -> bool {
+    let Some(rest) = loc.strip_prefix("node_modules/") else {
+        return false;
+    };
+    !rest.is_empty()
+        && !rest.starts_with('.')
+        && if rest.starts_with('@') {
+            rest.split('/').count() == 2 && !rest.ends_with('/')
+        } else {
+            !rest.contains('/')
+        }
+}
+
+fn bytes_has_funding_field(bytes: &[u8]) -> bool {
+    #[derive(Default)]
+    struct Present(bool);
+    impl<'de> serde::Deserialize<'de> for Present {
+        fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+        where
+            D: serde::Deserializer<'de>,
+        {
+            serde::de::IgnoredAny::deserialize(deserializer)?;
+            Ok(Present(true))
+        }
+    }
+    #[derive(serde::Deserialize)]
+    struct FundingProbe {
+        #[serde(default)]
+        funding: Present,
+    }
+    if !bytes.windows(9).any(|w| w == b"\"funding\"") && !bytes.windows(2).any(|w| w == b"\\u") {
+        return false;
+    }
+    let json_bytes = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(bytes);
+    serde_json::from_slice::<FundingProbe>(json_bytes).is_ok_and(|probe| probe.funding.0)
+}
+
+fn root_has_install_hooks(manifest: &Manifest) -> bool {
+    const ROOT_HOOKS: [&str; 7] = [
+        "preinstall",
+        "install",
+        "postinstall",
+        "prepublish",
+        "preprepare",
+        "prepare",
+        "postprepare",
+    ];
+    ROOT_HOOKS
+        .iter()
+        .any(|h| manifest.scripts.get(*h).is_some_and(|cmd| !cmd.is_empty()))
+}
+
+fn spawn_populate_cas_from_installed(
+    pack_store: Arc<PackStore>,
+    loc_base_dir: PathBuf,
+    pkgs: Vec<(String, String)>,
+) {
+    if pkgs.is_empty() {
+        return;
+    }
+    std::thread::spawn(move || {
+        let mut cas_copy_list = Vec::new();
+        for (loc, integrity_str) in pkgs {
+            if let Ok(Some(pack)) = pack_store.get_package_pack(&integrity_str) {
+                for entry in &pack.index.files {
+                    if let Some(ref cas_path) = entry.cas_path {
+                        if !cas_path.metadata().is_ok_and(|m| m.len() == entry.size) {
+                            cas_copy_list.push((
+                                loc_base_dir.join(&loc).join(&entry.path),
+                                cas_path.clone(),
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        if !cas_copy_list.is_empty() {
+            pack_store.populate_cas_from_installed(&cas_copy_list);
+        }
+    });
+}
+
+fn manifest_has_warnable_scripts(manifest: &Manifest, pkg_is_registry: bool) -> bool {
+    manifest.scripts.contains_key("preinstall")
+        || manifest.scripts.contains_key("install")
+        || manifest.scripts.contains_key("postinstall")
+        || (!pkg_is_registry && manifest.scripts.contains_key("prepare"))
+}
+
+fn compute_top_level_funding_count(
+    options: &InstallOptions,
+    lockfile: &LockfileV3,
+    loc_base_dir: &Path,
+    platform_skipped: Option<&HashSet<String>>,
+    checked_funding_pkgs: &HashMap<String, bool>,
+    in_memory_manifests: &HashMap<String, Manifest>,
+) -> usize {
+    let mut count = 0usize;
+    for (pkg_key, pkg_info) in &lockfile.packages {
+        if !is_top_level_nm_pkg(pkg_key) {
+            continue;
+        }
+        if platform_skipped.is_some_and(|s| s.contains(pkg_key)) {
+            continue;
+        }
+        if lockfile_entry_omitted(options, lockfile, pkg_key, pkg_info) {
+            continue;
+        }
+        if let Some(&has_funding) = checked_funding_pkgs.get(pkg_key) {
+            if has_funding {
+                count += 1;
+            }
+        } else if let Some(m) = in_memory_manifests.get(pkg_key) {
+            if m.extra.contains_key("funding") {
+                count += 1;
+            }
+        } else if std::fs::read(loc_base_dir.join(pkg_key).join("package.json"))
+            .is_ok_and(|b| bytes_has_funding_field(&b))
+        {
+            count += 1;
+        }
+    }
+    count
+}
+
+fn has_unsatisfied_peer_dependency(graph: &DependencyGraph) -> bool {
+    use rnpm_solver::graph::DependencyType;
+    for edge in &graph.edges {
+        if !matches!(
+            edge.dep_type,
+            DependencyType::Peer | DependencyType::PeerOptional
+        ) {
+            continue;
+        }
+        let Some(current) = graph.nodes.get(&edge.to_location) else {
+            continue;
+        };
+        let Ok(spec) =
+            rnpm_solver::aliases::DependencySpec::parse(&edge.install_name, &edge.spec)
+        else {
+            continue;
+        };
+        if !rnpm_solver::hoisting::node_satisfies_target(current, &spec.target) {
+            return true;
+        }
+    }
+    false
 }
 
 /// npm's reify diff for an ideal lockfile, treating omitted and
@@ -3224,6 +3462,60 @@ impl Installer {
         legacy_lock::hydrate_old_lockfile(self.registry_client(), lockfile, skip_names).await
     }
 
+    fn warn_unreviewed_scripts_for_hot_noop(
+        &self,
+        actual: &LockfileV3,
+        root_manifest: &Manifest,
+        cached_script_locs: Option<&Option<Vec<String>>>,
+    ) {
+        if self.options.ignore_scripts || self.options.silent {
+            return;
+        }
+        if let Some(Some(script_locs)) = cached_script_locs {
+            if script_locs.is_empty() {
+                return;
+            }
+            let ws_paths: HashSet<String> = if root_manifest.workspaces.is_some() {
+                discover_workspaces_from_manifest(&self.options.project_dir, root_manifest)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|m| m.relative_path)
+                    .collect()
+            } else {
+                HashSet::new()
+            };
+            let script_set: HashSet<&str> = script_locs.iter().map(String::as_str).collect();
+            let no_script_locations: HashSet<String> = actual
+                .packages
+                .keys()
+                .filter(|loc| !loc.is_empty() && !script_set.contains(loc.as_str()))
+                .cloned()
+                .collect();
+            self.warn_unreviewed_scripts_with_workspaces_and_hints(
+                actual,
+                &self.options.project_dir,
+                &ws_paths,
+                None,
+                (!no_script_locations.is_empty()).then_some(&no_script_locations),
+            );
+            return;
+        }
+        let ws_paths = if root_manifest.workspaces.is_some() {
+            discover_workspaces_from_manifest(&self.options.project_dir, root_manifest)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|m| m.relative_path)
+                .collect()
+        } else {
+            HashSet::new()
+        };
+        self.warn_unreviewed_scripts_with_workspaces(
+            actual,
+            &self.options.project_dir,
+            &ws_paths,
+        );
+    }
+
     /// npm's post-reify advisory about install scripts the allowScripts
     /// policy does not cover.
     fn warn_unreviewed_scripts_with_workspaces(
@@ -3232,15 +3524,49 @@ impl Installer {
         base_dir: &Path,
         workspace_paths: &HashSet<String>,
     ) {
+        self.warn_unreviewed_scripts_with_workspaces_and_manifests(
+            lockfile,
+            base_dir,
+            workspace_paths,
+            None,
+        );
+    }
+
+    fn warn_unreviewed_scripts_with_workspaces_and_manifests(
+        &self,
+        lockfile: &LockfileV3,
+        base_dir: &Path,
+        workspace_paths: &HashSet<String>,
+        known_manifests: Option<&HashMap<String, Manifest>>,
+    ) {
+        self.warn_unreviewed_scripts_with_workspaces_and_hints(
+            lockfile,
+            base_dir,
+            workspace_paths,
+            known_manifests,
+            None,
+        );
+    }
+
+    fn warn_unreviewed_scripts_with_workspaces_and_hints(
+        &self,
+        lockfile: &LockfileV3,
+        base_dir: &Path,
+        workspace_paths: &HashSet<String>,
+        known_manifests: Option<&HashMap<String, Manifest>>,
+        no_script_locations: Option<&HashSet<String>>,
+    ) {
         if self.options.ignore_scripts || self.options.silent {
             return;
         }
-        if let Some(message) = policy::unreviewed_scripts_warning(
+        if let Some(message) = policy::unreviewed_scripts_warning_with_hints(
             lockfile,
             base_dir,
             workspace_paths,
             &self.script_policy,
             self.options.is_global,
+            known_manifests,
+            no_script_locations,
         ) {
             eprintln!("{message}");
         }
@@ -3485,10 +3811,120 @@ impl Installer {
         res
     }
 
-    async fn install_internal(&mut self) -> Result<InstallSummary> {
-        if !self.options.dry_run {
-            crate::trash::cleanup_leftover_trash(&self.options.project_dir);
+    /// Synchronously handle a clean no-op install when inputs and hidden lockfile
+    /// match cached fingerprints, avoiding Tokio runtime startup overhead.
+    pub fn try_hot_noop_sync(&mut self) -> Result<Option<InstallSummary>> {
+        self.last_lockfile = None;
+        if self.options.is_global
+            || !self.options.packages.is_empty()
+            || self.options.force
+            || self.options.dry_run
+            || self.options.package_lock_only
+            || !self.options.unlocked_packages.is_empty()
+            || !self.options.vulnerability_constraints.is_empty()
+        {
+            return Ok(None);
         }
+
+        let collector = TimingCollector::new();
+        let plan_start = std::time::Instant::now();
+        let manifest_path = self.options.project_dir.join("package.json");
+        let Ok(pkg_json_bytes) = std::fs::read(&manifest_path) else {
+            return Ok(None);
+        };
+        if !self
+            .options
+            .project_dir
+            .join(LockfileV3::HIDDEN_LOCKFILE_PATH)
+            .is_file()
+        {
+            return Ok(None);
+        }
+        let Some(stored_raw) = self.read_cached_project_fingerprint() else {
+            return Ok(None);
+        };
+        let (stored_fingerprint, cached_funding, cached_script_locs) =
+            parse_stored_fingerprint(&stored_raw);
+        let Ok(root_manifest_pre) = Manifest::from_slice_readonly(&pkg_json_bytes) else {
+            return Ok(None);
+        };
+        let Ok(current_fingerprint) = fast_path::compute_project_fingerprint_with_inputs(
+            &self.options.project_dir,
+            &self.options,
+            Some((&pkg_json_bytes, &root_manifest_pre)),
+            None,
+        ) else {
+            return Ok(None);
+        };
+        if current_fingerprint != stored_fingerprint {
+            return Ok(None);
+        }
+        let Some((actual, root_manifest)) = fast_path::validate_hidden_lockfile_loaded_with_root(
+            &self.options.project_dir,
+            Some(&self.options),
+            Some((&pkg_json_bytes, &root_manifest_pre)),
+        ) else {
+            return Ok(None);
+        };
+        let parsed_root = root_manifest.as_ref().unwrap_or(&root_manifest_pre);
+        let lockfile_path = project_lockfile_path(&self.options.project_dir);
+        let has_peer_deps = !self.options.legacy_peer_deps
+            && actual.packages.values().any(|p| {
+                p.peer_dependencies
+                    .as_ref()
+                    .is_some_and(|peers| !peers.is_empty())
+            });
+        let mut loaded_project_lock = None;
+        if has_peer_deps {
+            loaded_project_lock = LockfileV3::load_from_file_readonly(&lockfile_path).ok();
+            let peer_lock = if self.options.package_lock_enabled() {
+                loaded_project_lock.as_ref().unwrap_or(&actual)
+            } else {
+                &actual
+            };
+            let graph = peer_graph_from_lockfile(peer_lock, parsed_root);
+            if has_unsatisfied_peer_dependency(&graph) {
+                return Ok(None);
+            }
+        }
+        collector.record_phase(Phase::Plan, plan_start.elapsed());
+
+        if !self.options.ignore_scripts {
+            // Root install hooks need the async executor's SIGINT/SIGTERM process-group
+            // handling; fall back to the async install path when hooks must execute.
+            if root_has_install_hooks(parsed_root) {
+                return Ok(None);
+            }
+            self.warn_unreviewed_scripts_for_hot_noop(
+                &actual,
+                parsed_root,
+                cached_script_locs.as_ref(),
+            );
+        }
+
+        let inventory = actual.packages.len() + usize::from(!actual.packages.contains_key(""));
+        if let Some(proj_lock) = loaded_project_lock {
+            self.last_lockfile = Some(proj_lock);
+        } else if actual.packages.contains_key("") {
+            self.last_lockfile = Some(actual);
+        }
+
+        Ok(Some(InstallSummary {
+            reify: Some(ReifyReport {
+                changes: Vec::new(),
+                inventory,
+                peer_warnings: Vec::new(),
+            }),
+            packages_installed: 0,
+            cache_hits: 0,
+            cache_misses: 0,
+            lockfile_path,
+            timing: Some(self.finish_timing(&collector)),
+            funding_count: cached_funding,
+        }))
+    }
+
+    async fn install_internal(&mut self) -> Result<InstallSummary> {
         let collector = TimingCollector::new();
         let plan_start = std::time::Instant::now();
         let _plan_span = tracing::info_span!("plan").entered();
@@ -3501,6 +3937,7 @@ impl Installer {
             ));
         }
 
+        let mut known_hidden_invalid = false;
         // Fast path check when nothing changed (Milestone M2, fixes Bug B7)
         if self.options.packages.is_empty()
             && !self.options.force
@@ -3508,13 +3945,17 @@ impl Installer {
             && !self.options.package_lock_only
             && self.options.unlocked_packages.is_empty()
             && self.options.vulnerability_constraints.is_empty()
-            && self
+        {
+            if !self
                 .options
                 .project_dir
                 .join(LockfileV3::HIDDEN_LOCKFILE_PATH)
                 .is_file()
-        {
-            if let Some(stored_fingerprint) = self.read_cached_project_fingerprint() {
+            {
+                known_hidden_invalid = !self.options.is_global;
+            } else if let Some(stored_raw) = self.read_cached_project_fingerprint() {
+                let (stored_fingerprint, cached_funding, cached_script_locs) =
+                    parse_stored_fingerprint(&stored_raw);
                 if let Ok(current_fingerprint) =
                     compute_project_fingerprint(&self.options.project_dir, &self.options)
                 {
@@ -3528,21 +3969,6 @@ impl Installer {
                             drop(_plan_span);
                             collector.record_phase(Phase::Plan, plan_start.elapsed());
                             if !self.options.ignore_scripts && !self.options.is_global {
-                                let ws_paths = root_manifest
-                                    .as_ref()
-                                    .filter(|m| m.workspaces.is_some())
-                                    .and_then(|m| {
-                                        discover_workspaces_from_manifest(&self.options.project_dir, m).ok()
-                                    })
-                                    .unwrap_or_default()
-                                    .into_iter()
-                                    .map(|m| m.relative_path)
-                                    .collect();
-                                self.warn_unreviewed_scripts_with_workspaces(
-                                    &actual,
-                                    &self.options.project_dir,
-                                    &ws_paths,
-                                );
                                 let parsed_root = match root_manifest {
                                     Some(ref m) => m,
                                     None => {
@@ -3551,13 +3977,20 @@ impl Installer {
                                         ));
                                     }
                                 };
-                                let opts = self.lifecycle_options();
-                                let _life_guard = collector.enter_phase(Phase::Lifecycle);
-                                self.run_lifecycle_hooks(rnpm_lifecycle::execute_root_hooks(
+                                self.warn_unreviewed_scripts_for_hot_noop(
+                                    &actual,
                                     parsed_root,
-                                    &opts,
-                                ))
-                                .await?;
+                                    cached_script_locs.as_ref(),
+                                );
+                                if root_has_install_hooks(parsed_root) {
+                                    let opts = self.lifecycle_options();
+                                    let _life_guard = collector.enter_phase(Phase::Lifecycle);
+                                    self.run_lifecycle_hooks(rnpm_lifecycle::execute_root_hooks(
+                                        parsed_root,
+                                        &opts,
+                                    ))
+                                    .await?;
+                                }
                             }
                             let inventory =
                                 actual.packages.len() + usize::from(!actual.packages.contains_key(""));
@@ -3606,11 +4039,18 @@ impl Installer {
                                 cache_misses: 0,
                                 lockfile_path,
                                 timing: Some(self.finish_timing(&collector)),
+                                funding_count: cached_funding,
                             });
+                        } else if !self.options.is_global {
+                            known_hidden_invalid = true;
                         }
                     }
                 }
             }
+        }
+
+        if !self.options.dry_run {
+            crate::trash::cleanup_leftover_trash(&self.options.project_dir);
         }
 
         let mut manifest = if manifest_path.exists() && !self.options.is_global {
@@ -4523,6 +4963,7 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                 cache_misses: 0,
                 lockfile_path,
                 timing: Some(self.finish_timing(&collector)),
+                funding_count: None,
             });
         }
 
@@ -4642,6 +5083,7 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                 cache_misses: 0,
                 lockfile_path,
                 timing: Some(self.finish_timing(&collector)),
+                funding_count: None,
             });
         }
 
@@ -4672,6 +5114,7 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
         // reify_isolated reconciles that tree itself.
         let actual_lockfile_opt = if !self.options.force
             && self.options.install_strategy != InstallStrategy::Linked
+            && !(known_hidden_invalid && loc_base_dir == self.options.project_dir)
             && validate_hidden_lockfile(&loc_base_dir, Some(&self.options))
         {
             LockfileV3::load_from_file_readonly(&loc_base_dir.join(LockfileV3::HIDDEN_LOCKFILE_PATH)).ok()
@@ -4796,6 +5239,7 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                 cache_misses: 0,
                 lockfile_path,
                 timing: Some(collector.finish()),
+                funding_count: None,
             });
         }
 
@@ -4879,6 +5323,9 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
             }
         }
 
+        let nm_clean_slate = tree_diff_opt.is_none()
+            && !node_modules_dir.exists()
+            && !rnpm_fs::is_junction(&node_modules_dir).unwrap_or(false);
         let mut lifecycle_nodes: Vec<LifecyclePackageNode> = Vec::new();
         let mut packages_to_download = Vec::new();
 
@@ -5374,17 +5821,13 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
 
         let mut used_fast_materialize = false;
         let mut in_memory_manifests: HashMap<String, Manifest> = HashMap::new();
+        let mut checked_funding_pkgs: HashMap<String, bool> = HashMap::new();
+        let mut no_script_locations: HashSet<String> = HashSet::new();
         if all_packs_available {
             let t_mat = std::time::Instant::now();
             let mut all_dirs = std::collections::BTreeSet::new();
             all_dirs.insert(node_modules_dir.clone());
-            if self.options.bin_links {
-                all_dirs.insert(root_bin_dir.clone());
-            }
 
-            let nm_clean_slate = tree_diff_opt.is_none()
-                && !node_modules_dir.exists()
-                && !rnpm_fs::is_junction(&node_modules_dir).unwrap_or(false);
             for (loc, _) in &packages_to_download {
                 let pkg_target = loc_base_dir.join(loc);
                 if !(nm_clean_slate && loc.starts_with("node_modules/"))
@@ -5518,6 +5961,20 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                         for (idx, (loc, pkg_target, pack)) in loaded_packs.iter().enumerate() {
                             let node = &packages_to_download[idx].1;
                             if let Some(slice) = pack.get_file_slice("package.json") {
+                                if is_top_level_nm_pkg(loc) {
+                                    checked_funding_pkgs
+                                        .insert(loc.clone(), bytes_has_funding_field(slice));
+                                }
+                                let has_gyp = pack
+                                    .index
+                                    .files
+                                    .iter()
+                                    .any(|e| e.path.eq_ignore_ascii_case("binding.gyp"))
+                                    || pack
+                                        .index
+                                        .symlinks
+                                        .iter()
+                                        .any(|s| s.0.eq_ignore_ascii_case("binding.gyp"));
                                 if let Ok(pkg_manifest) = Manifest::from_slice_readonly(slice) {
                                     if !pkg_manifest.engines.is_empty()
                                         || !slice.windows(9).any(|w| w == b"\"engines\"")
@@ -5525,10 +5982,23 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                                         in_memory_manifests
                                             .insert(loc.clone(), pkg_manifest.clone());
                                     }
+                                    let pkg_is_registry = !node.flags.link
+                                        && node
+                                            .resolved
+                                            .as_deref()
+                                            .is_none_or(policy::is_registry_tarball);
                                     let has_install_script =
                                         pkg_manifest.scripts.contains_key("preinstall")
                                             || pkg_manifest.scripts.contains_key("install")
                                             || pkg_manifest.scripts.contains_key("postinstall");
+                                    if !has_gyp
+                                        && !manifest_has_warnable_scripts(
+                                            &pkg_manifest,
+                                            pkg_is_registry,
+                                        )
+                                    {
+                                        no_script_locations.insert(loc.clone());
+                                    }
                                     if has_install_script {
                                         lifecycle_nodes.push(LifecyclePackageNode {
                                             package_path: loc.clone(),
@@ -5556,6 +6026,8 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
             }
         }
 
+        let mut deferred_pack_tasks = AbortTasksOnDrop::new();
+        let run_pack_cancel = deferred_pack_tasks.cancel_flag();
         if !used_fast_materialize {
             let loc_base_dir_v = rnpm_fs::to_verbatim_path(&loc_base_dir);
             let mut dirs_to_precreate = Vec::with_capacity(packages_to_download.len() * 2 + 2);
@@ -5627,6 +6099,7 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                 let pkg_writer_cfg = Arc::clone(&writer_cfg);
                 let loc = loc.clone();
                 let node = node.clone();
+                let run_pack_cancel = Arc::clone(&run_pack_cancel);
 
                 join_set.spawn(async move {
                     let _active_permit = Arc::clone(&active_sem)
@@ -6081,14 +6554,24 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                     let need_pack = integ_for_pack
                         .as_deref()
                         .is_some_and(|i| !i.is_empty());
+                    let cancel_bg = Arc::clone(&run_pack_cancel);
                     let pack_task = if need_pack || cache_persist.is_some() {
                         let sem_bg = Arc::clone(&pack_persist_sem);
                         let ps_bg = Arc::clone(&pack_store);
                         Some(tokio::task::spawn(async move {
+                            if cancel_bg.load(std::sync::atomic::Ordering::Relaxed) {
+                                return Ok(());
+                            }
                             let _permit =
                                 sem_bg.acquire_owned().await.map_err(|e| anyhow!("{e}"))?;
+                            if cancel_bg.load(std::sync::atomic::Ordering::Relaxed) {
+                                return Ok(());
+                            }
                             tokio::task::spawn_blocking(move || {
                                 let _hold_permit = _permit;
+                                if cancel_bg.load(std::sync::atomic::Ordering::Relaxed) {
+                                    return Ok::<(), anyhow::Error>(());
+                                }
                                 let t_sw = std::time::Instant::now();
                                 if let Some((blob_arc, cache_bg, url_bg, exp_bg)) = cache_persist {
                                     let _ = cache_bg.put_with_integrity(
@@ -6185,58 +6668,27 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                 }
             }
 
+            deferred_pack_tasks.extend(all_pack_tasks);
             drop(pack_sender);
             if let Some(ref mut w) = pack_writer {
                 w.close_input();
             }
 
-            let (pack_res, writer_res) = tokio::join!(finish_pack_tasks(all_pack_tasks), async {
-                if let Some(writer) = pack_writer {
-                    let t_writer = std::time::Instant::now();
-                    tokio::task::spawn_blocking(move || writer.wait())
-                        .await
-                        .map_err(|e| anyhow!("File writer panicked: {e}"))?
-                        .map_err(|e| anyhow!("Failed to write package files: {e}"))?;
-                    collector.record_phase(Phase::Materialize, t_writer.elapsed());
-                }
-                Ok::<(), anyhow::Error>(())
-            });
+            if let Some(writer) = pack_writer {
+                let t_writer = std::time::Instant::now();
+                tokio::task::spawn_blocking(move || writer.wait())
+                    .await
+                    .map_err(|e| anyhow!("File writer panicked: {e}"))?
+                    .map_err(|e| anyhow!("Failed to write package files: {e}"))?;
+                collector.record_phase(Phase::Materialize, t_writer.elapsed());
+            }
 
             if let Some(e) = first_err {
                 return Err(e);
             }
-            writer_res?;
-            pack_res?;
 
             for (link_path, target_path) in all_pending_symlinks {
                 let _ = rnpm_fs::create_link_or_copy(&link_path, &target_path);
-            }
-        }
-
-        // Fill CAS by copying from node_modules on 16 threads for cold installs (offloaded if eligible)
-        if !used_fast_materialize && self.pack_store().is_block_cloning_eligible(&loc_base_dir) {
-            let mut cas_copy_list = Vec::new();
-            for (loc, node) in &packages_to_download {
-                if let Some(ref integrity_str) = node.integrity {
-                    if !integrity_str.is_empty() {
-                        if let Ok(Some(pack)) = self.pack_store().get_package_pack(integrity_str) {
-                            for entry in &pack.index.files {
-                                if let Some(ref cas_path) = entry.cas_path {
-                                    if !cas_path.metadata().is_ok_and(|m| m.len() == entry.size) {
-                                        let src = loc_base_dir.join(loc).join(&entry.path);
-                                        cas_copy_list.push((src, cas_path.clone()));
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            if !cas_copy_list.is_empty() {
-                let ps = self.pack_store_arc();
-                std::thread::spawn(move || {
-                    ps.populate_cas_from_installed(&cas_copy_list);
-                });
             }
         }
 
@@ -6379,6 +6831,33 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
             if let Some(ref existing) = existing_lockfile_for_merge {
                 legacy_lock::restore_hydrated_entries(&mut lockfile, existing, &hydrated_locations);
             }
+        }
+
+        let pending_pack_tasks = deferred_pack_tasks.take();
+        if !pending_pack_tasks.is_empty() {
+            finish_pack_tasks(pending_pack_tasks).await?;
+            // Fill CAS by copying from node_modules on 16 threads for cold installs (offloaded if eligible)
+            if !used_fast_materialize && self.pack_store().is_block_cloning_eligible(&loc_base_dir)
+            {
+                let cas_pkgs: Vec<(String, String)> = packages_to_download
+                    .iter()
+                    .filter_map(|(loc, node)| {
+                        node.integrity
+                            .as_ref()
+                            .filter(|i| !i.is_empty())
+                            .map(|i| (loc.clone(), i.clone()))
+                    })
+                    .collect();
+                spawn_populate_cas_from_installed(
+                    self.pack_store_arc(),
+                    loc_base_dir.clone(),
+                    cas_pkgs,
+                );
+            }
+        }
+
+        {
+            let _lock_guard = collector.enter_phase(Phase::Lockfile);
             // 4. Write deterministic lockfile (only for local projects, not global prefix)
             if package_lock_enabled && !self.options.is_global && !self.options.no_save {
                 lockfile
@@ -6444,21 +6923,63 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
             .iter()
             .map(|m| m.relative_path.clone())
             .collect();
-        self.warn_unreviewed_scripts_with_workspaces(&lockfile, &loc_base_dir, &ws_paths);
+        self.warn_unreviewed_scripts_with_workspaces_and_hints(
+            &lockfile,
+            &loc_base_dir,
+            &ws_paths,
+            (!in_memory_manifests.is_empty()).then_some(&in_memory_manifests),
+            (!no_script_locations.is_empty()).then_some(&no_script_locations),
+        );
         if let Some(opts) = lifecycle_opts {
             let _life_guard = collector.enter_phase(Phase::Lifecycle);
-            if self.options.packages.is_empty() && !self.options.is_global {
+            if self.options.packages.is_empty() && !self.options.is_global && root_has_install_hooks(&manifest) {
                 self.run_lifecycle_hooks(rnpm_lifecycle::execute_root_hooks(&manifest, &opts)).await?;
             }
         }
+
+        let computed_funding_count = if nm_clean_slate
+            && used_fast_materialize
+            && !self.options.is_global
+        {
+            let platform_skipped =
+                lockfile_platform_skipped_packages(&lockfile, &self.options.platform());
+            Some(compute_top_level_funding_count(
+                &self.options,
+                &lockfile,
+                &loc_base_dir,
+                Some(&platform_skipped),
+                &checked_funding_pkgs,
+                &in_memory_manifests,
+            ))
+        } else {
+            None
+        };
+        let cached_script_locs: Option<Vec<String>> =
+            if nm_clean_slate && used_fast_materialize && !self.options.is_global {
+                Some(
+                    lockfile
+                        .packages
+                        .keys()
+                        .filter(|k| !k.is_empty() && !no_script_locations.contains(k.as_str()))
+                        .cloned()
+                        .collect(),
+                )
+            } else {
+                None
+            };
 
         if !self.options.dry_run && !self.options.package_lock_only {
             if let Ok(fingerprint) =
                 compute_project_fingerprint(&self.options.project_dir, &self.options)
             {
+                let stored = format_stored_fingerprint(
+                    &fingerprint,
+                    computed_funding_count,
+                    cached_script_locs.as_deref(),
+                );
                 let _ = self
                     .cache()
-                    .set_project_fingerprint(&self.options.project_dir, &fingerprint);
+                    .set_project_fingerprint(&self.options.project_dir, &stored);
             }
         }
 
@@ -6472,6 +6993,7 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
             cache_misses,
             lockfile_path,
             timing: Some(self.finish_timing(&collector)),
+            funding_count: computed_funding_count,
         })
     }
 
@@ -6869,6 +7391,7 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                 cache_misses: 0,
                 lockfile_path,
                 timing: Some(self.finish_timing(&collector)),
+                funding_count: None,
             });
         }
 
@@ -6901,9 +7424,6 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
             fast_trash_wipe_dir(&node_modules_dir)?;
         }
         std::fs::create_dir_all(&node_modules_dir)?;
-        if self.options.bin_links {
-            std::fs::create_dir_all(&bin_dir)?;
-        }
 
         // Pre-create parent and bin directories upfront only for local links/file:/git
         // packages when precreating on a clean slate; registry packages handle their
@@ -6982,6 +7502,7 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                 cache_misses: 0,
                 lockfile_path: project_lockfile_path(&self.options.project_dir),
                 timing: Some(collector.finish()),
+                funding_count: None,
             });
         }
 
@@ -7463,20 +7984,21 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
         let ci_writer_cfg = Arc::new(custom_cfg);
 
         // Concurrently fetch tarballs and populate pack_store for any packages missing a pack
-        let missing_packs: Vec<(usize, String, String, String, bool)> = packages_to_process
+        let missing_packs: Vec<(usize, String, String, String, bool, bool)> = packages_to_process
             .iter()
             .enumerate()
             .filter(|(_, (_, _, integrity_str, _, _, _))| {
                 !integrity_str.is_empty() && !self.pack_store().has_package_pack(integrity_str)
             })
             .map(
-                |(i, (pkg_key, resolved_url, integrity_str, is_optional, _, _))| {
+                |(i, (pkg_key, resolved_url, integrity_str, is_optional, _, has_bins_or_scripts))| {
                     (
                         i,
                         pkg_key.clone(),
                         resolved_url.clone(),
                         integrity_str.clone(),
                         *is_optional,
+                        *has_bins_or_scripts,
                     )
                 },
             )
@@ -7484,16 +8006,19 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
 
         let mut missing_pack_results: HashMap<usize, bool> = HashMap::new();
         let mut failed_optional_indices: HashSet<usize> = HashSet::new();
+        let mut in_memory_manifests: HashMap<String, Manifest> = HashMap::new();
+        let mut no_script_locations: HashSet<String> = HashSet::new();
+        let mut checked_funding_pkgs: HashMap<String, bool> = HashMap::new();
+        let mut deferred_pack_tasks = AbortTasksOnDrop::new();
+        let ci_pack_cancel = deferred_pack_tasks.cancel_flag();
 
         if !missing_packs.is_empty() {
             let t_missing_start = std::time::Instant::now();
             let node_modules_dir_v = rnpm_fs::to_verbatim_path(&node_modules_dir);
-            let bin_dir_v = rnpm_fs::to_verbatim_path(&bin_dir);
-            let mut dirs_to_precreate = Vec::with_capacity(missing_packs.len() * 2 + 2);
+            let mut dirs_to_precreate = Vec::with_capacity(missing_packs.len() * 2 + 1);
             dirs_to_precreate.push(node_modules_dir_v.clone());
-            dirs_to_precreate.push(bin_dir_v.clone());
             let loc_base_dir_v = rnpm_fs::to_verbatim_path(&loc_base_dir);
-            for (_, pkg_key, _, _, is_optional) in &missing_packs {
+            for (_, pkg_key, _, _, is_optional, _) in &missing_packs {
                 if *is_optional {
                     continue;
                 }
@@ -7509,7 +8034,7 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                 dirs_to_precreate.push(target);
             }
             let dir_refs: Vec<&Path> = dirs_to_precreate.iter().map(|p| p.as_path()).collect();
-            let _ = rnpm_fs::writer::precreate_directories(dir_refs);
+            let _ = precreate_directories(dir_refs);
 
             let timing_debug = std::env::var_os("RNPM_TIMING_DEBUG").is_some();
             let tm_nm_count = Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -7529,7 +8054,9 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
             let mut async_writer = rnpm_fs::AsyncFileWriter::spawn().ok();
             let writer_sender = async_writer.as_ref().map(|w| w.sender());
 
-            for (idx, pkg_key, resolved_url, integrity_str, is_optional) in &missing_packs {
+            for (idx, pkg_key, resolved_url, integrity_str, is_optional, has_bins_or_scripts) in
+                &missing_packs
+            {
                 let sem = Arc::clone(&semaphore);
                 let active_sem = Arc::clone(&active_semaphore);
                 let cpu_sem = Arc::clone(&cpu_semaphore);
@@ -7546,6 +8073,12 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                 let resolved_url = resolved_url.clone();
                 let integrity_str = integrity_str.clone();
                 let is_optional = *is_optional;
+                let parse_manifest_in_mem = *has_bins_or_scripts;
+                let pkg_is_registry = lockfile.packages.get(pkg_key.as_str()).is_none_or(|p| {
+                    p.link != Some(true)
+                        && p.resolved.as_deref().is_none_or(policy::is_registry_tarball)
+                });
+                let cancel_bg = Arc::clone(&ci_pack_cancel);
                 let writer_sender_clone = writer_sender.clone();
                 let tm_nm_count = Arc::clone(&tm_nm_count);
                 let tm_nm_bytes = Arc::clone(&tm_nm_bytes);
@@ -7765,6 +8298,36 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                                 }
                             }
 
+                            let pkg_json_target = pkg_target.join("package.json");
+                            let has_binding_gyp = decoded.files.iter().any(|f| {
+                                f.path.parent() == Some(pkg_target.as_path())
+                                    && f.path
+                                        .file_name()
+                                        .and_then(|n| n.to_str())
+                                        .is_some_and(|n| n.eq_ignore_ascii_case("binding.gyp"))
+                            }) || decoded.symlinks.iter().any(|(link, _)| {
+                                link.parent() == Some(pkg_target.as_path())
+                                    && link
+                                        .file_name()
+                                        .and_then(|n| n.to_str())
+                                        .is_some_and(|n| n.eq_ignore_ascii_case("binding.gyp"))
+                            });
+                            let pkg_json_file =
+                                decoded.files.iter().find(|f| f.path == pkg_json_target);
+                            let has_funding = is_top_level_nm_pkg(&pkg_key_for_pack)
+                                && pkg_json_file
+                                    .is_some_and(|f| bytes_has_funding_field(&f.data));
+                            let has_no_scripts = !has_binding_gyp
+                                && pkg_json_file.is_some_and(|f| {
+                                    !policy::may_have_install_scripts(&f.data, pkg_is_registry)
+                                });
+                            let in_mem_manifest = if parse_manifest_in_mem {
+                                pkg_json_file
+                                    .and_then(|f| Manifest::from_slice_readonly(&f.data).ok())
+                            } else {
+                                None
+                            };
+
                             if let Some(ref sender) = writer_sender_clone {
                                 if timing_debug {
                                     let now_ms = t_missing_start.elapsed().as_millis() as u64;
@@ -7790,14 +8353,14 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                                 }
                             }
 
-                            Ok::<(rnpm_cache::DecodedPackage, PathBuf), anyhow::Error>((decoded, pkg_target))
+                            Ok::<(rnpm_cache::DecodedPackage, PathBuf, Option<Manifest>, bool, bool), anyhow::Error>((decoded, pkg_target, in_mem_manifest, has_no_scripts, has_funding))
                         })
                         .await
                         .map_err(|e| anyhow!("decode worker panicked: {e}"))?
                     };
 
-                    let (decoded, pkg_target) = match decoded_res {
-                        Ok(pair) => pair,
+                    let (decoded, pkg_target, in_mem_manifest, has_no_scripts, has_funding) = match decoded_res {
+                        Ok(tuple) => tuple,
                         Err(e) => {
                             if is_optional {
                                 warn!("npm warn optional SKIPPING OPTIONAL DEPENDENCY: Failed to decode {pkg_key}: {e}");
@@ -7809,14 +8372,26 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                     };
 
                     let symlinks = decoded.symlinks.clone();
+                    let funding_entry = is_top_level_nm_pkg(&pkg_key).then_some((pkg_key.clone(), has_funding));
+                    let manifest_entry = in_mem_manifest.map(|m| (pkg_key.clone(), m));
+                    let no_scripts_entry = has_no_scripts.then(|| pkg_key.clone());
                     drop(_active_permit);
                     let pack_task = tokio::task::spawn(async move {
+                        if cancel_bg.load(std::sync::atomic::Ordering::Relaxed) {
+                            return Ok(());
+                        }
                         let _permit = pack_persist_sem
                             .acquire_owned()
                             .await
                             .map_err(|e| anyhow!("{e}"))?;
+                        if cancel_bg.load(std::sync::atomic::Ordering::Relaxed) {
+                            return Ok(());
+                        }
                         tokio::task::spawn_blocking(move || {
                             let _hold_permit = _permit;
+                            if cancel_bg.load(std::sync::atomic::Ordering::Relaxed) {
+                                return Ok::<(), anyhow::Error>(());
+                            }
                             let populate_cas = false;
                             if !integrity_str.is_empty() {
                                 pack_store
@@ -7847,7 +8422,15 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                         .map_err(|e| anyhow!("pack worker panicked: {e}"))?
                     });
 
-                    Ok(Some((idx, was_hit, symlinks, pack_task)))
+                    Ok(Some((
+                        idx,
+                        was_hit,
+                        manifest_entry,
+                        no_scripts_entry,
+                        funding_entry,
+                        symlinks,
+                        pack_task,
+                    )))
                 });
             }
 
@@ -7856,8 +8439,25 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
             let mut first_producer_err: Option<anyhow::Error> = None;
             while let Some(join_res) = join_set.join_next().await {
                 match join_res {
-                    Ok(Ok(Some((idx, was_hit, symlinks, pack_task)))) => {
+                    Ok(Ok(Some((
+                        idx,
+                        was_hit,
+                        manifest_entry,
+                        no_scripts_entry,
+                        funding_entry,
+                        symlinks,
+                        pack_task,
+                    )))) => {
                         missing_pack_results.insert(idx, was_hit);
+                        if let Some((pkg_key, m)) = manifest_entry {
+                            in_memory_manifests.insert(pkg_key, m);
+                        }
+                        if let Some(pkg_key) = no_scripts_entry {
+                            no_script_locations.insert(pkg_key);
+                        }
+                        if let Some((pkg_key, has_funding)) = funding_entry {
+                            checked_funding_pkgs.insert(pkg_key, has_funding);
+                        }
                         all_pending_symlinks.extend(symlinks);
                         all_pack_tasks.push(pack_task);
                     }
@@ -7876,80 +8476,56 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                 }
             }
             let t_producer_done = t_missing_start.elapsed();
+            deferred_pack_tasks.extend(all_pack_tasks);
 
             if let Some(ref mut w) = async_writer {
                 w.close_input();
             }
 
-            let tm_pack_done = std::sync::atomic::AtomicU64::new(0);
-            let (pack_res, writer_res) = tokio::join!(
-                async {
-                    let t_p = std::time::Instant::now();
-                    let result = finish_pack_tasks(all_pack_tasks).await;
-                    let p_done_ms = t_missing_start.elapsed().as_millis() as u64;
-                    tm_pack_done.store(p_done_ms, std::sync::atomic::Ordering::Relaxed);
-                    if timing_debug {
-                        eprintln!(
-                            "[TIMING_PROFILE] pack tasks finish wait: {:.2}s",
-                            t_p.elapsed().as_secs_f64()
-                        );
-                    }
-                    result
-                },
-                async {
-                    if let Some(w) = async_writer {
-                        let t_w = std::time::Instant::now();
-                        tokio::task::spawn_blocking(move || {
-                            w.wait().map_err(|e| anyhow!("AsyncFileWriter failed: {e}"))
-                        })
-                        .await
-                        .map_err(|e| anyhow!("AsyncFileWriter panicked: {e}"))??;
-                        collector.record_phase(Phase::Materialize, t_w.elapsed());
-                        let t_writer_done = t_missing_start.elapsed();
-                        if timing_debug {
-                            eprintln!(
-                                "[TIMING_PROFILE] async_writer finish wait: {:.2}s",
-                                t_w.elapsed().as_secs_f64()
-                            );
-                            eprintln!("[TIMING_PROFILE] missing_packs timeline:");
-                            eprintln!(
-                                "[TIMING_PROFILE]   first enqueue:        {:>7} ms",
-                                tm_first_enqueue.load(std::sync::atomic::Ordering::Relaxed)
-                            );
-                            eprintln!(
-                                "[TIMING_PROFILE]   last enqueue:         {:>7} ms",
-                                tm_last_enqueue.load(std::sync::atomic::Ordering::Relaxed)
-                            );
-                            eprintln!(
-                                "[TIMING_PROFILE]   producer finished:    {:>7.1} ms",
-                                t_producer_done.as_secs_f64() * 1000.0
-                            );
-                            eprintln!(
-                                "[TIMING_PROFILE]   writer finished:      {:>7.1} ms",
-                                t_writer_done.as_secs_f64() * 1000.0
-                            );
-                            eprintln!(
-                                "[TIMING_PROFILE]   pack tasks finished:  {:>7} ms",
-                                tm_pack_done.load(std::sync::atomic::Ordering::Relaxed)
-                            );
-                            eprintln!("[TIMING_PROFILE] payload counts & bytes:");
-                            eprintln!(
-                                "[TIMING_PROFILE]   node_modules files:   {:>7} ({:.1} MiB)",
-                                tm_nm_count.load(std::sync::atomic::Ordering::Relaxed),
-                                tm_nm_bytes.load(std::sync::atomic::Ordering::Relaxed) as f64
-                                    / 1024.0
-                                    / 1024.0
-                            );
-                        }
-                    }
-                    Ok::<(), anyhow::Error>(())
+            if let Some(w) = async_writer {
+                let t_w = std::time::Instant::now();
+                tokio::task::spawn_blocking(move || {
+                    w.wait().map_err(|e| anyhow!("AsyncFileWriter failed: {e}"))
+                })
+                .await
+                .map_err(|e| anyhow!("AsyncFileWriter panicked: {e}"))??;
+                collector.record_phase(Phase::Materialize, t_w.elapsed());
+                let t_writer_done = t_missing_start.elapsed();
+                if timing_debug {
+                    eprintln!(
+                        "[TIMING_PROFILE] async_writer finish wait: {:.2}s",
+                        t_w.elapsed().as_secs_f64()
+                    );
+                    eprintln!("[TIMING_PROFILE] missing_packs timeline:");
+                    eprintln!(
+                        "[TIMING_PROFILE]   first enqueue:        {:>7} ms",
+                        tm_first_enqueue.load(std::sync::atomic::Ordering::Relaxed)
+                    );
+                    eprintln!(
+                        "[TIMING_PROFILE]   last enqueue:         {:>7} ms",
+                        tm_last_enqueue.load(std::sync::atomic::Ordering::Relaxed)
+                    );
+                    eprintln!(
+                        "[TIMING_PROFILE]   producer finished:    {:>7.1} ms",
+                        t_producer_done.as_secs_f64() * 1000.0
+                    );
+                    eprintln!(
+                        "[TIMING_PROFILE]   writer finished:      {:>7.1} ms",
+                        t_writer_done.as_secs_f64() * 1000.0
+                    );
+                    eprintln!("[TIMING_PROFILE] payload counts & bytes:");
+                    eprintln!(
+                        "[TIMING_PROFILE]   node_modules files:   {:>7} ({:.1} MiB)",
+                        tm_nm_count.load(std::sync::atomic::Ordering::Relaxed),
+                        tm_nm_bytes.load(std::sync::atomic::Ordering::Relaxed) as f64
+                            / 1024.0
+                            / 1024.0
+                    );
                 }
-            );
+            }
             if let Some(err) = first_producer_err {
                 return Err(err);
             }
-            pack_res?;
-            writer_res?;
 
             for (link_path, target_path) in all_pending_symlinks {
                 rnpm_fs::create_link_or_copy(&link_path, &target_path).with_context(|| {
@@ -7969,7 +8545,7 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
             }
 
             if missing_pack_results.len() < missing_packs.len() {
-                for (idx, _, _, _, is_opt) in &missing_packs {
+                for (idx, _, _, _, is_opt, _) in &missing_packs {
                     if !missing_pack_results.contains_key(idx) && *is_opt {
                         failed_optional_indices.insert(*idx);
                     }
@@ -7990,7 +8566,8 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
         let all_direct_materialized = !missing_pack_results.is_empty()
             && missing_pack_results.len() == packages_to_process.len();
 
-        let all_packs_available = !packages_to_process.is_empty()
+        let all_packs_available = !all_direct_materialized
+            && !packages_to_process.is_empty()
             && if missing_packs.is_empty() {
                 packages_to_process
                     .iter()
@@ -8020,13 +8597,25 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
             {
                 let target_path = loc_base_dir.join(pkg_key);
                 if *has_bins_or_scripts {
-                    if let Some(l_node) = process_installed_pkg_manifest_without_bins(
-                        &target_path,
-                        pkg_key,
-                        resolved_url,
-                        declared_dependencies,
-                        *is_optional,
-                    ) {
+                    let found_node = if let Some(pkg_manifest) = in_memory_manifests.get(pkg_key) {
+                        lifecycle_node_for_manifest(
+                            &target_path,
+                            pkg_key,
+                            resolved_url,
+                            declared_dependencies,
+                            *is_optional,
+                            pkg_manifest.clone(),
+                        )
+                    } else {
+                        process_installed_pkg_manifest_without_bins(
+                            &target_path,
+                            pkg_key,
+                            resolved_url,
+                            declared_dependencies,
+                            *is_optional,
+                        )
+                    };
+                    if let Some(l_node) = found_node {
                         lifecycle_nodes.push(l_node);
                     }
                 }
@@ -8046,9 +8635,6 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
             let t_mat = std::time::Instant::now();
             let mut all_dirs = std::collections::BTreeSet::new();
             all_dirs.insert(rnpm_fs::to_verbatim_path(&node_modules_dir));
-            if self.options.bin_links {
-                all_dirs.insert(rnpm_fs::to_verbatim_path(&bin_dir));
-            }
 
             for (pkg_key, _, _, _, _, _) in &packages_to_process {
                 let pkg_target = loc_base_dir.join(pkg_key);
@@ -8213,9 +8799,31 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                                 },
                             )?;
                         }
+                        let pack_map: HashMap<&str, &rnpm_cache::PackagePack> = loaded_packs
+                            .iter()
+                            .map(|(k, _, p)| (k.as_str(), p))
+                            .collect();
                         if self.options.bin_links {
                             let t_bins = std::time::Instant::now();
-                            link_tree_bins(
+                            let mut bin_headers: HashMap<(String, String), &[u8]> =
+                                HashMap::with_capacity(known_bins.len() * 2);
+                            for (loc, entries) in &known_bins {
+                                if let Some(pack) = pack_map.get(loc.as_str()) {
+                                    for (_, script_rel) in entries {
+                                        let norm_rel = crate::link::norm_bin_rel(script_rel);
+                                        if let Some(slice) = pack
+                                            .get_file_slice(&norm_rel)
+                                            .or_else(|| pack.get_file_slice(script_rel))
+                                        {
+                                            bin_headers.insert(
+                                                (loc.clone(), norm_rel),
+                                                &slice[..slice.len().min(512)],
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                            link_tree_bins_with_headers(
                                 ci_tree_packages,
                                 Some(&known_bins),
                                 loc_base_ref,
@@ -8224,6 +8832,7 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                                 true,
                                 None,
                                 self.options.force,
+                                (!bin_headers.is_empty()).then_some(&bin_headers),
                             )?;
                             collector.record_phase(Phase::Bins, t_bins.elapsed());
                         } else {
@@ -8232,8 +8841,8 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                                 let ws_nm = loc_base_ref.join(&member.relative_path).join("node_modules");
                                 remove_all_bin_dirs(&ws_nm);
                             }
+                            clean_empty_bin_dirs(nm_dir_ref);
                         }
-                        clean_empty_bin_dirs(nm_dir_ref);
                         if save_hidden_needed {
                             let t_lock = std::time::Instant::now();
                             if self.options.omit_dev || self.options.omit_optional || self.options.omit_peer {
@@ -8246,7 +8855,7 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                         }
                     }
 
-                    // 4. Process lifecycle scripts directly from in-memory pack slices
+                    // 4. Process lifecycle scripts and manifest metadata directly from in-memory pack slices
                     let pack_map: HashMap<&str, &rnpm_cache::PackagePack> = loaded_packs
                         .iter()
                         .map(|(k, _, p)| (k.as_str(), p))
@@ -8262,11 +8871,45 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                     ) in &bin_packages
                     {
                         let target_path = loc_base_dir.join(pkg_key);
+                        let is_top_pkg = is_top_level_nm_pkg(pkg_key);
                         if *has_bins_or_scripts {
                             let mut found_node = None;
+                            let mut parsed_from_pack = false;
                             if let Some(pack) = pack_map.get(pkg_key.as_str()) {
                                 if let Some(slice) = pack.get_file_slice("package.json") {
-                                    if let Ok(pkg_manifest) = Manifest::from_slice(slice) {
+                                    if is_top_pkg {
+                                        checked_funding_pkgs
+                                            .insert(pkg_key.clone(), bytes_has_funding_field(slice));
+                                    }
+                                    let has_gyp = pack
+                                        .index
+                                        .files
+                                        .iter()
+                                        .any(|e| e.path.eq_ignore_ascii_case("binding.gyp"))
+                                        || pack
+                                            .index
+                                            .symlinks
+                                            .iter()
+                                            .any(|s| s.0.eq_ignore_ascii_case("binding.gyp"));
+                                    if let Ok(pkg_manifest) = Manifest::from_slice_readonly(slice) {
+                                        parsed_from_pack = true;
+                                        let pkg_is_registry =
+                                            lockfile.packages.get(pkg_key.as_str()).is_none_or(|p| {
+                                                p.link != Some(true)
+                                                    && p.resolved
+                                                        .as_deref()
+                                                        .is_none_or(policy::is_registry_tarball)
+                                            });
+                                        if !has_gyp
+                                            && !manifest_has_warnable_scripts(
+                                                &pkg_manifest,
+                                                pkg_is_registry,
+                                            )
+                                        {
+                                            no_script_locations.insert(pkg_key.clone());
+                                        }
+                                        in_memory_manifests
+                                            .insert(pkg_key.clone(), pkg_manifest.clone());
                                         found_node = lifecycle_node_for_manifest(
                                             &target_path,
                                             pkg_key,
@@ -8278,7 +8921,7 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                                     }
                                 }
                             }
-                            if found_node.is_none() {
+                            if !parsed_from_pack {
                                 found_node = process_installed_pkg_manifest_without_bins(
                                     &target_path,
                                     pkg_key,
@@ -8289,6 +8932,32 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
                             }
                             if let Some(l_node) = found_node {
                                 lifecycle_nodes.push(l_node);
+                            }
+                        } else if let Some(pack) = pack_map.get(pkg_key.as_str()) {
+                            let pkg_is_registry = lockfile.packages.get(pkg_key.as_str()).is_none_or(|p| {
+                                p.link != Some(true)
+                                    && p.resolved.as_deref().is_none_or(policy::is_registry_tarball)
+                            });
+                            let has_gyp = pack
+                                .index
+                                .files
+                                .iter()
+                                .any(|e| e.path.eq_ignore_ascii_case("binding.gyp"))
+                                || pack
+                                    .index
+                                    .symlinks
+                                    .iter()
+                                    .any(|s| s.0.eq_ignore_ascii_case("binding.gyp"));
+                            if let Some(slice) = pack.get_file_slice("package.json") {
+                                if is_top_pkg {
+                                    checked_funding_pkgs
+                                        .insert(pkg_key.clone(), bytes_has_funding_field(slice));
+                                }
+                                if !has_gyp
+                                    && !policy::may_have_install_scripts(slice, pkg_is_registry)
+                                {
+                                    no_script_locations.insert(pkg_key.clone());
+                                }
                             }
                         }
                         packages_installed += 1;
@@ -8621,28 +9290,21 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
             }
 
             // Fill CAS by copying from node_modules on 16 threads for cold installs (offloaded if eligible)
-            if self.pack_store().is_block_cloning_eligible(&loc_base_dir) {
-                let mut cas_copy_list = Vec::new();
-                for (pkg_key, _, integrity_str, _, _, _) in &packages_to_process {
-                    if !integrity_str.is_empty() {
-                        if let Ok(Some(pack)) = self.pack_store().get_package_pack(integrity_str) {
-                            for entry in &pack.index.files {
-                                if let Some(ref cas_path) = entry.cas_path {
-                                    if !cas_path.metadata().is_ok_and(|m| m.len() == entry.size) {
-                                        let src = loc_base_dir.join(pkg_key).join(&entry.path);
-                                        cas_copy_list.push((src, cas_path.clone()));
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                if !cas_copy_list.is_empty() {
-                    let ps = self.pack_store_arc();
-                    std::thread::spawn(move || {
-                        ps.populate_cas_from_installed(&cas_copy_list);
-                    });
-                }
+            if missing_packs.is_empty()
+                && self.pack_store().is_block_cloning_eligible(&loc_base_dir)
+            {
+                let cas_pkgs: Vec<(String, String)> = packages_to_process
+                    .iter()
+                    .filter(|(_, _, integrity_str, _, _, _)| !integrity_str.is_empty())
+                    .map(|(pkg_key, _, integrity_str, _, _, _)| {
+                        (pkg_key.clone(), integrity_str.clone())
+                    })
+                    .collect();
+                spawn_populate_cas_from_installed(
+                    self.pack_store_arc(),
+                    loc_base_dir.clone(),
+                    cas_pkgs,
+                );
             }
         }
 
@@ -8719,13 +9381,38 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
             None
         };
 
-        let root_bin = node_modules_dir.join(".bin");
-        if let Ok(mut bin_entries) = std::fs::read_dir(&root_bin) {
-            if bin_entries.next().is_none() {
-                let _ = std::fs::remove_dir(&root_bin);
+        if !self.options.bin_links {
+            clean_empty_bin_dirs(&node_modules_dir);
+        } else {
+            let root_bin = node_modules_dir.join(".bin");
+            if let Ok(mut bin_entries) = std::fs::read_dir(&root_bin) {
+                if bin_entries.next().is_none() {
+                    let _ = std::fs::remove_dir(&root_bin);
+                }
             }
         }
-        clean_empty_bin_dirs(&node_modules_dir);
+
+        let pending_pack_tasks = deferred_pack_tasks.take();
+        if !pending_pack_tasks.is_empty() {
+            finish_pack_tasks(pending_pack_tasks).await?;
+            // Fill CAS by copying from node_modules on 16 threads for cold installs (offloaded if eligible)
+            if missing_packs.is_empty()
+                && self.pack_store().is_block_cloning_eligible(&loc_base_dir)
+            {
+                let cas_pkgs: Vec<(String, String)> = packages_to_process
+                    .iter()
+                    .filter(|(_, _, integrity_str, _, _, _)| !integrity_str.is_empty())
+                    .map(|(pkg_key, _, integrity_str, _, _, _)| {
+                        (pkg_key.clone(), integrity_str.clone())
+                    })
+                    .collect();
+                spawn_populate_cas_from_installed(
+                    self.pack_store_arc(),
+                    loc_base_dir.clone(),
+                    cas_pkgs,
+                );
+            }
+        }
 
         // Persist hidden lockfile to node_modules/.package-lock.json unless package-lock is disabled
         let has_packages = lockfile.packages.keys().any(|k| !k.is_empty());
@@ -8746,19 +9433,59 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
             .iter()
             .map(|m| m.relative_path.clone())
             .collect();
-        self.warn_unreviewed_scripts_with_workspaces(&lockfile, &self.options.project_dir, &ws_paths);
+        self.warn_unreviewed_scripts_with_workspaces_and_hints(
+            &lockfile,
+            &self.options.project_dir,
+            &ws_paths,
+            (!in_memory_manifests.is_empty()).then_some(&in_memory_manifests),
+            (!no_script_locations.is_empty()).then_some(&no_script_locations),
+        );
         if let Some(opts) = lifecycle_opts {
             let _life_guard = collector.enter_phase(Phase::Lifecycle);
-            self.run_lifecycle_hooks(rnpm_lifecycle::execute_root_hooks(&manifest, &opts)).await?;
+            if root_has_install_hooks(&manifest) {
+                self.run_lifecycle_hooks(rnpm_lifecycle::execute_root_hooks(&manifest, &opts))
+                    .await?;
+            }
         }
+
+        let computed_funding_count =
+            if (used_fast_path || !missing_pack_results.is_empty()) && !self.options.is_global {
+                Some(compute_top_level_funding_count(
+                    &self.options,
+                    &lockfile,
+                    &loc_base_dir,
+                    Some(&platform_skipped_packages),
+                    &checked_funding_pkgs,
+                    &in_memory_manifests,
+                ))
+            } else {
+                None
+            };
+        let cached_script_locs: Option<Vec<String>> = if (used_fast_path || !missing_pack_results.is_empty()) && !self.options.is_global {
+            Some(
+                lockfile
+                    .packages
+                    .keys()
+                    .filter(|k| !k.is_empty() && !no_script_locations.contains(k.as_str()))
+                    .cloned()
+                    .collect(),
+            )
+        } else {
+            None
+        };
 
         if !self.options.dry_run && !self.options.package_lock_only {
             if let Ok(fingerprint) =
                 compute_project_fingerprint(&self.options.project_dir, &self.options)
             {
+                let stored = format_stored_fingerprint(
+                    &fingerprint,
+                    computed_funding_count,
+                    cached_script_locs.as_deref(),
+                );
                 let _ = self
                     .cache()
-                    .set_project_fingerprint(&self.options.project_dir, &fingerprint);
+                    .set_project_fingerprint(&self.options.project_dir, &stored);
             }
         }
 
@@ -8772,6 +9499,7 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
             cache_misses,
             lockfile_path,
             timing: Some(self.finish_timing(&collector)),
+            funding_count: computed_funding_count,
         })
     }
 
@@ -10576,6 +11304,11 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
         let mut opts = options.clone();
         opts.project_dir = self.options.project_dir.clone();
         let analysis = prune::discover_extraneous_packages(&self.options.project_dir, &opts)?;
+        self.prune_with_analysis(&analysis)
+    }
+
+    /// Executes pruning using a previously computed `PruneAnalysis` without re-scanning disk.
+    pub fn prune_with_analysis(&self, analysis: &PruneAnalysis) -> Result<PruneSummary> {
         let summary =
             prune::execute_prune(&self.options.project_dir, &analysis.extraneous_packages)?;
         if self.options.wait_for_trash || !self.options.detached_trash {

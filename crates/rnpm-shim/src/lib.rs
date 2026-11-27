@@ -1020,6 +1020,28 @@ pub fn create_shims_with_options(
     source_target: Option<&Path>,
     bin_dir_precreated: bool,
 ) -> Result<()> {
+    create_shims_with_preloaded_header(
+        bin_dir,
+        bin_name,
+        target_rel_from_node_modules,
+        force,
+        source_target,
+        bin_dir_precreated,
+        None,
+    )
+}
+
+/// Like `create_shims_with_options`, using an already-read target file header when provided.
+#[cfg(unix)]
+pub fn create_shims_with_preloaded_header(
+    bin_dir: &Path,
+    bin_name: &str,
+    target_rel_from_node_modules: &str,
+    force: bool,
+    source_target: Option<&Path>,
+    bin_dir_precreated: bool,
+    preloaded_header: Option<&[u8]>,
+) -> Result<()> {
     if !bin_dir_precreated {
         fs::create_dir_all(bin_dir)
             .with_context(|| format!("Failed to create bin dir {}", bin_dir.display()))?;
@@ -1034,7 +1056,23 @@ pub fn create_shims_with_options(
         return Ok(());
     }
 
-    let _ = normalize_shebang(&target_script);
+    let needs_shebang_normalize = match preloaded_header {
+        Some(header) => {
+            let clean = header.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(header);
+            if clean.starts_with(b"#!") {
+                match clean.iter().position(|&b| b == b'\n') {
+                    Some(nl_pos) => nl_pos > 0 && clean[nl_pos - 1] == b'\r',
+                    None => header.len() >= 512,
+                }
+            } else {
+                false
+            }
+        }
+        None => true,
+    };
+    if needs_shebang_normalize {
+        let _ = normalize_shebang(&target_script);
+    }
     use std::os::unix::fs::PermissionsExt;
     if let Ok(meta) = fs::metadata(&target_script) {
         let mut perms = meta.permissions();
@@ -1093,6 +1131,28 @@ pub fn create_shims_with_options(
     force: bool,
     source_target: Option<&Path>,
     bin_dir_precreated: bool,
+) -> Result<()> {
+    create_shims_with_preloaded_header(
+        bin_dir,
+        bin_name,
+        target_rel_from_node_modules,
+        force,
+        source_target,
+        bin_dir_precreated,
+        None,
+    )
+}
+
+/// Like `create_shims_with_options`, using an already-read target file header when provided.
+#[cfg(not(unix))]
+pub fn create_shims_with_preloaded_header(
+    bin_dir: &Path,
+    bin_name: &str,
+    target_rel_from_node_modules: &str,
+    force: bool,
+    source_target: Option<&Path>,
+    bin_dir_precreated: bool,
+    preloaded_header: Option<&[u8]>,
 ) -> Result<()> {
     use std::io::{Read, Write};
 
@@ -1231,7 +1291,33 @@ pub fn create_shims_with_options(
                 .map(|nm| nm.join(target_rel_from_node_modules)),
         };
         if let Some(target_path) = script_path {
-            let inspect = if source_target.is_some() {
+            let inspect = if let Some(header) = preloaded_header.filter(|_| source_target.is_some()) {
+                let clean = if header.starts_with(b"\xEF\xBB\xBF#!") {
+                    &header[3..]
+                } else if header.starts_with(b"#!") {
+                    header
+                } else {
+                    &[][..]
+                };
+                if clean.is_empty() && !header.starts_with(b"#!") && !header.starts_with(b"\xEF\xBB\xBF#!") {
+                    shebang::ShebangRead::NoShebang
+                } else if let Some(nl_pos) = clean.iter().position(|&b| b == b'\n') {
+                    if nl_pos > 0 && clean[nl_pos - 1] == b'\r' {
+                        // Normalize CRLF shebang line on disk just like the slow path.
+                        shebang::normalize_and_read_shebang_line(&target_path)
+                            .unwrap_or(shebang::ShebangRead::NotFile)
+                    } else {
+                        shebang::ShebangRead::Line(
+                            String::from_utf8_lossy(&clean[..nl_pos]).into_owned(),
+                        )
+                    }
+                } else if header.len() < 512 {
+                    shebang::ShebangRead::Line(String::from_utf8_lossy(clean).into_owned())
+                } else {
+                    shebang::normalize_and_read_shebang_line(&target_path)
+                        .unwrap_or(shebang::ShebangRead::NotFile)
+                }
+            } else if source_target.is_some() {
                 shebang::normalize_and_read_shebang_line(&target_path)
                     .unwrap_or(shebang::ShebangRead::NotFile)
             } else {

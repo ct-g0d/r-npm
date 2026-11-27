@@ -964,14 +964,55 @@ fn replace_kv_pairs(text: &str, key_name: &str) -> String {
 
 /// Concurrently drains a readable stream in chunks, applying credential scrubbing
 /// on streaming chunks to ensure child processes cannot stall from filled pipe buffers.
+fn utf8_incomplete_tail_len(bytes: &[u8]) -> usize {
+    let check_start = bytes.len().saturating_sub(4);
+    for idx in (check_start..bytes.len()).rev() {
+        let b = bytes[idx];
+        if b < 0x80 {
+            return 0;
+        }
+        if b >= 0xC0 {
+            let expected_len = if b < 0xE0 {
+                2
+            } else if b < 0xF0 {
+                3
+            } else {
+                4
+            };
+            let avail = bytes.len() - idx;
+            return if avail < expected_len { avail } else { 0 };
+        }
+    }
+    0
+}
+
+fn floor_char_boundary_idx(s: &str, mut idx: usize) -> usize {
+    idx = idx.min(s.len());
+    while idx > 0 && !s.is_char_boundary(idx) {
+        idx -= 1;
+    }
+    idx
+}
+
 pub fn drain_and_scrub_reader<R: std::io::Read>(reader: &mut R) -> String {
     let mut out = String::new();
-    let mut buf = vec![0u8; 64 * 1024];
+    let mut buf = [0u8; 8192];
+    let mut pending = [0u8; 4];
+    let mut pending_len = 0usize;
     let mut carry = String::new();
 
     loop {
-        match reader.read(&mut buf) {
+        let read_res = {
+            if pending_len > 0 {
+                buf[..pending_len].copy_from_slice(&pending[..pending_len]);
+            }
+            reader.read(&mut buf[pending_len..])
+        };
+        match read_res {
             Ok(0) => {
+                if pending_len > 0 {
+                    carry.push_str(&String::from_utf8_lossy(&pending[..pending_len]));
+                }
                 if !carry.is_empty() {
                     let scrubbed = scrub_text(&carry);
                     out.push_str(&scrubbed);
@@ -979,11 +1020,19 @@ pub fn drain_and_scrub_reader<R: std::io::Read>(reader: &mut R) -> String {
                 break;
             }
             Ok(n) => {
-                let chunk_str = String::from_utf8_lossy(&buf[..n]);
+                let total = pending_len + n;
+                let incomplete_tail = utf8_incomplete_tail_len(&buf[..total]);
+                let decode_end = total - incomplete_tail;
+                if incomplete_tail > 0 {
+                    pending[..incomplete_tail].copy_from_slice(&buf[decode_end..total]);
+                }
+                pending_len = incomplete_tail;
+
+                let chunk_str = String::from_utf8_lossy(&buf[..decode_end]);
                 let combined = format!("{carry}{chunk_str}");
 
                 if combined.len() > 512 {
-                    let split_candidate = combined.len() - 256;
+                    let split_candidate = floor_char_boundary_idx(&combined, combined.len() - 256);
                     let split_pos = match combined[..split_candidate].rfind(['\n', '\r', ' ', ';'])
                     {
                         Some(pos) => pos + 1,
@@ -1000,6 +1049,9 @@ pub fn drain_and_scrub_reader<R: std::io::Read>(reader: &mut R) -> String {
             }
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(_) => {
+                if pending_len > 0 {
+                    carry.push_str(&String::from_utf8_lossy(&pending[..pending_len]));
+                }
                 if !carry.is_empty() {
                     let scrubbed = scrub_text(&carry);
                     out.push_str(&scrubbed);
@@ -2739,6 +2791,14 @@ fn resolve_executable_in_env(
                     return Some(node_path.clone());
                 }
             }
+            // Avoid probing unrelated PATH directories when searching specifically for node.exe
+            // before reaching the directory where node.exe lives unless .exe/.cmd/.bat could exist.
+            if prog.eq_ignore_ascii_case("node.exe") {
+                if search_dir.join("node.exe").is_file() {
+                    return Some(search_dir.join("node.exe"));
+                }
+                continue;
+            }
         }
         if let Some(found) = probe_dir(&search_dir, prog) {
             return Some(found);
@@ -3042,39 +3102,84 @@ pub fn execute_lifecycle_script(ctx: &LifecycleContext) -> Result<ExitStatus> {
 
     let effective_timeout = ctx.timeout.or(ctx.sandbox_policy.max_execution_time);
     let status = if let Some(timeout) = effective_timeout {
-        let start = std::time::Instant::now();
-        let poll_interval = std::time::Duration::from_millis(10);
-        loop {
-            match child.try_wait().with_context(|| {
-                format!("Failed to poll lifecycle script for {}", ctx.package_name)
-            })? {
-                Some(status) => break status,
-                None => {
-                    if start.elapsed() >= timeout {
-                        warn!(
-                            "Lifecycle script '{}' timed out after {:?}; terminating process tree for {}",
-                            ctx.event, timeout, ctx.package_name
-                        );
-                        if let Some(ref g) = guard {
-                            g.terminate(124);
+        #[cfg(windows)]
+        {
+            use std::os::windows::io::AsRawHandle;
+            extern "system" {
+                fn WaitForSingleObject(hHandle: *mut std::ffi::c_void, dwMilliseconds: u32) -> u32;
+            }
+            const WAIT_TIMEOUT: u32 = 0x0000_0102;
+            let timeout_ms = timeout.as_millis().min((u32::MAX - 1) as u128) as u32;
+            let wait_res = unsafe { WaitForSingleObject(child.as_raw_handle(), timeout_ms) };
+            if wait_res == WAIT_TIMEOUT {
+                warn!(
+                    "Lifecycle script '{}' timed out after {:?}; terminating process tree for {}",
+                    ctx.event, timeout, ctx.package_name
+                );
+                if let Some(ref g) = guard {
+                    g.terminate(124);
+                }
+                let _ = child.kill();
+                let _ = child.wait();
+                if let Some(handle) = stdout_handle {
+                    let _ = handle.join();
+                }
+                if let Some(handle) = stderr_handle {
+                    let _ = handle.join();
+                }
+                return Err(anyhow::Error::from(ScriptExitError {
+                    exit_code: 124,
+                    message: format!(
+                        "Lifecycle script '{}' timed out after {:?}",
+                        ctx.event, timeout
+                    ),
+                }));
+            }
+            child.wait().with_context(|| {
+                format!(
+                    "Failed to wait for lifecycle script for {}",
+                    ctx.package_name
+                )
+            })?
+        }
+        #[cfg(not(windows))]
+        {
+            let start = std::time::Instant::now();
+            let mut poll_interval = std::time::Duration::from_millis(1);
+            loop {
+                match child.try_wait().with_context(|| {
+                    format!("Failed to poll lifecycle script for {}", ctx.package_name)
+                })? {
+                    Some(status) => break status,
+                    None => {
+                        if start.elapsed() >= timeout {
+                            warn!(
+                                "Lifecycle script '{}' timed out after {:?}; terminating process tree for {}",
+                                ctx.event, timeout, ctx.package_name
+                            );
+                            if let Some(ref g) = guard {
+                                g.terminate(124);
+                            }
+                            let _ = child.kill();
+                            let _ = child.wait();
+                            if let Some(handle) = stdout_handle {
+                                let _ = handle.join();
+                            }
+                            if let Some(handle) = stderr_handle {
+                                let _ = handle.join();
+                            }
+                            return Err(anyhow::Error::from(ScriptExitError {
+                                exit_code: 124,
+                                message: format!(
+                                    "Lifecycle script '{}' timed out after {:?}",
+                                    ctx.event, timeout
+                                ),
+                            }));
                         }
-                        let _ = child.kill();
-                        let _ = child.wait();
-                        if let Some(handle) = stdout_handle {
-                            let _ = handle.join();
-                        }
-                        if let Some(handle) = stderr_handle {
-                            let _ = handle.join();
-                        }
-                        return Err(anyhow::Error::from(ScriptExitError {
-                            exit_code: 124,
-                            message: format!(
-                                "Lifecycle script '{}' timed out after {:?}",
-                                ctx.event, timeout
-                            ),
-                        }));
+                        let remaining = timeout.saturating_sub(start.elapsed());
+                        std::thread::sleep(poll_interval.min(remaining));
+                        poll_interval = (poll_interval * 2).min(std::time::Duration::from_millis(10));
                     }
-                    std::thread::sleep(poll_interval);
                 }
             }
         }
@@ -3682,6 +3787,67 @@ pub fn collect_ancestor_bin_dirs(start_dir: &Path) -> Vec<PathBuf> {
     entries
 }
 
+#[cfg(windows)]
+fn build_binary_command_windows(
+    binary_path: &Path,
+    args: &[String],
+    current_dir: &Path,
+    env: &HashMap<String, String>,
+) -> Command {
+    use std::io::Read;
+    let ext = binary_path
+        .extension()
+        .and_then(|s| s.to_str())
+        .unwrap_or("");
+    if ext.eq_ignore_ascii_case("cmd") || ext.eq_ignore_ascii_case("bat") {
+        if ext.eq_ignore_ascii_case("cmd") {
+            if let Some(cmd) = try_unwrap_node_cmd_shim(binary_path, args, current_dir, env) {
+                return cmd;
+            }
+        }
+        let mut c = Command::new("cmd.exe");
+        c.arg("/c").arg(binary_path);
+        c.args(args);
+        return c;
+    }
+    if ext.eq_ignore_ascii_case("ps1") {
+        let mut c = Command::new("powershell.exe");
+        c.args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"]);
+        c.arg(binary_path);
+        c.args(args);
+        return c;
+    }
+    let is_js = ext.eq_ignore_ascii_case("js")
+        || ext.eq_ignore_ascii_case("cjs")
+        || ext.eq_ignore_ascii_case("mjs");
+    let has_shebang = if !is_js
+        && !ext.eq_ignore_ascii_case("exe")
+        && !ext.eq_ignore_ascii_case("com")
+    {
+        if let Ok(mut f) = std::fs::File::open(binary_path) {
+            let mut prefix = [0u8; 5];
+            let n = f.read(&mut prefix).unwrap_or(0);
+            let head = &prefix[..n];
+            head.starts_with(b"#!") || head.starts_with(b"\xEF\xBB\xBF#!")
+        } else {
+            false
+        }
+    } else {
+        false
+    };
+
+    if is_js || has_shebang {
+        let mut c = Command::new("node");
+        c.arg(binary_path);
+        c.args(args);
+        c
+    } else {
+        let mut c = Command::new(binary_path);
+        c.args(args);
+        c
+    }
+}
+
 /// Spawns and executes a standalone binary or command with full TTY stdin/stdout forwarding,
 /// process tree guard containment (Windows Job Object or Unix process group),
 /// signal propagation, and non-zero exit code fidelity.
@@ -3741,48 +3907,7 @@ pub fn execute_binary(
     );
 
     #[cfg(windows)]
-    let mut cmd = {
-        let ext = binary_path
-            .extension()
-            .and_then(|s| s.to_str())
-            .unwrap_or("");
-        if ext.eq_ignore_ascii_case("cmd") || ext.eq_ignore_ascii_case("bat") {
-            let mut c = Command::new("cmd.exe");
-            c.arg("/c").arg(binary_path);
-            c.args(args);
-            c
-        } else if ext.eq_ignore_ascii_case("ps1") {
-            let mut c = Command::new("powershell.exe");
-            c.args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"]);
-            c.arg(binary_path);
-            c.args(args);
-            c
-        } else {
-            let is_js = ext.eq_ignore_ascii_case("js")
-                || ext.eq_ignore_ascii_case("cjs")
-                || ext.eq_ignore_ascii_case("mjs");
-            let has_shebang = if binary_path.exists() {
-                if let Ok(bytes) = std::fs::read(binary_path) {
-                    bytes.starts_with(b"#!") || bytes.starts_with(b"\xEF\xBB\xBF#!")
-                } else {
-                    false
-                }
-            } else {
-                false
-            };
-
-            if is_js || has_shebang {
-                let mut c = Command::new("node");
-                c.arg(binary_path);
-                c.args(args);
-                c
-            } else {
-                let mut c = Command::new(binary_path);
-                c.args(args);
-                c
-            }
-        }
-    };
+    let mut cmd = build_binary_command_windows(binary_path, args, current_dir, &env);
 
     #[cfg(not(windows))]
     let mut cmd = {
@@ -3895,48 +4020,7 @@ where
     );
 
     #[cfg(windows)]
-    let mut cmd = {
-        let ext = binary_path
-            .extension()
-            .and_then(|s| s.to_str())
-            .unwrap_or("");
-        if ext.eq_ignore_ascii_case("cmd") || ext.eq_ignore_ascii_case("bat") {
-            let mut c = Command::new("cmd.exe");
-            c.arg("/c").arg(binary_path);
-            c.args(args);
-            c
-        } else if ext.eq_ignore_ascii_case("ps1") {
-            let mut c = Command::new("powershell.exe");
-            c.args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"]);
-            c.arg(binary_path);
-            c.args(args);
-            c
-        } else {
-            let is_js = ext.eq_ignore_ascii_case("js")
-                || ext.eq_ignore_ascii_case("cjs")
-                || ext.eq_ignore_ascii_case("mjs");
-            let has_shebang = if binary_path.exists() {
-                if let Ok(bytes) = std::fs::read(binary_path) {
-                    bytes.starts_with(b"#!") || bytes.starts_with(b"\xEF\xBB\xBF#!")
-                } else {
-                    false
-                }
-            } else {
-                false
-            };
-
-            if is_js || has_shebang {
-                let mut c = Command::new("node");
-                c.arg(binary_path);
-                c.args(args);
-                c
-            } else {
-                let mut c = Command::new(binary_path);
-                c.args(args);
-                c
-            }
-        }
-    };
+    let mut cmd = build_binary_command_windows(binary_path, args, current_dir, &env);
 
     #[cfg(not(windows))]
     let mut cmd = {
@@ -4490,6 +4574,148 @@ async fn execute_dependency_hooks_with_abort(
     Ok(())
 }
 
+const ROOT_INSTALL_HOOKS: [&str; 7] = [
+    "preinstall",
+    "install",
+    "postinstall",
+    "prepublish",
+    "preprepare",
+    "prepare",
+    "postprepare",
+];
+
+fn prepare_root_hook_contexts(
+    root_manifest: &Manifest,
+    opts: &LifecycleOptions,
+    trusted_config: Option<&rnpm_config::Config>,
+) -> (Vec<LifecycleContext>, bool) {
+    if opts.ignore_scripts || opts.sandbox_policy.level == SandboxLevel::Disabled {
+        return (Vec::new(), true);
+    }
+
+    let active_hooks: Vec<(&str, &str)> = ROOT_INSTALL_HOOKS
+        .iter()
+        .filter_map(|&hook| {
+            root_manifest
+                .scripts
+                .get(hook)
+                .filter(|cmd| !cmd.is_empty())
+                .map(|cmd| (hook, cmd.as_str()))
+        })
+        .collect();
+    if active_hooks.is_empty() {
+        return (Vec::new(), true);
+    }
+
+    let root_config = trusted_config
+        .cloned()
+        .or_else(get_trusted_config)
+        .unwrap_or_else(|| rnpm_config::Config::load(Some(&opts.root_dir)).unwrap_or_default());
+    let mut base_extra = HashMap::new();
+    if !opts.init_cwd.as_os_str().is_empty() {
+        base_extra.insert(
+            "INIT_CWD".to_string(),
+            opts.init_cwd.to_string_lossy().to_string(),
+        );
+    }
+    let mut root_precomputed = Some(precompute_lifecycle_env_with_manifest(
+        &opts.root_dir,
+        &opts.root_dir,
+        root_manifest.name.as_deref().unwrap_or("root"),
+        root_manifest.version.as_deref(),
+        &root_config,
+        Some(&base_extra),
+        Some(root_manifest),
+    ));
+    let is_silent = root_config.get("loglevel") == Some("silent");
+    let last_idx = active_hooks.len() - 1;
+    let mut contexts = Vec::with_capacity(active_hooks.len());
+
+    for (idx, (hook, script_cmd)) in active_hooks.into_iter().enumerate() {
+        let mut ctx = LifecycleContext::new_with_config(
+            &opts.root_dir,
+            &opts.root_dir,
+            root_manifest.name.as_deref().unwrap_or("root"),
+            hook,
+            script_cmd,
+            root_config.clone(),
+        );
+        ctx.precomputed_env = if idx == last_idx {
+            root_precomputed.take()
+        } else {
+            root_precomputed.clone()
+        };
+        if !opts.init_cwd.as_os_str().is_empty() {
+            ctx.extra_env.insert(
+                "INIT_CWD".to_string(),
+                opts.init_cwd.to_string_lossy().to_string(),
+            );
+        }
+        ctx.package_version = root_manifest.version.clone();
+        ctx.timeout = opts.timeout;
+        ctx.sandbox_policy = opts.sandbox_policy.clone();
+        ctx.foreground_scripts = opts.foreground_scripts;
+        if opts.foreground_scripts {
+            ctx.capture_output = false;
+        }
+        ctx.node_gyp = opts.node_gyp.clone();
+        ctx.offline = opts.offline;
+        contexts.push(ctx);
+    }
+
+    (contexts, is_silent)
+}
+
+fn print_root_hook_banner(root_manifest: &Manifest, hook: &str, script_cmd: &str) {
+    let name = root_manifest.name.as_deref().unwrap_or("");
+    let id = root_manifest
+        .version
+        .as_ref()
+        .map(|v| format!("{name}@{v} "))
+        .unwrap_or_else(|| {
+            if name.is_empty() {
+                String::new()
+            } else {
+                format!("{name} ")
+            }
+        });
+    // npm routes lifecycle banners to stderr in JSON mode so stdout stays parseable.
+    let json_mode = rnpm_config::get_process_cli_overrides()
+        .and_then(|o| o.get("json").cloned())
+        .is_some_and(|v| v != "false" && v != "0");
+    if json_mode {
+        eprintln!("\n> {id}{hook}\n> {script_cmd}\n");
+    } else {
+        println!("\n> {id}{hook}\n> {script_cmd}\n");
+    }
+}
+
+/// Synchronously run root install hooks after reification without a Tokio runtime.
+pub fn execute_root_hooks_sync(root_manifest: &Manifest, opts: &LifecycleOptions) -> Result<()> {
+    execute_root_hooks_sync_with_config(root_manifest, opts, None)
+}
+
+/// Synchronously run root install hooks using an already-loaded config without a Tokio runtime.
+pub fn execute_root_hooks_sync_with_config(
+    root_manifest: &Manifest,
+    opts: &LifecycleOptions,
+    trusted_config: Option<&rnpm_config::Config>,
+) -> Result<()> {
+    let (contexts, is_silent) = prepare_root_hook_contexts(root_manifest, opts, trusted_config);
+    for ctx in &contexts {
+        if !is_silent {
+            print_root_hook_banner(root_manifest, &ctx.event, &ctx.script_cmd);
+        }
+        let status = execute_lifecycle_script(ctx)?;
+        if !status.success() {
+            return Err(anyhow::Error::from(ScriptExitError::lifecycle_failure(
+                ctx, &status,
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Run root install hooks after reification has persisted the public lockfile.
 pub async fn execute_root_hooks(root_manifest: &Manifest, opts: &LifecycleOptions) -> Result<()> {
     execute_root_hooks_with_abort(root_manifest, opts, None).await
@@ -4500,124 +4726,33 @@ async fn execute_root_hooks_with_abort(
     opts: &LifecycleOptions,
     abort_rx: Option<tokio::sync::watch::Receiver<bool>>,
 ) -> Result<()> {
-    if opts.ignore_scripts || opts.sandbox_policy.level == SandboxLevel::Disabled {
-        return Ok(());
-    }
-    let root_hooks = [
-        "preinstall",
-        "install",
-        "postinstall",
-        "prepublish",
-        "preprepare",
-        "prepare",
-        "postprepare",
-    ];
-
-    let root_config = get_trusted_config().unwrap_or_else(|| {
-        rnpm_config::Config::load(Some(&opts.root_dir)).unwrap_or_default()
-    });
-
-    let root_has_hooks = root_hooks
-        .iter()
-        .any(|h| root_manifest.scripts.get(*h).is_some_and(|cmd| !cmd.is_empty()));
-    let root_precomputed = if root_has_hooks {
-        let mut base_extra = HashMap::new();
-        if !opts.init_cwd.as_os_str().is_empty() {
-            base_extra.insert(
-                "INIT_CWD".to_string(),
-                opts.init_cwd.to_string_lossy().to_string(),
-            );
+    let (contexts, is_silent) = prepare_root_hook_contexts(root_manifest, opts, None);
+    for ctx in &contexts {
+        if let Some(ref rx) = abort_rx {
+            if *rx.borrow() {
+                return Err(anyhow::anyhow!(
+                    "Topological lifecycle execution aborted by signal"
+                ));
+            }
         }
-        Some(precompute_lifecycle_env_with_manifest(
-            &opts.root_dir,
-            &opts.root_dir,
-            root_manifest.name.as_deref().unwrap_or("root"),
-            root_manifest.version.as_deref(),
-            &root_config,
-            Some(&base_extra),
-            Some(root_manifest),
-        ))
-    } else {
-        None
-    };
-
-    let is_silent = root_config.get("loglevel") == Some("silent");
-
-    for hook in root_hooks {
-        if let Some(script_cmd) = root_manifest.scripts.get(hook).filter(|cmd| !cmd.is_empty()) {
-            if let Some(ref rx) = abort_rx {
-                if *rx.borrow() {
-                    return Err(anyhow::anyhow!(
-                        "Topological lifecycle execution aborted by signal"
-                    ));
-                }
-            }
-
-            let mut ctx = LifecycleContext::new_with_config(
-                &opts.root_dir,
-                &opts.root_dir,
-                root_manifest.name.as_deref().unwrap_or("root"),
-                hook,
-                script_cmd,
-                root_config.clone(),
-            );
-            ctx.precomputed_env = root_precomputed.clone();
-            if !opts.init_cwd.as_os_str().is_empty() {
-                ctx.extra_env.insert(
-                    "INIT_CWD".to_string(),
-                    opts.init_cwd.to_string_lossy().to_string(),
-                );
-            }
-            ctx.package_version = root_manifest.version.clone();
-            if !is_silent {
-                let name = root_manifest.name.as_deref().unwrap_or("");
-                let id = root_manifest
-                    .version
-                    .as_ref()
-                    .map(|v| format!("{name}@{v} "))
-                    .unwrap_or_else(|| {
-                        if name.is_empty() {
-                            String::new()
-                        } else {
-                            format!("{name} ")
-                        }
-                    });
-                // npm routes lifecycle banners to stderr in JSON mode so stdout stays parseable.
-                let json_mode = rnpm_config::get_process_cli_overrides()
-                    .and_then(|o| o.get("json").cloned())
-                    .is_some_and(|v| v != "false" && v != "0");
-                if json_mode {
-                    eprintln!("\n> {id}{hook}\n> {script_cmd}\n");
+        if !is_silent {
+            print_root_hook_banner(root_manifest, &ctx.event, &ctx.script_cmd);
+        }
+        let abort_fut = {
+            let mut rx_opt = abort_rx.clone();
+            async move {
+                if let Some(ref mut rx) = rx_opt {
+                    let _ = rx.wait_for(|&val| val).await;
                 } else {
-                    println!("\n> {id}{hook}\n> {script_cmd}\n");
+                    std::future::pending::<()>().await;
                 }
             }
-            ctx.timeout = opts.timeout;
-            ctx.sandbox_policy = opts.sandbox_policy.clone();
-            ctx.foreground_scripts = opts.foreground_scripts;
-            if opts.foreground_scripts {
-                ctx.capture_output = false;
-            }
-            ctx.node_gyp = opts.node_gyp.clone();
-            ctx.offline = opts.offline;
-
-            let abort_fut = {
-                let mut rx_opt = abort_rx.clone();
-                async move {
-                    if let Some(ref mut rx) = rx_opt {
-                        let _ = rx.wait_for(|&val| val).await;
-                    } else {
-                        std::future::pending::<()>().await;
-                    }
-                }
-            };
-
-            let status = execute_lifecycle_script_with_abort(&ctx, abort_fut).await?;
-            if !status.success() {
-                return Err(anyhow::Error::from(ScriptExitError::lifecycle_failure(
-                    &ctx, &status,
-                )));
-            }
+        };
+        let status = execute_lifecycle_script_with_abort(ctx, abort_fut).await?;
+        if !status.success() {
+            return Err(anyhow::Error::from(ScriptExitError::lifecycle_failure(
+                ctx, &status,
+            )));
         }
     }
 

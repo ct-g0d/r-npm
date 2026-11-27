@@ -1,4 +1,5 @@
 use crate::error::FsError;
+use crate::fast_hash::{fx_map, fx_set, FxHashMap, FxHashSet};
 use flate2::read::GzDecoder;
 use path_clean::clean;
 use rnpm_core::integrity::{Algorithm, Integrity};
@@ -237,8 +238,9 @@ pub(crate) fn join_clean_rel(base: &Path, rel: &str) -> PathBuf {
 fn ensure_dir_created(
     dir: &Path,
     root: &Path,
-    created_dirs: &mut HashSet<PathBuf>,
+    created_dirs: &mut FxHashSet<PathBuf>,
     safe_cache: &mut HashSet<PathBuf>,
+    track_safe_cache: bool,
 ) -> Result<(), FsError> {
     if created_dirs.contains(dir) {
         return Ok(());
@@ -323,7 +325,9 @@ fn ensure_dir_created(
             break;
         }
         let inserted = created_dirs.insert(p.to_path_buf());
-        safe_cache.insert(p.to_path_buf());
+        if track_safe_cache {
+            safe_cache.insert(p.to_path_buf());
+        }
         if !inserted {
             break;
         }
@@ -351,14 +355,14 @@ pub(crate) enum TrackReject {
 }
 
 pub(crate) struct PathCollisionTracker {
-    pub(crate) map: HashMap<String, TrackedEntry>,
+    pub(crate) map: FxHashMap<String, TrackedEntry>,
     pub(crate) has_symlinks: bool,
 }
 
 impl PathCollisionTracker {
     pub(crate) fn with_capacity(cap: usize) -> Self {
         Self {
-            map: HashMap::with_capacity(cap),
+            map: fx_map(cap),
             has_symlinks: false,
         }
     }
@@ -512,30 +516,51 @@ pub fn extract_tar_gz<R: Read>(
     destination: &Path,
     limits: Option<TarLimits>,
 ) -> Result<ExtractionSummary, FsError> {
+    struct PendingTarFile {
+        path: PathBuf,
+        start: usize,
+        len: usize,
+        mode: u32,
+    }
+
     let start_extract = std::time::Instant::now();
     let mut inflate_nanos = 0u64;
     let limits = limits.unwrap_or_default();
     let verbatim_dest = crate::path::to_verbatim_path(destination);
-    fs::create_dir_all(&verbatim_dest)?;
+
+    // Fast-path detection: if `create_dir` creates `verbatim_dest`, it is guaranteed fresh/empty
+    // without issuing a `read_dir` syscall.
+    let is_fresh_dest = match fs::create_dir(&verbatim_dest) {
+        Ok(()) => true,
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => match fs::read_dir(&verbatim_dest) {
+            Ok(mut it) => it.next().is_none(),
+            Err(_) => true,
+        },
+        Err(_) => {
+            fs::create_dir_all(&verbatim_dest)?;
+            match fs::read_dir(&verbatim_dest) {
+                Ok(mut it) => it.next().is_none(),
+                Err(_) => true,
+            }
+        }
+    };
     let clean_dest = clean(&verbatim_dest);
 
-    // Fast-path detection: if destination is fresh/empty before unpacking,
-    // entries that were not previously unpacked in this archive guaranteed do not exist on disk.
-    let is_fresh_dest = match fs::read_dir(&verbatim_dest) {
-        Ok(mut it) => it.next().is_none(),
-        Err(_) => true,
-    };
-
-    let mut created_dirs: HashSet<PathBuf> = HashSet::new();
+    let mut created_dirs: FxHashSet<PathBuf> = fx_set(16);
     created_dirs.insert(clean_dest.clone());
     created_dirs.insert(verbatim_dest.clone());
 
-    let mut verified_safe_ancestors: HashSet<PathBuf> = HashSet::new();
-    verified_safe_ancestors.insert(clean_dest.clone());
-    verified_safe_ancestors.insert(verbatim_dest.clone());
+    let mut verified_safe_ancestors: HashSet<PathBuf> = if is_fresh_dest {
+        HashSet::new()
+    } else {
+        let mut s = HashSet::new();
+        s.insert(clean_dest.clone());
+        s.insert(verbatim_dest.clone());
+        s
+    };
 
     let compressed_counter = Arc::new(AtomicU64::new(0));
-    let buf_reader = io::BufReader::with_capacity(32 * 1024, reader);
+    let buf_reader = io::BufReader::with_capacity(64 * 1024, reader);
     let counting_reader = CountingReader::with_counter(buf_reader, Arc::clone(&compressed_counter));
     let gz = GzDecoder::new(counting_reader);
     let buffered_gz = io::BufReader::with_capacity(64 * 1024, gz);
@@ -546,22 +571,21 @@ pub fn extract_tar_gz<R: Read>(
     let mut symlink_count = 0;
     let mut total_uncompressed = 0u64;
     let mut tracker = PathCollisionTracker::with_capacity(32);
-    let mut saw_npmignores: HashSet<String> = HashSet::new();
-    let mut hardlink_targets: std::collections::HashMap<PathBuf, PathBuf> =
-        std::collections::HashMap::new();
+    let mut saw_npmignores: FxHashSet<String> = fx_set(4);
+    let mut hardlink_targets: FxHashMap<PathBuf, PathBuf> = fx_map(0);
     let mut copy_buf: Vec<u8> = Vec::new();
     let mut scratch_buf: Vec<u8> = Vec::new();
     let mut wide_buf: Vec<u16> = Vec::with_capacity(260);
-    let mut pending_files: Vec<crate::writer::MaterializeFile> = Vec::with_capacity(64);
-    let mut pending_bytes: u64 = 0;
+    let mut pending_files: Vec<PendingTarFile> = Vec::with_capacity(64);
+    let mut pending_arena: Vec<u8> = Vec::with_capacity(128 * 1024);
     let mut recorded_files: u64 = 0;
     let mut recorded_bytes: u64 = 0;
-    const PENDING_FLUSH_BYTES: u64 = 4 * 1024 * 1024;
+    const PENDING_FLUSH_BYTES: usize = 4 * 1024 * 1024;
     let cached_cfg = crate::writer::determine_writer_config(&verbatim_dest, None);
 
-    let flush_pending = |pending_files: &mut Vec<crate::writer::MaterializeFile>,
-                         pending_bytes: &mut u64,
-                         created_dirs: &mut HashSet<PathBuf>,
+    let flush_pending = |pending_files: &mut Vec<PendingTarFile>,
+                         pending_arena: &mut Vec<u8>,
+                         created_dirs: &mut FxHashSet<PathBuf>,
                          verified_safe_ancestors: &mut HashSet<PathBuf>,
                          recorded_files: &mut u64,
                          recorded_bytes: &mut u64,
@@ -570,13 +594,11 @@ pub fn extract_tar_gz<R: Read>(
         if pending_files.is_empty() {
             return Ok(());
         }
-        let batch = std::mem::take(pending_files);
-        let batch_len = batch.len() as u64;
-        let batch_bytes = *pending_bytes;
-        *pending_bytes = 0;
+        let batch_len = pending_files.len() as u64;
+        let batch_bytes = pending_arena.len() as u64;
 
-        let mut unique_dirs: HashSet<&Path> = HashSet::with_capacity(batch.len() / 2 + 1);
-        for f in &batch {
+        let mut unique_dirs: FxHashSet<&Path> = fx_set(pending_files.len() / 2 + 1);
+        for f in pending_files.iter() {
             if let Some(p) = f.path.parent() {
                 if !created_dirs.contains(p) {
                     unique_dirs.insert(p);
@@ -593,7 +615,9 @@ pub fn extract_tar_gz<R: Read>(
                         break;
                     }
                     let inserted = created_dirs.insert(p.to_path_buf());
-                    verified_safe_ancestors.insert(p.to_path_buf());
+                    if !is_fresh_dest {
+                        verified_safe_ancestors.insert(p.to_path_buf());
+                    }
                     if !inserted {
                         break;
                     }
@@ -602,21 +626,35 @@ pub fn extract_tar_gz<R: Read>(
             }
         }
 
-        if batch.len() < 4 {
-            for item in &batch {
+        if pending_files.len() < 4 {
+            for item in pending_files.iter() {
                 crate::writer::write_file_fast_buf(
                     &item.path,
-                    &item.data,
+                    &pending_arena[item.start..item.start + item.len],
                     item.mode,
                     cached_cfg.preallocate_threshold,
                     wide_buf,
                     true,
                 )?;
             }
+            pending_files.clear();
         } else {
-            crate::writer::materialize_files_parallel(batch, &cached_cfg)?;
+            let arena_slice = &pending_arena[..];
+            let mut refs = Vec::with_capacity(pending_files.len());
+            for item in pending_files.drain(..) {
+                refs.push(crate::writer::MaterializeFileRef {
+                    path: item.path,
+                    data: &arena_slice[item.start..item.start + item.len],
+                    mode: item.mode,
+                    package_id: None,
+                    source_path: None,
+                    expected_sha256: None,
+                    source_verified: false,
+                });
+            }
+            crate::writer::materialize_files_parallel_refs(refs, &cached_cfg)?;
         }
-        // `write_file_fast_buf(..., true)` / `materialize_files_parallel` already recorded these.
+        pending_arena.clear();
         *recorded_files += batch_len;
         *recorded_bytes += batch_bytes;
         Ok(())
@@ -886,7 +924,7 @@ pub fn extract_tar_gz<R: Read>(
             if !pending_files.is_empty() {
                 flush_pending(
                     &mut pending_files,
-                    &mut pending_bytes,
+                    &mut pending_arena,
                     &mut created_dirs,
                     &mut verified_safe_ancestors,
                     &mut recorded_files,
@@ -934,6 +972,7 @@ pub fn extract_tar_gz<R: Read>(
                             &verbatim_dest,
                             &mut created_dirs,
                             &mut verified_safe_ancestors,
+                            !is_fresh_dest,
                         )?;
                     }
 
@@ -1101,6 +1140,7 @@ pub fn extract_tar_gz<R: Read>(
                             &verbatim_dest,
                             &mut created_dirs,
                             &mut verified_safe_ancestors,
+                            !is_fresh_dest,
                         )?;
                     }
 
@@ -1121,7 +1161,7 @@ pub fn extract_tar_gz<R: Read>(
             if was_seen && !pending_files.is_empty() {
                 flush_pending(
                     &mut pending_files,
-                    &mut pending_bytes,
+                    &mut pending_arena,
                     &mut created_dirs,
                     &mut verified_safe_ancestors,
                     &mut recorded_files,
@@ -1139,6 +1179,7 @@ pub fn extract_tar_gz<R: Read>(
                     &verbatim_dest,
                     &mut created_dirs,
                     &mut verified_safe_ancestors,
+                    !is_fresh_dest,
                 )?;
             }
         } else if entry_type.is_file() {
@@ -1172,14 +1213,17 @@ pub fn extract_tar_gz<R: Read>(
                 && !created_dirs.contains(&target_path)
             {
                 let sz = entry_size as usize;
-                let mut file_data = vec![0u8; sz];
+                let start = pending_arena.len();
                 let t_read = std::time::Instant::now();
                 if sz > 0 {
-                    entry.read_exact(&mut file_data).map_err(FsError::Io)?;
+                    pending_arena.resize(start + sz, 0);
+                    entry
+                        .read_exact(&mut pending_arena[start..start + sz])
+                        .map_err(FsError::Io)?;
                 }
                 inflate_nanos += t_read.elapsed().as_nanos() as u64;
 
-                total_uncompressed += file_data.len() as u64;
+                total_uncompressed += sz as u64;
                 if total_uncompressed > limits.max_uncompressed_size {
                     return Err(FsError::TarBombLimitExceeded {
                         limit_type: "uncompressed size".to_string(),
@@ -1207,18 +1251,17 @@ pub fn extract_tar_gz<R: Read>(
                     }
                 }
 
-                pending_bytes += file_data.len() as u64;
-                pending_files.push(crate::writer::MaterializeFile {
+                pending_files.push(PendingTarFile {
                     path: target_path,
-                    data: Arc::new(file_data),
+                    start,
+                    len: sz,
                     mode,
-                    package_id: None,
                 });
 
-                if pending_bytes >= PENDING_FLUSH_BYTES {
+                if pending_arena.len() >= PENDING_FLUSH_BYTES {
                     flush_pending(
                         &mut pending_files,
-                        &mut pending_bytes,
+                        &mut pending_arena,
                         &mut created_dirs,
                         &mut verified_safe_ancestors,
                         &mut recorded_files,
@@ -1232,7 +1275,7 @@ pub fn extract_tar_gz<R: Read>(
             if !pending_files.is_empty() {
                 flush_pending(
                     &mut pending_files,
-                    &mut pending_bytes,
+                    &mut pending_arena,
                     &mut created_dirs,
                     &mut verified_safe_ancestors,
                     &mut recorded_files,
@@ -1248,6 +1291,7 @@ pub fn extract_tar_gz<R: Read>(
                     &verbatim_dest,
                     &mut created_dirs,
                     &mut verified_safe_ancestors,
+                    !is_fresh_dest,
                 )?;
             }
 
@@ -1371,6 +1415,7 @@ pub fn extract_tar_gz<R: Read>(
                             &verbatim_dest,
                             &mut created_dirs,
                             &mut verified_safe_ancestors,
+                            !is_fresh_dest,
                         )?;
                     }
                     File::create(&target_path)?
@@ -1469,7 +1514,7 @@ pub fn extract_tar_gz<R: Read>(
     if !pending_files.is_empty() {
         flush_pending(
             &mut pending_files,
-            &mut pending_bytes,
+            &mut pending_arena,
             &mut created_dirs,
             &mut verified_safe_ancestors,
             &mut recorded_files,

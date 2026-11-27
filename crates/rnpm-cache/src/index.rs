@@ -1,5 +1,4 @@
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -19,8 +18,8 @@ pub(crate) fn encode_hex_lower<'a>(bytes: &[u8], out: &'a mut [u8]) -> &'a str {
 
 #[inline]
 pub(crate) fn sha256_hex_stack<'a>(data: &[u8], out: &'a mut [u8; 64]) -> &'a str {
-    let digest = Sha256::digest(data);
-    encode_hex_lower(&digest, out)
+    let digest = ring::digest::digest(&ring::digest::SHA256, data);
+    encode_hex_lower(digest.as_ref(), out)
 }
 
 #[inline]

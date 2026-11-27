@@ -91,17 +91,17 @@ async fn test_pack_store_two_files_per_package_and_warm_ci_read() {
         pack_path.display()
     );
     assert!(
-        idx_path.is_file(),
-        "idx file exists: {}",
+        !idx_path.exists(),
+        "v2 single-file pack embeds index without sibling idx file: {}",
         idx_path.display()
     );
 
-    // Exit criterion check: adding a package to store creates exactly 2 files (pack + idx) in prefix folder
+    // Exit criterion check: adding a package to store creates exactly 1 self-contained v2 .pack file in prefix folder
     let prefix_dir = pack_path.parent().unwrap();
     let files_in_prefix = fs::read_dir(prefix_dir).unwrap().count();
     assert_eq!(
-        files_in_prefix, 2,
-        "Adding package must create exactly 2 files in store prefix dir"
+        files_in_prefix, 1,
+        "Adding package must create exactly 1 self-contained .pack file in store prefix dir"
     );
 
     // Verify 4 KiB alignment of every file in the pack
@@ -210,7 +210,7 @@ async fn test_pack_store_crash_recovery_truncated_or_deleted_pack() {
     let pack_store = installer.pack_store();
     let (pack_path, idx_path) = pack_store.pack_paths(integrity);
     assert!(pack_path.is_file());
-    assert!(idx_path.is_file());
+    assert!(!idx_path.exists());
 
     // 2. Truncate .pack file to half size (simulating crash during write)
     let pack_bytes = fs::read(&pack_path).unwrap();
@@ -235,8 +235,9 @@ async fn test_pack_store_crash_recovery_truncated_or_deleted_pack() {
         "module.exports = { version: '2.5.0' };"
     );
 
-    // 3. Delete .pack entirely leaving only .idx (simulating crash before pack written or pack deleted)
+    // 3. Delete .pack entirely (leaving a stray orphan .idx) to verify missing-pack recovery
     fs::remove_file(&pack_path).unwrap();
+    fs::write(&idx_path, b"orphan-idx").unwrap();
     assert!(!pack_path.exists());
     assert!(idx_path.exists());
 

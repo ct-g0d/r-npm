@@ -212,7 +212,15 @@ impl PrecompiledNode {
         }
 
         let parent_str = ancestors[0].as_ref();
-        let (parent_name, parent_ver) = parse_key_and_spec(parent_str).unwrap_or((parent_str, ""));
+        let (parent_name, parent_ver) = if parent_str
+            .as_bytes()
+            .get(1..)
+            .is_some_and(|tail| tail.contains(&b'@'))
+        {
+            parse_key_and_spec(parent_str).unwrap_or((parent_str, ""))
+        } else {
+            (parent_str, "")
+        };
 
         let rule_list = self.rules_by_pkg.get(parent_name)?;
 
@@ -409,7 +417,15 @@ impl FastNode {
         }
 
         let parent_str = ancestors[0].as_ref();
-        let (parent_name, parent_ver) = parse_key_and_spec(parent_str).unwrap_or((parent_str, ""));
+        let (parent_name, parent_ver) = if parent_str
+            .as_bytes()
+            .get(1..)
+            .is_some_and(|tail| tail.contains(&b'@'))
+        {
+            parse_key_and_spec(parent_str).unwrap_or((parent_str, ""))
+        } else {
+            (parent_str, "")
+        };
 
         let rule_list = self.rules_by_pkg.get(parent_name)?;
 
@@ -711,6 +727,48 @@ impl Overrides {
         )
     }
 
+    /// Fast precompiled lookup bypassing `rules` mutation checks, returning a borrowed
+    /// slice when the resolved spec comes directly from the compiled rule or reference map.
+    #[inline]
+    pub fn resolve_override_precompiled_with_caller_cow<'a, T: AsRef<str>>(
+        &'a self,
+        dep_name: &str,
+        requested_spec: &str,
+        ancestors: &[T],
+        caller_specs: Option<&'a BTreeMap<String, String>>,
+    ) -> Result<Option<std::borrow::Cow<'a, str>>, OverrideError> {
+        self.resolve_override_precompiled_in_context_cow(
+            dep_name,
+            requested_spec,
+            ancestors,
+            &self.root_dependencies,
+            caller_specs,
+        )
+    }
+
+    /// Fast precompiled lookup in a caller context, returning a borrowed slice when possible.
+    #[inline]
+    pub fn resolve_override_precompiled_in_context_cow<'a, T: AsRef<str>>(
+        &'a self,
+        dep_name: &str,
+        requested_spec: &str,
+        ancestors: &[T],
+        reference_root: &'a BTreeMap<String, String>,
+        caller_specs: Option<&'a BTreeMap<String, String>>,
+    ) -> Result<Option<std::borrow::Cow<'a, str>>, OverrideError> {
+        if self.rules.is_empty() {
+            return Ok(None);
+        }
+        Self::resolve_with_fast_index_cow(
+            &self.fast_idx,
+            dep_name,
+            requested_spec,
+            ancestors,
+            reference_root,
+            caller_specs,
+        )
+    }
+
     #[inline]
     fn resolve_with_fast_index<T: AsRef<str>>(
         fast: &FastOverridesIndex,
@@ -720,6 +778,28 @@ impl Overrides {
         reference_root: &BTreeMap<String, String>,
         caller_specs: Option<&BTreeMap<String, String>>,
     ) -> Result<Option<String>, OverrideError> {
+        Ok(Self::resolve_with_fast_index_cow(
+            fast,
+            dep_name,
+            requested_spec,
+            ancestors,
+            reference_root,
+            caller_specs,
+        )?
+        .map(std::borrow::Cow::into_owned))
+    }
+
+    #[inline]
+    fn resolve_with_fast_index_cow<'a, T: AsRef<str>>(
+        fast: &'a FastOverridesIndex,
+        dep_name: &str,
+        requested_spec: &str,
+        ancestors: &[T],
+        reference_root: &'a BTreeMap<String, String>,
+        caller_specs: Option<&'a BTreeMap<String, String>>,
+    ) -> Result<Option<std::borrow::Cow<'a, str>>, OverrideError> {
+        use std::borrow::Cow;
+
         // O(1) fast check: If dep_name is not targeted anywhere in overrides, exit immediately
         if !fast.all_target_names.contains(dep_name) {
             return Ok(None);
@@ -750,7 +830,7 @@ impl Overrides {
 
         // 4. Fast path when not a $ reference override
         if !raw_override.starts_with('$') {
-            return Ok(Some(raw_override.to_string()));
+            return Ok(Some(Cow::Borrowed(raw_override)));
         }
 
         // 5. Resolve reference override ($pkg) if present, following chained references with cycle detection
@@ -760,30 +840,30 @@ impl Overrides {
                 .or_else(|| caller_specs.and_then(|specs| specs.get(first_ref)));
             if let Some(spec) = direct_spec {
                 if !spec.starts_with('$') {
-                    return Ok(Some(spec.clone()));
+                    return Ok(Some(Cow::Borrowed(spec.as_str())));
                 }
             }
         }
-        let mut current_spec = raw_override.to_string();
+        let mut current_spec: &str = raw_override;
         let mut visited_refs = BTreeSet::new();
 
         while let Some(ref_name) = current_spec.strip_prefix('$') {
-            if !visited_refs.insert(ref_name.to_string()) {
+            if !visited_refs.insert(ref_name) {
                 return Err(OverrideError::UnresolvableReference(format!(
                     "cyclic reference override ${ref_name}"
                 )));
             }
 
             if let Some(ref_spec) = reference_root.get(ref_name) {
-                current_spec = ref_spec.clone();
+                current_spec = ref_spec.as_str();
             } else if let Some(caller_spec) = caller_specs.and_then(|specs| specs.get(ref_name)) {
-                current_spec = caller_spec.clone();
+                current_spec = caller_spec.as_str();
             } else {
                 return Err(OverrideError::UnresolvableReference(ref_name.to_string()));
             }
         }
 
-        Ok(Some(current_spec))
+        Ok(Some(Cow::Borrowed(current_spec)))
     }
 }
 

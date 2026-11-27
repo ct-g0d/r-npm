@@ -234,7 +234,6 @@ fn push_fast_partial_stack(
 /// Zero-alloc fast stack parser for single-set non-prerelease range expressions (`<= 4` comparators).
 pub(crate) fn try_parse_fast_set_stack(s: &str, out: &mut [StackComparator; 4]) -> Option<usize> {
     let trimmed = s.trim();
-    let mut len = 0usize;
     if trimmed.is_empty() || trimmed == "*" || trimmed == "x" || trimmed == "X" {
         out[0] = StackComparator::new(Op::Gte, 0, 0, 0, false);
         return Some(1);
@@ -242,10 +241,17 @@ pub(crate) fn try_parse_fast_set_stack(s: &str, out: &mut [StackComparator; 4]) 
 
     let (op, rest) = split_fast_op_prefix(trimmed);
     if let Some(p) = parse_fast_partial_token(rest) {
+        let mut len = 0usize;
         push_fast_partial_stack(op, p, out, &mut len)?;
         return Some(len);
     }
 
+    try_parse_fast_multi_set_stack(trimmed, out)
+}
+
+#[inline]
+fn try_parse_fast_multi_set_stack(trimmed: &str, out: &mut [StackComparator; 4]) -> Option<usize> {
+    let mut len = 0usize;
     if trimmed.contains("||") {
         return None;
     }
@@ -597,15 +603,21 @@ fn try_fast_comparator_set(
 
     let (op, rest) = split_fast_op_prefix(s);
     if let Some(partial) = parse_fast_partial_token(rest) {
-        let mut comparators = Vec::with_capacity(2);
-        if let Err(e) = push_fast_partial_comparators(op, partial, input_for_err, &mut comparators) {
-            return Some(Err(e));
-        }
+        let Some((bounds, count)) = expand_fast_partial_bounds(op, partial) else {
+            return Some(Err(SemverError::InvalidRange(format!(
+                "Version number overflow: {input_for_err}"
+            ))));
+        };
+        let comparators = if count == 1 {
+            vec![stack_to_comparator(&bounds[0])]
+        } else {
+            vec![stack_to_comparator(&bounds[0]), stack_to_comparator(&bounds[1])]
+        };
         return Some(Ok(ComparatorSet { comparators }));
     }
 
     let mut stack = [StackComparator::new(Op::Eq, 0, 0, 0, false); 4];
-    let len = try_parse_fast_set_stack(s, &mut stack)?;
+    let len = try_parse_fast_multi_set_stack(s, &mut stack)?;
     let mut comparators = Vec::with_capacity(len);
     for c in &stack[..len] {
         comparators.push(stack_to_comparator(c));

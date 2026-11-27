@@ -23,6 +23,7 @@ use flate2::bufread::GzDecoder;
 use memmap2::Mmap;
 use path_clean::clean;
 use rnpm_core::{Algorithm, Integrity};
+use rnpm_fs::fast_hash::{fx_set, FxHashSet};
 use rnpm_fs::writer::ParallelWriterConfig;
 #[cfg(windows)]
 use rnpm_fs::RawFileHandle;
@@ -31,7 +32,6 @@ use rnpm_fs::{
     ExtractionSummary,
 };
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256, Sha512};
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, OpenOptions};
 #[cfg(windows)]
@@ -47,8 +47,20 @@ use std::time::Duration;
 use tracing::warn;
 
 #[inline]
+fn sha256_digest(data: &[u8]) -> [u8; 32] {
+    let d = ring::digest::digest(&ring::digest::SHA256, data);
+    d.as_ref().try_into().expect("SHA-256 digest is 32 bytes")
+}
+
+#[inline]
+fn sha512_digest(data: &[u8]) -> [u8; 64] {
+    let d = ring::digest::digest(&ring::digest::SHA512, data);
+    d.as_ref().try_into().expect("SHA-512 digest is 64 bytes")
+}
+
+#[inline]
 fn sha256_hex_string(data: &[u8]) -> String {
-    let digest = Sha256::digest(data);
+    let digest = sha256_digest(data);
     let mut hex_buf = [0u8; 64];
     encode_hex_lower(&digest, &mut hex_buf).to_string()
 }
@@ -175,7 +187,7 @@ impl<'a> TarStreamReader<'a> {
         };
         if tarball_bytes.starts_with(&[0x1f, 0x8b]) {
             Self::Gz(Box::new(BufReader::with_capacity(
-                16 * 1024,
+                64 * 1024,
                 GzDecoder::new(slice),
             )))
         } else {
@@ -488,14 +500,47 @@ fn is_clean_rel_ascii_path(p: &str) -> bool {
 #[cfg(windows)]
 #[inline]
 fn encode_verbatim_prefix_wide(dir: &Path) -> Vec<u16> {
-    use std::os::windows::ffi::OsStrExt;
-    let v = rnpm_fs::path::to_verbatim_path(dir);
-    let mut wide = Vec::with_capacity(v.as_os_str().len() + 2);
-    wide.extend(v.as_os_str().encode_wide());
+    let mut wide = Vec::with_capacity(dir.as_os_str().len() + 6);
+    crate::storage::encode_verbatim_wide_into(dir, &mut wide);
+    if wide.last().copied() == Some(0) {
+        wide.pop();
+    }
     if wide.last().copied() != Some(b'\\' as u16) {
         wide.push(b'\\' as u16);
     }
     wide
+}
+
+#[cfg(windows)]
+#[inline]
+fn ensure_dir_fast_win32(path: &Path, prefix_wide_with_slash: &[u16]) -> std::io::Result<()> {
+    extern "system" {
+        fn CreateDirectoryW(
+            lpPathName: *const u16,
+            lpSecurityAttributes: *mut std::ffi::c_void,
+        ) -> i32;
+        fn GetLastError() -> u32;
+    }
+    const ERROR_ALREADY_EXISTS: u32 = 183;
+
+    let mut target_wide = Vec::with_capacity(prefix_wide_with_slash.len() + 1);
+    let trimmed = if prefix_wide_with_slash.ends_with(&[b'\\' as u16])
+        && prefix_wide_with_slash.len() > 7
+    {
+        &prefix_wide_with_slash[..prefix_wide_with_slash.len() - 1]
+    } else {
+        prefix_wide_with_slash
+    };
+    target_wide.extend_from_slice(trimmed);
+    target_wide.push(0);
+    if unsafe { CreateDirectoryW(target_wide.as_ptr(), std::ptr::null_mut()) } != 0 {
+        return Ok(());
+    }
+    let err = unsafe { GetLastError() };
+    if err == ERROR_ALREADY_EXISTS {
+        return Ok(());
+    }
+    std::fs::create_dir_all(rnpm_fs::to_verbatim_path(path))
 }
 
 #[cfg(windows)]
@@ -511,59 +556,100 @@ fn append_ascii_rel_wide(buf: &mut Vec<u16>, prefix: &[u16], rel: &str) {
 }
 
 #[cfg(windows)]
-fn win_create_dir_all_wide(prefix: &[u16], rel_dir: &str, wide_buf: &mut Vec<u16>) -> std::io::Result<()> {
+#[inline]
+fn append_ascii_rel_tail_wide(buf: &mut Vec<u16>, prefix_len: usize, rel: &str) {
+    buf.truncate(prefix_len);
+    buf.reserve(rel.len() + 1);
+    for &b in rel.as_bytes() {
+        buf.push(if b == b'/' { b'\\' as u16 } else { b as u16 });
+    }
+    buf.push(0);
+}
+
+#[cfg(windows)]
+fn win_create_dir_top_down_cached<'a>(
+    prefix: &[u16],
+    rel_dir: &'a str,
+    created_rel_dirs: &mut FxHashSet<&'a str>,
+    wide_buf: &mut Vec<u16>,
+) -> std::io::Result<()> {
     extern "system" {
-        fn CreateDirectoryW(lpPathName: *const u16, lpSecurityAttributes: *mut std::ffi::c_void) -> i32;
+        fn CreateDirectoryW(
+            lpPathName: *const u16,
+            lpSecurityAttributes: *mut std::ffi::c_void,
+        ) -> i32;
         fn GetLastError() -> u32;
     }
-    const ERROR_PATH_NOT_FOUND: u32 = 3;
     const ERROR_ALREADY_EXISTS: u32 = 183;
 
-    if rel_dir.is_empty() {
+    if rel_dir.is_empty() || created_rel_dirs.contains(rel_dir) {
         return Ok(());
-    }
-    append_ascii_rel_wide(wide_buf, prefix, rel_dir);
-    let ok = unsafe { CreateDirectoryW(wide_buf.as_ptr(), std::ptr::null_mut()) };
-    if ok != 0 {
-        return Ok(());
-    }
-    let err = unsafe { GetLastError() };
-    if err == ERROR_ALREADY_EXISTS {
-        return Ok(());
-    }
-    if err != ERROR_PATH_NOT_FOUND {
-        return Err(std::io::Error::from_raw_os_error(err as i32));
     }
 
-    // Create ancestor segments from prefix onward without extra string allocations.
-    let start_idx = prefix.len();
-    let end_idx = wide_buf.len().saturating_sub(1);
-    let mut i = start_idx;
-    while i < end_idx {
-        if wide_buf[i] == b'\\' as u16 && i > start_idx {
-            let saved = wide_buf[i];
-            wide_buf[i] = 0;
-            let r = unsafe { CreateDirectoryW(wide_buf.as_ptr(), std::ptr::null_mut()) };
-            wide_buf[i] = saved;
-            if r == 0 {
-                let e = unsafe { GetLastError() };
-                if e != ERROR_ALREADY_EXISTS && e != ERROR_PATH_NOT_FOUND {
-                    return Err(std::io::Error::from_raw_os_error(e as i32));
-                }
+    // Find the longest already-created prefix so we never issue syscalls for known ancestors
+    // and never trigger ERROR_PATH_NOT_FOUND by trying the deepest leaf first.
+    let bytes = rel_dir.as_bytes();
+    let mut known_len = 0usize;
+    if let Some(last_sep) = bytes.iter().rposition(|&b| b == b'/') {
+        let mut pos = last_sep;
+        loop {
+            let sub = &rel_dir[..pos];
+            if created_rel_dirs.contains(sub) {
+                known_len = pos;
+                break;
+            }
+            match bytes[..pos].iter().rposition(|&b| b == b'/') {
+                Some(prev) => pos = prev,
+                None => break,
             }
         }
-        i += 1;
     }
-    let final_ok = unsafe { CreateDirectoryW(wide_buf.as_ptr(), std::ptr::null_mut()) };
-    if final_ok != 0 {
+
+    // Create each missing component top-down in one buffer pass.
+    append_ascii_rel_wide(wide_buf, prefix, rel_dir);
+    let base_len = prefix.len();
+    let mut seg_start = if known_len == 0 { 0 } else { known_len + 1 };
+    while seg_start < rel_dir.len() {
+        let seg_end = match bytes[seg_start..].iter().position(|&b| b == b'/') {
+            Some(off) => seg_start + off,
+            None => rel_dir.len(),
+        };
+        let wide_end = base_len + seg_end;
+        let saved = wide_buf[wide_end];
+        wide_buf[wide_end] = 0;
+        let ok = unsafe { CreateDirectoryW(wide_buf.as_ptr(), std::ptr::null_mut()) };
+        if ok == 0 {
+            let err = unsafe { GetLastError() };
+            if err != ERROR_ALREADY_EXISTS {
+                wide_buf[wide_end] = saved;
+                return Err(std::io::Error::from_raw_os_error(err as i32));
+            }
+        }
+        wide_buf[wide_end] = saved;
+        created_rel_dirs.insert(&rel_dir[..seg_end]);
+        seg_start = seg_end + 1;
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn create_dir_top_down_cached<'a>(
+    target_dir: &Path,
+    rel_dir: &'a str,
+    created_rel_dirs: &mut FxHashSet<&'a str>,
+) -> std::io::Result<()> {
+    if rel_dir.is_empty() || created_rel_dirs.contains(rel_dir) {
         return Ok(());
     }
-    let final_err = unsafe { GetLastError() };
-    if final_err == ERROR_ALREADY_EXISTS {
-        Ok(())
-    } else {
-        Err(std::io::Error::from_raw_os_error(final_err as i32))
+    std::fs::create_dir_all(target_dir.join(rel_dir))?;
+    let mut cur = rel_dir;
+    while !cur.is_empty() && created_rel_dirs.insert(cur) {
+        match cur.rfind('/') {
+            Some(p) => cur = &cur[..p],
+            None => break,
+        }
     }
+    Ok(())
 }
 
 #[inline]
@@ -750,6 +836,233 @@ impl<'a> PackInputFile<'a> {
     }
 }
 
+const PACK_V2_MAGIC: &[u8; 8] = b"RNPMPK02";
+const PACK_V2_FOOTER_LEN: usize = 24;
+
+#[inline]
+fn current_mtime_nanos_100ns() -> u64 {
+    let ns = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    (ns / 100) * 100
+}
+
+#[inline]
+fn idx_hash64(idx_bytes: &[u8]) -> u64 {
+    let d = sha256_digest(idx_bytes);
+    u64::from_le_bytes(d[..8].try_into().expect("8 bytes"))
+}
+
+fn encode_pack_index_v2(index: &PackIndex, out: &mut Vec<u8>) {
+    #[inline]
+    fn write_str(s: &str, out: &mut Vec<u8>) {
+        let b = s.as_bytes();
+        out.extend_from_slice(&(b.len() as u32).to_le_bytes());
+        out.extend_from_slice(b);
+    }
+    #[inline]
+    fn write_opt_str(s: Option<&str>, out: &mut Vec<u8>) {
+        match s {
+            Some(v) => {
+                out.push(1);
+                write_str(v, out);
+            }
+            None => out.push(0),
+        }
+    }
+    #[inline]
+    fn write_opt_u64(v: Option<u64>, out: &mut Vec<u8>) {
+        match v {
+            Some(n) => {
+                out.push(1);
+                out.extend_from_slice(&n.to_le_bytes());
+            }
+            None => out.push(0),
+        }
+    }
+
+    let start = out.len();
+    out.push(1u8); // codec version 1
+    write_str(&index.integrity, out);
+    write_str(&index.sha512_hex, out);
+    out.extend_from_slice(&index.total_pack_size.to_le_bytes());
+    write_opt_str(index.pack_checksum.as_deref(), out);
+    write_opt_u64(index.pack_mtime, out);
+    out.extend_from_slice(&(index.files.len() as u32).to_le_bytes());
+    for entry in &index.files {
+        write_str(&entry.path, out);
+        out.extend_from_slice(&entry.mode.to_le_bytes());
+        out.extend_from_slice(&entry.size.to_le_bytes());
+        out.extend_from_slice(&entry.offset.to_le_bytes());
+        out.extend_from_slice(&entry.aligned_offset.to_le_bytes());
+        write_opt_str(entry.sha256.as_deref(), out);
+        write_opt_u64(entry.cas_mtime, out);
+    }
+    out.extend_from_slice(&(index.symlinks.len() as u32).to_le_bytes());
+    for (link, target) in &index.symlinks {
+        write_str(link, out);
+        write_str(target, out);
+    }
+    let idx_slice = &out[start..];
+    let idx_len = idx_slice.len() as u64;
+    let idx_hash = idx_hash64(idx_slice);
+    out.extend_from_slice(&idx_len.to_le_bytes());
+    out.extend_from_slice(&idx_hash.to_le_bytes());
+    out.extend_from_slice(PACK_V2_MAGIC);
+}
+
+fn decode_pack_index_v2(bytes: &[u8]) -> Result<PackIndex, CacheError> {
+    struct Cursor<'a> {
+        buf: &'a [u8],
+        pos: usize,
+    }
+    impl<'a> Cursor<'a> {
+        #[inline]
+        fn take(&mut self, n: usize) -> Result<&'a [u8], CacheError> {
+            let end = self
+                .pos
+                .checked_add(n)
+                .ok_or_else(|| CacheError::InvalidPack("Pack v2 index overflow".into()))?;
+            if end > self.buf.len() {
+                return Err(CacheError::InvalidPack("Truncated pack v2 index".into()));
+            }
+            let slice = &self.buf[self.pos..end];
+            self.pos = end;
+            Ok(slice)
+        }
+        #[inline]
+        fn read_u8(&mut self) -> Result<u8, CacheError> {
+            Ok(self.take(1)?[0])
+        }
+        #[inline]
+        fn read_u32(&mut self) -> Result<u32, CacheError> {
+            Ok(u32::from_le_bytes(self.take(4)?.try_into().unwrap()))
+        }
+        #[inline]
+        fn read_u64(&mut self) -> Result<u64, CacheError> {
+            Ok(u64::from_le_bytes(self.take(8)?.try_into().unwrap()))
+        }
+        #[inline]
+        fn read_string(&mut self) -> Result<String, CacheError> {
+            let len = self.read_u32()? as usize;
+            let b = self.take(len)?;
+            let s = std::str::from_utf8(b)
+                .map_err(|_| CacheError::InvalidPack("Invalid UTF-8 in pack v2 index".into()))?;
+            Ok(s.to_owned())
+        }
+        #[inline]
+        fn read_opt_string(&mut self) -> Result<Option<String>, CacheError> {
+            match self.read_u8()? {
+                0 => Ok(None),
+                1 => Ok(Some(self.read_string()?)),
+                _ => Err(CacheError::InvalidPack("Invalid option tag in pack v2 index".into())),
+            }
+        }
+        #[inline]
+        fn read_opt_u64(&mut self) -> Result<Option<u64>, CacheError> {
+            match self.read_u8()? {
+                0 => Ok(None),
+                1 => Ok(Some(self.read_u64()?)),
+                _ => Err(CacheError::InvalidPack("Invalid option tag in pack v2 index".into())),
+            }
+        }
+    }
+
+    let limits = rnpm_fs::TarLimits::default();
+    let mut c = Cursor { buf: bytes, pos: 0 };
+    if c.read_u8()? != 1 {
+        return Err(CacheError::InvalidPack("Unsupported pack v2 index version".into()));
+    }
+    let integrity = c.read_string()?;
+    let sha512_hex = c.read_string()?;
+    let total_pack_size = c.read_u64()?;
+    let pack_checksum = c.read_opt_string()?;
+    let pack_mtime = c.read_opt_u64()?;
+    let files_len = c.read_u32()? as usize;
+    if files_len > limits.max_entries {
+        return Err(CacheError::InvalidPack("Pack v2 entry count exceeds limit".into()));
+    }
+    let mut files = Vec::with_capacity(files_len);
+    for _ in 0..files_len {
+        let path = c.read_string()?;
+        let mode = c.read_u32()?;
+        let size = c.read_u64()?;
+        let offset = c.read_u64()?;
+        let aligned_offset = c.read_u64()?;
+        let sha256 = c.read_opt_string()?;
+        let cas_mtime = c.read_opt_u64()?;
+        files.push(PackFileEntry {
+            path,
+            mode,
+            size,
+            offset,
+            aligned_offset,
+            sha256,
+            cas_path: None,
+            cas_verified: false,
+            cas_mtime,
+        });
+    }
+    let symlinks_len = c.read_u32()? as usize;
+    if symlinks_len > limits.max_symlinks {
+        return Err(CacheError::InvalidPack("Pack v2 symlink count exceeds limit".into()));
+    }
+    let mut symlinks = Vec::with_capacity(symlinks_len);
+    for _ in 0..symlinks_len {
+        let link = c.read_string()?;
+        let target = c.read_string()?;
+        symlinks.push((link, target));
+    }
+    if c.pos != bytes.len() {
+        return Err(CacheError::InvalidPack("Trailing bytes in pack v2 index".into()));
+    }
+    Ok(PackIndex {
+        integrity,
+        sha512_hex,
+        total_pack_size,
+        pack_checksum,
+        pack_mtime,
+        files,
+        symlinks,
+    })
+}
+
+fn parse_pack_v2_buffer(buf: &[u8]) -> Option<Result<(PackIndex, usize), CacheError>> {
+    if buf.len() < PACK_V2_FOOTER_LEN {
+        return None;
+    }
+    let footer = &buf[buf.len() - PACK_V2_FOOTER_LEN..];
+    if &footer[16..24] != PACK_V2_MAGIC {
+        return None;
+    }
+    let idx_len = u64::from_le_bytes(footer[0..8].try_into().unwrap());
+    let expected_hash = u64::from_le_bytes(footer[8..16].try_into().unwrap());
+    let idx_end = buf.len() - PACK_V2_FOOTER_LEN;
+    let Ok(idx_len_usize) = usize::try_from(idx_len) else {
+        return Some(Err(CacheError::InvalidPack("Pack v2 index length overflow".into())));
+    };
+    if idx_len_usize > idx_end {
+        return Some(Err(CacheError::InvalidPack("Pack v2 index length exceeds file size".into())));
+    }
+    let idx_start = idx_end - idx_len_usize;
+    let idx_slice = &buf[idx_start..idx_end];
+    if idx_hash64(idx_slice) != expected_hash {
+        return Some(Err(CacheError::CorruptedPack("Pack v2 embedded index checksum mismatch".into())));
+    }
+    let index = match decode_pack_index_v2(idx_slice) {
+        Ok(idx) => idx,
+        Err(e) => return Some(Err(e)),
+    };
+    if index.total_pack_size != idx_start as u64 {
+        return Some(Err(CacheError::CorruptedPack(format!(
+            "Pack v2 payload length mismatch: index={}, actual={}",
+            index.total_pack_size, idx_start
+        ))));
+    }
+    Some(Ok((index, idx_start)))
+}
+
 /// Memory-mapped file buffer or buffered bytes fallback.
 #[derive(Debug)]
 enum PackBuffer {
@@ -774,6 +1087,7 @@ impl PackBuffer {
 pub struct PackagePack {
     pub index: PackIndex,
     buffer: Arc<PackBuffer>,
+    payload_len: usize,
     pub pack_path: PathBuf,
     pub idx_path: PathBuf,
 }
@@ -793,7 +1107,7 @@ fn verify_pack_slice_checksum(
     pack_path: &Path,
 ) -> Result<(), CacheError> {
     if let Some(ref expected) = index.pack_checksum {
-        let digest = Sha256::digest(pack_data);
+        let digest = sha256_digest(pack_data);
         let mut hex_buf = [0u8; 64];
         let actual = encode_hex_lower(&digest, &mut hex_buf);
         if actual != expected {
@@ -817,16 +1131,16 @@ fn verify_pack_slice_checksum(
 }
 
 impl PackagePack {
-    /// Return the raw byte slice of the entire memory-mapped pack.
+    /// Return the raw byte slice of the entire memory-mapped pack payload.
     pub fn data(&self) -> &[u8] {
-        self.buffer.data()
+        &self.buffer.data()[..self.payload_len]
     }
 
     /// Returns all CAS write jobs for this package pack, zero-copy sharing the pack buffer.
     pub fn cas_write_jobs(&self) -> Vec<CasWriteJob> {
         let bytes_arc = match self.buffer.as_ref() {
             PackBuffer::Bytes(b) => Arc::clone(b),
-            _ => Arc::new(self.buffer.data().to_vec()),
+            _ => Arc::new(self.data().to_vec()),
         };
         let mut jobs = Vec::with_capacity(self.index.files.len());
         for entry in &self.index.files {
@@ -996,9 +1310,12 @@ impl PackagePack {
             }
 
             // 1. Directories first: deduplicate relative directories before issuing Win32/FS calls.
+            #[cfg(windows)]
+            ensure_dir_fast_win32(target_dir, &verbatim_prefix_wide)?;
+            #[cfg(not(windows))]
             std::fs::create_dir_all(target_dir)?;
-            let mut created_rel_dirs: HashSet<&str> =
-                HashSet::with_capacity(self.index.files.len() / 2 + 4);
+            let mut created_rel_dirs: FxHashSet<&str> = fx_set(self.index.files.len() / 2 + 4);
+            let mut last_rel_dir: &str = "";
             #[cfg(windows)]
             let mut dir_wide_buf: Vec<u16> = Vec::with_capacity(260);
 
@@ -1012,18 +1329,20 @@ impl PackagePack {
                 }
                 if let Some(slash) = entry.path.rfind('/') {
                     let rel_dir = &entry.path[..slash];
-                    if !rel_dir.is_empty() && !created_rel_dirs.contains(rel_dir) {
+                    if !rel_dir.is_empty()
+                        && rel_dir != last_rel_dir
+                        && !created_rel_dirs.contains(rel_dir)
+                    {
+                        last_rel_dir = rel_dir;
                         #[cfg(windows)]
-                        win_create_dir_all_wide(&verbatim_prefix_wide, rel_dir, &mut dir_wide_buf)?;
+                        win_create_dir_top_down_cached(
+                            &verbatim_prefix_wide,
+                            rel_dir,
+                            &mut created_rel_dirs,
+                            &mut dir_wide_buf,
+                        )?;
                         #[cfg(not(windows))]
-                        std::fs::create_dir_all(target_dir.join(rel_dir))?;
-                        let mut cur = rel_dir;
-                        while !cur.is_empty() && created_rel_dirs.insert(cur) {
-                            match cur.rfind('/') {
-                                Some(p) => cur = &cur[..p],
-                                None => break,
-                            }
-                        }
+                        create_dir_top_down_cached(target_dir, rel_dir, &mut created_rel_dirs)?;
                     }
                 }
             }
@@ -1055,9 +1374,11 @@ impl PackagePack {
             }
         }
 
-        // Check if pack file and destination are on the same ReFS volume (Dev Drive block cloning)
+        // Check if pack file and destination are on the same ReFS volume (Dev Drive block cloning).
+        // Checking `is_refs_volume(target_dir)` first short-circuits `is_same_volume` on NTFS/Unix.
         let can_block_clone = can_block_clone_hint.unwrap_or_else(|| {
-            is_same_volume(&self.pack_path, target_dir)
+            is_refs_volume(target_dir)
+                && is_same_volume(&self.pack_path, target_dir)
                 && (is_block_cloning_supported(target_dir) || is_refs_volume(target_dir))
         });
 
@@ -1078,6 +1399,11 @@ impl PackagePack {
         let files = &self.index.files;
         if !can_block_clone && files.len() >= 8 {
             let num_threads = 24.min(files.len() / 2).max(2).min(files.len());
+            let chunk_size = if files.len() <= 64 {
+                1
+            } else {
+                (files.len() / (num_threads * 2)).clamp(1, 4)
+            };
             let next_idx = AtomicUsize::new(0);
             let has_err = AtomicBool::new(false);
             let first_err: Mutex<Option<CacheError>> = Mutex::new(None);
@@ -1085,51 +1411,70 @@ impl PackagePack {
             let prefix_ref = &verbatim_prefix_wide;
             rnpm_fs::run_parallel(num_threads, &|| {
                 #[cfg(windows)]
-                let mut wide_buf: Vec<u16> = Vec::with_capacity(260);
+                let prefix_len = prefix_ref.len();
+                #[cfg(windows)]
+                let mut wide_buf: Vec<u16> = {
+                    let mut v = Vec::with_capacity(prefix_len + 128);
+                    v.extend_from_slice(prefix_ref);
+                    v
+                };
                 let mut local_files = 0u64;
                 let mut local_bytes = 0u64;
                 loop {
                     if has_err.load(Ordering::Relaxed) {
                         break;
                     }
-                    let idx = next_idx.fetch_add(1, Ordering::Relaxed);
-                    if idx >= files.len() {
+                    let start_idx = next_idx.fetch_add(chunk_size, Ordering::Relaxed);
+                    if start_idx >= files.len() {
                         break;
                     }
-                    let entry = &files[idx];
-                    let start = entry.offset as usize;
-                    let end = start + entry.size as usize;
-                    let slice = &pack_data[start..end];
+                    let end_idx = (start_idx + chunk_size).min(files.len());
+                    for entry in &files[start_idx..end_idx] {
+                        let start = entry.offset as usize;
+                        let end = start + entry.size as usize;
+                        let slice = &pack_data[start..end];
 
-                    if entry.cas_verified {
-                        if let Some(ref cas_path) = entry.cas_path {
-                            let is_corrupted_or_missing = fast_size_and_mtime(cas_path)
-                                .map(|(sz, mt)| {
-                                    sz != entry.size
-                                        || (entry.cas_mtime.is_some() && mt != entry.cas_mtime)
-                                })
-                                .unwrap_or(true);
-                            if is_corrupted_or_missing {
-                                let _ = PackStore::write_cas_file_safe(cas_path, slice);
+                        if entry.cas_verified {
+                            if let Some(ref cas_path) = entry.cas_path {
+                                let is_corrupted_or_missing = fast_size_and_mtime(cas_path)
+                                    .map(|(sz, mt)| {
+                                        sz != entry.size
+                                            || (entry.cas_mtime.is_some() && mt != entry.cas_mtime)
+                                    })
+                                    .unwrap_or(true);
+                                if is_corrupted_or_missing {
+                                    let _ = PackStore::write_cas_file_safe(cas_path, slice);
+                                }
                             }
                         }
-                    }
 
-                    let write_res: std::io::Result<bool> = {
-                        #[cfg(windows)]
-                        {
-                            if is_clean_rel_ascii_path(&entry.path) {
-                                append_ascii_rel_wide(&mut wide_buf, prefix_ref, &entry.path);
-                                match rnpm_fs::writer::write_file_fast_wide_raw(
-                                    &wide_buf,
-                                    target_dir,
-                                    slice,
-                                    entry.mode,
-                                    prealloc_thresh,
-                                    false,
-                                ) {
-                                    Ok(()) => Ok(true),
-                                    Err(_) => clone_or_write_pack_file(
+                        let write_res: std::io::Result<bool> = {
+                            #[cfg(windows)]
+                            {
+                                if is_clean_rel_ascii_path(&entry.path) {
+                                    append_ascii_rel_tail_wide(&mut wide_buf, prefix_len, &entry.path);
+                                    match rnpm_fs::writer::write_file_fast_wide_raw(
+                                        &wide_buf,
+                                        target_dir,
+                                        slice,
+                                        entry.mode,
+                                        prealloc_thresh,
+                                        false,
+                                    ) {
+                                        Ok(()) => Ok(true),
+                                        Err(_) => clone_or_write_pack_file(
+                                            None,
+                                            &target_dir.join(&entry.path),
+                                            slice,
+                                            entry.offset,
+                                            entry.size,
+                                            entry.mode,
+                                            prealloc_thresh,
+                                        )
+                                        .map(|_| false),
+                                    }
+                                } else {
+                                    clone_or_write_pack_file(
                                         None,
                                         &target_dir.join(&entry.path),
                                         slice,
@@ -1138,9 +1483,11 @@ impl PackagePack {
                                         entry.mode,
                                         prealloc_thresh,
                                     )
-                                    .map(|_| false),
+                                    .map(|_| false)
                                 }
-                            } else {
+                            }
+                            #[cfg(not(windows))]
+                            {
                                 clone_or_write_pack_file(
                                     None,
                                     &target_dir.join(&entry.path),
@@ -1152,38 +1499,25 @@ impl PackagePack {
                                 )
                                 .map(|_| false)
                             }
-                        }
-                        #[cfg(not(windows))]
-                        {
-                            clone_or_write_pack_file(
-                                None,
-                                &target_dir.join(&entry.path),
-                                slice,
-                                entry.offset,
-                                entry.size,
-                                entry.mode,
-                                prealloc_thresh,
-                            )
-                            .map(|_| false)
-                        }
-                    };
-                    match write_res {
-                        Err(e) => {
-                            if local_files > 0 {
-                                rnpm_fs::record_files_created_batch(local_files, local_bytes);
+                        };
+                        match write_res {
+                            Err(e) => {
+                                if local_files > 0 {
+                                    rnpm_fs::record_files_created_batch(local_files, local_bytes);
+                                }
+                                has_err.store(true, Ordering::Relaxed);
+                                let mut guard = first_err.lock().unwrap();
+                                if guard.is_none() {
+                                    *guard = Some(CacheError::Io(e));
+                                }
+                                return;
                             }
-                            has_err.store(true, Ordering::Relaxed);
-                            let mut guard = first_err.lock().unwrap();
-                            if guard.is_none() {
-                                *guard = Some(CacheError::Io(e));
+                            Ok(true) => {
+                                local_files += 1;
+                                local_bytes += slice.len() as u64;
                             }
-                            return;
+                            Ok(false) => {}
                         }
-                        Ok(true) => {
-                            local_files += 1;
-                            local_bytes += slice.len() as u64;
-                        }
-                        Ok(false) => {}
                     }
                 }
                 if local_files > 0 {
@@ -1286,13 +1620,14 @@ pub struct DeferredPackPayloads {
 #[derive(Debug, Clone)]
 pub struct PackStore {
     root: PathBuf,
-    mmap_cache: Arc<RwLock<HashMap<String, PackagePack>>>,
+    mmap_cache: Arc<RwLock<HashMap<String, Arc<PackagePack>>>>,
     block_clone_cache: Arc<RwLock<HashMap<PathBuf, bool>>>,
     #[cfg(windows)]
     block_clone_drive_cache: Arc<[AtomicU8; 26]>,
     cas_stamp_cache: Arc<RwLock<HashMap<PathBuf, (u64, u64)>>>,
     has_cas_files: Arc<AtomicBool>,
     created_prefixes: Arc<RwLock<std::collections::HashSet<String>>>,
+    pack_prefix_dirs: Arc<[AtomicU64; 4]>,
     cas_prefix_dirs: Arc<[AtomicU64; 4]>,
 }
 
@@ -1322,13 +1657,30 @@ impl PackStore {
             cas_stamp_cache: Arc::new(RwLock::new(HashMap::new())),
             has_cas_files: Arc::new(AtomicBool::new(has_cas)),
             created_prefixes: Arc::new(RwLock::new(std::collections::HashSet::new())),
+            pack_prefix_dirs: Arc::new([const { AtomicU64::new(0) }; 4]),
             cas_prefix_dirs: Arc::new([const { AtomicU64::new(0) }; 4]),
         })
     }
 
-    /// Ensures that the prefix directory under `packs/<prefix>` exists, using memoized in-memory check.
+    /// Ensures that the prefix directory under `packs/<prefix>` exists, using lock-free bitset memoization.
     pub fn ensure_pack_prefix_dir(&self, prefix: &str) -> std::io::Result<PathBuf> {
         let prefix_dir = self.packs_dir().join(prefix);
+        if prefix.len() == 2 {
+            if let Some(b) = hex2_byte(prefix) {
+                let w = (b >> 6) as usize;
+                let m = 1u64 << (b & 63);
+                if (self.pack_prefix_dirs[w].load(Ordering::Relaxed) & m) != 0 {
+                    return Ok(prefix_dir);
+                }
+                match fs::create_dir(&prefix_dir) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+                    Err(_) => fs::create_dir_all(&prefix_dir)?,
+                }
+                self.pack_prefix_dirs[w].fetch_or(m, Ordering::Relaxed);
+                return Ok(prefix_dir);
+            }
+        }
         {
             if let Ok(guard) = self.created_prefixes.read() {
                 if guard.contains(prefix) {
@@ -1453,18 +1805,55 @@ impl PackStore {
         Self::write_cas_file_with_mtime_opt(cas_path, data, parent_created, true)
     }
 
+    #[inline]
     fn write_cas_file_with_mtime_opt(
         cas_path: &Path,
         data: &[u8],
         parent_created: bool,
         cas_may_exist: bool,
     ) -> std::io::Result<Option<u64>> {
+        let mut wide_cas = Vec::new();
+        let mut wide_tmp = Vec::new();
+        Self::write_cas_file_with_mtime_buf(
+            cas_path,
+            data,
+            parent_created,
+            cas_may_exist,
+            &mut wide_cas,
+            &mut wide_tmp,
+        )
+    }
+
+    fn write_cas_file_with_mtime_buf(
+        cas_path: &Path,
+        data: &[u8],
+        parent_created: bool,
+        cas_may_exist: bool,
+        wide_cas: &mut Vec<u16>,
+        wide_tmp: &mut Vec<u16>,
+    ) -> std::io::Result<Option<u64>> {
         #[cfg(windows)]
         {
-            let mut wide_cas = Vec::with_capacity(260);
-            crate::storage::encode_verbatim_wide_into(cas_path, &mut wide_cas);
+            #[inline]
+            fn push_u64_utf16(out: &mut Vec<u16>, mut n: u64) {
+                let mut digits = [0u8; 20];
+                let mut i = digits.len();
+                loop {
+                    i -= 1;
+                    digits[i] = b'0' + (n % 10) as u8;
+                    n /= 10;
+                    if n == 0 {
+                        break;
+                    }
+                }
+                for &d in &digits[i..] {
+                    out.push(d as u16);
+                }
+            }
+
+            crate::storage::encode_verbatim_wide_into(cas_path, wide_cas);
             if cas_may_exist {
-                if let Some((sz, mt)) = fast_size_and_mtime_wide(&wide_cas) {
+                if let Some((sz, mt)) = fast_size_and_mtime_wide(wide_cas) {
                     if sz == data.len() as u64 && fs::read(cas_path).is_ok_and(|e| e == data) {
                         return Ok(mt);
                     }
@@ -1478,24 +1867,32 @@ impl PackStore {
             }
             let count = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
             let pid = std::process::id();
-            let mut wide_tmp = Vec::with_capacity(wide_cas.len() + 32);
-            wide_tmp.extend_from_slice(&wide_cas[..wide_cas.len().saturating_sub(1)]);
-            let suffix = format!(".tmp_{pid}_{count}");
-            wide_tmp.extend(suffix.encode_utf16());
+            wide_tmp.clear();
+            let base_len = wide_cas.len().saturating_sub(1);
+            wide_tmp.reserve(base_len + 48);
+            wide_tmp.extend_from_slice(&wide_cas[..base_len]);
+            wide_tmp.extend_from_slice(&[
+                b'.' as u16,
+                b't' as u16,
+                b'm' as u16,
+                b'p' as u16,
+                b'_' as u16,
+            ]);
+            push_u64_utf16(wide_tmp, pid as u64);
+            wide_tmp.push(b'_' as u16);
+            push_u64_utf16(wide_tmp, count);
             wide_tmp.push(0);
 
-            if crate::storage::write_and_rename_atomic_wide(
-                &wide_tmp,
-                &wide_cas,
+            if let Ok(mt) = crate::storage::write_and_rename_atomic_wide_with_mtime(
+                wide_tmp,
+                wide_cas,
                 cas_path,
                 cas_path,
                 data,
-            )
-            .is_ok()
-            {
-                return Ok(fast_size_and_mtime_wide(&wide_cas).and_then(|(_, mt)| mt));
+            ) {
+                return Ok(mt);
             }
-            if let Some((sz, mt)) = fast_size_and_mtime_wide(&wide_cas) {
+            if let Some((sz, mt)) = fast_size_and_mtime_wide(wide_cas) {
                 if sz == data.len() as u64 && fs::read(cas_path).is_ok_and(|e| e == data) {
                     return Ok(mt);
                 }
@@ -1530,11 +1927,12 @@ impl PackStore {
                     });
                 }
             }
-            Ok(fast_size_and_mtime_wide(&wide_cas).and_then(|(_, mt)| mt))
+            Ok(fast_size_and_mtime_wide(wide_cas).and_then(|(_, mt)| mt))
         }
 
         #[cfg(not(windows))]
         {
+            let _ = (wide_cas, wide_tmp);
             if cas_may_exist {
                 if let Some((sz, mt)) = fast_size_and_mtime(cas_path) {
                     if sz == data.len() as u64 {
@@ -1704,7 +2102,7 @@ impl PackStore {
         Ok(())
     }
 
-    /// Checks if a complete package pack (.pack and .idx) exists in the store.
+    /// Checks if a complete package pack (`.pack` v2 or legacy `.pack` + `.idx`) exists in the store.
     pub fn has_package_pack(&self, integrity: &str) -> bool {
         // Fast path: check raw key before parsing integrity
         {
@@ -1727,26 +2125,49 @@ impl PackStore {
             }
         }
 
-        let prefix_dir = self.packs_dir().join(&prefix);
-        let pack_path = prefix_dir.join(format!("{safe_stem}.pack"));
-        if let Ok(meta) = pack_path.metadata() {
-            if meta.is_file() && meta.len() > 0 {
-                let idx_path = prefix_dir.join(format!("{safe_stem}.idx"));
-                if idx_path.metadata().is_ok_and(|m| m.is_file()) {
-                    return true;
+        fn check_stem_complete(prefix_dir: &Path, stem: &str) -> Result<bool, std::io::Error> {
+            use std::io::{Read, Seek, SeekFrom};
+            let pack_path = prefix_dir.join(format!("{stem}.pack"));
+            let mut file = fs::File::open(&pack_path)?;
+            let meta = file.metadata()?;
+            if !meta.is_file() {
+                return Ok(false);
+            }
+            let len = meta.len();
+            if len >= PACK_V2_FOOTER_LEN as u64
+                && file.seek(SeekFrom::End(-(PACK_V2_FOOTER_LEN as i64))).is_ok()
+            {
+                let mut footer = [0u8; PACK_V2_FOOTER_LEN];
+                if file.read_exact(&mut footer).is_ok() && &footer[16..24] == PACK_V2_MAGIC {
+                    let idx_len = u64::from_le_bytes(footer[0..8].try_into().unwrap());
+                    return Ok(idx_len <= len - PACK_V2_FOOTER_LEN as u64);
                 }
+            }
+            if len > 0 {
+                let idx_path = prefix_dir.join(format!("{stem}.idx"));
+                if idx_path.metadata().is_ok_and(|m| m.is_file()) {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        }
+
+        let prefix_dir = self.packs_dir().join(&prefix);
+        match check_stem_complete(&prefix_dir, &safe_stem) {
+            Ok(true) => return true,
+            Ok(false) => {}
+            Err(e) => {
+                #[cfg(windows)]
+                if e.raw_os_error() == Some(3) {
+                    return false;
+                }
+                let _ = e;
             }
         }
 
         if safe_stem != sha512_hex {
-            let alt_pack = prefix_dir.join(format!("{sha512_hex}.pack"));
-            if let Ok(meta) = alt_pack.metadata() {
-                if meta.is_file() && meta.len() > 0 {
-                    let alt_idx = prefix_dir.join(format!("{sha512_hex}.idx"));
-                    if alt_idx.metadata().is_ok_and(|m| m.is_file()) {
-                        return true;
-                    }
-                }
+            if let Ok(true) = check_stem_complete(&prefix_dir, &sha512_hex) {
+                return true;
             }
         }
         false
@@ -1756,11 +2177,19 @@ impl PackStore {
     ///
     /// Caches open memory maps across process lifetime for fast reuse.
     pub fn get_package_pack(&self, integrity: &str) -> Result<Option<PackagePack>, CacheError> {
+        self.get_package_pack_arc(integrity)
+            .map(|opt| opt.map(|arc| (*arc).clone()))
+    }
+
+    fn get_package_pack_arc(
+        &self,
+        integrity: &str,
+    ) -> Result<Option<Arc<PackagePack>>, CacheError> {
         // 1. Check in-memory cache by exact string before parsing integrity
         {
             let guard = self.mmap_cache.read().unwrap();
             if let Some(pack) = guard.get(integrity) {
-                return Ok(Some(pack.clone()));
+                return Ok(Some(Arc::clone(pack)));
             }
         }
 
@@ -1774,27 +2203,75 @@ impl PackStore {
                 .or_else(|| guard.get(&sha512_hex))
                 .or_else(|| canon.as_deref().and_then(|c| guard.get(c)))
             {
-                return Ok(Some(pack.clone()));
+                return Ok(Some(Arc::clone(pack)));
             }
         }
 
-        // 2. Locate on disk and read index: read directly to avoid redundant stat syscalls
+        // 2. Open .pack once (single-file v2 embeds index trailer; legacy v1 reads sibling .idx).
+        const DIRECT_READ_THRESHOLD: u64 = 4 * 1024 * 1024;
+        fn read_pack_file_with_mtime(
+            path: &Path,
+            direct_threshold: u64,
+        ) -> std::io::Result<(Arc<PackBuffer>, u64, Option<u64>)> {
+            let mut file = OpenOptions::new().read(true).open(path)?;
+            let meta = file.metadata()?;
+            let pack_len = meta.len();
+            let mtime = mtime_to_timestamp(&meta);
+            let buffer = if pack_len == 0 {
+                Arc::new(PackBuffer::Empty)
+            } else if pack_len <= direct_threshold {
+                let target_len = usize::try_from(pack_len)
+                    .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "pack size overflow"))?;
+                let mut bytes = vec![0u8; target_len];
+                let mut read = 0usize;
+                while read < target_len {
+                    match file.read(&mut bytes[read..]) {
+                        Ok(0) => break,
+                        Ok(n) => read += n,
+                        Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                        Err(e) => return Err(e),
+                    }
+                }
+                if read < target_len {
+                    bytes.truncate(read);
+                }
+                Arc::new(PackBuffer::Bytes(Arc::new(bytes)))
+            } else {
+                match unsafe { memmap2::Mmap::map(&file) } {
+                    Ok(mmap) => Arc::new(PackBuffer::Mmap(Arc::new(mmap))),
+                    Err(_) => {
+                        let mut bytes = Vec::with_capacity(pack_len as usize);
+                        file.read_to_end(&mut bytes)?;
+                        Arc::new(PackBuffer::Bytes(Arc::new(bytes)))
+                    }
+                }
+            };
+            Ok((buffer, pack_len, mtime))
+        }
+
         let prefix_dir = self.packs_dir().join(&prefix);
         let mut pack_path = prefix_dir.join(format!("{safe_stem}.pack"));
         let mut idx_path = prefix_dir.join(format!("{safe_stem}.idx"));
-        let idx_bytes = match fs::read(&idx_path) {
-            Ok(b) => b,
+        let (buffer, pack_len, current_pack_mtime) = match read_pack_file_with_mtime(
+            &pack_path,
+            DIRECT_READ_THRESHOLD,
+        ) {
+            Ok(res) => res,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                #[cfg(windows)]
+                if e.raw_os_error() == Some(3) {
+                    return Ok(None);
+                }
                 if safe_stem == sha512_hex {
                     return Ok(None);
                 }
                 let alt_pack = prefix_dir.join(format!("{sha512_hex}.pack"));
                 let alt_idx = prefix_dir.join(format!("{sha512_hex}.idx"));
-                match fs::read(&alt_idx) {
-                    Ok(b) => {
+                match read_pack_file_with_mtime(&alt_pack, DIRECT_READ_THRESHOLD) {
+                    Ok(res) => {
                         pack_path = alt_pack;
                         idx_path = alt_idx;
-                        b
+                        res
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
                     Err(e) => return Err(CacheError::Io(e)),
@@ -1802,41 +2279,86 @@ impl PackStore {
             }
             Err(e) => return Err(CacheError::Io(e)),
         };
-        let mut index: PackIndex = match PackIndex::from_bytes(&idx_bytes) {
-            Ok(idx) => idx,
-            Err(e) => {
+
+        let (mut index, payload_len, is_v2) = match parse_pack_v2_buffer(buffer.data()) {
+            Some(Ok((idx, pay_len))) => (idx, pay_len, true),
+            Some(Err(e)) => {
                 warn!(
-                    "Corrupted pack index at '{}': {e}. Purging.",
-                    idx_path.display()
+                    "Corrupted pack v2 at '{}': {e}. Purging.",
+                    pack_path.display()
                 );
                 let _ = self.purge(integrity);
                 return Ok(None);
             }
+            None => {
+                // Legacy v1 fallback: read sibling .idx JSON file. If neither v2 trailer nor
+                // sibling .idx exists, the `.pack` file on disk is truncated/zeroed/corrupted; purge it.
+                let idx_bytes = match fs::read(&idx_path) {
+                    Ok(b) => b,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        let is_all_zero = !buffer.data().is_empty()
+                            && buffer.data().iter().all(|&b| b == 0);
+                        let _ = self.purge(integrity);
+                        if is_all_zero {
+                            return Err(CacheError::CorruptedPack(format!(
+                                "Pack file at '{}' is completely zeroed / corrupted",
+                                pack_path.display()
+                            )));
+                        }
+                        return Ok(None);
+                    }
+                    Err(e) => return Err(CacheError::Io(e)),
+                };
+                let idx = match PackIndex::from_bytes(&idx_bytes) {
+                    Ok(idx) => idx,
+                    Err(e) => {
+                        warn!(
+                            "Corrupted pack index at '{}': {e}. Purging.",
+                            idx_path.display()
+                        );
+                        let _ = self.purge(integrity);
+                        return Ok(None);
+                    }
+                };
+                let expected_padded = if idx.total_pack_size > 0 {
+                    (idx.total_pack_size + (PACK_ALIGNMENT as u64 - 1)) & !(PACK_ALIGNMENT as u64 - 1)
+                } else {
+                    0
+                };
+                if (pack_len != idx.total_pack_size && pack_len != expected_padded)
+                    || (pack_len == 0 && !idx.files.is_empty())
+                {
+                    warn!(
+                        "Pack file length mismatch for '{}': disk pack_len={}, index total_pack_size={} (expected padded {}). Purging.",
+                        pack_path.display(),
+                        pack_len,
+                        idx.total_pack_size,
+                        expected_padded
+                    );
+                    let _ = self.purge(integrity);
+                    return Ok(None);
+                }
+                (idx, buffer.data().len(), false)
+            }
         };
 
-        let expected_padded = if index.total_pack_size > 0 {
-            (index.total_pack_size + (PACK_ALIGNMENT as u64 - 1)) & !(PACK_ALIGNMENT as u64 - 1)
-        } else {
-            0
-        };
-        let max_pack_bound = expected_padded.max(index.total_pack_size);
-
-        // Re-validate every entry path in index before loading/materializing to prevent tampering
+        // Re-validate every entry path and offset/size bounds against `payload_len` before exposing slices.
         for entry in &index.files {
             if let Err(e) = fast_validate_entry_path(&entry.path) {
                 warn!(
-                    "Malicious or invalid entry path '{}' in index at '{}': {e}. Purging.",
+                    "Malicious or invalid entry path '{}' in index for '{}': {e}. Purging.",
                     entry.path,
-                    idx_path.display()
+                    pack_path.display()
                 );
                 let _ = self.purge(integrity);
                 return Ok(None);
             }
-            if entry.offset.saturating_add(entry.size) > max_pack_bound {
+            if entry.offset.saturating_add(entry.size) > payload_len as u64 {
                 warn!(
-                    "Pack entry '{}' bounds exceed total_pack_size in index at '{}'. Purging.",
+                    "Pack entry '{}' bounds exceed payload_len {} for '{}'. Purging.",
                     entry.path,
-                    idx_path.display()
+                    payload_len,
+                    pack_path.display()
                 );
                 let _ = self.purge(integrity);
                 return Ok(None);
@@ -1845,119 +2367,92 @@ impl PackStore {
         for (link_rel, target_rel) in &index.symlinks {
             if let Err(e) = fast_validate_entry_path(link_rel) {
                 warn!(
-                    "Malicious symlink link_rel '{}' in index at '{}': {e}. Purging.",
+                    "Malicious symlink link_rel '{}' in index for '{}': {e}. Purging.",
                     link_rel,
-                    idx_path.display()
+                    pack_path.display()
                 );
                 let _ = self.purge(integrity);
                 return Ok(None);
             }
             if let Err(e) = fast_validate_entry_path(target_rel) {
                 warn!(
-                    "Malicious symlink target_rel '{}' in index at '{}': {e}. Purging.",
+                    "Malicious symlink target_rel '{}' in index for '{}': {e}. Purging.",
                     target_rel,
-                    idx_path.display()
+                    pack_path.display()
                 );
                 let _ = self.purge(integrity);
                 return Ok(None);
             }
         }
 
-        // 4. Open pack once; read small packs directly into memory and mmap larger packs
-        let mut file = match OpenOptions::new().read(true).open(&pack_path) {
-            Ok(f) => f,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(e) => return Err(CacheError::Io(e)),
-        };
-        let meta = file.metadata()?;
-        let pack_len = meta.len();
-
-        if (pack_len != index.total_pack_size && pack_len != expected_padded)
-            || (pack_len == 0 && !index.files.is_empty())
-        {
-            warn!(
-                "Pack file length mismatch for '{}': disk pack_len={}, index total_pack_size={} (expected padded {}). Purging.",
-                pack_path.display(),
-                pack_len,
-                index.total_pack_size,
-                expected_padded
-            );
-            let _ = self.purge(integrity);
-            return Ok(None);
-        }
-
-        const DIRECT_READ_THRESHOLD: u64 = 128 * 1024;
-        let buffer = if pack_len == 0 {
-            Arc::new(PackBuffer::Empty)
-        } else if pack_len <= DIRECT_READ_THRESHOLD {
-            let mut bytes = Vec::with_capacity(pack_len as usize);
-            file.read_to_end(&mut bytes)?;
-            Arc::new(PackBuffer::Bytes(Arc::new(bytes)))
-        } else {
-            match unsafe { memmap2::Mmap::map(&file) } {
-                Ok(mmap) => Arc::new(PackBuffer::Mmap(Arc::new(mmap))),
-                Err(_) => {
-                    let mut bytes = Vec::with_capacity(pack_len as usize);
-                    file.read_to_end(&mut bytes)?;
-                    Arc::new(PackBuffer::Bytes(Arc::new(bytes)))
-                }
-            }
-        };
-
         let mut index_updated = false;
 
         // Fast pack verification: if pack_mtime matches current disk mtime, skip full SHA256 digest.
-        let current_pack_mtime = mtime_to_timestamp(&meta);
         let pack_verified = index.pack_mtime.is_some()
             && current_pack_mtime.is_some()
             && index.pack_mtime == current_pack_mtime;
 
         if !pack_verified {
-            if let Err(e) = verify_pack_slice_checksum(buffer.data(), &index, &pack_path) {
+            if let Err(e) = verify_pack_slice_checksum(&buffer.data()[..payload_len], &index, &pack_path) {
                 let _ = self.purge(integrity);
                 return Err(e);
             }
-            if let Some(m) = current_pack_mtime {
-                index.pack_mtime = Some(m);
-                index_updated = true;
+            if !is_v2 {
+                if let Some(m) = current_pack_mtime {
+                    index.pack_mtime = Some(m);
+                    index_updated = true;
+                }
             }
         }
 
-        let buf_data = buffer.data();
+        let buf_data = &buffer.data()[..payload_len];
         let has_cas = self.has_cas_files.load(Ordering::Relaxed);
-        let cas_dir = if has_cas { Some(self.cas_dir()) } else { None };
+        if has_cas {
+            let cas_dir = self.cas_dir();
+            for entry in &mut index.files {
+                let valid_sha = entry.sha256.as_deref().is_some_and(|s| {
+                    s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit())
+                });
+                if !valid_sha {
+                    let start = entry.offset as usize;
+                    let end = start + entry.size as usize;
+                    if end <= buf_data.len() {
+                        entry.sha256 = Some(sha256_hex_string(&buf_data[start..end]));
+                        if !is_v2 {
+                            index_updated = true;
+                        }
+                    } else {
+                        continue;
+                    }
+                }
 
-        // Ensure valid SHA-256 digests and derived CAS paths first.
-        for entry in &mut index.files {
-            let valid_sha = entry.sha256.as_deref().is_some_and(|s| {
-                s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit())
-            });
-            if !valid_sha {
-                let start = entry.offset as usize;
-                let end = start + entry.size as usize;
-                if end <= buf_data.len() {
-                    entry.sha256 = Some(sha256_hex_string(&buf_data[start..end]));
-                    index_updated = true;
-                } else {
+                let Some(ref sha) = entry.sha256 else {
                     continue;
+                };
+                // Always derive CAS path from this store's cas_dir + validated SHA-256;
+                // never trust arbitrary deserialized paths from `.idx`.
+                let cas_file = cas_dir.join(&sha[0..2]).join(sha);
+                if entry.cas_path.as_ref() != Some(&cas_file) {
+                    entry.cas_path = Some(cas_file);
                 }
             }
-
-            let Some(ref sha) = entry.sha256 else {
-                continue;
-            };
-            // Always derive CAS path from this store's cas_dir + validated SHA-256;
-            // never trust arbitrary deserialized paths from `.idx`.
-            let cas_file = match cas_dir.as_ref() {
-                Some(d) => d.join(&sha[0..2]).join(sha),
-                None => self.cas_file_path(sha),
-            };
-            if entry.cas_path.as_ref() != Some(&cas_file) && (entry.cas_path.is_some() || has_cas) {
-                entry.cas_path = Some(cas_file);
-            }
-
-            if !has_cas {
+        } else {
+            for entry in &mut index.files {
                 entry.cas_verified = false;
+                if entry.cas_path.is_some() {
+                    if let Some(ref sha) = entry.sha256 {
+                        if sha.len() == 64 && sha.bytes().all(|b| b.is_ascii_hexdigit()) {
+                            let cas_file = self.cas_file_path(sha);
+                            if entry.cas_path.as_ref() != Some(&cas_file) {
+                                entry.cas_path = Some(cas_file);
+                            }
+                        } else {
+                            entry.cas_path = None;
+                        }
+                    } else {
+                        entry.cas_path = None;
+                    }
+                }
             }
         }
 
@@ -2005,7 +2500,7 @@ impl PackStore {
                         } else {
                             let hash_valid = if current_size == entry.size {
                                 if let Ok(bytes) = fs::read(cas_file) {
-                                    let digest = Sha256::digest(&bytes);
+                                    let digest = sha256_digest(&bytes);
                                     let mut hex_buf = [0u8; 64];
                                     encode_hex_lower(&digest, &mut hex_buf).eq_ignore_ascii_case(sha)
                                 } else {
@@ -2092,7 +2587,7 @@ impl PackStore {
             }
         }
 
-        if index_updated {
+        if !is_v2 && index_updated {
             let pid = std::process::id();
             let count = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
             let tmp_idx = self.tmp_dir().join(format!("idx_upd_{pid}_{count}.tmp"));
@@ -2103,21 +2598,22 @@ impl PackStore {
             }
         }
 
-        let pack = PackagePack {
+        let pack = Arc::new(PackagePack {
             index,
             buffer,
+            payload_len,
             pack_path,
             idx_path,
-        };
+        });
 
         // 5. Store in cache across process lifetime
         {
             let mut guard = self.mmap_cache.write().unwrap();
-            guard.insert(integrity.to_string(), pack.clone());
-            guard.insert(safe_stem, pack.clone());
-            guard.insert(sha512_hex, pack.clone());
+            guard.insert(integrity.to_string(), Arc::clone(&pack));
+            guard.insert(safe_stem, Arc::clone(&pack));
+            guard.insert(sha512_hex, Arc::clone(&pack));
             if let Some(canon_key) = canon {
-                guard.insert(canon_key, pack.clone());
+                guard.insert(canon_key, Arc::clone(&pack));
             }
         }
 
@@ -2362,18 +2858,23 @@ impl PackStore {
                 }));
             }
 
-            let sha = sha256_hex_string(data);
-            let cas_path = cas_dir.as_ref().map(|d| {
-                let p = if sha.len() >= 2 { &sha[0..2] } else { "00" };
-                d.join(p).join(&sha)
-            });
+            let (sha, cas_path) = if populate_cas {
+                let s = sha256_hex_string(data);
+                let p = cas_dir.as_ref().map(|d| {
+                    let prefix = if s.len() >= 2 { &s[0..2] } else { "00" };
+                    d.join(prefix).join(&s)
+                });
+                (Some(s), p)
+            } else {
+                (None, None)
+            };
             index_files.push(PackFileEntry {
                 path,
                 mode,
                 size: data.len() as u64,
                 offset: aligned_offset as u64,
                 aligned_offset: aligned_offset as u64,
-                sha256: Some(sha),
+                sha256: sha,
                 cas_path,
                 cas_verified: false,
                 cas_mtime: None,
@@ -2423,13 +2924,15 @@ impl PackStore {
 
         let pack_checksum = sha256_hex_string(&pack_bytes);
 
+        let target_mtime_nanos = current_mtime_nanos_100ns();
         let mut index = PackIndex::with_checksum(
             integrity.to_string(),
             sha512_hex.clone(),
-            pack_bytes.len() as u64,
+            padded_len as u64,
             pack_checksum,
             index_files,
         );
+        index.pack_mtime = Some(target_mtime_nanos);
         index.symlinks = links;
 
         let prefix_dir = self.ensure_pack_prefix_dir(&prefix).map_err(|e| {
@@ -2445,20 +2948,41 @@ impl PackStore {
         let final_pack = prefix_dir.join(format!("{safe_stem}.pack"));
         let final_idx = prefix_dir.join(format!("{safe_stem}.idx"));
 
-        let idx_bytes = if write_files {
-            let tmp_dir = self.tmp_dir();
-            let count = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-            let pid = std::process::id();
-            let tmp_pack = tmp_dir.join(format!("pack_{pid}_{count}.tmp"));
-            let tmp_idx = tmp_dir.join(format!("idx_{pid}_{count}.tmp"));
+        // Embed compact binary v2 index + 24-byte footer at the end of `pack_bytes`
+        // so single-file `.pack` is self-contained with zero sibling `.idx` I/O.
+        encode_pack_index_v2(&index, &mut pack_bytes);
 
-            crate::storage::write_and_rename_atomic(&tmp_pack, &final_pack, &pack_bytes)?;
-            // Windows can move the write time when the handle closes, so read it from
-            // the final closed file so subsequent loads match `meta` mtime cleanly.
-            index.pack_mtime = fast_size_and_mtime(&final_pack).and_then(|(_, mt)| mt);
-            let serialized = index.to_bytes().map_err(CacheError::Json)?;
-            crate::storage::write_and_rename_atomic(&tmp_idx, &final_idx, &serialized)?;
-            serialized
+        let idx_bytes = if write_files {
+            #[cfg(windows)]
+            {
+                let tmp_root = self.tmp_dir();
+                crate::storage::with_temp_wide_stack(&tmp_root, "pk", |wide_tmp, tmp_hint| {
+                    crate::storage::with_verbatim_wide_stack(&final_pack, |wide_final| {
+                        crate::storage::write_and_rename_atomic_wide_set_mtime(
+                            wide_tmp,
+                            wide_final,
+                            tmp_hint,
+                            &final_pack,
+                            &pack_bytes,
+                            Some(target_mtime_nanos),
+                        )
+                    })
+                })?;
+            }
+            #[cfg(not(windows))]
+            {
+                let tmp_dir = self.tmp_dir();
+                let count = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+                let pid = std::process::id();
+                let tmp_pack = tmp_dir.join(format!("pack_{pid}_{count}.tmp"));
+                crate::storage::write_and_rename_atomic_with_set_mtime(
+                    &tmp_pack,
+                    &final_pack,
+                    &pack_bytes,
+                    Some(target_mtime_nanos),
+                )?;
+            }
+            Vec::new()
         } else {
             index.to_bytes().map_err(CacheError::Json)?
         };
@@ -2467,31 +2991,32 @@ impl PackStore {
         let idx_bytes_arc = Arc::new(idx_bytes);
 
         // 4. Update memory-map cache
-        let buffer = if pack_bytes_arc.is_empty() {
+        let buffer = if padded_len == 0 && pack_bytes_arc.is_empty() {
             Arc::new(PackBuffer::Empty)
         } else {
             Arc::new(PackBuffer::Bytes(Arc::clone(&pack_bytes_arc)))
         };
 
-        let pack = PackagePack {
+        let pack = Arc::new(PackagePack {
             index,
             buffer,
+            payload_len: padded_len,
             pack_path: final_pack.clone(),
             idx_path: final_idx.clone(),
-        };
+        });
 
         {
             let mut guard = self.mmap_cache.write().unwrap();
-            guard.insert(integrity.to_string(), pack.clone());
-            guard.insert(safe_stem, pack.clone());
-            guard.insert(sha512_hex, pack.clone());
+            guard.insert(integrity.to_string(), Arc::clone(&pack));
+            guard.insert(safe_stem, Arc::clone(&pack));
+            guard.insert(sha512_hex, Arc::clone(&pack));
             if let Some(canon_key) = canon {
-                guard.insert(canon_key, pack.clone());
+                guard.insert(canon_key, Arc::clone(&pack));
             }
         }
 
         Ok((
-            pack,
+            (*pack).clone(),
             DeferredPackPayloads {
                 pack: (final_pack, pack_bytes_arc),
                 idx: (final_idx, idx_bytes_arc),
@@ -2503,9 +3028,9 @@ impl PackStore {
         if entries.is_empty() {
             return;
         }
-        let mut prefix_dirs: Vec<(Option<u8>, PathBuf)> = Vec::new();
+        let mut prefix_dirs: Vec<(Option<u8>, &Path)> = Vec::new();
         let mut seen_prefix_mask = [0u64; 4];
-        let mut unique_jobs: Vec<(PathBuf, &[u8])> = Vec::with_capacity(entries.len());
+        let mut unique_jobs: Vec<(&Path, &[u8])> = Vec::with_capacity(entries.len());
         let mut seen_cas: HashMap<&Path, usize> = HashMap::with_capacity(entries.len());
         let mut entry_job_idx: Vec<Option<usize>> = Vec::with_capacity(entries.len());
 
@@ -2514,10 +3039,11 @@ impl PackStore {
             let end = start.saturating_add(entry.size as usize);
             if end <= pack_bytes.len() {
                 if let Some(ref cas_path) = entry.cas_path {
-                    if let Some(&idx) = seen_cas.get(cas_path.as_path()) {
+                    let cas_ref = cas_path.as_path();
+                    if let Some(&idx) = seen_cas.get(cas_ref) {
                         entry_job_idx.push(Some(idx));
                     } else {
-                        if let Some(parent) = cas_path.parent() {
+                        if let Some(parent) = cas_ref.parent() {
                             let prefix_byte = entry.sha256.as_deref().and_then(hex2_byte);
                             let need_dir = match prefix_byte {
                                 Some(b) => {
@@ -2533,15 +3059,15 @@ impl PackStore {
                                         false
                                     }
                                 }
-                                None => !prefix_dirs.iter().any(|(_, p)| p == parent),
+                                None => !prefix_dirs.iter().any(|(_, p)| *p == parent),
                             };
                             if need_dir {
-                                prefix_dirs.push((prefix_byte, parent.to_path_buf()));
+                                prefix_dirs.push((prefix_byte, parent));
                             }
                         }
                         let idx = unique_jobs.len();
-                        seen_cas.insert(cas_path.as_path(), idx);
-                        unique_jobs.push((cas_path.clone(), &pack_bytes[start..end]));
+                        seen_cas.insert(cas_ref, idx);
+                        unique_jobs.push((cas_ref, &pack_bytes[start..end]));
                         entry_job_idx.push(Some(idx));
                     }
                     continue;
@@ -2554,6 +3080,8 @@ impl PackStore {
             return;
         }
         if !prefix_dirs.is_empty() {
+            // Ensure parent cas/ directory once so prefix dir creation needs no ancestor stats.
+            let _ = fs::create_dir_all(self.cas_dir());
             if prefix_dirs.len() >= 8 {
                 let dir_idx = AtomicUsize::new(0);
                 rnpm_fs::run_parallel(8.min(prefix_dirs.len()), &|| loop {
@@ -2561,8 +3089,13 @@ impl PackStore {
                     if idx >= prefix_dirs.len() {
                         break;
                     }
-                    let (pb_opt, ref parent) = prefix_dirs[idx];
-                    if fs::create_dir_all(parent).is_ok() {
+                    let (pb_opt, parent) = prefix_dirs[idx];
+                    let created = match fs::create_dir(parent) {
+                        Ok(()) => true,
+                        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => true,
+                        Err(_) => fs::create_dir_all(parent).is_ok(),
+                    };
+                    if created {
                         if let Some(b) = pb_opt {
                             let w = (b >> 6) as usize;
                             let m = 1u64 << (b & 63);
@@ -2571,9 +3104,14 @@ impl PackStore {
                     }
                 });
             } else {
-                for (pb_opt, parent) in &prefix_dirs {
-                    if fs::create_dir_all(parent).is_ok() {
-                        if let Some(b) = *pb_opt {
+                for &(pb_opt, parent) in &prefix_dirs {
+                    let created = match fs::create_dir(parent) {
+                        Ok(()) => true,
+                        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => true,
+                        Err(_) => fs::create_dir_all(parent).is_ok(),
+                    };
+                    if created {
+                        if let Some(b) = pb_opt {
                             let w = (b >> 6) as usize;
                             let m = 1u64 << (b & 63);
                             self.cas_prefix_dirs[w].fetch_or(m, Ordering::Relaxed);
@@ -2589,19 +3127,32 @@ impl PackStore {
             .map(|_| AtomicBool::new(false))
             .collect();
         let next_idx = AtomicUsize::new(0);
-        let num_workers = 32.min(unique_jobs.len());
-        rnpm_fs::run_parallel(num_workers, &|| loop {
-            let idx = next_idx.fetch_add(1, Ordering::Relaxed);
-            if idx >= unique_jobs.len() {
-                break;
-            }
-            let (ref cas_path, slice) = unique_jobs[idx];
-            if let Ok(mt_opt) =
-                Self::write_cas_file_with_mtime_opt(cas_path, slice, true, cas_may_exist)
-            {
-                ok_flags[idx].store(true, Ordering::Relaxed);
-                if let Some(mt) = mt_opt {
-                    mtimes[idx].store(mt, Ordering::Relaxed);
+        let num_workers = 16.min(unique_jobs.len());
+        rnpm_fs::run_parallel(num_workers, &|| {
+            #[cfg(windows)]
+            let mut wide_cas = Vec::with_capacity(260);
+            #[cfg(windows)]
+            let mut wide_tmp = Vec::with_capacity(300);
+            #[cfg(not(windows))]
+            let (mut wide_cas, mut wide_tmp) = (Vec::new(), Vec::new());
+            loop {
+                let idx = next_idx.fetch_add(1, Ordering::Relaxed);
+                if idx >= unique_jobs.len() {
+                    break;
+                }
+                let (cas_path, slice) = unique_jobs[idx];
+                if let Ok(mt_opt) = Self::write_cas_file_with_mtime_buf(
+                    cas_path,
+                    slice,
+                    true,
+                    cas_may_exist,
+                    &mut wide_cas,
+                    &mut wide_tmp,
+                ) {
+                    ok_flags[idx].store(true, Ordering::Relaxed);
+                    if let Some(mt) = mt_opt {
+                        mtimes[idx].store(mt, Ordering::Relaxed);
+                    }
                 }
             }
         });
@@ -2701,7 +3252,7 @@ impl PackStore {
                 if b64.len() == 88 && !b64.as_bytes().iter().any(|b| b.is_ascii_whitespace()) {
                     let mut expected_bytes = [0u8; 66];
                     if let Ok(64) = BASE64.decode_mut(b64.as_bytes(), &mut expected_bytes) {
-                        let actual: [u8; 64] = Sha512::digest(tarball_bytes).into();
+                        let actual = sha512_digest(tarball_bytes);
                         let mut diff = 0u8;
                         for i in 0..64 {
                             diff |= actual[i] ^ expected_bytes[i];
@@ -2730,7 +3281,7 @@ impl PackStore {
                     }
                     Err(_) => {
                         if trimmed.len() == 128 && trimmed.bytes().all(|c| c.is_ascii_hexdigit()) {
-                            let digest: [u8; 64] = Sha512::digest(tarball_bytes).into();
+                            let digest = sha512_digest(tarball_bytes);
                             let mut hex_buf = [0u8; 128];
                             let actual_hex = encode_hex_lower(&digest, &mut hex_buf);
                             if !actual_hex.eq_ignore_ascii_case(trimmed) {
@@ -3112,6 +3663,7 @@ impl PackStore {
             return Ok(PackagePack {
                 index: dummy_index,
                 buffer: Arc::new(PackBuffer::Empty),
+                payload_len: 0,
                 pack_path: PathBuf::new(),
                 idx_path: PathBuf::new(),
             });
@@ -3162,46 +3714,47 @@ impl PackStore {
             }));
         }
 
-        // Compute per-file SHA-256 digests and derived CAS paths after dedup/compaction
-        // (in parallel for large packages).
-        if index_files.len() >= 32 {
-            struct HashSlot(std::cell::UnsafeCell<PackFileEntry>);
-            // SAFETY: Each index is claimed at most once via `next_hash_idx.fetch_add(1)`.
-            unsafe impl Sync for HashSlot {}
-            let slots: Vec<HashSlot> = std::mem::take(&mut index_files)
-                .into_iter()
-                .map(|e| HashSlot(std::cell::UnsafeCell::new(e)))
-                .collect();
-            let next_hash_idx = AtomicUsize::new(0);
-            let workers = 16.min(slots.len());
-            let pack_slice = &pack_bytes[..];
-            let cas_dir_ref = cas_dir.as_ref();
-            rnpm_fs::run_parallel(workers, &|| loop {
-                let idx = next_hash_idx.fetch_add(1, Ordering::Relaxed);
-                if idx >= slots.len() {
-                    break;
+        // Compute per-file SHA-256 digests and derived CAS paths only when `populate_cas` is true.
+        if populate_cas {
+            if index_files.len() >= 32 {
+                struct HashSlot(std::cell::UnsafeCell<PackFileEntry>);
+                // SAFETY: Each index is claimed at most once via `next_hash_idx.fetch_add(1)`.
+                unsafe impl Sync for HashSlot {}
+                let slots: Vec<HashSlot> = std::mem::take(&mut index_files)
+                    .into_iter()
+                    .map(|e| HashSlot(std::cell::UnsafeCell::new(e)))
+                    .collect();
+                let next_hash_idx = AtomicUsize::new(0);
+                let workers = 16.min(slots.len());
+                let pack_slice = &pack_bytes[..];
+                let cas_dir_ref = cas_dir.as_ref();
+                rnpm_fs::run_parallel(workers, &|| loop {
+                    let idx = next_hash_idx.fetch_add(1, Ordering::Relaxed);
+                    if idx >= slots.len() {
+                        break;
+                    }
+                    let entry = unsafe { &mut *slots[idx].0.get() };
+                    let start = entry.offset as usize;
+                    let end = start + entry.size as usize;
+                    let sha = sha256_hex_string(&pack_slice[start..end]);
+                    entry.cas_path = cas_dir_ref.map(|d| {
+                        let p = if sha.len() >= 2 { &sha[0..2] } else { "00" };
+                        d.join(p).join(&sha)
+                    });
+                    entry.sha256 = Some(sha);
+                });
+                index_files = slots.into_iter().map(|s| s.0.into_inner()).collect();
+            } else {
+                for entry in &mut index_files {
+                    let start = entry.offset as usize;
+                    let end = start + entry.size as usize;
+                    let sha = sha256_hex_string(&pack_bytes[start..end]);
+                    entry.cas_path = cas_dir.as_ref().map(|d| {
+                        let p = if sha.len() >= 2 { &sha[0..2] } else { "00" };
+                        d.join(p).join(&sha)
+                    });
+                    entry.sha256 = Some(sha);
                 }
-                let entry = unsafe { &mut *slots[idx].0.get() };
-                let start = entry.offset as usize;
-                let end = start + entry.size as usize;
-                let sha = sha256_hex_string(&pack_slice[start..end]);
-                entry.cas_path = cas_dir_ref.map(|d| {
-                    let p = if sha.len() >= 2 { &sha[0..2] } else { "00" };
-                    d.join(p).join(&sha)
-                });
-                entry.sha256 = Some(sha);
-            });
-            index_files = slots.into_iter().map(|s| s.0.into_inner()).collect();
-        } else {
-            for entry in &mut index_files {
-                let start = entry.offset as usize;
-                let end = start + entry.size as usize;
-                let sha = sha256_hex_string(&pack_bytes[start..end]);
-                entry.cas_path = cas_dir.as_ref().map(|d| {
-                    let p = if sha.len() >= 2 { &sha[0..2] } else { "00" };
-                    d.join(p).join(&sha)
-                });
-                entry.sha256 = Some(sha);
             }
         }
 
@@ -3931,7 +4484,7 @@ impl PackStore {
         dirs_precreated: bool,
     ) -> Result<ExtractionSummary, CacheError> {
         let pack = self
-            .get_package_pack(integrity)?
+            .get_package_pack_arc(integrity)?
             .ok_or_else(|| CacheError::PackNotFound(integrity.to_string()))?;
         let can_block_clone = self.is_block_cloning_eligible(target_dir);
         match pack.materialize_to_opt(
@@ -4001,7 +4554,7 @@ impl PackStore {
             }
             if let Some(strongest) = parsed.strongest_algorithm() {
                 if let Some(entry) = parsed.entries.iter().find(|e| e.algorithm == strongest) {
-                    let digest = Sha512::digest(&entry.digest);
+                    let digest = sha512_digest(&entry.digest);
                     let mut hex_buf = [0u8; 128];
                     let sha512_hex = encode_hex_lower(&digest, &mut hex_buf).to_string();
                     let prefix = sha512_hex[0..2].to_string();
@@ -4022,7 +4575,7 @@ impl PackStore {
         }
 
         // 3. Fallback: hash the string itself to produce a deterministic SHA-512 hex
-        let digest = Sha512::digest(trimmed.as_bytes());
+        let digest = sha512_digest(trimmed.as_bytes());
         let mut hex_buf = [0u8; 128];
         let sha512_hex = encode_hex_lower(&digest, &mut hex_buf).to_string();
         let prefix = sha512_hex[0..2].to_string();
@@ -4112,13 +4665,19 @@ fn is_destination_valid(to: &Path) -> bool {
                     return meta.len() == index.total_pack_size || meta.len() == expected_padded;
                 }
             }
+            return false;
         }
-        meta.len() > 0
+        if meta.len() >= PACK_V2_FOOTER_LEN as u64 {
+            if let Ok(bytes) = fs::read(to) {
+                return matches!(parse_pack_v2_buffer(&bytes), Some(Ok(_)));
+            }
+        }
+        false
     } else {
         if let Some(name) = to.file_name().and_then(|n| n.to_str()) {
             if name.len() == 64 && name.chars().all(|c| c.is_ascii_hexdigit()) {
                 if let Ok(bytes) = fs::read(to) {
-                    let actual = HEXLOWER.encode(&Sha256::digest(&bytes));
+                    let actual = HEXLOWER.encode(&sha256_digest(&bytes));
                     return actual.eq_ignore_ascii_case(name);
                 }
                 return false;
@@ -4343,7 +4902,7 @@ mod tests {
 
         store.put_package_pack(integrity, &files).unwrap();
 
-        // Exactly 2 files created under packs/<prefix>/
+        // Exactly 1 self-contained v2 `.pack` file created under packs/<prefix>/
         let (pack_path, idx_path) = store.pack_paths(integrity);
         assert!(
             pack_path.is_file(),
@@ -4351,16 +4910,16 @@ mod tests {
             pack_path.display()
         );
         assert!(
-            idx_path.is_file(),
-            "Index file must exist: {}",
+            !idx_path.exists(),
+            "Self-contained v2 pack must not write sibling .idx: {}",
             idx_path.display()
         );
 
         let prefix_dir = pack_path.parent().unwrap();
         let entries_count = fs::read_dir(prefix_dir).unwrap().count();
         assert_eq!(
-            entries_count, 2,
-            "Only exactly 2 files (pack + idx) should exist in store prefix dir"
+            entries_count, 1,
+            "Only 1 self-contained .pack file should exist in store prefix dir"
         );
 
         // has_package_pack check
@@ -4584,20 +5143,21 @@ mod tests {
         let files = [PackInputFile::new("index.js", 0o644, b"console.log('hi');")];
         store.put_package_pack(integrity, &files).unwrap();
 
-        let (_, idx_path) = store.pack_paths(integrity);
-        assert!(idx_path.is_file());
-
-        // Tamper with the index to include a traversal path
-        let mut idx: PackIndex = PackIndex::from_bytes(&fs::read(&idx_path).unwrap()).unwrap();
+        // Convert on-disk pack to legacy v1 `.pack` + `.idx` and tamper the `.idx` with a traversal path.
+        let loaded = store.get_package_pack(integrity).unwrap().unwrap();
+        let raw_payload = loaded.data().to_vec();
+        let mut idx = loaded.index.clone();
         idx.files[0].path = "../evil.js".to_string();
-        fs::write(&idx_path, idx.to_bytes().unwrap()).unwrap();
-
-        // Clear in-memory cache to force reading from disk
+        let (pack_path, idx_path) = store.pack_paths(integrity);
         store.clear_mmap_cache();
+        fs::write(&pack_path, &raw_payload).unwrap();
+        fs::write(&idx_path, idx.to_bytes().unwrap()).unwrap();
+        assert!(idx_path.is_file());
 
         // get_package_pack must detect the tampered path, purge the pack/idx, and return None
         let loaded = store.get_package_pack(integrity).unwrap();
         assert!(loaded.is_none());
+        assert!(!pack_path.exists());
         assert!(!idx_path.exists());
     }
 
@@ -4665,7 +5225,7 @@ mod tests {
 
         let (pack_path, idx_path) = store.pack_paths(integrity);
         assert!(pack_path.is_file());
-        assert!(idx_path.is_file());
+        assert!(!idx_path.exists());
         assert!(store.has_package_pack(integrity));
 
         store.purge(integrity).unwrap();
@@ -4722,7 +5282,7 @@ mod tests {
 
         let (pack_path, idx_path) = store.pack_paths(integrity);
         assert!(pack_path.is_file());
-        assert!(idx_path.is_file());
+        assert!(!idx_path.exists());
 
         // Corrupt a byte in the pack file without changing its length
         store.clear_mmap_cache();
@@ -4894,7 +5454,7 @@ mod tests {
         store.put_package_pack(integrity, &files).unwrap();
         let (pack_path, idx_path) = store.pack_paths(integrity);
         assert!(pack_path.is_file());
-        assert!(idx_path.is_file());
+        assert!(!idx_path.exists());
 
         // 2. Create another temp file and rename to the already existing valid destination
         let tmp_file = store.tmp_dir().join("another_tmp.tmp");
@@ -4923,7 +5483,7 @@ mod tests {
 
         let (pack_path, idx_path) = store.pack_paths(integrity);
         assert!(pack_path.is_file());
-        assert!(idx_path.is_file());
+        assert!(!idx_path.exists());
 
         // Create a target destination where 'sub' is a regular file, causing mkdir to fail with Io error
         let target_dir = tempdir().unwrap();
@@ -4940,7 +5500,6 @@ mod tests {
 
         // The pack must NOT be purged because this was an environmental/IO error!
         assert!(pack_path.is_file(), "Pack must NOT be purged on I/O error");
-        assert!(idx_path.is_file(), "Index must NOT be purged on I/O error");
         assert!(store.has_package_pack(integrity));
     }
 
@@ -4956,37 +5515,35 @@ mod tests {
 
         let index = store.put_package_pack(integrity, &files).unwrap();
         let (pack_path, idx_path) = store.pack_paths(integrity);
-        assert!(idx_path.is_file());
+        assert!(pack_path.is_file());
+        assert!(!idx_path.exists());
 
-        let pack_len = fs::metadata(&pack_path).unwrap().len();
         assert_eq!(
-            pack_len % 4096,
+            index.total_pack_size % 4096,
             0,
-            "Pack file on disk must be 4096-byte cluster aligned"
-        );
-        assert_eq!(
-            pack_len, 4096,
-            "123-byte payload must be padded up to 4096 bytes"
+            "Pack payload section must be 4096-byte cluster aligned"
         );
         assert_eq!(
             index.total_pack_size, 4096,
-            "Index total_pack_size must reflect the padded pack length"
+            "Index total_pack_size must reflect the padded 4096-byte payload length"
         );
 
-        // Verify trailing bytes are zero-padded
+        // Verify trailing payload bytes up to 4096 are zero-padded before v2 trailer
         let raw_bytes = fs::read(&pack_path).unwrap();
-        assert_eq!(raw_bytes.len(), 4096);
+        assert!(raw_bytes.len() > 4096);
         assert_eq!(&raw_bytes[0..123], &small_payload[..]);
         assert!(
-            raw_bytes[123..].iter().all(|&b| b == 0),
+            raw_bytes[123..4096].iter().all(|&b| b == 0),
             "Padding bytes must be zeroes"
         );
 
         // Reload and verify
+        store.clear_mmap_cache();
         let pack = store
             .get_package_pack(integrity)
             .unwrap()
             .expect("Pack must load");
+        assert_eq!(pack.data().len(), 4096);
         assert_eq!(pack.get_file_slice("index.js").unwrap(), &small_payload[..]);
 
         // Also test tarball creation pads to 4 KiB
@@ -5008,11 +5565,17 @@ mod tests {
         let tar_index = store
             .put_package_from_tarball(&tarball_integ, &tarball_bytes)
             .unwrap();
-        let (tar_pack_path, _) = store.pack_paths(&tarball_integ);
-        let tar_pack_len = fs::metadata(&tar_pack_path).unwrap().len();
-        assert_eq!(tar_pack_len % 4096, 0, "Tarball pack must be 4 KiB padded");
-        assert_eq!(tar_pack_len, 4096);
+        let (tar_pack_path, tar_idx_path) = store.pack_paths(&tarball_integ);
+        assert!(tar_pack_path.is_file());
+        assert!(!tar_idx_path.exists());
+        assert_eq!(
+            tar_index.total_pack_size % 4096,
+            0,
+            "Tarball pack payload must be 4 KiB padded"
+        );
         assert_eq!(tar_index.total_pack_size, 4096);
+        let tar_pack = store.get_package_pack(&tarball_integ).unwrap().unwrap();
+        assert_eq!(tar_pack.data().len(), 4096);
 
         // Materialize should succeed
         let target = tempdir().unwrap();
@@ -5109,7 +5672,7 @@ mod tests {
             repaired_disk_bytes, original_data,
             "CAS blob on disk must be repaired to original content"
         );
-        let repaired_sha = HEXLOWER.encode(&Sha256::digest(&repaired_disk_bytes));
+        let repaired_sha = HEXLOWER.encode(&sha256_digest(&repaired_disk_bytes));
         assert_eq!(
             repaired_sha, expected_sha256,
             "Repaired CAS blob must match expected SHA-256"
@@ -5696,14 +6259,17 @@ mod tests {
             )
             .unwrap();
 
-        // Tamper .idx on disk so entry.cas_path points outside cas_dir
-        let idx_path = store.idx_path(integrity);
-        let mut idx = PackIndex::from_bytes(&fs::read(&idx_path).unwrap()).unwrap();
+        // Write legacy v1 `.pack` + `.idx` and tamper `.idx` on disk so entry.cas_path points outside cas_dir
+        let pack = store.get_package_pack(integrity).unwrap().unwrap();
+        let raw_payload = pack.data().to_vec();
+        let mut idx = pack.index.clone();
+        let (pack_path, idx_path) = store.pack_paths(integrity);
         idx.files[0].cas_path = Some(outside_victim.clone());
         idx.files[0].cas_mtime = Some(1); // force stamp mismatch -> repair path
+        store.clear_mmap_cache();
+        fs::write(&pack_path, &raw_payload).unwrap();
         fs::write(&idx_path, idx.to_bytes().unwrap()).unwrap();
 
-        store.clear_mmap_cache();
         let loaded = store.get_package_pack(integrity).unwrap().unwrap();
 
         assert_eq!(
@@ -5799,11 +6365,12 @@ mod tests {
             "Compacted pack size {} must match retained live entry (<= 4096), not 256KB+ discarded duplicates",
             idx.total_pack_size
         );
-        let pack_disk_len = fs::metadata(store.pack_path(&integrity)).unwrap().len();
-        assert_eq!(pack_disk_len, PACK_ALIGNMENT as u64);
+        let pack_in_mem = store.get_package_pack(&integrity).unwrap().unwrap();
+        assert_eq!(pack_in_mem.data().len(), PACK_ALIGNMENT);
 
         store.clear_mmap_cache();
         let pack = store.get_package_pack(&integrity).unwrap().unwrap();
+        assert_eq!(pack.data().len(), PACK_ALIGNMENT);
         assert_eq!(pack.get_file_slice("sub/data.bin").unwrap(), small_new);
     }
 
@@ -5982,17 +6549,19 @@ mod tests {
             Err(CacheError::Fs(rnpm_fs::FsError::ForbiddenSparseFile { .. }))
         ));
 
-        // 3. Tampered .idx cas_path is ignored & derived inside store cas_dir; tampered entry path purges pack
+        // 3. Legacy tampered .idx cas_path is ignored & derived inside store cas_dir; tampered entry path purges pack
         let integ_ok = "sha512-tampertest000000000000000000000000000000000000000000000000000000000000000000000000000000==";
         let files = [PackInputFile::new("index.js", 0o644, b"console.log(1);")];
         store.put_package_pack(integ_ok, &files).unwrap();
+        let orig = store.get_package_pack(integ_ok).unwrap().unwrap();
+        let raw_payload = orig.data().to_vec();
+        let mut parsed = orig.index.clone();
         store.clear_mmap_cache();
 
-        let idx_path = store.idx_path(integ_ok);
-        let idx_raw = fs::read_to_string(&idx_path).unwrap();
-        let mut parsed: PackIndex = serde_json::from_str(&idx_raw).unwrap();
+        let (pack_path, idx_path) = store.pack_paths(integ_ok);
         let rogue_cas = dir.path().join("outside_cas_target");
         parsed.files[0].cas_path = Some(rogue_cas.clone());
+        fs::write(&pack_path, &raw_payload).unwrap();
         fs::write(&idx_path, parsed.to_bytes().unwrap()).unwrap();
 
         let loaded = store.get_package_pack(integ_ok).unwrap().unwrap();
@@ -6005,5 +6574,85 @@ mod tests {
         fs::write(&idx_path, parsed.to_bytes().unwrap()).unwrap();
         assert!(store.get_package_pack(integ_ok).unwrap().is_none());
         assert!(!idx_path.exists());
+    }
+
+    #[test]
+    fn test_pack_v2_self_contained_single_file_and_corrupt_footer_purged() {
+        let dir = tempdir().unwrap();
+        let store = PackStore::new(dir.path()).unwrap();
+        let integrity = "sha512-v2singlefilecorruptfooter==";
+        let files = [
+            PackInputFile::new("package.json", 0o644, b"{\"name\":\"v2\"}"),
+            PackInputFile::new("lib/index.js", 0o644, b"module.exports = 1;"),
+        ];
+        store.put_package_pack_deferred(integrity, &files).unwrap();
+        let (pack_path, idx_path) = store.pack_paths(integrity);
+        assert!(pack_path.is_file());
+        assert!(!idx_path.exists());
+
+        // Reload from disk without clearing or touching `.idx`
+        store.clear_mmap_cache();
+        let loaded = store.get_package_pack(integrity).unwrap().unwrap();
+        assert_eq!(loaded.get_file_slice("lib/index.js").unwrap(), b"module.exports = 1;");
+        assert!(!idx_path.exists());
+
+        // Corrupt a byte inside the embedded v2 index region -> must detect checksum mismatch & purge
+        store.clear_mmap_cache();
+        let mut disk_bytes = fs::read(&pack_path).unwrap();
+        let corrupt_pos = disk_bytes.len() - PACK_V2_FOOTER_LEN - 4;
+        disk_bytes[corrupt_pos] ^= 0x55;
+        fs::write(&pack_path, &disk_bytes).unwrap();
+        assert!(store.get_package_pack(integrity).unwrap().is_none());
+        assert!(!pack_path.exists());
+    }
+
+    #[test]
+    fn test_pack_v1_legacy_fallback_reads_and_caches_mtime() {
+        let dir = tempdir().unwrap();
+        let store = PackStore::new(dir.path()).unwrap();
+        let integrity = "sha512-legacyv1fallbackcheck==";
+        let files = [PackInputFile::new("index.js", 0o644, b"legacy payload")];
+        store.put_package_pack_deferred(integrity, &files).unwrap();
+
+        let pack = store.get_package_pack(integrity).unwrap().unwrap();
+        let raw_payload = pack.data().to_vec();
+        let mut v1_index = pack.index.clone();
+        v1_index.pack_mtime = None;
+        let (pack_path, idx_path) = store.pack_paths(integrity);
+
+        store.clear_mmap_cache();
+        fs::write(&pack_path, &raw_payload).unwrap();
+        fs::write(&idx_path, v1_index.to_bytes().unwrap()).unwrap();
+
+        assert!(store.has_package_pack(integrity));
+        let reloaded = store.get_package_pack(integrity).unwrap().unwrap();
+        assert_eq!(reloaded.get_file_slice("index.js").unwrap(), b"legacy payload");
+        let updated_idx = PackIndex::from_bytes(&fs::read(&idx_path).unwrap()).unwrap();
+        assert!(updated_idx.pack_mtime.is_some());
+    }
+
+    #[test]
+    fn test_is_destination_valid_rejects_truncated_pack_and_replaces() {
+        let dir = tempdir().unwrap();
+        let store = PackStore::new(dir.path()).unwrap();
+        let integrity = "sha512-truncateddestvalidcheck==";
+        let files = [PackInputFile::new("index.js", 0o644, b"healthy v2 payload")];
+
+        store.put_package_pack_deferred(integrity, &files).unwrap();
+        let (pack_path, _idx_path) = store.pack_paths(integrity);
+        let healthy_bytes = fs::read(&pack_path).unwrap();
+
+        // Corrupt existing `.pack` into a short truncated file (no `.idx` present).
+        store.clear_mmap_cache();
+        fs::write(&pack_path, b"truncated").unwrap();
+        assert!(!is_destination_valid(&pack_path));
+
+        // Atomic rename from a valid staged `.pack` must replace the truncated file.
+        let staged = store.tmp_dir().join("healthy_replace.tmp");
+        fs::write(&staged, &healthy_bytes).unwrap();
+        rename_atomic(&staged, &pack_path).unwrap();
+
+        let loaded = store.get_package_pack(integrity).unwrap().unwrap();
+        assert_eq!(loaded.get_file_slice("index.js").unwrap(), b"healthy v2 payload");
     }
 }

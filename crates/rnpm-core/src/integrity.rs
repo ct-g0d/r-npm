@@ -160,6 +160,12 @@ pub struct IntegrityEntry {
 
 #[inline]
 fn decode_base64_digest(b64_bytes: &[u8]) -> Option<Vec<u8>> {
+    // Fast path for standard 4-byte-aligned base64 (e.g. 88-byte sha512, 44-byte sha256, 28-byte sha1)
+    if !b64_bytes.is_empty() && (b64_bytes.len() & 3) == 0 {
+        if let Some(out) = decode_base64_aligned_fast(b64_bytes) {
+            return Some(out);
+        }
+    }
     let decode_len = BASE64.decode_len(b64_bytes.len()).ok()?;
     // SHA-512 base64 is 88 bytes -> decode_len is 66, so stack buffer must exceed 66 bytes.
     if decode_len <= 96 {
@@ -171,6 +177,76 @@ fn decode_base64_digest(b64_bytes: &[u8]) -> Option<Vec<u8>> {
     } else {
         BASE64.decode(b64_bytes).ok()
     }
+}
+
+const B64_DEC_TABLE: [i8; 256] = {
+    let mut t = [-1i8; 256];
+    let mut i = 0u8;
+    while i < 26 {
+        t[(b'A' + i) as usize] = i as i8;
+        t[(b'a' + i) as usize] = (i + 26) as i8;
+        i += 1;
+    }
+    let mut d = 0u8;
+    while d < 10 {
+        t[(b'0' + d) as usize] = (d + 52) as i8;
+        d += 1;
+    }
+    t[b'+' as usize] = 62;
+    t[b'/' as usize] = 63;
+    t
+};
+
+#[inline]
+fn decode_base64_aligned_fast(bytes: &[u8]) -> Option<Vec<u8>> {
+    let len = bytes.len();
+    let pad = if bytes[len - 1] == b'=' {
+        if bytes[len - 2] == b'=' {
+            2
+        } else {
+            1
+        }
+    } else {
+        0
+    };
+    let out_len = (len / 4) * 3 - pad;
+    let mut out = Vec::with_capacity(out_len);
+    let full_quads = if pad == 0 { len } else { len - 4 };
+    let mut i = 0usize;
+    while i < full_quads {
+        let a = B64_DEC_TABLE[bytes[i] as usize];
+        let b = B64_DEC_TABLE[bytes[i + 1] as usize];
+        let c = B64_DEC_TABLE[bytes[i + 2] as usize];
+        let d = B64_DEC_TABLE[bytes[i + 3] as usize];
+        if (a | b | c | d) < 0 {
+            return None;
+        }
+        let v = ((a as u32) << 18) | ((b as u32) << 12) | ((c as u32) << 6) | (d as u32);
+        out.push((v >> 16) as u8);
+        out.push((v >> 8) as u8);
+        out.push(v as u8);
+        i += 4;
+    }
+    if pad == 1 {
+        let a = B64_DEC_TABLE[bytes[i] as usize];
+        let b = B64_DEC_TABLE[bytes[i + 1] as usize];
+        let c = B64_DEC_TABLE[bytes[i + 2] as usize];
+        if (a | b | c) < 0 || (c & 0x03) != 0 {
+            return None;
+        }
+        let v = ((a as u32) << 12) | ((b as u32) << 6) | (c as u32);
+        out.push((v >> 10) as u8);
+        out.push((v >> 2) as u8);
+    } else if pad == 2 {
+        let a = B64_DEC_TABLE[bytes[i] as usize];
+        let b = B64_DEC_TABLE[bytes[i + 1] as usize];
+        if (a | b) < 0 || (b & 0x0f) != 0 {
+            return None;
+        }
+        let v = ((a as u32) << 6) | (b as u32);
+        out.push((v >> 4) as u8);
+    }
+    Some(out)
 }
 
 impl IntegrityEntry {
@@ -226,7 +302,31 @@ impl Integrity {
 
     pub fn parse(input: &str) -> Result<Self, IntegrityError> {
         // Fast path for single clean SRI token (e.g. "sha512-...==") with zero whitespace scanning
-        if let Some((algo_str, base64_str)) = input.split_once('-') {
+        let bytes = input.as_bytes();
+        let fast_prefix = if bytes.len() > 7 && bytes[6] == b'-' {
+            match &bytes[..6] {
+                b"sha512" => Some((Algorithm::Sha512, 7)),
+                b"sha256" => Some((Algorithm::Sha256, 7)),
+                b"sha384" => Some((Algorithm::Sha384, 7)),
+                _ => None,
+            }
+        } else if bytes.len() > 5 && bytes[..5] == *b"sha1-" {
+            Some((Algorithm::Sha1, 5))
+        } else {
+            None
+        };
+        if let Some((algo, off)) = fast_prefix {
+            let base64_str = &input[off..];
+            if let Some(digest) = decode_base64_digest(base64_str.as_bytes()) {
+                return Ok(Self {
+                    entries: vec![IntegrityEntry {
+                        algorithm: algo,
+                        digest,
+                        digest_base64: base64_str.to_string(),
+                    }],
+                });
+            }
+        } else if let Some((algo_str, base64_str)) = input.split_once('-') {
             if !algo_str.is_empty() && !base64_str.is_empty() {
                 if let Some(algo) = parse_algorithm(algo_str) {
                     if let Some(digest) = decode_base64_digest(base64_str.as_bytes()) {

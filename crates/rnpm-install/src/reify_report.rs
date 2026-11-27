@@ -413,84 +413,138 @@ fn scan(
         .map(|e| e.file_name().to_string_lossy().to_string())
         .collect();
     names.sort();
-    for name in names {
-        if name.starts_with('.') {
-            continue;
+        #[derive(serde::Deserialize)]
+        struct PackageVersionOnly {
+            version: Option<String>,
         }
-        let path = dir.join(&name);
-        if name.starts_with('@') {
-            scan(
-                project_dir,
-                &path,
-                &format!("{prefix}/{name}"),
-                project_lock,
-                out,
-            );
-            continue;
-        }
-        // Scoped packages arrive here as prefix ".../@scope".
-        let location = format!("{prefix}/{name}");
-        let is_link = std::fs::symlink_metadata(&path)
-            .map(|m| m.file_type().is_symlink())
-            .unwrap_or(false)
-            || junction_target(&path).is_some();
-        if is_link {
-            let target = std::fs::canonicalize(&path).ok().and_then(|t| {
-                let base = std::fs::canonicalize(project_dir).ok()?;
-                t.strip_prefix(&base)
-                    .ok()
-                    .map(|r| r.to_string_lossy().replace('\\', "/"))
-            });
-            out.insert(
-                location,
-                LockfilePackage {
-                    link: Some(true),
-                    resolved: target,
-                    ..Default::default()
-                },
-            );
-            continue;
-        }
-        let pkg = if let Ok(text) = std::fs::read_to_string(path.join("package.json")) {
-            if let Ok(manifest) =
-                serde_json::from_str::<serde_json::Value>(text.trim_start_matches('\u{feff}'))
-            {
-                let version = manifest["version"].as_str().map(str::to_string);
-                let mut p = LockfilePackage {
-                    version: version.clone(),
-                    ..Default::default()
-                };
-                if let Some(locked) = project_lock.and_then(|l| l.get(&location)) {
-                    if locked.version == version {
-                        p.resolved = locked.resolved.clone();
-                        p.integrity = locked.integrity.clone();
-                        p.in_bundle = locked.in_bundle;
-                    }
-                }
-                p
-            } else if let Some(locked) = project_lock.and_then(|l| l.get(&location)) {
-                locked.clone()
-            } else {
+
+        let mut pkg_candidates = Vec::new();
+        for name in names {
+            if name.starts_with('.') {
                 continue;
             }
-        } else if let Some(locked) = project_lock.and_then(|l| l.get(&location)) {
-            locked.clone()
-        } else {
-            continue;
+            let path = dir.join(&name);
+            if name.starts_with('@') {
+                scan(
+                    project_dir,
+                    &path,
+                    &format!("{prefix}/{name}"),
+                    project_lock,
+                    out,
+                );
+                continue;
+            }
+            // Scoped packages arrive here as prefix ".../@scope".
+            let location = format!("{prefix}/{name}");
+            let is_link = std::fs::symlink_metadata(&path)
+                .map(|m| m.file_type().is_symlink())
+                .unwrap_or(false)
+                || junction_target(&path).is_some();
+            if is_link {
+                let target = std::fs::canonicalize(&path).ok().and_then(|t| {
+                    let base = std::fs::canonicalize(project_dir).ok()?;
+                    t.strip_prefix(&base)
+                        .ok()
+                        .map(|r| r.to_string_lossy().replace('\\', "/"))
+                });
+                out.insert(
+                    location,
+                    LockfilePackage {
+                        link: Some(true),
+                        resolved: target,
+                        ..Default::default()
+                    },
+                );
+                continue;
+            }
+            pkg_candidates.push((location, path));
+        }
+
+        let read_pkg = |location: &str, path: &Path| -> Option<(String, LockfilePackage, Option<std::path::PathBuf>)> {
+            let pkg = if let Ok(bytes) = std::fs::read(path.join("package.json")) {
+                let trimmed = bytes.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(&bytes);
+                if let Ok(manifest) = serde_json::from_slice::<PackageVersionOnly>(trimmed) {
+                    let version = manifest.version;
+                    let mut p = LockfilePackage {
+                        version: version.clone(),
+                        ..Default::default()
+                    };
+                    if let Some(locked) = project_lock.and_then(|l| l.get(location)) {
+                        if locked.version == version {
+                            p.resolved = locked.resolved.clone();
+                            p.integrity = locked.integrity.clone();
+                            p.in_bundle = locked.in_bundle;
+                        }
+                    }
+                    p
+                } else {
+                    project_lock.and_then(|l| l.get(location)).cloned()?
+                }
+            } else {
+                project_lock.and_then(|l| l.get(location)).cloned()?
+            };
+            let nested = path.join("node_modules");
+            let nested_opt = nested.is_dir().then_some(nested);
+            Some((location.to_string(), pkg, nested_opt))
         };
-        out.insert(location.clone(), pkg);
-        let nested = path.join("node_modules");
-        if nested.is_dir() {
-            scan(
-                project_dir,
-                &nested,
-                &format!("{location}/node_modules"),
-                project_lock,
-                out,
-            );
+
+        type IndexedScanItem = (usize, String, LockfilePackage, Option<std::path::PathBuf>);
+        let resolved_items: Vec<(String, LockfilePackage, Option<std::path::PathBuf>)> =
+            if pkg_candidates.len() <= 48 {
+                pkg_candidates
+                    .iter()
+                    .filter_map(|(loc, p)| read_pkg(loc, p))
+                    .collect()
+            } else {
+                let workers = std::thread::available_parallelism()
+                    .map(|n| n.get())
+                    .unwrap_or(4)
+                    .min(8)
+                    .min(pkg_candidates.len());
+                let next_idx = std::sync::atomic::AtomicUsize::new(0);
+                let mut results: Vec<Vec<IndexedScanItem>> =
+                    std::thread::scope(|scope| {
+                        let mut handles = Vec::with_capacity(workers);
+                        for _ in 0..workers {
+                            handles.push(scope.spawn(|| {
+                                let mut local = Vec::new();
+                                loop {
+                                    let idx = next_idx
+                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    if idx >= pkg_candidates.len() {
+                                        break;
+                                    }
+                                    let (loc, p) = &pkg_candidates[idx];
+                                    if let Some((l, pkg, nested)) = read_pkg(loc, p) {
+                                        local.push((idx, l, pkg, nested));
+                                    }
+                                }
+                                local
+                            }));
+                        }
+                        handles.into_iter().filter_map(|h| h.join().ok()).collect()
+                    });
+                let mut flat = Vec::with_capacity(pkg_candidates.len());
+                for chunk in results.drain(..) {
+                    flat.extend(chunk);
+                }
+                flat.sort_unstable_by_key(|(idx, _, _, _)| *idx);
+                flat.into_iter().map(|(_, l, p, n)| (l, p, n)).collect()
+            };
+
+        for (location, pkg, nested_opt) in resolved_items {
+            out.insert(location.clone(), pkg);
+            if let Some(nested) = nested_opt {
+                scan(
+                    project_dir,
+                    &nested,
+                    &format!("{location}/node_modules"),
+                    project_lock,
+                    out,
+                );
+            }
         }
     }
-}
 
 #[cfg(windows)]
 fn junction_target(path: &Path) -> Option<std::path::PathBuf> {

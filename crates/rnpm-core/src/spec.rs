@@ -135,7 +135,14 @@ impl PackageTarget {
         // - ASCII alphabetic tag (not 'v'/'V'/'x'/'X') without ':', '/', '@', whitespace -> Tag directly
         let bytes = trimmed_spec.as_bytes();
         let first = bytes[0];
-        if matches!(first, b'^' | b'>' | b'<') || (first == b'~' && !trimmed_spec.starts_with("~/"))
+        if first == b'n' && trimmed_spec.starts_with("npm:") {
+            return Self::parse_alias(&trimmed_spec[4..]);
+        }
+        if first == b'w' && trimmed_spec.starts_with("workspace:") {
+            return Ok(PackageTarget::Workspace(trimmed_spec[10..].trim().to_string()));
+        }
+        if matches!(first, b'^' | b'>' | b'<')
+            || (first == b'~' && bytes.get(1) != Some(&b'/'))
         {
             if let Ok(range) = Range::parse(trimmed_spec) {
                 return Ok(PackageTarget::Range(range));
@@ -160,37 +167,27 @@ impl PackageTarget {
             return Ok(PackageTarget::Tag(trimmed_spec.to_string()));
         }
 
-        // Direct protocol prefixes before github shorthand expansion
+        // Direct protocol prefixes & bare paths before github shorthand expansion
+        if let Some(alias_str) = trimmed_spec.strip_prefix("npm:") {
+            return Self::parse_alias(alias_str);
+        }
         if let Some(ws_spec) = trimmed_spec.strip_prefix("workspace:") {
             return Ok(PackageTarget::Workspace(ws_spec.trim().to_string()));
         }
-        if let Some(alias_str) = trimmed_spec.strip_prefix("npm:") {
-            return Self::parse_alias(alias_str);
+        let raw_bytes = trimmed_spec.as_bytes();
+        let is_bare_path = trimmed_spec.starts_with('.')
+            || trimmed_spec.starts_with("~/")
+            || trimmed_spec.starts_with('/')
+            || trimmed_spec.starts_with('\\')
+            || (raw_bytes.len() >= 2
+                && raw_bytes[0].is_ascii_alphabetic()
+                && raw_bytes[1] == b':');
+        if trimmed_spec.starts_with("file:") || is_bare_path {
+            return Ok(PackageTarget::File(parse_file_path(trimmed_spec)));
         }
 
         let expanded = expand_github_shorthand(trimmed_spec);
         let s = expanded.as_ref();
-
-        // workspace: protocol specifier (e.g. workspace:*, workspace:^, workspace:~, workspace:^1.0.0)
-        if let Some(ws_spec) = s.strip_prefix("workspace:") {
-            return Ok(PackageTarget::Workspace(ws_spec.trim().to_string()));
-        }
-
-        // file: specifier, or a bare path (npa isFilespec: ^(?:[.]|~\/|[/\\]|[a-zA-Z]:))
-        let bytes = s.as_bytes();
-        let is_bare_path = s.starts_with('.')
-            || s.starts_with("~/")
-            || s.starts_with('/')
-            || s.starts_with('\\')
-            || (bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':');
-        if s.starts_with("file:") || is_bare_path {
-            return Ok(PackageTarget::File(parse_file_path(s)));
-        }
-
-        // npm: alias specifier (e.g. npm:foo@^1.0.0 or npm:@scope/foo@~2.0.0)
-        if let Some(alias_str) = s.strip_prefix("npm:") {
-            return Self::parse_alias(alias_str);
-        }
 
         // Git dependency specifications:
         if is_git_spec(s) {
@@ -390,7 +387,7 @@ impl PackageTarget {
         // Could be @scope/pkg@spec or pkg@spec or pkg
         let (name, sub_spec) = split_name_and_spec(trimmed)?;
         let inner_target = if let Some(spec) = sub_spec {
-            PackageTarget::parse(spec)?
+            PackageTarget::parse_trimmed(spec.trim())?
         } else {
             PackageTarget::Tag("latest".to_string())
         };
@@ -449,12 +446,8 @@ impl PackageSpec {
             return Err(SpecError::Empty);
         }
 
-        // Fast path: scoped package (`@scope/pkg[@spec]`) or unscoped registry spec without `:` / `/`
-        if trimmed_input.starts_with('@')
-            || !trimmed_input
-                .bytes()
-                .any(|b| matches!(b, b':' | b'/'))
-        {
+        // Fast path: scoped package (`@scope/pkg[@spec]`), unscoped bare name, or unscoped `name@target`.
+        if trimmed_input.starts_with('@') {
             let (name, spec_opt) = split_name_and_spec(trimmed_input)?;
             let target = if let Some(spec) = spec_opt {
                 PackageTarget::parse_trimmed(spec.trim())?
@@ -465,6 +458,48 @@ impl PackageSpec {
                 name: name.to_string(),
                 target,
             });
+        }
+
+        let bytes = trimmed_input.as_bytes();
+        let mut at_idx = None;
+        let mut has_delim_before_at = false;
+        for (idx, &b) in bytes.iter().enumerate() {
+            if b == b'@' {
+                at_idx = Some(idx);
+                break;
+            }
+            if b == b':' || b == b'/' {
+                has_delim_before_at = true;
+                break;
+            }
+        }
+        if !has_delim_before_at {
+            let Some(at) = at_idx else {
+                return Ok(Self {
+                    name: trimmed_input.to_string(),
+                    target: PackageTarget::Tag("latest".to_string()),
+                });
+            };
+            let name = &trimmed_input[..at];
+            let spec = &trimmed_input[at + 1..];
+            if name.is_empty() || spec.is_empty() {
+                return Err(SpecError::InvalidFormat(trimmed_input.to_string()));
+            }
+            let spec_trimmed = spec.trim();
+            let sb = spec_trimmed.as_bytes();
+            let maybe_scp = sb.contains(&b':')
+                && !spec_trimmed.starts_with("npm:")
+                && !spec_trimmed.starts_with("file:")
+                && !spec_trimmed.starts_with("workspace:")
+                && !spec_trimmed.starts_with("http://")
+                && !spec_trimmed.starts_with("https://")
+                && PackageTarget::is_scp_git_url(trimmed_input);
+            if !maybe_scp {
+                return Ok(Self {
+                    name: name.to_string(),
+                    target: PackageTarget::parse_trimmed(spec_trimmed)?,
+                });
+            }
         }
 
         // Direct protocol prefixes before github shorthand expansion
@@ -559,7 +594,7 @@ impl PackageSpec {
             return Err(SpecError::InvalidName(name.to_string()));
         }
 
-        let target = PackageTarget::parse(spec)?;
+        let target = PackageTarget::parse_trimmed(spec.trim())?;
         Ok(Self {
             name: trimmed_name.to_string(),
             target,
