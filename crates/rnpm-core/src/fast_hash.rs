@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::hash::{BuildHasher, Hasher};
 
 #[derive(Clone, Copy, Default)]
-pub(crate) struct FxBuildHasher;
+pub struct FxBuildHasher;
 
 impl BuildHasher for FxBuildHasher {
     type Hasher = FxHasher;
@@ -13,7 +13,7 @@ impl BuildHasher for FxBuildHasher {
     }
 }
 
-pub(crate) struct FxHasher {
+pub struct FxHasher {
     hash: u64,
 }
 
