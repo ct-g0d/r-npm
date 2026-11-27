@@ -152,11 +152,12 @@ mod tests {
         assert_eq!(migrated.version, Some("0.1.0".to_string()));
         assert_eq!(migrated.lockfile_version, 3);
 
-        // Verify root package "" exists
+        // Verify root package "" exists and dev dep was routed to dev_dependencies, not dependencies
         let root = migrated.packages.get("").expect("Root package missing");
         assert_eq!(root.name, Some("legacy-app".to_string()));
-        let root_deps = root.dependencies.as_ref().unwrap();
-        assert_eq!(root_deps.get("parent-pkg"), Some(&"1.0.0".to_string()));
+        assert_eq!(root.dependencies, None);
+        let root_dev_deps = root.dev_dependencies.as_ref().unwrap();
+        assert_eq!(root_dev_deps.get("parent-pkg"), Some(&"1.0.0".to_string()));
 
         // Verify flattened node_modules/parent-pkg
         let parent = migrated
@@ -2031,5 +2032,195 @@ mod tests {
         let expected_neg_zero: serde_json::Value = serde_json::from_str("-0").unwrap();
         assert_eq!(p.extra.get("negZero"), Some(&expected_neg_zero));
         assert_eq!(p_ro.extra.get("negZero"), Some(&expected_neg_zero));
+    }
+
+    #[test]
+    fn test_integrity_rejects_prefix_spoof_and_arbitrary_transitive_link() {
+        let policy = crate::integrity::IntegrityPolicy::strict()
+            .with_allowed_registries(vec!["https://registry.npmjs.org".to_string()]);
+
+        // #06a: Prefix-spoofed registry path ("evil-express/-/express-4.18.2.tgz") must be rejected
+        let spoof_json = r#"{
+  "name": "spoof-app",
+  "lockfileVersion": 3,
+  "packages": {
+    "": { "version": "1.0.0", "dependencies": { "express": "^4.18.2" } },
+    "node_modules/express": {
+      "version": "4.18.2",
+      "resolved": "https://registry.npmjs.org/evil-express/-/express-4.18.2.tgz",
+      "integrity": "sha512-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=="
+    }
+  }
+}"#;
+        let spoof_lf = LockfileV3::from_json_str(spoof_json).unwrap();
+        let err = crate::integrity::verify_lockfile_integrity(&spoof_lf, &policy)
+            .expect_err("prefix-spoofed tarball path must be rejected");
+        assert!(matches!(err, crate::error::LockfileError::PoisonedDependency { .. }));
+
+        // Subpath mirror with exact boundary ("/mirror/express/-/express-4.18.2.tgz") should succeed
+        let valid_mirror_json = spoof_json.replace("/evil-express/-/", "/mirror/express/-/");
+        let valid_mirror_lf = LockfileV3::from_json_str(&valid_mirror_json).unwrap();
+        crate::integrity::verify_lockfile_integrity(&valid_mirror_lf, &policy)
+            .expect("exact segment boundary subpath should pass");
+
+        // #06b: Transitive nested `"link": true` pointing to a remote tarball or outside root must fail
+        let transitive_remote_link_json = r#"{
+  "name": "link-bypass-app",
+  "lockfileVersion": 3,
+  "packages": {
+    "": { "version": "1.0.0", "dependencies": { "a": "1.0.0" } },
+    "node_modules/a": {
+      "version": "1.0.0",
+      "resolved": "https://registry.npmjs.org/a/-/a-1.0.0.tgz",
+      "integrity": "sha512-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==",
+      "dependencies": { "b": "1.0.0" }
+    },
+    "node_modules/a/node_modules/b": {
+      "version": "1.0.0",
+      "resolved": "https://evil.example.com/b.tgz",
+      "link": true
+    }
+  }
+}"#;
+        let trans_lf = LockfileV3::from_json_str(transitive_remote_link_json).unwrap();
+        let err = crate::integrity::verify_lockfile_integrity(&trans_lf, &policy)
+            .expect_err("transitive link:true without integrity must be audited");
+        assert!(matches!(err, crate::error::LockfileError::MissingIntegrity(_)));
+
+        let transitive_remote_link_with_hash = transitive_remote_link_json.replace(
+            "\"link\": true",
+            "\"integrity\": \"sha512-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==\",\n      \"link\": true",
+        );
+        let trans_lf_hash = LockfileV3::from_json_str(&transitive_remote_link_with_hash).unwrap();
+        let err_hash = crate::integrity::verify_lockfile_integrity(&trans_lf_hash, &policy)
+            .expect_err("transitive link:true pointing to remote URL must not bypass registry check");
+        assert!(matches!(err_hash, crate::error::LockfileError::SuspiciousResolution { .. }));
+
+        // Even with an allowed registry URL + valid integrity hash, a "link": true entry cannot reference remote targets
+        let transitive_registry_link = transitive_remote_link_with_hash
+            .replace("https://evil.example.com/b.tgz", "https://registry.npmjs.org/b/-/b-1.0.0.tgz");
+        let trans_lf_reg = LockfileV3::from_json_str(&transitive_registry_link).unwrap();
+        let err_reg = crate::integrity::verify_lockfile_integrity(&trans_lf_reg, &policy)
+            .expect_err("link:true cannot reference remote registry target");
+        assert!(matches!(err_reg, crate::error::LockfileError::PoisonedDependency { .. }));
+
+        // Transitive local link outside workspaces must fail when allow_transitive_file is false
+        let transitive_local_link = transitive_remote_link_json
+            .replace("https://evil.example.com/b.tgz", "file:./sneaky");
+        let trans_lf_local = LockfileV3::from_json_str(&transitive_local_link).unwrap();
+        let err_local = crate::integrity::verify_lockfile_integrity(&trans_lf_local, &policy)
+            .expect_err("transitive non-workspace local link:true must fail under strict policy");
+        assert!(matches!(err_local, crate::error::LockfileError::PoisonedDependency { .. }));
+
+        // Legitimate direct workspace link under root.workspaces must still pass even if
+        // allow_transitive_file is false
+        let workspace_link_json = r#"{
+  "name": "ws-app",
+  "lockfileVersion": 3,
+  "packages": {
+    "": {
+      "version": "1.0.0",
+      "workspaces": ["packages/*"],
+      "dependencies": { "pkg-a": "*" }
+    },
+    "packages/pkg-a": { "version": "1.0.0" },
+    "node_modules/pkg-a": { "resolved": "packages/pkg-a", "link": true }
+  }
+}"#;
+        let ws_lf = LockfileV3::from_json_str(workspace_link_json).unwrap();
+        crate::integrity::verify_lockfile_integrity(&ws_lf, &policy)
+            .expect("direct workspace member link should pass");
+    }
+
+    #[test]
+    fn test_sync_root_manifest_invalidates_raw_value_and_v1_migration_separates_deps() {
+        // #15a: Parsed lockfile keeps raw_value on ""; sync_root_manifest must invalidate raw_value
+        // so LockfileWriter emits the updated root dependencies/version.
+        let initial_json = r#"{
+  "name": "my-app",
+  "version": "1.0.0",
+  "lockfileVersion": 3,
+  "packages": {
+    "": {
+      "name": "my-app",
+      "version": "1.0.0",
+      "dependencies": { "chalk": "^5.0.0" }
+    }
+  }
+}"#;
+        let mut lf = LockfileV3::from_json_str(initial_json).unwrap();
+        assert!(lf.root_package().unwrap().raw_value.is_some());
+
+        let mut manifest = rnpm_core::manifest::Manifest::default();
+        manifest.name = Some("my-app".to_string());
+        manifest.version = Some("2.0.0".to_string());
+        manifest.dependencies.insert("lodash".to_string(), "^4.17.21".to_string());
+
+        lf.sync_root_manifest(&manifest);
+        assert!(
+            lf.root_package().unwrap().raw_value.is_none(),
+            "sync_root_manifest must invalidate root raw_value"
+        );
+
+        let serialized = lf.to_json_string().unwrap();
+        let reparsed = LockfileV3::from_json_str(&serialized).unwrap();
+        let root = reparsed.root_package().unwrap();
+        assert_eq!(root.version.as_deref(), Some("2.0.0"));
+        assert_eq!(
+            root.dependencies
+                .as_ref()
+                .and_then(|d| d.get("lodash"))
+                .map(String::as_str),
+            Some("^4.17.21")
+        );
+        assert!(root.dependencies.as_ref().is_none_or(|d| !d.contains_key("chalk")));
+
+        // #15b: v1 migration must not dump dev, optional, or hoisted transitive deps into root.dependencies
+        let v1_json = r#"{
+  "name": "v1-app",
+  "version": "1.0.0",
+  "lockfileVersion": 1,
+  "requires": true,
+  "dependencies": {
+    "prod-direct": {
+      "version": "1.0.0",
+      "requires": { "hoisted-transitive": "^1.0.0" }
+    },
+    "hoisted-transitive": {
+      "version": "1.2.0"
+    },
+    "dev-only": {
+      "version": "2.0.0",
+      "dev": true
+    },
+    "opt-only": {
+      "version": "3.0.0",
+      "optional": true
+    }
+  }
+}"#;
+        let migrated = parse_and_migrate(v1_json).unwrap();
+        let v1_root = migrated.root_package().unwrap();
+        let prod = v1_root.dependencies.as_ref().unwrap();
+        assert_eq!(prod.get("prod-direct").map(String::as_str), Some("1.0.0"));
+        assert!(!prod.contains_key("hoisted-transitive"));
+        assert!(!prod.contains_key("dev-only"));
+        assert!(!prod.contains_key("opt-only"));
+        assert_eq!(
+            v1_root
+                .dev_dependencies
+                .as_ref()
+                .and_then(|d| d.get("dev-only"))
+                .map(String::as_str),
+            Some("2.0.0")
+        );
+        assert_eq!(
+            v1_root
+                .optional_dependencies
+                .as_ref()
+                .and_then(|d| d.get("opt-only"))
+                .map(String::as_str),
+            Some("3.0.0")
+        );
     }
 }

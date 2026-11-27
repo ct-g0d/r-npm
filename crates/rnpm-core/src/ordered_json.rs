@@ -428,6 +428,93 @@ pub(crate) fn write_ordered_json_value(
     }
 }
 
+pub(crate) fn write_serde_json_value(
+    val: &serde_json::Value,
+    indent: &str,
+    newline: &str,
+    depth: usize,
+    out: &mut String,
+) {
+    match val {
+        serde_json::Value::Null => out.push_str("null"),
+        serde_json::Value::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
+        serde_json::Value::Number(n) => write_json_number(n, out),
+        serde_json::Value::String(s) => write_json_str(s, out),
+        serde_json::Value::Array(arr) => {
+            if arr.is_empty() {
+                out.push_str("[]");
+                return;
+            }
+            let pretty = !indent.is_empty();
+            out.push('[');
+            for (idx, item) in arr.iter().enumerate() {
+                if idx > 0 {
+                    out.push(',');
+                }
+                if pretty {
+                    out.push_str(newline);
+                    push_indent(out, indent, depth + 1);
+                }
+                write_serde_json_value(item, indent, newline, depth + 1, out);
+            }
+            if pretty {
+                out.push_str(newline);
+                push_indent(out, indent, depth);
+            }
+            out.push(']');
+        }
+        serde_json::Value::Object(map) => {
+            if map.is_empty() {
+                out.push_str("{}");
+                return;
+            }
+            let pretty = !indent.is_empty();
+            out.push('{');
+            for (idx, (k, v)) in map.iter().enumerate() {
+                if idx > 0 {
+                    out.push(',');
+                }
+                if pretty {
+                    out.push_str(newline);
+                    push_indent(out, indent, depth + 1);
+                }
+                write_json_str(k, out);
+                out.push_str(if pretty { ": " } else { ":" });
+                write_serde_json_value(v, indent, newline, depth + 1, out);
+            }
+            if pretty {
+                out.push_str(newline);
+                push_indent(out, indent, depth);
+            }
+            out.push('}');
+        }
+    }
+}
+
+pub(crate) fn ordered_json_eq_serde_value(
+    raw: &OrderedJsonValue,
+    val: &serde_json::Value,
+) -> bool {
+    match (raw, val) {
+        (OrderedJsonValue::Null, serde_json::Value::Null) => true,
+        (OrderedJsonValue::Bool(a), serde_json::Value::Bool(b)) => a == b,
+        (OrderedJsonValue::Number(a), serde_json::Value::Number(b)) => a == b,
+        (OrderedJsonValue::String(a), serde_json::Value::String(b)) => a == b,
+        (OrderedJsonValue::Array(a), serde_json::Value::Array(b)) => {
+            a.len() == b.len()
+                && a.iter()
+                    .zip(b.iter())
+                    .all(|(x, y)| ordered_json_eq_serde_value(x, y))
+        }
+        (OrderedJsonValue::Object(a), serde_json::Value::Object(b)) => {
+            a.len() == b.len()
+                && a.iter()
+                    .all(|(k, v)| b.get(k).is_some_and(|bv| ordered_json_eq_serde_value(v, bv)))
+        }
+        _ => false,
+    }
+}
+
 impl From<serde_json::Value> for OrderedJsonValue {
     fn from(val: serde_json::Value) -> Self {
         match val {

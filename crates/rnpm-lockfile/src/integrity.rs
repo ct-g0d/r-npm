@@ -156,14 +156,30 @@ pub fn verify_lockfile_integrity(
         }
     }
 
+    let root_workspaces = lockfile
+        .root_package()
+        .and_then(|r| r.workspaces.as_deref())
+        .unwrap_or(&[]);
+
     for (pkg_path, pkg) in &lockfile.packages {
         // Skip root package itself
         if pkg_path.is_empty() {
             continue;
         }
 
-        // Symlinked/workspace packages are local references
+        // Skip workspace package directory entries (no remote resolved URL, matches root workspaces)
+        if pkg.resolved.is_none()
+            && pkg.integrity.is_none()
+            && pkg.link != Some(true)
+            && is_workspace_package_entry(pkg_path, lockfile, root_workspaces)
+        {
+            continue;
+        }
+
+        // Symlinked/workspace packages are only allowed to skip remote tarball checks
+        // when they are legitimate local workspace/direct file links within project boundaries.
         if pkg.link == Some(true) {
+            audit_link_package(pkg_path, pkg, lockfile, &direct_deps, root_workspaces, policy)?;
             continue;
         }
 
@@ -220,6 +236,129 @@ fn audit_integrity(
     }
 
     Ok(())
+}
+
+#[inline]
+fn strip_prefix_ignore_ascii_case<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
+    starts_with_ignore_ascii_case(s, prefix).then(|| &s[prefix.len()..])
+}
+
+/// Validates that a `resolved` target for a `"link": true` entry is a safe relative local path
+/// within the repository root boundary. Returns `None` for remote URLs, git specs, absolute
+/// paths, or relative paths that escape the project root via `..`.
+fn normalize_local_link_target(resolved: &str) -> Option<String> {
+    let trimmed = resolved.trim();
+    if trimmed.is_empty() {
+        return Some(String::new());
+    }
+    if starts_with_ignore_ascii_case(trimmed, "git@") || trimmed.contains("://") {
+        return None;
+    }
+    let after_scheme = if let Some(rest) = strip_prefix_ignore_ascii_case(trimmed, "file:") {
+        rest.trim()
+    } else if trimmed.contains(':') {
+        return None;
+    } else {
+        trimmed
+    };
+
+    let posix = after_scheme.replace('\\', "/");
+    if posix.starts_with('/') {
+        return None;
+    }
+    let bytes = posix.as_bytes();
+    if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+        return None;
+    }
+
+    let mut segments: Vec<&str> = Vec::new();
+    for seg in posix.split('/') {
+        match seg {
+            "" | "." => continue,
+            ".." => {
+                segments.pop()?;
+            }
+            other => segments.push(other),
+        }
+    }
+    Some(segments.join("/"))
+}
+
+fn is_workspace_package_entry(
+    pkg_path: &str,
+    lockfile: &LockfileV3,
+    root_workspaces: &[String],
+) -> bool {
+    !pkg_path.is_empty()
+        && !root_workspaces.is_empty()
+        && !pkg_path.split('/').any(|s| s == "node_modules")
+        && lockfile.packages.contains_key(pkg_path)
+        && rnpm_core::workspace::path_matches_workspace_patterns(pkg_path, root_workspaces)
+}
+
+fn audit_link_package(
+    pkg_path: &str,
+    pkg: &crate::model::LockfilePackage,
+    lockfile: &LockfileV3,
+    direct_deps: &HashSet<&str>,
+    root_workspaces: &[String],
+    policy: &IntegrityPolicy,
+) -> Result<(), LockfileError> {
+    let Some(ref resolved) = pkg.resolved else {
+        return Err(LockfileError::PoisonedDependency {
+            package: pkg_path.to_string(),
+            reason: format!("Link package '{pkg_path}' is missing a resolved local target"),
+        });
+    };
+
+    let is_direct = is_direct_dependency(pkg_path, direct_deps);
+
+    let Some(target_rel) = normalize_local_link_target(resolved) else {
+        let trimmed = resolved.trim();
+        let looks_remote_or_git = starts_with_ignore_ascii_case(trimmed, "http://")
+            || starts_with_ignore_ascii_case(trimmed, "https://")
+            || starts_with_ignore_ascii_case(trimmed, "git://")
+            || starts_with_ignore_ascii_case(trimmed, "git+")
+            || starts_with_ignore_ascii_case(trimmed, "git@");
+        if looks_remote_or_git {
+            audit_integrity(pkg_path, pkg, policy)?;
+            audit_resolved_url(
+                pkg_path,
+                pkg.name.as_deref(),
+                pkg.version.as_deref(),
+                resolved,
+                is_direct,
+                policy,
+            )?;
+            return Err(LockfileError::PoisonedDependency {
+                package: pkg_path.to_string(),
+                reason: format!(
+                    "Link package '{pkg_path}' cannot reference remote or git target '{resolved}'"
+                ),
+            });
+        }
+        return Err(LockfileError::PoisonedDependency {
+            package: pkg_path.to_string(),
+            reason: format!(
+                "Link package '{pkg_path}' target '{resolved}' escapes local project boundaries"
+            ),
+        });
+    };
+
+    if is_direct || policy.allow_transitive_file {
+        return Ok(());
+    }
+
+    if is_workspace_package_entry(&target_rel, lockfile, root_workspaces) {
+        return Ok(());
+    }
+
+    Err(LockfileError::PoisonedDependency {
+        package: pkg_path.to_string(),
+        reason: format!(
+            "Transitive link package '{pkg_path}' points to untrusted local target '{resolved}'"
+        ),
+    })
 }
 
 #[inline]
@@ -496,10 +635,17 @@ fn audit_tarball_name_and_version(
             pkg_name
         };
 
-        // 1. Verify prefix matches package name
-        let clean_prefix = prefix.trim_start_matches('/');
-        let expected_name_trimmed = pkg_name.trim_start_matches('/');
-        if !clean_prefix.ends_with(expected_name_trimmed) {
+        // 1. Verify prefix matches package name on an exact path segment boundary
+        let clean_prefix = prefix.trim_start_matches('/').trim_end_matches('/');
+        let expected_name_trimmed = pkg_name.trim_start_matches('/').trim_end_matches('/');
+        let prefix_matches = !expected_name_trimmed.is_empty()
+            && (clean_prefix == expected_name_trimmed
+                || (clean_prefix.len() > expected_name_trimmed.len()
+                    && clean_prefix.ends_with(expected_name_trimmed)
+                    && clean_prefix.as_bytes()
+                        [clean_prefix.len() - expected_name_trimmed.len() - 1]
+                        == b'/'));
+        if !prefix_matches {
             return Err(LockfileError::PoisonedDependency {
                 package: pkg_path.to_string(),
                 reason: format!(

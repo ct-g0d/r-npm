@@ -897,22 +897,52 @@ pub fn pkg_delete(manifest_path: &Path, fields: &[String]) -> Result<()> {
         parsed_fields.push((trimmed.to_string(), segments));
     }
 
-    // Sort array index deletions in descending index order if targeting the same parent path,
-    // ensuring index shifts do not corrupt sibling deletion targets.
-    parsed_fields.sort_by(|(_, segs_a), (_, segs_b)| {
-        if segs_a.len() == segs_b.len() && !segs_a.is_empty() {
-            let parent_a = &segs_a[..segs_a.len() - 1];
-            let parent_b = &segs_b[..segs_b.len() - 1];
-            if parent_a == parent_b {
-                if let (PathSegment::Index(idx_a), PathSegment::Index(idx_b)) =
-                    (&segs_a[segs_a.len() - 1], &segs_b[segs_b.len() - 1])
-                {
-                    return idx_b.cmp(idx_a);
-                }
-            }
+    fn segment_rank(seg: &PathSegment) -> u8 {
+        match seg {
+            PathSegment::Key(_) => 0,
+            PathSegment::Index(_) => 1,
+            PathSegment::Append => 2,
         }
-        std::cmp::Ordering::Equal
+    }
+
+    fn cmp_segment_asc(a: &PathSegment, b: &PathSegment) -> std::cmp::Ordering {
+        match (a, b) {
+            (PathSegment::Key(ka), PathSegment::Key(kb)) => ka.cmp(kb),
+            (PathSegment::Index(ia), PathSegment::Index(ib)) => ia.cmp(ib),
+            (PathSegment::Append, PathSegment::Append) => std::cmp::Ordering::Equal,
+            _ => segment_rank(a).cmp(&segment_rank(b)),
+        }
+    }
+
+    fn cmp_segment_last_desc_index(a: &PathSegment, b: &PathSegment) -> std::cmp::Ordering {
+        match (a, b) {
+            (PathSegment::Key(ka), PathSegment::Key(kb)) => ka.cmp(kb),
+            (PathSegment::Index(ia), PathSegment::Index(ib)) => ib.cmp(ia),
+            (PathSegment::Append, PathSegment::Append) => std::cmp::Ordering::Equal,
+            _ => segment_rank(a).cmp(&segment_rank(b)),
+        }
+    }
+
+    // Strict total order: deeper paths first, then lexicographical parent segments,
+    // then descending array index so sibling deletions never shift remaining indices.
+    parsed_fields.sort_by(|(_, segs_a), (_, segs_b)| {
+        segs_b
+            .len()
+            .cmp(&segs_a.len())
+            .then_with(|| {
+                let len = segs_a.len();
+                let parent_a = &segs_a[..len - 1];
+                let parent_b = &segs_b[..len - 1];
+                for (sa, sb) in parent_a.iter().zip(parent_b.iter()) {
+                    let ord = cmp_segment_asc(sa, sb);
+                    if ord != std::cmp::Ordering::Equal {
+                        return ord;
+                    }
+                }
+                cmp_segment_last_desc_index(&segs_a[len - 1], &segs_b[len - 1])
+            })
     });
+    parsed_fields.dedup_by(|(_, segs_a), (_, segs_b)| segs_a == segs_b);
 
     for (_, segments) in parsed_fields {
         delete_value(&mut root, &segments);
