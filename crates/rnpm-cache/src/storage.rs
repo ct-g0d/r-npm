@@ -2968,10 +2968,11 @@ impl Cache {
         Ok(count)
     }
 
-    /// Purge known cache subdirectories (`content-v2`, `index-v5`, `tmp`, `_tmp`, `locks`, `_locks`, `_fingerprints`, `packs`, `cas`)
+    /// Purge known cache subdirectories (`_cacache`, `content-v2`, `index-v5`, `tmp`, `_tmp`, `locks`, `_locks`, `_fingerprints`, `packs`, `cas`)
     /// cleanly handling Windows file attributes without touching unrelated files in `self.root`.
     pub fn clean(&self) -> Result<(), CacheError> {
         let targets = [
+            self.root.join("_cacache"),
             self.root.join("content-v2"),
             self.root.join("index-v5"),
             self.root.join("tmp"),
