@@ -4732,26 +4732,21 @@ fn validate_fast_path_dep(
             .map(|n| n.all_dependency_specs());
         let need_ancestors = overrides.has_nested_target(dep_name)
             || alias_split.is_some_and(|(real, _)| overrides.has_nested_target(real));
-        let mut ancestors: Vec<String> = Vec::new();
         if !from_loc.is_empty() && need_ancestors {
-            for scope in crate::hoisting::iter_ancestor_scopes(from_loc) {
-                if let Some(n) = node_by_loc.get(scope) {
-                    if n.version.is_empty() {
-                        ancestors.push(n.name.clone());
-                    } else {
-                        ancestors.push(format!("{}@{}", n.name, n.version));
-                    }
-                }
-            }
-            ancestors.reverse();
+            // Hoisted lockfiles do not encode logical dependency ancestry in
+            // physical install locations (e.g. `a -> b -> c` all hoisted at root).
+            // Fall back to full resolution so nested overrides evaluate against
+            // true logical ancestry.
+            return false;
         }
+        let ancestors: &[String] = &[];
         let mut via_alias = false;
         let resolved_override = {
             let direct_res = if check_direct {
                 overrides.resolve_override_precompiled_with_caller(
                     dep_name,
                     raw_spec,
-                    &ancestors,
+                    ancestors,
                     caller_specs.as_ref(),
                 )
             } else {
@@ -4765,7 +4760,7 @@ fn validate_fast_path_dep(
                         overrides.resolve_override_precompiled_with_caller(
                             real_pkg,
                             inner_spec,
-                            &ancestors,
+                            ancestors,
                             caller_specs.as_ref(),
                         )
                     } else {
@@ -4971,6 +4966,70 @@ mod tests {
                 .resolve_override_precompiled_with_caller("foo", "^1.0.0", &["root"], None)
                 .unwrap(),
             Some("2.0.0".to_string())
+        );
+    }
+
+    #[test]
+    fn test_fast_path_rejects_hoisted_nested_override() {
+        // Lockfile has hoisted root -> a@1.0.0 -> b@1.0.0 -> c@1.0.0 all at top level.
+        // Adding a nested override `{"a": {"c": "2.0.0"}}` must NOT pass fast-path validation
+        // because physical scopes for `b -> c` only contain `[b, root]` and omit logical ancestor `a`.
+        let mut node_a = Node {
+            location: "node_modules/a".to_string(),
+            install_name: "a".to_string(),
+            name: "a".to_string(),
+            version: "1.0.0".to_string(),
+            parsed_version: Some(Version::parse("1.0.0").unwrap()),
+            ..Default::default()
+        };
+        node_a.dependencies.insert("b".to_string(), "^1.0.0".to_string());
+        let mut node_b = Node {
+            location: "node_modules/b".to_string(),
+            install_name: "b".to_string(),
+            name: "b".to_string(),
+            version: "1.0.0".to_string(),
+            parsed_version: Some(Version::parse("1.0.0").unwrap()),
+            ..Default::default()
+        };
+        node_b.dependencies.insert("c".to_string(), "^1.0.0".to_string());
+        let node_c = Node {
+            location: "node_modules/c".to_string(),
+            install_name: "c".to_string(),
+            name: "c".to_string(),
+            version: "1.0.0".to_string(),
+            parsed_version: Some(Version::parse("1.0.0").unwrap()),
+            ..Default::default()
+        };
+
+        let mut node_by_loc: FastMap<&str, &Node> = FastMap::default();
+        node_by_loc.insert("node_modules/a", &node_a);
+        node_by_loc.insert("node_modules/b", &node_b);
+        node_by_loc.insert("node_modules/c", &node_c);
+
+        let overrides = Overrides::from_json_value(
+            Some(&serde_json::json!({
+                "a": {
+                    "c": "2.0.0"
+                }
+            })),
+            BTreeMap::new(),
+        );
+        let options = ResolverOptions::default();
+        let mut buf = String::new();
+
+        assert!(
+            !validate_fast_path_dep(
+                &node_by_loc,
+                "node_modules/b",
+                "c",
+                "^1.0.0",
+                DependencyType::Prod,
+                &options,
+                &overrides,
+                true,
+                &mut buf,
+            ),
+            "nested override targeting `c` must force full logical-ancestry resolution instead of accepting hoisted `c@1.0.0`"
         );
     }
 }

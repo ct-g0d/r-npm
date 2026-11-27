@@ -960,6 +960,12 @@ impl crate::Installer {
             &manifests,
         );
         let nm = project.join("node_modules");
+        if !self.options.is_global
+            && (rnpm_fs::junction::is_junction(&nm).unwrap_or(false)
+                || std::fs::symlink_metadata(&nm).is_ok_and(|m| m.file_type().is_symlink()))
+        {
+            rnpm_fs::junction::remove_junction(&nm)?;
+        }
         std::fs::create_dir_all(&nm)?;
 
         // Remove what the isolated tree does not hold: a hoisted layout left

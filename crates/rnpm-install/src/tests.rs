@@ -7089,3 +7089,72 @@ fn test_uninstall_prunes_workspace_nested_node_modules_and_keeps_ws_dev_deps() {
         .contains_key("packages/ws-a/node_modules/ws-only-dep"));
     assert!(updated_lock.packages.contains_key("node_modules/ws-dev-dep"));
 }
+
+#[tokio::test]
+async fn test_incremental_install_unlinks_symlinked_node_modules_without_touching_target() {
+    let tmp = tempdir().unwrap();
+    let project_dir = tmp.path().join("project");
+    let outside_dir = tmp.path().join("outside-target");
+    fs::create_dir_all(&project_dir).unwrap();
+    fs::create_dir_all(&outside_dir).unwrap();
+    let sentinel = outside_dir.join("sentinel.txt");
+    fs::write(&sentinel, "do-not-touch").unwrap();
+
+    // Create a local tarball dependency so install runs offline with a real package write.
+    let tarball_bytes = create_test_bin_tarball("local-pkg", "1.0.0", "local-cli");
+    let tgz_path = project_dir.join("local-pkg-1.0.0.tgz");
+    fs::write(&tgz_path, &tarball_bytes).unwrap();
+    fs::write(
+        project_dir.join("package.json"),
+        serde_json::json!({
+            "name": "symlink-nm-app",
+            "version": "1.0.0",
+            "dependencies": {
+                "local-pkg": "file:./local-pkg-1.0.0.tgz"
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    // First generate package-lock.json, then replace node_modules with a junction/symlink to outside_dir.
+    let mut setup_installer = Installer::new(InstallOptions {
+        project_dir: project_dir.clone(),
+        package_lock_only: true,
+        offline: true,
+        ..Default::default()
+    })
+    .unwrap();
+    setup_installer.install().await.unwrap();
+
+    let nm = project_dir.join("node_modules");
+    rnpm_fs::create_junction(&nm, &outside_dir).unwrap();
+    assert!(rnpm_fs::is_junction(&nm).unwrap());
+
+    // Incremental install (from_scratch = false) must unlink the symlink/junction and install locally.
+    let mut installer = Installer::new(InstallOptions {
+        project_dir: project_dir.clone(),
+        offline: true,
+        ..Default::default()
+    })
+    .unwrap();
+    installer.install().await.unwrap();
+
+    assert!(
+        !rnpm_fs::is_junction(&nm).unwrap(),
+        "node_modules must be replaced by a real local directory"
+    );
+    assert!(
+        nm.join("local-pkg/package.json").is_file(),
+        "local-pkg must be installed into local node_modules"
+    );
+    assert_eq!(
+        fs::read_to_string(&sentinel).unwrap(),
+        "do-not-touch",
+        "external symlink target contents must be untouched"
+    );
+    assert!(
+        !outside_dir.join("local-pkg").exists(),
+        "install must never write packages into the external symlink target"
+    );
+}

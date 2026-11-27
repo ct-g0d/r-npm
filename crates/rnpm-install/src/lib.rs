@@ -5106,6 +5106,12 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
             let base = self.options.project_dir.clone();
             (nm, bin, base)
         };
+        if !self.options.is_global {
+            unlink_symlinked_dir(&node_modules_dir)?;
+            if self.options.bin_links {
+                unlink_symlinked_dir(&root_bin_dir)?;
+            }
+        }
         std::fs::create_dir_all(&node_modules_dir).context("Failed to create node_modules")?;
         if self.options.bin_links {
             std::fs::create_dir_all(&root_bin_dir).context("Failed to create bin dir")?;
@@ -7417,6 +7423,14 @@ npm error Unsupported URL Type \"{protocol}\": {spec}"
             let base = self.options.project_dir.clone();
             (nm, bin, base)
         };
+        // Never write package files or shims through a symlinked/junctioned
+        // `node_modules` (or `.bin`) directory into an external target.
+        if !self.options.is_global {
+            unlink_symlinked_dir(&node_modules_dir)?;
+            if self.options.bin_links {
+                unlink_symlinked_dir(&bin_dir)?;
+            }
+        }
         // `rnpm ci` (`from_scratch == true`) performs a clean wipe of `node_modules`.
         // Incremental `rnpm install` (`from_scratch == false`) preserves `node_modules`
         // and only removes extraneous/mismatched packages in place.
@@ -12647,6 +12661,21 @@ fn remove_validated_nm_package(
             }
         }
     }
+}
+
+/// Unlinks `path` if it is a symlink or NTFS junction without touching its target.
+fn unlink_symlinked_dir(path: &Path) -> Result<()> {
+    if rnpm_fs::is_junction(path).unwrap_or(false)
+        || std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink())
+    {
+        rnpm_fs::remove_junction(path).with_context(|| {
+            format!(
+                "Failed to unlink symlinked directory at {}",
+                path.display()
+            )
+        })?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
