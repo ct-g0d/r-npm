@@ -2,8 +2,9 @@ use crate::error::ShimError;
 use crate::path::compute_relative_path;
 use crate::shebang::{normalize_and_read_shebang_info, ShebangInfo};
 use crate::{
-    escape_cmd_path_cow, escape_posix_path_cow, escape_ps1_path_cow, push_escaped_cmd_arg,
-    push_escaped_posix_arg, push_escaped_ps1_arg,
+    escape_cmd_path_cow, escape_posix_path_cow, escape_ps1_path_cow, push_escaped_cmd_batch_arg,
+    push_escaped_cmd_prog, push_escaped_posix_arg, push_escaped_posix_prog_unquoted,
+    push_escaped_ps1_arg, sanitize_shebang_program,
 };
 use rnpm_core::manifest::{Manifest, PackageBin};
 use std::io::Write;
@@ -87,18 +88,20 @@ fn prepare_shim_destination(path: &Path) {
 pub fn generate_shim_content(rel_path: &str, shebang: Option<&ShebangInfo>) -> ShimContent {
     let default_shebang = ShebangInfo::default();
     let info = shebang.unwrap_or(&default_shebang);
-    let prog = &info.program;
+    let clean_prog = sanitize_shebang_program(&info.program);
+    let prog = clean_prog.as_ref();
 
     // 1. Unix POSIX Shell Script (<name>)
     // Match npm's cmd-shim output exactly, including blank lines, indentation,
     // and the double-space argument separator when no shebang args exist.
     let sh_rel_path = escape_posix_path_cow(rel_path);
+    let sh_prog = escape_posix_path_cow(prog);
     let mut sh = String::with_capacity(
-        310 + prog.len() * 2 + sh_rel_path.len() * 2 + info.args.len() * 8,
+        310 + sh_prog.len() * 2 + sh_rel_path.len() * 2 + info.args.len() * 8,
     );
     sh.push_str(
         "#!/bin/sh\n\
-basedir=$(dirname \"$(echo \"$0\" | sed -e 's,\\,/,g')\")\n\
+basedir=$(dirname \"$(echo \"$0\" | sed -e 's,\\\\,/,g')\")\n\
 \n\
 case `uname` in\n\
     *CYGWIN*|*MINGW*|*MSYS*)\n\
@@ -110,9 +113,9 @@ esac\n\
 \n\
 if [ -x \"$basedir/",
     );
-    sh.push_str(prog);
+    sh.push_str(&sh_prog);
     sh.push_str("\" ]; then\n  exec \"$basedir/");
-    sh.push_str(prog);
+    sh.push_str(&sh_prog);
     sh.push_str("\" ");
     if info.args.is_empty() {
         sh.push_str("  ");
@@ -125,7 +128,7 @@ if [ -x \"$basedir/",
     sh.push_str("\"$basedir/");
     sh.push_str(&sh_rel_path);
     sh.push_str("\" \"$@\"\nelse \n  exec ");
-    sh.push_str(prog);
+    push_escaped_posix_prog_unquoted(&mut sh, prog);
     sh.push(' ');
     if info.args.is_empty() {
         sh.push_str("  ");
@@ -156,11 +159,11 @@ CALL :find_dp0\r\n\
 \r\n\
 IF EXIST \"%dp0%\\",
     );
-    cmd.push_str(prog);
+    push_escaped_cmd_prog(&mut cmd, prog, false);
     cmd.push_str(".exe\" (\r\n  SET \"_prog=%dp0%\\");
-    cmd.push_str(prog);
+    push_escaped_cmd_prog(&mut cmd, prog, false);
     cmd.push_str(".exe\"\r\n) ELSE (\r\n  SET \"_prog=");
-    cmd.push_str(prog);
+    push_escaped_cmd_prog(&mut cmd, prog, true);
     cmd.push_str(
         "\"\r\n  SET PATHEXT=%PATHEXT:;.JS;=;%\r\n)\r\n\r\nendLocal & goto #_undefined_# 2>NUL || title %COMSPEC% & \"%_prog%\" ",
     );
@@ -168,18 +171,22 @@ IF EXIST \"%dp0%\\",
         cmd.push(' ');
     } else {
         for arg in &info.args {
-            push_escaped_cmd_arg(&mut cmd, arg);
+            push_escaped_cmd_batch_arg(&mut cmd, arg);
             cmd.push(' ');
         }
     }
     cmd.push_str("\"%dp0%\\");
     cmd.push_str(&win_rel_path);
+    if win_rel_path.ends_with('\\') {
+        cmd.push('\\');
+    }
     cmd.push_str("\" %*\r\n");
 
     // 3. Windows PowerShell Wrapper (<name>.ps1)
     let ps1_rel_path = escape_ps1_path_cow(rel_path);
+    let ps1_prog = escape_ps1_path_cow(prog);
     let mut ps1 = String::with_capacity(
-        620 + prog.len() * 3 + ps1_rel_path.len() * 4 + info.args.len() * 16,
+        620 + ps1_prog.len() * 3 + ps1_rel_path.len() * 4 + info.args.len() * 16,
     );
     ps1.push_str(
         "#!/usr/bin/env pwsh\r\n\
@@ -194,14 +201,14 @@ if ($PSVersionTable.PSVersion -lt \"6.0\" -or $IsWindows) {\r\n\
 $ret=0\r\n\
 if (Test-Path \"$basedir/",
     );
-    ps1.push_str(prog);
+    ps1.push_str(&ps1_prog);
     ps1.push_str(
         "$exe\") {\r\n\
   # Support pipeline input\r\n\
   if ($MyInvocation.ExpectingInput) {\r\n\
     $input | & \"$basedir/",
     );
-    ps1.push_str(prog);
+    ps1.push_str(&ps1_prog);
     ps1.push_str("$exe\" ");
     let mut ps1_args_buf = String::new();
     if info.args.is_empty() {
@@ -216,7 +223,7 @@ if (Test-Path \"$basedir/",
     ps1.push_str("\"$basedir/");
     ps1.push_str(&ps1_rel_path);
     ps1.push_str("\" $args\r\n  } else {\r\n    & \"$basedir/");
-    ps1.push_str(prog);
+    ps1.push_str(&ps1_prog);
     ps1.push_str("$exe\" ");
     ps1.push_str(&ps1_args_buf);
     ps1.push_str("\"$basedir/");
@@ -229,13 +236,13 @@ if (Test-Path \"$basedir/",
   if ($MyInvocation.ExpectingInput) {\r\n\
     $input | & \"",
     );
-    ps1.push_str(prog);
+    ps1.push_str(&ps1_prog);
     ps1.push_str("$exe\" ");
     ps1.push_str(&ps1_args_buf);
     ps1.push_str("\"$basedir/");
     ps1.push_str(&ps1_rel_path);
     ps1.push_str("\" $args\r\n  } else {\r\n    & \"");
-    ps1.push_str(prog);
+    ps1.push_str(&ps1_prog);
     ps1.push_str("$exe\" ");
     ps1.push_str(&ps1_args_buf);
     ps1.push_str("\"$basedir/");

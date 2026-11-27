@@ -4882,3 +4882,249 @@ fn drain_and_scrub_reader_handles_utf8_across_8kb_and_split_boundaries() {
     assert_eq!(drained, text);
     assert!(!drained.contains('\u{FFFD}'));
 }
+
+#[test]
+fn test_npmrc_credentials_scrubbed_from_lifecycle_env_and_script_base_env() {
+    let dir = tempfile::tempdir().unwrap();
+    let user_rc = dir.path().join("user.npmrc");
+    std::fs::write(
+        &user_rc,
+        "//registry.npmjs.org/:_authToken=secret_bearer_token_123\n\
+         _authToken=raw_global_token\n\
+         _auth=dXNlcjpwYXNz\n\
+         _password=base64_pass\n\
+         token=leaky_token_val\n\
+         password=leaky_pass_val\n\
+         proxy=http://alice:supersecret@proxy.internal:8080/\n\
+         registry=https://registry.npmjs.org/\n",
+    )
+    .unwrap();
+
+    let mut opts = rnpm_config::ConfigOptions::new()
+        .project_dir(dir.path())
+        .userconfig(user_rc)
+        .globalconfig(std::path::PathBuf::from("false"))
+        .builtin_config(std::path::PathBuf::from("false"));
+    opts.env_vars = Some(std::collections::BTreeMap::new());
+    let config = rnpm_config::Config::load_with_options(opts).unwrap();
+
+    // Check npm_config_env_from_config directly AND fallback when layers is empty
+    for cfg in [config.clone(), {
+        let mut no_layers = config.clone();
+        no_layers.layers.clear();
+        no_layers
+    }] {
+        let vars: std::collections::HashMap<String, String> =
+            npm_config_env_from_config(dir.path(), &cfg)
+                .into_iter()
+                .collect();
+        for forbidden in [
+            "npm_config__authToken",
+            "npm_config__authtoken",
+            "npm_config__auth",
+            "npm_config__password",
+            "npm_config_token",
+            "npm_config_password",
+        ] {
+            assert!(
+                !vars.contains_key(forbidden),
+                "sensitive config key {forbidden} leaked into npm_config_env_from_config: {vars:?}"
+            );
+        }
+        let joined: String = vars.values().cloned().collect::<Vec<_>>().join("\n");
+        assert!(!joined.contains("supersecret"), "proxy password leaked: {joined}");
+        assert!(!joined.contains("secret_bearer_token_123"));
+        assert!(!joined.contains("raw_global_token"));
+        assert!(!joined.contains("leaky_token_val"));
+    }
+
+    // Also verify ScriptBaseEnv::build (used during batched installs) and build_lifecycle_env_with_config
+    for cfg in [config.clone(), {
+        let mut no_layers = config;
+        no_layers.layers.clear();
+        no_layers
+    }] {
+        let base = ScriptBaseEnv::build(dir.path(), &cfg, None, None, None);
+        let ctx = LifecycleContext::new_with_config(
+            dir.path(),
+            dir.path(),
+            "app",
+            "postinstall",
+            "echo ok",
+            cfg.clone(),
+        );
+        let lifecycle_env = build_lifecycle_env_with_config(&ctx, &cfg);
+        for env_map in [&base.env, &lifecycle_env] {
+            let env_dump: String = env_map
+                .iter()
+                .filter(|(k, _)| k.starts_with("npm_config_"))
+                .map(|(k, v)| format!("{k}={v}"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(
+                !env_dump.contains("leaky_token_val")
+                    && !env_dump.contains("leaky_pass_val")
+                    && !env_dump.contains("supersecret")
+                    && !env_dump.contains("raw_global_token")
+                    && !env_map.contains_key("npm_config_token")
+                    && !env_map.contains_key("npm_config_password"),
+                "Leaked sensitive .npmrc values:\n{env_dump}"
+            );
+        }
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn test_windows_cmd_outer_quote_preservation() {
+    let dir = tempfile::tempdir().unwrap();
+    let script_js = dir.path().join("space dir").join("run.js");
+    std::fs::create_dir_all(script_js.parent().unwrap()).unwrap();
+    std::fs::write(&script_js, "console.log('cmd_quote_ok');").unwrap();
+
+    // Command begins and ends with quotes; without outer quoting `cmd /s` strips both quotes
+    let cmd_str = format!(r#""node" "{}""#, script_js.display());
+    let mut ctx = LifecycleContext::new(dir.path(), dir.path(), "app", "postinstall", &cmd_str);
+    ctx.capture_output = true;
+    ctx.sandbox_policy = ScriptSandboxPolicy::permissive();
+
+    let out = execute_lifecycle_script_captured(&ctx).unwrap();
+    assert_eq!(out.exit_code, 0, "stderr: {}", out.stderr);
+    assert!(
+        out.stdout.contains("cmd_quote_ok"),
+        "stdout was {:?}, stderr: {:?}",
+        out.stdout,
+        out.stderr
+    );
+}
+
+#[tokio::test]
+async fn test_topological_execution_handles_nested_duplicate_without_corrupting_top_level() {
+    let dir = tempfile::tempdir().unwrap();
+    let order_file = dir.path().join("order.log");
+    let order_path = order_file.to_string_lossy().replace('\\', "/");
+
+    let mut foo_top_manifest = rnpm_core::manifest::Manifest::default();
+    foo_top_manifest.name = Some("foo".into());
+    foo_top_manifest.scripts.insert(
+        "postinstall".into(),
+        format!(
+            "node -e \"setTimeout(()=>require('fs').appendFileSync('{order_path}','foo-top\\n'),120)\""
+        ),
+    );
+
+    let mut bar_manifest = rnpm_core::manifest::Manifest::default();
+    bar_manifest.name = Some("bar".into());
+    bar_manifest.scripts.insert(
+        "postinstall".into(),
+        format!("node -e \"require('fs').appendFileSync('{order_path}','bar\\n')\""),
+    );
+
+    let mut baz_manifest = rnpm_core::manifest::Manifest::default();
+    baz_manifest.name = Some("baz".into());
+    baz_manifest.scripts.insert(
+        "postinstall".into(),
+        format!("node -e \"require('fs').appendFileSync('{order_path}','baz\\n')\""),
+    );
+
+    // Nested foo appears AFTER top-level foo and has its own postinstall.
+    // `foo-top` sleeps 120ms while `foo-nested` finishes immediately: if `bar` mistakenly
+    // resolved to `foo-nested`, `bar` would finish before `foo-top`!
+    // `baz` depends on `foo` -> resolves to its nested `node_modules/baz/node_modules/foo` FIRST!
+    let mut foo_nested_manifest = rnpm_core::manifest::Manifest::default();
+    foo_nested_manifest.name = Some("foo".into());
+    foo_nested_manifest.scripts.insert(
+        "postinstall".into(),
+        format!("node -e \"require('fs').appendFileSync('{order_path}','foo-nested\\n')\""),
+    );
+
+    for rel in [
+        "node_modules/foo",
+        "node_modules/bar",
+        "node_modules/baz",
+        "node_modules/baz/node_modules/foo",
+    ] {
+        std::fs::create_dir_all(dir.path().join(rel)).unwrap();
+    }
+
+    let nodes = vec![
+        LifecyclePackageNode {
+            package_path: "node_modules/foo".into(),
+            disk_path: dir.path().join("node_modules/foo"),
+            manifest: foo_top_manifest,
+            source: PackageSource::Registry,
+            dependencies: vec![],
+            optional: false,
+        },
+        LifecyclePackageNode {
+            package_path: "node_modules/bar".into(),
+            disk_path: dir.path().join("node_modules/bar"),
+            manifest: bar_manifest,
+            source: PackageSource::Registry,
+            dependencies: vec!["foo".into()],
+            optional: false,
+        },
+        LifecyclePackageNode {
+            package_path: "node_modules/baz".into(),
+            disk_path: dir.path().join("node_modules/baz"),
+            manifest: baz_manifest,
+            source: PackageSource::Registry,
+            dependencies: vec!["foo".into()],
+            optional: false,
+        },
+        LifecyclePackageNode {
+            package_path: "node_modules/baz/node_modules/foo".into(),
+            disk_path: dir.path().join("node_modules/baz/node_modules/foo"),
+            manifest: foo_nested_manifest,
+            source: PackageSource::Registry,
+            dependencies: vec![],
+            optional: false,
+        },
+    ];
+
+    let mut opts = LifecycleOptions::new(dir.path());
+    opts.sandbox_policy = ScriptSandboxPolicy::permissive();
+    execute_dependency_hooks_with_abort(&nodes, &opts, None)
+        .await
+        .unwrap();
+
+    let lines: Vec<String> = std::fs::read_to_string(&order_file)
+        .unwrap()
+        .lines()
+        .map(|s| s.to_string())
+        .collect();
+    let pos = |name: &str| lines.iter().position(|l| l == name).unwrap();
+    assert!(
+        pos("foo-top") < pos("bar"),
+        "bar must run after top-level foo even when nested duplicate foo exists: {lines:?}"
+    );
+    assert!(
+        pos("foo-nested") < pos("baz"),
+        "baz must run after its nested foo: {lines:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_ensure_node_gyp_async_bootstrap_without_blocking() {
+    let dir = tempfile::tempdir().unwrap();
+    let npmrc_path = dir.path().join("test.npmrc");
+    // Unreachable local registry + isolated cache dir tests bootstrap_node_gyp_async directly inside Tokio
+    std::fs::write(
+        &npmrc_path,
+        format!(
+            "registry=http://127.0.0.1:9/\ncache={}\n",
+            dir.path().join("npm-cache").display()
+        ),
+    )
+    .unwrap();
+    let cfg = rnpm_config::Config::load_with_options(
+        rnpm_config::ConfigOptions::new()
+            .userconfig(npmrc_path)
+            .globalconfig(std::path::PathBuf::from("false"))
+            .builtin_config(std::path::PathBuf::from("false"))
+            .env_vars(std::collections::BTreeMap::new()),
+    )
+    .unwrap();
+    let err = bootstrap_node_gyp_async(dir.path(), &cfg).await;
+    assert!(err.is_err(), "unreachable local port must fail cleanly inside async bootstrap");
+}

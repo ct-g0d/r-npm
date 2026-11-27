@@ -282,10 +282,12 @@ pub fn query_is_dev_drive(volume_path: &str) -> bool {
     // Fallback: check via fsutil devdrv query <drive> or PowerShell (Get-Volume -DriveLetter <x>).DevDrive
     if let Some(drive_letter) = trimmed.chars().next() {
         if trimmed.chars().nth(1) == Some(':') {
-            if let Ok(output) = std::process::Command::new("fsutil")
+            use std::os::windows::process::CommandExt;
+            let mut fsutil_cmd = std::process::Command::new("fsutil");
+            fsutil_cmd
                 .args(["devdrv", "query", &format!("{drive_letter}:")])
-                .output()
-            {
+                .creation_flags(0x0800_0000);
+            if let Ok(output) = fsutil_cmd.output() {
                 if output.status.success() {
                     let text = String::from_utf8_lossy(&output.stdout).to_lowercase();
                     if text.contains("developer volume: yes")
@@ -302,10 +304,10 @@ pub fn query_is_dev_drive(volume_path: &str) -> bool {
             let ps_cmd = format!(
                 "& {{ try {{ $v = Get-Volume -DriveLetter {drive_letter} -ErrorAction Stop; [bool]$v.DevDrive }} catch {{ $false }} }}"
             );
-            if let Ok(output) = std::process::Command::new("powershell.exe")
-                .args(["-NoProfile", "-NonInteractive", "-Command", &ps_cmd])
-                .output()
-            {
+            let mut ps = std::process::Command::new("powershell.exe");
+            ps.args(["-NoProfile", "-NonInteractive", "-Command", &ps_cmd])
+                .creation_flags(0x0800_0000);
+            if let Ok(output) = ps.output() {
                 let text = String::from_utf8_lossy(&output.stdout);
                 if text.trim().eq_ignore_ascii_case("true") {
                     return true;
@@ -397,10 +399,12 @@ pub fn query_defender_info() -> DefenderInfo {
     {
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
+            use std::os::windows::process::CommandExt;
             let cmd = "& { try { $s = Get-MpComputerStatus; $p = Get-MpPreference; $excl = if ($p.ExclusionPath) { @($p.ExclusionPath) } else { @() }; @{ RealTime = [bool]$s.RealTimeProtectionEnabled; PerfMode = [int]$p.PerformanceModeStatus; Excl = $excl } | ConvertTo-Json -Compress } catch { @{ Error = 'unavailable' } | ConvertTo-Json -Compress } }";
-            let res = std::process::Command::new("powershell.exe")
-                .args(["-NoProfile", "-NonInteractive", "-Command", cmd])
-                .output();
+            let mut ps = std::process::Command::new("powershell.exe");
+            ps.args(["-NoProfile", "-NonInteractive", "-Command", cmd])
+                .creation_flags(0x0800_0000);
+            let res = ps.output();
             let _ = tx.send(res);
         });
 
@@ -1242,9 +1246,13 @@ async fn run_check(kind: DoctorCheckKind, env: &DoctorEnv) -> Result<String, Che
 }
 
 async fn node_version_check() -> Result<String, CheckFailure> {
-    let current = std::process::Command::new("node")
-        .arg("--version")
+    let mut cmd = tokio::process::Command::new("node");
+    cmd.arg("--version");
+    #[cfg(windows)]
+    cmd.creation_flags(0x0800_0000);
+    let current = cmd
         .output()
+        .await
         .ok()
         .filter(|o| o.status.success())
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
@@ -1376,23 +1384,38 @@ pub async fn run_npm_doctor(project_dir: &Path, groups: &[String]) -> anyhow::Re
     let config = rnpm_config::Config::load(Some(project_dir)).unwrap_or_default();
     let registry = config.npmrc.registry.clone();
     let silent = doctor_is_silent(&config);
-    let env = DoctorEnv {
+    let env = std::sync::Arc::new(DoctorEnv {
         config,
         registry,
         project_dir: project_dir.to_path_buf(),
-    };
+    });
+    let selected: Vec<&DoctorCheck> = DOCTOR_CHECKS
+        .iter()
+        .filter(|check| {
+            !(cfg!(windows) && !check.windows)
+                && (groups.is_empty() || groups.iter().any(|g| check.groups.contains(&g.as_str())))
+        })
+        .collect();
+    let mut results: Vec<Option<Result<String, CheckFailure>>> =
+        (0..selected.len()).map(|_| None).collect();
+    let mut join_set = tokio::task::JoinSet::new();
+    for (idx, check) in selected.iter().enumerate() {
+        let env_c = std::sync::Arc::clone(&env);
+        let kind = check.kind;
+        join_set.spawn(async move { (idx, run_check(kind, &env_c).await) });
+    }
+    while let Some(res) = join_set.join_next().await {
+        match res {
+            Ok((idx, outcome)) => results[idx] = Some(outcome),
+            Err(e) => anyhow::bail!("Doctor check panicked: {e}"),
+        }
+    }
     let mut all_ok = true;
-    for check in DOCTOR_CHECKS {
-        if cfg!(windows) && !check.windows {
-            continue;
-        }
-        if !groups.is_empty() && !groups.iter().any(|g| check.groups.contains(&g.as_str())) {
-            continue;
-        }
+    for (check, outcome) in selected.into_iter().zip(results) {
         if !silent {
             println!("{}", check.title);
         }
-        match run_check(check.kind, &env).await {
+        match outcome.unwrap_or_else(|| Err(CheckFailure::Error("Check did not complete".into()))) {
             Ok(result) => {
                 if !silent {
                     if result.is_empty() {

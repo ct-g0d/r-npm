@@ -16,11 +16,12 @@ pub mod sandbox;
 
 pub use error::LifecycleError;
 pub use node_gyp::{
-    bootstrap_node_gyp, count_node_modules_depth, create_private_node_gyp_shim, ensure_node_gyp,
-    find_cache_dir, find_node_gyp, find_registry, install_production_dependencies,
-    is_ancestor_satisfied, is_offline_mode, node_gyp_bin_dir, package_dir_in_node_modules,
-    pick_matching_version, unpack_tarball, validate_package_name, verify_tarball_integrity,
-    MAX_NESTING_DEPTH, StagingGuard,
+    bootstrap_node_gyp, bootstrap_node_gyp_async, count_node_modules_depth,
+    create_private_node_gyp_shim, ensure_node_gyp, ensure_node_gyp_async, find_cache_dir,
+    find_node_gyp, find_registry, install_production_dependencies, is_ancestor_satisfied,
+    is_offline_mode, node_gyp_bin_dir, package_dir_in_node_modules, pick_matching_version,
+    unpack_tarball, validate_package_name, verify_tarball_integrity, MAX_NESTING_DEPTH,
+    StagingGuard,
 };
 pub use policy::{SandboxLevel, ScriptSandboxPolicy};
 pub use sandbox::{check_dangerous_command_patterns, CommandPatternAnalyzer};
@@ -1642,23 +1643,30 @@ pub fn npm_config_env_from_config(
                 || key.starts_with(['/', '@', '_'])
                 || key.contains(":_")
                 || key.contains("//")
+                || is_sensitive_credential_key(&key)
             {
                 continue;
             }
-            out.push((
-                format!("npm_config_{}", key.replace('-', "_").to_ascii_lowercase()),
-                value.clone(),
-            ));
+            let env_key = format!("npm_config_{}", key.replace('-', "_").to_ascii_lowercase());
+            if is_sensitive_credential_key(&env_key) {
+                continue;
+            }
+            out.push((env_key, rnpm_config::npmrc::scrub_credentials(value)));
         }
     } else {
         for (key, value) in &config.npmrc.settings {
-            if key.starts_with(['/', '@', '_']) || key.contains(":_") || key.contains("//") {
+            if key.starts_with(['/', '@', '_'])
+                || key.contains(":_")
+                || key.contains("//")
+                || is_sensitive_credential_key(key)
+            {
                 continue;
             }
-            out.push((
-                format!("npm_config_{}", key.replace('-', "_").to_ascii_lowercase()),
-                value.clone(),
-            ));
+            let env_key = format!("npm_config_{}", key.replace('-', "_").to_ascii_lowercase());
+            if is_sensitive_credential_key(&env_key) {
+                continue;
+            }
+            out.push((env_key, rnpm_config::npmrc::scrub_credentials(value)));
         }
     }
     let global_prefix = config
@@ -2118,32 +2126,45 @@ impl ScriptBaseEnv {
                 }
             }
             for (key, (source, value)) in winning {
-                if source == "env" {
+                if source == "env" || is_sensitive_credential_key(key) {
                     continue;
                 }
+                let env_key_raw = format!("npm_config_{}", key.replace('-', "_"));
+                let lower_k = format!("npm_config_{}", key.replace('-', "_").to_ascii_lowercase());
+                if is_sensitive_credential_key(&env_key_raw)
+                    || is_sensitive_credential_key(&lower_k)
+                {
+                    continue;
+                }
+                let scrubbed_val = rnpm_config::npmrc::scrub_credentials(value);
                 if !(key.starts_with(['/', '@', '_'])
                     || key.contains(":_")
                     || key.contains("//"))
                 {
-                    let lower_k = format!("npm_config_{}", key.replace('-', "_").to_ascii_lowercase());
-                    env.entry(lower_k).or_insert_with(|| value.clone());
+                    env.entry(lower_k).or_insert_with(|| scrubbed_val.clone());
                 }
-                if !is_sensitive_credential_key(key) {
-                    env.insert(format!("npm_config_{}", key.replace('-', "_")), value.clone());
-                }
+                env.insert(env_key_raw, scrubbed_val);
             }
         } else {
             for (key, value) in &config.npmrc.settings {
+                if is_sensitive_credential_key(key) {
+                    continue;
+                }
+                let env_key_raw = format!("npm_config_{}", key.replace('-', "_"));
+                let lower_k = format!("npm_config_{}", key.replace('-', "_").to_ascii_lowercase());
+                if is_sensitive_credential_key(&env_key_raw)
+                    || is_sensitive_credential_key(&lower_k)
+                {
+                    continue;
+                }
+                let scrubbed_val = rnpm_config::npmrc::scrub_credentials(value);
                 if !(key.starts_with(['/', '@', '_'])
                     || key.contains(":_")
                     || key.contains("//"))
                 {
-                    let lower_k = format!("npm_config_{}", key.replace('-', "_").to_ascii_lowercase());
-                    env.entry(lower_k).or_insert_with(|| value.clone());
+                    env.entry(lower_k).or_insert_with(|| scrubbed_val.clone());
                 }
-                if !is_sensitive_credential_key(key) {
-                    env.insert(format!("npm_config_{}", key.replace('-', "_")), value.clone());
-                }
+                env.insert(env_key_raw, scrubbed_val);
             }
         }
 
@@ -2986,7 +3007,9 @@ pub(crate) fn create_shell_command(ctx: &LifecycleContext) -> Command {
         #[cfg(windows)]
         {
             use std::os::windows::process::CommandExt;
-            cmd.raw_arg(format!("/d /s /c {}", ctx.script_cmd));
+            // Wrap script_cmd in outer double quotes so `cmd /s` strips only our outer
+            // delimiter pair instead of mangling commands that start/end with quotes.
+            cmd.raw_arg(format!("/d /s /c \"{}\"", ctx.script_cmd));
         }
         #[cfg(not(windows))]
         {
@@ -3266,7 +3289,7 @@ where
 
     if ctx.script_cmd.contains("node-gyp") {
         let config = load_config_for_context(ctx);
-        let gyp_path = ensure_node_gyp(
+        let gyp_path = ensure_node_gyp_async(
             &ctx.project_root,
             &ctx.package_dir,
             &config,
@@ -3274,6 +3297,7 @@ where
             ctx.offline,
             &ctx.package_name,
         )
+        .await
         .map_err(|e| anyhow::anyhow!(e))?;
         env.insert(
             "npm_config_node_gyp".to_string(),
@@ -4215,18 +4239,82 @@ async fn execute_dependency_hooks_with_abort(
         return Ok(());
     }
 
-    // Build dependency index matching node name / package_path lookup.
-    let mut name_to_idx: HashMap<String, usize> = HashMap::with_capacity(nodes.len() * 2);
+    // Index nodes by normalized `package_path` AND top-level/shallowest name fallback so
+    // nested duplicates (e.g. `node_modules/bar/node_modules/foo`) never overwrite top-level `foo`.
+    fn normalize_pkg_path(raw: &str) -> String {
+        raw.replace('\\', "/").trim_end_matches('/').to_string()
+    }
+
+    let norm_paths: Vec<String> = nodes
+        .iter()
+        .map(|node| normalize_pkg_path(&node.package_path))
+        .collect();
+    let mut path_to_idx: HashMap<String, usize> = HashMap::with_capacity(nodes.len());
+    let mut name_to_fallback_idx: HashMap<String, usize> = HashMap::with_capacity(nodes.len());
+
     for (idx, node) in nodes.iter().enumerate() {
+        let norm_path = &norm_paths[idx];
+        path_to_idx.insert(norm_path.clone(), idx);
+
         let name = node
             .manifest
             .name
             .clone()
-            .unwrap_or_else(|| node.package_path.clone());
-        name_to_idx.insert(name, idx);
-        if let Some(stripped) = node.package_path.strip_prefix("node_modules/") {
-            name_to_idx.insert(stripped.to_string(), idx);
+            .unwrap_or_else(|| norm_path.clone());
+        // Prefer shallower paths (top-level `node_modules/<name>`) when falling back by bare name.
+        name_to_fallback_idx
+            .entry(name)
+            .and_modify(|existing_idx| {
+                if norm_paths[idx].len() < norm_paths[*existing_idx].len() {
+                    *existing_idx = idx;
+                }
+            })
+            .or_insert(idx);
+    }
+
+    fn resolve_dep_idx(
+        u: usize,
+        dep: &str,
+        norm_paths: &[String],
+        path_to_idx: &HashMap<String, usize>,
+        name_to_fallback_idx: &HashMap<String, usize>,
+    ) -> Option<usize> {
+        // 1. Check explicit path key directly if provided (e.g. workspace member path)
+        if let Some(&idx) = path_to_idx.get(dep) {
+            return Some(idx);
         }
+
+        // 2. Walk ancestor node_modules scopes from `u`'s directory up to project root.
+        let mut dir = norm_paths[u].as_str();
+        loop {
+            let candidate = if dir.is_empty() {
+                format!("node_modules/{dep}")
+            } else {
+                format!("{dir}/node_modules/{dep}")
+            };
+            if let Some(&idx) = path_to_idx.get(&candidate) {
+                return Some(idx);
+            }
+            if dir.is_empty() {
+                break;
+            }
+            // Jump to parent package/workspace directory (skipping intermediate `node_modules` folder).
+            if let Some(pos) = dir.rfind('/') {
+                let parent = &dir[..pos];
+                if let Some(stripped) = parent.strip_suffix("/node_modules") {
+                    dir = stripped;
+                } else if parent == "node_modules" {
+                    dir = "";
+                } else {
+                    dir = parent;
+                }
+            } else {
+                dir = "";
+            }
+        }
+
+        // 3. Fallback to shallowest node matching package name.
+        name_to_fallback_idx.get(dep).copied()
     }
 
     // Construct an acyclic dependency DAG using DFS cycle back-edge breaking.
@@ -4236,10 +4324,13 @@ async fn execute_dependency_hooks_with_abort(
     let mut visited = vec![false; n];
     let mut in_stack = vec![false; n];
 
+    #[allow(clippy::too_many_arguments)]
     fn dfs_dag(
         u: usize,
         nodes: &[LifecyclePackageNode],
-        name_to_idx: &HashMap<String, usize>,
+        norm_paths: &[String],
+        path_to_idx: &HashMap<String, usize>,
+        name_to_fallback_idx: &HashMap<String, usize>,
         visited: &mut [bool],
         in_stack: &mut [bool],
         dependents: &mut [Vec<usize>],
@@ -4251,14 +4342,25 @@ async fn execute_dependency_hooks_with_abort(
         in_stack[u] = true;
         let mut added_deps: Vec<usize> = Vec::with_capacity(nodes[u].dependencies.len());
         for dep in &nodes[u].dependencies {
-            if let Some(&v) = name_to_idx.get(dep) {
+            if let Some(v) = resolve_dep_idx(u, dep, norm_paths, path_to_idx, name_to_fallback_idx)
+            {
                 if v != u && !in_stack[v] {
                     if !added_deps.contains(&v) {
                         added_deps.push(v);
                         dependents[v].push(u);
                         indegree[u] += 1;
                     }
-                    dfs_dag(v, nodes, name_to_idx, visited, in_stack, dependents, indegree);
+                    dfs_dag(
+                        v,
+                        nodes,
+                        norm_paths,
+                        path_to_idx,
+                        name_to_fallback_idx,
+                        visited,
+                        in_stack,
+                        dependents,
+                        indegree,
+                    );
                 }
             }
         }
@@ -4271,7 +4373,9 @@ async fn execute_dependency_hooks_with_abort(
             dfs_dag(
                 i,
                 nodes,
-                &name_to_idx,
+                &norm_paths,
+                &path_to_idx,
+                &name_to_fallback_idx,
                 &mut visited,
                 &mut in_stack,
                 &mut dependents,
