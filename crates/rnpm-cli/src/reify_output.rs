@@ -393,6 +393,30 @@ pub(crate) async fn finish_with_config(
     elapsed: std::time::Duration,
     preloaded_config: Option<&rnpm_config::Config>,
 ) -> anyhow::Result<()> {
+    finish_with_config_and_lockfile(
+        project_dir,
+        report,
+        json,
+        dry_run,
+        silent,
+        elapsed,
+        preloaded_config,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn finish_with_config_and_lockfile(
+    project_dir: &Path,
+    report: &ReifyReport,
+    json: bool,
+    dry_run: bool,
+    silent: bool,
+    elapsed: std::time::Duration,
+    preloaded_config: Option<&rnpm_config::Config>,
+    preloaded_lockfile: Option<&rnpm_lockfile::LockfileV3>,
+) -> anyhow::Result<()> {
     let owned_config;
     let config = match preloaded_config {
         Some(cfg) => cfg,
@@ -405,7 +429,7 @@ pub(crate) async fn finish_with_config(
     let fund_enabled = config.get_bool("fund").unwrap_or(true);
     let mut opts = ReifyOutputOptions::from_config_loaded(config, json, dry_run, fund_enabled);
     opts.silent |= silent;
-    let parsed_lock = if !opts.dry_run && audit_enabled && fund_enabled {
+    let owned_lock = if preloaded_lockfile.is_none() && !opts.dry_run && (audit_enabled || fund_enabled) {
         let (lock_path, _) = rnpm_install::resolve_lockfile_path(project_dir);
         if lock_path.exists() {
             rnpm_lockfile::load_and_migrate_readonly(&lock_path).ok()
@@ -415,24 +439,66 @@ pub(crate) async fn finish_with_config(
     } else {
         None
     };
-    let audit = if audit_enabled && !opts.dry_run && project_dir.join("package-lock.json").exists()
-    {
-        crate::audit::build_audit_report_with_config_and_lockfile(
-            project_dir,
-            None,
-            Some(config),
-            parsed_lock.as_ref(),
-        )
-        .await
-        .ok()
-        .map(|(r, _)| r)
-    } else {
-        None
-    };
-    let funding = if fund_enabled && !opts.dry_run {
-        crate::audit::count_funding_packages_with_lockfile(project_dir, parsed_lock.as_ref())
-    } else {
-        0
-    };
-    print(project_dir, report, audit.as_ref(), funding, &opts, elapsed)
+    let effective_lock = preloaded_lockfile.or(owned_lock.as_ref());
+    let need_audit = audit_enabled && !opts.dry_run && project_dir.join("package-lock.json").exists();
+    let need_fund = fund_enabled && !opts.dry_run;
+    let fund_from_mem = need_fund
+        .then(|| {
+            effective_lock.and_then(|lf| {
+                let c = lf
+                    .packages
+                    .iter()
+                    .filter(|(k, p)| !k.is_empty() && p.extra.contains_key("funding"))
+                    .count();
+                (c > 0).then_some(c)
+            })
+        })
+        .flatten();
+    let dir_for_fund = project_dir.to_path_buf();
+
+    let (audit, funding) = tokio::join!(
+        async {
+            if need_audit {
+                crate::audit::build_audit_report_with_config_and_lockfile(
+                    project_dir,
+                    None,
+                    Some(config),
+                    effective_lock,
+                )
+                .await
+                .ok()
+                .map(|(r, _)| r)
+            } else {
+                None
+            }
+        },
+        async {
+            if !need_fund {
+                0
+            } else if let Some(c) = fund_from_mem {
+                c
+            } else if effective_lock.is_some() {
+                tokio::task::spawn_blocking(move || {
+                    crate::audit::count_funding_packages_in_node_modules(&dir_for_fund)
+                })
+                .await
+                .unwrap_or(0)
+            } else {
+                tokio::task::spawn_blocking(move || {
+                    crate::audit::count_funding_packages_with_lockfile(&dir_for_fund, None)
+                })
+                .await
+                .unwrap_or(0)
+            }
+        }
+    );
+    print_with_lockfile(
+        project_dir,
+        report,
+        audit.as_ref(),
+        funding,
+        &opts,
+        elapsed,
+        effective_lock,
+    )
 }

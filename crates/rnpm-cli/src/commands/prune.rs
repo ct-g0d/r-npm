@@ -41,7 +41,6 @@ pub(crate) async fn run_with_config(
 
     let nm_dir = current_dir.join("node_modules");
     let had_nm = nm_dir.exists();
-    let before = crate::reify_output::snapshot(&current_dir);
 
     let install_options = InstallOptions {
         project_dir: current_dir.clone(),
@@ -66,10 +65,10 @@ pub(crate) async fn run_with_config(
         omit_peer,
     };
 
-    let report = if args.dry_run {
-        let analysis = installer.analyze_prune(&prune_options)?;
-        let mut report = install_summary.reify.unwrap_or_default();
-        for pkg in analysis.extraneous_packages {
+    let analysis = installer.analyze_prune(&prune_options)?;
+    let mut report = install_summary.reify.unwrap_or_default();
+    if args.dry_run {
+        for pkg in &analysis.extraneous_packages {
             report.changes.push(rnpm_install::ReifyChange::Remove(
                 rnpm_install::ReifyEntry {
                     name: pkg
@@ -78,21 +77,45 @@ pub(crate) async fn run_with_config(
                         .next()
                         .unwrap_or(&pkg.name)
                         .to_string(),
-                    version: pkg.version.unwrap_or_default(),
-                    location: pkg.path,
+                    version: pkg.version.clone().unwrap_or_default(),
+                    location: pkg.path.clone(),
                 },
             ));
         }
-        report
     } else {
-        installer.prune(&prune_options)?;
+        let summary = installer.prune_with_analysis(&analysis)?;
         if !had_nm && install_summary.packages_installed == 0 && nm_dir.exists() {
             let _ = std::fs::remove_dir_all(&nm_dir);
         }
-        crate::reify_output::report_between(&before, &crate::reify_output::snapshot(&current_dir))
-    };
+        let removed_set: std::collections::HashSet<&str> = summary
+            .removed_packages
+            .iter()
+            .map(String::as_str)
+            .collect();
+        for pkg in &analysis.extraneous_packages {
+            if removed_set.contains(pkg.path.as_str()) {
+                report.changes.push(rnpm_install::ReifyChange::Remove(
+                    rnpm_install::ReifyEntry {
+                        name: pkg
+                            .path
+                            .rsplit("node_modules/")
+                            .next()
+                            .unwrap_or(&pkg.name)
+                            .to_string(),
+                        version: pkg.version.clone().unwrap_or_default(),
+                        location: pkg.path.clone(),
+                    },
+                ));
+            }
+        }
+        report.inventory = analysis
+            .discovered_packages
+            .len()
+            .saturating_sub(summary.removed_packages.len())
+            + 1;
+    }
 
-    crate::reify_output::finish_with_config(
+    crate::reify_output::finish_with_config_and_lockfile(
         &current_dir,
         &report,
         args.json,
@@ -100,6 +123,7 @@ pub(crate) async fn run_with_config(
         args.silent,
         start_time.elapsed(),
         preloaded_config,
+        installer.last_lockfile(),
     )
     .await
 }

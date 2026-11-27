@@ -186,8 +186,15 @@ pub fn compute_project_fingerprint(project_dir: &Path, options: &InstallOptions)
         hasher.update(bytes);
     }
 
-    if let Some(ws_root) = rnpm_config::find_workspace_root(project_dir) {
-        let ws_npmrc = ws_root.join(".npmrc");
+    let ws_npmrc_opt = if let Some(ref cfg) = options.config_override {
+        cfg.layers
+            .iter()
+            .find(|l| l.name == "workspace")
+            .and_then(|l| l.source.clone())
+    } else {
+        rnpm_config::find_workspace_root(project_dir).map(|ws_root| ws_root.join(".npmrc"))
+    };
+    if let Some(ws_npmrc) = ws_npmrc_opt {
         if let Some(bytes) = read_rc_cached(&mut rc_file_cache, &ws_npmrc) {
             hasher.update(b"\nworkspace_root_npmrc_bytes:\n");
             hasher.update(bytes);
@@ -971,9 +978,9 @@ pub(crate) fn validate_hidden_lockfile_loaded(
     let avail = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(4);
-    let num_threads = checks.len().div_ceil(48).min(avail).min(8);
+    let num_threads = checks.len().div_ceil(16).min(avail).min(8);
 
-    if checks.len() <= 48 || num_threads <= 1 {
+    if checks.len() <= 16 || num_threads <= 1 {
         for check in &checks {
             if check.is_link_or_junction && !check.folder_path.exists() {
                 debug!(
