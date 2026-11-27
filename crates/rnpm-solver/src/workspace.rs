@@ -893,11 +893,6 @@ pub fn resolve_workspace_graph<P: PackageMetadataProvider>(
         }
 
         for (dep_name, dep_spec) in &member.manifest.peer_dependencies {
-            if sibling_prod.contains_key(dep_name.as_str())
-                || sibling_dev.contains_key(dep_name.as_str())
-            {
-                continue;
-            }
             let Some(&sibling) = member_by_name.get(dep_name.as_str()) else {
                 continue;
             };
@@ -905,10 +900,17 @@ pub fn resolve_workspace_graph<P: PackageMetadataProvider>(
             let compatible = if let Some(ws_spec) = trimmed_spec.strip_prefix("workspace:") {
                 validate_workspace_protocol_constraint(member, sibling, ws_spec, dep_spec)?;
                 true
+            } else if sibling_prod.contains_key(dep_name.as_str())
+                || sibling_dev.contains_key(dep_name.as_str())
+            {
+                false
             } else {
                 is_sibling_compatible(sibling, trimmed_spec)
             };
-            if compatible {
+            if compatible
+                && !sibling_prod.contains_key(dep_name.as_str())
+                && !sibling_dev.contains_key(dep_name.as_str())
+            {
                 let sibling_link_loc = format!("node_modules/{dep_name}");
                 let is_opt = member
                     .manifest

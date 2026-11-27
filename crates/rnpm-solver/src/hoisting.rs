@@ -1048,17 +1048,22 @@ fn provider_accepts_parsed_version(
         return false;
     };
     let matches_replacement = |target: &PackageTarget| -> bool {
-        match target {
-            PackageTarget::Url(_) | PackageTarget::File(_) | PackageTarget::Git { .. } => false,
-            PackageTarget::Alias { name, target } => {
-                existing.name == *name
-                    && !matches!(
-                        target.as_ref(),
-                        PackageTarget::Url(_) | PackageTarget::File(_) | PackageTarget::Git { .. }
-                    )
-                    && version_entry_satisfies_target(version, parsed_version.as_ref(), target)
+        let mut curr = target;
+        loop {
+            match curr {
+                PackageTarget::Url(_) | PackageTarget::File(_) | PackageTarget::Git { .. } => {
+                    return false;
+                }
+                PackageTarget::Alias { name, target } => {
+                    if existing.name != *name {
+                        return false;
+                    }
+                    curr = target.as_ref();
+                }
+                _ => {
+                    return version_entry_satisfies_target(version, parsed_version.as_ref(), curr);
+                }
             }
-            _ => version_entry_satisfies_target(version, parsed_version.as_ref(), target),
         }
     };
     // A provider whose placing edge is not recorded yet (a late optional peer

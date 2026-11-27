@@ -167,40 +167,27 @@ impl PackageTarget {
             return Ok(PackageTarget::Tag(trimmed_spec.to_string()));
         }
 
-        // Direct protocol prefixes before github shorthand expansion
+        // Direct protocol prefixes & bare paths before github shorthand expansion
         if let Some(alias_str) = trimmed_spec.strip_prefix("npm:") {
             return Self::parse_alias(alias_str);
         }
         if let Some(ws_spec) = trimmed_spec.strip_prefix("workspace:") {
             return Ok(PackageTarget::Workspace(ws_spec.trim().to_string()));
         }
-        if trimmed_spec.starts_with("file:") {
+        let raw_bytes = trimmed_spec.as_bytes();
+        let is_bare_path = trimmed_spec.starts_with('.')
+            || trimmed_spec.starts_with("~/")
+            || trimmed_spec.starts_with('/')
+            || trimmed_spec.starts_with('\\')
+            || (raw_bytes.len() >= 2
+                && raw_bytes[0].is_ascii_alphabetic()
+                && raw_bytes[1] == b':');
+        if trimmed_spec.starts_with("file:") || is_bare_path {
             return Ok(PackageTarget::File(parse_file_path(trimmed_spec)));
         }
 
         let expanded = expand_github_shorthand(trimmed_spec);
         let s = expanded.as_ref();
-
-        // workspace: protocol specifier (e.g. workspace:*, workspace:^, workspace:~, workspace:^1.0.0)
-        if let Some(ws_spec) = s.strip_prefix("workspace:") {
-            return Ok(PackageTarget::Workspace(ws_spec.trim().to_string()));
-        }
-
-        // file: specifier, or a bare path (npa isFilespec: ^(?:[.]|~\/|[/\\]|[a-zA-Z]:))
-        let bytes = s.as_bytes();
-        let is_bare_path = s.starts_with('.')
-            || s.starts_with("~/")
-            || s.starts_with('/')
-            || s.starts_with('\\')
-            || (bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':');
-        if s.starts_with("file:") || is_bare_path {
-            return Ok(PackageTarget::File(parse_file_path(s)));
-        }
-
-        // npm: alias specifier (e.g. npm:foo@^1.0.0 or npm:@scope/foo@~2.0.0)
-        if let Some(alias_str) = s.strip_prefix("npm:") {
-            return Self::parse_alias(alias_str);
-        }
 
         // Git dependency specifications:
         if is_git_spec(s) {
