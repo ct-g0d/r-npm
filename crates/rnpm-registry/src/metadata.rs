@@ -741,7 +741,7 @@ pub fn parse_packument_with_mode(
     bytes: &[u8],
     mode: PackumentParseMode,
 ) -> Result<AbbreviatedPackageMetadata, RegistryError> {
-    let metadata = if bytes.len() >= 96 * 1024 {
+    let metadata = if bytes.len() >= 256 * 1024 {
         if let Some(res) = parallel_versions::try_parse_parallel(bytes, mode) {
             res?
         } else {
@@ -1183,11 +1183,35 @@ mod parallel_versions {
                 let v_end = skip_json_value(bytes, v_start)?;
                 let val_slice = &bytes[v_start..v_end];
                 match raw_key {
-                    b"name" => name_slice = Some(val_slice),
-                    b"dist-tags" => dist_tags_slice = Some(val_slice),
-                    b"modified" => modified_slice = Some(val_slice),
-                    b"time" => time_slice = Some(val_slice),
-                    _ => {}
+                    b"name" => {
+                        if name_slice.is_some() {
+                            return None;
+                        }
+                        name_slice = Some(val_slice);
+                    }
+                    b"dist-tags" => {
+                        if dist_tags_slice.is_some() {
+                            return None;
+                        }
+                        dist_tags_slice = Some(val_slice);
+                    }
+                    b"modified" => {
+                        if modified_slice.is_some() {
+                            return None;
+                        }
+                        modified_slice = Some(val_slice);
+                    }
+                    b"time" => {
+                        if time_slice.is_some() {
+                            return None;
+                        }
+                        time_slice = Some(val_slice);
+                    }
+                    _ => {
+                        if serde_json::from_slice::<serde::de::IgnoredAny>(val_slice).is_err() {
+                            return None;
+                        }
+                    }
                 }
                 p = v_end;
             }
@@ -3362,6 +3386,79 @@ mod tests {
                 .and_then(|a| a.provenance.as_ref())
                 .and_then(|p| p.predicate_type.as_deref()),
             Some("https://slsa.dev/provenance/v1")
+        );
+    }
+
+    fn build_large_packument_json(
+        prefix_fields: &str,
+        suffix_fields: &str,
+        num_versions: usize,
+    ) -> Vec<u8> {
+        let mut s = String::with_capacity(300 * 1024);
+        s.push('{');
+        s.push_str(prefix_fields);
+        s.push_str("\"versions\":{");
+        let pad = "a".repeat(512);
+        for i in 0..num_versions {
+            if i > 0 {
+                s.push(',');
+            }
+            s.push_str(&format!(
+                "\"1.0.{i}\":{{\"version\":\"1.0.{i}\",\"description\":\"{pad}\",\"dist\":{{\"tarball\":\"https://registry.npmjs.org/pkg/-/pkg-1.0.{i}.tgz\"}}}}"
+            ));
+        }
+        s.push('}');
+        if !suffix_fields.is_empty() {
+            s.push(',');
+            s.push_str(suffix_fields);
+        }
+        s.push('}');
+        assert!(s.len() >= 256 * 1024);
+        s.into_bytes()
+    }
+
+    #[test]
+    fn test_parallel_packument_rejects_malformed_ignored_field() {
+        let invalid_escape = build_large_packument_json(
+            "\"name\":\"pkg\",",
+            "\"readme\":\"bad \\x escape\"",
+            450,
+        );
+        assert!(
+            matches!(parse_install_packument(&invalid_escape), Err(RegistryError::Json(_))),
+            "malformed ignored string escape must still be rejected in parallel mode"
+        );
+
+        let invalid_number = build_large_packument_json(
+            "\"name\":\"pkg\",",
+            "\"weirdCount\":1..2e++--",
+            450,
+        );
+        assert!(
+            matches!(parse_install_packument(&invalid_number), Err(RegistryError::Json(_))),
+            "malformed ignored number must still be rejected in parallel mode"
+        );
+
+        let valid = build_large_packument_json(
+            "\"name\":\"pkg\",",
+            "\"readme\":\"valid text\"",
+            450,
+        );
+        let parsed = parse_install_packument(&valid).unwrap();
+        assert_eq!(parsed.name, "pkg");
+        assert_eq!(parsed.versions.len(), 450);
+    }
+
+    #[test]
+    fn test_parallel_packument_duplicate_name_matches_sequential() {
+        let dup_name = build_large_packument_json(
+            "\"name\":\"pkg-a\",",
+            "\"name\":\"pkg-b\"",
+            450,
+        );
+        assert!(
+            parse_install_packument(&dup_name).is_err(),
+            "duplicate top-level name before and after versions must fail validation identically to sequential parser"
         );
     }
 }

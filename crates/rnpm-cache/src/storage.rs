@@ -599,6 +599,7 @@ fn rename_handle_win32(
     let mut created_parent = false;
     let mut cleared_ro = false;
     let mut yield_retries = 0u32;
+    let mut sleep_retries = 0u32;
     loop {
         let res = match try_rename(
             FILE_RENAME_INFO_EX,
@@ -620,132 +621,17 @@ fn rename_handle_win32(
                     SetFileAttributesW(wide_target_null.as_ptr(), FILE_ATTRIBUTE_NORMAL);
                 }
             }
-            Err(ERROR_ACCESS_DENIED | ERROR_SHARING_VIOLATION) if yield_retries < 64 => {
+            Err(ERROR_ACCESS_DENIED | ERROR_SHARING_VIOLATION) if yield_retries < 8 => {
                 yield_retries += 1;
                 yield_now();
+            }
+            Err(ERROR_ACCESS_DENIED | ERROR_SHARING_VIOLATION) if sleep_retries < 6 => {
+                sleep(Duration::from_millis(1u64 << sleep_retries));
+                sleep_retries += 1;
             }
             Err(e) => return Err(std::io::Error::from_raw_os_error(e as i32)),
         }
     }
-}
-
-#[cfg(windows)]
-pub(crate) fn write_cas_create_new_wide_with_mtime(
-    wide_cas_null: &[u16],
-    data: &[u8],
-) -> Result<Option<u64>, u32> {
-    #[repr(C)]
-    #[allow(non_snake_case)]
-    struct FileTimeRaw {
-        dwLowDateTime: u32,
-        dwHighDateTime: u32,
-    }
-    extern "system" {
-        fn CreateFileW(
-            lpFileName: *const u16,
-            dwDesiredAccess: u32,
-            dwShareMode: u32,
-            lpSecurityAttributes: *mut std::ffi::c_void,
-            dwCreationDisposition: u32,
-            dwFlagsAndAttributes: u32,
-            hTemplateFile: *mut std::ffi::c_void,
-        ) -> *mut std::ffi::c_void;
-        fn WriteFile(
-            hFile: *mut std::ffi::c_void,
-            lpBuffer: *const std::ffi::c_void,
-            nNumberOfBytesToWrite: u32,
-            lpNumberOfBytesWritten: *mut u32,
-            lpOverlapped: *mut std::ffi::c_void,
-        ) -> i32;
-        fn GetFileTime(
-            hFile: *mut std::ffi::c_void,
-            lpCreationTime: *mut FileTimeRaw,
-            lpLastAccessTime: *mut FileTimeRaw,
-            lpLastWriteTime: *mut FileTimeRaw,
-        ) -> i32;
-        fn SetFileInformationByHandle(
-            hFile: *mut std::ffi::c_void,
-            FileInformationClass: i32,
-            lpFileInformation: *const std::ffi::c_void,
-            dwBufferSize: u32,
-        ) -> i32;
-        fn CloseHandle(hObject: *mut std::ffi::c_void) -> i32;
-        fn GetLastError() -> u32;
-    }
-    const GENERIC_WRITE: u32 = 0x4000_0000;
-    const FILE_READ_ATTRIBUTES: u32 = 0x0080;
-    const DELETE_ACCESS: u32 = 0x0001_0000;
-    const CREATE_NEW: u32 = 1;
-    const FILE_ATTRIBUTE_NORMAL: u32 = 0x80;
-    const FILE_DISPOSITION_INFO: i32 = 4;
-    const INVALID_HANDLE_VALUE: *mut std::ffi::c_void = -1isize as *mut std::ffi::c_void;
-    const WINDOWS_EPOCH_OFFSET: u64 = 116_444_736_000_000_000;
-
-    // Open exclusively with share_mode=0 while writing directly to the content-addressed path
-    // so no concurrent reader observes partial bytes and we avoid a temp-file rename + extra AV scan.
-    let handle = unsafe {
-        CreateFileW(
-            wide_cas_null.as_ptr(),
-            GENERIC_WRITE | FILE_READ_ATTRIBUTES | DELETE_ACCESS,
-            0,
-            std::ptr::null_mut(),
-            CREATE_NEW,
-            FILE_ATTRIBUTE_NORMAL,
-            std::ptr::null_mut(),
-        )
-    };
-    if handle == INVALID_HANDLE_VALUE {
-        return Err(unsafe { GetLastError() });
-    }
-
-    let mut offset = 0usize;
-    while offset < data.len() {
-        let chunk = ((data.len() - offset).min(u32::MAX as usize)) as u32;
-        let mut written = 0u32;
-        let ok = unsafe {
-            WriteFile(
-                handle,
-                data[offset..].as_ptr() as *const _,
-                chunk,
-                &mut written,
-                std::ptr::null_mut(),
-            )
-        };
-        if ok == 0 || written == 0 {
-            let err = unsafe { GetLastError() };
-            unsafe {
-                let del: u8 = 1;
-                SetFileInformationByHandle(handle, FILE_DISPOSITION_INFO, &del as *const u8 as *const _, 1);
-                CloseHandle(handle);
-            }
-            return Err(if err == 0 { 29 } else { err });
-        }
-        offset += written as usize;
-    }
-
-    let mut lwt = FileTimeRaw {
-        dwLowDateTime: 0,
-        dwHighDateTime: 0,
-    };
-    let mtime = if unsafe {
-        GetFileTime(
-            handle,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            &mut lwt,
-        )
-    } != 0
-    {
-        let ft = ((lwt.dwHighDateTime as u64) << 32) | (lwt.dwLowDateTime as u64);
-        ft.checked_sub(WINDOWS_EPOCH_OFFSET).map(|t| t * 100)
-    } else {
-        None
-    };
-
-    unsafe {
-        CloseHandle(handle);
-    }
-    Ok(mtime)
 }
 
 #[cfg(windows)]
@@ -835,9 +721,11 @@ fn write_and_rename_atomic_wide_impl(
     const GENERIC_WRITE: u32 = 0x4000_0000;
     const FILE_READ_ATTRIBUTES: u32 = 0x0080;
     const DELETE_ACCESS: u32 = 0x0001_0000;
-    const FILE_SHARE_ALL: u32 = 1 | 2 | 4;
+    const FILE_SHARE_DELETE: u32 = 4;
     const CREATE_NEW: u32 = 1;
     const FILE_ATTRIBUTE_NORMAL: u32 = 0x80;
+    const FILE_FLAG_SEQUENTIAL_SCAN: u32 = 0x0800_0000;
+    const FILE_TMP_FLAGS: u32 = FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN;
     const FILE_DISPOSITION_INFO: i32 = 4;
     const ERROR_PATH_NOT_FOUND: u32 = 3;
     const INVALID_HANDLE_VALUE: *mut std::ffi::c_void = -1isize as *mut std::ffi::c_void;
@@ -849,14 +737,15 @@ fn write_and_rename_atomic_wide_impl(
         GENERIC_WRITE | DELETE_ACCESS
     };
 
+    // Unique temp files block external read/write sharing probes until rename + CloseHandle.
     let mut handle = unsafe {
         CreateFileW(
             wide_tmp_null.as_ptr(),
             access,
-            FILE_SHARE_ALL,
+            FILE_SHARE_DELETE,
             std::ptr::null_mut(),
             CREATE_NEW,
-            FILE_ATTRIBUTE_NORMAL,
+            FILE_TMP_FLAGS,
             std::ptr::null_mut(),
         )
     };
@@ -870,10 +759,10 @@ fn write_and_rename_atomic_wide_impl(
                 CreateFileW(
                     wide_tmp_null.as_ptr(),
                     access,
-                    FILE_SHARE_ALL,
+                    FILE_SHARE_DELETE,
                     std::ptr::null_mut(),
                     CREATE_NEW,
-                    FILE_ATTRIBUTE_NORMAL,
+                    FILE_TMP_FLAGS,
                     std::ptr::null_mut(),
                 )
             };
@@ -1556,32 +1445,6 @@ impl Cache {
     /// Store a pre-verified blob atomically by its known SHA-512 hex digest.
     pub fn put_blob_direct(&self, data: &[u8], sha512_hex: &str) -> Result<(), CacheError> {
         let npm_path = self.npm_blob_path_for_algo(Algorithm::Sha512, sha512_hex);
-
-        #[cfg(windows)]
-        {
-            let mut wide = Vec::with_capacity(260);
-            encode_verbatim_wide_into(&npm_path, &mut wide);
-            if !prefix_bitset_has(&self.blob_prefix_dirs, sha512_hex) {
-                ensure_sharded_parent_win32(&wide, &npm_path)?;
-                prefix_bitset_set(&self.blob_prefix_dirs, sha512_hex);
-            }
-            match write_cas_create_new_wide_with_mtime(&wide, data) {
-                Ok(_) => {
-                    prefix_bitset_set(&self.blob_prefix_dirs, sha512_hex);
-                    debug!("Directly stored blob {}", npm_path.display());
-                    return Ok(());
-                }
-                Err(3) => {
-                    // ERROR_PATH_NOT_FOUND
-                    ensure_sharded_parent_win32(&wide, &npm_path)?;
-                    if write_cas_create_new_wide_with_mtime(&wide, data).is_ok() {
-                        prefix_bitset_set(&self.blob_prefix_dirs, sha512_hex);
-                        return Ok(());
-                    }
-                }
-                Err(_) => {}
-            }
-        }
 
         let mut npm_definitely_missing = false;
         match fs::File::open(&npm_path) {

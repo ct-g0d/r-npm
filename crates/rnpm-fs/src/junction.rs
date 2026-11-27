@@ -291,6 +291,8 @@ fn remove_file_safe(path: &Path, meta: Option<&fs::Metadata>) -> Result<(), FsEr
     let _ = meta;
 
     let mut attempts = 0;
+    #[cfg(unix)]
+    let mut retried_writable_parent = false;
     let mut delay = std::time::Duration::from_millis(5);
     loop {
         attempts += 1;
@@ -299,16 +301,17 @@ fn remove_file_safe(path: &Path, meta: Option<&fs::Metadata>) -> Result<(), FsEr
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
             Err(err) => {
                 #[cfg(unix)]
-                if attempts == 1 && err.kind() == std::io::ErrorKind::PermissionDenied {
+                if !retried_writable_parent && err.kind() == std::io::ErrorKind::PermissionDenied {
                     use std::os::unix::fs::PermissionsExt;
+                    retried_writable_parent = true;
                     if let Some(parent) = path.parent() {
                         if let Ok(m) = fs::symlink_metadata(parent) {
                             let mut perms = m.permissions();
                             if perms.mode() & 0o200 == 0 {
                                 perms.set_mode(perms.mode() | 0o700);
                                 let _ = fs::set_permissions(parent, perms);
-                                continue;
                             }
+                            continue;
                         }
                     }
                 }
@@ -329,6 +332,8 @@ fn remove_file_safe(path: &Path, meta: Option<&fs::Metadata>) -> Result<(), FsEr
 #[cfg(not(windows))]
 fn remove_dir_safe(path: &Path) -> Result<(), FsError> {
     let mut attempts = 0;
+    #[cfg(unix)]
+    let mut retried_writable_parent = false;
     let mut delay = std::time::Duration::from_millis(5);
     loop {
         attempts += 1;
@@ -337,16 +342,17 @@ fn remove_dir_safe(path: &Path) -> Result<(), FsError> {
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
             Err(err) => {
                 #[cfg(unix)]
-                if attempts == 1 && err.kind() == std::io::ErrorKind::PermissionDenied {
+                if !retried_writable_parent && err.kind() == std::io::ErrorKind::PermissionDenied {
                     use std::os::unix::fs::PermissionsExt;
+                    retried_writable_parent = true;
                     if let Some(parent) = path.parent() {
                         if let Ok(m) = fs::symlink_metadata(parent) {
                             let mut perms = m.permissions();
                             if perms.mode() & 0o200 == 0 {
                                 perms.set_mode(perms.mode() | 0o700);
                                 let _ = fs::set_permissions(parent, perms);
-                                continue;
                             }
+                            continue;
                         }
                     }
                 }
@@ -656,8 +662,8 @@ mod win_rm {
             {
                 let _guard = FindGuard(handle);
                 loop {
-                    let fd = unsafe { find_data.assume_init_ref() };
-                    let c = &fd.cFileName;
+                    let fd_ptr = find_data.as_ptr();
+                    let c = unsafe { &(*fd_ptr).cFileName };
                     let is_dot = (c[0] == b'.' as u16 && c[1] == 0)
                         || (c[0] == b'.' as u16 && c[1] == b'.' as u16 && c[2] == 0);
                     if !is_dot {
@@ -669,7 +675,7 @@ mod win_rm {
                         }
                         child_buf.extend_from_slice(&c[..name_len]);
 
-                        let attrs = fd.dwFileAttributes;
+                        let attrs = unsafe { (*fd_ptr).dwFileAttributes };
                         let is_ro = (attrs & FILE_ATTRIBUTE_READONLY) != 0;
                         let is_reparse = (attrs & FILE_ATTRIBUTE_REPARSE_POINT) != 0;
                         let is_dir = (attrs & FILE_ATTRIBUTE_DIRECTORY) != 0;

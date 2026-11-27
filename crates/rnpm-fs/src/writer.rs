@@ -485,8 +485,10 @@ where
         if let Some(prefix) = common_prefix {
             encode_dir_bytes_wide_only(prefix, &mut scratch_wide);
             if !dir_exists_wide(&scratch_wide) {
-                let os_prefix = unsafe { std::ffi::OsStr::from_encoded_bytes_unchecked(prefix) };
-                std::fs::create_dir_all(Path::new(os_prefix))?;
+                use std::os::windows::ffi::OsStringExt;
+                let verbatim_prefix =
+                    std::ffi::OsString::from_wide(&scratch_wide[..scratch_wide.len().saturating_sub(1)]);
+                std::fs::create_dir_all(&verbatim_prefix)?;
             }
             known_existing_bytes.insert(prefix);
         }
@@ -904,28 +906,38 @@ pub(crate) fn write_file_fast_wide(
             lpOverlapped: *mut std::ffi::c_void,
         ) -> i32;
 
+        fn SetFileInformationByHandle(
+            hFile: *mut std::ffi::c_void,
+            FileInformationClass: i32,
+            lpFileInformation: *const std::ffi::c_void,
+            dwBufferSize: u32,
+        ) -> i32;
+
         fn CloseHandle(hObject: *mut std::ffi::c_void) -> i32;
         fn GetLastError() -> u32;
     }
 
     const GENERIC_WRITE: u32 = 0x40000000;
+    const DELETE_ACCESS: u32 = 0x00010000;
+    const FILE_SHARE_DELETE: u32 = 4;
     const CREATE_NEW: u32 = 1;
     const FILE_ATTRIBUTE_NORMAL: u32 = 0x80;
     const FILE_FLAG_SEQUENTIAL_SCAN: u32 = 0x08000000;
     const FILE_FLAGS_NEW: u32 = FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN;
+    const FILE_DISPOSITION_INFO: i32 = 4;
     const INVALID_HANDLE_VALUE: *mut std::ffi::c_void = -1isize as *mut std::ffi::c_void;
     const ERROR_PATH_NOT_FOUND: u32 = 3;
     const ERROR_ACCESS_DENIED: u32 = 5;
     const ERROR_FILE_EXISTS: u32 = 80;
     const ERROR_ALREADY_EXISTS: u32 = 183;
 
-    // Fast path: exclusive creation with dwShareMode = 0 avoids truncating an existing hardlink
-    // and keeps AV/indexer probes off the file handle while we write & close it.
+    // Fast path: CREATE_NEW with FILE_SHARE_DELETE blocks read/write AV/indexer probes while
+    // writing sequentially, allows collision unlinks, and cleans up partial files on write failure.
     let mut handle = unsafe {
         CreateFileW(
             path_wide.as_ptr(),
-            GENERIC_WRITE,
-            0,
+            GENERIC_WRITE | DELETE_ACCESS,
+            FILE_SHARE_DELETE,
             std::ptr::null_mut(),
             CREATE_NEW,
             FILE_FLAGS_NEW,
@@ -940,8 +952,8 @@ pub(crate) fn write_file_fast_wide(
             handle = unsafe {
                 CreateFileW(
                     path_wide.as_ptr(),
-                    GENERIC_WRITE,
-                    0,
+                    GENERIC_WRITE | DELETE_ACCESS,
+                    FILE_SHARE_DELETE,
                     std::ptr::null_mut(),
                     CREATE_NEW,
                     FILE_FLAGS_NEW,
@@ -961,8 +973,8 @@ pub(crate) fn write_file_fast_wide(
             handle = unsafe {
                 CreateFileW(
                     path_wide.as_ptr(),
-                    GENERIC_WRITE,
-                    0,
+                    GENERIC_WRITE | DELETE_ACCESS,
+                    FILE_SHARE_DELETE,
                     std::ptr::null_mut(),
                     CREATE_NEW,
                     FILE_FLAGS_NEW,
@@ -995,12 +1007,26 @@ pub(crate) fn write_file_fast_wide(
             if ok == 0 {
                 let err = unsafe { GetLastError() };
                 unsafe {
+                    let del: u8 = 1;
+                    SetFileInformationByHandle(
+                        handle,
+                        FILE_DISPOSITION_INFO,
+                        &del as *const u8 as *const std::ffi::c_void,
+                        1,
+                    );
                     CloseHandle(handle);
                 }
                 return Err(std::io::Error::from_raw_os_error(err as i32));
             }
             if written == 0 {
                 unsafe {
+                    let del: u8 = 1;
+                    SetFileInformationByHandle(
+                        handle,
+                        FILE_DISPOSITION_INFO,
+                        &del as *const u8 as *const std::ffi::c_void,
+                        1,
+                    );
                     CloseHandle(handle);
                 }
                 return Err(std::io::Error::new(

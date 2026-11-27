@@ -1606,26 +1606,6 @@ impl PackStore {
                     let _ = fs::create_dir_all(parent);
                 }
             }
-            // Fast path: exclusive CREATE_NEW directly at the content-addressed CAS path.
-            // Eliminates temp file creation, POSIX rename, and duplicate AV filter callbacks.
-            match crate::storage::write_cas_create_new_wide_with_mtime(wide_cas, data) {
-                Ok(mt) => return Ok(mt),
-                Err(3) => {
-                    // ERROR_PATH_NOT_FOUND
-                    if let Some(parent) = cas_path.parent() {
-                        let _ = fs::create_dir_all(parent);
-                    }
-                    if let Ok(mt) = crate::storage::write_cas_create_new_wide_with_mtime(wide_cas, data) {
-                        return Ok(mt);
-                    }
-                }
-                Err(_) => {}
-            }
-            if let Some((sz, mt)) = fast_size_and_mtime_wide(wide_cas) {
-                if sz == data.len() as u64 && fs::read(cas_path).is_ok_and(|e| e == data) {
-                    return Ok(mt);
-                }
-            }
             let count = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
             let pid = std::process::id();
             wide_tmp.clear();
@@ -1710,16 +1690,7 @@ impl PackStore {
                     let _ = fs::create_dir_all(parent);
                 }
             }
-            if !cas_may_exist {
-                if let Ok(mut f) = OpenOptions::new().write(true).create_new(true).open(cas_path) {
-                    if std::io::Write::write_all(&mut f, data).is_ok() {
-                        let mt = f.metadata().ok().and_then(|m| mtime_to_timestamp(&m));
-                        return Ok(mt);
-                    }
-                    drop(f);
-                    let _ = fs::remove_file(cas_path);
-                }
-            }
+            let _ = cas_may_exist;
             let count = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
             let pid = std::process::id();
             let tmp_path = cas_path.with_extension(format!("tmp_{pid}_{count}"));
