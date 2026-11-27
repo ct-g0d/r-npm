@@ -2794,7 +2794,9 @@ impl Cache {
             }
         }
 
-        // If an accept header was provided, also fallback to the key without accept header
+        // If an accept header was provided, fallback to the default (full) unkeyed entry,
+        // and if full metadata was requested (accept == None), optionally match explicit
+        // application/json, but NEVER serve an abbreviated install-v1 packument for a full request.
         if accept.is_some() {
             let key_no_accept = Self::packument_key(registry, name, None);
             if let Some(res) = self.get_exact(&key_no_accept)? {
@@ -2807,16 +2809,13 @@ impl Cache {
                 }
             }
         } else {
-            let key_abbrev =
-                Self::packument_key(registry, name, Some("application/vnd.npm.install-v1+json"));
-            if let Some(res) = self.get_exact(&key_abbrev)? {
+            let key_full_json = Self::packument_key(registry, name, Some("application/json"));
+            if let Some(res) = self.get_exact(&key_full_json)? {
                 return Ok(Some(res));
             }
-            let alt_abbrev = format!(
-                "pacote:packument:{reg_with_slash}:{name}:application/vnd.npm.install-v1+json"
-            );
-            if alt_abbrev != key_abbrev {
-                if let Some(res) = self.get_exact(&alt_abbrev)? {
+            let alt_full_json = format!("pacote:packument:{reg_with_slash}:{name}:application/json");
+            if alt_full_json != key_full_json {
+                if let Some(res) = self.get_exact(&alt_full_json)? {
                     return Ok(Some(res));
                 }
             }
@@ -2899,16 +2898,13 @@ impl Cache {
                 }
             }
         } else {
-            let key_abbrev =
-                Self::packument_key(registry, name, Some("application/vnd.npm.install-v1+json"));
-            if let Some(res) = self.get_blob_path(&key_abbrev)? {
+            let key_full_json = Self::packument_key(registry, name, Some("application/json"));
+            if let Some(res) = self.get_blob_path(&key_full_json)? {
                 return Ok(Some(res));
             }
-            let alt_abbrev = format!(
-                "pacote:packument:{reg_with_slash}:{name}:application/vnd.npm.install-v1+json"
-            );
-            if alt_abbrev != key_abbrev {
-                if let Some(res) = self.get_blob_path(&alt_abbrev)? {
+            let alt_full_json = format!("pacote:packument:{reg_with_slash}:{name}:application/json");
+            if alt_full_json != key_full_json {
+                if let Some(res) = self.get_blob_path(&alt_full_json)? {
                     return Ok(Some(res));
                 }
             }
@@ -2972,30 +2968,27 @@ impl Cache {
         Ok(count)
     }
 
-    /// Purge all cache contents (content, index, tmp, locks) cleanly handling Windows file attributes.
+    /// Purge known cache subdirectories (`content-v2`, `index-v5`, `tmp`, `_tmp`, `locks`, `_locks`, `_fingerprints`, `packs`, `cas`)
+    /// cleanly handling Windows file attributes without touching unrelated files in `self.root`.
     pub fn clean(&self) -> Result<(), CacheError> {
         let targets = [
             self.root.join("content-v2"),
             self.root.join("index-v5"),
             self.root.join("tmp"),
+            self.root.join("_tmp"),
             self.root.join("locks"),
+            self.root.join("_locks"),
             self.root.join("_fingerprints"),
+            self.root.join("packs"),
+            self.root.join("cas"),
         ];
 
         for dir in &targets {
             if dir.exists() {
-                remove_dir_all_with_retries(dir)?;
-            }
-        }
-
-        // Also clean any stray files or directories directly in self.root
-        if let Ok(entries) = fs::read_dir(&self.root) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.is_file() {
-                    let _ = remove_file_with_retries(&path);
-                } else if path.is_dir() {
-                    let _ = remove_dir_all_with_retries(&path);
+                if dir.is_file() {
+                    remove_file_with_retries(dir)?;
+                } else {
+                    remove_dir_all_with_retries(dir)?;
                 }
             }
         }
@@ -3469,5 +3462,73 @@ mod atomic_win_tests {
         // Putting another blob with the same `<p1>`/`<p2>` prefix must succeed cleanly.
         cache.put_blob_direct(payload1, &sha1).unwrap();
         assert_eq!(fs::read(&blob1).unwrap(), payload1);
+    }
+
+    #[test]
+    fn clean_preserves_unrelated_user_files_in_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::new(dir.path()).unwrap();
+        cache.put("test-key", b"cached bytes", None).unwrap();
+
+        let user_file = cache.root().join("user-notes.txt");
+        let user_dir = cache.root().join("custom-backup");
+        fs::create_dir_all(&user_dir).unwrap();
+        fs::write(&user_file, b"important user notes").unwrap();
+        fs::write(user_dir.join("keep.dat"), b"important backup").unwrap();
+
+        cache.clean().unwrap();
+
+        assert!(cache.get("test-key").unwrap().is_none());
+        assert_eq!(fs::read(&user_file).unwrap(), b"important user notes");
+        assert_eq!(fs::read(user_dir.join("keep.dat")).unwrap(), b"important backup");
+    }
+
+    #[test]
+    fn full_packument_lookup_never_returns_abbreviated_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::new(dir.path()).unwrap();
+        let registry = "https://registry.npmjs.org";
+        let abbrev = br#"{"name":"demo","dist-tags":{"latest":"1.0.0"},"versions":{"1.0.0":{"name":"demo","version":"1.0.0"}}}"#;
+        let full = br#"{"name":"demo","readme":"full readme","dist-tags":{"latest":"1.0.0"},"versions":{"1.0.0":{"name":"demo","version":"1.0.0"}}}"#;
+
+        cache
+            .put_packument_with_accept(
+                registry,
+                "demo",
+                Some("application/vnd.npm.install-v1+json"),
+                abbrev,
+                None,
+            )
+            .unwrap();
+
+        // Full metadata queries MUST NOT collide onto the abbreviated install-v1 cache entry.
+        assert!(cache.get_packument(registry, "demo").unwrap().is_none());
+        assert!(cache
+            .get_packument_with_accept(registry, "demo", Some("application/json"))
+            .unwrap()
+            .is_none());
+        assert!(cache
+            .get_packument_blob_path(registry, "demo", None)
+            .unwrap()
+            .is_none());
+        assert!(cache
+            .get_packument_blob_path(registry, "demo", Some("application/json"))
+            .unwrap()
+            .is_none());
+        assert!(cache
+            .get_packument_with_accept(
+                registry,
+                "demo",
+                Some("application/vnd.npm.install-v1+json")
+            )
+            .unwrap()
+            .is_some());
+
+        // Storing full packument under explicit application/json satisfies accept: None.
+        cache
+            .put_packument_with_accept(registry, "demo", Some("application/json"), full, None)
+            .unwrap();
+        let (_, got_full) = cache.get_packument(registry, "demo").unwrap().unwrap();
+        assert_eq!(got_full, full);
     }
 }

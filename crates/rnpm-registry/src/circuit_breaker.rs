@@ -22,6 +22,7 @@ struct HostCircuit {
     state: CircuitBreakerState,
     last_state_change: Instant,
     dirty: bool,
+    half_open_probe_in_flight: bool,
 }
 
 impl Default for HostCircuit {
@@ -31,6 +32,36 @@ impl Default for HostCircuit {
             state: CircuitBreakerState::Closed,
             last_state_change: Instant::now(),
             dirty: false,
+            half_open_probe_in_flight: false,
+        }
+    }
+}
+
+/// RAII guard for an active single probe in `CircuitBreakerState::HalfOpen`.
+/// Releases the probe slot if dropped before `record_success`/`record_failure` completes.
+#[derive(Debug)]
+pub struct HalfOpenProbeGuard {
+    host: String,
+    hosts: Arc<RwLock<HashMap<String, HostCircuit>>>,
+    disarmed: bool,
+}
+
+impl HalfOpenProbeGuard {
+    /// Marks the probe as completed so `Drop` will not clear `half_open_probe_in_flight`.
+    pub fn disarm(&mut self) {
+        self.disarmed = true;
+    }
+}
+
+impl Drop for HalfOpenProbeGuard {
+    fn drop(&mut self) {
+        if !self.disarmed {
+            let mut hosts = self.hosts.write().unwrap_or_else(|e| e.into_inner());
+            if let Some(entry) = hosts.get_mut(&self.host) {
+                if entry.state == CircuitBreakerState::HalfOpen {
+                    entry.half_open_probe_in_flight = false;
+                }
+            }
         }
     }
 }
@@ -88,6 +119,71 @@ impl CircuitBreaker {
         entry.state
     }
 
+    /// Acquire permission to dispatch a request for `host`, enforcing the single-probe
+    /// guard when the circuit is in `HalfOpen` state.
+    pub async fn try_acquire_request(
+        &self,
+        host: &str,
+    ) -> Result<Option<HalfOpenProbeGuard>, CircuitBreakerState> {
+        if self.failure_threshold == 0 || self.dirty_hosts.load(Ordering::Acquire) == 0 {
+            return Ok(None);
+        }
+
+        {
+            let hosts = self.hosts.read().unwrap_or_else(|e| e.into_inner());
+            let Some(entry) = hosts.get(host) else {
+                return Ok(None);
+            };
+            match entry.state {
+                CircuitBreakerState::Closed => return Ok(None),
+                CircuitBreakerState::Open => {
+                    if entry.last_state_change.elapsed() < self.reset_timeout {
+                        return Err(CircuitBreakerState::Open);
+                    }
+                }
+                CircuitBreakerState::HalfOpen => {
+                    if entry.half_open_probe_in_flight {
+                        return Err(CircuitBreakerState::HalfOpen);
+                    }
+                }
+            }
+        }
+
+        let mut hosts = self.hosts.write().unwrap_or_else(|e| e.into_inner());
+        let Some(entry) = hosts.get_mut(host) else {
+            return Ok(None);
+        };
+        match entry.state {
+            CircuitBreakerState::Closed => Ok(None),
+            CircuitBreakerState::Open => {
+                if entry.last_state_change.elapsed() >= self.reset_timeout {
+                    entry.state = CircuitBreakerState::HalfOpen;
+                    entry.last_state_change = Instant::now();
+                    entry.half_open_probe_in_flight = true;
+                    Ok(Some(HalfOpenProbeGuard {
+                        host: host.to_string(),
+                        hosts: Arc::clone(&self.hosts),
+                        disarmed: false,
+                    }))
+                } else {
+                    Err(CircuitBreakerState::Open)
+                }
+            }
+            CircuitBreakerState::HalfOpen => {
+                if entry.half_open_probe_in_flight {
+                    Err(CircuitBreakerState::HalfOpen)
+                } else {
+                    entry.half_open_probe_in_flight = true;
+                    Ok(Some(HalfOpenProbeGuard {
+                        host: host.to_string(),
+                        hosts: Arc::clone(&self.hosts),
+                        disarmed: false,
+                    }))
+                }
+            }
+        }
+    }
+
     /// Record a successful request to a host, closing the circuit and resetting failure counts.
     pub async fn record_success(&self, host: &str) {
         if self.failure_threshold == 0 || self.dirty_hosts.load(Ordering::Acquire) == 0 {
@@ -116,6 +212,7 @@ impl CircuitBreaker {
             }
             entry.consecutive_failures = 0;
             entry.state = CircuitBreakerState::Closed;
+            entry.half_open_probe_in_flight = false;
             entry.last_state_change = Instant::now();
         }
     }
@@ -141,6 +238,7 @@ impl CircuitBreaker {
             || entry.state == CircuitBreakerState::HalfOpen
         {
             entry.state = CircuitBreakerState::Open;
+            entry.half_open_probe_in_flight = false;
             entry.last_state_change = Instant::now();
         }
 
@@ -157,6 +255,7 @@ impl CircuitBreaker {
             }
             entry.consecutive_failures = 0;
             entry.state = CircuitBreakerState::Closed;
+            entry.half_open_probe_in_flight = false;
             entry.last_state_change = Instant::now();
         }
     }
@@ -170,6 +269,7 @@ impl CircuitBreaker {
             self.dirty_hosts.fetch_add(1, Ordering::Release);
         }
         entry.state = CircuitBreakerState::Open;
+        entry.half_open_probe_in_flight = false;
         entry.consecutive_failures = self.failure_threshold;
         entry.last_state_change = Instant::now();
     }

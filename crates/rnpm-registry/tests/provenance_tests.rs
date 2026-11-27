@@ -2074,3 +2074,368 @@ fn test_live_rekor_submission_payload_builder_produces_base64_pem_roundtrip() {
     let pem_decoded_der = rnpm_registry::provenance::decode_pem_to_der(&pem_string).unwrap();
     assert_eq!(pem_decoded_der, cert_der);
 }
+
+fn sign_bundle_with_chain(
+    tarball_bytes: &[u8],
+    signer: &EphemeralSigner,
+    chain_ders: Vec<Vec<u8>>,
+    slsa_repo_uri: &str,
+) -> SigstoreBundle {
+    let sha512_hex = HEXLOWER.encode(&Sha512::digest(tarball_bytes));
+    let mut digest = HashMap::new();
+    digest.insert("sha512".to_string(), sha512_hex);
+
+    let mut cs_digest = HashMap::new();
+    cs_digest.insert("sha1".to_string(), "deadbeef".to_string());
+
+    let statement = InTotoStatement {
+        statement_type: "https://in-toto.io/Statement/v0.1".into(),
+        subject: vec![InTotoSubject {
+            name: "pkg:npm/pkg@1.0.0".into(),
+            digest,
+        }],
+        predicate_type: "https://slsa.dev/provenance/v0.2".into(),
+        predicate: SlsaPredicate {
+            builder: Some(SlsaBuilder {
+                id: "https://github.com/actions/runner/v2".into(),
+            }),
+            build_type: Some("https://actions.github.com/Workflow@v1".into()),
+            invocation: Some(SlsaInvocation {
+                config_source: Some(SlsaConfigSource {
+                    uri: Some(slsa_repo_uri.to_string()),
+                    digest: cs_digest,
+                    entry_point: Some(".github/workflows/deploy.yml".into()),
+                }),
+                parameters: None,
+                environment: None,
+            }),
+            recipe: None,
+            materials: Vec::new(),
+            build_definition: None,
+            run_details: None,
+        },
+    };
+
+    let envelope = sign_dsse_envelope(&statement, signer).unwrap();
+    let payload_bytes = decode_base64(&envelope.payload).unwrap();
+    let payload_hash_hex = HEXLOWER.encode(&Sha256::digest(&payload_bytes));
+    let leaf_b64 = data_encoding::BASE64.encode(&chain_ders[0]);
+    let now = 1700000000i64;
+    let canonical_body_json = serde_json::json!({
+        "apiVersion": "0.0.1",
+        "kind": "dsse",
+        "spec": {
+            "payloadHash": {
+                "algorithm": "sha256",
+                "value": payload_hash_hex,
+            },
+            "signatures": [
+                {
+                    "signature": envelope.signatures[0].sig,
+                    "verifier": leaf_b64,
+                }
+            ]
+        }
+    });
+    let body_b64 = data_encoding::BASE64.encode(serde_json::to_string(&canonical_body_json).unwrap().as_bytes());
+    let rng = ring::rand::SystemRandom::new();
+    let rekor_priv = decode_base64(TEST_MOCK_REKOR_PRIV_PKCS8_B64).unwrap();
+    let rekor_key_pair = ring::signature::EcdsaKeyPair::from_pkcs8(
+        &ring::signature::ECDSA_P256_SHA256_ASN1_SIGNING,
+        &rekor_priv,
+        &rng,
+    )
+    .unwrap();
+    let set_canonical_json = format!(
+        r#"{{"body":"{}","integratedTime":{},"logID":"{}","logIndex":{}}}"#,
+        body_b64, now, REKOR_DEFAULT_LOG_ID, 998878
+    );
+    let rekor_sig = rekor_key_pair.sign(&rng, set_canonical_json.as_bytes()).unwrap();
+
+    let tlog_entry = TlogEntry {
+        log_index: 998878,
+        log_id: LogId {
+            key_id: REKOR_DEFAULT_LOG_ID.into(),
+        },
+        integrated_time: now,
+        inclusion_promise: Some(rnpm_registry::provenance::InclusionPromise {
+            signed_entry_timestamp: data_encoding::BASE64.encode(rekor_sig.as_ref()),
+        }),
+        inclusion_proof: None,
+        canonicalized_body: Some(body_b64),
+    };
+
+    SigstoreBundle {
+        media_type: Some("application/vnd.dev.sigstore.bundle+json;version=0.2".into()),
+        verification_material: Some(VerificationMaterial {
+            x509_certificate_chain: Some(rnpm_registry::provenance::X509CertificateChain {
+                certificates: chain_ders
+                    .into_iter()
+                    .map(|der| rnpm_registry::provenance::X509Certificate {
+                        raw_bytes: data_encoding::BASE64.encode(&der),
+                    })
+                    .collect(),
+            }),
+            certificate: None,
+            public_key: None,
+            tlog_entries: vec![tlog_entry],
+            timestamp_verification_data: None,
+        }),
+        dsse_envelope: Some(envelope),
+    }
+}
+
+#[test]
+fn test_env_var_mock_roots_ignored_in_non_test_verifier() {
+    struct EnvReset;
+    impl Drop for EnvReset {
+        fn drop(&mut self) {
+            std::env::remove_var("RNPM_TEST_MOCK_ROOTS");
+        }
+    }
+
+    let tarball_bytes = b"mock root gate payload";
+    let sha512_hex = HEXLOWER.encode(&Sha512::digest(tarball_bytes));
+    let bundle = make_test_bundle("pkg", &sha512_hex, "https://github.com/org/repo", "deadbeef");
+
+    std::env::set_var("RNPM_TEST_MOCK_ROOTS", "1");
+    let _reset = EnvReset;
+
+    // Non-test ProvenanceVerifier::new MUST ignore RNPM_TEST_MOCK_ROOTS and reject mock-root bundles.
+    let prod_verifier = ProvenanceVerifier::new(ProvenancePolicy::AllowAny);
+    let err = prod_verifier
+        .verify("pkg", &bundle, Some("1.0.0"), Some(tarball_bytes))
+        .unwrap_err();
+    match err {
+        RegistryError::InvalidSigstoreBundle(msg) => {
+            assert!(
+                msg.contains("Certificate chain does not terminate in a trusted Fulcio root CA"),
+                "Unexpected error: {msg}"
+            );
+        }
+        other => panic!("Expected InvalidSigstoreBundle, got {other:?}"),
+    }
+
+    // Explicit opt-in with_test_mock_roots() succeeds on the same bundle.
+    assert!(prod_verifier
+        .with_test_mock_roots()
+        .verify("pkg", &bundle, Some("1.0.0"), Some(tarball_bytes))
+        .is_ok());
+}
+
+#[test]
+fn test_x509_basic_constraints_and_key_usage_enforcement() {
+    let rng = ring::rand::SystemRandom::new();
+    let ca_priv = decode_base64(TEST_MOCK_CA_PRIV_PKCS8_B64).unwrap();
+    let ca_key_pair = ring::signature::EcdsaKeyPair::from_pkcs8(
+        &ring::signature::ECDSA_P256_SHA256_ASN1_SIGNING,
+        &ca_priv,
+        &rng,
+    )
+    .unwrap();
+
+    let now = 1700000000i64;
+    let tarball_bytes = b"x509 constraint payload";
+    let fulcio_exts = [
+        (
+            rnpm_registry::asn1::OID_FULCIO_ISSUER,
+            "https://token.actions.githubusercontent.com",
+        ),
+        (
+            rnpm_registry::asn1::OID_FULCIO_GITHUB_WORKFLOW_REPOSITORY,
+            "https://github.com/trusted/repo",
+        ),
+    ];
+
+    // 1. Forged child signed by an end-entity intermediate (BasicConstraints missing / cA=false) -> rejected
+    let non_ca_inter = EphemeralSigner::new().unwrap();
+    let non_ca_inter_der = rnpm_registry::asn1::create_test_x509_certificate_with_constraints(
+        "non-ca-inter",
+        "sigstore",
+        non_ca_inter.public_key_uncompressed(),
+        None,
+        &[],
+        now - 100,
+        now + 1000,
+        Some(false),
+        None,
+        &|tbs| ca_key_pair.sign(&rng, tbs).unwrap().as_ref().to_vec(),
+    );
+    let leaf_signer = EphemeralSigner::new().unwrap();
+    let leaf_from_non_ca = rnpm_registry::asn1::create_test_x509_certificate(
+        "leaf",
+        "non-ca-inter",
+        leaf_signer.public_key_uncompressed(),
+        Some("https://github.com/actions/runner"),
+        &fulcio_exts,
+        now - 60,
+        now + 600,
+        &|tbs| non_ca_inter.sign(tbs).unwrap(),
+    );
+    let bundle_non_ca = sign_bundle_with_chain(
+        tarball_bytes,
+        &leaf_signer,
+        vec![leaf_from_non_ca, non_ca_inter_der],
+        "https://github.com/trusted/repo",
+    );
+    let verifier = ProvenanceVerifier::new(ProvenancePolicy::AllowAny).with_test_mock_roots();
+    let err = verifier
+        .verify("pkg", &bundle_non_ca, Some("1.0.0"), Some(tarball_bytes))
+        .unwrap_err();
+    assert!(
+        format!("{err:?}").contains("BasicConstraints"),
+        "Expected BasicConstraints rejection, got {err:?}"
+    );
+
+    // 2. Intermediate with cA=true but KeyUsage missing keyCertSign (digitalSignature 0x80 only) -> rejected
+    let no_kcs_inter = EphemeralSigner::new().unwrap();
+    let no_kcs_inter_der = rnpm_registry::asn1::create_test_x509_certificate_with_constraints(
+        "no-kcs-inter",
+        "sigstore",
+        no_kcs_inter.public_key_uncompressed(),
+        None,
+        &[],
+        now - 100,
+        now + 1000,
+        Some(true),
+        Some(0x80),
+        &|tbs| ca_key_pair.sign(&rng, tbs).unwrap().as_ref().to_vec(),
+    );
+    let leaf_from_no_kcs = rnpm_registry::asn1::create_test_x509_certificate(
+        "leaf",
+        "no-kcs-inter",
+        leaf_signer.public_key_uncompressed(),
+        Some("https://github.com/actions/runner"),
+        &fulcio_exts,
+        now - 60,
+        now + 600,
+        &|tbs| no_kcs_inter.sign(tbs).unwrap(),
+    );
+    let bundle_no_kcs = sign_bundle_with_chain(
+        tarball_bytes,
+        &leaf_signer,
+        vec![leaf_from_no_kcs, no_kcs_inter_der],
+        "https://github.com/trusted/repo",
+    );
+    let err = verifier
+        .verify("pkg", &bundle_no_kcs, Some("1.0.0"), Some(tarball_bytes))
+        .unwrap_err();
+    assert!(
+        format!("{err:?}").contains("keyCertSign"),
+        "Expected keyCertSign rejection, got {err:?}"
+    );
+
+    // 3. Leaf cert marked cA=true -> rejected
+    let ca_leaf_der = rnpm_registry::asn1::create_test_x509_certificate_with_constraints(
+        "ca-leaf",
+        "sigstore",
+        leaf_signer.public_key_uncompressed(),
+        Some("https://github.com/actions/runner"),
+        &fulcio_exts,
+        now - 60,
+        now + 600,
+        Some(true),
+        Some(0x04),
+        &|tbs| ca_key_pair.sign(&rng, tbs).unwrap().as_ref().to_vec(),
+    );
+    let bundle_ca_leaf = sign_bundle_with_chain(
+        tarball_bytes,
+        &leaf_signer,
+        vec![ca_leaf_der],
+        "https://github.com/trusted/repo",
+    );
+    let err = verifier
+        .verify("pkg", &bundle_ca_leaf, Some("1.0.0"), Some(tarball_bytes))
+        .unwrap_err();
+    assert!(
+        format!("{err:?}").contains("BasicConstraints"),
+        "Expected leaf CA=true rejection, got {err:?}"
+    );
+
+    // 4. Positive control: intermediate with cA=true + keyCertSign and normal end-entity leaf -> accepted
+    let valid_inter = EphemeralSigner::new().unwrap();
+    let valid_inter_der = rnpm_registry::asn1::create_test_ca_x509_certificate(
+        "valid-inter",
+        "sigstore",
+        valid_inter.public_key_uncompressed(),
+        None,
+        &[],
+        now - 100,
+        now + 1000,
+        &|tbs| ca_key_pair.sign(&rng, tbs).unwrap().as_ref().to_vec(),
+    );
+    let valid_leaf = rnpm_registry::asn1::create_test_x509_certificate(
+        "leaf",
+        "valid-inter",
+        leaf_signer.public_key_uncompressed(),
+        Some("https://github.com/actions/runner"),
+        &fulcio_exts,
+        now - 60,
+        now + 600,
+        &|tbs| valid_inter.sign(tbs).unwrap(),
+    );
+    let valid_bundle = sign_bundle_with_chain(
+        tarball_bytes,
+        &leaf_signer,
+        vec![valid_leaf, valid_inter_der],
+        "https://github.com/trusted/repo",
+    );
+    verifier
+        .verify("pkg", &valid_bundle, Some("1.0.0"), Some(tarball_bytes))
+        .unwrap();
+}
+
+#[test]
+fn test_require_repository_prefers_authenticated_oidc_over_forged_slsa_predicate() {
+    let rng = ring::rand::SystemRandom::new();
+    let ca_priv = decode_base64(TEST_MOCK_CA_PRIV_PKCS8_B64).unwrap();
+    let ca_key_pair = ring::signature::EcdsaKeyPair::from_pkcs8(
+        &ring::signature::ECDSA_P256_SHA256_ASN1_SIGNING,
+        &ca_priv,
+        &rng,
+    )
+    .unwrap();
+
+    let now = 1700000000i64;
+    let tarball_bytes = b"oidc priority payload";
+    let signer = EphemeralSigner::new().unwrap();
+    // Fulcio OIDC cert attests attacker/evil, while self-asserted SLSA predicate claims trusted/good.
+    let fulcio_exts = [
+        (
+            rnpm_registry::asn1::OID_FULCIO_ISSUER,
+            "https://token.actions.githubusercontent.com",
+        ),
+        (
+            rnpm_registry::asn1::OID_FULCIO_GITHUB_WORKFLOW_REPOSITORY,
+            "https://github.com/attacker/evil",
+        ),
+    ];
+    let leaf_der = rnpm_registry::asn1::create_test_x509_certificate(
+        "leaf",
+        "sigstore",
+        signer.public_key_uncompressed(),
+        Some("https://github.com/actions/runner"),
+        &fulcio_exts,
+        now - 60,
+        now + 600,
+        &|tbs| ca_key_pair.sign(&rng, tbs).unwrap().as_ref().to_vec(),
+    );
+    let bundle = sign_bundle_with_chain(
+        tarball_bytes,
+        &signer,
+        vec![leaf_der],
+        "https://github.com/trusted/good",
+    );
+
+    let verifier = ProvenanceVerifier::new(ProvenancePolicy::RequireRepository {
+        expected_repository: "trusted/good".to_string(),
+    })
+    .with_test_mock_roots();
+    let err = verifier
+        .verify("pkg", &bundle, Some("1.0.0"), Some(tarball_bytes))
+        .unwrap_err();
+    assert!(
+        matches!(err, RegistryError::UntrustedSourceRepository { .. }),
+        "Expected UntrustedSourceRepository when OIDC cert repo disagrees, got {err:?}"
+    );
+}

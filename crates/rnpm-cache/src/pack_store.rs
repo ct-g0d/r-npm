@@ -1613,6 +1613,167 @@ pub struct DeferredPackPayloads {
     pub idx: (PathBuf, Arc<Vec<u8>>),
 }
 
+const DEFAULT_MMAP_CACHE_MAX_PACKS: usize = 256;
+const DEFAULT_MMAP_CACHE_MAX_BYTES: usize = 256 * 1024 * 1024;
+
+#[derive(Debug)]
+struct CachedMmapEntry {
+    pack: Arc<PackagePack>,
+    aliases: Vec<String>,
+    byte_size: usize,
+    last_used: std::sync::atomic::AtomicU64,
+}
+
+#[derive(Debug)]
+struct BoundedMmapCache {
+    entries: HashMap<usize, CachedMmapEntry>,
+    key_to_id: HashMap<String, usize>,
+    total_bytes: usize,
+    next_id: usize,
+    clock: std::sync::atomic::AtomicU64,
+    max_packs: usize,
+    max_bytes: usize,
+}
+
+impl BoundedMmapCache {
+    fn new(max_packs: usize, max_bytes: usize) -> Self {
+        Self {
+            entries: HashMap::new(),
+            key_to_id: HashMap::new(),
+            total_bytes: 0,
+            next_id: 0,
+            clock: std::sync::atomic::AtomicU64::new(0),
+            max_packs,
+            max_bytes,
+        }
+    }
+
+    fn contains_key(&self, key: &str) -> bool {
+        self.key_to_id.contains_key(key)
+    }
+
+    fn get(&self, key: &str) -> Option<Arc<PackagePack>> {
+        let id = self.key_to_id.get(key)?;
+        let entry = self.entries.get(id)?;
+        let stamp = self.clock.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+        entry.last_used.store(stamp, Ordering::Relaxed);
+        Some(Arc::clone(&entry.pack))
+    }
+
+    fn remove_entry_by_id(&mut self, id: usize) {
+        if let Some(entry) = self.entries.remove(&id) {
+            self.total_bytes = self.total_bytes.saturating_sub(entry.byte_size);
+            for alias in &entry.aliases {
+                if self.key_to_id.get(alias).copied() == Some(id) {
+                    self.key_to_id.remove(alias);
+                }
+            }
+        }
+    }
+
+    fn remove_key(&mut self, key: &str) {
+        if let Some(id) = self.key_to_id.remove(key) {
+            self.remove_entry_by_id(id);
+        }
+    }
+
+    fn evict_to_fit(&mut self, incoming_bytes: usize, max_packs: usize, max_bytes: usize) {
+        while !self.entries.is_empty()
+            && (self.entries.len() >= max_packs
+                || self.total_bytes.saturating_add(incoming_bytes) > max_bytes)
+        {
+            let lru_id = self
+                .entries
+                .iter()
+                .min_by_key(|(id, e)| (e.last_used.load(Ordering::Relaxed), **id))
+                .map(|(id, _)| *id);
+            let Some(victim) = lru_id else {
+                break;
+            };
+            self.remove_entry_by_id(victim);
+        }
+    }
+
+    fn insert(&mut self, aliases: Vec<String>, pack: Arc<PackagePack>) {
+        let byte_size = pack.buffer.data().len().max(pack.payload_len);
+        if self.max_packs == 0 || byte_size > self.max_bytes {
+            return;
+        }
+
+        // Remove any prior entry mapped to any of these aliases so accounting stays exact.
+        let existing_ids: Vec<usize> = aliases
+            .iter()
+            .filter_map(|k| self.key_to_id.get(k).copied())
+            .collect();
+        for id in existing_ids {
+            self.remove_entry_by_id(id);
+        }
+
+        self.evict_to_fit(byte_size, self.max_packs, self.max_bytes);
+        if self.entries.len() >= self.max_packs
+            || self.total_bytes.saturating_add(byte_size) > self.max_bytes
+        {
+            return;
+        }
+
+        let mut dedup_aliases = Vec::with_capacity(aliases.len());
+        for alias in aliases {
+            if !alias.is_empty() && !dedup_aliases.contains(&alias) {
+                dedup_aliases.push(alias);
+            }
+        }
+        if dedup_aliases.is_empty() {
+            return;
+        }
+
+        let id = self.next_id;
+        self.next_id = self.next_id.wrapping_add(1);
+        let stamp = self.clock.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+
+        for alias in &dedup_aliases {
+            self.key_to_id.insert(alias.clone(), id);
+        }
+        self.total_bytes = self.total_bytes.saturating_add(byte_size);
+        self.entries.insert(
+            id,
+            CachedMmapEntry {
+                pack,
+                aliases: dedup_aliases,
+                byte_size,
+                last_used: std::sync::atomic::AtomicU64::new(stamp),
+            },
+        );
+    }
+
+    fn clear(&mut self) {
+        self.entries.clear();
+        self.key_to_id.clear();
+        self.total_bytes = 0;
+    }
+
+    fn set_limits(&mut self, max_packs: usize, max_bytes: usize) {
+        self.max_packs = max_packs;
+        self.max_bytes = max_bytes;
+        if max_packs == 0 || max_bytes == 0 {
+            self.clear();
+            return;
+        }
+        while !self.entries.is_empty()
+            && (self.entries.len() > self.max_packs || self.total_bytes > self.max_bytes)
+        {
+            let lru_id = self
+                .entries
+                .iter()
+                .min_by_key(|(id, e)| (e.last_used.load(Ordering::Relaxed), **id))
+                .map(|(id, _)| *id);
+            let Some(victim) = lru_id else {
+                break;
+            };
+            self.remove_entry_by_id(victim);
+        }
+    }
+}
+
 /// The Pack Store manager.
 ///
 /// Stores packages as 4 KiB-aligned `.pack` blobs and `.idx` indices under
@@ -1620,7 +1781,7 @@ pub struct DeferredPackPayloads {
 #[derive(Debug, Clone)]
 pub struct PackStore {
     root: PathBuf,
-    mmap_cache: Arc<RwLock<HashMap<String, Arc<PackagePack>>>>,
+    mmap_cache: Arc<RwLock<BoundedMmapCache>>,
     block_clone_cache: Arc<RwLock<HashMap<PathBuf, bool>>>,
     #[cfg(windows)]
     block_clone_drive_cache: Arc<[AtomicU8; 26]>,
@@ -1650,7 +1811,10 @@ impl PackStore {
 
         Ok(Self {
             root,
-            mmap_cache: Arc::new(RwLock::new(HashMap::new())),
+            mmap_cache: Arc::new(RwLock::new(BoundedMmapCache::new(
+                DEFAULT_MMAP_CACHE_MAX_PACKS,
+                DEFAULT_MMAP_CACHE_MAX_BYTES,
+            ))),
             block_clone_cache: Arc::new(RwLock::new(HashMap::new())),
             #[cfg(windows)]
             block_clone_drive_cache: Arc::new([const { AtomicU8::new(0) }; 26]),
@@ -2076,12 +2240,12 @@ impl PackStore {
         // 1. Remove from in-memory cache
         {
             let mut guard = self.mmap_cache.write().unwrap();
-            guard.remove(integrity);
-            guard.remove(integrity.trim());
-            guard.remove(&safe_stem);
-            guard.remove(&sha512_hex);
+            guard.remove_key(integrity);
+            guard.remove_key(integrity.trim());
+            guard.remove_key(&safe_stem);
+            guard.remove_key(&sha512_hex);
             if let Some(ref canon_key) = canon {
-                guard.remove(canon_key);
+                guard.remove_key(canon_key);
             }
         }
 
@@ -2189,7 +2353,7 @@ impl PackStore {
         {
             let guard = self.mmap_cache.read().unwrap();
             if let Some(pack) = guard.get(integrity) {
-                return Ok(Some(Arc::clone(pack)));
+                return Ok(Some(pack));
             }
         }
 
@@ -2203,7 +2367,7 @@ impl PackStore {
                 .or_else(|| guard.get(&sha512_hex))
                 .or_else(|| canon.as_deref().and_then(|c| guard.get(c)))
             {
-                return Ok(Some(Arc::clone(pack)));
+                return Ok(Some(pack));
             }
         }
 
@@ -2606,15 +2770,14 @@ impl PackStore {
             idx_path,
         });
 
-        // 5. Store in cache across process lifetime
+        // 5. Store in bounded cache
         {
-            let mut guard = self.mmap_cache.write().unwrap();
-            guard.insert(integrity.to_string(), Arc::clone(&pack));
-            guard.insert(safe_stem, Arc::clone(&pack));
-            guard.insert(sha512_hex, Arc::clone(&pack));
+            let mut aliases = vec![integrity.to_string(), safe_stem, sha512_hex];
             if let Some(canon_key) = canon {
-                guard.insert(canon_key, Arc::clone(&pack));
+                aliases.push(canon_key);
             }
+            let mut guard = self.mmap_cache.write().unwrap();
+            guard.insert(aliases, Arc::clone(&pack));
         }
 
         Ok(Some(pack))
@@ -3006,13 +3169,12 @@ impl PackStore {
         });
 
         {
-            let mut guard = self.mmap_cache.write().unwrap();
-            guard.insert(integrity.to_string(), Arc::clone(&pack));
-            guard.insert(safe_stem, Arc::clone(&pack));
-            guard.insert(sha512_hex, Arc::clone(&pack));
+            let mut aliases = vec![integrity.to_string(), safe_stem, sha512_hex];
             if let Some(canon_key) = canon {
-                guard.insert(canon_key, Arc::clone(&pack));
+                aliases.push(canon_key);
             }
+            let mut guard = self.mmap_cache.write().unwrap();
+            guard.insert(aliases, Arc::clone(&pack));
         }
 
         Ok((
@@ -4506,6 +4668,19 @@ impl PackStore {
     /// Clear in-memory cached memory maps.
     pub fn clear_mmap_cache(&self) {
         self.mmap_cache.write().unwrap().clear();
+    }
+
+    /// Configure the maximum number of cached packs and cached bytes retained in `mmap_cache`.
+    #[doc(hidden)]
+    pub fn set_mmap_cache_limits(&self, max_packs: usize, max_bytes: usize) {
+        self.mmap_cache.write().unwrap().set_limits(max_packs, max_bytes);
+    }
+
+    /// Return `(cached_pack_count, cached_bytes)` currently retained in `mmap_cache`.
+    #[doc(hidden)]
+    pub fn mmap_cache_stats(&self) -> (usize, usize) {
+        let guard = self.mmap_cache.read().unwrap();
+        (guard.entries.len(), guard.total_bytes)
     }
 
     /// Derives (prefix, safe_stem, sha512_hex) for an integrity string.
@@ -6654,5 +6829,41 @@ mod tests {
 
         let loaded = store.get_package_pack(integrity).unwrap().unwrap();
         assert_eq!(loaded.get_file_slice("index.js").unwrap(), b"healthy v2 payload");
+    }
+
+    #[test]
+    fn test_mmap_cache_bounded_eviction() {
+        let dir = tempdir().unwrap();
+        let store = PackStore::new(dir.path()).unwrap();
+        store.set_mmap_cache_limits(2, 1024 * 1024);
+
+        let payload = vec![b'x'; 2048];
+        let mut integrities = Vec::new();
+        for i in 0..5 {
+            let integ = format!("sha512-boundedmmap{i}==");
+            let files = [PackInputFile::new("index.js", 0o644, &payload)];
+            store.put_package_pack_deferred(&integ, &files).unwrap();
+            integrities.push(integ);
+        }
+
+        let (count, total_bytes) = store.mmap_cache_stats();
+        assert!(
+            count <= 2,
+            "Expected mmap_cache entry count <= 2, got {count}"
+        );
+        assert!(
+            total_bytes <= 1024 * 1024,
+            "Expected bounded mmap_cache bytes, got {total_bytes}"
+        );
+
+        // Even evicted packs still reload cleanly from disk on demand.
+        let oldest = store.get_package_pack(&integrities[0]).unwrap().unwrap();
+        assert_eq!(oldest.get_file_slice("index.js").unwrap(), payload.as_slice());
+        assert!(store.mmap_cache_stats().0 <= 2);
+
+        // Tight byte limit evicts down to <= max_bytes.
+        store.set_mmap_cache_limits(16, 10_000);
+        let (_, tight_bytes) = store.mmap_cache_stats();
+        assert!(tight_bytes <= 10_000);
     }
 }

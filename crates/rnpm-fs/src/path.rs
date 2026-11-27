@@ -192,11 +192,12 @@ pub fn to_verbatim_path(path: &Path) -> PathBuf {
             let normalized = path_str.replace('/', "\\");
             if normalized.starts_with(r"\\?\UNC\") || normalized.starts_with(r"\??\UNC\") {
                 let unc_tail = &normalized[8..];
-                let cleaned = clean_windows_components(unc_tail);
+                let cleaned = clean_windows_components(unc_tail, 2);
                 return PathBuf::from(format!(r"\\?\UNC\{cleaned}"));
             } else {
                 let tail = &normalized[4..];
-                let cleaned = clean_windows_components(tail);
+                let min_preserve = usize::from(!(tail.len() >= 2 && tail.as_bytes()[1] == b':'));
+                let cleaned = clean_windows_components(tail, min_preserve);
                 return PathBuf::from(format!(r"\\?\{cleaned}"));
             }
         }
@@ -219,10 +220,10 @@ pub fn to_verbatim_path(path: &Path) -> PathBuf {
 
         // Check if UNC path (e.g. \\server\share\...)
         if let Some(unc_tail) = abs_str.strip_prefix(r"\\") {
-            let cleaned = clean_windows_components(unc_tail);
+            let cleaned = clean_windows_components(unc_tail, 2);
             PathBuf::from(format!(r"\\?\UNC\{cleaned}"))
         } else {
-            let cleaned = clean_windows_components(&abs_str);
+            let cleaned = clean_windows_components(&abs_str, 0);
             PathBuf::from(format!(r"\\?\{cleaned}"))
         }
     }
@@ -246,7 +247,7 @@ pub fn strip_verbatim_prefix(path: &Path) -> PathBuf {
 }
 
 #[cfg(windows)]
-fn clean_windows_components(path_str: &str) -> String {
+fn clean_windows_components(path_str: &str, min_preserve: usize) -> String {
     let mut parts: Vec<&str> = Vec::new();
     let mut drive_prefix = String::new();
 
@@ -262,7 +263,7 @@ fn clean_windows_components(path_str: &str) -> String {
         if part.is_empty() || part == "." {
             continue;
         } else if part == ".." {
-            if !parts.is_empty() {
+            if parts.len() > min_preserve {
                 parts.pop();
             }
         } else {

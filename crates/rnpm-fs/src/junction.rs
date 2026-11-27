@@ -1155,7 +1155,7 @@ fn create_windows_junction(link: &Path, target: &Path) -> Result<(), FsError> {
     }
     const INVALID_FILE_ATTRIBUTES: u32 = u32::MAX;
 
-    let res = crate::path::with_verbatim_wide(target, |target_wide| {
+    crate::path::with_verbatim_wide(target, |target_wide| {
         let attrs = unsafe { GetFileAttributesW(target_wide.as_ptr()) };
         if attrs == INVALID_FILE_ATTRIBUTES {
             return Err(FsError::Io(std::io::Error::new(
@@ -1164,27 +1164,7 @@ fn create_windows_junction(link: &Path, target: &Path) -> Result<(), FsError> {
             )));
         }
         create_junction_win32_wide(link, target_wide)
-    });
-
-    match res {
-        Ok(()) => return Ok(()),
-        Err(FsError::Io(ref e)) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Err(FsError::Io(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                format!("junction target does not exist: {}", target.display()),
-            )));
-        }
-        Err(e) => {
-            tracing::debug!("Direct Win32 junction creation failed ({e:?}), attempting fallback");
-        }
-    }
-
-    let target_abs = if target.is_absolute() {
-        target.to_path_buf()
-    } else {
-        std::env::current_dir().map_err(FsError::Io)?.join(target)
-    };
-    create_junction_cmd_fallback(link, &target_abs)
+    })
 }
 
 #[cfg(windows)]
@@ -1192,6 +1172,13 @@ fn create_junction_win32(link: &Path, target: &Path) -> Result<(), FsError> {
     crate::path::with_verbatim_wide(target, |target_wide| {
         create_junction_win32_wide(link, target_wide)
     })
+}
+
+#[cfg(windows)]
+fn write_u16_slice_le(dst: &mut [u8], src: &[u16]) {
+    for (chunk, &val) in dst.as_chunks_mut::<2>().0.iter_mut().zip(src.iter()) {
+        *chunk = val.to_le_bytes();
+    }
 }
 
 #[cfg(windows)]
@@ -1270,6 +1257,7 @@ fn create_junction_win32_wide(link: &Path, target_wide_null: &[u16]) -> Result<(
         (false, false)
     };
 
+    const MAXIMUM_REPARSE_DATA_BUFFER_SIZE: usize = 16 * 1024;
     let sub_len_u16 = if has_verb_prefix { tw.len() } else { tw.len() + 4 };
     let print_len_u16 = if is_unc {
         2 + (tw.len() - 8)
@@ -1279,10 +1267,27 @@ fn create_junction_win32_wide(link: &Path, target_wide_null: &[u16]) -> Result<(
         tw.len()
     };
 
-    let sub_len_bytes = (sub_len_u16 * 2) as u16;
-    let print_len_bytes = (print_len_u16 * 2) as u16;
-    let reparse_data_len = 8 + sub_len_bytes + 2 + print_len_bytes + 2;
-    let total_buffer_len = 8 + reparse_data_len as usize;
+    let len_err = || FsError::JunctionError {
+        path: link.to_path_buf(),
+        detail: format!(
+            "Junction target path exceeds Windows MAXIMUM_REPARSE_DATA_BUFFER_SIZE ({MAXIMUM_REPARSE_DATA_BUFFER_SIZE} bytes)"
+        ),
+    };
+    let sub_len_bytes_usize = sub_len_u16.checked_mul(2).ok_or_else(len_err)?;
+    let print_len_bytes_usize = print_len_u16.checked_mul(2).ok_or_else(len_err)?;
+    let total_buffer_len = 16usize
+        .checked_add(sub_len_bytes_usize)
+        .and_then(|v| v.checked_add(2))
+        .and_then(|v| v.checked_add(print_len_bytes_usize))
+        .and_then(|v| v.checked_add(2))
+        .ok_or_else(len_err)?;
+    if total_buffer_len > MAXIMUM_REPARSE_DATA_BUFFER_SIZE {
+        return Err(len_err());
+    }
+
+    let sub_len_bytes = u16::try_from(sub_len_bytes_usize).map_err(|_| len_err())?;
+    let print_len_bytes = u16::try_from(print_len_bytes_usize).map_err(|_| len_err())?;
+    let reparse_data_len = u16::try_from(total_buffer_len - 8).map_err(|_| len_err())?;
 
     let mut stack_buf = [0u8; 1024];
     let mut heap_buf: Vec<u8> = Vec::new();
@@ -1307,36 +1312,35 @@ fn create_junction_win32_wide(link: &Path, target_wide_null: &[u16]) -> Result<(
 
     let path_buf_start = 16usize;
     if has_verb_prefix {
-        let tw_bytes: &[u8] =
-            unsafe { std::slice::from_raw_parts(tw.as_ptr() as *const u8, tw.len() * 2) };
-        buffer[path_buf_start..path_buf_start + tw_bytes.len()].copy_from_slice(tw_bytes);
+        write_u16_slice_le(
+            &mut buffer[path_buf_start..path_buf_start + tw.len() * 2],
+            tw,
+        );
         // Flip `\\?\` -> `\??\` at UTF-16 index 1
         buffer[path_buf_start + 2..path_buf_start + 4].copy_from_slice(&(b'?' as u16).to_le_bytes());
     } else {
-        let nt_bytes: &[u8] =
-            unsafe { std::slice::from_raw_parts(nt_prefix.as_ptr() as *const u8, 8) };
-        buffer[path_buf_start..path_buf_start + 8].copy_from_slice(nt_bytes);
-        let tw_bytes: &[u8] =
-            unsafe { std::slice::from_raw_parts(tw.as_ptr() as *const u8, tw.len() * 2) };
-        buffer[path_buf_start + 8..path_buf_start + 8 + tw_bytes.len()].copy_from_slice(tw_bytes);
+        write_u16_slice_le(&mut buffer[path_buf_start..path_buf_start + 8], &nt_prefix);
+        write_u16_slice_le(
+            &mut buffer[path_buf_start + 8..path_buf_start + 8 + tw.len() * 2],
+            tw,
+        );
     }
 
     let print_byte_start = path_buf_start + print_offset as usize;
     if is_unc {
         let double_slash: [u16; 2] = [b'\\' as u16, b'\\' as u16];
-        let ds_bytes: &[u8] =
-            unsafe { std::slice::from_raw_parts(double_slash.as_ptr() as *const u8, 4) };
-        buffer[print_byte_start..print_byte_start + 4].copy_from_slice(ds_bytes);
+        write_u16_slice_le(&mut buffer[print_byte_start..print_byte_start + 4], &double_slash);
         let tail = &tw[8..];
-        let tail_bytes: &[u8] =
-            unsafe { std::slice::from_raw_parts(tail.as_ptr() as *const u8, tail.len() * 2) };
-        buffer[print_byte_start + 4..print_byte_start + 4 + tail_bytes.len()]
-            .copy_from_slice(tail_bytes);
+        write_u16_slice_le(
+            &mut buffer[print_byte_start + 4..print_byte_start + 4 + tail.len() * 2],
+            tail,
+        );
     } else {
         let tail = if has_verb_prefix { &tw[4..] } else { tw };
-        let tail_bytes: &[u8] =
-            unsafe { std::slice::from_raw_parts(tail.as_ptr() as *const u8, tail.len() * 2) };
-        buffer[print_byte_start..print_byte_start + tail_bytes.len()].copy_from_slice(tail_bytes);
+        write_u16_slice_le(
+            &mut buffer[print_byte_start..print_byte_start + tail.len() * 2],
+            tail,
+        );
     }
 
     crate::path::with_verbatim_wide(link, |link_wide| {
@@ -1440,47 +1444,6 @@ fn create_junction_win32_wide(link: &Path, target_wide_null: &[u16]) -> Result<(
 
         Ok(())
     })
-}
-
-#[cfg(windows)]
-fn create_junction_cmd_fallback(link: &Path, target: &Path) -> Result<(), FsError> {
-    use std::os::windows::process::CommandExt;
-    use std::process::Command;
-
-    let clean_link = crate::path::strip_verbatim_prefix(link)
-        .to_string_lossy()
-        .to_string();
-    let clean_target = crate::path::strip_verbatim_prefix(target)
-        .to_string_lossy()
-        .to_string();
-
-    let escaped_link = clean_link.replace('%', "%%");
-    let escaped_target = clean_target.replace('%', "%%");
-
-    let cmd_line = format!(r#"mklink /J "{}" "{}""#, escaped_link, escaped_target);
-
-    let output = Command::new("cmd.exe")
-        .raw_arg(format!(r#"/S /C "{}""#, cmd_line))
-        .output()
-        .map_err(|err| FsError::JunctionError {
-            path: link.to_path_buf(),
-            detail: format!("Failed to execute mklink /J fallback: {err}"),
-        })?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        return Err(FsError::JunctionError {
-            path: link.to_path_buf(),
-            detail: format!(
-                "mklink /J fallback failed: stdout='{}' stderr='{}'",
-                stdout.trim(),
-                stderr.trim()
-            ),
-        });
-    }
-
-    Ok(())
 }
 
 /// Reads the target path of a junction or symlink.
