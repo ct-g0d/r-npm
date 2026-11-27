@@ -2525,7 +2525,12 @@ impl RegistryClient {
             None
         };
 
-        let initial_auth = if self.has_any_auth && self.is_trusted_target(&initial_url, &initial_url)
+        let initial_auth = if self.has_any_auth
+            && if self.has_scoped_auth {
+                self.is_trusted_target(&initial_url, &initial_url)
+            } else {
+                self.is_trusted_host(&initial_url)
+            }
         {
             if !self.has_scoped_auth {
                 self.bearer_auth_header.clone().or_else(|| {
@@ -3378,16 +3383,16 @@ impl RegistryClient {
     ) -> Result<AbbreviatedPackageMetadata, RegistryError> {
         let url = self.package_metadata_url(package_name)?;
         let target_repr = options.effective_representation();
+        let cache_key = PackumentCacheKey {
+            url: url.as_str().to_owned(),
+            representation: target_repr,
+        };
         let cached_etag = {
-            let key = PackumentCacheKey {
-                url: url.as_str().to_owned(),
-                representation: target_repr,
-            };
             let guard = self
                 .packument_cache
                 .read()
                 .unwrap_or_else(|e| e.into_inner());
-            guard.get(&key).and_then(|c| c.etag.clone())
+            guard.get(&cache_key).and_then(|c| c.etag.clone())
         };
 
         match self
@@ -3401,16 +3406,12 @@ impl RegistryClient {
         {
             MetadataFetchResult::Fresh { metadata, .. } => Ok(metadata),
             MetadataFetchResult::NotModified { etag, cache_metadata } => {
-                let key = PackumentCacheKey {
-                    url: url.as_str().to_owned(),
-                    representation: target_repr,
-                };
                 let cached_meta = {
                     let mut guard = self
                         .packument_cache
                         .write()
                         .unwrap_or_else(|e| e.into_inner());
-                    guard.get_mut(&key).map(|entry| {
+                    guard.get_mut(&cache_key).map(|entry| {
                         if etag.is_some() {
                             entry.etag = etag;
                         }
@@ -3758,6 +3759,7 @@ impl RegistryClient {
         if_none_match: Option<&str>,
         accept_header: &str,
     ) -> Result<MetadataFetchResult, RegistryError> {
+        let _concurrent_fetch_guard = crate::metadata::ConcurrentMetadataFetchGuard::enter();
         let host_key = self
             .config
             .circuit_breaker_enabled
@@ -3776,8 +3778,8 @@ impl RegistryClient {
                 .await?;
 
             let status = resp.status();
-            let cache_metadata = packument_cache_metadata(resp.headers());
             if status == StatusCode::NOT_MODIFIED {
+                let cache_metadata = packument_cache_metadata(resp.headers());
                 let etag = resp
                     .headers()
                     .get(ETAG)
@@ -3837,6 +3839,8 @@ impl RegistryClient {
                     body,
                 });
             }
+
+            let cache_metadata = packument_cache_metadata(resp.headers());
 
             let etag = resp
                 .headers()

@@ -1,4 +1,5 @@
 use crate::error::FsError;
+use crate::fast_hash::{fx_map, fx_set, FxHashMap, FxHashSet};
 use crate::tarball::{
     fast_validate_and_strip_ascii, join_clean_rel, strip_package_prefix, unlink_target_path,
     validate_entry_path, validate_link_target, CountingReader, ExtractionSummary,
@@ -8,7 +9,7 @@ use data_encoding::HEXLOWER;
 use flate2::read::GzDecoder;
 use path_clean::clean;
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashSet};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 #[cfg(windows)]
@@ -326,14 +327,52 @@ fn create_dir_bytes_wide_buf(dir_bytes: &[u8], wide_buf: &mut Vec<u16>) -> std::
     use std::os::windows::ffi::OsStrExt;
     wide_buf.clear();
     debug_assert!(!dir_bytes.is_empty());
-    // SAFETY: `dir_bytes` comes exclusively from `Path::as_os_str().as_encoded_bytes()` sliced
-    // immediately before an ASCII `b'\\'` (`0x5C`) separator (or at full slice length). Because `0x5C`
-    // is ASCII `< 0x80`, it can never fall inside a multi-byte UTF-8/WTF-8 code unit sequence nor split
-    // a surrogate pair across both halves, so every prefix cut before `b'\\'` preserves valid WTF-8.
-    let os = unsafe { std::ffi::OsStr::from_encoded_bytes_unchecked(dir_bytes) };
-    wide_buf.extend(os.encode_wide());
+    let needs_prefix = !(dir_bytes.starts_with(br"\\?\") || dir_bytes.starts_with(br"\??\"));
+    if dir_bytes.is_ascii() {
+        wide_buf.reserve(dir_bytes.len() + if needs_prefix { 5 } else { 1 });
+        if needs_prefix {
+            wide_buf.extend_from_slice(&[b'\\' as u16, b'\\' as u16, b'?' as u16, b'\\' as u16]);
+        }
+        for &b in dir_bytes {
+            wide_buf.push(b as u16);
+        }
+    } else {
+        if needs_prefix {
+            wide_buf.extend_from_slice(&[b'\\' as u16, b'\\' as u16, b'?' as u16, b'\\' as u16]);
+        }
+        // SAFETY: `dir_bytes` comes exclusively from `Path::as_os_str().as_encoded_bytes()` sliced
+        // immediately before an ASCII `b'\\'` (`0x5C`) separator (or at full slice length). Because `0x5C`
+        // is ASCII `< 0x80`, it can never fall inside a multi-byte UTF-8/WTF-8 code unit sequence nor split
+        // a surrogate pair across both halves, so every prefix cut before `b'\\'` preserves valid WTF-8.
+        let os = unsafe { std::ffi::OsStr::from_encoded_bytes_unchecked(dir_bytes) };
+        wide_buf.extend(os.encode_wide());
+    }
     wide_buf.push(0);
     create_dir_wide_or_fallback(wide_buf)
+}
+
+#[cfg(windows)]
+#[inline]
+fn encode_dir_bytes_wide_only(dir_bytes: &[u8], wide_buf: &mut Vec<u16>) {
+    use std::os::windows::ffi::OsStrExt;
+    wide_buf.clear();
+    let needs_prefix = !(dir_bytes.starts_with(br"\\?\") || dir_bytes.starts_with(br"\??\"));
+    if dir_bytes.is_ascii() {
+        wide_buf.reserve(dir_bytes.len() + if needs_prefix { 5 } else { 1 });
+        if needs_prefix {
+            wide_buf.extend_from_slice(&[b'\\' as u16, b'\\' as u16, b'?' as u16, b'\\' as u16]);
+        }
+        for &b in dir_bytes {
+            wide_buf.push(b as u16);
+        }
+    } else {
+        if needs_prefix {
+            wide_buf.extend_from_slice(&[b'\\' as u16, b'\\' as u16, b'?' as u16, b'\\' as u16]);
+        }
+        let os = unsafe { std::ffi::OsStr::from_encoded_bytes_unchecked(dir_bytes) };
+        wide_buf.extend(os.encode_wide());
+    }
+    wide_buf.push(0);
 }
 
 /// Pre-creates a collection of directories in breadth-first order (by path depth),
@@ -346,35 +385,65 @@ where
 {
     #[cfg(windows)]
     {
-        use std::os::windows::ffi::OsStrExt;
-
         let iter = dirs.into_iter();
         let (lower, _) = iter.size_hint();
-        let mut raw_seen: HashSet<&std::ffi::OsStr> = HashSet::with_capacity(lower);
-        let mut unique_paths: Vec<PathBuf> = Vec::with_capacity(lower);
-        let mut verb_seen: HashSet<PathBuf> = HashSet::with_capacity(lower);
+        let mut raw_seen: FxHashSet<&'a [u8]> = fx_set(lower);
+        let mut norm_borrowed: Vec<&'a [u8]> = Vec::with_capacity(lower);
+        let mut norm_owned: Vec<Vec<u8>> = Vec::new();
+        let mut norm_owned_seen: FxHashSet<Vec<u8>> = fx_set(0);
 
         for d in iter {
-            let os = d.as_os_str();
-            if os.is_empty() || !raw_seen.insert(os) {
+            let bytes = d.as_os_str().as_encoded_bytes();
+            if bytes.is_empty() || !raw_seen.insert(bytes) {
                 continue;
             }
-            let verbatim = crate::path::to_verbatim_path(d);
-            if verb_seen.insert(verbatim.clone()) {
-                unique_paths.push(verbatim);
+            if crate::path::is_clean_drive_abs(bytes) {
+                norm_borrowed.push(bytes);
+            } else if crate::path::is_clean_already_verbatim(bytes)
+                && bytes.len() >= 7
+                && bytes[4].is_ascii_alphabetic()
+                && bytes[5] == b':'
+                && bytes[6] == b'\\'
+            {
+                let tail = &bytes[4..];
+                if raw_seen.insert(tail) {
+                    norm_borrowed.push(tail);
+                }
+            } else {
+                let verbatim = crate::path::to_verbatim_path(d);
+                let vb = verbatim.into_os_string().into_encoded_bytes();
+                let clean_vb = if vb.starts_with(br"\\?\")
+                    && vb.len() >= 7
+                    && vb[5] == b':'
+                    && vb[6] == b'\\'
+                {
+                    vb[4..].to_vec()
+                } else {
+                    vb
+                };
+                if !raw_seen.contains(clean_vb.as_slice()) && norm_owned_seen.insert(clean_vb.clone())
+                {
+                    norm_owned.push(clean_vb);
+                }
             }
         }
 
-        if unique_paths.is_empty() {
+        let total_unique = norm_borrowed.len() + norm_owned.len();
+        if total_unique == 0 {
             return Ok(());
         }
 
-        // Compute longest common directory prefix on clean verbatim paths so we
+        let first_slice: &[u8] = if let Some(&s) = norm_borrowed.first() {
+            s
+        } else {
+            norm_owned[0].as_slice()
+        };
+
+        // Compute longest common directory prefix on clean paths so we
         // ensure the shared root exists once and never touch drive roots (C:\).
-        let common_prefix: Option<PathBuf> = {
-            let mut prefix = unique_paths[0].as_os_str().as_encoded_bytes();
-            for p in &unique_paths[1..] {
-                let b = p.as_os_str().as_encoded_bytes();
+        let common_prefix: Option<&[u8]> = {
+            let mut prefix = first_slice;
+            let update_prefix = |prefix: &mut &[u8], b: &[u8]| {
                 let min_len = prefix.len().min(b.len());
                 let mut i = 0;
                 while i < min_len && prefix[i] == b[i] {
@@ -389,51 +458,51 @@ where
                     }
                     i = i.saturating_sub(1);
                 }
-                prefix = &prefix[..i];
-                if prefix.len() <= 6 {
+                *prefix = &prefix[..i];
+            };
+            for &b in norm_borrowed.iter().skip(usize::from(!norm_borrowed.is_empty())) {
+                update_prefix(&mut prefix, b);
+                if prefix.len() <= 3 {
                     break;
                 }
             }
-            // Must include at least one subdirectory below drive root (\\?\X:\sub) or UNC share (\\?\UNC\server\share\sub)
-            if prefix.len() > 7 && prefix.starts_with(br"\\?\") {
-                let valid = if prefix.starts_with(br"\\?\UNC\") {
-                    prefix[8..].iter().filter(|&&b| b == b'\\').count() >= 2
-                } else {
-                    prefix[5] == b':' && prefix[6] == b'\\'
-                };
-                if valid {
-                    // SAFETY: `prefix` is a non-empty prefix of `unique_paths[0]`'s valid WTF-8 bytes,
-                    // guaranteed by `boundary_ok` / the rewind loop to match either the full path or end
-                    // immediately before an ASCII `b'\\'` (`0x5C`), preserving valid WTF-8 encoding.
-                    let os_prefix =
-                        unsafe { std::ffi::OsStr::from_encoded_bytes_unchecked(prefix) };
-                    Some(PathBuf::from(os_prefix))
-                } else {
-                    None
+            for o in &norm_owned {
+                update_prefix(&mut prefix, o.as_slice());
+                if prefix.len() <= 3 {
+                    break;
                 }
-            } else {
-                None
             }
+
+            let is_valid = (prefix.len() > 3 && prefix[1] == b':' && prefix[2] == b'\\')
+                || (prefix.len() > 8
+                    && prefix.starts_with(br"\\?\UNC\")
+                    && prefix[8..].iter().filter(|&&b| b == b'\\').count() >= 2);
+            is_valid.then_some(prefix)
         };
 
-        let mut known_existing_bytes: HashSet<&[u8]> = HashSet::new();
+        let mut known_existing_bytes: FxHashSet<&[u8]> = fx_set(4);
         let mut scratch_wide = Vec::with_capacity(260);
-        if let Some(ref prefix) = common_prefix {
-            scratch_wide.extend(prefix.as_os_str().encode_wide());
-            scratch_wide.push(0);
+        if let Some(prefix) = common_prefix {
+            encode_dir_bytes_wide_only(prefix, &mut scratch_wide);
             if !dir_exists_wide(&scratch_wide) {
-                std::fs::create_dir_all(prefix)?;
+                use std::os::windows::ffi::OsStringExt;
+                let verbatim_prefix =
+                    std::ffi::OsString::from_wide(&scratch_wide[..scratch_wide.len().saturating_sub(1)]);
+                std::fs::create_dir_all(&verbatim_prefix)?;
             }
-            known_existing_bytes.insert(prefix.as_os_str().as_encoded_bytes());
+            known_existing_bytes.insert(prefix);
         }
 
-        let mut pending_seen: HashSet<&[u8]> = HashSet::with_capacity(unique_paths.len() * 2);
-        let mut by_depth: Vec<(usize, &[u8])> = Vec::with_capacity(unique_paths.len() * 2);
+        let mut pending_seen: FxHashSet<&[u8]> = fx_set(total_unique * 2);
+        let mut by_depth: Vec<(usize, &[u8])> = Vec::with_capacity(total_unique * 2);
         let mut min_depth = usize::MAX;
         let mut max_depth = 0usize;
 
-        for dir in &unique_paths {
-            let full_bytes = dir.as_os_str().as_encoded_bytes();
+        for full_bytes in norm_borrowed
+            .iter()
+            .copied()
+            .chain(norm_owned.iter().map(|v| v.as_slice()))
+        {
             let mut end = full_bytes.len();
             let mut depth = full_bytes.iter().filter(|&&b| b == b'\\').count();
             let min_root = if full_bytes.starts_with(br"\\?\UNC\") {
@@ -453,6 +522,8 @@ where
                 } else {
                     full_bytes.len()
                 }
+            } else if full_bytes.len() >= 3 && full_bytes[1] == b':' && full_bytes[2] == b'\\' {
+                3
             } else if full_bytes.starts_with(br"\\?\")
                 && full_bytes.len() >= 7
                 && full_bytes[5] == b':'
@@ -468,12 +539,7 @@ where
                     break;
                 }
                 if common_prefix.is_none() {
-                    scratch_wide.clear();
-                    // SAFETY: `slice` is either the full valid WTF-8 path or cut right before ASCII `b'\\'`.
-                    let slice_os =
-                        unsafe { std::ffi::OsStr::from_encoded_bytes_unchecked(slice) };
-                    scratch_wide.extend(slice_os.encode_wide());
-                    scratch_wide.push(0);
+                    encode_dir_bytes_wide_only(slice, &mut scratch_wide);
                     if dir_exists_wide(&scratch_wide) {
                         known_existing_bytes.insert(slice);
                         break;
@@ -502,21 +568,20 @@ where
             return Ok(());
         }
 
+        if total_to_create <= 32 {
+            by_depth.sort_unstable_by_key(|(d, _)| *d);
+            for &(_, slice) in &by_depth {
+                create_dir_bytes_wide_buf(slice, &mut scratch_wide)?;
+            }
+            return Ok(());
+        }
+
         let num_levels = max_depth - min_depth + 1;
         let mut levels: Vec<Vec<&[u8]>> = (0..num_levels).map(|_| Vec::new()).collect();
         for (depth, slice) in by_depth {
             levels[depth - min_depth].push(slice);
         }
         levels.retain(|l| !l.is_empty());
-
-        if total_to_create <= 32 {
-            for level in &levels {
-                for &slice in level {
-                    create_dir_bytes_wide_buf(slice, &mut scratch_wide)?;
-                }
-            }
-            return Ok(());
-        }
 
         // Peel shallow low-fanout levels sequentially so workers can create independent
         // package subtrees top-down with zero barrier synchronization.
@@ -566,10 +631,9 @@ where
 
         // Promote a small number of high-fanout scope roots (e.g. `@scope`) so every
         // package gets its own balanced bucket without per-level barriers.
-        let mut promoted: HashSet<&[u8]> = HashSet::new();
+        let mut promoted: FxHashSet<&[u8]> = fx_set(4);
         {
-            let mut child_counts: HashMap<&[u8], usize> =
-                HashMap::with_capacity(levels[split_idx].len());
+            let mut child_counts: FxHashMap<&[u8], usize> = fx_map(levels[split_idx].len());
             for &s in &levels[split_idx] {
                 child_counts.insert(s, 0);
             }
@@ -591,7 +655,7 @@ where
             }
         }
 
-        let mut bucket_map: HashMap<&[u8], usize> = HashMap::with_capacity(total_to_create);
+        let mut bucket_map: FxHashMap<&[u8], usize> = fx_map(total_to_create);
         let mut buckets: Vec<Vec<&[u8]>> = Vec::with_capacity(levels[split_idx].len() * 2);
 
         for &s in &levels[split_idx] {
@@ -842,11 +906,17 @@ pub(crate) fn write_file_fast_wide(
             lpOverlapped: *mut std::ffi::c_void,
         ) -> i32;
 
+        fn DeleteFileW(lpFileName: *const u16) -> i32;
+
         fn CloseHandle(hObject: *mut std::ffi::c_void) -> i32;
         fn GetLastError() -> u32;
     }
 
     const GENERIC_WRITE: u32 = 0x40000000;
+    const FILE_SHARE_READ: u32 = 1;
+    const FILE_SHARE_WRITE: u32 = 2;
+    const FILE_SHARE_DELETE: u32 = 4;
+    const FILE_SHARE_ALL: u32 = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
     const CREATE_NEW: u32 = 1;
     const FILE_ATTRIBUTE_NORMAL: u32 = 0x80;
     const INVALID_HANDLE_VALUE: *mut std::ffi::c_void = -1isize as *mut std::ffi::c_void;
@@ -854,11 +924,6 @@ pub(crate) fn write_file_fast_wide(
     const ERROR_ACCESS_DENIED: u32 = 5;
     const ERROR_FILE_EXISTS: u32 = 80;
     const ERROR_ALREADY_EXISTS: u32 = 183;
-
-    const FILE_SHARE_READ: u32 = 1;
-    const FILE_SHARE_WRITE: u32 = 2;
-    const FILE_SHARE_DELETE: u32 = 4;
-    const FILE_SHARE_ALL: u32 = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
 
     // Fast path: exclusive creation avoids truncating an existing hardlink or
     // following a symlink without paying a pre-stat syscall on fresh installs.
@@ -937,12 +1002,14 @@ pub(crate) fn write_file_fast_wide(
                 let err = unsafe { GetLastError() };
                 unsafe {
                     CloseHandle(handle);
+                    DeleteFileW(path_wide.as_ptr());
                 }
                 return Err(std::io::Error::from_raw_os_error(err as i32));
             }
             if written == 0 {
                 unsafe {
                     CloseHandle(handle);
+                    DeleteFileW(path_wide.as_ptr());
                 }
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::WriteZero,
@@ -1032,7 +1099,11 @@ fn write_file_fast_impl(
     }
 
     if !data.is_empty() {
-        file.write_all(data)?;
+        if let Err(e) = file.write_all(data) {
+            drop(file);
+            let _ = std::fs::remove_file(path);
+            return Err(e);
+        }
     }
 
     #[cfg(unix)]
@@ -1553,6 +1624,8 @@ fn materialize_items_slice<T: MatItem>(
     let total_files = items.len();
     let mut num_threads = if config.is_hdd {
         config.worker_threads.clamp(1, 4)
+    } else if config.worker_threads == 0 {
+        select_default_concurrency(Some(false)).0.clamp(1, 32)
     } else {
         config.worker_threads.clamp(1, 32)
     }
@@ -1841,7 +1914,7 @@ pub fn decode_tar_entries<R: Read>(
     let mut symlink_count = 0usize;
 
     let mut tracker = PathCollisionTracker::with_capacity(32);
-    let mut hardlink_targets: HashMap<PathBuf, PathBuf> = HashMap::new();
+    let mut hardlink_targets: FxHashMap<PathBuf, PathBuf> = fx_map(0);
     let mut safe_ancestors = HashSet::new();
     let empty_symlinks = HashSet::new();
 
@@ -1849,7 +1922,7 @@ pub fn decode_tar_entries<R: Read>(
     let mut files: Vec<Option<MaterializeFile>> = Vec::with_capacity(32);
     let mut symlinks = Vec::new();
     let mut hardlinks = Vec::new();
-    let mut saw_npmignores: HashSet<String> = HashSet::new();
+    let mut saw_npmignores: FxHashSet<String> = fx_set(4);
 
     let entries = archive.entries().map_err(FsError::Io)?;
 
@@ -2259,7 +2332,8 @@ pub fn decode_tar_entries<R: Read>(
             let file_buf = match entry_size {
                 0 => Vec::new(),
                 sz if sz <= 4 * 1024 * 1024 => {
-                    let mut buf = vec![0u8; sz as usize];
+                    let cap = sz as usize;
+                    let mut buf = vec![0u8; cap];
                     entry.read_exact(&mut buf).map_err(FsError::Io)?;
                     buf
                 }
@@ -2455,8 +2529,7 @@ pub fn extract_tarball_direct<R: Read>(
     let t_mat = std::time::Instant::now();
 
     // 1. Directory pre-creation with pre-deduplication to avoid redundant allocations and syscalls
-    let mut unique_dirs: std::collections::HashSet<&Path> =
-        std::collections::HashSet::with_capacity(decoded.directories.len() + 8);
+    let mut unique_dirs: FxHashSet<&Path> = fx_set(decoded.directories.len() + 8);
     unique_dirs.insert(destination);
     for d in &decoded.directories {
         unique_dirs.insert(d.as_path());
@@ -2598,8 +2671,7 @@ pub fn extract_packages_direct_parallel<R: Read + Send>(
         all_files.append(&mut decoded.files);
     }
 
-    let mut unique_dirs: std::collections::HashSet<&Path> =
-        std::collections::HashSet::with_capacity(total_dirs_count);
+    let mut unique_dirs: FxHashSet<&Path> = fx_set(total_dirs_count);
     unique_dirs.insert(root_destination);
     for (idx, res) in decoded_results.iter().enumerate() {
         if let Ok(decoded) = res {

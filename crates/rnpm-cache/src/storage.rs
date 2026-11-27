@@ -7,7 +7,7 @@ use crate::lock::CacheLock;
 use data_encoding::{BASE64, HEXLOWER};
 use rnpm_core::{Algorithm, Integrity, IntegrityError};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha512};
+use sha1::Digest as _;
 use std::collections::HashSet;
 use std::fmt::Write as _;
 use std::fs::{self, OpenOptions};
@@ -22,6 +22,12 @@ use tracing::{debug, warn};
 static TMP_COUNTER: AtomicU64 = AtomicU64::new(1);
 static PROCESS_START_NANOS: OnceLock<u128> = OnceLock::new();
 const LOCK_SHARD_COUNT: usize = 64;
+
+#[inline]
+fn sha512_digest(data: &[u8]) -> [u8; 64] {
+    let d = ring::digest::digest(&ring::digest::SHA512, data);
+    d.as_ref().try_into().expect("SHA-512 digest is 64 bytes")
+}
 
 #[inline]
 fn process_start_nanos() -> u128 {
@@ -365,8 +371,58 @@ fn rename_with_retries(from: &Path, to: &Path) -> std::io::Result<()> {
 
 #[cfg(windows)]
 #[inline]
-pub(crate) fn encode_verbatim_wide_into(path: &Path, buf: &mut Vec<u16>) {
+fn append_os_wide_fast(os: &std::ffi::OsStr, buf: &mut Vec<u16>) {
     use std::os::windows::ffi::OsStrExt;
+    let b = os.as_encoded_bytes();
+    if b.is_ascii() {
+        buf.reserve(b.len() + 1);
+        buf.extend(b.iter().map(|&c| c as u16));
+    } else {
+        buf.extend(os.encode_wide());
+    }
+}
+
+#[cfg(windows)]
+#[inline]
+fn with_verbatim_wide_stack<R>(path: &Path, f: impl FnOnce(&[u16]) -> R) -> R {
+    let os = path.as_os_str();
+    let bytes = os.as_encoded_bytes();
+    const STACK_CAP: usize = 320;
+    if bytes.is_ascii()
+        && bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && bytes[2] == b'\\'
+        && bytes.len() + 6 <= STACK_CAP
+        && !bytes.contains(&b'/')
+        && !bytes[3..].windows(2).any(|w| w == b"\\\\")
+        && !bytes.windows(3).any(|w| w == b"\\.\\")
+        && !bytes.windows(4).any(|w| w == b"\\..\\")
+        && !bytes.ends_with(br"\.")
+        && !bytes.ends_with(br"\..")
+        && !bytes.ends_with(b"\\")
+    {
+        let mut stack = [0u16; STACK_CAP];
+        stack[0] = b'\\' as u16;
+        stack[1] = b'\\' as u16;
+        stack[2] = b'?' as u16;
+        stack[3] = b'\\' as u16;
+        let mut idx = 4;
+        for &b in bytes {
+            stack[idx] = b as u16;
+            idx += 1;
+        }
+        stack[idx] = 0;
+        return f(&stack[..=idx]);
+    }
+    let mut wide = Vec::with_capacity(260);
+    encode_verbatim_wide_into(path, &mut wide);
+    f(&wide)
+}
+
+#[cfg(windows)]
+#[inline]
+pub(crate) fn encode_verbatim_wide_into(path: &Path, buf: &mut Vec<u16>) {
     buf.clear();
     let os = path.as_os_str();
     let bytes = os.as_encoded_bytes();
@@ -376,7 +432,7 @@ pub(crate) fn encode_verbatim_wide_into(path: &Path, buf: &mut Vec<u16>) {
         && !bytes.windows(3).any(|w| w == b"\\.\\")
         && !bytes.windows(4).any(|w| w == b"\\..\\")
     {
-        buf.extend(os.encode_wide());
+        append_os_wide_fast(os, buf);
         buf.push(0);
         return;
     }
@@ -393,13 +449,72 @@ pub(crate) fn encode_verbatim_wide_into(path: &Path, buf: &mut Vec<u16>) {
         && !bytes.ends_with(b"\\")
     {
         buf.extend_from_slice(&[b'\\' as u16, b'\\' as u16, b'?' as u16, b'\\' as u16]);
-        buf.extend(os.encode_wide());
+        append_os_wide_fast(os, buf);
         buf.push(0);
         return;
     }
     let verb = rnpm_fs::to_verbatim_path(path);
-    buf.extend(verb.as_os_str().encode_wide());
+    append_os_wide_fast(verb.as_os_str(), buf);
     buf.push(0);
+}
+
+/// Fast parent-directory creator for two-level sharded cache paths (`.../<p1>/<p2>/<file>`).
+#[cfg(windows)]
+fn ensure_sharded_parent_win32(wide_file_null: &[u16], file_hint: &Path) -> std::io::Result<()> {
+    extern "system" {
+        fn CreateDirectoryW(
+            lpPathName: *const u16,
+            lpSecurityAttributes: *mut std::ffi::c_void,
+        ) -> i32;
+        fn GetLastError() -> u32;
+    }
+    const ERROR_ALREADY_EXISTS: u32 = 183;
+    const ERROR_PATH_NOT_FOUND: u32 = 3;
+
+    // Strip trailing NUL and filename
+    let without_null = &wide_file_null[..wide_file_null.len().saturating_sub(1)];
+    let Some(last_sep) = without_null.iter().rposition(|&c| c == b'\\' as u16) else {
+        return Ok(());
+    };
+    let parent = &without_null[..last_sep];
+    if let Some(grand_sep) = parent.iter().rposition(|&c| c == b'\\' as u16) {
+        let mut gp_buf = [0u16; 320];
+        let gp_len = grand_sep;
+        if gp_len < gp_buf.len() {
+            gp_buf[..gp_len].copy_from_slice(&parent[..gp_len]);
+            gp_buf[gp_len] = 0;
+            let ok_gp = unsafe { CreateDirectoryW(gp_buf.as_ptr(), std::ptr::null_mut()) };
+            if ok_gp == 0 {
+                let err = unsafe { GetLastError() };
+                if err != ERROR_ALREADY_EXISTS {
+                    if err == ERROR_PATH_NOT_FOUND {
+                        if let Some(p) = file_hint.parent() {
+                            return fs::create_dir_all(p);
+                        }
+                    } else {
+                        return Err(std::io::Error::from_raw_os_error(err as i32));
+                    }
+                }
+            }
+        }
+    }
+    let mut p_buf = [0u16; 320];
+    if parent.len() < p_buf.len() {
+        p_buf[..parent.len()].copy_from_slice(parent);
+        p_buf[parent.len()] = 0;
+        let ok = unsafe { CreateDirectoryW(p_buf.as_ptr(), std::ptr::null_mut()) };
+        if ok != 0 {
+            return Ok(());
+        }
+        let err = unsafe { GetLastError() };
+        if err == ERROR_ALREADY_EXISTS {
+            return Ok(());
+        }
+    }
+    if let Some(p) = file_hint.parent() {
+        fs::create_dir_all(p)?;
+    }
+    Ok(())
 }
 
 #[cfg(windows)]
@@ -425,6 +540,7 @@ fn rename_handle_win32(
     const FILE_ATTRIBUTE_NORMAL: u32 = 0x80;
     const ERROR_PATH_NOT_FOUND: u32 = 3;
     const ERROR_ACCESS_DENIED: u32 = 5;
+    const ERROR_SHARING_VIOLATION: u32 = 32;
     const ERROR_NOT_SUPPORTED: u32 = 50;
     const ERROR_INVALID_PARAMETER: u32 = 87;
 
@@ -482,6 +598,8 @@ fn rename_handle_win32(
 
     let mut created_parent = false;
     let mut cleared_ro = false;
+    let mut yield_retries = 0u32;
+    let mut sleep_retries = 0u32;
     loop {
         let res = match try_rename(
             FILE_RENAME_INFO_EX,
@@ -495,15 +613,21 @@ fn rename_handle_win32(
             Ok(()) => return Ok(()),
             Err(ERROR_PATH_NOT_FOUND) if !created_parent => {
                 created_parent = true;
-                if let Some(parent) = target_hint.parent() {
-                    fs::create_dir_all(parent)?;
-                }
+                ensure_sharded_parent_win32(wide_target_null, target_hint)?;
             }
             Err(ERROR_ACCESS_DENIED) if !cleared_ro => {
                 cleared_ro = true;
                 unsafe {
                     SetFileAttributesW(wide_target_null.as_ptr(), FILE_ATTRIBUTE_NORMAL);
                 }
+            }
+            Err(ERROR_ACCESS_DENIED | ERROR_SHARING_VIOLATION) if yield_retries < 8 => {
+                yield_retries += 1;
+                yield_now();
+            }
+            Err(ERROR_ACCESS_DENIED | ERROR_SHARING_VIOLATION) if sleep_retries < 6 => {
+                sleep(Duration::from_millis(1u64 << sleep_retries));
+                sleep_retries += 1;
             }
             Err(e) => return Err(std::io::Error::from_raw_os_error(e as i32)),
         }
@@ -518,6 +642,50 @@ pub(crate) fn write_and_rename_atomic_wide(
     target_hint: &Path,
     data: &[u8],
 ) -> std::io::Result<()> {
+    write_and_rename_atomic_wide_impl(
+        wide_tmp_null,
+        wide_target_null,
+        tmp_hint,
+        target_hint,
+        data,
+        false,
+    )
+    .map(|_| ())
+}
+
+#[cfg(windows)]
+pub(crate) fn write_and_rename_atomic_wide_with_mtime(
+    wide_tmp_null: &[u16],
+    wide_target_null: &[u16],
+    tmp_hint: &Path,
+    target_hint: &Path,
+    data: &[u8],
+) -> std::io::Result<Option<u64>> {
+    write_and_rename_atomic_wide_impl(
+        wide_tmp_null,
+        wide_target_null,
+        tmp_hint,
+        target_hint,
+        data,
+        true,
+    )
+}
+
+#[cfg(windows)]
+fn write_and_rename_atomic_wide_impl(
+    wide_tmp_null: &[u16],
+    wide_target_null: &[u16],
+    tmp_hint: &Path,
+    target_hint: &Path,
+    data: &[u8],
+    capture_mtime: bool,
+) -> std::io::Result<Option<u64>> {
+    #[repr(C)]
+    #[allow(non_snake_case)]
+    struct FileTimeRaw {
+        dwLowDateTime: u32,
+        dwHighDateTime: u32,
+    }
     extern "system" {
         fn CreateFileW(
             lpFileName: *const u16,
@@ -535,6 +703,12 @@ pub(crate) fn write_and_rename_atomic_wide(
             lpNumberOfBytesWritten: *mut u32,
             lpOverlapped: *mut std::ffi::c_void,
         ) -> i32;
+        fn GetFileTime(
+            hFile: *mut std::ffi::c_void,
+            lpCreationTime: *mut FileTimeRaw,
+            lpLastAccessTime: *mut FileTimeRaw,
+            lpLastWriteTime: *mut FileTimeRaw,
+        ) -> i32;
         fn SetFileInformationByHandle(
             hFile: *mut std::ffi::c_void,
             FileInformationClass: i32,
@@ -545,6 +719,7 @@ pub(crate) fn write_and_rename_atomic_wide(
         fn GetLastError() -> u32;
     }
     const GENERIC_WRITE: u32 = 0x4000_0000;
+    const FILE_READ_ATTRIBUTES: u32 = 0x0080;
     const DELETE_ACCESS: u32 = 0x0001_0000;
     const FILE_SHARE_ALL: u32 = 1 | 2 | 4;
     const CREATE_NEW: u32 = 1;
@@ -552,11 +727,18 @@ pub(crate) fn write_and_rename_atomic_wide(
     const FILE_DISPOSITION_INFO: i32 = 4;
     const ERROR_PATH_NOT_FOUND: u32 = 3;
     const INVALID_HANDLE_VALUE: *mut std::ffi::c_void = -1isize as *mut std::ffi::c_void;
+    const WINDOWS_EPOCH_OFFSET: u64 = 116_444_736_000_000_000;
+
+    let access = if capture_mtime {
+        GENERIC_WRITE | FILE_READ_ATTRIBUTES | DELETE_ACCESS
+    } else {
+        GENERIC_WRITE | DELETE_ACCESS
+    };
 
     let mut handle = unsafe {
         CreateFileW(
             wide_tmp_null.as_ptr(),
-            GENERIC_WRITE | DELETE_ACCESS,
+            access,
             FILE_SHARE_ALL,
             std::ptr::null_mut(),
             CREATE_NEW,
@@ -573,7 +755,7 @@ pub(crate) fn write_and_rename_atomic_wide(
             handle = unsafe {
                 CreateFileW(
                     wide_tmp_null.as_ptr(),
-                    GENERIC_WRITE | DELETE_ACCESS,
+                    access,
                     FILE_SHARE_ALL,
                     std::ptr::null_mut(),
                     CREATE_NEW,
@@ -626,10 +808,26 @@ pub(crate) fn write_and_rename_atomic_wide(
         return Err(e);
     }
 
+    let mtime = if capture_mtime {
+        let mut lwt = FileTimeRaw {
+            dwLowDateTime: 0,
+            dwHighDateTime: 0,
+        };
+        if unsafe { GetFileTime(handle, std::ptr::null_mut(), std::ptr::null_mut(), &mut lwt) } != 0
+        {
+            let ft = ((lwt.dwHighDateTime as u64) << 32) | (lwt.dwLowDateTime as u64);
+            ft.checked_sub(WINDOWS_EPOCH_OFFSET).map(|t| t * 100)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
     unsafe {
         CloseHandle(handle);
     }
-    Ok(())
+    Ok(mtime)
 }
 
 pub(crate) fn write_and_rename_atomic(
@@ -685,19 +883,126 @@ pub(crate) fn write_and_rename_atomic(
     }
 }
 
+#[cfg(windows)]
+fn read_file_win32_once(path: &Path) -> std::io::Result<Vec<u8>> {
+    extern "system" {
+        fn CreateFileW(
+            lpFileName: *const u16,
+            dwDesiredAccess: u32,
+            dwShareMode: u32,
+            lpSecurityAttributes: *mut std::ffi::c_void,
+            dwCreationDisposition: u32,
+            dwFlagsAndAttributes: u32,
+            hTemplateFile: *mut std::ffi::c_void,
+        ) -> *mut std::ffi::c_void;
+        fn GetFileSizeEx(hFile: *mut std::ffi::c_void, lpFileSize: *mut i64) -> i32;
+        fn ReadFile(
+            hFile: *mut std::ffi::c_void,
+            lpBuffer: *mut std::ffi::c_void,
+            nNumberOfBytesToRead: u32,
+            lpNumberOfBytesRead: *mut u32,
+            lpOverlapped: *mut std::ffi::c_void,
+        ) -> i32;
+        fn CloseHandle(hObject: *mut std::ffi::c_void) -> i32;
+        fn GetLastError() -> u32;
+    }
+    const GENERIC_READ: u32 = 0x8000_0000;
+    const FILE_SHARE_ALL: u32 = 1 | 2 | 4;
+    const OPEN_EXISTING: u32 = 3;
+    const FILE_FLAG_SEQUENTIAL_SCAN: u32 = 0x0800_0000;
+    const INVALID_HANDLE_VALUE: *mut std::ffi::c_void = -1isize as *mut std::ffi::c_void;
+
+    let handle = with_verbatim_wide_stack(path, |wide| unsafe {
+        CreateFileW(
+            wide.as_ptr(),
+            GENERIC_READ,
+            FILE_SHARE_ALL,
+            std::ptr::null_mut(),
+            OPEN_EXISTING,
+            FILE_FLAG_SEQUENTIAL_SCAN,
+            std::ptr::null_mut(),
+        )
+    });
+    if handle == INVALID_HANDLE_VALUE {
+        return Err(std::io::Error::from_raw_os_error(unsafe { GetLastError() } as i32));
+    }
+
+    let mut file_size: i64 = 0;
+    if unsafe { GetFileSizeEx(handle, &mut file_size) } == 0 {
+        let err = unsafe { GetLastError() };
+        unsafe { CloseHandle(handle) };
+        return Err(std::io::Error::from_raw_os_error(err as i32));
+    }
+    let expected_len = usize::try_from(file_size.max(0)).unwrap_or(0);
+    let mut out = Vec::<u8>::with_capacity(expected_len);
+    let mut total_read = 0usize;
+
+    // Fast path: read the known exact size in a single ReadFile without an EOF probe.
+    while total_read < expected_len {
+        let remaining = expected_len - total_read;
+        let to_read = remaining.min(u32::MAX as usize) as u32;
+        let mut n_read = 0u32;
+        let ok = unsafe {
+            ReadFile(
+                handle,
+                out.as_mut_ptr().add(total_read) as *mut _,
+                to_read,
+                &mut n_read,
+                std::ptr::null_mut(),
+            )
+        };
+        if ok == 0 {
+            let err = unsafe { GetLastError() };
+            unsafe {
+                out.set_len(total_read);
+                CloseHandle(handle);
+            }
+            return Err(std::io::Error::from_raw_os_error(err as i32));
+        }
+        if n_read == 0 {
+            break;
+        }
+        total_read += n_read as usize;
+    }
+    unsafe {
+        out.set_len(total_read);
+        CloseHandle(handle);
+    }
+    Ok(out)
+}
+
 /// Helper to reliably read a file with retries on Windows transient file sharing locks.
 fn read_file_with_retries(path: &Path) -> std::io::Result<Vec<u8>> {
-    match fs::read(path) {
+    let read_once = |p: &Path| -> std::io::Result<Vec<u8>> {
+        #[cfg(windows)]
+        {
+            read_file_win32_once(p)
+        }
+        #[cfg(not(windows))]
+        {
+            fs::read(p)
+        }
+    };
+
+    match read_once(path) {
         Ok(bytes) => return Ok(bytes),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(e),
         Err(_) => {}
+    }
+    for _ in 0..8 {
+        yield_now();
+        match read_once(path) {
+            Ok(bytes) => return Ok(bytes),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(e),
+            Err(_) => {}
+        }
     }
     let mut attempts = 1u32;
     let mut delay = Duration::from_micros(500);
     loop {
         retry_backoff(attempts, &mut delay, Duration::from_millis(100));
         attempts += 1;
-        match fs::read(path) {
+        match read_once(path) {
             Ok(bytes) => return Ok(bytes),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(e),
             Err(e) => {
@@ -843,7 +1148,7 @@ fn verify_sha512_and_integrity(
     key_for_err: &str,
 ) -> Result<[u8; 64], CacheError> {
     if expected_integrity.strongest_algorithm() == Some(Algorithm::Sha512) {
-        let actual_digest: [u8; 64] = Sha512::digest(data).into();
+        let actual_digest = sha512_digest(data);
         if sha512_matches_integrity(&actual_digest, expected_integrity) == Some(true) {
             return Ok(actual_digest);
         }
@@ -870,7 +1175,7 @@ fn verify_sha512_and_integrity(
         },
         other => CacheError::Core(rnpm_core::CoreError::Integrity(other)),
     })?;
-    Ok(Sha512::digest(data).into())
+    Ok(sha512_digest(data))
 }
 
 /// Content-addressable cache manager.
@@ -1125,7 +1430,7 @@ impl Cache {
         let sha512_bytes: [u8; 64] = if let Some(expected) = expected_integrity {
             verify_sha512_and_integrity(data, expected, "blob")?
         } else {
-            Sha512::digest(data).into()
+            sha512_digest(data)
         };
         let mut hex_buf = [0u8; 128];
         let sha512_hex = encode_hex_lower(&sha512_bytes, &mut hex_buf).to_string();
@@ -1137,6 +1442,7 @@ impl Cache {
     /// Store a pre-verified blob atomically by its known SHA-512 hex digest.
     pub fn put_blob_direct(&self, data: &[u8], sha512_hex: &str) -> Result<(), CacheError> {
         let npm_path = self.npm_blob_path_for_algo(Algorithm::Sha512, sha512_hex);
+
         let mut npm_definitely_missing = false;
         match fs::File::open(&npm_path) {
             Ok(mut f) => {
@@ -1197,6 +1503,13 @@ impl Cache {
 
         if npm_definitely_missing || fs::symlink_metadata(&npm_path).is_err() {
             if !prefix_bitset_has(&self.blob_prefix_dirs, sha512_hex) {
+                #[cfg(windows)]
+                {
+                    let mut wide = Vec::with_capacity(260);
+                    encode_verbatim_wide_into(&npm_path, &mut wide);
+                    ensure_sharded_parent_win32(&wide, &npm_path)?;
+                }
+                #[cfg(not(windows))]
                 if let Some(parent) = npm_path.parent() {
                     fs::create_dir_all(parent)?;
                 }
@@ -1293,7 +1606,7 @@ impl Cache {
             }
         };
 
-        let actual_digest: [u8; 64] = Sha512::digest(&bytes).into();
+        let actual_digest = sha512_digest(&bytes);
         let matches = match decode_sha512_hex_stack(sha512_hex) {
             Some(expected) => actual_digest == expected,
             None => {
@@ -1468,6 +1781,13 @@ impl Cache {
             .unwrap_or_else(|e| e.into_inner());
 
         if !prefix_bitset_has(&self.index_prefix_dirs, hash) {
+            #[cfg(windows)]
+            {
+                let mut wide = Vec::with_capacity(260);
+                encode_verbatim_wide_into(&npm_path, &mut wide);
+                ensure_sharded_parent_win32(&wide, &npm_path)?;
+            }
+            #[cfg(not(windows))]
             if let Some(parent) = npm_path.parent() {
                 fs::create_dir_all(parent)?;
             }
@@ -1506,7 +1826,7 @@ impl Cache {
             let bytes = verify_sha512_and_integrity(data, expected, key)?;
             (bytes, expected.to_string())
         } else {
-            let bytes: [u8; 64] = Sha512::digest(data).into();
+            let bytes = sha512_digest(data);
             let integ = format!("sha512-{}", BASE64.encode(&bytes));
             (bytes, integ)
         };
@@ -1535,7 +1855,7 @@ impl Cache {
         data: &[u8],
         metadata: Option<serde_json::Value>,
     ) -> Result<IndexEntry, CacheError> {
-        let sha512_bytes: [u8; 64] = Sha512::digest(data).into();
+        let sha512_bytes = sha512_digest(data);
         let mut hex_buf = [0u8; 128];
         let sha512_hex = encode_hex_lower(&sha512_bytes, &mut hex_buf).to_string();
         let integrity = format!("sha512-{}", BASE64.encode(&sha512_bytes));
@@ -1714,7 +2034,7 @@ impl Cache {
             Err(e) => return Err(CacheError::Io(e)),
         };
 
-        let mut hasher = Sha512::new();
+        let mut hasher = ring::digest::Context::new(&ring::digest::SHA512);
         let mut buffer = [0u8; 131072];
         let mut total_size = 0u64;
 
@@ -1737,7 +2057,11 @@ impl Cache {
             return Err(err);
         }
 
-        let sha512_bytes: [u8; 64] = hasher.finalize().into();
+        let digest = hasher.finish();
+        let sha512_bytes: [u8; 64] = digest
+            .as_ref()
+            .try_into()
+            .expect("SHA-512 digest is 64 bytes");
         let mut hex_buf = [0u8; 128];
         let sha512_hex = encode_hex_lower(&sha512_bytes, &mut hex_buf).to_string();
 
@@ -1835,7 +2159,7 @@ impl Cache {
                 Ok(meta) => {
                     let ok = meta.len() == total_size
                         && read_file_with_retries(&npm_path)
-                            .is_ok_and(|b| Sha512::digest(&b).as_slice() == sha512_bytes.as_slice());
+                            .is_ok_and(|b| sha512_digest(&b).as_slice() == sha512_bytes.as_slice());
                     if !ok {
                         let _ = remove_file_with_retries(&npm_path);
                     }
@@ -2266,7 +2590,7 @@ impl Cache {
 
         match read_file_with_retries(path) {
             Ok(bytes) => {
-                let actual: [u8; 64] = Sha512::digest(&bytes).into();
+                let actual = sha512_digest(&bytes);
                 if actual == expected {
                     (1, 0, bytes.len() as u64, Some(actual))
                 } else {
@@ -2347,7 +2671,7 @@ impl Cache {
                 Err(e) => Err(e),
             };
             if let Ok(blob_bytes) = bytes_res {
-                let actual: [u8; 64] = Sha512::digest(&blob_bytes).into();
+                let actual = sha512_digest(&blob_bytes);
                 if actual == digest {
                     return (1, 0, 0, Some(digest));
                 }
@@ -2511,7 +2835,7 @@ impl Cache {
                     if is_blob {
                         if let Some(expected) = Self::expected_blob_digest(&path) {
                             if let Ok(bytes) = fs::read(&path) {
-                                let actual: [u8; 64] = Sha512::digest(&bytes).into();
+                                let actual = sha512_digest(&bytes);
                                 if actual != expected {
                                     let _ = remove_file_with_retries(&path);
                                     count += 1;

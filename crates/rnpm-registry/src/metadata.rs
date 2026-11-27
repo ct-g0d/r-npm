@@ -455,31 +455,22 @@ fn contains_crlf(s: &str) -> bool {
     s.as_bytes().iter().any(|&b| b == b'\r' || b == b'\n')
 }
 
+const FAST_TARBALL_PATH_CHAR: [bool; 256] = {
+    let mut t = [false; 256];
+    let allowed = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~/@+=,;:$&'()*!";
+    let mut i = 0;
+    while i < allowed.len() {
+        t[allowed[i] as usize] = true;
+        i += 1;
+    }
+    t
+};
+
 #[inline]
 fn is_fast_tarball_path(path: &str) -> bool {
-    path.as_bytes().iter().all(|&b| {
-        b.is_ascii_alphanumeric()
-            || matches!(
-                b,
-                b'-' | b'.'
-                    | b'_'
-                    | b'~'
-                    | b'/'
-                    | b'@'
-                    | b'+'
-                    | b'='
-                    | b','
-                    | b';'
-                    | b':'
-                    | b'!'
-                    | b'$'
-                    | b'&'
-                    | b'\''
-                    | b'('
-                    | b')'
-                    | b'*'
-            )
-    })
+    path.as_bytes()
+        .iter()
+        .all(|&b| FAST_TARBALL_PATH_CHAR[b as usize])
 }
 
 /// Fast-path validation returning the validated scheme+authority prefix length (`"https://host/"`)
@@ -741,11 +732,651 @@ pub fn parse_packument_with_mode(
     bytes: &[u8],
     mode: PackumentParseMode,
 ) -> Result<AbbreviatedPackageMetadata, RegistryError> {
-    let mut deserializer = serde_json::Deserializer::from_slice(bytes);
-    let metadata = PackageMetadataSeed { mode }.deserialize(&mut deserializer)?;
-    deserializer.end()?;
+    let metadata = if bytes.len() >= 256 * 1024 {
+        if let Some(res) = parallel_versions::try_parse_parallel(bytes, mode) {
+            res?
+        } else {
+            let mut deserializer = serde_json::Deserializer::from_slice(bytes);
+            let m = PackageMetadataSeed { mode }.deserialize(&mut deserializer)?;
+            deserializer.end()?;
+            m
+        }
+    } else {
+        let mut deserializer = serde_json::Deserializer::from_slice(bytes);
+        let m = PackageMetadataSeed { mode }.deserialize(&mut deserializer)?;
+        deserializer.end()?;
+        m
+    };
     metadata.validate()?;
     Ok(metadata)
+}
+
+pub(crate) struct ConcurrentMetadataFetchGuard;
+
+impl ConcurrentMetadataFetchGuard {
+    #[inline]
+    pub(crate) fn enter() -> Self {
+        parallel_versions::ACTIVE_CONCURRENT_FETCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Self
+    }
+}
+
+impl Drop for ConcurrentMetadataFetchGuard {
+    #[inline]
+    fn drop(&mut self) {
+        parallel_versions::ACTIVE_CONCURRENT_FETCHES.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+mod parallel_versions {
+    use super::{
+        AbbreviatedPackageMetadata, AbbreviatedVersion, CowStr, DistTagsSeed, PackumentParseMode,
+        TimeSeed, VersionSeed,
+    };
+    use crate::error::RegistryError;
+    use serde::de::DeserializeSeed;
+    use std::cell::UnsafeCell;
+    use std::collections::{btree_map::Entry, BTreeMap, HashMap, VecDeque};
+    use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+    use std::sync::{Arc, Condvar, Mutex, OnceLock};
+
+    pub(super) static ACTIVE_CONCURRENT_FETCHES: AtomicUsize = AtomicUsize::new(0);
+    static ACTIVE_PARALLEL_PARSERS: AtomicUsize = AtomicUsize::new(0);
+
+    struct ActiveParserGuard;
+    impl Drop for ActiveParserGuard {
+        fn drop(&mut self) {
+            ACTIVE_PARALLEL_PARSERS.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+
+    const CLOSED_BIT: u64 = 1u64 << 63;
+    const SLOTS_SHIFT: u32 = 32;
+    const SLOTS_MASK: u64 = ((1u64 << 31) - 1) << SLOTS_SHIFT;
+    const ACTIVE_MASK: u64 = u32::MAX as u64;
+
+    struct ParseBatch {
+        call: unsafe fn(*const ()),
+        ctx: *const (),
+        state: AtomicU64,
+        panic: Mutex<Option<Box<dyn std::any::Any + Send>>>,
+        done_lock: Mutex<()>,
+        done_cvar: Condvar,
+    }
+
+    // Safety: `ctx` points to a `Sync` closure `&F` live until `BatchFinishGuard::drop`.
+    unsafe impl Send for ParseBatch {}
+    unsafe impl Sync for ParseBatch {}
+
+    impl ParseBatch {
+        #[inline]
+        fn try_enter(&self) -> bool {
+            let mut cur = self.state.load(Ordering::Acquire);
+            loop {
+                if (cur & CLOSED_BIT) != 0 || (cur & SLOTS_MASK) == 0 {
+                    return false;
+                }
+                let next = cur - (1u64 << SLOTS_SHIFT) + 1;
+                match self
+                    .state
+                    .compare_exchange_weak(cur, next, Ordering::AcqRel, Ordering::Acquire)
+                {
+                    Ok(_) => return true,
+                    Err(actual) => cur = actual,
+                }
+            }
+        }
+
+        #[inline]
+        fn has_open_slots(&self) -> bool {
+            let cur = self.state.load(Ordering::Acquire);
+            (cur & CLOSED_BIT) == 0 && (cur & SLOTS_MASK) != 0
+        }
+
+        fn execute_as_helper(&self) {
+            let res = catch_unwind(AssertUnwindSafe(|| unsafe { (self.call)(self.ctx) }));
+            if let Err(payload) = res {
+                let mut guard = self.panic.lock().unwrap_or_else(|e| e.into_inner());
+                if guard.is_none() {
+                    *guard = Some(payload);
+                }
+            }
+            let prev = self.state.fetch_sub(1, Ordering::AcqRel);
+            if (prev & CLOSED_BIT) != 0 && (prev & ACTIVE_MASK) == 1 {
+                let _done = self.done_lock.lock().unwrap_or_else(|e| e.into_inner());
+                self.done_cvar.notify_one();
+            }
+        }
+    }
+
+    struct BatchFinishGuard<'a>(&'a ParseBatch);
+
+    impl Drop for BatchFinishGuard<'_> {
+        fn drop(&mut self) {
+            let mut cur = self.0.state.load(Ordering::Acquire);
+            loop {
+                let active = cur & ACTIVE_MASK;
+                let next = CLOSED_BIT | active;
+                match self.0.state.compare_exchange_weak(
+                    cur,
+                    next,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                ) {
+                    Ok(_) => break,
+                    Err(actual) => cur = actual,
+                }
+            }
+            if (self.0.state.load(Ordering::Acquire) & ACTIVE_MASK) > 0 {
+                let mut done = self.0.done_lock.lock().unwrap_or_else(|e| e.into_inner());
+                while (self.0.state.load(Ordering::Acquire) & ACTIVE_MASK) > 0 {
+                    done = self
+                        .0
+                        .done_cvar
+                        .wait(done)
+                        .unwrap_or_else(|e| e.into_inner());
+                }
+            }
+        }
+    }
+
+    struct PoolState {
+        queue: VecDeque<Arc<ParseBatch>>,
+        idle_workers: usize,
+    }
+
+    struct ParsePool {
+        state: Mutex<PoolState>,
+        cvar: Condvar,
+        max_threads: usize,
+    }
+
+    impl ParsePool {
+        fn global() -> &'static Arc<Self> {
+            static POOL: OnceLock<Arc<ParsePool>> = OnceLock::new();
+            POOL.get_or_init(|| {
+                let cores = std::thread::available_parallelism()
+                    .map(|n| n.get())
+                    .unwrap_or(4);
+                let max_threads = cores.clamp(2, 8);
+                let helpers = max_threads.saturating_sub(1);
+                let pool = Arc::new(Self {
+                    state: Mutex::new(PoolState {
+                        queue: VecDeque::with_capacity(8),
+                        idle_workers: 0,
+                    }),
+                    cvar: Condvar::new(),
+                    max_threads,
+                });
+                for idx in 0..helpers {
+                    let p = Arc::clone(&pool);
+                    let _ = std::thread::Builder::new()
+                        .name(format!("rnpm-packument-{idx}"))
+                        .spawn(move || p.worker_loop());
+                }
+                pool
+            })
+        }
+
+        fn worker_loop(self: Arc<Self>) {
+            loop {
+                let batch = {
+                    let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                    loop {
+                        let mut picked = None;
+                        while let Some(front) = guard.queue.front() {
+                            if front.try_enter() {
+                                let b = Arc::clone(front);
+                                if !b.has_open_slots() {
+                                    guard.queue.pop_front();
+                                }
+                                picked = Some(b);
+                                break;
+                            }
+                            guard.queue.pop_front();
+                        }
+                        if let Some(b) = picked {
+                            break b;
+                        }
+                        guard.idle_workers += 1;
+                        guard = self.cvar.wait(guard).unwrap_or_else(|e| e.into_inner());
+                        guard.idle_workers = guard.idle_workers.saturating_sub(1);
+                    }
+                };
+                batch.execute_as_helper();
+            }
+        }
+    }
+
+    unsafe fn call_closure<F: Fn() + Sync>(ctx: *const ()) {
+        let f = &*(ctx as *const F);
+        f();
+    }
+
+    fn run_parallel<F: Fn() + Sync>(requested_threads: usize, f: &F) {
+        if requested_threads <= 1 {
+            f();
+            return;
+        }
+        let pool = ParsePool::global();
+        let workers = requested_threads.min(pool.max_threads).max(1);
+        let helper_slots = workers.saturating_sub(1);
+        let initial_state = (helper_slots as u64) << SLOTS_SHIFT;
+        let batch = Arc::new(ParseBatch {
+            call: call_closure::<F>,
+            ctx: (f as *const F).cast::<()>(),
+            state: AtomicU64::new(initial_state),
+            panic: Mutex::new(None),
+            done_lock: Mutex::new(()),
+            done_cvar: Condvar::new(),
+        });
+
+        let should_wake = if helper_slots > 0 {
+            let mut guard = pool.state.lock().unwrap_or_else(|e| e.into_inner());
+            guard.queue.push_back(Arc::clone(&batch));
+            guard.idle_workers > 0
+        } else {
+            false
+        };
+        if should_wake {
+            pool.cvar.notify_all();
+        }
+
+        let caller_res = {
+            let _finish = BatchFinishGuard(&batch);
+            catch_unwind(AssertUnwindSafe(f))
+        };
+
+        if let Err(payload) = caller_res {
+            resume_unwind(payload);
+        }
+        let helper_panic = batch.panic.lock().unwrap_or_else(|e| e.into_inner()).take();
+        if let Some(payload) = helper_panic {
+            resume_unwind(payload);
+        }
+    }
+
+    /// 0 = normal byte, 1 = '"' / '\\' / < 0x20.
+    const STR_SCAN: [u8; 256] = {
+        let mut t = [0u8; 256];
+        let mut i = 0usize;
+        while i < 0x20 {
+            t[i] = 1;
+            i += 1;
+        }
+        t[b'"' as usize] = 1;
+        t[b'\\' as usize] = 1;
+        t
+    };
+
+    #[inline]
+    fn skip_ws(bytes: &[u8], mut p: usize) -> usize {
+        let len = bytes.len();
+        if p < len && bytes[p] > b' ' {
+            return p;
+        }
+        while p < len {
+            match bytes[p] {
+                b' ' | b'\t' | b'\n' | b'\r' => p += 1,
+                _ => break,
+            }
+        }
+        p
+    }
+
+    /// Skips a JSON string starting at the opening `"` byte, returning the index right after `"`.
+    #[inline]
+    fn skip_json_string(bytes: &[u8], start_quote: usize) -> Option<usize> {
+        let len = bytes.len();
+        if bytes.get(start_quote).copied() != Some(b'"') {
+            return None;
+        }
+        let mut p = start_quote + 1;
+        loop {
+            while p + 4 <= len {
+                let m = STR_SCAN[bytes[p] as usize]
+                    | STR_SCAN[bytes[p + 1] as usize]
+                    | STR_SCAN[bytes[p + 2] as usize]
+                    | STR_SCAN[bytes[p + 3] as usize];
+                if m != 0 {
+                    break;
+                }
+                p += 4;
+            }
+            while p < len && STR_SCAN[bytes[p] as usize] == 0 {
+                p += 1;
+            }
+            if p >= len {
+                return None;
+            }
+            match bytes[p] {
+                b'"' => return Some(p + 1),
+                b'\\' => {
+                    p += 1;
+                    let esc = *bytes.get(p)?;
+                    p += 1;
+                    if esc == b'u' {
+                        p = p.checked_add(4)?;
+                        if p > len {
+                            return None;
+                        }
+                    }
+                }
+                _ => return None,
+            }
+        }
+    }
+
+    /// Skips any valid JSON value boundaries so top-level/version object slices can be isolated.
+    fn skip_json_value(bytes: &[u8], start: usize) -> Option<usize> {
+        let mut p = skip_ws(bytes, start);
+        let len = bytes.len();
+        match *bytes.get(p)? {
+            b'"' => skip_json_string(bytes, p),
+            b'{' | b'[' => {
+                let mut depth = 1usize;
+                p += 1;
+                while p < len {
+                    match bytes[p] {
+                        b'"' => p = skip_json_string(bytes, p)?,
+                        b'{' | b'[' => {
+                            depth += 1;
+                            p += 1;
+                        }
+                        b'}' | b']' => {
+                            depth -= 1;
+                            p += 1;
+                            if depth == 0 {
+                                return Some(p);
+                            }
+                        }
+                        _ => p += 1,
+                    }
+                }
+                None
+            }
+            b't' => bytes[p..].starts_with(b"true").then_some(p + 4),
+            b'f' => bytes[p..].starts_with(b"false").then_some(p + 5),
+            b'n' => bytes[p..].starts_with(b"null").then_some(p + 4),
+            b'-' | b'0'..=b'9' => {
+                p += 1;
+                while p < len {
+                    match bytes[p] {
+                        b'0'..=b'9' | b'.' | b'e' | b'E' | b'+' | b'-' => p += 1,
+                        _ => break,
+                    }
+                }
+                Some(p)
+            }
+            _ => None,
+        }
+    }
+
+    struct ScannedPackument<'a> {
+        name_slice: Option<&'a [u8]>,
+        dist_tags_slice: Option<&'a [u8]>,
+        modified_slice: Option<&'a [u8]>,
+        time_slice: Option<&'a [u8]>,
+        version_entries: Vec<(&'a [u8], &'a [u8])>,
+    }
+
+    fn scan_packument_top_level(bytes: &[u8]) -> Option<ScannedPackument<'_>> {
+        let mut p = skip_ws(bytes, 0);
+        if bytes.get(p).copied() != Some(b'{') {
+            return None;
+        }
+        p += 1;
+        p = skip_ws(bytes, p);
+        if bytes.get(p).copied() == Some(b'}') {
+            return None;
+        }
+
+        let mut name_slice = None;
+        let mut dist_tags_slice = None;
+        let mut modified_slice = None;
+        let mut time_slice = None;
+        let mut version_entries: Option<Vec<(&[u8], &[u8])>> = None;
+
+        loop {
+            p = skip_ws(bytes, p);
+            let k_start = p;
+            let k_end = skip_json_string(bytes, k_start)?;
+            let raw_key = &bytes[k_start + 1..k_end - 1];
+            if raw_key.contains(&b'\\')
+                || (!raw_key.is_ascii() && std::str::from_utf8(raw_key).is_err())
+            {
+                return None;
+            }
+            p = skip_ws(bytes, k_end);
+            if bytes.get(p).copied() != Some(b':') {
+                return None;
+            }
+            p = skip_ws(bytes, p + 1);
+
+            if raw_key == b"versions" {
+                if version_entries.is_some() || bytes.get(p).copied() != Some(b'{') {
+                    return None;
+                }
+                p = skip_ws(bytes, p + 1);
+                let mut entries = Vec::with_capacity(64);
+                if bytes.get(p).copied() != Some(b'}') {
+                    loop {
+                        p = skip_ws(bytes, p);
+                        let vk_start = p;
+                        let vk_end = skip_json_string(bytes, vk_start)?;
+                        p = skip_ws(bytes, vk_end);
+                        if bytes.get(p).copied() != Some(b':') {
+                            return None;
+                        }
+                        let vv_start = skip_ws(bytes, p + 1);
+                        let vv_end = skip_json_value(bytes, vv_start)?;
+                        entries.push((&bytes[vk_start..vk_end], &bytes[vv_start..vv_end]));
+                        p = skip_ws(bytes, vv_end);
+                        match bytes.get(p).copied() {
+                            Some(b',') => p += 1,
+                            Some(b'}') => {
+                                p += 1;
+                                break;
+                            }
+                            _ => return None,
+                        }
+                    }
+                } else {
+                    p += 1;
+                }
+                if entries.len() < 48 {
+                    return None;
+                }
+                version_entries = Some(entries);
+            } else {
+                let v_start = p;
+                let v_end = skip_json_value(bytes, v_start)?;
+                let val_slice = &bytes[v_start..v_end];
+                match raw_key {
+                    b"name" => {
+                        if name_slice.is_some() {
+                            return None;
+                        }
+                        name_slice = Some(val_slice);
+                    }
+                    b"dist-tags" => {
+                        if dist_tags_slice.is_some() {
+                            return None;
+                        }
+                        dist_tags_slice = Some(val_slice);
+                    }
+                    b"modified" => {
+                        if modified_slice.is_some() {
+                            return None;
+                        }
+                        modified_slice = Some(val_slice);
+                    }
+                    b"time" => {
+                        if time_slice.is_some() {
+                            return None;
+                        }
+                        time_slice = Some(val_slice);
+                    }
+                    _ => {
+                        if serde_json::from_slice::<serde::de::IgnoredAny>(val_slice).is_err() {
+                            return None;
+                        }
+                    }
+                }
+                p = v_end;
+            }
+
+            p = skip_ws(bytes, p);
+            match bytes.get(p).copied() {
+                Some(b',') => p += 1,
+                Some(b'}') => {
+                    p += 1;
+                    break;
+                }
+                _ => return None,
+            }
+        }
+
+        if skip_ws(bytes, p) != bytes.len() {
+            return None;
+        }
+        Some(ScannedPackument {
+            name_slice,
+            dist_tags_slice,
+            modified_slice,
+            time_slice,
+            version_entries: version_entries?,
+        })
+    }
+
+    pub(super) fn try_parse_parallel(
+        bytes: &[u8],
+        mode: PackumentParseMode,
+    ) -> Option<Result<AbbreviatedPackageMetadata, RegistryError>> {
+        if ACTIVE_CONCURRENT_FETCHES.load(Ordering::Relaxed) > 1 {
+            return None;
+        }
+        let _active_guard = ActiveParserGuard;
+        if ACTIVE_PARALLEL_PARSERS.fetch_add(1, Ordering::AcqRel) >= 1 {
+            return None;
+        }
+
+        let scanned = scan_packument_top_level(bytes)?;
+
+        let name: Option<String> = match scanned.name_slice {
+            Some(s) => match serde_json::from_slice::<Option<String>>(s) {
+                Ok(n) => n,
+                Err(_) => return None,
+            },
+            None => None,
+        };
+        let dist_tags: HashMap<String, String> = match scanned.dist_tags_slice {
+            Some(s) => match DistTagsSeed.deserialize(&mut serde_json::Deserializer::from_slice(s))
+            {
+                Ok(m) => m,
+                Err(_) => return None,
+            },
+            None => HashMap::new(),
+        };
+        let modified: Option<String> = match scanned.modified_slice {
+            Some(s) => match serde_json::from_slice::<Option<String>>(s) {
+                Ok(m) => m,
+                Err(_) => return None,
+            },
+            None => None,
+        };
+        let time: BTreeMap<String, String> = match scanned.time_slice {
+            Some(s) => match TimeSeed.deserialize(&mut serde_json::Deserializer::from_slice(s)) {
+                Ok(t) => t,
+                Err(_) => return None,
+            },
+            None => BTreeMap::new(),
+        };
+
+        let entries = &scanned.version_entries;
+        let num_workers = ParsePool::global()
+            .max_threads
+            .min(entries.len() / 24)
+            .max(1);
+        let chunk_len = entries.len().div_ceil(num_workers);
+        let chunks: Vec<&[(&[u8], &[u8])]> = entries.chunks(chunk_len).collect();
+
+        type ChunkResult = Result<Vec<(String, AbbreviatedVersion)>, ()>;
+        struct Slot(UnsafeCell<Option<ChunkResult>>);
+        // Safety: each index `idx` is written once by the worker claiming `idx`.
+        unsafe impl Sync for Slot {}
+
+        let slots: Vec<Slot> = (0..chunks.len()).map(|_| Slot(UnsafeCell::new(None))).collect();
+        let next_chunk = AtomicUsize::new(0);
+        let root_name_ref = name.as_deref();
+
+        run_parallel(chunks.len(), &|| loop {
+            let idx = next_chunk.fetch_add(1, Ordering::Relaxed);
+            if idx >= chunks.len() {
+                break;
+            }
+            let slice = chunks[idx];
+            let mut out = Vec::with_capacity(slice.len());
+            let mut ok = true;
+            for &(k_bytes, v_bytes) in slice {
+                let Ok(cow_key) = serde_json::from_slice::<CowStr<'_>>(k_bytes) else {
+                    ok = false;
+                    break;
+                };
+                let key_owned = cow_key.into_owned();
+                let mut de = serde_json::Deserializer::from_slice(v_bytes);
+                let seed = VersionSeed {
+                    mode,
+                    root_name: root_name_ref,
+                    version_key: Some(key_owned.as_str()),
+                };
+                let Ok(ver) = seed.deserialize(&mut de) else {
+                    ok = false;
+                    break;
+                };
+                if de.end().is_err() {
+                    ok = false;
+                    break;
+                }
+                out.push((key_owned, ver));
+            }
+            unsafe {
+                *slots[idx].0.get() = Some(if ok { Ok(out) } else { Err(()) });
+            }
+        });
+
+        let mut versions = BTreeMap::new();
+        for slot in slots {
+            let res = match slot.0.into_inner() {
+                Some(Ok(v)) => v,
+                _ => return None,
+            };
+            for (k, v) in res {
+                match versions.entry(k) {
+                    Entry::Occupied(occ) => {
+                        return Some(Err(RegistryError::Json(serde::de::Error::custom(format!(
+                            "duplicate version key '{}' found in packument metadata",
+                            occ.key()
+                        )))));
+                    }
+                    Entry::Vacant(vac) => {
+                        vac.insert(v);
+                    }
+                }
+            }
+        }
+
+        let pkg_name = name.unwrap_or_default();
+
+        Some(Ok(AbbreviatedPackageMetadata {
+            name: pkg_name,
+            dist_tags,
+            modified,
+            versions,
+            time,
+        }))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1765,21 +2396,20 @@ impl<'de, 'a> Visitor<'de> for VersionVisitor<'a> {
                 "deprecated" => {
                     deprecated = access.next_value_seed(DeprecatedSeed)?;
                 }
+                "scripts" => {
+                    let val = access.next_value_seed(FastJsonValueSeed)?;
+                    extra.insert(key.into_owned(), val);
+                }
                 other => {
-                    if other == "scripts" {
+                    let drop = match self.mode {
+                        PackumentParseMode::Install => is_heavy_unused_install_field(other),
+                        PackumentParseMode::Full => is_heavy_unused_full_field(other),
+                    };
+                    if drop {
+                        let _ = access.next_value::<serde::de::IgnoredAny>()?;
+                    } else {
                         let val = access.next_value_seed(FastJsonValueSeed)?;
                         extra.insert(key.into_owned(), val);
-                    } else {
-                        let drop = match self.mode {
-                            PackumentParseMode::Install => is_heavy_unused_install_field(other),
-                            PackumentParseMode::Full => is_heavy_unused_full_field(other),
-                        };
-                        if drop {
-                            let _ = access.next_value::<serde::de::IgnoredAny>()?;
-                        } else {
-                            let val = access.next_value_seed(FastJsonValueSeed)?;
-                            extra.insert(key.into_owned(), val);
-                        }
                     }
                 }
             }
@@ -2761,6 +3391,91 @@ mod tests {
                 .and_then(|a| a.provenance.as_ref())
                 .and_then(|p| p.predicate_type.as_deref()),
             Some("https://slsa.dev/provenance/v1")
+        );
+    }
+
+    fn build_large_packument_json(
+        prefix_fields: &str,
+        suffix_fields: &str,
+        num_versions: usize,
+    ) -> Vec<u8> {
+        let mut s = String::with_capacity(300 * 1024);
+        s.push('{');
+        s.push_str(prefix_fields);
+        s.push_str("\"versions\":{");
+        let pad = "a".repeat(512);
+        for i in 0..num_versions {
+            if i > 0 {
+                s.push(',');
+            }
+            s.push_str(&format!(
+                "\"1.0.{i}\":{{\"version\":\"1.0.{i}\",\"description\":\"{pad}\",\"dist\":{{\"tarball\":\"https://registry.npmjs.org/pkg/-/pkg-1.0.{i}.tgz\"}}}}"
+            ));
+        }
+        s.push('}');
+        if !suffix_fields.is_empty() {
+            s.push(',');
+            s.push_str(suffix_fields);
+        }
+        s.push('}');
+        assert!(s.len() >= 256 * 1024);
+        s.into_bytes()
+    }
+
+    #[test]
+    fn test_parallel_packument_rejects_malformed_ignored_field() {
+        let invalid_escape = build_large_packument_json(
+            "\"name\":\"pkg\",",
+            "\"readme\":\"bad \\x escape\"",
+            450,
+        );
+        assert!(
+            matches!(parse_install_packument(&invalid_escape), Err(RegistryError::Json(_))),
+            "malformed ignored string escape must still be rejected in parallel mode"
+        );
+
+        let invalid_number = build_large_packument_json(
+            "\"name\":\"pkg\",",
+            "\"weirdCount\":1..2e++--",
+            450,
+        );
+        assert!(
+            matches!(parse_install_packument(&invalid_number), Err(RegistryError::Json(_))),
+            "malformed ignored number must still be rejected in parallel mode"
+        );
+
+        let valid = build_large_packument_json(
+            "\"name\":\"pkg\",",
+            "\"readme\":\"valid text\"",
+            450,
+        );
+        let parsed = parse_install_packument(&valid).unwrap();
+        assert_eq!(parsed.name, "pkg");
+        assert_eq!(parsed.versions.len(), 450);
+    }
+
+    #[test]
+    fn test_parallel_packument_duplicate_name_matches_sequential() {
+        let dup_name = build_large_packument_json(
+            "\"name\":\"pkg-a\",",
+            "\"name\":\"pkg-b\"",
+            450,
+        );
+        assert!(
+            parse_install_packument(&dup_name).is_err(),
+            "duplicate top-level name before and after versions must fail validation identically to sequential parser"
+        );
+    }
+
+    #[test]
+    fn test_parallel_packument_rejects_invalid_utf8_unknown_key() {
+        let mut bytes = build_large_packument_json("\"name\":\"pkg\",", "", 450);
+        // Pop closing `}` and append a non-UTF-8 top-level key before closing `}`.
+        assert_eq!(bytes.pop(), Some(b'}'));
+        bytes.extend_from_slice(b",\"bad\xFFkey\":1}");
+        assert!(
+            matches!(parse_install_packument(&bytes), Err(RegistryError::Json(_))),
+            "invalid UTF-8 in unknown top-level key must be rejected identically to sequential parser"
         );
     }
 }
