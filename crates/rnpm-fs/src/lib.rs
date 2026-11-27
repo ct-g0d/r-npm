@@ -15,6 +15,89 @@ pub mod pool;
 pub mod tarball;
 pub mod writer;
 
+pub(crate) mod fast_hash {
+    use std::collections::{HashMap, HashSet};
+    use std::hash::{BuildHasherDefault, Hasher};
+
+    #[derive(Default)]
+    pub(crate) struct FxHasher {
+        hash: u64,
+    }
+
+    const K: u64 = 0x517c_c1b7_2722_0a95;
+
+    impl FxHasher {
+        #[inline]
+        fn add(&mut self, val: u64) {
+            self.hash = (self.hash.rotate_left(5) ^ val).wrapping_mul(K);
+        }
+    }
+
+    impl Hasher for FxHasher {
+        #[inline]
+        fn finish(&self) -> u64 {
+            self.hash
+        }
+
+        #[inline]
+        fn write(&mut self, mut bytes: &[u8]) {
+            while bytes.len() >= 8 {
+                let word = u64::from_ne_bytes(bytes[..8].try_into().unwrap());
+                self.add(word);
+                bytes = &bytes[8..];
+            }
+            if bytes.len() >= 4 {
+                let word = u32::from_ne_bytes(bytes[..4].try_into().unwrap()) as u64;
+                self.add(word);
+                bytes = &bytes[4..];
+            }
+            if bytes.len() >= 2 {
+                let word = u16::from_ne_bytes(bytes[..2].try_into().unwrap()) as u64;
+                self.add(word);
+                bytes = &bytes[2..];
+            }
+            if let Some(&b) = bytes.first() {
+                self.add(b as u64);
+            }
+        }
+
+        #[inline]
+        fn write_u8(&mut self, i: u8) {
+            self.add(i as u64);
+        }
+        #[inline]
+        fn write_u16(&mut self, i: u16) {
+            self.add(i as u64);
+        }
+        #[inline]
+        fn write_u32(&mut self, i: u32) {
+            self.add(i as u64);
+        }
+        #[inline]
+        fn write_u64(&mut self, i: u64) {
+            self.add(i);
+        }
+        #[inline]
+        fn write_usize(&mut self, i: usize) {
+            self.add(i as u64);
+        }
+    }
+
+    pub(crate) type FxBuildHasher = BuildHasherDefault<FxHasher>;
+    pub(crate) type FxHashMap<K, V> = HashMap<K, V, FxBuildHasher>;
+    pub(crate) type FxHashSet<K> = HashSet<K, FxBuildHasher>;
+
+    #[inline]
+    pub(crate) fn fx_map<K, V>(cap: usize) -> FxHashMap<K, V> {
+        HashMap::with_capacity_and_hasher(cap, FxBuildHasher::default())
+    }
+
+    #[inline]
+    pub(crate) fn fx_set<K>(cap: usize) -> FxHashSet<K> {
+        HashSet::with_capacity_and_hasher(cap, FxBuildHasher::default())
+    }
+}
+
 pub use node_writer::{
     AsyncFileWriter, AsyncFileWriterSender, NodeWriter, NodeWriterMsg, NodeWriterSender,
     RustWriterPool, WriteTask,

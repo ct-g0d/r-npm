@@ -287,24 +287,8 @@ fn remove_file_safe(path: &Path, meta: Option<&fs::Metadata>) -> Result<(), FsEr
             }
         }
     }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let needs_chmod = meta
-            .map(|m| m.permissions().mode() & 0o200 == 0)
-            .unwrap_or_else(|| {
-                fs::symlink_metadata(path)
-                    .map(|m| m.permissions().mode() & 0o200 == 0)
-                    .unwrap_or(false)
-            });
-        if needs_chmod {
-            if let Ok(m) = fs::symlink_metadata(path) {
-                let mut perms = m.permissions();
-                perms.set_mode(perms.mode() | 0o600);
-                let _ = fs::set_permissions(path, perms);
-            }
-        }
-    }
+    #[cfg(not(windows))]
+    let _ = meta;
 
     let mut attempts = 0;
     let mut delay = std::time::Duration::from_millis(5);
@@ -314,6 +298,20 @@ fn remove_file_safe(path: &Path, meta: Option<&fs::Metadata>) -> Result<(), FsEr
             Ok(()) => return Ok(()),
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
             Err(err) => {
+                #[cfg(unix)]
+                if attempts == 1 && err.kind() == std::io::ErrorKind::PermissionDenied {
+                    use std::os::unix::fs::PermissionsExt;
+                    if let Some(parent) = path.parent() {
+                        if let Ok(m) = fs::symlink_metadata(parent) {
+                            let mut perms = m.permissions();
+                            if perms.mode() & 0o200 == 0 {
+                                perms.set_mode(perms.mode() | 0o700);
+                                let _ = fs::set_permissions(parent, perms);
+                                continue;
+                            }
+                        }
+                    }
+                }
                 if attempts >= 15 || !crate::atomic::is_retryable_error(&err) {
                     return Err(FsError::Io(err));
                 }
@@ -338,6 +336,20 @@ fn remove_dir_safe(path: &Path) -> Result<(), FsError> {
             Ok(()) => return Ok(()),
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
             Err(err) => {
+                #[cfg(unix)]
+                if attempts == 1 && err.kind() == std::io::ErrorKind::PermissionDenied {
+                    use std::os::unix::fs::PermissionsExt;
+                    if let Some(parent) = path.parent() {
+                        if let Ok(m) = fs::symlink_metadata(parent) {
+                            let mut perms = m.permissions();
+                            if perms.mode() & 0o200 == 0 {
+                                perms.set_mode(perms.mode() | 0o700);
+                                let _ = fs::set_permissions(parent, perms);
+                                continue;
+                            }
+                        }
+                    }
+                }
                 if attempts >= 15 || !crate::atomic::is_retryable_error(&err) {
                     return Err(FsError::Io(err));
                 }
@@ -559,6 +571,7 @@ mod win_rm {
         child_buf: &mut Vec<u16>,
         subdirs_out: &mut Vec<DirItem>,
         single_chain: &mut Vec<Vec<u16>>,
+        raw_subdirs: &mut Vec<(Vec<u16>, bool)>,
     ) -> Result<(), FsError> {
         single_chain.clear();
         let top_parent = dir.parent.take();
@@ -581,12 +594,12 @@ mod win_rm {
             pattern_buf.push(b'*' as u16);
             pattern_buf.push(0);
 
-            let mut find_data: WIN32_FIND_DATAW = unsafe { std::mem::zeroed() };
+            let mut find_data = std::mem::MaybeUninit::<WIN32_FIND_DATAW>::uninit();
             let mut handle = unsafe {
                 FindFirstFileExW(
                     pattern_buf.as_ptr(),
                     FIND_EX_INFO_BASIC,
-                    &mut find_data,
+                    find_data.as_mut_ptr(),
                     FIND_EX_SEARCH_NAME_MATCH,
                     std::ptr::null_mut(),
                     FIND_FIRST_EX_LARGE_FETCH,
@@ -599,7 +612,7 @@ mod win_rm {
                         FindFirstFileExW(
                             pattern_buf.as_ptr(),
                             FIND_EX_INFO_STANDARD,
-                            &mut find_data,
+                            find_data.as_mut_ptr(),
                             FIND_EX_SEARCH_NAME_MATCH,
                             std::ptr::null_mut(),
                             0,
@@ -619,7 +632,7 @@ mod win_rm {
                         FindFirstFileExW(
                             pattern_buf.as_ptr(),
                             FIND_EX_INFO_BASIC,
-                            &mut find_data,
+                            find_data.as_mut_ptr(),
                             FIND_EX_SEARCH_NAME_MATCH,
                             std::ptr::null_mut(),
                             FIND_FIRST_EX_LARGE_FETCH,
@@ -639,11 +652,12 @@ mod win_rm {
                 return Err(FsError::Io(std::io::Error::from_raw_os_error(err as i32)));
             }
 
-            let mut raw_subdirs: Vec<(Vec<u16>, bool)> = Vec::new();
+            raw_subdirs.clear();
             {
                 let _guard = FindGuard(handle);
                 loop {
-                    let c = &find_data.cFileName;
+                    let fd = unsafe { find_data.assume_init_ref() };
+                    let c = &fd.cFileName;
                     let is_dot = (c[0] == b'.' as u16 && c[1] == 0)
                         || (c[0] == b'.' as u16 && c[1] == b'.' as u16 && c[2] == 0);
                     if !is_dot {
@@ -655,7 +669,7 @@ mod win_rm {
                         }
                         child_buf.extend_from_slice(&c[..name_len]);
 
-                        let attrs = find_data.dwFileAttributes;
+                        let attrs = fd.dwFileAttributes;
                         let is_ro = (attrs & FILE_ATTRIBUTE_READONLY) != 0;
                         let is_reparse = (attrs & FILE_ATTRIBUTE_REPARSE_POINT) != 0;
                         let is_dir = (attrs & FILE_ATTRIBUTE_DIRECTORY) != 0;
@@ -672,7 +686,7 @@ mod win_rm {
                         }
                     }
 
-                    if unsafe { FindNextFileW(handle, &mut find_data) } == 0 {
+                    if unsafe { FindNextFileW(handle, find_data.as_mut_ptr()) } == 0 {
                         let err = unsafe { GetLastError() };
                         if err == ERROR_NO_MORE_FILES {
                             break;
@@ -720,7 +734,7 @@ mod win_rm {
                 remaining: AtomicUsize::new(raw_subdirs.len()),
                 parent: curr_parent,
             });
-            for (sub_wide, is_ro) in raw_subdirs {
+            for (sub_wide, is_ro) in raw_subdirs.drain(..) {
                 subdirs_out.push(DirItem {
                     wide_no_null: sub_wide,
                     is_ro,
@@ -750,6 +764,7 @@ mod win_rm {
         let mut child_buf = Vec::with_capacity(300);
         let mut local_subdirs = Vec::with_capacity(16);
         let mut single_chain = Vec::with_capacity(8);
+        let mut raw_subdirs = Vec::with_capacity(16);
 
         // Traverse sequentially until queue fans out (>= 2 subdirs), avoiding thread
         // dispatch overhead on tiny trees while scaling cleanly for nested node_modules.
@@ -762,6 +777,7 @@ mod win_rm {
                 &mut child_buf,
                 &mut local_subdirs,
                 &mut single_chain,
+                &mut raw_subdirs,
             )?;
             stack.append(&mut local_subdirs);
         }
@@ -788,9 +804,9 @@ mod win_rm {
             }
 
             let num_threads = std::thread::available_parallelism()
-                .map(|n| n.get())
-                .unwrap_or(4)
-                .clamp(2, 16)
+                .map(|n| n.get() * 2)
+                .unwrap_or(8)
+                .clamp(4, 24)
                 .min(stack.len().max(2));
             let state = Mutex::new(QueueState {
                 pending: stack.into_iter().collect(),
@@ -806,6 +822,7 @@ mod win_rm {
                 let mut c_buf = Vec::with_capacity(300);
                 let mut local_subs = Vec::with_capacity(16);
                 let mut local_single = Vec::with_capacity(8);
+                let mut local_raw_subs = Vec::with_capacity(16);
                 let mut local_stack: Vec<DirItem> = Vec::with_capacity(16);
                 let mut active_guard = ActiveGuard {
                     state: &state,
@@ -869,6 +886,7 @@ mod win_rm {
                         &mut c_buf,
                         &mut local_subs,
                         &mut local_single,
+                        &mut local_raw_subs,
                     ) {
                         local_stack.clear();
                         let mut guard = state.lock().unwrap_or_else(|e| e.into_inner());
@@ -953,45 +971,48 @@ pub fn remove_dir_all_safe(path: &Path) -> Result<(), FsError> {
         let mut unlinks: Vec<(PathBuf, bool)> = Vec::new();
 
         while let Some((current_dir, depth)) = dir_stack.pop() {
-            {
-                use std::os::unix::fs::PermissionsExt;
-                if let Ok(m) = fs::symlink_metadata(&current_dir) {
-                    let mut perms = m.permissions();
-                    if perms.mode() & 0o200 == 0 {
-                        perms.set_mode(perms.mode() | 0o700);
-                        let _ = fs::set_permissions(&current_dir, perms);
-                    }
-                }
-            }
-
-            match fs::read_dir(&current_dir) {
-                Ok(entries) => {
-                    for entry_res in entries {
-                        let entry = match entry_res {
-                            Ok(e) => e,
-                            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
-                            Err(err) => return Err(FsError::Io(err)),
-                        };
-                        let entry_path = entry.path();
-                        let ft = match entry.file_type() {
-                            Ok(ft) => ft,
-                            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
-                            Err(err) => return Err(FsError::Io(err)),
-                        };
-
-                        if ft.is_symlink() {
-                            unlinks.push((entry_path, true));
-                        } else if ft.is_dir() {
-                            dir_stack.push((entry_path, depth + 1));
-                        } else {
-                            unlinks.push((entry_path, false));
+            let entries = match fs::read_dir(&current_dir) {
+                Ok(e) => e,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                    use std::os::unix::fs::PermissionsExt;
+                    if let Ok(m) = fs::symlink_metadata(&current_dir) {
+                        let mut perms = m.permissions();
+                        if perms.mode() & 0o200 == 0 {
+                            perms.set_mode(perms.mode() | 0o700);
+                            let _ = fs::set_permissions(&current_dir, perms);
                         }
                     }
-                    dirs_collected.push((current_dir, depth));
+                    match fs::read_dir(&current_dir) {
+                        Ok(e) => e,
+                        Err(e2) if e2.kind() == std::io::ErrorKind::NotFound => continue,
+                        Err(e2) => return Err(FsError::Io(e2)),
+                    }
                 }
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                 Err(e) => return Err(FsError::Io(e)),
+            };
+            for entry_res in entries {
+                let entry = match entry_res {
+                    Ok(e) => e,
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(err) => return Err(FsError::Io(err)),
+                };
+                let entry_path = entry.path();
+                let ft = match entry.file_type() {
+                    Ok(ft) => ft,
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(err) => return Err(FsError::Io(err)),
+                };
+
+                if ft.is_symlink() {
+                    unlinks.push((entry_path, true));
+                } else if ft.is_dir() {
+                    dir_stack.push((entry_path, depth + 1));
+                } else {
+                    unlinks.push((entry_path, false));
+                }
             }
+            dirs_collected.push((current_dir, depth));
         }
 
         let total_unlinks = unlinks.len();

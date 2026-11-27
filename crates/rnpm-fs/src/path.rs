@@ -4,10 +4,10 @@ use std::path::{Path, PathBuf};
 
 #[cfg(windows)]
 #[inline]
-fn is_clean_windows_tail(bytes: &[u8]) -> bool {
+fn is_clean_windows_tail_ascii(bytes: &[u8]) -> Option<bool> {
     let len = bytes.len();
     if len == 0 {
-        return true;
+        return Some(true);
     }
     if bytes == b"."
         || bytes.starts_with(br".\")
@@ -15,49 +15,52 @@ fn is_clean_windows_tail(bytes: &[u8]) -> bool {
         || bytes.ends_with(br"\.")
         || bytes.ends_with(b"\\")
     {
-        return false;
+        return None;
     }
+    let mut all_ascii = true;
     let mut i = 0;
     while i < len {
         let b = bytes[i];
+        if b >= 0x80 {
+            all_ascii = false;
+        }
         if b == b'/' {
-            return false;
+            return None;
         }
         if b == b'\\' && i + 1 < len {
             let next = bytes[i + 1];
             if next == b'\\' {
-                return false;
+                return None;
             }
             if next == b'.' && i + 2 < len && bytes[i + 2] == b'\\' {
-                return false;
+                return None;
             }
         }
         if b == b'.' && i + 1 < len && bytes[i + 1] == b'.' {
-            return false;
+            return None;
         }
         i += 1;
     }
-    true
+    Some(all_ascii)
 }
 
 #[cfg(windows)]
 #[inline]
-fn is_clean_already_verbatim(bytes: &[u8]) -> bool {
+pub(crate) fn is_clean_already_verbatim(bytes: &[u8]) -> bool {
     if !(bytes.starts_with(br"\\?\") || bytes.starts_with(br"\??\")) {
         return false;
     }
-    // Check for UNC/normal cleanliness after the 4-byte prefix
-    is_clean_windows_tail(&bytes[4..])
+    is_clean_windows_tail_ascii(&bytes[4..]).is_some()
 }
 
 #[cfg(windows)]
 #[inline]
-fn is_clean_drive_abs(bytes: &[u8]) -> bool {
+pub(crate) fn is_clean_drive_abs(bytes: &[u8]) -> bool {
     bytes.len() >= 3
         && bytes[0].is_ascii_alphabetic()
         && bytes[1] == b':'
         && bytes[2] == b'\\'
-        && is_clean_windows_tail(&bytes[3..])
+        && is_clean_windows_tail_ascii(&bytes[3..]).is_some()
 }
 
 /// Encodes `path` as a null-terminated Windows verbatim UTF-16 path into `buf`,
@@ -72,16 +75,37 @@ pub(crate) fn encode_verbatim_wide(path: &Path, buf: &mut Vec<u16>) {
         buf.push(0);
         return;
     }
-    if is_clean_already_verbatim(bytes) {
-        buf.extend(os.encode_wide());
-        buf.push(0);
-        return;
+    if bytes.starts_with(br"\\?\") || bytes.starts_with(br"\??\") {
+        if let Some(all_ascii) = is_clean_windows_tail_ascii(&bytes[4..]) {
+            if all_ascii {
+                buf.reserve(bytes.len() + 1);
+                for &b in bytes {
+                    buf.push(b as u16);
+                }
+                buf.push(0);
+            } else {
+                buf.extend(os.encode_wide());
+                buf.push(0);
+            }
+            return;
+        }
     }
-    if is_clean_drive_abs(bytes) {
-        buf.extend_from_slice(&[b'\\' as u16, b'\\' as u16, b'?' as u16, b'\\' as u16]);
-        buf.extend(os.encode_wide());
-        buf.push(0);
-        return;
+    if bytes.len() >= 3 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' && bytes[2] == b'\\' {
+        if let Some(all_ascii) = is_clean_windows_tail_ascii(&bytes[3..]) {
+            if all_ascii {
+                buf.reserve(bytes.len() + 5);
+                buf.extend_from_slice(&[b'\\' as u16, b'\\' as u16, b'?' as u16, b'\\' as u16]);
+                for &b in bytes {
+                    buf.push(b as u16);
+                }
+                buf.push(0);
+            } else {
+                buf.extend_from_slice(&[b'\\' as u16, b'\\' as u16, b'?' as u16, b'\\' as u16]);
+                buf.extend(os.encode_wide());
+                buf.push(0);
+            }
+            return;
+        }
     }
     let verb = to_verbatim_path(path);
     buf.extend(verb.as_os_str().encode_wide());
