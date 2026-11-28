@@ -1254,11 +1254,17 @@ mod parallel_versions {
         bytes: &[u8],
         mode: PackumentParseMode,
     ) -> Option<Result<AbbreviatedPackageMetadata, RegistryError>> {
-        if ACTIVE_CONCURRENT_FETCHES.load(Ordering::Relaxed) > 1 {
+        // Allow parallel parsing either when this is the sole active fetch, or when the
+        // packument is large enough (>= 1 MiB) to amortize thread-pool dispatch while
+        // other fetches are blocked on network I/O. Cap concurrent parallel parsers to 2.
+        const LARGE_PACKUMENT_PARALLEL_THRESHOLD: usize = 1024 * 1024;
+        if bytes.len() < LARGE_PACKUMENT_PARALLEL_THRESHOLD
+            && ACTIVE_CONCURRENT_FETCHES.load(Ordering::Relaxed) > 1
+        {
             return None;
         }
         let _active_guard = ActiveParserGuard;
-        if ACTIVE_PARALLEL_PARSERS.fetch_add(1, Ordering::AcqRel) >= 1 {
+        if ACTIVE_PARALLEL_PARSERS.fetch_add(1, Ordering::AcqRel) >= 2 {
             return None;
         }
 

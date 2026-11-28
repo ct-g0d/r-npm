@@ -412,9 +412,9 @@ pub(super) async fn complete_graph(
         }
         let via = vulnerabilities[&name].via.clone();
         for dep in via.iter().filter_map(Value::as_str) {
-            let vuln = vulnerabilities
-                .get_mut(dep)
-                .expect("via references a vulnerability");
+            let Some(vuln) = vulnerabilities.get_mut(dep) else {
+                continue;
+            };
             if fix == json!(false)
                 || vuln.fix_available == json!(true)
                 || (fix.is_object() && vuln.fix_available["isSemVerMajor"] != json!(true))

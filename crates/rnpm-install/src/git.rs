@@ -211,14 +211,15 @@ impl GitFetcher {
                 normalized_url.clone()
             };
         let args = ["--no-replace-objects", "ls-remote", &ls_remote_url];
-        let output = match tokio::process::Command::new("git")
+        let mut ls_cmd = tokio::process::Command::new("git");
+        ls_cmd
             .args(args)
             .env("GIT_TERMINAL_PROMPT", "0")
             .env("GIT_ASKPASS", "")
-            .env("SSH_ASKPASS", "")
-            .output()
-            .await
-        {
+            .env("SSH_ASKPASS", "");
+        #[cfg(windows)]
+        ls_cmd.creation_flags(0x0800_0000);
+        let output = match ls_cmd.output().await {
             Ok(out) => out,
             Err(e) => {
                 if e.kind() == std::io::ErrorKind::NotFound {
@@ -1281,6 +1282,8 @@ fn is_valid_hex_sha(s: &str) -> bool {
 /// Executes git command with sanitized environment variables (non-interactive).
 async fn run_git_cmd(args: &[&str], cwd: Option<&Path>) -> Result<(bool, String, String)> {
     let mut cmd = tokio::process::Command::new("git");
+    #[cfg(windows)]
+    cmd.creation_flags(0x0800_0000);
     cmd.args([
         "-c",
         "core.autocrlf=false",
@@ -1317,6 +1320,8 @@ async fn run_git_cmd(args: &[&str], cwd: Option<&Path>) -> Result<(bool, String,
 async fn run_git_archive(remote_dir: &Path, commit_sha: &str) -> Result<Vec<u8>> {
     let remote_dir_str = remote_dir.to_string_lossy();
     let mut cmd = tokio::process::Command::new("git");
+    #[cfg(windows)]
+    cmd.creation_flags(0x0800_0000);
     cmd.args([
         "-c",
         "core.longpaths=true",

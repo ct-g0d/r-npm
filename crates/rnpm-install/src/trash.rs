@@ -116,6 +116,12 @@ pub fn spawn_detached_worker(trash_path: &Path) -> bool {
     cmd.spawn().is_ok()
 }
 
+/// Scans `project_dir` (skipping `node_modules`, which `ci` is about to replace wholesale)
+/// for any leftover `.rnpm-trash-*` directories from previous runs and removes them.
+pub fn cleanup_leftover_trash_root_only(project_dir: &Path) {
+    clean_trash_in_dir(project_dir);
+}
+
 /// Scans `project_dir` and `project_dir/node_modules` for any leftover `.rnpm-trash-*` directories
 /// from previous runs and removes them.
 pub fn cleanup_leftover_trash(project_dir: &Path) {

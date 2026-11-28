@@ -1373,6 +1373,17 @@ fn create_junction_win32_wide(link: &Path, target_wide_null: &[u16]) -> Result<(
                             }
                         }
                     } else {
+                        const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x10;
+                        const FILE_ATTRIBUTE_READONLY: u32 = 0x01;
+                        if attrs != INVALID_FILE_ATTRIBUTES
+                            && (attrs & FILE_ATTRIBUTE_DIRECTORY) == 0
+                        {
+                            return Err(FsError::JunctionError {
+                                path: link.to_path_buf(),
+                                detail: "Destination path already exists and is not a directory"
+                                    .to_string(),
+                            });
+                        }
                         let link_v = crate::path::to_verbatim_path(link);
                         if fs::read_dir(&link_v).map_err(FsError::Io)?.next().is_some() {
                             return Err(FsError::JunctionError {
@@ -1380,6 +1391,23 @@ fn create_junction_win32_wide(link: &Path, target_wide_null: &[u16]) -> Result<(
                                 detail: "Destination directory already exists and is not empty"
                                     .to_string(),
                             });
+                        }
+                        if attrs != INVALID_FILE_ATTRIBUTES
+                            && (attrs & FILE_ATTRIBUTE_READONLY) != 0
+                        {
+                            #[link(name = "kernel32")]
+                            extern "system" {
+                                fn SetFileAttributesW(
+                                    lpFileName: *const u16,
+                                    dwFileAttributes: u32,
+                                ) -> i32;
+                            }
+                            unsafe {
+                                SetFileAttributesW(
+                                    link_wide.as_ptr(),
+                                    attrs & !FILE_ATTRIBUTE_READONLY,
+                                );
+                            }
                         }
                     }
                 } else {

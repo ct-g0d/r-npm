@@ -699,6 +699,54 @@ fn push_u128_wide_slice(buf: &mut [u16], pos: &mut usize, mut val: u128) {
 
 #[cfg(windows)]
 #[inline]
+pub(crate) fn with_sibling_temp_wide_stack<R>(
+    wide_target_null: &[u16],
+    prefix: &str,
+    f: impl FnOnce(&[u16], Option<&Path>) -> R,
+) -> R {
+    let count = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let pid = std::process::id();
+    let without_null = &wide_target_null[..wide_target_null.len().saturating_sub(1)];
+    if let Some(last_sep) = without_null.iter().rposition(|&c| c == b'\\' as u16) {
+        let dir_len = last_sep + 1;
+        const STACK_CAP: usize = 352;
+        // dir + "." + prefix + "_" + pid(10) + "_" + count(20) + ".tmp\0" = dir_len + prefix + 38
+        if prefix.is_ascii() && dir_len + prefix.len() + 38 <= STACK_CAP {
+            let mut stack = [0u16; STACK_CAP];
+            stack[..dir_len].copy_from_slice(&without_null[..dir_len]);
+            let mut pos = dir_len;
+            stack[pos] = b'.' as u16;
+            pos += 1;
+            for &b in prefix.as_bytes() {
+                stack[pos] = b as u16;
+                pos += 1;
+            }
+            stack[pos] = b'_' as u16;
+            pos += 1;
+            push_u128_wide_slice(&mut stack, &mut pos, pid as u128);
+            stack[pos] = b'_' as u16;
+            pos += 1;
+            push_u128_wide_slice(&mut stack, &mut pos, count as u128);
+            for &b in b".tmp\0" {
+                stack[pos] = b as u16;
+                pos += 1;
+            }
+            return f(&stack[..pos], None);
+        }
+        let mut wide = Vec::with_capacity(dir_len + prefix.len() + 40);
+        wide.extend_from_slice(&without_null[..dir_len]);
+        let mut suffix = String::with_capacity(prefix.len() + 36);
+        let _ = write!(&mut suffix, ".{prefix}_{pid}_{count}.tmp");
+        wide.extend(suffix.bytes().map(|b| b as u16));
+        wide.push(0);
+        return f(&wide, None);
+    }
+    f(wide_target_null, None)
+}
+
+#[cfg(windows)]
+#[inline]
+#[allow(dead_code)]
 pub(crate) fn with_temp_wide_stack<R>(
     root: &Path,
     prefix: &str,
@@ -885,6 +933,128 @@ fn rename_handle_win32(
             Err(e) => return Err(std::io::Error::from_raw_os_error(e as i32)),
         }
     }
+}
+
+/// Fast-path cold write: creates a brand-new file directly with `CREATE_NEW` and exclusive
+/// share mode (`0`), avoiding sibling temp file + `SetFileInformationByHandle(FileRenameInfoEx)`
+/// NTFS rename journal overhead on pristine caches. Callers must fall back to
+/// `write_and_rename_atomic_wide` on any error (including `ERROR_FILE_EXISTS`).
+#[cfg(windows)]
+pub(crate) fn write_create_new_wide_set_mtime(
+    wide_target_null: &[u16],
+    data: &[u8],
+    set_mtime_nanos: Option<u64>,
+) -> std::io::Result<()> {
+    #[repr(C)]
+    #[allow(non_snake_case)]
+    struct FileTimeRaw {
+        dwLowDateTime: u32,
+        dwHighDateTime: u32,
+    }
+    extern "system" {
+        fn CreateFileW(
+            lpFileName: *const u16,
+            dwDesiredAccess: u32,
+            dwShareMode: u32,
+            lpSecurityAttributes: *mut std::ffi::c_void,
+            dwCreationDisposition: u32,
+            dwFlagsAndAttributes: u32,
+            hTemplateFile: *mut std::ffi::c_void,
+        ) -> *mut std::ffi::c_void;
+        fn WriteFile(
+            hFile: *mut std::ffi::c_void,
+            lpBuffer: *const std::ffi::c_void,
+            nNumberOfBytesToWrite: u32,
+            lpNumberOfBytesWritten: *mut u32,
+            lpOverlapped: *mut std::ffi::c_void,
+        ) -> i32;
+        fn SetFileTime(
+            hFile: *mut std::ffi::c_void,
+            lpCreationTime: *const FileTimeRaw,
+            lpLastAccessTime: *const FileTimeRaw,
+            lpLastWriteTime: *const FileTimeRaw,
+        ) -> i32;
+        fn SetFileInformationByHandle(
+            hFile: *mut std::ffi::c_void,
+            FileInformationClass: i32,
+            lpFileInformation: *const std::ffi::c_void,
+            dwBufferSize: u32,
+        ) -> i32;
+        fn CloseHandle(hObject: *mut std::ffi::c_void) -> i32;
+        fn GetLastError() -> u32;
+    }
+    const GENERIC_WRITE: u32 = 0x4000_0000;
+    const DELETE_ACCESS: u32 = 0x0001_0000;
+    const CREATE_NEW: u32 = 1;
+    const FILE_ATTRIBUTE_NORMAL: u32 = 0x80;
+    const FILE_DISPOSITION_INFO: i32 = 4;
+    const INVALID_HANDLE_VALUE: *mut std::ffi::c_void = -1isize as *mut std::ffi::c_void;
+    const WINDOWS_EPOCH_OFFSET: u64 = 116_444_736_000_000_000;
+
+    let handle = unsafe {
+        CreateFileW(
+            wide_target_null.as_ptr(),
+            GENERIC_WRITE | DELETE_ACCESS,
+            0, // Exclusive during the brief write so concurrent readers retry until complete.
+            std::ptr::null_mut(),
+            CREATE_NEW,
+            FILE_ATTRIBUTE_NORMAL,
+            std::ptr::null_mut(),
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        return Err(std::io::Error::from_raw_os_error(unsafe { GetLastError() } as i32));
+    }
+
+    let cleanup_and_close = |h: *mut std::ffi::c_void| unsafe {
+        let del: u8 = 1;
+        SetFileInformationByHandle(h, FILE_DISPOSITION_INFO, &del as *const u8 as *const _, 1);
+        CloseHandle(h);
+    };
+
+    let mut offset = 0usize;
+    while offset < data.len() {
+        let chunk = ((data.len() - offset).min(u32::MAX as usize)) as u32;
+        let mut written = 0u32;
+        let ok = unsafe {
+            WriteFile(
+                handle,
+                data[offset..].as_ptr() as *const _,
+                chunk,
+                &mut written,
+                std::ptr::null_mut(),
+            )
+        };
+        if ok == 0 {
+            let err = unsafe { GetLastError() };
+            cleanup_and_close(handle);
+            return Err(std::io::Error::from_raw_os_error(err as i32));
+        }
+        if written == 0 {
+            cleanup_and_close(handle);
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WriteZero,
+                "WriteFile returned 0 bytes written",
+            ));
+        }
+        offset += written as usize;
+    }
+
+    if let Some(ns) = set_mtime_nanos {
+        let ft_100ns = (ns / 100).saturating_add(WINDOWS_EPOCH_OFFSET);
+        let ft = FileTimeRaw {
+            dwLowDateTime: ft_100ns as u32,
+            dwHighDateTime: (ft_100ns >> 32) as u32,
+        };
+        unsafe {
+            SetFileTime(handle, std::ptr::null(), std::ptr::null(), &ft);
+        }
+    }
+
+    unsafe {
+        CloseHandle(handle);
+    }
+    Ok(())
 }
 
 #[cfg(windows)]
@@ -1249,21 +1419,34 @@ pub(crate) fn read_file_win32_once_wide(wide_null: &[u16]) -> std::io::Result<Ve
     const FILE_SHARE_ALL: u32 = 1 | 2 | 4;
     const OPEN_EXISTING: u32 = 3;
     const FILE_FLAG_SEQUENTIAL_SCAN: u32 = 0x0800_0000;
+    const ERROR_SHARING_VIOLATION: u32 = 32;
     const INVALID_HANDLE_VALUE: *mut std::ffi::c_void = -1isize as *mut std::ffi::c_void;
 
-    let handle = unsafe {
-        CreateFileW(
-            wide_null.as_ptr(),
-            GENERIC_READ,
-            FILE_SHARE_ALL,
-            std::ptr::null_mut(),
-            OPEN_EXISTING,
-            FILE_FLAG_SEQUENTIAL_SCAN,
-            std::ptr::null_mut(),
-        )
-    };
-    if handle == INVALID_HANDLE_VALUE {
-        return Err(std::io::Error::from_raw_os_error(unsafe { GetLastError() } as i32));
+    let mut handle = INVALID_HANDLE_VALUE;
+    for attempt in 0..8 {
+        handle = unsafe {
+            CreateFileW(
+                wide_null.as_ptr(),
+                GENERIC_READ,
+                FILE_SHARE_ALL,
+                std::ptr::null_mut(),
+                OPEN_EXISTING,
+                FILE_FLAG_SEQUENTIAL_SCAN,
+                std::ptr::null_mut(),
+            )
+        };
+        if handle != INVALID_HANDLE_VALUE {
+            break;
+        }
+        let last_err = unsafe { GetLastError() };
+        if last_err != ERROR_SHARING_VIOLATION || attempt == 7 {
+            return Err(std::io::Error::from_raw_os_error(last_err as i32));
+        }
+        if attempt < 4 {
+            std::thread::yield_now();
+        } else {
+            std::thread::sleep(Duration::from_millis(1));
+        }
     }
 
     let mut file_size: i64 = 0;
@@ -1415,48 +1598,115 @@ fn parse_index_integrity(entry: &mut IndexEntry) -> Option<ParsedIntegrity> {
     Some(ParsedIntegrity::Full(parsed))
 }
 
-fn parse_index_line(trimmed: &str, expected_key: Option<&str>) -> Option<(IndexEntry, ParsedIntegrity)> {
+#[allow(clippy::large_enum_variant)]
+enum ParsedIndexLine {
+    Entry(IndexEntry, ParsedIntegrity),
+    Tombstone,
+    Invalid,
+}
+
+fn parse_index_line_status(trimmed: &str, expected_key: Option<&str>) -> ParsedIndexLine {
     let json_str = match trimmed.find('\t') {
         Some(tab_pos) => &trimmed[tab_pos + 1..],
         None => trimmed,
     };
-    let mut entry = serde_json::from_str::<IndexEntry>(json_str).ok()?;
-    if let Some(k) = expected_key {
-        if entry.key != k {
-            return None;
+    if let Ok(mut entry) = serde_json::from_str::<IndexEntry>(json_str) {
+        if let Some(k) = expected_key {
+            if entry.key != k {
+                return ParsedIndexLine::Invalid;
+            }
+        }
+        return match parse_index_integrity(&mut entry) {
+            Some(parsed) => ParsedIndexLine::Entry(entry, parsed),
+            None => ParsedIndexLine::Invalid,
+        };
+    }
+    // Recognize cacache deletion tombstones (`{"key":"...","integrity":null,...}`) so
+    // recovery never skips a tombstone and resurrects a deleted entry.
+    if let Ok(val) = serde_json::from_str::<serde_json::Value>(json_str) {
+        if let Some(obj) = val.as_object() {
+            let key_matches = match expected_key {
+                Some(k) => obj.get("key").and_then(|v| v.as_str()) == Some(k),
+                None => obj.get("key").and_then(|v| v.as_str()).is_some(),
+            };
+            if key_matches && obj.get("integrity").is_some_and(|v| v.is_null()) {
+                return ParsedIndexLine::Tombstone;
+            }
         }
     }
-    let parsed = parse_index_integrity(&mut entry)?;
-    Some((entry, parsed))
+    ParsedIndexLine::Invalid
 }
 
-fn parse_index_entry_slice(
-    content: &str,
+fn parse_index_line(trimmed: &str, expected_key: Option<&str>) -> Option<(IndexEntry, ParsedIntegrity)> {
+    match parse_index_line_status(trimmed, expected_key) {
+        ParsedIndexLine::Entry(entry, parsed) => Some((entry, parsed)),
+        ParsedIndexLine::Tombstone | ParsedIndexLine::Invalid => None,
+    }
+}
+
+fn parse_index_bytes(
+    bytes: &[u8],
     expected_key: Option<&str>,
     strict_all_lines: bool,
 ) -> Option<(IndexEntry, ParsedIntegrity)> {
-    if strict_all_lines {
-        let mut last: Option<(IndexEntry, ParsedIntegrity)> = None;
-        for line in content.lines() {
-            let trimmed = line.trim();
-            if trimmed.is_empty() {
-                continue;
-            }
-            last = Some(parse_index_line(trimmed, expected_key)?);
-        }
-        if last.is_some() {
-            return last;
-        }
-    } else {
-        for line in content.lines().rev() {
-            let trimmed = line.trim();
-            if trimmed.is_empty() {
-                continue;
-            }
-            return parse_index_line(trimmed, expected_key);
-        }
+    let non_empty: Vec<&[u8]> = bytes
+        .split(|&b| b == b'\n')
+        .map(|l| l.strip_suffix(b"\r").unwrap_or(l))
+        .filter(|l| !l.iter().all(|b| b.is_ascii_whitespace()))
+        .collect();
+    if non_empty.is_empty() {
+        return None;
     }
 
+    if strict_all_lines {
+        let mut last: Option<(IndexEntry, ParsedIntegrity)> = None;
+        for line_bytes in &non_empty {
+            let trimmed = std::str::from_utf8(line_bytes).ok()?.trim();
+            last = Some(parse_index_line(trimmed, expected_key)?);
+        }
+        return last;
+    }
+
+    // Validate lines from the end: recognize tombstones immediately and tolerate ONLY a single
+    // incomplete/corrupt trailing line (e.g. crash mid-write or mid-UTF-8 at EOF).
+    let last_idx = non_empty.len() - 1;
+    let last_status = match std::str::from_utf8(non_empty[last_idx]) {
+        Ok(s) => parse_index_line_status(s.trim(), expected_key),
+        Err(_) => ParsedIndexLine::Invalid,
+    };
+    match last_status {
+        ParsedIndexLine::Entry(entry, parsed) => Some((entry, parsed)),
+        ParsedIndexLine::Tombstone => None,
+        ParsedIndexLine::Invalid if last_idx > 0 => {
+            let prev_str = std::str::from_utf8(non_empty[last_idx - 1]).ok()?;
+            parse_index_line(prev_str.trim(), expected_key)
+        }
+        ParsedIndexLine::Invalid => None,
+    }
+}
+
+fn parse_index_content_bytes(
+    bytes: &[u8],
+    expected_key: Option<&str>,
+    strict_all_lines: bool,
+) -> Option<(IndexEntry, ParsedIntegrity)> {
+    if let Some(pair) = parse_index_bytes(bytes, expected_key, strict_all_lines) {
+        return Some(pair);
+    }
+    if let Ok(content) = std::str::from_utf8(bytes) {
+        if content.trim_start().starts_with('{') {
+            if let Ok(mut entry) = serde_json::from_str::<IndexEntry>(content) {
+                if let Some(k) = expected_key {
+                    if entry.key != k {
+                        return None;
+                    }
+                }
+                if let Some(parsed) = parse_index_integrity(&mut entry) {
+                    return Some((entry, parsed));
+                }
+            }
+        }
+    }
     None
 }
 
@@ -1467,22 +1717,7 @@ fn parse_index_content(
     expected_key: Option<&str>,
     strict_all_lines: bool,
 ) -> Option<(IndexEntry, ParsedIntegrity)> {
-    if let Some(pair) = parse_index_entry_slice(content, expected_key, strict_all_lines) {
-        return Some(pair);
-    }
-    if content.trim_start().starts_with('{') {
-        if let Ok(mut entry) = serde_json::from_str::<IndexEntry>(content) {
-            if let Some(k) = expected_key {
-                if entry.key != k {
-                    return None;
-                }
-            }
-            if let Some(parsed) = parse_index_integrity(&mut entry) {
-                return Some((entry, parsed));
-            }
-        }
-    }
-    None
+    parse_index_content_bytes(content.as_bytes(), expected_key, strict_all_lines)
 }
 
 #[inline]
@@ -1534,17 +1769,24 @@ pub struct Cache {
     #[cfg(windows)]
     index_p1_dirs: Arc<[AtomicU64; 4]>,
     index_prefix_dirs: Arc<[AtomicU64; 1024]>,
+    #[cfg(windows)]
+    known_empty_blobs: Arc<std::sync::atomic::AtomicBool>,
     lock_shards: Arc<[Mutex<()>; LOCK_SHARD_COUNT]>,
+    canonical_dirs: Arc<Mutex<std::collections::HashMap<PathBuf, PathBuf>>>,
 }
 
 impl Cache {
     /// Initialize a cache instance at the given root directory.
     pub fn new(root: impl AsRef<Path>) -> Result<Self, CacheError> {
         let root = root.as_ref().to_path_buf();
-        fs::create_dir_all(root.join("content-v2").join("sha512"))?;
-        fs::create_dir_all(root.join("index-v5"))?;
-        fs::create_dir_all(root.join("tmp"))?;
-        fs::create_dir_all(root.join("locks"))?;
+        let locks_dir = root.join("locks");
+        let fresh_cache = !locks_dir.is_dir();
+        if fresh_cache {
+            fs::create_dir_all(root.join("content-v2").join("sha512"))?;
+            fs::create_dir_all(root.join("index-v5"))?;
+            fs::create_dir_all(root.join("tmp"))?;
+            fs::create_dir_all(&locks_dir)?;
+        }
         Ok(Self {
             root,
             lock_timeout: CacheLock::DEFAULT_TIMEOUT,
@@ -1555,7 +1797,10 @@ impl Cache {
             #[cfg(windows)]
             index_p1_dirs: Arc::new([const { AtomicU64::new(0) }; 4]),
             index_prefix_dirs: Arc::new([const { AtomicU64::new(0) }; 1024]),
+            #[cfg(windows)]
+            known_empty_blobs: Arc::new(std::sync::atomic::AtomicBool::new(fresh_cache)),
             lock_shards: Arc::new(std::array::from_fn(|_| Mutex::new(()))),
+            canonical_dirs: Arc::new(Mutex::new(std::collections::HashMap::new())),
         })
     }
 
@@ -1579,6 +1824,27 @@ impl Cache {
     /// Temp directory located on the SAME filesystem/volume for atomic renames.
     pub fn tmp_dir(&self) -> PathBuf {
         self.root.join("tmp")
+    }
+
+    /// Fast O(1) check whether `index-v5` contains at least one entry directory.
+    pub fn has_any_index_entries(&self) -> bool {
+        fs::read_dir(self.root.join("index-v5"))
+            .ok()
+            .and_then(|mut it| it.next())
+            .is_some()
+    }
+
+    /// Fast O(1) check whether `content-v2/sha512` contains at least one blob shard directory.
+    pub fn has_any_blobs(&self) -> bool {
+        let has_any = fs::read_dir(self.root.join("content-v2").join("sha512"))
+            .ok()
+            .and_then(|mut it| it.next())
+            .is_some();
+        #[cfg(windows)]
+        if !has_any {
+            self.known_empty_blobs.store(true, Ordering::Relaxed);
+        }
+        has_any
     }
 
     /// Compute storage path for a SHA-512 digest hex string.
@@ -1798,9 +2064,46 @@ impl Cache {
         #[cfg(windows)]
         {
             let fast_res: Result<Option<()>, CacheError> =
-                with_verbatim_wide_stack(&npm_path, |wide_target| match query_win_attr_wide(
-                    wide_target,
-                ) {
+                with_verbatim_wide_stack(&npm_path, |wide_target| {
+                    // Cold-cache fast path: when `content-v2/sha512` started empty and this
+                    // `<p1>/<p2>` shard has never been written in this process, skip the
+                    // guaranteed-miss `GetFileAttributesExW` stat and go straight to parent
+                    // creation (with `blob_p1_dirs` memoization) + atomic sibling-temp write.
+                    if self.known_empty_blobs.load(Ordering::Relaxed)
+                        && !prefix_bitset_has(&self.blob_prefix_dirs, sha512_hex)
+                        && ensure_sharded_parent_win32_cached(
+                            wide_target,
+                            &npm_path,
+                            Some(&self.blob_p1_dirs),
+                            Some(&self.blob_prefix_dirs),
+                            sha512_hex,
+                        )
+                        .is_ok()
+                    {
+                        if write_create_new_wide_set_mtime(wide_target, data, None).is_ok() {
+                            debug!("Directly stored cold blob {}", npm_path.display());
+                            return Ok(Some(()));
+                        }
+                        let atomic_ok = with_sibling_temp_wide_stack(
+                            wide_target,
+                            "b",
+                            |wide_tmp, tmp_hint| {
+                                write_and_rename_atomic_wide(
+                                    wide_tmp,
+                                    wide_target,
+                                    tmp_hint,
+                                    &npm_path,
+                                    data,
+                                )
+                            },
+                        );
+                        if atomic_ok.is_ok() {
+                            debug!("Atomically stored cold blob {}", npm_path.display());
+                            return Ok(Some(()));
+                        }
+                    }
+
+                    match query_win_attr_wide(wide_target) {
                     WinAttrStat::Dir => Err(CacheError::Io(std::io::Error::new(
                         std::io::ErrorKind::AlreadyExists,
                         format!("Blob path is a directory: {}", npm_path.display()),
@@ -1856,7 +2159,7 @@ impl Cache {
                         }
 
                         let atomic_ok =
-                            with_temp_wide_stack(&self.root, "blob", |wide_tmp, tmp_hint| {
+                            with_sibling_temp_wide_stack(wide_target, "b", |wide_tmp, tmp_hint| {
                                 write_and_rename_atomic_wide(
                                     wide_tmp,
                                     wide_target,
@@ -1880,6 +2183,7 @@ impl Cache {
                         }
                     }
                     WinAttrStat::Error(_) => Ok(None),
+                    }
                 });
             if let Some(()) = fast_res? {
                 return Ok(());
@@ -2176,19 +2480,7 @@ impl Cache {
             }
         };
 
-        let content = match std::str::from_utf8(&bytes) {
-            Ok(s) => s,
-            Err(e) => {
-                warn!(
-                    "Non-UTF8 index entry at {} ({e}). Purging corrupt index.",
-                    index_path.display()
-                );
-                self.purge_key_index_files(key);
-                return Ok(None);
-            }
-        };
-
-        if let Some(pair) = parse_index_content(content, Some(key), false) {
+        if let Some(pair) = parse_index_content_bytes(&bytes, Some(key), false) {
             return Ok(Some(pair));
         }
 
@@ -2198,6 +2490,25 @@ impl Cache {
         );
         self.purge_key_index_files(key);
         Ok(None)
+    }
+
+    /// Store a pre-verified blob and its URL-keyed index entry without re-hashing SHA-512.
+    pub fn put_verified_blob_and_index(
+        &self,
+        key: &str,
+        data: &[u8],
+        integrity: &str,
+        sha512_hex: &str,
+    ) -> Result<(), CacheError> {
+        self.put_blob_direct(data, sha512_hex)?;
+        let entry = IndexEntry::new(
+            key.to_string(),
+            integrity.to_string(),
+            sha512_hex.to_string(),
+            data.len() as u64,
+            None,
+        );
+        self.write_index_entry(key, &entry)
     }
 
     fn write_index_entry(&self, key: &str, entry: &IndexEntry) -> Result<(), CacheError> {
@@ -2227,10 +2538,11 @@ impl Cache {
                     Some(&self.index_prefix_dirs),
                     hash,
                 )?;
-                let ok = with_temp_wide_stack(&self.root, "index", |wide_tmp, tmp_hint| {
-                    write_and_rename_atomic_wide(wide_tmp, wide_target, tmp_hint, &npm_path, &buf)
-                        .is_ok()
-                });
+                let ok = write_create_new_wide_set_mtime(wide_target, &buf, None).is_ok()
+                    || with_sibling_temp_wide_stack(wide_target, "i", |wide_tmp, tmp_hint| {
+                        write_and_rename_atomic_wide(wide_tmp, wide_target, tmp_hint, &npm_path, &buf)
+                            .is_ok()
+                    });
                 Ok(ok)
             });
             if res? {
@@ -2930,38 +3242,53 @@ impl Cache {
         let pid = std::process::id();
         let in_flight_blob = format!("blob_{pid}_");
         let in_flight_idx = format!("index_{pid}_");
+        let in_flight_pk = format!("pk_{pid}_");
+
+        let clean_entry = |path: &Path, now: SystemTime| -> bool {
+            let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            let Ok(meta) = fs::metadata(path) else {
+                return false;
+            };
+            let mtime = meta.modified().unwrap_or(now);
+            let age = now.duration_since(mtime).unwrap_or(Duration::ZERO);
+            let should_remove = if max_age.is_zero() {
+                !((file_name.starts_with(&in_flight_blob)
+                    || file_name.starts_with(&in_flight_idx)
+                    || file_name.starts_with(&in_flight_pk))
+                    && age < Duration::from_millis(5000))
+            } else {
+                age >= max_age
+            };
+            if !should_remove {
+                return false;
+            }
+            if path.is_dir() {
+                remove_dir_all_with_retries(path).is_ok()
+            } else {
+                remove_file_with_retries(path).is_ok()
+            }
+        };
 
         if let Ok(entries) = fs::read_dir(self.tmp_dir()) {
             let now = SystemTime::now();
             for entry in entries.flatten() {
                 let path = entry.path();
                 let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-
-                let should_remove = if let Ok(meta) = fs::metadata(&path) {
-                    let mtime = meta.modified().unwrap_or(now);
-                    let age = now.duration_since(mtime).unwrap_or(Duration::ZERO);
-
-                    if max_age.is_zero() {
-                        // If file is an active in-flight temporary file created by the current process recently (< 5000ms),
-                        // preserve it so concurrent threads are not interrupted under thread starvation.
-                        !((file_name.starts_with(&in_flight_blob)
-                            || file_name.starts_with(&in_flight_idx))
-                            && age < Duration::from_millis(5000))
-                    } else {
-                        age >= max_age
-                    }
-                } else {
-                    false
-                };
-
-                if should_remove {
-                    if path.is_dir() {
-                        if remove_dir_all_with_retries(&path).is_ok() {
-                            count += 1;
+                let is_shard_dir = file_name.len() == 1
+                    && file_name.as_bytes()[0].is_ascii_hexdigit()
+                    && path.is_dir();
+                if is_shard_dir {
+                    if let Ok(sub_entries) = fs::read_dir(&path) {
+                        for sub in sub_entries.flatten() {
+                            if clean_entry(&sub.path(), now) {
+                                count += 1;
+                            }
                         }
-                    } else if remove_file_with_retries(&path).is_ok() {
-                        count += 1;
                     }
+                    continue;
+                }
+                if clean_entry(&path, now) {
+                    count += 1;
                 }
             }
         }
@@ -3031,7 +3358,33 @@ impl Cache {
         None
     }
 
+    fn is_sibling_temp_file(path: &Path) -> bool {
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            return false;
+        };
+        name.ends_with(".tmp")
+            && (name.starts_with(".b_") || name.starts_with(".i_") || name.starts_with(".p_"))
+    }
+
+    fn handle_sibling_temp_file(path: &Path) -> bool {
+        if !Self::is_sibling_temp_file(path) {
+            return false;
+        }
+        let stale = fs::metadata(path)
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|mt| SystemTime::now().duration_since(mt).ok())
+            .is_some_and(|age| age >= Duration::from_secs(5));
+        if stale {
+            let _ = remove_file_with_retries(path);
+        }
+        true
+    }
+
     fn verify_single_blob(path: &Path) -> (usize, usize, u64, Option<[u8; 64]>) {
+        if Self::handle_sibling_temp_file(path) {
+            return (0, 0, 0, None);
+        }
         let Some(expected) = Self::expected_blob_digest(path) else {
             warn!(
                 "Invalid blob file name '{}' in content-v2. Purging.",
@@ -3073,6 +3426,9 @@ impl Cache {
         path: &Path,
         valid_blobs: &HashSet<[u8; 64]>,
     ) -> (usize, usize, usize, Option<[u8; 64]>) {
+        if Self::handle_sibling_temp_file(path) {
+            return (0, 0, 0, None);
+        }
         let bytes = match read_file_with_retries(path) {
             Ok(b) => b,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return (0, 0, 0, None),
@@ -3316,11 +3672,30 @@ impl Cache {
         Ok(count)
     }
 
-    /// Compute storage path for a project fast-path fingerprint keyed by its canonical directory.
-    pub fn fingerprint_path(&self, project_dir: &Path) -> PathBuf {
+    fn canonical_project_dir(&self, project_dir: &Path) -> PathBuf {
+        {
+            let guard = self
+                .canonical_dirs
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if let Some(cached) = guard.get(project_dir) {
+                return cached.clone();
+            }
+        }
         let canonical = project_dir
             .canonicalize()
             .unwrap_or_else(|_| project_dir.to_path_buf());
+        let mut guard = self
+            .canonical_dirs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if guard.len() < 64 {
+            guard.insert(project_dir.to_path_buf(), canonical.clone());
+        }
+        canonical
+    }
+
+    fn fingerprint_path_from_canonical(&self, canonical: &Path) -> PathBuf {
         let path_str = canonical.to_string_lossy();
         let normalized = path_str.strip_prefix(r"\\?\").unwrap_or(&path_str);
         #[cfg(windows)]
@@ -3333,6 +3708,12 @@ impl Cache {
         self.root
             .join("_fingerprints")
             .join(format!("{key}.json"))
+    }
+
+    /// Compute storage path for a project fast-path fingerprint keyed by its canonical directory.
+    pub fn fingerprint_path(&self, project_dir: &Path) -> PathBuf {
+        let canonical = self.canonical_project_dir(project_dir);
+        self.fingerprint_path_from_canonical(&canonical)
     }
 
     /// Retrieve the cached project fingerprint for a project directory.
@@ -3362,10 +3743,8 @@ impl Cache {
         project_dir: &Path,
         fingerprint: &str,
     ) -> Result<(), CacheError> {
-        let target_path = self.fingerprint_path(project_dir);
-        let canonical = project_dir
-            .canonicalize()
-            .unwrap_or_else(|_| project_dir.to_path_buf());
+        let canonical = self.canonical_project_dir(project_dir);
+        let target_path = self.fingerprint_path_from_canonical(&canonical);
         let record = serde_json::json!({
             "project_path": canonical.to_string_lossy(),
             "fingerprint": fingerprint,
@@ -3531,5 +3910,65 @@ mod atomic_win_tests {
             .unwrap();
         let (_, got_full) = cache.get_packument(registry, "demo").unwrap().unwrap();
         assert_eq!(got_full, full);
+    }
+
+    #[test]
+    fn truncated_eof_index_line_recovers_valid_preceding_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::new(dir.path()).unwrap();
+        let key = "recover-truncated-eof";
+        cache.put(key, b"valid payload", None).unwrap();
+
+        let mut hex_buf = [0u8; 64];
+        let hash = sha256_hex_stack(key.as_bytes(), &mut hex_buf);
+        let idx_path = npm_index_path_from_hash(cache.root(), hash);
+        let mut raw = fs::read(&idx_path).unwrap();
+        raw.extend_from_slice(b"deadbeef\t{\"key\":\"partial-crash-write");
+        fs::write(&idx_path, &raw).unwrap();
+
+        let (_, got) = cache
+            .get(key)
+            .unwrap()
+            .expect("valid earlier index line must survive truncated trailing line");
+        assert_eq!(got, b"valid payload");
+
+        // Re-putting over an existing entry must overwrite cleanly via atomic rename fallback.
+        cache.put(key, b"updated payload", None).unwrap();
+        let (_, updated) = cache.get(key).unwrap().unwrap();
+        assert_eq!(updated, b"updated payload");
+
+        // Mid-UTF-8 truncated trailing line must still recover the valid preceding line.
+        let mut raw_utf8 = fs::read(&idx_path).unwrap();
+        raw_utf8.extend_from_slice(b"deadbeef\t{\"key\":\"partial-\xff\xfe");
+        fs::write(&idx_path, &raw_utf8).unwrap();
+        let (_, recovered) = cache
+            .get(key)
+            .unwrap()
+            .expect("mid-UTF-8 truncated tail must recover preceding valid line");
+        assert_eq!(recovered, b"updated payload");
+
+        // A valid `integrity: null` tombstone must NOT resurrect the preceding entry.
+        cache.put(key, b"before tombstone", None).unwrap();
+        let mut raw_tombstone = fs::read(&idx_path).unwrap();
+        if !raw_tombstone.ends_with(b"\n") {
+            raw_tombstone.push(b'\n');
+        }
+        raw_tombstone.extend_from_slice(
+            format!("0000000000000000000000000000000000000000\t{{\"key\":\"{key}\",\"integrity\":null,\"time\":1}}\n")
+                .as_bytes(),
+        );
+        fs::write(&idx_path, &raw_tombstone).unwrap();
+        assert!(
+            cache.get(key).unwrap().is_none(),
+            "tombstone must not resurrect earlier index entry"
+        );
+
+        // Even if a truncated line follows a tombstone, recovery must stop at the tombstone.
+        raw_tombstone.extend_from_slice(b"deadbeef\t{\"key\":\"partial-\xff\xfe");
+        fs::write(&idx_path, &raw_tombstone).unwrap();
+        assert!(
+            cache.get(key).unwrap().is_none(),
+            "truncated tail after tombstone must not resurrect earlier index entry"
+        );
     }
 }

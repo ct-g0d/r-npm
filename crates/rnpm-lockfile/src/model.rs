@@ -893,13 +893,14 @@ fn peer_meta_from_json_value<E: serde::de::Error>(
     }
 }
 
-fn bundle_deps_from_json_value<E: serde::de::Error>(
-    val: &serde_json::Value,
+fn bundle_deps_from_ordered_value<E: serde::de::Error>(
+    val: &rnpm_core::ordered_json::OrderedJsonValue,
 ) -> Result<Option<BundledDependencies>, E> {
+    use rnpm_core::ordered_json::OrderedJsonValue;
     match val {
-        serde_json::Value::Null => Ok(None),
-        serde_json::Value::Bool(b) => Ok(Some(BundledDependencies::Boolean(*b))),
-        serde_json::Value::Array(arr) => {
+        OrderedJsonValue::Null => Ok(None),
+        OrderedJsonValue::Bool(b) => Ok(Some(BundledDependencies::Boolean(*b))),
+        OrderedJsonValue::Array(arr) => {
             let mut out = Vec::with_capacity(arr.len());
             for item in arr {
                 let s = item
@@ -909,7 +910,7 @@ fn bundle_deps_from_json_value<E: serde::de::Error>(
             }
             Ok(Some(BundledDependencies::List(out)))
         }
-        serde_json::Value::Object(map) => Ok(Some(BundledDependencies::List(
+        OrderedJsonValue::Object(map) => Ok(Some(BundledDependencies::List(
             map.keys().cloned().collect(),
         ))),
         _ => Err(E::custom("expected a boolean, array of strings, or object for bundleDependencies")),
@@ -1120,9 +1121,10 @@ impl<'de> DeserializeSeed<'de> for LockfilePackageSeed {
                         "bundleDependencies" | "bundledDependencies" => {
                             mark_seen(&mut seen, 1 << 25, "bundleDependencies")?;
                             if let Some(ref mut rm) = raw_map {
-                                let rv = map.next_value::<serde_json::Value>()?;
-                                pkg.bundle_dependencies = bundle_deps_from_json_value(&rv)?;
-                                rm.insert(key.into_string(), rv);
+                                let ov = map
+                                    .next_value::<rnpm_core::ordered_json::OrderedJsonValue>()?;
+                                pkg.bundle_dependencies = bundle_deps_from_ordered_value(&ov)?;
+                                rm.insert(key.into_string(), serde_json::Value::from(ov));
                             } else {
                                 pkg.bundle_dependencies =
                                     map.next_value::<Option<BundledDependencies>>()?;
@@ -1805,7 +1807,12 @@ fn project_lockfile_format(
     let mut detected_newline = None;
 
     for path in all_paths {
-        if let Ok(raw) = std::fs::read_to_string(&path) {
+        let Ok(file) = std::fs::File::open(&path) else {
+            continue;
+        };
+        let mut buf = Vec::with_capacity(4096);
+        if std::io::Read::read_to_end(&mut std::io::Read::take(file, 4096), &mut buf).is_ok() {
+            let raw = String::from_utf8_lossy(&buf);
             let fmt = rnpm_core::ManifestFormat::detect(&raw);
             if detected_indent.is_none() && !fmt.indent.is_empty() {
                 detected_indent = Some(fmt.indent);
@@ -3916,23 +3923,29 @@ impl LockfileV3 {
 
         // Per npm Arborist parity: hidden lockfile lists only what is physically on disk!
         // Do NOT include platform-skipped optional packages (like `fsevents` on Windows).
+        // Non-optional packages are always kept, so check `is_optional` first to avoid
+        // issuing `stat()` syscalls for the ~98% non-optional packages in the tree.
+        let mut node_modules_is_dir: Option<bool> = None;
         hidden.packages.retain(|pkg_key, pkg| {
             if pkg_key.is_empty() {
                 return false;
             }
-            let disk_path = project_dir.join(pkg_key);
-            let exists_on_disk =
-                disk_path.exists() || std::fs::symlink_metadata(&disk_path).is_ok();
-            if exists_on_disk {
-                return true;
-            }
             let is_optional = pkg.optional.unwrap_or(false)
                 || pkg.dev_optional.unwrap_or(false)
                 || pkg.is_effective_optional();
-            if is_optional && is_platform_incompatible(pkg) {
+            if !is_optional {
+                return true;
+            }
+            let disk_path = project_dir.join(pkg_key);
+            if disk_path.exists() || std::fs::symlink_metadata(&disk_path).is_ok() {
+                return true;
+            }
+            if is_platform_incompatible(pkg) {
                 return false;
             }
-            if is_optional && project_dir.join("node_modules").is_dir() {
+            let nm_exists = *node_modules_is_dir
+                .get_or_insert_with(|| project_dir.join("node_modules").is_dir());
+            if nm_exists {
                 return false;
             }
             true

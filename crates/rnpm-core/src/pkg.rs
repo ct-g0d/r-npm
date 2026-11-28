@@ -329,6 +329,14 @@ pub fn set_value(
                     }
                     OrderedJsonValue::Array(arr) => {
                         if let Ok(idx) = key.parse::<usize>() {
+                            const MAX_PKG_ARRAY_INDEX: usize = 10_000;
+                            if idx > MAX_PKG_ARRAY_INDEX {
+                                bail!(
+                                    "Array index {} exceeds maximum allowed limit ({})",
+                                    idx,
+                                    MAX_PKG_ARRAY_INDEX
+                                );
+                            }
                             if idx < arr.len() {
                                 arr[idx] = value;
                             } else {
@@ -349,6 +357,14 @@ pub fn set_value(
                 },
                 PathSegment::Index(idx) => {
                     let idx = *idx;
+                    const MAX_PKG_ARRAY_INDEX: usize = 10_000;
+                    if idx > MAX_PKG_ARRAY_INDEX {
+                        bail!(
+                            "Array index {} exceeds maximum allowed limit ({})",
+                            idx,
+                            MAX_PKG_ARRAY_INDEX
+                        );
+                    }
                     match current {
                         OrderedJsonValue::Array(arr) => {
                             if idx < arr.len() {
@@ -428,6 +444,14 @@ pub fn set_value(
                     let idx = key.parse::<usize>().map_err(|_| {
                         anyhow!("Cannot navigate named property '{}' on array", key)
                     })?;
+                    const MAX_PKG_ARRAY_INDEX: usize = 10_000;
+                    if idx > MAX_PKG_ARRAY_INDEX {
+                        bail!(
+                            "Array index {} exceeds maximum allowed limit ({})",
+                            idx,
+                            MAX_PKG_ARRAY_INDEX
+                        );
+                    }
                     while arr.len() <= idx {
                         arr.push(OrderedJsonValue::Null);
                     }
@@ -460,6 +484,14 @@ pub fn set_value(
             },
             PathSegment::Index(idx) => {
                 let idx = *idx;
+                const MAX_PKG_ARRAY_INDEX: usize = 10_000;
+                if idx > MAX_PKG_ARRAY_INDEX {
+                    bail!(
+                        "Array index {} exceeds maximum allowed limit ({})",
+                        idx,
+                        MAX_PKG_ARRAY_INDEX
+                    );
+                }
                 match current {
                     OrderedJsonValue::Array(arr) => {
                         while arr.len() <= idx {
@@ -1568,5 +1600,25 @@ fn normalize_keywords(map: &mut OrderedJsonMap) {
                 .collect();
             *val = OrderedJsonValue::Array(items);
         }
+    }
+}
+
+#[cfg(test)]
+mod pkg_stability_tests {
+    use super::*;
+
+    #[test]
+    fn set_value_rejects_excessive_array_index_without_oom() {
+        let mut root = OrderedJsonValue::Object(OrderedJsonMap::new());
+        let ok_path = parse_path("items[5]").unwrap();
+        assert!(set_value(&mut root, &ok_path, OrderedJsonValue::String("ok".into())).is_ok());
+
+        let huge_path = parse_path("items[10001]").unwrap();
+        let err = set_value(&mut root, &huge_path, OrderedJsonValue::String("boom".into()))
+            .expect_err("array index above 10000 must be rejected");
+        assert!(
+            err.to_string().contains("maximum"),
+            "unexpected error: {err}"
+        );
     }
 }

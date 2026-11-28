@@ -117,8 +117,25 @@ pub(crate) fn apply(report: &mut AuditReport, old: &LockfileV3, ideal: &Lockfile
         in_range
     };
 
+    #[derive(Eq, PartialEq)]
+    struct QueueItem(NodeId);
+    impl Ord for QueueItem {
+        fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+            // Reversed for min-heap ordering by (depth, arborist_compare, is_new).
+            depth(&other.0 .0)
+                .cmp(&depth(&self.0 .0))
+                .then_with(|| arborist_compare(&other.0 .0, &self.0 .0))
+                .then_with(|| other.0 .1.cmp(&self.0 .1))
+        }
+    }
+    impl PartialOrd for QueueItem {
+        fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+            Some(self.cmp(other))
+        }
+    }
+
     // #queueVulnDependents: every node with an edge into a vulnerable node.
-    let mut queue: Vec<NodeId> = Vec::new();
+    let mut queue: std::collections::BinaryHeap<QueueItem> = std::collections::BinaryHeap::new();
     let vulnerable: HashSet<&str> = report
         .vulnerabilities
         .values()
@@ -129,18 +146,12 @@ pub(crate) fn apply(report: &mut AuditReport, old: &LockfileV3, ideal: &Lockfile
             .iter()
             .any(|n| resolve(&tree, loc, n).is_some_and(|to| vulnerable.contains(to)))
         {
-            queue.push((loc.clone(), false));
+            queue.push(QueueItem((loc.clone(), false)));
         }
     }
 
     let mut seen: HashSet<NodeId> = HashSet::new();
-    while !queue.is_empty() {
-        queue.sort_by(|a, b| {
-            depth(&a.0)
-                .cmp(&depth(&b.0))
-                .then_with(|| arborist_compare(&a.0, &b.0))
-        });
-        let id = queue.remove(0);
+    while let Some(QueueItem(id)) = queue.pop() {
         let current = tree.get(&id.0).is_some_and(|(new, _)| *new == id.1);
         if !current || !seen.insert(id.clone()) {
             continue;
@@ -162,7 +173,7 @@ pub(crate) fn apply(report: &mut AuditReport, old: &LockfileV3, ideal: &Lockfile
                 Some(next) => {
                     detached.insert(to.clone());
                     tree.insert(to.clone(), (true, next));
-                    queue.push((to, true));
+                    queue.push(QueueItem((to, true)));
                 }
                 None => {
                     detached.insert(to.clone());

@@ -476,15 +476,21 @@ struct NodeWriterWorker {
 
 impl NodeWriterWorker {
     fn spawn(uv_size: &str, concurrency: &str) -> Result<Self, std::io::Error> {
-        let mut child = Command::new("node")
-            .env("UV_THREADPOOL_SIZE", uv_size)
+        let mut cmd = Command::new("node");
+        cmd.env("UV_THREADPOOL_SIZE", uv_size)
             .env("RNPM_NODE_WRITER_CONCURRENCY", concurrency)
             .arg("-e")
             .arg(NODE_WRITER_SCRIPT)
             .stdin(Stdio::piped())
             .stdout(Stdio::inherit())
-            .stderr(Stdio::inherit())
-            .spawn()?;
+            .stderr(Stdio::inherit());
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            cmd.creation_flags(CREATE_NO_WINDOW);
+        }
+        let mut child = cmd.spawn()?;
 
         let mut stdin = std::io::BufWriter::with_capacity(512 * 1024, child.stdin.take().unwrap());
         let (tx, rx): (SyncSender<NodeWriterMsg>, Receiver<NodeWriterMsg>) = sync_channel(1024);
@@ -917,12 +923,15 @@ impl RustWriterPool {
         })
     }
 
+    /// Obtains a cloned sender for worker threads, or `None` if input was already closed.
+    pub fn try_sender(&self) -> Option<RustWriterSender> {
+        self.sender.clone()
+    }
+
     /// Obtains a cloned sender for worker threads.
     pub fn sender(&self) -> RustWriterSender {
-        self.sender
-            .as_ref()
+        self.try_sender()
             .expect("RustWriterPool sender already closed")
-            .clone()
     }
 
     /// Signals workers that no more tasks will be enqueued, allowing all queued tasks to drain.
@@ -1014,10 +1023,23 @@ impl AsyncFileWriter {
 
     /// Uses the Rust writer unless `RNPM_WRITER=node` explicitly selects Node.js.
     pub fn spawn() -> Result<Self, std::io::Error> {
+        Self::spawn_with_config(16, 4096)
+    }
+
+    /// Spawns the configured writer with explicit worker count and queue capacity.
+    pub fn spawn_with_config(workers: usize, queue_capacity: usize) -> Result<Self, std::io::Error> {
         if std::env::var("RNPM_WRITER").is_ok_and(|pref| pref.eq_ignore_ascii_case("node")) {
             return NodeWriter::spawn().map(Self::Node);
         }
-        RustWriterPool::spawn(16, 4096).map(Self::Rust)
+        RustWriterPool::spawn(workers.max(1), queue_capacity.max(64)).map(Self::Rust)
+    }
+
+    /// Obtains a cloned sender for distributing write tasks, or `None` if closed.
+    pub fn try_sender(&self) -> Option<AsyncFileWriterSender> {
+        match self {
+            Self::Node(nw) => Some(AsyncFileWriterSender::Node(nw.sender())),
+            Self::Rust(rw) => rw.try_sender().map(AsyncFileWriterSender::Rust),
+        }
     }
 
     /// Obtains a cloned sender for distributing write tasks.

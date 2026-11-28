@@ -1233,6 +1233,13 @@ async fn run_check(kind: DoctorCheckKind, env: &DoctorEnv) -> Result<String, Che
             while let Some(dir) = stack.pop() {
                 for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
                     let p = entry.path();
+                    let is_link = std::fs::symlink_metadata(&p)
+                        .map(|m| m.file_type().is_symlink())
+                        .unwrap_or(false)
+                        || rnpm_fs::is_junction(&p).unwrap_or(false);
+                    if is_link {
+                        continue;
+                    }
                     if p.is_dir() {
                         stack.push(p);
                     } else {

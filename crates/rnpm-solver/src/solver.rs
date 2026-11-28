@@ -2692,6 +2692,7 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
                 }
 
                 let child_pkg_name = dep_spec.package_name.clone();
+                self.provider.prefetch_tarball_hint(chosen_version);
                 self.graph.add_edge(DependencyEdge {
                     from_location: self.strings.get(task.parent_location).to_string(),
                     to_location: target_loc.clone(),
@@ -3146,8 +3147,11 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
             nested_buf.clear();
             nested_buf.push_str(&loc);
             nested_buf.push_str("/node_modules/");
-            for key in &reached {
-                if key.starts_with(nested_buf.as_str()) {
+            for (key, _) in self.graph.nodes.range(nested_buf.clone()..) {
+                if !key.starts_with(nested_buf.as_str()) {
+                    break;
+                }
+                if reached.contains(key) {
                     work.push_back(key.clone());
                 }
             }
@@ -4007,6 +4011,7 @@ impl<'a, P: PackageMetadataProvider> Solver<'a, P> {
             ) else {
                 continue;
             };
+            self.provider.prefetch_tarball_hint(version);
             let bundled: Vec<&str> = match version
                 .extra
                 .get("bundleDependencies")

@@ -816,9 +816,60 @@ pub fn is_sensitive_credential_key(key: &str) -> bool {
     false
 }
 
+#[inline]
+fn contains_ascii_case_insensitive(haystack: &[u8], needle_lower: &[u8]) -> bool {
+    let n = needle_lower.len();
+    if n == 0 || haystack.len() < n {
+        return false;
+    }
+    let first = needle_lower[0];
+    let limit = haystack.len() - n;
+    let mut i = 0;
+    while i <= limit {
+        if haystack[i].to_ascii_lowercase() == first {
+            let mut matched = true;
+            let mut j = 1;
+            while j < n {
+                if haystack[i + j].to_ascii_lowercase() != needle_lower[j] {
+                    matched = false;
+                    break;
+                }
+                j += 1;
+            }
+            if matched {
+                return true;
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
+fn may_contain_secret(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    const NEEDLES: &[&[u8]] = &[
+        b"bearer ",
+        b"npm_",
+        b"ghp_",
+        b"github_pat_",
+        b"_auth",
+        b"token",
+        b"passw",
+        b"secret",
+        b"key",
+        b"jwt",
+    ];
+    NEEDLES
+        .iter()
+        .any(|needle| contains_ascii_case_insensitive(bytes, needle))
+}
+
 /// Redact sensitive tokens and passwords from stdout, stderr, or error traces.
 /// Section 4.2: Logging & Error Scrubbing.
 pub fn scrub_text(text: &str) -> String {
+    if !may_contain_secret(text) {
+        return text.to_string();
+    }
     let mut result = text.to_string();
 
     // 1. Redact Bearer tokens
@@ -1745,13 +1796,13 @@ pub fn build_lifecycle_env_with_config(
     }
 
     let mut current = ctx.package_dir.as_path();
-    while let Some(parent) = current.parent() {
+    while current != ctx.project_root {
+        let Some(parent) = current.parent() else {
+            break;
+        };
         let parent_bin = parent.join("node_modules").join(".bin");
         if parent_bin.exists() && !path_entries.contains(&parent_bin) {
             path_entries.push(parent_bin);
-        }
-        if parent == ctx.project_root {
-            break;
         }
         current = parent;
     }
@@ -3829,9 +3880,49 @@ fn build_binary_command_windows(
                 return cmd;
             }
         }
+        use std::os::windows::process::CommandExt;
+        let quote_cmd_arg = |arg: &str| -> String {
+            if arg.is_empty()
+                || arg
+                    .bytes()
+                    .any(|b| matches!(b, b' ' | b'\t' | b'"' | b'&' | b'|' | b'<' | b'>' | b'^' | b'(' | b')'))
+            {
+                let mut out = String::with_capacity(arg.len() + 2);
+                out.push('"');
+                let mut backslashes = 0usize;
+                for ch in arg.chars() {
+                    if ch == '\\' {
+                        backslashes += 1;
+                    } else if ch == '"' {
+                        for _ in 0..(backslashes * 2 + 1) {
+                            out.push('\\');
+                        }
+                        out.push('"');
+                        backslashes = 0;
+                    } else {
+                        for _ in 0..backslashes {
+                            out.push('\\');
+                        }
+                        backslashes = 0;
+                        out.push(ch);
+                    }
+                }
+                for _ in 0..(backslashes * 2) {
+                    out.push('\\');
+                }
+                out.push('"');
+                out
+            } else {
+                arg.to_string()
+            }
+        };
+        let mut cmdline = quote_cmd_arg(&binary_path.to_string_lossy());
+        for arg in args {
+            cmdline.push(' ');
+            cmdline.push_str(&quote_cmd_arg(arg));
+        }
         let mut c = Command::new("cmd.exe");
-        c.arg("/c").arg(binary_path);
-        c.args(args);
+        c.raw_arg(format!("/d /s /c \"{cmdline}\""));
         return c;
     }
     if ext.eq_ignore_ascii_case("ps1") {
@@ -4148,7 +4239,7 @@ where
                 g.terminate(exit_code);
             }
             cancel_guard.completed = true;
-            let _ = tokio::time::timeout(std::time::Duration::from_millis(500), &mut wait_handle).await;
+            await_terminated_task(&mut wait_handle).await;
             return Err(anyhow::Error::from(ScriptExitError {
                 exit_code: exit_code as i32,
                 message: format!("Process execution for {bin_display} terminated by {sig}"),
@@ -4160,7 +4251,7 @@ where
                 g.terminate(143);
             }
             cancel_guard.completed = true;
-            let _ = tokio::time::timeout(std::time::Duration::from_millis(500), &mut wait_handle).await;
+            await_terminated_task(&mut wait_handle).await;
             return Err(anyhow::Error::from(ScriptExitError {
                 exit_code: 143,
                 message: format!("Process execution for {bin_display} aborted by signal"),

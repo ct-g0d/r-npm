@@ -389,14 +389,15 @@ fn collect_entries(current: &Path, list: &mut Vec<String>) {
             } else if p.is_file() {
                 if let Ok(text) = std::fs::read_to_string(&p) {
                     let mut live = std::collections::BTreeMap::new();
-                    let records: Vec<&str> =
-                        if serde_json::from_str::<serde_json::Value>(&text).is_ok() {
-                            vec![&text]
-                        } else {
-                            text.lines()
-                                .filter_map(|line| line.split_once('\t').map(|(_, json)| json))
-                                .collect()
-                        };
+                    let records: Vec<&str> = if text.trim_start().starts_with('{')
+                        && serde_json::from_str::<serde_json::Value>(&text).is_ok()
+                    {
+                        vec![&text]
+                    } else {
+                        text.lines()
+                            .filter_map(|line| line.split_once('\t').map(|(_, json)| json))
+                            .collect()
+                    };
                     for record in records {
                         if let Ok(value) = serde_json::from_str::<serde_json::Value>(record) {
                             if let Some(key) = value.get("key").and_then(|v| v.as_str()) {

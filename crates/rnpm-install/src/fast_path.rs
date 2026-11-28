@@ -1232,49 +1232,51 @@ pub fn validate_hidden_lockfile_simple(project_dir: &Path) -> bool {
     validate_hidden_lockfile(project_dir, None)
 }
 
-/// Loads package packs in parallel across workers.
+/// Loads package packs in parallel across workers without deep-cloning pack indices.
 pub(crate) fn parallel_load_packs(
     pack_store: &Arc<PackStore>,
     loc_base_dir: &Path,
     packages_to_process: &[crate::link::CiPackage],
-) -> (Vec<(String, PathBuf, PackagePack)>, bool) {
+    verify_cas: bool,
+) -> (Vec<(String, PathBuf, Arc<PackagePack>)>, bool) {
     let total_pkgs = packages_to_process.len();
     let num_workers = 16.min(total_pkgs);
     let next_idx = std::sync::atomic::AtomicUsize::new(0);
     let load_failed = std::sync::atomic::AtomicBool::new(false);
     let pack_store = Arc::clone(pack_store);
 
+    type LoadedPackItem = (usize, String, PathBuf, Arc<PackagePack>);
     let mut loaded_packs = Vec::with_capacity(total_pkgs);
     let load_success = std::thread::scope(|scope| {
         let mut handles = Vec::with_capacity(num_workers);
         for _ in 0..num_workers {
-            handles.push(scope.spawn(|| -> Result<Vec<(usize, String, PathBuf, PackagePack)>, ()> {
-                let mut local = Vec::new();
-                while !load_failed.load(std::sync::atomic::Ordering::Relaxed) {
-                    let idx = next_idx.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    if idx >= total_pkgs {
-                        break;
+            handles.push(scope.spawn(|| -> Result<Vec<LoadedPackItem>, ()> {
+                    let mut local = Vec::new();
+                    while !load_failed.load(std::sync::atomic::Ordering::Relaxed) {
+                        let idx = next_idx.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        if idx >= total_pkgs {
+                            break;
+                        }
+                        let (pkg_key, _, integrity_str, _, _, _) = &packages_to_process[idx];
+                        let pkg_target = loc_base_dir.join(pkg_key);
+                        match pack_store.get_package_pack_uncached(integrity_str, verify_cas) {
+                            Ok(Some(pack)) => {
+                                local.push((idx, pkg_key.clone(), pkg_target, pack));
+                            }
+                            Err(e) => {
+                                warn!("get_package_pack_uncached failed for {pkg_key}: {e}. Falling back to standard pipeline.");
+                                load_failed.store(true, std::sync::atomic::Ordering::Relaxed);
+                                return Err(());
+                            }
+                            Ok(None) => {
+                                warn!("Package pack missing for {pkg_key}. Falling back to standard pipeline.");
+                                load_failed.store(true, std::sync::atomic::Ordering::Relaxed);
+                                return Err(());
+                            }
+                        }
                     }
-                    let (pkg_key, _, integrity_str, _, _, _) = &packages_to_process[idx];
-                    let pkg_target = loc_base_dir.join(pkg_key);
-                    match pack_store.get_package_pack(integrity_str) {
-                        Ok(Some(pack)) => {
-                            local.push((idx, pkg_key.clone(), pkg_target, pack));
-                        }
-                        Err(e) => {
-                            warn!("get_package_pack failed for {pkg_key}: {e}. Falling back to standard pipeline.");
-                            load_failed.store(true, std::sync::atomic::Ordering::Relaxed);
-                            return Err(());
-                        }
-                        Ok(None) => {
-                            warn!("Package pack missing for {pkg_key}. Falling back to standard pipeline.");
-                            load_failed.store(true, std::sync::atomic::Ordering::Relaxed);
-                            return Err(());
-                        }
-                    }
-                }
-                Ok(local)
-            }));
+                    Ok(local)
+                }));
         }
 
         let mut all_results = Vec::with_capacity(total_pkgs);

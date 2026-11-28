@@ -17,8 +17,21 @@ fn generate_token_ids(tokens: &mut [serde_json::Value], min_length: usize) {
     for i in 0..tokens.len() {
         let key = &keys[i];
         let mut id = key.clone();
-        for len in min_length..key.len() {
-            let prefix = &key[..len];
+        let char_boundaries: Vec<usize> = key
+            .char_indices()
+            .skip(1)
+            .map(|(byte_idx, _)| byte_idx)
+            .chain(std::iter::once(key.len()))
+            .collect();
+        for (char_count_minus_one, &byte_end) in char_boundaries.iter().enumerate() {
+            let char_len = char_count_minus_one + 1;
+            if char_len < min_length {
+                continue;
+            }
+            if byte_end == key.len() {
+                break;
+            }
+            let prefix = &key[..byte_end];
             let has_other_match = keys
                 .iter()
                 .enumerate()
@@ -92,11 +105,7 @@ pub(crate) async fn run(
                     let id = t.get("id").and_then(|v| v.as_str()).unwrap_or("");
                     let name = t.get("name").and_then(|v| v.as_str()).unwrap_or("");
                     let created = t.get("created").and_then(|v| v.as_str()).unwrap_or("");
-                    let created_date = if created.len() >= 10 {
-                        &created[..10]
-                    } else {
-                        created
-                    };
+                    let created_date: String = created.chars().take(10).collect();
                     println!("Token {tok}… with id {id} name {name} created {created_date}");
                     if let Some(cidr) = t.get("cidr_whitelist").and_then(|v| v.as_array()) {
                         let cidr_strs: Vec<_> = cidr.iter().filter_map(|c| c.as_str()).collect();

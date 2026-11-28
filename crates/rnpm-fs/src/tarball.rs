@@ -2251,11 +2251,10 @@ fn walk_dir_collect(
         } else {
             current_dir.join(".gitignore")
         };
-        let prefix = current_dir
-            .strip_prefix(root_dir)
-            .unwrap()
-            .to_string_lossy()
-            .replace('\\', "/");
+        let Ok(rel_dir) = current_dir.strip_prefix(root_dir) else {
+            return Ok(());
+        };
+        let prefix = rel_dir.to_string_lossy().replace('\\', "/");
         ignore_scopes.push((format!("{prefix}/"), parse_ignore_patterns(&local)?));
     }
     let entries = match fs::read_dir(current_dir) {
@@ -2502,50 +2501,64 @@ fn match_glob_or_parent(pattern: &str, text: &str) -> bool {
 }
 
 fn expand_braces(pattern: &str) -> Vec<String> {
-    let Some(open) = pattern.find('{') else {
-        return vec![pattern.to_string()];
-    };
-    let mut depth = 0;
-    let mut close = None;
-    for (i, c) in pattern[open..].char_indices() {
-        match c {
-            '{' => depth += 1,
-            '}' => {
-                depth -= 1;
-                if depth == 0 {
-                    close = Some(open + i);
-                    break;
+    const MAX_BRACE_EXPANSIONS: usize = 1024;
+    let mut results = vec![pattern.to_string()];
+    let mut i = 0;
+    while i < results.len() {
+        let current = results[i].clone();
+        let Some(open) = current.find('{') else {
+            i += 1;
+            continue;
+        };
+        let mut depth = 0usize;
+        let mut close = None;
+        for (idx, c) in current[open..].char_indices() {
+            match c {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        close = Some(open + idx);
+                        break;
+                    }
                 }
+                _ => {}
             }
-            _ => {}
+        }
+        let Some(close) = close else {
+            i += 1;
+            continue;
+        };
+        let inner = &current[open + 1..close];
+        let mut parts = Vec::new();
+        let (mut d, mut start) = (0usize, 0usize);
+        for (idx, c) in inner.char_indices() {
+            match c {
+                '{' => d += 1,
+                '}' => d -= 1,
+                ',' if d == 0 => {
+                    parts.push(&inner[start..idx]);
+                    start = idx + 1;
+                }
+                _ => {}
+            }
+        }
+        parts.push(&inner[start..]);
+        if parts.len() < 2 {
+            i += 1;
+            continue;
+        }
+        let (head, tail) = (&current[..open], &current[close + 1..]);
+        if results.len() - 1 + parts.len() > MAX_BRACE_EXPANSIONS {
+            i += 1;
+            continue;
+        }
+        results.remove(i);
+        for (offset, part) in parts.into_iter().enumerate() {
+            results.insert(i + offset, format!("{head}{part}{tail}"));
         }
     }
-    let Some(close) = close else {
-        return vec![pattern.to_string()];
-    };
-    let inner = &pattern[open + 1..close];
-    let mut parts = Vec::new();
-    let (mut depth, mut start) = (0, 0);
-    for (i, c) in inner.char_indices() {
-        match c {
-            '{' => depth += 1,
-            '}' => depth -= 1,
-            ',' if depth == 0 => {
-                parts.push(&inner[start..i]);
-                start = i + 1;
-            }
-            _ => {}
-        }
-    }
-    parts.push(&inner[start..]);
-    if parts.len() < 2 {
-        return vec![pattern.to_string()];
-    }
-    let (head, tail) = (&pattern[..open], &pattern[close + 1..]);
-    parts
-        .into_iter()
-        .flat_map(|part| expand_braces(&format!("{head}{part}{tail}")))
-        .collect()
+    results
 }
 
 fn match_segments(pat: &[&str], txt: &[&str]) -> bool {
@@ -2569,39 +2582,112 @@ fn match_segment(pattern: &str, text: &str) -> bool {
     if t.first() == Some(&'.') && matches!(p.first(), Some('*') | Some('?') | Some('[')) {
         return false;
     }
-    fn go(p: &[char], t: &[char]) -> bool {
-        match p.first() {
-            None => t.is_empty(),
-            Some('*') => (0..=t.len()).any(|i| go(&p[1..], &t[i..])),
-            Some('?') => !t.is_empty() && go(&p[1..], &t[1..]),
-            Some('[') => {
-                let Some(end) = p.iter().skip(1).position(|c| *c == ']').map(|i| i + 1) else {
-                    return !t.is_empty() && t[0] == '[' && go(&p[1..], &t[1..]);
-                };
-                let Some(&c) = t.first() else { return false };
-                let mut class = &p[1..end];
-                let negate = matches!(class.first(), Some('!') | Some('^'));
-                if negate {
-                    class = &class[1..];
+
+    enum PatTok {
+        Star,
+        Any,
+        Lit(char),
+        Class { negate: bool, ranges: Vec<(char, char)> },
+    }
+
+    let mut tokens = Vec::with_capacity(p.len());
+    let mut pi = 0usize;
+    while pi < p.len() {
+        match p[pi] {
+            '*' => {
+                if !matches!(tokens.last(), Some(PatTok::Star)) {
+                    tokens.push(PatTok::Star);
                 }
-                let mut hit = false;
-                let mut i = 0;
-                while i < class.len() {
-                    if i + 2 < class.len() && class[i + 1] == '-' {
-                        hit |= class[i] <= c && c <= class[i + 2];
-                        i += 3;
-                    } else {
-                        hit |= class[i] == c;
-                        i += 1;
-                    }
-                }
-                hit != negate && go(&p[end + 1..], &t[1..])
+                pi += 1;
             }
-            Some('\\') if p.len() > 1 => !t.is_empty() && t[0] == p[1] && go(&p[2..], &t[1..]),
-            Some(&c) => !t.is_empty() && t[0] == c && go(&p[1..], &t[1..]),
+            '?' => {
+                tokens.push(PatTok::Any);
+                pi += 1;
+            }
+            '[' => {
+                if let Some(end_rel) = p[pi + 1..].iter().position(|&c| c == ']') {
+                    let end = pi + 1 + end_rel;
+                    let mut class = &p[pi + 1..end];
+                    let negate = matches!(class.first(), Some('!') | Some('^'));
+                    if negate {
+                        class = &class[1..];
+                    }
+                    let mut ranges = Vec::new();
+                    let mut ci = 0usize;
+                    while ci < class.len() {
+                        if ci + 2 < class.len() && class[ci + 1] == '-' {
+                            ranges.push((class[ci], class[ci + 2]));
+                            ci += 3;
+                        } else {
+                            ranges.push((class[ci], class[ci]));
+                            ci += 1;
+                        }
+                    }
+                    tokens.push(PatTok::Class { negate, ranges });
+                    pi = end + 1;
+                } else {
+                    tokens.push(PatTok::Lit('['));
+                    pi += 1;
+                }
+            }
+            '\\' if pi + 1 < p.len() => {
+                tokens.push(PatTok::Lit(p[pi + 1]));
+                pi += 2;
+            }
+            c => {
+                tokens.push(PatTok::Lit(c));
+                pi += 1;
+            }
         }
     }
-    go(&p, &t)
+
+    let n = t.len();
+    let mut dp = vec![false; n + 1];
+    let mut next = vec![false; n + 1];
+    dp[0] = true;
+
+    for tok in &tokens {
+        next.fill(false);
+        match tok {
+            PatTok::Star => {
+                let mut seen = false;
+                for j in 0..=n {
+                    if dp[j] {
+                        seen = true;
+                    }
+                    next[j] = seen;
+                }
+            }
+            PatTok::Any => {
+                for j in 0..n {
+                    if dp[j] {
+                        next[j + 1] = true;
+                    }
+                }
+            }
+            PatTok::Lit(expected) => {
+                for j in 0..n {
+                    if dp[j] && t[j] == *expected {
+                        next[j + 1] = true;
+                    }
+                }
+            }
+            PatTok::Class { negate, ranges } => {
+                for j in 0..n {
+                    if dp[j] {
+                        let c = t[j];
+                        let hit = ranges.iter().any(|&(lo, hi)| lo <= c && c <= hi);
+                        if hit != *negate {
+                            next[j + 1] = true;
+                        }
+                    }
+                }
+            }
+        }
+        std::mem::swap(&mut dp, &mut next);
+    }
+
+    dp[n]
 }
 
 /// Sort helper for npm pack files:
@@ -3058,5 +3144,27 @@ mod gzip_tests {
                 .expect("decompression must succeed");
             assert_eq!(decompressed2, input);
         }
+    }
+
+    #[test]
+    fn test_glob_match_segment_no_exponential_backtracking_and_brace_cap() {
+        let start = std::time::Instant::now();
+        let pattern = "a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*b";
+        let text = "a".repeat(64);
+        assert!(!super::match_segment(pattern, &text));
+        assert!(super::match_segment("a*a*b", "aaaaab"));
+        assert!(
+            start.elapsed() < std::time::Duration::from_millis(200),
+            "multi-star glob took too long: {:?}",
+            start.elapsed()
+        );
+
+        let nested_braces = "{a,b}".repeat(12); // 2^12 = 4096 uncapped
+        let expanded = super::expand_braces(&nested_braces);
+        assert!(
+            expanded.len() <= 1024,
+            "brace expansion must be capped at 1024, got {}",
+            expanded.len()
+        );
     }
 }

@@ -988,7 +988,7 @@ impl crate::Installer {
             if rnpm_fs::junction::is_junction(path).unwrap_or(false) {
                 let _ = rnpm_fs::junction::remove_junction(path);
             } else if path.is_dir() {
-                let _ = std::fs::remove_dir_all(path);
+                let _ = rnpm_fs::remove_dir_all_safe(path);
             } else {
                 let _ = std::fs::remove_file(path);
             }
