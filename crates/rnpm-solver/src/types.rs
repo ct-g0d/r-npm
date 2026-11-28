@@ -144,6 +144,11 @@ pub trait PackageMetadataProvider: Send + Sync {
         self.prefetch_packages(&names);
     }
 
+    /// Hint that a specific resolved version is likely to be materialized, allowing
+    /// network-backed providers to pipeline tarball downloads alongside subsequent
+    /// metadata waves. Pure in-memory or offline providers ignore this.
+    fn prefetch_tarball_hint(&self, _version: &PackageVersionMetadata) {}
+
     /// Whether this provider benefits from multi-threaded closure prefetching (e.g. network/disk).
     /// Pure in-memory providers can return `false` to avoid spawning prefetch worker threads.
     #[doc(hidden)]

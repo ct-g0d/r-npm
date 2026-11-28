@@ -1104,8 +1104,8 @@ pub(crate) enum Commands {
         /// Specific package name(s) or specs to filter the tree
         packages: Vec<String>,
 
-        /// Maximum depth to recurse (default 0 for direct dependencies)
-        #[arg(long)]
+        /// Maximum depth to recurse (default 0 for direct dependencies; accepts `Infinity`)
+        #[arg(long, value_parser = parse_list_depth)]
         depth: Option<usize>,
 
         /// Show all dependencies regardless of depth
@@ -9731,13 +9731,13 @@ fn try_parse_fast_command_with_overrides(
                     if depth.is_some() {
                         return None;
                     }
-                    depth = Some(d_str.parse::<usize>().ok()?);
+                    depth = Some(parse_list_depth(d_str).ok()?);
                 } else if tok == "--depth" {
                     if depth.is_some() {
                         return None;
                     }
                     i += 1;
-                    depth = Some(rest.get(i)?.parse::<usize>().ok()?);
+                    depth = Some(parse_list_depth(rest.get(i)?).ok()?);
                 } else if let Some(val) = tok.strip_prefix("--omit=") {
                     if val.is_empty() {
                         return None;
@@ -10615,18 +10615,15 @@ fn try_parse_fast_command_with_overrides(
 }
 
 fn init_cli_request_context(command_name: &str, config: &rnpm_config::Config) {
-    let mut agent = config
-        .npmrc
-        .settings
-        .get("user-agent")
-        .cloned()
-        .unwrap_or_else(crate::node_info::npm_user_agent);
-    if config.get_bool("workspaces") == Some(true)
-        || config.get("workspace").is_some_and(|v| !v.is_empty())
-    {
-        agent = agent.replace("workspaces/false", "workspaces/true");
-    }
-    rnpm_registry::client::set_cli_request_context(command_name.to_string(), agent);
+    let explicit_ua = config.npmrc.settings.get("user-agent").cloned();
+    let workspaces = config.get_bool("workspaces") == Some(true)
+        || config.get("workspace").is_some_and(|v| !v.is_empty());
+    rnpm_registry::client::set_cli_request_context_lazy(
+        command_name.to_string(),
+        explicit_ua,
+        crate::node_info::npm_user_agent,
+        workspaces,
+    );
 }
 
 fn main() {
@@ -11009,9 +11006,28 @@ fn main() {
             } => {
                 packages.is_empty()
                     && (*offline
-                        || (!*force && current_dir.join("node_modules/.package-lock.json").is_file()))
+                        || (!*force
+                            && (current_dir.join("node_modules/.package-lock.json").is_file()
+                                || current_dir.join("package-lock.json").is_file()
+                                || current_dir.join("npm-shrinkwrap.json").is_file())))
             }
-            Commands::Ci { offline, .. } => *offline,
+            Commands::Ci { .. } => true,
+            Commands::Ping { .. }
+            | Commands::Whoami { .. }
+            | Commands::View { .. }
+            | Commands::Search { .. }
+            | Commands::Audit { .. }
+            | Commands::Outdated { .. }
+            | Commands::Token { .. }
+            | Commands::DistTag { .. }
+            | Commands::Owner { .. }
+            | Commands::Access { .. }
+            | Commands::Org { .. }
+            | Commands::Team { .. }
+            | Commands::Profile { .. }
+            | Commands::Star { .. }
+            | Commands::Stars { .. }
+            | Commands::Unstar { .. } => true,
             _ => false,
         }
     };
@@ -11054,6 +11070,31 @@ fn main() {
     let _ = std::io::Write::flush(&mut std::io::stderr());
     std::mem::forget(rt);
     std::process::exit(0);
+}
+
+fn parse_list_depth(value: &str) -> Result<usize, String> {
+    let trimmed = value.trim();
+    if trimmed.eq_ignore_ascii_case("infinity") || trimmed.eq_ignore_ascii_case("inf") {
+        return Ok(usize::MAX);
+    }
+    trimmed
+        .parse::<usize>()
+        .map_err(|e| format!("invalid value '{value}' for '--depth <DEPTH>': {e}"))
+}
+
+#[cfg(test)]
+mod list_depth_tests {
+    use super::parse_list_depth;
+
+    #[test]
+    fn parse_list_depth_accepts_infinity_and_numeric_values() {
+        assert_eq!(parse_list_depth("Infinity"), Ok(usize::MAX));
+        assert_eq!(parse_list_depth("infinity"), Ok(usize::MAX));
+        assert_eq!(parse_list_depth("inf"), Ok(usize::MAX));
+        assert_eq!(parse_list_depth("0"), Ok(0));
+        assert_eq!(parse_list_depth("3"), Ok(3));
+        assert!(parse_list_depth("not-a-number").is_err());
+    }
 }
 
 #[cfg(test)]

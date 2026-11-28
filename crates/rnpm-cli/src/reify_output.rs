@@ -261,15 +261,16 @@ pub(crate) fn print_with_lockfile(
     let (added, changed, removed) = (add.len(), change.len(), remove.len());
 
     if opts.json {
-        let mut summary = serde_json::Map::new();
-        summary.insert("add".into(), Value::Array(add));
-        summary.insert("added".into(), added.into());
-        summary.insert("audited".into(), audited.into());
-        summary.insert("change".into(), Value::Array(change));
-        summary.insert("changed".into(), changed.into());
-        summary.insert("funding".into(), funding.into());
-        summary.insert("remove".into(), Value::Array(remove));
-        summary.insert("removed".into(), removed.into());
+        use rnpm_core::ordered_json::{OrderedJsonMap, OrderedJsonValue};
+        let mut summary = OrderedJsonMap::new();
+        summary.insert("add".into(), Value::Array(add).into());
+        summary.insert("added".into(), Value::from(added).into());
+        summary.insert("audited".into(), Value::from(audited).into());
+        summary.insert("change".into(), Value::Array(change).into());
+        summary.insert("changed".into(), Value::from(changed).into());
+        summary.insert("funding".into(), Value::from(funding).into());
+        summary.insert("remove".into(), Value::Array(remove).into());
+        summary.insert("removed".into(), Value::from(removed).into());
         if let Some(audit) = audit {
             summary.insert(
                 "audit".into(),
@@ -277,10 +278,14 @@ pub(crate) fn print_with_lockfile(
                     serde_json::to_value(audit)?
                 } else {
                     serde_json::to_value(&audit.metadata)?
-                },
+                }
+                .into(),
             );
         }
-        println!("{}", serde_json::to_string_pretty(&Value::Object(summary))?);
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&OrderedJsonValue::Object(summary))?
+        );
         return Ok(());
     }
 

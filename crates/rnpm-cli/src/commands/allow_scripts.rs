@@ -15,9 +15,15 @@ fn installed_install_script_packages(current_dir: &Path) -> Result<BTreeMap<Stri
         root: &Path,
         lock: Option<&serde_json::Value>,
         found: &mut BTreeMap<String, PathBuf>,
+        visited: &mut std::collections::HashSet<PathBuf>,
     ) -> Result<()> {
         if !dir.is_dir() {
             return Ok(());
+        }
+        if let Ok(canon) = std::fs::canonicalize(dir) {
+            if !visited.insert(canon) {
+                return Ok(());
+            }
         }
         for entry in std::fs::read_dir(dir)?.flatten() {
             let path = entry.path();
@@ -79,16 +85,23 @@ fn installed_install_script_packages(current_dir: &Path) -> Result<BTreeMap<Stri
                 }
                 let nested = path.join("node_modules");
                 if nested.is_dir() {
-                    walk(&nested, root, lock, found)?;
+                    walk(&nested, root, lock, found, visited)?;
                 }
             } else {
-                walk(&path, root, lock, found)?;
+                walk(&path, root, lock, found, visited)?;
             }
         }
         Ok(())
     }
 
-    walk(&node_modules, current_dir, lock_value.as_ref(), &mut found)?;
+    let mut visited = std::collections::HashSet::new();
+    walk(
+        &node_modules,
+        current_dir,
+        lock_value.as_ref(),
+        &mut found,
+        &mut visited,
+    )?;
     Ok(found)
 }
 

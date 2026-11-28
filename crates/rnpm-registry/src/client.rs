@@ -73,12 +73,67 @@ pub const NPM_INSTALL_V1_JSON: &str = "application/vnd.npm.install-v1+json";
 pub const NPM_INSTALL_ACCEPT: &str =
     "application/vnd.npm.install-v1+json; q=1.0, application/json; q=0.8";
 
-static CLI_REQUEST_CONTEXT: std::sync::OnceLock<(String, String)> = std::sync::OnceLock::new();
+enum CliUserAgentSource {
+    Explicit(String),
+    Lazy {
+        resolver: fn() -> String,
+        workspaces: bool,
+        resolved: std::sync::OnceLock<String>,
+    },
+}
+
+impl CliUserAgentSource {
+    fn as_str(&self) -> &str {
+        match self {
+            Self::Explicit(s) => s.as_str(),
+            Self::Lazy {
+                resolver,
+                workspaces,
+                resolved,
+            } => resolved
+                .get_or_init(|| {
+                    let mut agent = resolver();
+                    if *workspaces {
+                        agent = agent.replace("workspaces/false", "workspaces/true");
+                    }
+                    agent
+                })
+                .as_str(),
+        }
+    }
+}
+
+static CLI_REQUEST_CONTEXT: std::sync::OnceLock<(String, CliUserAgentSource)> =
+    std::sync::OnceLock::new();
 
 /// Install the CLI's canonical command and expanded npm user agent once per
 /// invocation. Library callers retain their configured request identity.
 pub fn set_cli_request_context(command: String, user_agent: String) {
-    let _ = CLI_REQUEST_CONTEXT.set((command, user_agent));
+    let _ = CLI_REQUEST_CONTEXT.set((command, CliUserAgentSource::Explicit(user_agent)));
+}
+
+/// Install the CLI's canonical command with a lazy user-agent resolver so commands
+/// that never hit the network avoid probing `node.exe` at startup.
+pub fn set_cli_request_context_lazy(
+    command: String,
+    explicit_user_agent: Option<String>,
+    resolver: fn() -> String,
+    workspaces: bool,
+) {
+    let source = match explicit_user_agent {
+        Some(mut ua) => {
+            if workspaces {
+                ua = ua.replace("workspaces/false", "workspaces/true");
+            }
+            CliUserAgentSource::Explicit(ua)
+        }
+        None => CliUserAgentSource::Lazy {
+            resolver,
+            workspaces,
+            resolved: std::sync::OnceLock::new(),
+        },
+    };
+    let _ = CLI_REQUEST_CONTEXT.set((command, source));
 }
 
 fn packument_cache_metadata(headers: &HeaderMap) -> serde_json::Value {
@@ -378,10 +433,10 @@ fn track_http_request(method: &Method, url: &Url) {
 }
 
 #[inline]
-fn has_proxy_env_vars() -> bool {
+fn has_http_proxy_env_vars() -> bool {
     #[cfg(windows)]
     {
-        const VARS: &[&str] = &["HTTP_PROXY", "HTTPS_PROXY", "PROXY"];
+        const VARS: &[&str] = &["HTTP_PROXY", "PROXY"];
         VARS.iter()
             .any(|name| std::env::var_os(name).is_some_and(|v| !v.is_empty()))
     }
@@ -389,11 +444,8 @@ fn has_proxy_env_vars() -> bool {
     {
         std::env::vars_os().any(|(k, v)| {
             !v.is_empty()
-                && k.to_str().is_some_and(|s| {
-                    s.eq_ignore_ascii_case("http_proxy")
-                        || s.eq_ignore_ascii_case("https_proxy")
-                        || s.eq_ignore_ascii_case("proxy")
-                })
+                && k.to_str()
+                    .is_some_and(|s| s.eq_ignore_ascii_case("http_proxy") || s.eq_ignore_ascii_case("proxy"))
         })
     }
 }
@@ -477,7 +529,16 @@ async fn next_chunk_with_idle_timeout(
 
 fn clone_clonable_registry_error(err: &RegistryError) -> Option<RegistryError> {
     Some(match err {
-        RegistryError::Http(_) | RegistryError::Json(_) => return None,
+        RegistryError::Http(e) => RegistryError::Transport(crate::error::HttpTransportError {
+            message: crate::network_errors::format_http(e),
+            is_connect: e.is_connect(),
+            is_timeout: e.is_timeout(),
+            is_decode: e.is_decode(),
+            is_transient: err.is_transient(),
+        }),
+        RegistryError::Json(e) => {
+            RegistryError::MalformedMetadata(format!("JSON parse error: {e}"))
+        }
         RegistryError::Transport(e) => RegistryError::Transport(e.clone()),
         RegistryError::UrlParse(e) => RegistryError::UrlParse(*e),
         RegistryError::PackageNotFound { package, status } => RegistryError::PackageNotFound {
@@ -1828,7 +1889,9 @@ impl RegistryClient {
         if let Some((command, cli_ua)) = CLI_REQUEST_CONTEXT.get() {
             HeaderValue::from_str(command).map_err(|e| RegistryError::Other(e.to_string()))?;
             if config.user_agent == default_user_agent_str() {
-                HeaderValue::from_str(cli_ua).map_err(|e| RegistryError::Other(e.to_string()))?;
+                if let CliUserAgentSource::Explicit(ua) = cli_ua {
+                    HeaderValue::from_str(ua).map_err(|e| RegistryError::Other(e.to_string()))?;
+                }
             }
         }
 
@@ -1987,10 +2050,13 @@ impl RegistryClient {
         } else {
             config.pool_max_idle_per_host
         };
-        let may_use_http_proxy = config.proxy.is_some()
-            || config.http_proxy.is_some()
-            || config.https_proxy.is_some()
-            || has_proxy_env_vars();
+        // `http1_pool` only handles plain `http://` URLs (and hands any `https://` redirect
+        // back to `reqwest`), matching `build_http_client`: `http_proxy` or `proxy` (even when
+        // combined with `https_proxy`) proxies plain HTTP, while `https_proxy`-only (or env
+        // `HTTPS_PROXY`-only) does not.
+        let may_use_http_proxy = config.http_proxy.is_some()
+            || config.proxy.is_some()
+            || (config.https_proxy.is_none() && has_http_proxy_env_vars());
 
         Ok(Self {
             base_client,
@@ -2340,7 +2406,7 @@ impl RegistryClient {
                 if let Ok(cmd_val) = HeaderValue::from_str(command) {
                     headers.insert("npm-command", cmd_val);
                 }
-                HeaderValue::from_str(cli_ua).unwrap_or_else(|_| default_ua_header())
+                HeaderValue::from_str(cli_ua.as_str()).unwrap_or_else(|_| default_ua_header())
             } else {
                 if let Some((command, _)) = cli_context {
                     if let Ok(cmd_val) = HeaderValue::from_str(command) {
@@ -4534,6 +4600,9 @@ impl RegistryClient {
                         stream_attempt += 1;
                         continue;
                     } else {
+                        if let Some(ref hk) = host_key {
+                            self.circuit_breaker.record_failure(hk).await;
+                        }
                         return Err(mismatch_err);
                     }
                 }
@@ -5265,10 +5334,24 @@ impl RegistryClient {
 
             if let Some(content_length) = expected_content_length {
                 if bytes.len() as u64 != content_length {
-                    return Err(RegistryError::ContentLengthMismatch {
+                    let mismatch_err = RegistryError::ContentLengthMismatch {
                         expected: content_length,
                         actual: bytes.len() as u64,
-                    });
+                    };
+                    if mismatch_err.is_transient() && stream_attempt < self.config.max_retries {
+                        let delay = self.calculate_backoff(stream_attempt);
+                        debug!(
+                            "Tarball Content-Length mismatch for {}, retrying in {:?} (attempt {}/{})",
+                            url, delay, stream_attempt + 1, self.config.max_retries
+                        );
+                        tokio::time::sleep(delay).await;
+                        stream_attempt += 1;
+                        continue;
+                    }
+                    if let Some(ref hk) = host_key {
+                        self.circuit_breaker.record_failure(hk).await;
+                    }
+                    return Err(mismatch_err);
                 }
             }
 
@@ -5678,10 +5761,24 @@ impl RegistryClient {
                         drop(bw);
                         let _ = tokio::fs::remove_file(&temp_path).await;
                     }
-                    return Err(RegistryError::ContentLengthMismatch {
+                    let mismatch_err = RegistryError::ContentLengthMismatch {
                         expected: content_length,
                         actual: written,
-                    });
+                    };
+                    if mismatch_err.is_transient() && stream_attempt < self.config.max_retries {
+                        let delay = self.calculate_backoff(stream_attempt);
+                        debug!(
+                            "Tarball file Content-Length mismatch for {}, retrying in {:?} (attempt {}/{})",
+                            url, delay, stream_attempt + 1, self.config.max_retries
+                        );
+                        tokio::time::sleep(delay).await;
+                        stream_attempt += 1;
+                        continue;
+                    }
+                    if let Some(ref hk) = host_key {
+                        self.circuit_breaker.record_failure(hk).await;
+                    }
+                    return Err(mismatch_err);
                 }
             }
 
@@ -8580,5 +8677,34 @@ nB99xJBcpcklOhB/x8L3Vb9kw8ZPzUvYKI7lj0+yjYJannulkI7H7LB4hxKnVKp5\n\
             "explicit auth_tokens entry must be attached on redirect_count == 0 even if not in trusted_hosts"
         );
         server.abort();
+    }
+
+    #[test]
+    fn test_http1_pool_allowed_with_https_only_proxy_and_disabled_with_http_proxy() {
+        let plain_http = Url::parse("http://127.0.0.1:4873/pkg").unwrap();
+        let https_url = Url::parse("https://registry.npmjs.org/pkg").unwrap();
+
+        let client_https_only = RegistryClient::with_config(RegistryClientConfig {
+            https_proxy: Some("http://127.0.0.1:8888".to_string()),
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(client_https_only.can_use_http1_pool(&plain_http));
+        assert!(!client_https_only.can_use_http1_pool(&https_url));
+
+        let client_http_proxy = RegistryClient::with_config(RegistryClientConfig {
+            http_proxy: Some("http://127.0.0.1:8888".to_string()),
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(!client_http_proxy.can_use_http1_pool(&plain_http));
+
+        let client_combined_proxy = RegistryClient::with_config(RegistryClientConfig {
+            proxy: Some("http://127.0.0.1:8888".to_string()),
+            https_proxy: Some("http://127.0.0.1:9999".to_string()),
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(!client_combined_proxy.can_use_http1_pool(&plain_http));
     }
 }

@@ -791,46 +791,131 @@ fn normalize_workspace_nodes(node: &mut InspectedNode, root: &Path) {
 
 fn ordered_query_node(node: &InspectedNode) -> rnpm_core::ordered_json::OrderedJsonValue {
     use rnpm_core::ordered_json::OrderedJsonValue;
-    let computed = node.to_query_json();
     let mut map: rnpm_core::ordered_json::OrderedJsonMap = node
-        .path
-        .as_ref()
-        .and_then(|p| std::fs::read_to_string(p.join("package.json")).ok())
-        .and_then(|s| serde_json::from_str::<OrderedJsonValue>(&s).ok())
-        .and_then(|v| v.as_object().cloned())
+        .raw_manifest_text
+        .as_deref()
+        .and_then(|s| serde_json::from_str::<OrderedJsonValue>(s).ok())
+        .or_else(|| {
+            node.path
+                .as_ref()
+                .and_then(|p| std::fs::read_to_string(p.join("package.json")).ok())
+                .and_then(|s| serde_json::from_str::<OrderedJsonValue>(&s).ok())
+        })
+        .and_then(|v| match v {
+            OrderedJsonValue::Object(m) => Some(m),
+            _ => None,
+        })
         .unwrap_or_else(|| {
             let mut map = rnpm_core::ordered_json::OrderedJsonMap::new();
-            for key in ["name", "version"] {
-                if let Some(value) = computed.get(key) {
-                    map.insert(key.to_string(), value.clone().into());
-                }
+            map.insert(
+                "name".to_string(),
+                OrderedJsonValue::String(node.name.clone()),
+            );
+            if let Some(v) = &node.version {
+                map.insert(
+                    "version".to_string(),
+                    OrderedJsonValue::String(v.clone()),
+                );
             }
             if let Some(Value::Object(raw)) = &node.raw_manifest {
                 for (key, value) in raw {
                     map.insert(key.clone(), value.clone().into());
                 }
+            } else {
+                if let Some(desc) = &node.description {
+                    map.insert(
+                        "description".to_string(),
+                        OrderedJsonValue::String(desc.clone()),
+                    );
+                }
+                if let Some(lic) = &node.license {
+                    map.insert(
+                        "license".to_string(),
+                        OrderedJsonValue::String(lic.clone()),
+                    );
+                }
+                if let Some(repo) = &node.repository {
+                    map.insert("repository".to_string(), repo.clone().into());
+                }
+                if let Some(eng) = &node.engines {
+                    map.insert(
+                        "engines".to_string(),
+                        serde_json::to_value(eng).unwrap_or(Value::Null).into(),
+                    );
+                }
             }
             map
         });
-    for key in [
-        "_id",
-        "pkgid",
-        "location",
-        "path",
-        "realpath",
-        "resolved",
-        "from",
-        "to",
-        "dev",
-        "inBundle",
-        "deduped",
-        "overridden",
-        "queryContext",
-    ] {
-        if let Some(value) = computed.get(key) {
-            map.insert(key.to_string(), value.clone().into());
-        }
+
+    let pkgid = node.pkgid.clone().unwrap_or_else(|| match &node.version {
+        Some(v) => format!("{}@{}", node.name, v),
+        None => node.name.clone(),
+    });
+    map.insert("_id".to_string(), OrderedJsonValue::String(pkgid.clone()));
+    map.insert("pkgid".to_string(), OrderedJsonValue::String(pkgid));
+    map.insert(
+        "location".to_string(),
+        OrderedJsonValue::String(node.location.clone()),
+    );
+    map.insert(
+        "path".to_string(),
+        match &node.path {
+            Some(p) => OrderedJsonValue::String(p.to_string_lossy().to_string()),
+            None => OrderedJsonValue::Null,
+        },
+    );
+    map.insert(
+        "realpath".to_string(),
+        match &node.realpath {
+            Some(p) => OrderedJsonValue::String(p.to_string_lossy().to_string()),
+            None => OrderedJsonValue::Null,
+        },
+    );
+    map.insert(
+        "resolved".to_string(),
+        match &node.resolved {
+            Some(r) => OrderedJsonValue::String(r.clone()),
+            None => OrderedJsonValue::Null,
+        },
+    );
+    map.insert(
+        "from".to_string(),
+        OrderedJsonValue::Array(
+            node.from
+                .iter()
+                .cloned()
+                .map(OrderedJsonValue::String)
+                .collect(),
+        ),
+    );
+    map.insert(
+        "to".to_string(),
+        OrderedJsonValue::Array(
+            node.to
+                .iter()
+                .cloned()
+                .map(OrderedJsonValue::String)
+                .collect(),
+        ),
+    );
+    map.insert("dev".to_string(), OrderedJsonValue::Bool(node.dev));
+    map.insert(
+        "inBundle".to_string(),
+        OrderedJsonValue::Bool(node.in_bundle),
+    );
+    map.insert("deduped".to_string(), OrderedJsonValue::Bool(node.deduped));
+    map.insert(
+        "overridden".to_string(),
+        OrderedJsonValue::Bool(node.overridden),
+    );
+    let mut query_ctx = node.query_context.clone();
+    if node.missing {
+        query_ctx.insert("missing".to_string(), Value::Bool(true));
     }
+    map.insert(
+        "queryContext".to_string(),
+        serde_json::to_value(query_ctx).unwrap_or_default().into(),
+    );
     OrderedJsonValue::Object(map)
 }
 

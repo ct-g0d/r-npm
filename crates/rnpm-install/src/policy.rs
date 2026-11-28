@@ -890,28 +890,49 @@ fn linux_libc_family() -> Option<String> {
 
 /// node's `os.release()`: the kernel release, or `major.minor.build` on Windows.
 fn os_release() -> Option<String> {
-    let out = if cfg!(windows) {
-        std::process::Command::new("cmd")
-            .args(["/c", "ver"])
-            .output()
-            .ok()?
-    } else {
-        std::process::Command::new("uname")
-            .arg("-r")
-            .output()
-            .ok()?
-    };
-    let text = String::from_utf8_lossy(&out.stdout);
-    if cfg!(windows) {
-        let start = text.find(|c: char| c.is_ascii_digit())?;
-        let ver: String = text[start..]
-            .chars()
-            .take_while(|c| c.is_ascii_digit() || *c == '.')
-            .collect();
-        Some(ver.split('.').take(3).collect::<Vec<_>>().join("."))
-    } else {
-        Some(text.trim().to_string())
-    }
+    static OS_RELEASE: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    OS_RELEASE
+        .get_or_init(|| {
+            #[cfg(windows)]
+            {
+                #[repr(C)]
+                #[allow(non_snake_case)]
+                struct RtlOsVersionInfoW {
+                    dwOSVersionInfoSize: u32,
+                    dwMajorVersion: u32,
+                    dwMinorVersion: u32,
+                    dwBuildNumber: u32,
+                    dwPlatformId: u32,
+                    szCSDVersion: [u16; 128],
+                }
+                #[link(name = "ntdll")]
+                extern "system" {
+                    fn RtlGetVersion(lpVersionInformation: *mut RtlOsVersionInfoW) -> i32;
+                }
+                let mut info = RtlOsVersionInfoW {
+                    dwOSVersionInfoSize: std::mem::size_of::<RtlOsVersionInfoW>() as u32,
+                    dwMajorVersion: 0,
+                    dwMinorVersion: 0,
+                    dwBuildNumber: 0,
+                    dwPlatformId: 0,
+                    szCSDVersion: [0; 128],
+                };
+                if unsafe { RtlGetVersion(&mut info) } == 0 {
+                    return Some(format!(
+                        "{}.{}.{}",
+                        info.dwMajorVersion, info.dwMinorVersion, info.dwBuildNumber
+                    ));
+                }
+                None
+            }
+            #[cfg(not(windows))]
+            {
+                let out = std::process::Command::new("uname").arg("-r").output().ok()?;
+                let text = String::from_utf8_lossy(&out.stdout);
+                Some(text.trim().to_string())
+            }
+        })
+        .clone()
 }
 
 /// npm-install-checks `checkDevEngines`, as npm runs it before arborist

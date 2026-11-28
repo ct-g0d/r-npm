@@ -83,6 +83,9 @@ pub struct InspectedNode {
     /// Raw package manifest JSON if available
     #[serde(skip)]
     pub raw_manifest: Option<Value>,
+    /// Raw package.json source text (cached during parallel scan so `query` avoids re-reading disk)
+    #[serde(skip)]
+    pub raw_manifest_text: Option<String>,
 }
 
 impl InspectedNode {
@@ -124,6 +127,7 @@ impl InspectedNode {
             problems: Vec::new(),
             dependencies: BTreeMap::new(),
             raw_manifest: None,
+            raw_manifest_text: None,
         }
     }
 
@@ -286,6 +290,7 @@ pub(crate) struct DiskPackage {
     pub version: Option<String>,
     pub manifest: Option<Manifest>,
     pub raw_json: Option<Value>,
+    pub raw_text: Option<String>,
     pub is_link: bool,
 }
 
@@ -435,7 +440,7 @@ pub(crate) fn scan_disk_packages_with_raw(
     }
 
     let parse_entry = |item: &RawDiskEntry| {
-        let (manifest, raw_json, version) =
+        let (manifest, raw_json, raw_text, version) =
             load_package_manifest(&item.dir_path, include_raw_json);
         let name = manifest
             .as_ref()
@@ -451,6 +456,7 @@ pub(crate) fn scan_disk_packages_with_raw(
                 version,
                 manifest,
                 raw_json,
+                raw_text,
                 is_link: item.is_link,
             },
         )
@@ -508,19 +514,19 @@ fn project_relative_realpath(project_dir: &Path, link: &Path) -> Option<String> 
 fn load_package_manifest(
     dir: &Path,
     include_raw_json: bool,
-) -> (Option<Manifest>, Option<Value>, Option<String>) {
+) -> (Option<Manifest>, Option<Value>, Option<String>, Option<String>) {
     let manifest_path = dir.join("package.json");
     if let Ok(content) = std::fs::read_to_string(&manifest_path) {
         let manifest = Manifest::from_str_readonly(&content).ok();
-        let raw_json = if include_raw_json {
-            serde_json::from_str::<Value>(&content).ok()
+        let (raw_json, raw_text) = if include_raw_json {
+            (serde_json::from_str::<Value>(&content).ok(), Some(content))
         } else {
-            None
+            (None, None)
         };
         let version = manifest.as_ref().and_then(|m| m.version.clone());
-        return (manifest, raw_json, version);
+        return (manifest, raw_json, raw_text, version);
     }
-    (None, None, None)
+    (None, None, None, None)
 }
 
 /// Candidate locations in resolution order: from most nested to root node_modules.
@@ -555,14 +561,15 @@ pub fn build_dependency_tree_with_raw(
     include_raw_json: bool,
 ) -> anyhow::Result<InspectedNode> {
     let manifest_path = project_dir.join("package.json");
-    let (root_manifest, root_raw) = if manifest_path.exists() {
+    let (root_manifest, root_raw, root_raw_text) = if manifest_path.exists() {
         let content = std::fs::read_to_string(&manifest_path)?;
         let clean = content.strip_prefix('\u{feff}').unwrap_or(&content);
         let m = Manifest::from_str_readonly(clean).ok();
         let j = serde_json::from_str::<Value>(clean).ok();
-        (m, j)
+        let txt = include_raw_json.then(|| clean.to_string());
+        (m, j, txt)
     } else {
-        (None, None)
+        (None, None, None)
     };
 
     let root_name = root_manifest
@@ -592,6 +599,7 @@ pub fn build_dependency_tree_with_raw(
         root.repository = r.get("repository").cloned();
         root.raw_manifest = Some(r.clone());
     }
+    root.raw_manifest_text = root_raw_text;
 
     let lockfile_path = project_dir.join("package-lock.json");
     let lockfile = if lockfile_path.exists() {
@@ -1106,6 +1114,7 @@ fn create_node_from_disk(
         problems: Vec::new(),
         dependencies: BTreeMap::new(),
         raw_manifest: disk_pkg.raw_json.clone(),
+        raw_manifest_text: disk_pkg.raw_text.clone(),
     }
 }
 
@@ -1153,6 +1162,7 @@ fn create_missing_node(
         problems: Vec::new(),
         dependencies: BTreeMap::new(),
         raw_manifest: None,
+        raw_manifest_text: None,
     }
 }
 
@@ -1271,5 +1281,6 @@ fn create_node_from_lock(
         problems: Vec::new(),
         dependencies: BTreeMap::new(),
         raw_manifest: None,
+        raw_manifest_text: None,
     }
 }

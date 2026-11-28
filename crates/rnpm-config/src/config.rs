@@ -539,16 +539,19 @@ impl Config {
                     });
                     base_npmrc.merge(global_config);
                 } else {
-                    let etc_path = PathBuf::from("/etc/npmrc");
-                    if let Some(global_config) =
-                        Npmrc::from_file_if_exists_with_env(&etc_path, env_lookup)?
+                    #[cfg(unix)]
                     {
-                        layers.push(ConfigLayer {
-                            name: "global".to_string(),
-                            source: Some(etc_path),
-                            settings: global_config.scrubbed_settings(),
-                        });
-                        base_npmrc.merge(global_config);
+                        let etc_path = PathBuf::from("/etc/npmrc");
+                        if let Some(global_config) =
+                            Npmrc::from_file_if_exists_with_env(&etc_path, env_lookup)?
+                        {
+                            layers.push(ConfigLayer {
+                                name: "global".to_string(),
+                                source: Some(etc_path),
+                                settings: global_config.scrubbed_settings(),
+                            });
+                            base_npmrc.merge(global_config);
+                        }
                     }
                 }
             }

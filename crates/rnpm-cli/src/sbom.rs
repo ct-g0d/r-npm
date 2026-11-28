@@ -196,26 +196,36 @@ fn scan_license(source: &str) -> Option<Vec<LicenseToken>> {
         }
         j
     };
+    static SPDX_LICENSE_SET: std::sync::OnceLock<std::collections::HashSet<&'static str>> =
+        std::sync::OnceLock::new();
+    static SPDX_EXCEPTION_SET: std::sync::OnceLock<std::collections::HashSet<&'static str>> =
+        std::sync::OnceLock::new();
+    let license_set = SPDX_LICENSE_SET.get_or_init(|| SPDX_LICENSE_IDS.lines().collect());
+    let exception_set = SPDX_EXCEPTION_SET.get_or_init(|| SPDX_EXCEPTIONS.lines().collect());
+
     let mut i = 0;
     let mut tokens = Vec::new();
     'outer: while i < bytes.len() {
-        while i < bytes.len() && bytes[i] == b' ' {
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
             i += 1;
         }
         if i >= bytes.len() {
             break;
         }
         let rest = &source[i..];
-        let upper = rest.to_ascii_uppercase();
         for op in ["WITH", "AND", "OR"] {
-            if upper.starts_with(op) {
-                tokens.push(LicenseToken::Op(op.to_string()));
-                i += op.len();
-                continue 'outer;
+            if rest.starts_with(op) {
+                let next_byte = bytes.get(i + op.len()).copied();
+                let is_boundary = next_byte.is_none_or(|b| b.is_ascii_whitespace() || b == b'(');
+                if is_boundary {
+                    tokens.push(LicenseToken::Op(op.to_string()));
+                    i += op.len();
+                    continue 'outer;
+                }
             }
         }
         if let c @ (b'(' | b')' | b':' | b'+') = bytes[i] {
-            if c == b'+' && i > 1 && bytes[i - 1] == b' ' {
+            if c == b'+' && i > 0 && bytes[i - 1].is_ascii_whitespace() {
                 return None;
             }
             tokens.push(LicenseToken::Op((c as char).to_string()));
@@ -241,9 +251,9 @@ fn scan_license(source: &str) -> Option<Vec<LicenseToken>> {
         }
         let end = idstring(i);
         let id = &source[i..end];
-        if end > i && SPDX_LICENSE_IDS.lines().any(|l| l == id) {
+        if end > i && license_set.contains(id) {
             tokens.push(LicenseToken::License(id.to_string()));
-        } else if end > i && SPDX_EXCEPTIONS.lines().any(|l| l == id) {
+        } else if end > i && exception_set.contains(id) {
             tokens.push(LicenseToken::Exception(id.to_string()));
         } else {
             return None;

@@ -1506,7 +1506,7 @@ impl PackagePack {
                                     rnpm_fs::record_files_created_batch(local_files, local_bytes);
                                 }
                                 has_err.store(true, Ordering::Relaxed);
-                                let mut guard = first_err.lock().unwrap();
+                                let mut guard = first_err.lock().unwrap_or_else(|e| e.into_inner());
                                 if guard.is_none() {
                                     *guard = Some(CacheError::Io(e));
                                 }
@@ -1524,7 +1524,7 @@ impl PackagePack {
                     rnpm_fs::record_files_created_batch(local_files, local_bytes);
                 }
             });
-            if let Some(err) = first_err.into_inner().unwrap() {
+            if let Some(err) = first_err.into_inner().unwrap_or_else(|e| e.into_inner()) {
                 return Err(err);
             }
         } else {
@@ -1797,16 +1797,15 @@ impl PackStore {
     /// Uses lazy on-demand creation for pack and CAS prefix directories instead of eager 256-dir loops.
     pub fn new(root: impl AsRef<Path>) -> Result<Self, CacheError> {
         let root = root.as_ref().to_path_buf();
-        let packs_dir = root.join("packs");
-        fs::create_dir_all(&packs_dir)?;
-        fs::create_dir_all(root.join("tmp"))?;
         let cas_dir = root.join("cas");
-        fs::create_dir_all(&cas_dir)?;
-
-        let has_cas = if let Ok(mut it) = fs::read_dir(&cas_dir) {
-            it.next().is_some()
-        } else {
-            false
+        let has_cas = match fs::read_dir(&cas_dir) {
+            Ok(mut it) => it.next().is_some(),
+            Err(_) => {
+                fs::create_dir_all(root.join("packs"))?;
+                fs::create_dir_all(root.join("tmp"))?;
+                fs::create_dir_all(&cas_dir)?;
+                false
+            }
         };
 
         Ok(Self {
@@ -2239,7 +2238,7 @@ impl PackStore {
 
         // 1. Remove from in-memory cache
         {
-            let mut guard = self.mmap_cache.write().unwrap();
+            let mut guard = self.mmap_cache.write().unwrap_or_else(|e| e.into_inner());
             guard.remove_key(integrity);
             guard.remove_key(integrity.trim());
             guard.remove_key(&safe_stem);
@@ -2337,6 +2336,23 @@ impl PackStore {
         false
     }
 
+    /// Fast O(1) check whether the pack store contains any packs in memory or on disk.
+    pub fn has_any_packs(&self) -> bool {
+        if !self
+            .mmap_cache
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .entries
+            .is_empty()
+        {
+            return true;
+        }
+        fs::read_dir(self.packs_dir())
+            .ok()
+            .and_then(|mut it| it.next())
+            .is_some()
+    }
+
     /// Retrieve and memory-map a package pack by integrity.
     ///
     /// Caches open memory maps across process lifetime for fast reuse.
@@ -2345,31 +2361,76 @@ impl PackStore {
             .map(|opt| opt.map(|arc| (*arc).clone()))
     }
 
-    fn get_package_pack_arc(
+    /// Retrieve a shared `Arc<PackagePack>` without deep-cloning its index or file entries.
+    pub fn get_package_pack_arc(
         &self,
         integrity: &str,
     ) -> Result<Option<Arc<PackagePack>>, CacheError> {
+        self.get_package_pack_arc_inner(integrity, true, true)
+    }
+
+    /// Retrieve a shared `Arc<PackagePack>`, optionally skipping per-entry CAS stat/verification
+    /// when the caller is not going to use block cloning (e.g. standard NTFS volumes).
+    pub fn get_package_pack_arc_opt(
+        &self,
+        integrity: &str,
+        verify_cas: bool,
+    ) -> Result<Option<Arc<PackagePack>>, CacheError> {
+        self.get_package_pack_arc_inner(integrity, verify_cas, true)
+    }
+
+    /// Retrieve a `PackagePack` directly from disk (checking `mmap_cache` only if non-empty,
+    /// and never acquiring the global `mmap_cache` write lock on load). Ideal for one-shot
+    /// parallel warm/CI materialization where each pack is read once.
+    pub fn get_package_pack_uncached(
+        &self,
+        integrity: &str,
+        verify_cas: bool,
+    ) -> Result<Option<Arc<PackagePack>>, CacheError> {
+        self.get_package_pack_arc_inner(integrity, verify_cas, false)
+    }
+
+    fn get_package_pack_arc_inner(
+        &self,
+        integrity: &str,
+        verify_cas: bool,
+        cache_in_mem: bool,
+    ) -> Result<Option<Arc<PackagePack>>, CacheError> {
+        let need_cas = verify_cas && self.has_cas_files.load(Ordering::Relaxed);
+        let cas_ready = |pack: &PackagePack| -> bool {
+            !need_cas
+                || pack.index.files.is_empty()
+                || pack.index.files.iter().all(|f| f.cas_path.is_some())
+        };
+
         // 1. Check in-memory cache by exact string before parsing integrity
-        {
-            let guard = self.mmap_cache.read().unwrap();
-            if let Some(pack) = guard.get(integrity) {
-                return Ok(Some(pack));
-            }
-        }
-
-        let (prefix, safe_stem, sha512_hex, canon) =
-            Self::integrity_key_parts_with_canon(integrity);
-
-        {
-            let guard = self.mmap_cache.read().unwrap();
-            if let Some(pack) = guard
-                .get(&safe_stem)
-                .or_else(|| guard.get(&sha512_hex))
-                .or_else(|| canon.as_deref().and_then(|c| guard.get(c)))
+        let (prefix, safe_stem, sha512_hex, canon) = if cache_in_mem {
             {
-                return Ok(Some(pack));
+                let guard = self.mmap_cache.read().unwrap_or_else(|e| e.into_inner());
+                if let Some(pack) = guard.get(integrity) {
+                    if cas_ready(&pack) {
+                        return Ok(Some(pack));
+                    }
+                }
             }
-        }
+
+            let parts = Self::integrity_key_parts_with_canon(integrity);
+            {
+                let guard = self.mmap_cache.read().unwrap_or_else(|e| e.into_inner());
+                if let Some(pack) = guard
+                    .get(&parts.1)
+                    .or_else(|| guard.get(&parts.2))
+                    .or_else(|| parts.3.as_deref().and_then(|c| guard.get(c)))
+                {
+                    if cas_ready(&pack) {
+                        return Ok(Some(pack));
+                    }
+                }
+            }
+            parts
+        } else {
+            Self::integrity_key_parts_with_canon(integrity)
+        };
 
         // 2. Open .pack once (single-file v2 embeds index trailer; legacy v1 reads sibling .idx).
         const DIRECT_READ_THRESHOLD: u64 = 4 * 1024 * 1024;
@@ -2451,6 +2512,7 @@ impl PackStore {
                     "Corrupted pack v2 at '{}': {e}. Purging.",
                     pack_path.display()
                 );
+                drop(buffer);
                 let _ = self.purge(integrity);
                 return Ok(None);
             }
@@ -2462,6 +2524,7 @@ impl PackStore {
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                         let is_all_zero = !buffer.data().is_empty()
                             && buffer.data().iter().all(|&b| b == 0);
+                        drop(buffer);
                         let _ = self.purge(integrity);
                         if is_all_zero {
                             return Err(CacheError::CorruptedPack(format!(
@@ -2480,6 +2543,7 @@ impl PackStore {
                             "Corrupted pack index at '{}': {e}. Purging.",
                             idx_path.display()
                         );
+                        drop(buffer);
                         let _ = self.purge(integrity);
                         return Ok(None);
                     }
@@ -2499,6 +2563,7 @@ impl PackStore {
                         idx.total_pack_size,
                         expected_padded
                     );
+                    drop(buffer);
                     let _ = self.purge(integrity);
                     return Ok(None);
                 }
@@ -2514,6 +2579,7 @@ impl PackStore {
                     entry.path,
                     pack_path.display()
                 );
+                drop(buffer);
                 let _ = self.purge(integrity);
                 return Ok(None);
             }
@@ -2524,6 +2590,7 @@ impl PackStore {
                     payload_len,
                     pack_path.display()
                 );
+                drop(buffer);
                 let _ = self.purge(integrity);
                 return Ok(None);
             }
@@ -2535,6 +2602,7 @@ impl PackStore {
                     link_rel,
                     pack_path.display()
                 );
+                drop(buffer);
                 let _ = self.purge(integrity);
                 return Ok(None);
             }
@@ -2544,6 +2612,7 @@ impl PackStore {
                     target_rel,
                     pack_path.display()
                 );
+                drop(buffer);
                 let _ = self.purge(integrity);
                 return Ok(None);
             }
@@ -2558,6 +2627,7 @@ impl PackStore {
 
         if !pack_verified {
             if let Err(e) = verify_pack_slice_checksum(&buffer.data()[..payload_len], &index, &pack_path) {
+                drop(buffer);
                 let _ = self.purge(integrity);
                 return Err(e);
             }
@@ -2570,7 +2640,7 @@ impl PackStore {
         }
 
         let buf_data = &buffer.data()[..payload_len];
-        let has_cas = self.has_cas_files.load(Ordering::Relaxed);
+        let has_cas = need_cas;
         if has_cas {
             let cas_dir = self.cas_dir();
             for entry in &mut index.files {
@@ -2770,13 +2840,13 @@ impl PackStore {
             idx_path,
         });
 
-        // 5. Store in bounded cache
-        {
+        // 5. Store in bounded cache (only when caller wants in-process caching)
+        if cache_in_mem {
             let mut aliases = vec![integrity.to_string(), safe_stem, sha512_hex];
             if let Some(canon_key) = canon {
                 aliases.push(canon_key);
             }
-            let mut guard = self.mmap_cache.write().unwrap();
+            let mut guard = self.mmap_cache.write().unwrap_or_else(|e| e.into_inner());
             guard.insert(aliases, Arc::clone(&pack));
         }
 
@@ -2832,6 +2902,54 @@ impl PackStore {
 
         self.put_package_pack_with_cas(integrity, &input_files, populate_cas)
             .map(|p| p.index)
+    }
+
+    /// Persist both regular payloads and validated link metadata from one decode
+    /// without inserting into the in-process `mmap_cache` (avoids global write-lock
+    /// contention and `PackagePack` cloning during background cold-install persistence).
+    pub fn put_decoded_package_uncached(
+        &self,
+        integrity: &str,
+        pkg_target: &Path,
+        decoded: &DecodedPackage,
+        populate_cas: bool,
+    ) -> Result<(), CacheError> {
+        let base = rnpm_fs::to_verbatim_path(pkg_target);
+        let mut input_files = Vec::with_capacity(decoded.files.len());
+        for file in &decoded.files {
+            let relative = file.path.strip_prefix(&base).map_err(|_| {
+                CacheError::InvalidPack(format!("File escapes package: {}", file.path.display()))
+            })?;
+            input_files.push(PackInputFile {
+                path: relative.to_string_lossy().replace('\\', "/"),
+                mode: file.mode,
+                data: file.data.as_slice(),
+            });
+        }
+        let mut links = Vec::with_capacity(decoded.symlinks.len());
+        for (link, target) in &decoded.symlinks {
+            let relative_link = link
+                .strip_prefix(&base)
+                .map_err(|_| CacheError::InvalidPack("Link escapes package".into()))?;
+            let relative_target = target
+                .strip_prefix(&base)
+                .map_err(|_| CacheError::InvalidPack("Link target escapes package".into()))?;
+            rnpm_fs::validate_entry_path(relative_link).map_err(CacheError::Fs)?;
+            rnpm_fs::validate_entry_path(relative_target).map_err(CacheError::Fs)?;
+            links.push((
+                relative_link.to_string_lossy().replace('\\', "/"),
+                relative_target.to_string_lossy().replace('\\', "/"),
+            ));
+        }
+        self.put_package_pack_with_cas_opt_cache(
+            integrity,
+            &input_files,
+            populate_cas,
+            true,
+            false,
+            &links,
+        )
+        .map(|_| ())
     }
 
     /// Persist both regular payloads and validated link metadata from one decode.
@@ -2917,6 +3035,25 @@ impl PackStore {
         write_files: bool,
         links: &[(String, String)],
     ) -> Result<(PackagePack, DeferredPackPayloads), CacheError> {
+        self.put_package_pack_with_cas_opt_cache(
+            integrity,
+            files,
+            populate_cas,
+            write_files,
+            true,
+            links,
+        )
+    }
+
+    fn put_package_pack_with_cas_opt_cache(
+        &self,
+        integrity: &str,
+        files: &[PackInputFile<'_>],
+        populate_cas: bool,
+        write_files: bool,
+        cache_in_mem: bool,
+        links: &[(String, String)],
+    ) -> Result<(PackagePack, DeferredPackPayloads), CacheError> {
         let limits = rnpm_fs::TarLimits::default();
         if files.len() > limits.max_entries {
             return Err(CacheError::Fs(rnpm_fs::FsError::TarBombLimitExceeded {
@@ -2986,7 +3123,6 @@ impl PackStore {
             }
         }
 
-        // 1. Pack construction with 4 KiB alignment
         let mut pack_bytes = Vec::with_capacity(total_size);
         let mut index_files = Vec::with_capacity(deduped_files.len());
         let cas_dir = populate_cas.then(|| self.cas_dir());
@@ -3051,9 +3187,11 @@ impl PackStore {
             links.to_vec(),
             populate_cas,
             write_files,
+            cache_in_mem,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn finalize_pack_and_write(
         &self,
         integrity: &str,
@@ -3062,13 +3200,13 @@ impl PackStore {
         links: Vec<(String, String)>,
         populate_cas: bool,
         write_files: bool,
+        cache_in_mem: bool,
     ) -> Result<(PackagePack, DeferredPackPayloads), CacheError> {
         let (prefix, safe_stem, sha512_hex, canon) =
             Self::integrity_key_parts_with_canon(integrity);
 
-        // Pad the end of the .pack file with zeroes up to a 4096-byte cluster boundary
-        // ((total_pack_size + 4095) & !4095). This ensures that FSCTL_DUPLICATE_EXTENTS_TO_FILE
-        // for the last file in the pack does not extend past the end of the source .pack file.
+        // Pad the end of the .pack file to a 4096-byte cluster boundary for block-cloning
+        // (FSCTL_DUPLICATE_EXTENTS_TO_FILE) compatibility.
         let unpadded_len = pack_bytes.len();
         let padded_len = if unpadded_len > 0 {
             (unpadded_len + (PACK_ALIGNMENT - 1)) & !(PACK_ALIGNMENT - 1)
@@ -3118,9 +3256,17 @@ impl PackStore {
         let idx_bytes = if write_files {
             #[cfg(windows)]
             {
-                let tmp_root = self.tmp_dir();
-                crate::storage::with_temp_wide_stack(&tmp_root, "pk", |wide_tmp, tmp_hint| {
-                    crate::storage::with_verbatim_wide_stack(&final_pack, |wide_final| {
+                crate::storage::with_verbatim_wide_stack(&final_pack, |wide_final| {
+                    if crate::storage::write_create_new_wide_set_mtime(
+                        wide_final,
+                        &pack_bytes,
+                        Some(target_mtime_nanos),
+                    )
+                    .is_ok()
+                    {
+                        return Ok(());
+                    }
+                    crate::storage::with_sibling_temp_wide_stack(wide_final, "p", |wide_tmp, tmp_hint| {
                         crate::storage::write_and_rename_atomic_wide_set_mtime(
                             wide_tmp,
                             wide_final,
@@ -3168,17 +3314,23 @@ impl PackStore {
             idx_path: final_idx.clone(),
         });
 
-        {
+        if cache_in_mem {
             let mut aliases = vec![integrity.to_string(), safe_stem, sha512_hex];
             if let Some(canon_key) = canon {
                 aliases.push(canon_key);
             }
-            let mut guard = self.mmap_cache.write().unwrap();
+            let mut guard = self.mmap_cache.write().unwrap_or_else(|e| e.into_inner());
             guard.insert(aliases, Arc::clone(&pack));
         }
 
+        let pack_out = if cache_in_mem {
+            (*pack).clone()
+        } else {
+            Arc::try_unwrap(pack).unwrap_or_else(|a| (*a).clone())
+        };
+
         Ok((
-            (*pack).clone(),
+            pack_out,
             DeferredPackPayloads {
                 pack: (final_pack, pack_bytes_arc),
                 idx: (final_idx, idx_bytes_arc),
@@ -3347,7 +3499,17 @@ impl PackStore {
         integrity: &str,
         tarball_bytes: &[u8],
     ) -> Result<PackIndex, CacheError> {
-        self.put_package_from_tarball_internal(integrity, tarball_bytes, true, true, None)
+        self.put_package_from_tarball_opt(integrity, tarball_bytes, true)
+    }
+
+    /// Extract a tarball into the pack store atomically with explicit CAS population control.
+    pub fn put_package_from_tarball_opt(
+        &self,
+        integrity: &str,
+        tarball_bytes: &[u8],
+        populate_cas: bool,
+    ) -> Result<PackIndex, CacheError> {
+        self.put_package_from_tarball_internal(integrity, tarball_bytes, populate_cas, true, None)
             .map(|p| p.index)
     }
 
@@ -3926,6 +4088,7 @@ impl PackStore {
             index_files,
             Vec::new(),
             populate_cas,
+            true,
             true,
         )
         .map(|(p, _)| p)
@@ -4645,19 +4808,21 @@ impl PackStore {
         writer_config: Option<&ParallelWriterConfig>,
         dirs_precreated: bool,
     ) -> Result<ExtractionSummary, CacheError> {
+        let can_block_clone = self.is_block_cloning_eligible(target_dir);
         let pack = self
             .get_package_pack_arc(integrity)?
             .ok_or_else(|| CacheError::PackNotFound(integrity.to_string()))?;
-        let can_block_clone = self.is_block_cloning_eligible(target_dir);
-        match pack.materialize_to_opt(
+        let res = pack.materialize_to_opt(
             target_dir,
             writer_config,
             Some(can_block_clone),
             dirs_precreated,
-        ) {
+        );
+        match res {
             Ok(summary) => Ok(summary),
             Err(e) => {
                 if e.is_pack_corruption() {
+                    drop(pack);
                     let _ = self.purge(integrity);
                 }
                 Err(e)
@@ -4667,13 +4832,16 @@ impl PackStore {
 
     /// Clear in-memory cached memory maps.
     pub fn clear_mmap_cache(&self) {
-        self.mmap_cache.write().unwrap().clear();
+        self.mmap_cache.write().unwrap_or_else(|e| e.into_inner()).clear();
     }
 
     /// Configure the maximum number of cached packs and cached bytes retained in `mmap_cache`.
     #[doc(hidden)]
     pub fn set_mmap_cache_limits(&self, max_packs: usize, max_bytes: usize) {
-        self.mmap_cache.write().unwrap().set_limits(max_packs, max_bytes);
+        self.mmap_cache
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .set_limits(max_packs, max_bytes);
     }
 
     /// Return `(cached_pack_count, cached_bytes)` currently retained in `mmap_cache`.

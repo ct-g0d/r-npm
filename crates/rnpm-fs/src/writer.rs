@@ -1038,9 +1038,29 @@ pub(crate) fn write_file_fast_wide(
     Ok(())
 }
 
+/// Creates a directory using a caller-provided wide buffer on Windows (`CreateDirectoryW` fast path,
+/// falling back to `std::fs::create_dir_all` if intermediate parents are missing).
+#[inline]
+pub fn create_dir_fast_buf(path: &Path, wide_buf: &mut Vec<u16>) -> std::io::Result<()> {
+    #[cfg(windows)]
+    {
+        crate::path::encode_verbatim_wide(path, wide_buf);
+        create_dir_wide_or_fallback(wide_buf)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = wide_buf;
+        match std::fs::create_dir(path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && path.is_dir() => Ok(()),
+            Err(_) => std::fs::create_dir_all(path),
+        }
+    }
+}
+
 /// Writes a file reusing a caller-provided wide-string buffer on Windows.
 #[inline]
-pub(crate) fn write_file_fast_buf(
+pub fn write_file_fast_buf(
     path: &Path,
     data: &[u8],
     mode: u32,

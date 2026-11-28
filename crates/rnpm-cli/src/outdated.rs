@@ -518,20 +518,33 @@ pub fn resolve_wanted_and_latest(
     dist_tags: &HashMap<String, String>,
     versions: &BTreeMap<String, AbbreviatedVersion>,
 ) -> (String, String) {
+    let parsed_versions: Option<Vec<(Version, &str)>> = if dist_tags.contains_key("latest")
+        && dist_tags.contains_key(declared_spec)
+    {
+        None
+    } else {
+        Some(
+            versions
+                .keys()
+                .filter_map(|v_str| Version::parse(v_str).ok().map(|v| (v, v_str.as_str())))
+                .collect(),
+        )
+    };
+
     // 1. Determine `latest`
     let latest = dist_tags
         .get("latest")
         .cloned()
         .or_else(|| {
-            let mut max_ver: Option<(Version, String)> = None;
-            for v_str in versions.keys() {
-                if let Ok(v) = Version::parse(v_str) {
-                    if max_ver.as_ref().is_none_or(|(m, _)| &v > m) {
-                        max_ver = Some((v, v_str.clone()));
+            let mut max_ver: Option<(&Version, &str)> = None;
+            if let Some(ref parsed) = parsed_versions {
+                for (v, v_str) in parsed {
+                    if max_ver.as_ref().is_none_or(|(m, _)| v > *m) {
+                        max_ver = Some((v, *v_str));
                     }
                 }
             }
-            max_ver.map(|(_, s)| s)
+            max_ver.map(|(_, s)| s.to_string())
         })
         .unwrap_or_else(|| {
             if current != "MISSING" {
@@ -545,16 +558,16 @@ pub fn resolve_wanted_and_latest(
     let wanted = if let Some(tag_ver) = dist_tags.get(declared_spec) {
         tag_ver.clone()
     } else if let Ok(range) = Range::parse(declared_spec) {
-        let mut max_satisfying: Option<(Version, String)> = None;
-        for v_str in versions.keys() {
-            if let Ok(v) = Version::parse(v_str) {
-                if range.satisfies(&v) && max_satisfying.as_ref().is_none_or(|(m, _)| &v > m) {
-                    max_satisfying = Some((v, v_str.clone()));
+        let mut max_satisfying: Option<(&Version, &str)> = None;
+        if let Some(ref parsed) = parsed_versions {
+            for (v, v_str) in parsed {
+                if range.satisfies(v) && max_satisfying.as_ref().is_none_or(|(m, _)| v > *m) {
+                    max_satisfying = Some((v, *v_str));
                 }
             }
         }
         if let Some((_, v_str)) = max_satisfying {
-            v_str
+            v_str.to_string()
         } else if current != "MISSING" {
             current.to_string()
         } else {

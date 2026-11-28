@@ -157,12 +157,12 @@ pub fn find_node_gyp(
     let mut check_dirs = Vec::new();
     check_dirs.push(package_dir.to_path_buf());
     let mut current = package_dir;
-    while let Some(parent) = current.parent() {
+    while current != project_root {
+        let Some(parent) = current.parent() else {
+            break;
+        };
         if !check_dirs.contains(&parent.to_path_buf()) {
             check_dirs.push(parent.to_path_buf());
-        }
-        if parent == project_root {
-            break;
         }
         current = parent;
     }
